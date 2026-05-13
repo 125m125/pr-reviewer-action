@@ -1,6 +1,6 @@
 # pr-reviewer-action
 
-Analyze pull requests with a self-hosted or cloud OpenAI-compatible model.
+Analyze pull requests with a self-hosted or cloud OpenAI-compatible or Anthropic-compatible model.
 
 [![CI](https://github.com/joryirving/pr-reviewer-action/actions/workflows/ci.yaml/badge.svg)](https://github.com/joryirving/pr-reviewer-action/actions/workflows/ci.yaml)
 
@@ -9,7 +9,8 @@ The action gathers PR metadata, diff context, linked issue context from PR-closi
 ## What it supports
 
 - self-hosted OpenAI-compatible endpoints
-- cloud OpenAI-compatible subscriptions with bearer auth
+- native Anthropic-compatible `/messages` endpoints
+- cloud OpenAI-compatible or Anthropic-compatible subscriptions
 - optional fallback model/endpoint
 - optional evidence providers for repo-specific checks
 - optional read-only tool harness for one planning round
@@ -32,12 +33,16 @@ The action gathers PR metadata, diff context, linked issue context from PR-closi
 | `github_token` | GitHub token for PR and API access | Yes | - |
 | `repo` | Repository in `owner/name` format | No | current repository |
 | `pr_number` | Pull request number | No | current `pull_request` number |
-| `ai_base_url` | Base URL of the primary OpenAI-compatible API | Yes | - |
+| `ai_base_url` | Base URL of the primary AI API | Yes | - |
+| `ai_api_format` | Primary API request/response format: `openai` or `anthropic` | No | `openai` |
 | `ai_model` | Model name for the primary analysis pass | Yes | - |
-| `ai_api_key` | Optional bearer token for the primary AI endpoint | No | `""` |
-| `ai_fallback_base_url` | Optional fallback OpenAI-compatible API base URL | No | `""` |
+| `ai_api_key` | Optional API key for the primary AI endpoint. OpenAI format sends `Authorization: Bearer`; Anthropic format sends `x-api-key` | No | `""` |
+| `ai_max_tokens` | Maximum completion tokens for primary and fallback final review calls. Required by Anthropic-compatible APIs | No | `4096` |
+| `anthropic_version` | `anthropic-version` header used for Anthropic-compatible requests | No | `2023-06-01` |
+| `ai_fallback_base_url` | Optional fallback AI API base URL | No | `""` |
+| `ai_fallback_api_format` | Fallback API request/response format; defaults to `ai_api_format` when blank | No | `""` |
 | `ai_fallback_model` | Optional fallback model name | No | `""` |
-| `ai_fallback_api_key` | Optional bearer token for the fallback AI endpoint | No | `""` |
+| `ai_fallback_api_key` | Optional API key for the fallback AI endpoint | No | `""` |
 | `ai_primary_retries` | Number of retries for the primary model | No | `8` |
 | `ai_primary_retry_delay_sec` | Delay between retries in seconds | No | `15` |
 | `allowed_source_hosts` | Comma-separated allowlist for linked URL fetching | No | `github.com,api.github.com,gitlab.com,registry.terraform.io,artifacthub.io` |
@@ -143,6 +148,22 @@ jobs:
           publish_review_comment: "true"
 ```
 
+### Native Anthropic-compatible endpoint
+
+```yaml
+- uses: joryirving/pr-reviewer-action@v1
+  with:
+    github_token: ${{ secrets.GITHUB_TOKEN }}
+    ai_base_url: https://api.anthropic.com/v1
+    ai_api_format: anthropic
+    ai_model: claude-sonnet-4-5
+    ai_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+    ai_max_tokens: "4096"
+    publish_review_comment: "true"
+```
+
+When `ai_api_format: anthropic` is set, the action posts to `/messages`, sends the `x-api-key` and `anthropic-version` headers, and parses only Anthropic `text` content blocks. Non-text blocks such as `thinking` are ignored so private reasoning is not copied into PR comments.
+
 ### With a fallback model
 
 ```yaml
@@ -153,6 +174,7 @@ jobs:
     ai_base_url: http://llama-server.internal:8080/v1
     ai_model: qwen3-32b
     ai_fallback_base_url: https://api.openai.com/v1
+    ai_fallback_api_format: openai
     ai_fallback_model: gpt-4.1-mini
     ai_fallback_api_key: ${{ secrets.OPENAI_API_KEY }}
 ```
@@ -263,7 +285,9 @@ If a repo wants more than policy context and needs to fully control the reviewer
 
 ## Notes
 
-- The action expects an OpenAI-compatible `POST /chat/completions` API.
+- `ai_api_format=openai` posts to `/chat/completions` and parses `choices[0].message.content`.
+- `ai_api_format=anthropic` posts to `/messages` and parses only `content[]` blocks where `type == "text"`.
+- The tool harness planner uses the primary `ai_api_format`; fallback settings apply only to the final review call.
 - `system_prompt` takes precedence over `system_prompt_file`.
 - `system_prompt_file` takes precedence over the bundled generic prompt.
 - `standards_file` is optional; if blank, the action checks `standards_file_candidates` in order and uses the first file found. `AGENTS.md` is checked first by default, then `CLAUDE.md`, making the action compatible with both Claude Code and non-Claude Code setups.
@@ -285,7 +309,7 @@ If a repo wants more than policy context and needs to fully control the reviewer
 
 ## Validation
 
-This repo includes a local smoke test that exercises the action logic against a real GitHub pull request while using a mock OpenAI-compatible API server.
+This repo includes a local smoke test that exercises the action logic against a real GitHub pull request while using a mock OpenAI/Anthropic-compatible API server.
 
 Run it with a specific PR:
 
@@ -303,7 +327,7 @@ The smoke test validates:
 
 - GitHub PR data collection through `gh`
 - review corpus assembly
-- OpenAI-compatible `chat/completions` request formatting
+- OpenAI-compatible `chat/completions` and Anthropic-compatible `messages` response parsing
 - output parsing and action output generation
 
 ## Examples

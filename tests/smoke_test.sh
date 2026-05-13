@@ -49,7 +49,18 @@ import sys, json
 from pathlib import Path
 
 response = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace"))
-content = ((response.get("choices") or [{}])[0].get("message") or {}).get("content")
+
+content = None
+if isinstance(response.get("choices"), list):
+    content = ((response.get("choices") or [{}])[0].get("message") or {}).get("content")
+elif isinstance(response.get("content"), list):
+    parts = []
+    for item in response.get("content") or []:
+        if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+            parts.append(item["text"])
+    content = "".join(parts)
+elif isinstance(response.get("content"), str):
+    content = response.get("content")
 
 if isinstance(content, str):
     text = content.strip()
@@ -155,6 +166,33 @@ if run_parse "$TMPDIR/resp-empty-array.json"; then
 else
   check "rejects empty array" "yes" "yes"
 fi
+
+echo ""
+echo "=== parse_and_validate: Anthropic text blocks ignore thinking ==="
+cat > "$TMPDIR/resp-anthropic.json" <<'EOF'
+{"id":"msg-test","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"private reasoning"},{"type":"text","text":"{\"verdict\":\"approve\",\"review_markdown\":\"Anthropic clean.\"}"}]}
+EOF
+run_parse "$TMPDIR/resp-anthropic.json"
+check "anthropic verdict=approve" "$(jq -r '.verdict' "$TMPDIR/out.json")" "approve"
+check "anthropic ignores thinking" "$(jq -r '.review_markdown' "$TMPDIR/out.json")" "Anthropic clean."
+
+echo ""
+echo "=== Tool harness: Anthropic planner request ==="
+mkdir -p "$TMPDIR/harness-anthropic"
+printf '# Review corpus\n' > "$TMPDIR/harness-anthropic/review-corpus.truncated.md"
+(
+  cd "$TMPDIR/harness-anthropic"
+  REPO=joryirving/home-ops \
+    AI_BASE_URL=http://127.0.0.1:18080/v1 \
+    AI_API_FORMAT=anthropic \
+    AI_MODEL=mock-anthropic \
+    TOOL_MODE=plan_execute_once \
+    TOOL_ALLOWED_GH_API_REPOS='*' \
+    ALLOWED_SOURCE_HOSTS=github.com \
+    python3 "$ROOT_DIR/scripts/run_tool_harness.py"
+)
+check "anthropic planner completed" "$(jq -r '.mode' "$TMPDIR/harness-anthropic/tool-harness.json")" "plan_execute_once"
+check "anthropic planner ignored non-requests response" "$(jq -r '.planning_warning' "$TMPDIR/harness-anthropic/tool-harness.json")" "Planner response did not contain requests[]"
 
 echo ""
 echo "=== Evidence provider execution ==="

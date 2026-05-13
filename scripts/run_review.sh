@@ -23,9 +23,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-${GITHUB_REPOSITORY:-}}"
 PR_NUMBER="${PR_NUMBER:-}"
 AI_BASE_URL="${AI_BASE_URL:-}"
+AI_API_FORMAT="${AI_API_FORMAT:-openai}"
 AI_MODEL="${AI_MODEL:-}"
 AI_API_KEY="${AI_API_KEY:-}"
+AI_MAX_TOKENS="${AI_MAX_TOKENS:-4096}"
+ANTHROPIC_VERSION="${ANTHROPIC_VERSION:-2023-06-01}"
 AI_FALLBACK_BASE_URL="${AI_FALLBACK_BASE_URL:-}"
+AI_FALLBACK_API_FORMAT="${AI_FALLBACK_API_FORMAT:-}"
 AI_FALLBACK_MODEL="${AI_FALLBACK_MODEL:-}"
 AI_FALLBACK_API_KEY="${AI_FALLBACK_API_KEY:-}"
 AI_PRIMARY_RETRIES="${AI_PRIMARY_RETRIES:-8}"
@@ -75,6 +79,32 @@ fi
 if [[ -z "$GH_TOKEN" ]]; then
   error "Missing GitHub token in GH_TOKEN or GITHUB_TOKEN"
   exit 1
+fi
+
+normalize_api_format() {
+  local value="$1"
+  value="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
+    openai|anthropic) printf '%s' "$value" ;;
+    *) return 1 ;;
+  esac
+}
+
+if ! AI_API_FORMAT="$(normalize_api_format "$AI_API_FORMAT")"; then
+  error "Invalid AI_API_FORMAT '$AI_API_FORMAT'; expected openai or anthropic"
+  exit 1
+fi
+
+if [[ -z "$AI_FALLBACK_API_FORMAT" ]]; then
+  AI_FALLBACK_API_FORMAT="$AI_API_FORMAT"
+elif ! AI_FALLBACK_API_FORMAT="$(normalize_api_format "$AI_FALLBACK_API_FORMAT")"; then
+  error "Invalid AI_FALLBACK_API_FORMAT '$AI_FALLBACK_API_FORMAT'; expected openai or anthropic"
+  exit 1
+fi
+
+if [[ ! "$AI_MAX_TOKENS" =~ ^[0-9]+$ || "$AI_MAX_TOKENS" -lt 1 ]]; then
+  error "Invalid AI_MAX_TOKENS '$AI_MAX_TOKENS'; defaulting to 4096"
+  AI_MAX_TOKENS=4096
 fi
 
 if [[ -n "$AI_FALLBACK_BASE_URL" && -z "$AI_FALLBACK_MODEL" ]]; then
@@ -140,22 +170,62 @@ fi
 curl_model() {
   local base_url="$1"
   local api_key="$2"
-  local payload_file="$3"
-  local output_file="$4"
+  local api_format="$3"
+  local payload_file="$4"
+  local output_file="$5"
+
+  local endpoint
+  local auth_header=()
+  if [[ "$api_format" == "anthropic" ]]; then
+    endpoint="$base_url/messages"
+    auth_header=( -H "anthropic-version: $ANTHROPIC_VERSION" )
+    if [[ -n "$api_key" ]]; then
+      auth_header+=( -H "x-api-key: $api_key" )
+    fi
+  else
+    endpoint="$base_url/chat/completions"
+    if [[ -n "$api_key" ]]; then
+      auth_header=( -H "Authorization: Bearer $api_key" )
+    fi
+  fi
 
   local args=(
     -q
     -fsSL
-    "$base_url/chat/completions"
+    "$endpoint"
     -H "Content-Type: application/json"
     --data "@$payload_file"
   )
 
-  if [[ -n "$api_key" ]]; then
-    args+=( -H "Authorization: Bearer $api_key" )
-  fi
+  args+=( "${auth_header[@]}" )
 
   curl "${args[@]}" > "$output_file"
+}
+
+build_model_request() {
+  local api_format="$1"
+  local model="$2"
+  local system="$3"
+  local user="$4"
+  local corpus_file="$5"
+  local output_file="$6"
+
+  if [[ "$api_format" == "anthropic" ]]; then
+    jq -n \
+      --arg model "$model" \
+      --arg system "$system" \
+      --arg user "$user" \
+      --argjson max_tokens "$AI_MAX_TOKENS" \
+      --rawfile corpus "$corpus_file" \
+      '{model:$model,max_tokens:$max_tokens,system:$system,messages:[{role:"user",content:($user + "\n\n" + $corpus)}],temperature:0.1}' > "$output_file"
+  else
+    jq -n \
+      --arg model "$model" \
+      --arg system "$system" \
+      --arg user "$user" \
+      --rawfile corpus "$corpus_file" \
+      '{model:$model,messages:[{role:"system",content:$system},{role:"user",content:($user + "\n\n" + $corpus)}],temperature:0.1}' > "$output_file"
+  fi
 }
 
 parse_and_validate() {
@@ -166,7 +236,19 @@ import json
 from pathlib import Path
 
 response = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace"))
-content = ((response.get("choices") or [{}])[0].get("message") or {}).get("content")
+
+content = None
+if isinstance(response.get("choices"), list):
+    content = ((response.get("choices") or [{}])[0].get("message") or {}).get("content")
+elif isinstance(response.get("content"), list):
+    # Anthropic message responses may include thinking/tool blocks. Only text blocks are review content.
+    parts = []
+    for item in response.get("content") or []:
+        if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+            parts.append(item["text"])
+    content = "".join(parts)
+elif isinstance(response.get("content"), str):
+    content = response.get("content")
 
 if isinstance(content, str):
     text = content.strip()
@@ -765,20 +847,21 @@ EOF
   head -c "$MAX_CORPUS" review-corpus.md > review-corpus.truncated.md
 fi
 
-log "Analyzing with $AI_MODEL..."
+log "Analyzing with $AI_MODEL using $AI_API_FORMAT API format..."
 
-jq -n \
-  --arg model "$AI_MODEL" \
-  --arg system "$SYSTEM_PROMPT" \
-  --arg user "Analyze this pull request corpus and return STRICT JSON." \
-  --rawfile corpus review-corpus.truncated.md \
-  '{model:$model,messages:[{role:"system",content:$system},{role:"user",content:($user + "\n\n" + $corpus)}],temperature:0.1}' > ai-request.primary.json
+build_model_request \
+  "$AI_API_FORMAT" \
+  "$AI_MODEL" \
+  "$SYSTEM_PROMPT" \
+  "Analyze this pull request corpus and return STRICT JSON." \
+  review-corpus.truncated.md \
+  ai-request.primary.json
 
 PRIMARY_OK=0
 ATTEMPT=1
 while [ "$ATTEMPT" -le "$AI_PRIMARY_RETRIES" ]; do
-  echo "Primary model attempt ${ATTEMPT}/${AI_PRIMARY_RETRIES}: $AI_MODEL @ $AI_BASE_URL"
-  if curl_model "$AI_BASE_URL" "$AI_API_KEY" ai-request.primary.json ai-response.primary.json && \
+  echo "Primary model attempt ${ATTEMPT}/${AI_PRIMARY_RETRIES}: $AI_MODEL @ $AI_BASE_URL ($AI_API_FORMAT)"
+  if curl_model "$AI_BASE_URL" "$AI_API_KEY" "$AI_API_FORMAT" ai-request.primary.json ai-response.primary.json && \
     parse_and_validate ai-response.primary.json; then
     PRIMARY_OK=1
     break
@@ -790,7 +873,7 @@ while [ "$ATTEMPT" -le "$AI_PRIMARY_RETRIES" ]; do
 done
 
 if [ "$PRIMARY_OK" -eq 1 ]; then
-  ANALYSIS_ENGINE="$AI_MODEL@$AI_BASE_URL"
+  ANALYSIS_ENGINE="$AI_MODEL@$AI_BASE_URL ($AI_API_FORMAT)"
   echo "Primary model succeeded"
 else
   if [[ -z "$AI_FALLBACK_BASE_URL" || -z "$AI_FALLBACK_MODEL" ]]; then
@@ -798,18 +881,19 @@ else
     exit 1
   fi
 
-  echo "Primary model unavailable after retries; trying fallback: $AI_FALLBACK_MODEL @ $AI_FALLBACK_BASE_URL" >&2
+  echo "Primary model unavailable after retries; trying fallback: $AI_FALLBACK_MODEL @ $AI_FALLBACK_BASE_URL ($AI_FALLBACK_API_FORMAT)" >&2
   head -c 120000 review-corpus.md > review-corpus.fallback.truncated.md
-  jq -n \
-    --arg model "$AI_FALLBACK_MODEL" \
-    --arg system "$SYSTEM_PROMPT" \
-    --arg user "Analyze this pull request corpus and return STRICT JSON." \
-    --rawfile corpus review-corpus.fallback.truncated.md \
-    '{model:$model,messages:[{role:"system",content:$system},{role:"user",content:($user + "\n\n" + $corpus)}],temperature:0.1}' > ai-request.fallback.json
+  build_model_request \
+    "$AI_FALLBACK_API_FORMAT" \
+    "$AI_FALLBACK_MODEL" \
+    "$SYSTEM_PROMPT" \
+    "Analyze this pull request corpus and return STRICT JSON." \
+    review-corpus.fallback.truncated.md \
+    ai-request.fallback.json
 
-  if curl_model "$AI_FALLBACK_BASE_URL" "$AI_FALLBACK_API_KEY" ai-request.fallback.json ai-response.fallback.json && \
+  if curl_model "$AI_FALLBACK_BASE_URL" "$AI_FALLBACK_API_KEY" "$AI_FALLBACK_API_FORMAT" ai-request.fallback.json ai-response.fallback.json && \
     parse_and_validate ai-response.fallback.json; then
-    ANALYSIS_ENGINE="$AI_FALLBACK_MODEL@$AI_FALLBACK_BASE_URL"
+    ANALYSIS_ENGINE="$AI_FALLBACK_MODEL@$AI_FALLBACK_BASE_URL ($AI_FALLBACK_API_FORMAT)"
     echo "Fallback model succeeded" >&2
   else
     error "Fallback model failed"

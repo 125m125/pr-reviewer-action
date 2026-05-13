@@ -34,3 +34,6 @@ jobs:
 
       - name: Verify smoke test helper is executable
         run: test -x tests/smoke_test.sh
+
+      - name: Run smoke test
+        run: tests/smoke_test.sh

@@ -50,6 +50,13 @@ def env_int_bounded(name, default_value, min_value, max_value):
     return min(max_value, value)
 
 
+def normalize_api_format(value):
+    candidate = (value or "openai").strip().lower()
+    if candidate in {"openai", "anthropic"}:
+        return candidate
+    return "openai"
+
+
 def normalize_host(host):
     return (host or "").strip().lower()
 
@@ -128,6 +135,7 @@ def safe_run(args, timeout_sec):
 
 def run_chat_completion(
     base_url,
+    api_format,
     model,
     api_key,
     system_prompt,
@@ -135,16 +143,27 @@ def run_chat_completion(
     timeout_sec,
     max_tokens,
 ):
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.0,
-        "max_tokens": max_tokens,
-    }
-    endpoint = base_url.rstrip("/") + "/chat/completions"
+    if api_format == "anthropic":
+        payload = {
+            "model": model,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_prompt}],
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+        }
+        endpoint = base_url.rstrip("/") + "/messages"
+    else:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+        }
+        endpoint = base_url.rstrip("/") + "/chat/completions"
+
     args = [
         "curl",
         "-q",
@@ -155,7 +174,11 @@ def run_chat_completion(
         "-H",
         "Content-Type: application/json",
     ]
-    if api_key:
+    if api_format == "anthropic":
+        args.extend(["-H", f"anthropic-version: {os.getenv('ANTHROPIC_VERSION', '2023-06-01')}"])
+        if api_key:
+            args.extend(["-H", f"x-api-key: {api_key}"])
+    elif api_key:
         args.extend(["-H", f"Authorization: Bearer {api_key}"])
 
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as payload_file:
@@ -183,6 +206,14 @@ def run_chat_completion(
 
     response_body = completed.stdout
     parsed = json.loads(response_body)
+    if api_format == "anthropic" and isinstance(parsed.get("content"), list):
+        parts = []
+        for item in parsed.get("content", []):
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
     return parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
 
 
@@ -419,6 +450,7 @@ def main():
 
     repo = os.getenv("REPO", "").strip()
     base_url = os.getenv("AI_BASE_URL", "").strip()
+    api_format = normalize_api_format(os.getenv("AI_API_FORMAT", "openai"))
     model = os.getenv("AI_MODEL", "").strip()
     api_key = os.getenv("AI_API_KEY", "").strip()
     max_requests = env_int("TOOL_MAX_REQUESTS", 4, 1)
@@ -493,6 +525,7 @@ def main():
     try:
         planning_response = run_chat_completion(
             base_url,
+            api_format,
             model,
             api_key,
             planning_system,

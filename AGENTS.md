@@ -1,10 +1,10 @@
 # Agents Guide: pr-reviewer-action
 
-This is a GitHub Action that analyzes pull requests using OpenAI-compatible models (cloud or self-hosted) and optionally publishes a sticky PR comment with the review.
+This is a GitHub Action that analyzes pull requests using OpenAI-compatible or Anthropic-compatible models (cloud or self-hosted) and optionally publishes a sticky PR comment with the review.
 
 ## What it does
 
-The action collects rich PR context (diff, files, linked issues, version hints, image digests, repo impact/history, standards files), assembles a review corpus, sends it to an LLM via `POST /chat/completions`, parses the JSON verdict + markdown body, and optionally publishes or updates a managed PR comment.
+The action collects rich PR context (diff, files, linked issues, version hints, image digests, repo impact/history, standards files), assembles a review corpus, sends it to an LLM via OpenAI `POST /chat/completions` or Anthropic `POST /messages`, parses the JSON verdict + markdown body, and optionally publishes or updates a managed PR comment.
 
 ## Key files
 
@@ -57,7 +57,7 @@ PR_NUMBER=6757 tests/smoke_test.sh
 tests/smoke_test.sh
 ```
 
-The smoke test validates: GitHub PR data collection, corpus assembly, chat/completions request formatting, output parsing.
+The smoke test validates: GitHub PR data collection, corpus assembly, OpenAI/Anthropic response parsing, and tool harness request formatting.
 
 ## Important conventions
 
