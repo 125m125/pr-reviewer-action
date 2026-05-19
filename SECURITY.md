@@ -7,6 +7,7 @@ This action reviews pull requests with an LLM and optional auxiliary tooling. Th
 - Prompt injection inside PR content, linked issues, linked sources, or fetched metadata
 - Tool request abuse (requesting sensitive files, broad API access, or untrusted hosts)
 - Token and secret exposure in tool outputs
+- Token and secret exposure in evidence-provider stdout/stderr
 - Cross-repository pull requests attempting to run repo-defined scripts
 
 ## Controls
@@ -19,7 +20,8 @@ This action reviews pull requests with an LLM and optional auxiliary tooling. Th
 - Anthropic responses are parsed from `text` blocks only; non-text blocks such as `thinking` are not added to review output
 - `read_file` is constrained to workspace-relative paths and blocks sensitive path patterns
 - `web_fetch` is constrained to `allowed_source_hosts`
-- Tool outputs are size-limited and pass through basic secret redaction before corpus inclusion
+- Tool outputs are size-limited and pass through shared secret redaction before corpus inclusion
+- Evidence provider stdout and stderr are passed through the same secret-redaction pipeline before being written to JSON summaries or markdown output
 - Tool and evidence-provider enrichment are skipped on cross-repository PRs by default (`tool_enable_for_forks=false`, `evidence_enable_for_forks=false`)
 - Evidence provider blocker findings can be deterministically enforced (`evidence_blocker_enforcement=true`)
 - Tool harness failures can be made fail-closed with `tool_failure_enforcement=true` (planning failure or all tool requests failing)
@@ -35,6 +37,6 @@ This action reviews pull requests with an LLM and optional auxiliary tooling. Th
 
 ## Known Limitations
 
-- Secret redaction is heuristic and not guaranteed to catch all credential formats
+- Secret redaction is heuristic and not guaranteed to catch all credential formats; it covers common patterns (GitHub tokens, AWS keys, bearer tokens, key=value secrets) but may miss novel or encoded credentials
 - LLM planning can still make low-quality tool choices; controls restrict blast radius but do not guarantee relevance
 - If you enable fork execution for tools/providers, you accept significantly higher risk

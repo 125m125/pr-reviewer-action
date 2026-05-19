@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
+"""Execute evidence-provider commands and write structured results."""
+
 import json
 import os
 import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+# Ensure the scripts directory is on sys.path so we can import shared helpers.
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from redact import mask_and_truncate, mask_secrets  # noqa: E402
 
 
 def env_int(name: str, default: int) -> int:
@@ -14,13 +24,6 @@ def env_int(name: str, default: int) -> int:
     except ValueError:
         return default
     return max(1, value)
-
-
-def truncate_text(raw: bytes, limit: int) -> tuple[str, bool]:
-    if len(raw) <= limit:
-        return raw.decode("utf-8", errors="replace"), False
-    clipped = raw[:limit].decode("utf-8", errors="replace")
-    return clipped + "\n[truncated]", True
 
 
 def normalize_severity(value: object) -> str:
@@ -215,10 +218,12 @@ def main() -> int:
             entry["duration_sec"] = round(time.monotonic() - start, 3)
             entry["exit_code"] = completed.returncode
             entry["status"] = "ok" if completed.returncode == 0 else "error"
-            entry["stdout"], entry["stdout_truncated"] = truncate_text(
+
+            # --- Secret redaction on stdout/stderr before capturing output ---
+            entry["stdout"], entry["stdout_truncated"] = mask_and_truncate(
                 completed.stdout, max_output
             )
-            entry["stderr"], entry["stderr_truncated"] = truncate_text(
+            entry["stderr"], entry["stderr_truncated"] = mask_and_truncate(
                 completed.stderr, max_output
             )
         except subprocess.TimeoutExpired as exc:
@@ -227,12 +232,20 @@ def main() -> int:
             entry["exit_code"] = None
             stdout_raw = exc.stdout if isinstance(exc.stdout, bytes) else b""
             stderr_raw = exc.stderr if isinstance(exc.stderr, bytes) else b""
-            entry["stdout"], entry["stdout_truncated"] = truncate_text(
-                stdout_raw, max_output
+
+            # Redact before storing in the summary JSON and markdown.
+            entry["stdout"], entry["stdout_truncated"] = mask_and_truncate(
+                stdout_raw.decode("utf-8", errors="replace") if stdout_raw else "",
+                max_output,
             )
-            entry["stderr"], entry["stderr_truncated"] = truncate_text(
-                stderr_raw, max_output
+            entry["stderr"], entry["stderr_truncated"] = mask_and_truncate(
+                stderr_raw.decode("utf-8", errors="replace") if stderr_raw else "",
+                max_output,
             )
+
+        # Also redact the stored stdout before JSON-parse attempt so that
+        # any secrets leaking into the parsed output are already gone.
+        entry["stdout"] = mask_secrets(entry["stdout"])
 
         parsed = None
         if entry["stdout"].strip():
@@ -289,7 +302,10 @@ def main() -> int:
 
             md_lines.append("")
 
-    write_outputs(summary, "\n".join(md_lines))
+    # Redact the entire generated markdown output as a safety net.
+    markdown = mask_secrets(markdown)
+
+    write_outputs(summary, markdown)
     return 0
 
 
