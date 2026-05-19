@@ -339,6 +339,60 @@ OUTPUT=$(bash "$TMPDIR/provider-smoke.sh" 2>&1)
 check "provider outputs JSON" "$(echo "$OUTPUT" | jq -r '.findings[0].message' 2>/dev/null)" "smoke provider executed"
 
 echo ""
+echo "=== Standards file discovery order ==="
+
+# Extract just the resolve_standards_file function for testing
+resolve_standards_file() {
+  if [[ -n "$STANDARDS_FILE" && -f "$STANDARDS_FILE" ]]; then
+    return
+  fi
+
+  local candidate
+  IFS=',' read -ra candidates <<< "$STANDARDS_FILE_CANDIDATES"
+  for candidate in "${candidates[@]}"; do
+    candidate="$(printf '%s' "$candidate" | xargs)"
+    [[ -n "$candidate" ]] || continue
+    if [[ -f "$candidate" ]]; then
+      STANDARDS_FILE="$candidate"
+      return
+    fi
+  done
+}
+
+
+# Test 1: AGENTS.md should be picked before CLAUDE.md when both exist
+mkdir -p "$TMPDIR/std-order-test"
+echo "agents content" > "$TMPDIR/std-order-test/AGENTS.md"
+echo "claude content" > "$TMPDIR/std-order-test/CLAUDE.md"
+
+(
+  cd "$TMPDIR/std-order-test"
+  STANDARDS_FILE="" STANDARDS_FILE_CANDIDATES="AGENTS.md,agents.md,CLAUDE.md,claude.md,.github/ai-review-rules.md,.github/ai-review-rules.txt"
+  resolve_standards_file
+  check "AGENTS.md preferred over CLAUDE.md" "$STANDARDS_FILE" "AGENTS.md"
+)
+
+# Test 2: explicit STANDARDS_FILE takes priority
+(
+  cd "$TMPDIR/std-order-test"
+  STANDARDS_FILE="CLAUDE.md" STANDARDS_FILE_CANDIDATES="AGENTS.md,agents.md,CLAUDE.md"
+  resolve_standards_file
+  check "explicit STANDARDS_FILE takes priority" "$STANDARDS_FILE" "CLAUDE.md"
+)
+
+# Test 3: first found candidate is used (AGENTS.md before agents.md)
+mkdir -p "$TMPDIR/std-order-test2"
+echo "agents" > "$TMPDIR/std-order-test2/AGENTS.md"
+echo "agents-lower" > "$TMPDIR/std-order-test2/agents.md"
+
+(
+  cd "$TMPDIR/std-order-test2"
+  STANDARDS_FILE="" STANDARDS_FILE_CANDIDATES="AGENTS.md,agents.md,CLAUDE.md"
+  resolve_standards_file
+  check "uppercase AGENTS.md preferred over lowercase agents.md" "$STANDARDS_FILE" "AGENTS.md"
+)
+
+echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 
 if [[ "$FAIL" -gt 0 ]]; then
