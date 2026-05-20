@@ -27,6 +27,37 @@ This action reviews pull requests with an LLM and optional auxiliary tooling. Th
 - Tool harness failures can be made fail-closed with `tool_failure_enforcement=true` (planning failure or all tool requests failing)
 - Tool harness can require minimum evidence breadth via `tool_min_successful_requests`
 
+## Reserved Metadata Markers
+
+The managed PR comment uses HTML comment markers to embed internal metadata for diff-skip and staleness detection:
+
+- `<!-- ai-pr-review-fingerprint:<value> -->` — stable patch + config fingerprint used by the precheck to skip unchanged diffs.
+- `<!-- ai-pr-review-sha:<sha> -->` — PR head SHA used to detect out-of-date reviews.
+
+### Threat
+
+A malicious PR could attempt prompt injection by embedding fake metadata markers in model-generated review markdown. If later parsing scans the entire managed comment body, such injected markers could interfere with precheck skip/precheck behavior (e.g., a fake fingerprint that matches an unrelated diff).
+
+### Mitigation
+
+The action uses a defense-in-depth approach:
+
+1. **Publish-time stripping** — Before publishing a managed PR comment, `scripts/strip_metadata_markers.py` is invoked on the model-generated markdown to remove any matching reserved marker patterns. The trusted markers (sha + fingerprint) are then appended *after* stripping, so only genuine ones survive.
+2. **Precheck reads first occurrence only** — The precheck parser uses `sed -n` with `head -n 1` to extract only the first occurrence of each marker from the comment body, providing a second layer of defense against any residual injection.
+
+### Reserved patterns
+
+The following patterns are treated as reserved and will be stripped from model output (case-insensitive matching, whitespace-tolerant):
+
+```
+<!-- ai-pr-review-fingerprint:<any-value> -->
+<!-- ai-pr-review-sha:<any-sha> -->
+```
+
+Non-reserved HTML comments (e.g., `<!-- TODO: fix this -->`) are preserved.
+
+See `scripts/strip_metadata_markers.py` for the implementation and `tests/test_strip_metadata_markers.py` for regression tests covering fake marker injection scenarios.
+
 ## Operational Guidance
 
 - Keep GitHub token permissions minimal (`contents: read`, `pull-requests: write`)
