@@ -235,9 +235,10 @@ build_model_request() {
       --arg model "$model" \
       --arg system "$system" \
       --arg user "$user" \
+      --argjson max_tokens "$AI_MAX_TOKENS" \
       --argjson stream "$stream" \
       --rawfile corpus "$corpus_file" \
-      '{model:$model,stream:$stream,messages:[{role:"system",content:$system},{role:"user",content:($user + "\n\n" + $corpus)}],temperature:0.1}' > "$output_file"
+      '{model:$model,max_tokens:$max_tokens,stream:$stream,messages:[{role:"system",content:$system},{role:"user",content:($user + "\n\n" + $corpus)}],temperature:0.1}' > "$output_file"
   fi
 }
 
