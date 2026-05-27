@@ -241,10 +241,9 @@ class TestParseResponse(TestCase):
 # parse_response_file
 # ---------------------------------------------------------------------------
 
-class TestParseResponseFile(TestCase):
-    def test_round_trip(self, tmp_path=None):
+class TestParseResponseFile:
+    def test_round_trip(self, tmp_path):
         """Write a response file, then read and parse it."""
-        import tempfile
         data = {
             "choices": [{
                 "message": {"content": json.dumps({
@@ -253,17 +252,11 @@ class TestParseResponseFile(TestCase):
                 })},
             }],
         }
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False, dir="/tmp"
-        ) as f:
-            json.dump(data, f)
-            path = f.name
-        try:
-            result = parse_response_file(path)
-            self.assertEqual(result["verdict"], "request_changes")
-            self.assertIn("typo", result["review_markdown"])
-        finally:
-            Path(path).unlink(missing_ok=True)
+        path = tmp_path / "response.json"
+        path.write_text(json.dumps(data))
+        result = parse_response_file(str(path))
+        assert result["verdict"] == "request_changes"
+        assert "typo" in result["review_markdown"]
 
 
 if __name__ == "__main__":
