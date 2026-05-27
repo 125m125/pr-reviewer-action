@@ -245,142 +245,10 @@ build_model_request() {
 reassemble_sse_response() {
   local response_file="$1"
   local api_format="$2"
-
-  if [[ "$api_format" == "anthropic" ]]; then
-    python3 - "$response_file" <<'PY'
-import sys
-from pathlib import Path
-
-response_file = sys.argv[1]
-lines = Path(response_file).read_text(encoding="utf-8", errors="replace").splitlines()
-
-content_parts = []
-stop_reason = None
-stop_sequence = None
-model = None
-message_id = None
-input_tokens = 0
-output_tokens = 0
-
-for line in lines:
-    line = line.strip()
-    if not line.startswith("data:"):
-        continue
-    data = line[5:].strip()
-    if not data or data == "[DONE]":
-        continue
-    try:
-        import json
-        event = json.loads(data)
-    except json.JSONDecodeError:
-        continue
-
-    etype = event.get("type", "")
-    if etype == "message_start":
-        message_id = event.get("message", {}).get("id")
-        model = event.get("message", {}).get("model")
-        input_tokens = event.get("message", {}).get("usage", {}).get("input_tokens", 0)
-        output_tokens = event.get("message", {}).get("usage", {}).get("output_tokens", 0)
-    elif etype == "content_block_delta":
-        delta = event.get("delta", {})
-        # Anthropic streaming spec uses delta.type == "text_delta"; accept "text" as well for
-        # non-conforming proxies. Thinking/tool_use deltas are intentionally ignored.
-        if delta.get("type") in ("text_delta", "text"):
-            text_chunk = delta.get("text", "")
-            if isinstance(text_chunk, str):
-                content_parts.append(text_chunk)
-    elif etype == "message_delta":
-        delta = event.get("delta", {})
-        stop_reason = delta.get("stop_reason")
-        stop_sequence = delta.get("stop_sequence")
-        usage = delta.get("usage", {})
-        if usage:
-            output_tokens += usage.get("output_tokens", 0)
-
-content_text = "".join(content_parts)
-result = {
-    "id": message_id or "",
-    "object": "chat.completion",
-    "model": model or "",
-    "choices": [{
-        "index": 0,
-        "message": {"role": "assistant", "content": content_text},
-        "finish_reason": stop_reason or "stop"
-    }],
-    "usage": {
-        "prompt_tokens": input_tokens,
-        "completion_tokens": output_tokens,
-        "total_tokens": input_tokens + output_tokens
-    }
-}
-
-Path(response_file).write_text(json.dumps(result, ensure_ascii=False) + "\n", encoding="utf-8")
-PY
-  else
-    python3 - "$response_file" <<'PY'
-import sys
-from pathlib import Path
-
-response_file = sys.argv[1]
-lines = Path(response_file).read_text(encoding="utf-8", errors="replace").splitlines()
-
-content_parts = []
-finish_reason = None
-model = None
-usage_prompt_tokens = 0
-usage_completion_tokens = 0
-id_val = ""
-
-for line in lines:
-    line = line.strip()
-    if not line.startswith("data:"):
-        continue
-    data = line[5:].strip()
-    if not data or data == "[DONE]":
-        continue
-    try:
-        import json
-        chunk = json.loads(data)
-    except json.JSONDecodeError:
-        continue
-
-    id_val = chunk.get("id", id_val)
-    model = chunk.get("model", model)
-    choices = chunk.get("choices", [])
-    for choice in choices:
-        delta = choice.get("delta", {})
-        if isinstance(delta, dict):
-            c = delta.get("content")
-            if isinstance(c, str):
-                content_parts.append(c)
-        fr = choice.get("finish_reason")
-        if fr is not None:
-            finish_reason = fr
-    usage = chunk.get("usage")
-    if isinstance(usage, dict):
-        usage_prompt_tokens += usage.get("prompt_tokens", 0)
-        usage_completion_tokens += usage.get("completion_tokens", 0)
-
-content_text = "".join(content_parts)
-result = {
-    "id": id_val,
-    "object": "chat.completion",
-    "model": model or "",
-    "choices": [{
-        "index": 0,
-        "message": {"role": "assistant", "content": content_text},
-        "finish_reason": finish_reason or "stop"
-    }],
-    "usage": {
-        "prompt_tokens": usage_prompt_tokens,
-        "completion_tokens": usage_completion_tokens,
-        "total_tokens": usage_prompt_tokens + usage_completion_tokens
-    }
-}
-
-Path(response_file).write_text(json.dumps(result, ensure_ascii=False) + "\n", encoding="utf-8")
-PY
-  fi
+  PYTHONPATH="${SCRIPT_DIR}/.." python3 -c "
+from pr_reviewer.sse_reassembler import reassemble_sse_to_file
+reassemble_sse_to_file('$response_file', '$api_format')
+"
 }
 
 parse_and_validate() {
@@ -396,33 +264,10 @@ Path('ai-output.json').write_text(json.dumps(result, ensure_ascii=False) + '\n',
 }
 
 normalize_enforced_review_markdown() {
-  python3 - <<'PY'
-import json
-import re
-from pathlib import Path
-
-path = Path("ai-output.json")
-data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-verdict = data.get("verdict")
-markdown = str(data.get("review_markdown") or "")
-
-if verdict == "request_changes":
-    markdown = re.sub(
-        r"(?im)^(#{1,6}\s*)?Recommendation:\s*Approve\s*$",
-        r"\1Model recommendation before enforcement: Approve",
-        markdown,
-    )
-    if not markdown.lstrip().startswith("## Final Recommendation"):
-        markdown = (
-            "## Final Recommendation\n"
-            "Request changes. One or more configured enforcement checks require this PR "
-            "to be treated as blocking even if the model's initial review text was approving.\n\n"
-            + markdown.lstrip()
-        )
-
-data["review_markdown"] = markdown
-path.write_text(json.dumps(data, ensure_ascii=False) + "\n", encoding="utf-8")
-PY
+  PYTHONPATH="${SCRIPT_DIR}/.." python3 -c "
+from pr_reviewer.enforcement import normalize_enforced_review_markdown
+normalize_enforced_review_markdown()
+"
 }
 
 log "Collecting PR context for #$PR_NUMBER in $REPO..."
@@ -445,28 +290,16 @@ head -c "$MAX_FILES" pr-files.json > pr-files.truncated.json
 jq -r '.body // ""' pr.json > pr-body.txt
 
 log "Gathering linked issue context..."
-python3 - <<'PY' > linked-issues.json
+REPO="$REPO" python3 - <<'PY' > linked-issues.json
 import json
 import os
-import re
 from pathlib import Path
+from pr_reviewer.github_context import extract_linked_issue_refs, linked_issues_to_json
 
 repo = os.environ["REPO"]
 body = Path("pr-body.txt").read_text(encoding="utf-8", errors="replace")
-pattern = re.compile(r'(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?[ \t]+((?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#\d+)')
-seen = set()
-items = []
-for match in pattern.finditer(body):
-    ref = match.group(1)
-    if ref in seen:
-        continue
-    seen.add(ref)
-    if "/" in ref:
-        repo_name, issue_number = ref.split("#", 1)
-    else:
-        repo_name, issue_number = repo, ref[1:]
-    items.append({"ref": ref, "repo": repo_name, "number": int(issue_number)})
-print(json.dumps(items[:8]))
+items = extract_linked_issue_refs(body, default_repo=repo)
+print(json.dumps(linked_issues_to_json(items)))
 PY
 
 : > linked-issues.md
