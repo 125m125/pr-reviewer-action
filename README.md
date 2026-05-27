@@ -222,6 +222,19 @@ The action supports three publish modes via the `publish_mode` input:
 | `review_comment` | Submits a non-blocking native PR review comment via `gh pr review --comment`. | None — review comments don't affect status checks |
 | `review_verdict` | Submits a native PR review verdict (`approve` or `request_changes`) via `gh pr review`. Affects branch protection and status checks. | Yes — counts as a real review |
 
+
+### Permissions per publish mode
+
+Each publish mode requires different GitHub token permissions in your workflow:
+
+| Publish mode | Required permissions | Notes |
+|---|---|---|
+| `comment` | `contents: read`, `pull-requests: write` | The action posts a managed comment using the existing sticky-comment behavior. `pull-requests: write` is needed for the token to create/edit PR comments. |
+| `review_comment` | `contents: read`, `pull-requests: write` | Submits non-blocking native review comments via `gh pr review --comment`. The token must have `pull-requests: write`. |
+| `review_verdict` | `contents: read`, `pull-requests: write` | Submits native approve or request-changes verdicts. Requires `pull-requests: write` and may additionally require the **Allow GitHub Actions to create and approve pull requests** setting (see below). |
+
+All modes require `contents: read` for the action to access repository files during review.
+
 ### Native PR review verdicts
 
 When `publish_mode=review_verdict` is set, the action submits a native GitHub PR review
@@ -253,8 +266,59 @@ merge policy.
     allow_approve: "true"
 ```
 
+
+#### Example: full workflow with `publish_mode=review_verdict`
+
+```yaml
+name: AI PR Review (native verdicts)
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: misospace/pr-reviewer-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          ai_base_url: https://api.openai.com/v1
+          ai_model: gpt-4.1
+          ai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          publish_review_comment: "true"
+          publish_mode: review_verdict
+          allow_approve: "true"
+```
+
+> **Note**: This workflow requires the **Allow GitHub Actions to create and approve pull requests** setting to be enabled for your repository or organization. Without it, native approvals will fail with a 403 error even though `pull-requests: write` is granted.
+
 This configuration allows the AI to submit native approvals when its verdict is `approve`.
 Fork PRs are still blocked from approval unless `approve_forks` is also set to `"true"`.
+
+### Why approvals may fail even with `pull-requests: write`
+
+Even when your workflow grants `pull-requests: write`, native PR review verdicts (approve/request-changes) may fail silently or error out because of **GitHub Actions repository settings**:
+
+1. **Allow GitHub Actions to create and approve pull requests** — This organization or repository setting must be enabled for Actions to submit native approvals. Without it, the `gh pr review --approve` command will fail with a 403 error from the GitHub API. You can find this setting under:
+   - **Repository**: Settings → Actions → General → "Allow GitHub Actions to create and approve pull requests"
+   - **Organization**: Settings → Actions → Organization permissions → "Allow GitHub Actions to create and approve pull requests"
+
+2. **Branch protection rules** — If branch protection requires a review from a specific user or team, the AI's approval may not satisfy that requirement. The PR will still show `request_changes` until the required reviewer approves.
+
+3. **Fork PRs without `approve_forks: true`** — Approvals from fork PRs are blocked by default unless `approve_forks` is explicitly set to `"true"`.
+
+When approval is blocked, the action always submits a `request_changes` verdict with an explanation in the review body rather than failing silently.
 
 ### Non-blocking review comments
 

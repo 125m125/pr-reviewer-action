@@ -61,6 +61,7 @@ See `scripts/strip_metadata_markers.py` for the implementation and `tests/test_s
 
 ## Operational Guidance
 
+- Enable `allow_approve` only when you understand the implications for your repository's merge policy; native approvals can affect branch protection rules and automerge pipelines
 - Keep GitHub token permissions minimal (`contents: read`, `pull-requests: write`)
 - Use self-hosted runners only when required, and isolate them from sensitive networks
 - Prefer `tool_mode=off` for public repositories unless you need tool planning
