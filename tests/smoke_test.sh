@@ -312,7 +312,7 @@ mkdir -p "$TMPDIR/harness-anthropic"
 printf '# Review corpus\n' > "$TMPDIR/harness-anthropic/review-corpus.truncated.md"
 (
   cd "$TMPDIR/harness-anthropic"
-  REPO=misospace/home-ops \
+  REPO=misospace/pr-reviewer-action \
     AI_BASE_URL=http://127.0.0.1:18080/v1 \
     AI_API_FORMAT=anthropic \
     AI_MODEL=mock-anthropic \

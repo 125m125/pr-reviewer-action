@@ -57,7 +57,7 @@ publish_review_comment         → sanitizes markdown → builds managed comment
 # Run smoke test against a specific PR
 PR_NUMBER=6757 tests/smoke_test.sh
 
-# Let it pick the most recent open PR in misospace/home-ops
+# Let it pick the most recent open PR in misospace/pr-reviewer-action
 tests/smoke_test.sh
 ```
 
