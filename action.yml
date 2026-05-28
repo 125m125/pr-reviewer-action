@@ -475,7 +475,13 @@ runs:
 
         if [ "$CAN_APPROVE" = true ]; then
           echo "Submitting native approval for #$PR_NUMBER"
-          gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body-file "$BODY_FILE"
+          if ! gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body-file "$BODY_FILE" 2>&1; then
+            echo "ERROR: Native approval failed for #$PR_NUMBER." >&2
+            echo "This may be caused by the 'Allow GitHub Actions to create and approve pull requests' setting being disabled." >&2
+            echo "Enable this setting at: Repository Settings → Actions → General → Allow GitHub Actions to create and approve pull requests" >&2
+            echo "Or at the organization level: Organization Settings → Actions → Organization permissions → Allow GitHub Actions to create and approve pull requests" >&2
+            exit 1
+          fi
         else
           # Block approval: submit request_changes with explanation
           echo "Blocking native approval for #$PR_NUMBER (allow_approve=${ALLOW_APPROVE_BOOL}, approve_forks=${APPROVE_FORKS_BOOL}, is_fork=${IS_FORK_PR})"
@@ -486,7 +492,7 @@ runs:
             # Model approved but guardrails blocked it
             {
               echo ""
-              echo "> **Approval blocked by policy**: This workflow requires `allow_approve: true` to submit native approvals. Set that input to enable automatic approval."
+              echo "> **Approval blocked by policy**: This workflow requires \`allow_approve: true\` to submit native approvals. Set that input to enable automatic approval."
             } >> "$BODY_FILE"
 
             gh pr review "$PR_NUMBER" --repo "$REPO" --request-changes --body-file "$BODY_FILE"
