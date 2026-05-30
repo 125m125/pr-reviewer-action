@@ -201,12 +201,25 @@ inputs:
     description: If true, skip the LLM review when the effective PR diff matches the last managed review comment fingerprint
     required: false
     default: "true"
-  comment_marker:
-    description: HTML comment marker used to identify the managed PR comment
+  ci_status_check:
+    description: If true, wait for all CI checks to reach a terminal state before starting the AI review. Polls commit-status API for the PR head SHA. Default false — immediate review (original behavior).
     required: false
-    default: "<!-- ai-pr-reviewer -->"
+    default: "false"
+  ci_timeout_sec:
+    description: Maximum seconds to wait for CI checks to complete when ci_status_check=true. Default 300.
+    required: false
+    default: "300"
+  ci_interval_sec:
+    description: Seconds between CI status polls when ci_status_check=true. Default 15.
+    required: false
+    default: "15"
+  ci_skip_on_timeout:
+    description: If true, proceed with review after timeout instead of failing. If false, abort the action on timeout. Default true.
+    required: false
+    default: "true"
 
 outputs:
+
   verdict:
     description: AI verdict, approve or request_changes
     value: ${{ steps.review.outputs.verdict }}
@@ -225,6 +238,12 @@ outputs:
   diff_fingerprint:
     description: Stable fingerprint of the current pull request patch
     value: ${{ steps.precheck.outputs.diff_fingerprint }}
+  ci_status_skipped:
+    description: Whether CI status check was skipped (true) or completed (false)
+    value: ${{ steps.ci_status.outputs.ci_status_skipped }}
+  ci_status_final:
+    description: Final CI state (success/failure) when ci_status_check completed
+    value: ${{ steps.ci_status.outputs.ci_status_final }}
 
 runs:
   using: composite
@@ -280,6 +299,19 @@ runs:
         AI_FALLBACK_CONNECT_TIMEOUT_SEC: ${{ inputs.ai_fallback_connect_timeout_sec }}
       run: bash "${{ github.action_path }}/scripts/check_review_needed.sh"
 
+    - name: Wait for CI checks to complete
+      id: ci_status
+      if: inputs.ci_status_check == 'true' && steps.precheck.outputs.should_review == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ inputs.repo || github.repository }}
+        PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        CI_TIMEOUT_SEC: ${{ inputs.ci_timeout_sec }}
+        CI_INTERVAL_SEC: ${{ inputs.ci_interval_sec }}
+        CI_SKIP_ON_TIMEOUT: ${{ inputs.ci_skip_on_timeout }}
+      run: bash "${{ github.action_path }}/scripts/wait_for_ci.sh"
+
     - name: Run AI review
       if: steps.precheck.outputs.should_review == 'true'
       id: review
@@ -328,6 +360,9 @@ runs:
         AI_CONNECT_TIMEOUT_SEC: ${{ inputs.ai_connect_timeout_sec }}
         AI_FALLBACK_REQUEST_TIMEOUT_SEC: ${{ inputs.ai_fallback_request_timeout_sec }}
         AI_FALLBACK_CONNECT_TIMEOUT_SEC: ${{ inputs.ai_fallback_connect_timeout_sec }}
+        CI_STATUS_CHECK: ${{ inputs.ci_status_check }}
+        CI_STATUS_FINAL: ${{ steps.ci_status.outputs.ci_status_final }}
+        CI_STATUS_SKIPPED: ${{ steps.ci_status.outputs.ci_status_skipped }}
       run: bash "${{ github.action_path }}/scripts/run_review.sh"
 
     - name: Publish review comment
