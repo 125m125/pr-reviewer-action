@@ -475,8 +475,7 @@ runs:
                   fi
                 fi
                 # Update body to compact outdated stub (best-effort)
-                OUTDATED_BODY="<!-- ai-pr-reviewer -->
-_Outdated: superseded by a newer automated review._"
+                OUTDATED_BODY="$(printf '<!-- ai-pr-reviewer -->\n_Outdated: superseded by a newer automated review._')"
                 if ! gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --method PATCH -f body="$OUTDATED_BODY" >/dev/null 2>&1; then
                   echo "  WARN: Could not update review #$REVIEW_ID body (submitted reviews may be read-only)" >&2
                 else
@@ -564,8 +563,7 @@ _Outdated: superseded by a newer automated review._"
                   fi
                 fi
                 # Update body to compact outdated stub (best-effort)
-                OUTDATED_BODY="<!-- ai-pr-reviewer -->
-_Outdated: superseded by a newer automated review._"
+                OUTDATED_BODY="$(printf '<!-- ai-pr-reviewer -->\n_Outdated: superseded by a newer automated review._')"
                 if ! gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --method PATCH -f body="$OUTDATED_BODY" >/dev/null 2>&1; then
                   echo "  WARN: Could not update review #$REVIEW_ID body (submitted reviews may be read-only)" >&2
                 else
