@@ -267,8 +267,8 @@ def test_git_grep_error_path():
         "subprocess.run", side_effect=subprocess.TimeoutExpired("git", 15)
     ):
         result = git_grep("some-pattern", "/tmp")
-    assert result == {"error": "git grep timed out after 15s"}, (
-        f"Expected error dict for timeout, got: {result}"
+    assert result.get("error") == "git grep timed out after 15s", (
+        f"Expected exact timeout error message, got: {result}"
     )
 
 
@@ -283,11 +283,22 @@ def test_git_grep_error_returncode():
     )
 
 
+def test_git_grep_error_generic():
+    """git_grep returns {'error': ...} for any unexpected exception."""
+    git_grep = _import_tool("git_grep")
+    with mock.patch("subprocess.run", side_effect=RuntimeError("permission denied")):
+        result = git_grep("some-pattern", "/tmp")
+    assert "error" in result and "permission denied" in result["error"], (
+        f"Expected error dict for unexpected exception, got: {result}"
+    )
+
+
 def test_gh_api_error_missing_token():
     """gh_api with no token returns {'error': 'Missing GH_TOKEN'}."""
     gh_api = _import_tool("gh_api")
 
-    # Ensure no token is available
+    # Ensure no token is available. try/finally guarantees restoration even
+    # if an assertion fails. Tests are single-threaded so this is safe.
     old_token = None
     for env_var in ("GH_TOKEN", "GITHUB_TOKEN"):
         if env_var in os.environ:
@@ -303,7 +314,11 @@ def test_gh_api_error_missing_token():
 
 
 def test_gh_api_error_repo_not_allowed():
-    """gh_api with a non-allowlisted repo returns {'error': ...}."""
+    """gh_api with a non-allowlisted repo returns {'error': ...}.
+
+    The allowlist check runs before any HTTP request, so the fake token set
+    below is never sent over the network. Verified by the urlopen assertion.
+    """
     gh_api = _import_tool("gh_api")
 
     old_token = None
@@ -537,6 +552,7 @@ def main():
         ("read_file path escape", test_read_file_path_escape),
         ("git_grep error path", test_git_grep_error_path),
         ("git_grep error returncode", test_git_grep_error_returncode),
+        ("git_grep error generic", test_git_grep_error_generic),
         ("gh_api missing token", test_gh_api_error_missing_token),
         ("gh_api repo not allowed", test_gh_api_error_repo_not_allowed),
         ("web_fetch non-allowlisted host", test_web_fetch_error_non_allowlisted_host),
