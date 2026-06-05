@@ -226,6 +226,14 @@ inputs:
     description: If true, proceed with review after timeout instead of failing. If false, abort the action on timeout. Default true.
     required: false
     default: "true"
+  review_scope:
+    description: >-
+      Controls whether the action reviews the full PR or only changes since the
+      last managed review. auto performs a full review first, then incremental
+      reviews on later PR synchronize events when safe. Accepted values: auto,
+      full, incremental.
+    required: false
+    default: "auto"
 
 outputs:
 
@@ -253,6 +261,15 @@ outputs:
   ci_status_final:
     description: Final CI state (success/failure) when ci_status_check completed
     value: ${{ steps.ci_status.outputs.ci_status_final }}
+  effective_review_scope:
+    description: Effective review scope used (full or incremental)
+    value: ${{ steps.precheck.outputs.effective_review_scope }}
+  previous_head_sha:
+    description: Previous head SHA when effective scope is incremental
+    value: ${{ steps.precheck.outputs.previous_head_sha }}
+  baseline_clean:
+    description: Whether the full-review baseline was clean (for verdict safety)
+    value: ${{ steps.precheck.outputs.baseline_clean }}
 
 runs:
   using: composite
@@ -275,6 +292,7 @@ runs:
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
         COMMENT_MARKER: ${{ inputs.comment_marker }}
+        REVIEW_SCOPE: ${{ inputs.review_scope }}
         SKIP_IF_DIFF_UNCHANGED: ${{ inputs.skip_if_diff_unchanged }}
         ACTION_REF: ${{ github.action_ref }}
         AI_MODEL: ${{ inputs.ai_model }}
@@ -373,6 +391,9 @@ runs:
         CI_STATUS_CHECK: ${{ inputs.ci_status_check }}
         CI_STATUS_FINAL: ${{ steps.ci_status.outputs.ci_status_final }}
         CI_STATUS_SKIPPED: ${{ steps.ci_status.outputs.ci_status_skipped }}
+        REVIEW_SCOPE: ${{ inputs.review_scope }}
+        EFFECTIVE_SCOPE: ${{ steps.precheck.outputs.effective_review_scope }}
+        PREVIOUS_HEAD_SHA: ${{ steps.precheck.outputs.previous_head_sha }}
       run: bash "${{ github.action_path }}/scripts/run_review.sh"
 
     - name: Publish review comment
@@ -407,8 +428,28 @@ runs:
           VERDICT_PREFIX="✅ **Automated recommendation: APPROVE**"
         fi
 
+        # Resolve effective scope from precheck
+        EFFECTIVE_SCOPE="${{ steps.precheck.outputs.effective_review_scope || 'full' }}"
+
+        # Build metadata marker
+        METADATA_MARKER="<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"${HEAD_SHA:-unknown}\",\"base_sha\":\"${{ github.event.pull_request.base.sha || '' }}\",\"review_scope\":\"${EFFECTIVE_SCOPE}\",\"review_result\":\"clean\"}"
+        if [ "$EFFECTIVE_SCOPE" = "incremental" ] && [ -n "${{ steps.precheck.outputs.previous_head_sha:-}}" ]; then
+          METADATA_MARKER="${METADATA_MARKER%,*},\"previous_head_sha\":\"${{ steps.precheck.outputs.previous_head_sha }}\"}"
+        fi
+
+        if [ -z "${PR_NUMBER:-}" ]; then
+          echo "publish_review_comment=true requires a pull_request event or explicit pr_number" >&2
+          exit 1
+        fi
+
+        if [ "$VERDICT" = "request_changes" ]; then
+          VERDICT_PREFIX="⚠️ **Automated recommendation: REQUEST CHANGES**"
+        else
+          VERDICT_PREFIX="✅ **Automated recommendation: APPROVE**"
+        fi
+
         {
-          echo "$COMMENT_MARKER"
+          echo "$METADATA_MARKER"
           if [ -n "${HEAD_SHA:-}" ]; then
             echo "<!-- ai-pr-review-sha:${HEAD_SHA} -->"
           fi
@@ -417,7 +458,7 @@ runs:
           fi
           echo "$VERDICT_PREFIX"
           echo
-          echo "_Analysis engine: ${ANALYSIS_ENGINE}_"
+          echo "_Analysis engine: ${ANALYSIS_ENGINE}_$(if [ \"$EFFECTIVE_SCOPE\" = \"incremental\" ]; then echo \" (incremental delta review)\"; fi)_"
           echo
           cat review-markdown.raw.md
         } > review-comment.md
@@ -431,6 +472,7 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         VERDICT: ${{ steps.review.outputs.verdict }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
         ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
@@ -491,13 +533,19 @@ runs:
           fi
         fi
 
+        # Resolve effective scope from precheck
+        EFFECTIVE_SCOPE="${{ steps.precheck.outputs.effective_review_scope || 'full' }}"
+
+        # Build metadata marker
+        METADATA_MARKER="<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"${HEAD_SHA:-unknown}\",\"base_sha\":\"${{ github.event.pull_request.base.sha || '' }}\",\"review_scope\":\"${EFFECTIVE_SCOPE}\",\"review_result\":\"clean\"}"
+
         # Build the review body with managed marker
         BODY_FILE="review-comment-body.md"
         {
-          echo "<!-- ai-pr-reviewer -->"
+          echo "$METADATA_MARKER"
           echo "# AI Automated Review"
           echo
-          echo "_Analysis engine: ${ANALYSIS_ENGINE}_"
+          echo "_Analysis engine: ${ANALYSIS_ENGINE}_$(if [ \"$EFFECTIVE_SCOPE\" = \"incremental\" ]; then echo \" (incremental delta review)\"; fi)_"
           echo
           cat review-comment-markdown.raw.md
         } > "$BODY_FILE"
@@ -517,6 +565,7 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         VERDICT: ${{ steps.review.outputs.verdict }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
         ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
@@ -582,28 +631,51 @@ runs:
         # Determine if the PR is from a fork
         IS_FORK_PR="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' 2>/dev/null || echo false)"
 
-        # Evaluate approval guardrails
+        # Resolve effective scope from precheck
+        EFFECTIVE_SCOPE="${{ steps.precheck.outputs.effective_review_scope || 'full' }}"
+        PREVIOUS_HEAD_SHA="${{ steps.precheck.outputs.previous_head_sha:-}}"
+        BASELINE_CLEAN="${{ steps.precheck.outputs.baseline_clean:-false }}"
+
+        # Build metadata marker with verdict safety for incremental
+        METADATA_MARKER="<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"${HEAD_SHA:-unknown}\",\"base_sha\":\"${{ github.event.pull_request.base.sha || '' }}\",\"review_scope\":\"${EFFECTIVE_SCOPE}\",\"review_result\":\"clean\"}"
+        if [ "$EFFECTIVE_SCOPE" = "incremental" ] && [ -n "$PREVIOUS_HEAD_SHA" ]; then
+          METADATA_MARKER="${METADATA_MARKER%,*},\"previous_head_sha\":\"${PREVIOUS_HEAD_SHA}\"}"
+        fi
+
+        # Evaluate approval guardrails with baseline check for incremental
         ALLOW_APPROVE_BOOL="$(printf '%s' "$ALLOW_APPROVE" | tr '[:upper:]' '[:lower:]')"
         APPROVE_FORKS_BOOL="$(printf '%s' "$APPROVE_FORKS" | tr '[:upper:]' '[:lower:]')"
 
         CAN_APPROVE=false
 
         if [ "$VERDICT" = "approve" ] && [ "$ALLOW_APPROVE_BOOL" = "true" ]; then
-          # Check fork gate
-          if [ "$IS_FORK_PR" != "true" ]; then
-            CAN_APPROVE=true
-          elif [ "$APPROVE_FORKS_BOOL" = "true" ]; then
-            CAN_APPROVE=true
+          # For incremental reviews, require a trusted clean full baseline
+          if [ "$EFFECTIVE_SCOPE" = "incremental" ] && [ "$BASELINE_CLEAN" != "true" ]; then
+            echo "Blocking approval: incremental review without trusted clean full baseline" >&2
+            CAN_APPROVE=false
+          else
+            # Check fork gate
+            if [ "$IS_FORK_PR" != "true" ]; then
+              CAN_APPROVE=true
+            elif [ "$APPROVE_FORKS_BOOL" = "true" ]; then
+              CAN_APPROVE=true
+            fi
           fi
         fi
 
         # Build the review body with managed marker
         BODY_FILE="review-verdict-body.md"
         {
-          echo "<!-- ai-pr-reviewer -->"
+          echo "$METADATA_MARKER"
           echo "# AI Automated Review"
           echo
-          echo "_Analysis engine: ${ANALYSIS_ENGINE}_"
+          if [ "$EFFECTIVE_SCOPE" = "incremental" ]; then
+            echo "_Incremental review: reviewed changes since the last managed review. This is not a full re-review of the entire PR._"
+          else
+            echo "_Full PR review._"
+          fi
+          echo
+          echo "_Analysis engine: ${ANALYSIS_ENGINE}_$(if [ \"$EFFECTIVE_SCOPE\" = \"incremental\" ]; then echo \" (incremental delta review)\"; fi)_"
           echo
           cat review-verdict-markdown.raw.md
         } > "$BODY_FILE"
