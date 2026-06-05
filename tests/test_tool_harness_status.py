@@ -32,6 +32,7 @@ def _import_tool(name):
     if str(_SCRIPTS_DIR) not in sys.path:
         sys.path.insert(0, str(_SCRIPTS_DIR))
     from run_tool_harness import (  # noqa: F401
+        fetch_url,
         gh_api,
         git_grep,
         read_file,
@@ -366,6 +367,204 @@ def test_run_command_error_not_allowlisted():
 
 
 # ---------------------------------------------------------------------------
+# Tests for issue #104: request_timeout parameter passing
+# ---------------------------------------------------------------------------
+
+
+def test_git_grep_uses_custom_timeout():
+    """git_grep passes the timeout value to subprocess.run."""
+    git_grep = _import_tool("git_grep")
+    mock_result = mock.Mock(returncode=1, stderr="", stdout="")
+    with mock.patch("subprocess.run", return_value=mock_result) as mock_run:
+        git_grep("pattern", "/tmp", request_timeout=42)
+    mock_run.assert_called_once_with(
+        ["git", "grep", "-n", "--", "pattern", "."],
+        cwd="/tmp",
+        capture_output=True,
+        text=True,
+        timeout=42,
+    )
+
+
+def test_git_grep_default_timeout():
+    """git_grep uses 15s default when no timeout is specified."""
+    git_grep = _import_tool("git_grep")
+    mock_result = mock.Mock(returncode=0, stderr="", stdout="")
+    with mock.patch("subprocess.run", return_value=mock_result) as mock_run:
+        git_grep("pattern", "/tmp")
+    mock_run.assert_called_once_with(
+        ["git", "grep", "-n", "--", "pattern", "."],
+        cwd="/tmp",
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+def test_git_grep_timeout_error_message():
+    """git_grep timeout error message includes the configured timeout."""
+    git_grep = _import_tool("git_grep")
+    with mock.patch(
+        "subprocess.run", side_effect=subprocess.TimeoutExpired("git", 10)
+    ):
+        result = git_grep("pattern", "/tmp", request_timeout=10)
+    assert result.get("error") == "git grep timed out after 10s"
+
+
+def test_gh_api_uses_custom_timeout():
+    """gh_api passes the timeout value to urllib.request.urlopen."""
+    gh_api = _import_tool("gh_api")
+
+    old_token = None
+    for env_var in ("GH_TOKEN", "GITHUB_TOKEN"):
+        if env_var in os.environ:
+            old_token = (env_var, os.environ[env_var])
+            del os.environ[env_var]
+
+    try:
+        os.environ["GH_TOKEN"] = "fake-token-for-testing"
+        fake_response = mock.Mock()
+        fake_response.read.return_value = b'{"data": {}}'
+        with mock.patch("urllib.request.urlopen", return_value=fake_response) as mock_urlopen:
+            gh_api("owner/repo/pulls/1", {"owner/repo"}, "owner/repo", request_timeout=42)
+        mock_urlopen.assert_called_once()
+        args, kwargs = mock_urlopen.call_args
+        assert kwargs.get("timeout") == 42, (
+            f"Expected timeout=42, got {kwargs}"
+        )
+    finally:
+        if old_token:
+            os.environ[old_token[0]] = old_token[1]
+        else:
+            del os.environ["GH_TOKEN"]
+
+
+def test_web_fetch_uses_custom_timeout():
+    """web_fetch passes the timeout value to urllib.request.urlopen."""
+    web_fetch = _import_tool("web_fetch")
+
+    fake_response = mock.Mock()
+    fake_response.read.return_value = b"content"
+    with mock.patch("urllib.request.urlopen", return_value=fake_response) as mock_urlopen:
+        web_fetch("https://github.com/test", ["github.com"], request_timeout=42)
+    mock_urlopen.assert_called_once()
+    args, kwargs = mock_urlopen.call_args
+    assert kwargs.get("timeout") == 42, (
+        f"Expected timeout=42, got {kwargs}"
+    )
+
+
+def test_fetch_url_uses_custom_timeout():
+    """fetch_url passes the timeout value to urllib.request.urlopen."""
+    fetch_url = _import_tool("fetch_url")
+
+    fake_response = mock.Mock()
+    fake_response.read.return_value = b"content"
+    with mock.patch("urllib.request.urlopen", return_value=fake_response) as mock_urlopen:
+        result = fetch_url("https://github.com/test", ["github.com"], request_timeout=35)
+    mock_urlopen.assert_called_once()
+    args, kwargs = mock_urlopen.call_args
+    assert kwargs.get("timeout") == 35, (
+        f"Expected timeout=35, got {kwargs}"
+    )
+
+
+def test_fetch_url_default_timeout():
+    """fetch_url uses 25s default when no timeout is specified."""
+    fetch_url = _import_tool("fetch_url")
+
+    fake_response = mock.Mock()
+    fake_response.read.return_value = b"content"
+    with mock.patch("urllib.request.urlopen", return_value=fake_response) as mock_urlopen:
+        result = fetch_url("https://github.com/test", ["github.com"])
+    mock_urlopen.assert_called_once()
+    args, kwargs = mock_urlopen.call_args
+    assert kwargs.get("timeout") == 25, (
+        f"Expected timeout=25, got {kwargs}"
+    )
+
+
+def test_run_command_uses_custom_timeout():
+    """run_command passes the timeout value to subprocess.run."""
+    run_command = _import_tool("run_command")
+    mock_result = mock.Mock(returncode=0, stdout="out", stderr="", exit_code=0)
+    with mock.patch("subprocess.run", return_value=mock_result) as mock_run:
+        run_command("git_status_short", "/tmp", request_timeout=45)
+    mock_run.assert_called_once_with(
+        ["git", "status", "--short"],
+        cwd="/tmp",
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+
+
+def test_run_command_timeout_error_message():
+    """run_command timeout error message includes the configured timeout."""
+    run_command = _import_tool("run_command")
+    with mock.patch(
+        "subprocess.run", side_effect=subprocess.TimeoutExpired("git", 10)
+    ):
+        result = run_command("git_status_short", "/tmp", request_timeout=10)
+    assert result.get("error") == "Command timed out after 10s"
+
+
+def test_env_int_bounded_defaults():
+    """env_int_bounded returns default when env var is not set."""
+    if str(_SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS_DIR))
+    from run_tool_harness import env_int_bounded
+
+    with mock.patch.dict(os.environ, {}, clear=True):
+        result = env_int_bounded("NONEXISTENT_VAR", 20, 1, 300)
+        assert result == 20
+
+
+def test_env_int_bounded_respects_value():
+    """env_int_bounded returns the configured value when valid."""
+    if str(_SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS_DIR))
+    from run_tool_harness import env_int_bounded
+
+    with mock.patch.dict(os.environ, {"TOOL_REQUEST_TIMEOUT_SEC": "50"}):
+        result = env_int_bounded("TOOL_REQUEST_TIMEOUT_SEC", 20, 1, 300)
+        assert result == 50
+
+
+def test_env_int_bounded_clamps_low():
+    """env_int_bounded clamps values below minimum to min_value."""
+    if str(_SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS_DIR))
+    from run_tool_harness import env_int_bounded
+
+    with mock.patch.dict(os.environ, {"TOOL_REQUEST_TIMEOUT_SEC": "0"}):
+        result = env_int_bounded("TOOL_REQUEST_TIMEOUT_SEC", 20, 1, 300)
+        assert result == 1
+
+
+def test_env_int_bounded_clamps_high():
+    """env_int_bounded clamps values above maximum to max_value."""
+    if str(_SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS_DIR))
+    from run_tool_harness import env_int_bounded
+
+    with mock.patch.dict(os.environ, {"TOOL_REQUEST_TIMEOUT_SEC": "9999"}):
+        result = env_int_bounded("TOOL_REQUEST_TIMEOUT_SEC", 20, 1, 300)
+        assert result == 300
+
+
+def test_env_int_bounded_invalid_falls_back():
+    """env_int_bounded returns default when value is not an integer."""
+    if str(_SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS_DIR))
+    from run_tool_harness import env_int_bounded
+
+    with mock.patch.dict(os.environ, {"TOOL_REQUEST_TIMEOUT_SEC": "not-a-number"}):
+        result = env_int_bounded("TOOL_REQUEST_TIMEOUT_SEC", 20, 1, 300)
+        assert result == 20
+
+
+# ---------------------------------------------------------------------------
 # Test: integration fixture where tool_min_successful_requests enforcement
 # fails when all planned calls produce errors
 # ---------------------------------------------------------------------------
@@ -557,6 +756,20 @@ def main():
         ("gh_api repo not allowed", test_gh_api_error_repo_not_allowed),
         ("web_fetch non-allowlisted host", test_web_fetch_error_non_allowlisted_host),
         ("run_command not allowlisted", test_run_command_error_not_allowlisted),
+        ("git_grep uses custom timeout", test_git_grep_uses_custom_timeout),
+        ("git_grep default timeout", test_git_grep_default_timeout),
+        ("git_grep timeout error message", test_git_grep_timeout_error_message),
+        ("gh_api uses custom timeout", test_gh_api_uses_custom_timeout),
+        ("web_fetch uses custom timeout", test_web_fetch_uses_custom_timeout),
+        ("fetch_url uses custom timeout", test_fetch_url_uses_custom_timeout),
+        ("fetch_url default timeout", test_fetch_url_default_timeout),
+        ("run_command uses custom timeout", test_run_command_uses_custom_timeout),
+        ("run_command timeout error message", test_run_command_timeout_error_message),
+        ("env_int_bounded defaults", test_env_int_bounded_defaults),
+        ("env_int_bounded respects value", test_env_int_bounded_respects_value),
+        ("env_int_bounded clamps low", test_env_int_bounded_clamps_low),
+        ("env_int_bounded clamps high", test_env_int_bounded_clamps_high),
+        ("env_int_bounded invalid falls back", test_env_int_bounded_invalid_falls_back),
         ("enforcement fixture no successes", test_enforcement_fixture_no_successes),
         ("integration all tools fail", test_integration_all_tools_fail),
         ("integration mixed success/failure", test_integration_mixed_success_and_failure),

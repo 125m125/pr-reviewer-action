@@ -246,7 +246,7 @@ def run_chat_completion(
     return parsed.get("choices", [{}])[0].get("message", {}).get("content", "")
 
 
-def fetch_url(url, allowed_hosts):
+def fetch_url(url, allowed_hosts, request_timeout=25):
     """Fetch a URL and return its text content (or None on failure)."""
     parsed = urllib.parse.urlparse(url)
     host = parsed.hostname or ""
@@ -259,7 +259,7 @@ def fetch_url(url, allowed_hosts):
             url,
             headers={"User-Agent": "ai-pr-reviewer/1.0"},
         )
-        with urllib.request.urlopen(req, timeout=25) as resp:
+        with urllib.request.urlopen(req, timeout=request_timeout) as resp:
             raw = resp.read()
             text = raw.decode("utf-8", errors="replace")
             return text[:5000]
@@ -292,7 +292,7 @@ def read_file(path, workspace_root):
         return {"error": str(exc)}
 
 
-def git_grep(pattern, workspace_root):
+def git_grep(pattern, workspace_root, request_timeout=15):
     """Run git grep and return matched lines."""
     try:
         result = subprocess.run(
@@ -300,19 +300,19 @@ def git_grep(pattern, workspace_root):
             cwd=workspace_root,
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=request_timeout,
         )
         if result.returncode not in (0, 1):
             return {"error": f"git grep failed: {result.stderr.strip()}"}
         lines = result.stdout.strip().splitlines()[:60]
         return {"matches": lines}
     except subprocess.TimeoutExpired:
-        return {"error": "git grep timed out after 15s"}
+        return {"error": f"git grep timed out after {request_timeout}s"}
     except Exception as exc:
         return {"error": str(exc)}
 
 
-def gh_api(endpoint, allowed_repos, current_repo):
+def gh_api(endpoint, allowed_repos, current_repo, request_timeout=25):
     """Make a GitHub API call with path/endpoint restrictions."""
     token = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN", "")
     if not token:
@@ -358,7 +358,7 @@ def gh_api(endpoint, allowed_repos, current_repo):
                 "User-Agent": "ai-pr-reviewer/1.0",
             },
         )
-        with urllib.request.urlopen(req, timeout=25) as resp:
+        with urllib.request.urlopen(req, timeout=request_timeout) as resp:
             raw = resp.read()
             data = json.loads(raw.decode("utf-8", errors="replace"))
             return {"data": data}
@@ -368,7 +368,7 @@ def gh_api(endpoint, allowed_repos, current_repo):
         return {"error": str(exc)}
 
 
-def web_fetch(url, allowed_hosts):
+def web_fetch(url, allowed_hosts, request_timeout=25):
     """Fetch a URL using the same host-allowlist logic."""
     parsed = urllib.parse.urlparse(url)
     host = parsed.hostname or ""
@@ -381,7 +381,7 @@ def web_fetch(url, allowed_hosts):
             url,
             headers={"User-Agent": "ai-pr-reviewer/1.0"},
         )
-        with urllib.request.urlopen(req, timeout=25) as resp:
+        with urllib.request.urlopen(req, timeout=request_timeout) as resp:
             raw = resp.read()
             text = raw.decode("utf-8", errors="replace")
             return {"content": text[:10000]}
@@ -389,7 +389,7 @@ def web_fetch(url, allowed_hosts):
         return {"error": str(exc)}
 
 
-def run_command(command, workspace_root):
+def run_command(command, workspace_root, request_timeout=30):
     """Execute a named read-only command definition.
 
     The planner may choose only command names from ALLOWED_COMMANDS. Raw shell
@@ -412,7 +412,7 @@ def run_command(command, workspace_root):
             cwd=workspace_root,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=request_timeout,
         )
         return {
             "stdout": mask_secrets((result.stdout or "").strip()),
@@ -428,7 +428,7 @@ def run_command(command, workspace_root):
         if isinstance(stderr, bytes):
             stderr = stderr.decode("utf-8", errors="replace")
         return {
-            "error": "Command timed out after 30s",
+            "error": f"Command timed out after {request_timeout}s",
             "stdout": mask_secrets(stdout),
             "stderr": mask_secrets(stderr),
             "command": command_name,
@@ -448,7 +448,8 @@ def main():
     max_response_bytes = int(os.getenv("TOOL_MAX_RESPONSE_BYTES", "12000"))
     planning_timeout = int(os.getenv("TOOL_PLANNING_TIMEOUT_SEC", "30"))
     planning_max_context = int(os.getenv("TOOL_PLANNING_MAX_CONTEXT_BYTES", "50000"))
-    request_timeout = int(os.getenv("TOOL_REQUEST_TIMEOUT_SEC", "20"))
+    max_requests = env_int_bounded("TOOL_MAX_REQUESTS", 4, 1, 20)
+    request_timeout = env_int_bounded("TOOL_REQUEST_TIMEOUT_SEC", 20, 1, 300)
 
     allowed_gh_repos_raw = os.getenv("TOOL_ALLOWED_GH_API_REPOS", "")
     allowed_gh_repos = set()
@@ -580,7 +581,7 @@ def main():
         )
         planning_user = (
             f"Repository: {repo}\n"
-            f"Max requests: 4\n"
+            f"Max requests: {max_requests}\n"
             f"Allowed repos for gh_api: {', '.join(sorted(allowed_gh_api_repos)) if allowed_gh_api_repos else '(none)'}\n"
             f"Allowed hosts for web_fetch: {', '.join(allowed_hosts) if allowed_hosts else '(none)'}\n"
             f"Corpus truncated for planning: {corpus_truncated}\n\n"
@@ -633,7 +634,7 @@ def main():
             md_lines.append(f"**Planning warning:** {result['planning_warning']}")
         md_lines.append("")
 
-        for i, raw_req in enumerate(requests_list[:4]):
+        for i, raw_req in enumerate(requests_list[:max_requests]):
             if not isinstance(raw_req, dict):
                 continue
             tool_name = raw_req.get("tool", "")
@@ -659,7 +660,7 @@ def main():
                     pattern = args.get("pattern", "")
                     if not pattern:
                         raise ValueError("Missing 'pattern' argument")
-                    res = git_grep(pattern, workspace_root)
+                    res = git_grep(pattern, workspace_root, request_timeout)
                     if res.get("error"):
                         raise ValueError(res["error"])
                     matches = res.get("matches", [])
@@ -671,7 +672,7 @@ def main():
                     endpoint = args.get("endpoint", "")
                     if not endpoint:
                         raise ValueError("Missing 'endpoint' argument")
-                    res = gh_api(endpoint, allowed_gh_repos, current_repo)
+                    res = gh_api(endpoint, allowed_gh_repos, current_repo, request_timeout)
                     if res.get("error"):
                         raise ValueError(res["error"])
                     data = res.get("data")
@@ -684,7 +685,7 @@ def main():
                     url = args.get("url", "")
                     if not url:
                         raise ValueError("Missing 'url' argument")
-                    res = web_fetch(url, allowed_hosts)
+                    res = web_fetch(url, allowed_hosts, request_timeout)
                     if res.get("error"):
                         raise ValueError(res["error"])
                     content_text = res.get("content", "")
@@ -695,7 +696,7 @@ def main():
                     command = args.get("command", "")
                     if not command:
                         raise ValueError("Missing 'command' argument")
-                    res = run_command(command, workspace_root)
+                    res = run_command(command, workspace_root, request_timeout)
                     if res.get("error"):
                         raise ValueError(res["error"])
                     stdout_text = res.get("stdout", "")
@@ -778,7 +779,7 @@ def main():
     md_lines.append(f"**Planned requests:** {result['planned_request_count']}")
     md_lines.append("")
 
-    for i, call in enumerate(tool_calls[:4]):
+    for i, call in enumerate(tool_calls[:max_requests]):
         tool_name = call.get("tool", "")
         args = call.get("args", {})
 
@@ -803,7 +804,7 @@ def main():
                 pattern = args.get("pattern", "")
                 if not pattern:
                     raise ValueError("Missing 'pattern' argument")
-                res = git_grep(pattern, workspace_root)
+                res = git_grep(pattern, workspace_root, request_timeout)
                 if res.get("error"):
                     raise ValueError(res["error"])
                 matches = res.get("matches", [])
@@ -815,7 +816,7 @@ def main():
                 endpoint = args.get("endpoint", "")
                 if not endpoint:
                     raise ValueError("Missing 'endpoint' argument")
-                res = gh_api(endpoint, allowed_gh_repos, current_repo)
+                res = gh_api(endpoint, allowed_gh_repos, current_repo, request_timeout)
                 if res.get("error"):
                     raise ValueError(res["error"])
                 data = res.get("data")
@@ -828,7 +829,7 @@ def main():
                 url = args.get("url", "")
                 if not url:
                     raise ValueError("Missing 'url' argument")
-                res = web_fetch(url, allowed_hosts)
+                res = web_fetch(url, allowed_hosts, request_timeout)
                 if res.get("error"):
                     raise ValueError(res["error"])
                 content_text = res.get("content", "")
@@ -839,7 +840,7 @@ def main():
                 command = args.get("command", "")
                 if not command:
                     raise ValueError("Missing 'command' argument")
-                res = run_command(command, workspace_root)
+                res = run_command(command, workspace_root, request_timeout)
                 if res.get("error"):
                     raise ValueError(res["error"])
                 stdout_text = res.get("stdout", "")
