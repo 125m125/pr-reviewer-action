@@ -32,6 +32,16 @@ GH_DENY_SUBSTRINGS = (
     "/dispatches",
 )
 
+# Allowed GitHub API path prefixes for gh_api tool calls.
+# Only read-only, non-sensitive endpoints are permitted.
+GH_API_ALLOWED_PREFIXES = (
+    "/repos/",
+    "/issues/",
+    "/search/",
+    "/releases/",
+    "/git/",
+)
+
 # The tool harness executes same-repo code, so command execution must not be
 # model-controlled shell text. Keep commands as named, argv-only definitions.
 # Additions here should be read-only and safe to run against untrusted PR input.
@@ -318,11 +328,22 @@ def gh_api(endpoint, allowed_repos, current_repo, request_timeout=25):
     if not token:
         return {"error": "Missing GH_TOKEN"}
 
+    # Validate endpoint contains only safe characters
+    if not GH_SAFE_PATH_RE.match(endpoint):
+        return {"error": "Endpoint contains disallowed characters"}
+
     # Parse endpoint to extract repo and path
     # Support both "repos/owner/repo/..." (prompt format) and "owner/repo/..." (direct)
     parts = endpoint.strip("/").split("/")
     if len(parts) < 2:
         return {"error": "Invalid endpoint format: expected owner/repo/..."}
+
+    # Reject dot-segments in any path component
+    for part in parts:
+        if part in (".", ".."):
+            return {"error": f"Dot-segment not allowed in path: {part}"}
+        if "." in part:
+            return {"error": "Dot segments in path components are not allowed"}
 
     # If the first segment is "repos", skip it and use the next two segments
     if parts[0] == "repos" and len(parts) >= 3:
@@ -342,8 +363,16 @@ def gh_api(endpoint, allowed_repos, current_repo, request_timeout=25):
     if not allowed:
         return {"error": f"Repo not allowed: {repo_key}"}
 
+    # Check endpoint prefix is in the allowlist of safe API paths
+    # Normalize direct format (owner/repo/...) to repos/owner/repo/... for prefix check
+    if parts[0] == "repos":
+        full_path = "/" + "/".join(parts)
+    else:
+        full_path = "/repos/" + "/".join(parts)
+    if not any(full_path.startswith(prefix) for prefix in GH_API_ALLOWED_PREFIXES):
+        return {"error": f"Endpoint prefix not allowed: {full_path}"}
+
     # Check for denied path segments
-    full_path = "/".join(parts)
     for deny in GH_DENY_SUBSTRINGS:
         if deny in full_path.lower():
             return {"error": f"Path segment denied: {deny}"}

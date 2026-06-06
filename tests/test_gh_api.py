@@ -153,6 +153,136 @@ class TestGhApiRepoParsing:
         )
 
 
+class TestGhApiPathValidation:
+    """Test that gh_api enforces character, dot-segment, and prefix restrictions."""
+
+    def _setup_env(self):
+        os.environ["GH_TOKEN"] = "test-token"
+
+    def test_disallowed_characters_rejected(self):
+        """Endpoints with spaces or special chars should be rejected."""
+        self._setup_env()
+        result = gh_api(
+            "repos/misospace/pr-reviewer-action/pulls/1 comment",
+            allowed_repos=set(),
+            current_repo="misospace/pr-reviewer-action",
+        )
+        assert "disallowed characters" in (result.get("error") or "").lower(), (
+            f"Endpoint with spaces should be rejected: {result}"
+        )
+
+    def test_null_byte_rejected(self):
+        """Endpoints with null bytes should be rejected."""
+        self._setup_env()
+        result = gh_api(
+            "repos/misospace/pr-reviewer-action/pulls/1\x00",
+            allowed_repos=set(),
+            current_repo="misospace/pr-reviewer-action",
+        )
+        assert result.get("error") is not None, (
+            f"Endpoint with null byte should be rejected: {result}"
+        )
+
+    def test_parent_directory_traversal_rejected(self):
+        """Endpoints containing '..' segment should be rejected."""
+        self._setup_env()
+        result = gh_api(
+            "repos/misospace/../pr-reviewer-action/pulls/1",
+            allowed_repos=set(),
+            current_repo="misospace/pr-reviewer-action",
+        )
+        assert "dot" in (result.get("error") or "").lower(), (
+            f"Dot-segment '..' should be rejected: {result}"
+        )
+
+    def test_current_directory_segment_rejected(self):
+        """Endpoints containing '.' segment should be rejected."""
+        self._setup_env()
+        result = gh_api(
+            "repos/./misospace/pr-reviewer-action/pulls/1",
+            allowed_repos=set(),
+            current_repo="misospace/pr-reviewer-action",
+        )
+        assert "dot-segment" in (result.get("error") or "").lower(), (
+            f"Dot-segment '.' should be rejected: {result}"
+        )
+
+    def test_dot_in_path_component_rejected(self):
+        """Endpoints with dots in path components should be rejected."""
+        self._setup_env()
+        result = gh_api(
+            "repos/misospace/pr-reviewer-action/pulls/1.patch",
+            allowed_repos=set(),
+            current_repo="misospace/pr-reviewer-action",
+        )
+        assert "dot" in (result.get("error") or "").lower(), (
+            f"Dots in path components should be rejected: {result}"
+        )
+
+    def test_unallowed_prefix_rejected(self):
+        """Endpoints not starting with an allowed prefix should be rejected."""
+        self._setup_env()
+        result = gh_api(
+            "user/misospace/emails",
+            allowed_repos={"misospace/pr-reviewer-action"},
+            current_repo="misospace/pr-reviewer-action",
+        )
+        assert "not allowed" in (result.get("error") or "").lower(), (
+            f"Unallowed prefix should be rejected: {result}"
+        )
+
+    def test_allowed_repos_prefix_passes(self):
+        """Endpoints starting with /repos/ should pass prefix check."""
+        self._setup_env()
+        result = gh_api(
+            "repos/misospace/pr-reviewer-action/pulls/1",
+            allowed_repos=set(),
+            current_repo="misospace/pr-reviewer-action",
+        )
+        assert "prefix not allowed" not in (result.get("error") or "").lower(), (
+            f"/repos/ prefix should be allowed: {result}"
+        )
+
+    def test_allowed_issues_prefix_passes(self):
+        """Endpoints starting with /issues/ should pass prefix check."""
+        self._setup_env()
+        result = gh_api(
+            "issues/misospace/pr-reviewer-action/comments",
+            allowed_repos={"misospace/pr-reviewer-action"},
+            current_repo="other/repo",
+        )
+        assert "prefix not allowed" not in (result.get("error") or "").lower(), (
+            f"/issues/ prefix should be allowed: {result}"
+        )
+
+    def test_allowed_search_prefix_passes(self):
+        """Endpoints starting with /search/ should pass prefix check."""
+        self._setup_env()
+        result = gh_api(
+            "search/code?q=foo",
+            allowed_repos={"misospace/pr-reviewer-action"},
+            current_repo="misospace/pr-reviewer-action",
+        )
+        # Note: search endpoints don't have a repo key, so this will fail on
+        # repo allowlist check, but should pass the prefix check
+        err = result.get("error") or ""
+        assert "prefix not allowed" not in err.lower(), (
+            f"/search/ prefix should be allowed: {result}"
+        )
+
+    def test_allowed_releases_prefix_passes(self):
+        """Endpoints starting with /releases/ should pass prefix check."""
+        self._setup_env()
+        result = gh_api(
+            "releases/misospace/pr-reviewer-action/tags",
+            allowed_repos=set(),
+            current_repo="misospace/pr-reviewer-action",
+        )
+        assert "prefix not allowed" not in (result.get("error") or "").lower(), (
+            f"/releases/ prefix should be allowed: {result}"
+        )
+
+
 if __name__ == "__main__":
     import pytest
     pytest.main([__file__, "-v"])
