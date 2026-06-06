@@ -18,6 +18,12 @@ The action gathers PR metadata, diff context, linked issue context from PR-closi
 - automatic skip when the effective PR diff is unchanged since the last managed review
 - linked issue body ingestion from `Fixes #123`, `Closes owner/repo#456`, and similar PR-body references
 - repo-provided rules via `CLAUDE.md`, `AGENTS.md`, or a custom file
+- upstream link sanitizer to neutralize auto-linked PR/issue/commit references in published reviews
+
+### Upstream Link Sanitizer
+
+Before publishing, the action runs `scripts/sanitize_review_markdown.py` on the review markdown to neutralize upstream GitHub references (PR URLs, issue URLs, commit URLs, compare URLs, cross-repo `owner/repo#123` references, and bare `#123` references). This prevents GitHub from auto-linking them into the reviewed repository, which would create notification noise and misleading linkbacks to unrelated projects. Sanitization is documented as P0 hygiene in [issue #132](https://github.com/misospace/pr-reviewer-action/issues/132).
+
 
 ## Requirements
 
