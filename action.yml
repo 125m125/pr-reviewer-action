@@ -443,17 +443,6 @@ runs:
           METADATA_MARKER="${METADATA_MARKER%,*},\"previous_head_sha\":\"${{ steps.precheck.outputs.previous_head_sha }}\"}"
         fi
 
-        if [ -z "${PR_NUMBER:-}" ]; then
-          echo "publish_review_comment=true requires a pull_request event or explicit pr_number" >&2
-          exit 1
-        fi
-
-        if [ "$VERDICT" = "request_changes" ]; then
-          VERDICT_PREFIX="⚠️ **Automated recommendation: REQUEST CHANGES**"
-        else
-          VERDICT_PREFIX="✅ **Automated recommendation: APPROVE**"
-        fi
-
         {
           echo "$METADATA_MARKER"
           if [ -n "${HEAD_SHA:-}" ]; then

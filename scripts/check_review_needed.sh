@@ -195,19 +195,15 @@ extract_review_metadata() {
   
   # Use Python to parse the JSON marker reliably (handles embedded quotes)
   eval "$(printf '%s' "$comment_body" | python3 -c "
-import json, re, sys
-body = sys.stdin.read()
-pattern = re.compile(r'<!--\s*ai-pr-reviewer:\s*(\{.*?\})\s*-->')
-match = pattern.search(body)
-if match:
-    try:
-        data = json.loads(match.group(1))
-        print(f'LAST_HEAD_SHA={data.get(\"head_sha\", \"\")}')
-        print(f'LAST_BASE_SHA={data.get(\"base_sha\", \"\")}')
-        print(f'LAST_REVIEW_SCOPE={data.get(\"review_scope\", \"\")}')
-        print(f'LAST_REVIEW_RESULT={data.get(\"review_result\", \"\")}')
-    except json.JSONDecodeError:
-        pass
+import sys
+sys.path.insert(0, '.')
+from pr_reviewer.metadata import parse_metadata
+data = parse_metadata(sys.stdin.read())
+if data:
+    print(f'LAST_HEAD_SHA={data.get(\"head_sha\", \"\")}')
+    print(f'LAST_BASE_SHA={data.get(\"base_sha\", \"\")}')
+    print(f'LAST_REVIEW_SCOPE={data.get(\"review_scope\", \"\")}')
+    print(f'LAST_REVIEW_RESULT={data.get(\"review_result\", \"\")}')
 " 2>/dev/null || true)"
 }
 
