@@ -83,13 +83,16 @@ while true; do
   # Determine overall state: pending | success | failure | error | neutral
   overall="$(printf '%s' "$response" | jq -r '.state // "unknown"' 2>/dev/null || echo "unknown")"
 
-  # Check for any pending checks in the check-runs API as well (the combined
-  # status API sometimes lags behind).
+  # Check for any non-completed checks in the check-runs API as well (the combined
+  # status API sometimes lags behind). GitHub Checks API statuses are:
+  # queued, in_progress, completed, requested, waiting, stale.
+  # We count all runs where status != "completed" (i.e., still running or queued).
   pending_checks=0
+  check_runs_response=""
   if [[ "$overall" != "failure" && "$overall" != "success" ]]; then
-    # Poll check-runs for pending jobs
-    pending_checks="$(gh api "repos/$REPO/commits/$sha/check-runs?status=pending&per_page=100" \
-      2>/dev/null | jq '.total_count // 0' 2>/dev/null || echo 0)"
+    # Fetch check-runs once and reuse for both pending and failed counts
+    check_runs_response="$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" 2>/dev/null || echo "{}")"
+    pending_checks="$(printf '%s' "$check_runs_response" | jq '[.check_runs[] | select(.status != "completed")] | length' 2>/dev/null || echo 0)"
   fi
 
   if [[ "$overall" == "success" || "$overall" == "failure" ]]; then
@@ -100,8 +103,20 @@ while true; do
     exit 0
   fi
 
+  # Detect failed check runs even when the combined status API hasn't caught up yet.
+  # This handles repos that rely primarily on GitHub Checks (not legacy statuses).
+  if [[ -n "$check_runs_response" ]]; then
+    failed_checks="$(printf '%s' "$check_runs_response" | jq '[.check_runs[] | select(.status == "completed" and .conclusion == "failure")] | length' 2>/dev/null || echo 0)"
+    if [[ "$failed_checks" -gt 0 ]]; then
+      log "Detected $failed_checks failed check run(s) before combined status updated — treating as failure"
+      echo "ci_status_final=failure" >> "$OUTPUT_FILE"
+      echo "ci_status_skipped=false" >> "$OUTPUT_FILE"
+      exit 0
+    fi
+  fi
+
   if [[ "$pending_checks" -gt 0 ]]; then
-    log "Overall=$overall, $pending_checks check(s) still pending — waiting ${CI_INTERVAL_SEC}s..."
+    log "Overall=$overall, $pending_checks check(s) not yet completed — waiting ${CI_INTERVAL_SEC}s..."
   else
     log "Overall=$overall — waiting ${CI_INTERVAL_SEC}s..."
   fi

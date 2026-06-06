@@ -148,6 +148,24 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# ── Test 13: Check-runs polling uses correct GitHub Checks API statuses ──
+echo ""
+echo "=== Test: check-runs polling counts non-completed runs ==="
+check_contains "check-runs query does NOT filter by status=pending (uses all statuses)" \
+  "$wait_content" 'check-runs?per_page=100'
+check_contains "counts non-completed check runs via jq select" \
+  "$wait_content" '.status != "completed"'
+check_contains "stores check-runs response for reuse" \
+  "$wait_content" 'check_runs_response='
+
+# ── Test 14: Failed check-run detection before combined status update ──
+echo ""
+echo "=== Test: failed check-run early detection ==="
+check_contains "detects failed check runs before combined status catches up" \
+  "$wait_content" '.conclusion == "failure"'
+check_contains "logs when failed check runs detected early" \
+  "$wait_content" 'failed check run'
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 
