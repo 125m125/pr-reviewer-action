@@ -120,11 +120,11 @@ ACTION_YML="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/action.yml"
 BODY_CONTENT_REVIEW_COMMENT=$(awk '/Publish review comment \(non-blocking\)/,/^    - name: Publish review verdict/' "$ACTION_YML")
 BODY_CONTENT_REVIEW_VERDICT=$(awk '/Publish review verdict/,0' "$ACTION_YML")
 
-check_contains "review_comment body includes <!-- ai-pr-reviewer --> marker" \
-  "$BODY_CONTENT_REVIEW_COMMENT" "<!-- ai-pr-reviewer -->"
+check_contains "review_comment step uses METADATA_MARKER in body" \
+  "$BODY_CONTENT_REVIEW_COMMENT" "METADATA_MARKER"
 
-check_contains "review_verdict body includes <!-- ai-pr-reviewer --> marker" \
-  "$BODY_CONTENT_REVIEW_VERDICT" "<!-- ai-pr-reviewer -->"
+check_contains "review_verdict step uses METADATA_MARKER in body" \
+  "$BODY_CONTENT_REVIEW_VERDICT" "METADATA_MARKER"
 
 # Check that review_comment body does NOT have the marker in the sticky comment mode (comment mode)
 STICKY_COMMENT_BODY=$(awk '/Publish review comment$/,/^    - name: Publish review comment \(non-blocking\)/' "$ACTION_YML")
@@ -132,35 +132,52 @@ check_contains "sticky comment mode uses COMMENT_MARKER variable" \
   "$STICKY_COMMENT_BODY" "COMMENT_MARKER"
 
 echo ""
+echo "=== Helper script validation ==="
+
+HELPER_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/publish_helpers.sh"
+
+check_exists "publish_helpers.sh exists" \
+  "$(test -f "$HELPER_SCRIPT" && echo 1 || echo 0)"
+
+check_exists "publish_helpers.sh is executable" \
+  "$(test -x "$HELPER_SCRIPT" && echo 1 || echo 0)"
+
+check_contains "helper contains sanitize_review_markdown function" \
+  "$(cat "$HELPER_SCRIPT")" "sanitize_review_markdown"
+
+check_contains "helper contains resolve_cleanup_flag function" \
+  "$(cat "$HELPER_SCRIPT")" "resolve_cleanup_flag"
+
+check_contains "helper contains cleanup_native_reviews function" \
+  "$(cat "$HELPER_SCRIPT")" "cleanup_native_reviews"
+
+check_contains "helper contains build_metadata_marker function" \
+  "$(cat "$HELPER_SCRIPT")" "build_metadata_marker"
+
+echo ""
 echo "=== Cleanup logic presence validation ==="
 
-# Check that cleanup logic exists in both native review steps
-CLEANUP_REVIEW_COMMENT=$(awk '/Publish review comment \(non-blocking\)/,/^    - name: Publish review verdict/' "$ACTION_YML")
-CLEANUP_REVIEW_VERDICT=$(awk '/Publish review verdict/,0' "$ACTION_YML")
+# Verify native review steps source the helper script and call functions
+BODY_CONTENT_REVIEW_COMMENT=$(awk '/Publish review comment \(non-blocking\)/,/^    - name: Publish review verdict/' "$ACTION_YML")
+BODY_CONTENT_REVIEW_VERDICT=$(awk '/Publish review verdict/,0' "$ACTION_YML")
 
-check_exists "review_comment step has cleanup resolution" \
-  "$(grep -c 'resolve.*cleanup\|CLEANUP_NATIVE_REVIEWS' <<< "$CLEANUP_REVIEW_COMMENT" || echo 0)"
+check_contains "review_comment step sources publish_helpers.sh" \
+  "$BODY_CONTENT_REVIEW_COMMENT" "publish_helpers.sh"
 
-check_exists "review_verdict step has cleanup resolution" \
-  "$(grep -c 'resolve.*cleanup\|CLEANUP_NATIVE_REVIEWS' <<< "$CLEANUP_REVIEW_VERDICT" || echo 0)"
+check_contains "review_verdict step sources publish_helpers.sh" \
+  "$BODY_CONTENT_REVIEW_VERDICT" "publish_helpers.sh"
 
-check_exists "review_comment step queries previous reviews" \
-  "$(grep -c 'PREV_REVIEWS' <<< "$CLEANUP_REVIEW_COMMENT" || echo 0)"
+check_contains "review_comment step calls cleanup_native_reviews" \
+  "$BODY_CONTENT_REVIEW_COMMENT" "cleanup_native_reviews"
 
-check_exists "review_verdict step queries previous reviews" \
-  "$(grep -c 'PREV_REVIEWS' <<< "$CLEANUP_REVIEW_VERDICT" || echo 0)"
+check_contains "review_verdict step calls cleanup_native_reviews" \
+  "$BODY_CONTENT_REVIEW_VERDICT" "cleanup_native_reviews"
 
-check_exists "review_comment step attempts dismissal" \
-  "$(grep -c 'dismissals.*PUT\|Dismissed outdated' <<< "$CLEANUP_REVIEW_COMMENT" || echo 0)"
+check_contains "review_comment step calls resolve_cleanup_flag" \
+  "$BODY_CONTENT_REVIEW_COMMENT" "resolve_cleanup_flag"
 
-check_exists "review_verdict step attempts dismissal" \
-  "$(grep -c 'dismissals.*PUT\|Dismissed outdated' <<< "$CLEANUP_REVIEW_VERDICT" || echo 0)"
-
-check_exists "review_comment step updates outdated body" \
-  "$(grep -c 'Outdated: superseded\|OUTDATED_BODY' <<< "$CLEANUP_REVIEW_COMMENT" || echo 0)"
-
-check_exists "review_verdict step updates outdated body" \
-  "$(grep -c 'Outdated: superseded\|OUTDATED_BODY' <<< "$CLEANUP_REVIEW_VERDICT" || echo 0)"
+check_contains "review_verdict step calls resolve_cleanup_flag" \
+  "$BODY_CONTENT_REVIEW_VERDICT" "resolve_cleanup_flag"
 
 echo ""
 echo "=== Input definition validation ==="
@@ -172,10 +189,10 @@ check_contains "cleanup_previous_native_reviews default is auto" \
   "$(cat "$ACTION_YML")" 'default: "auto"'
 
 check_exists "action.yml has CLEANUP_PREVIOUS_NATIVE_REVIEWS env in review_comment step" \
-  "$(grep -c 'CLEANUP_PREVIOUS_NATIVE_REVIEWS' <<< "$CLEANUP_REVIEW_COMMENT" || echo 0)"
+  "$(grep -c 'CLEANUP_PREVIOUS_NATIVE_REVIEWS' <<< "$BODY_CONTENT_REVIEW_COMMENT" || echo 0)"
 
 check_exists "action.yml has CLEANUP_PREVIOUS_NATIVE_REVIEWS env in review_verdict step" \
-  "$(grep -c 'CLEANUP_PREVIOUS_NATIVE_REVIEWS' <<< "$CLEANUP_REVIEW_VERDICT" || echo 0)"
+  "$(grep -c 'CLEANUP_PREVIOUS_NATIVE_REVIEWS' <<< "$BODY_CONTENT_REVIEW_VERDICT" || echo 0)"
 
 echo ""
 echo "=== README.md documentation validation ==="

@@ -413,40 +413,31 @@ runs:
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
         ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
         COMMENT_MARKER: ${{ inputs.comment_marker }}
+        GITHUB_ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
-        # Sanitize model output: strip internal metadata markers that the model
-        # might have generated, preventing fake markers from interfering with precheck.
-        printf '%s\n' "$REVIEW_MARKDOWN" > review-markdown.raw.md
-        python3 "${{ github.action_path }}/scripts/strip_metadata_markers.py" review-markdown.raw.md
-        # Neutralize upstream PR/issue/commit references so GitHub does not auto-link them.
-        python3 "${{ github.action_path }}/scripts/sanitize_review_markdown.py" review-markdown.raw.md
+        source "${GITHUB_ACTION_PATH}/scripts/publish_helpers.sh"
 
+        # Sanitize model output
+        sanitize_review_markdown "review-markdown.raw.md"
 
-        if [ -z "${PR_NUMBER:-}" ]; then
-          echo "publish_review_comment=true requires a pull_request event or explicit pr_number" >&2
-          exit 1
-        fi
+        # Validate PR number
+        validate_pr_number "review_comment"
 
-        if [ "$VERDICT" = "request_changes" ]; then
-          VERDICT_PREFIX="⚠️ **Automated recommendation: REQUEST CHANGES**"
-        else
-          VERDICT_PREFIX="✅ **Automated recommendation: APPROVE**"
-        fi
-
-        # Resolve effective scope from precheck
+        # Resolve effective scope and review result
         EFFECTIVE_SCOPE="${{ steps.precheck.outputs.effective_review_scope || 'full' }}"
-
-        # Determine review result for metadata marker
         REVIEW_RESULT="clean"
         if [ "$VERDICT" = "request_changes" ]; then
           REVIEW_RESULT="issues"
         fi
 
         # Build metadata marker
-        METADATA_MARKER="<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"${HEAD_SHA:-unknown}\",\"base_sha\":\"${{ github.event.pull_request.base.sha || '' }}\",\"review_scope\":\"${EFFECTIVE_SCOPE}\",\"review_result\":\"${REVIEW_RESULT}\"}"
-        if [ "$EFFECTIVE_SCOPE" = "incremental" ] && [ -n "${{ steps.precheck.outputs.previous_head_sha:-}}" ]; then
-          METADATA_MARKER="${METADATA_MARKER%,*},\"previous_head_sha\":\"${{ steps.precheck.outputs.previous_head_sha }}\"}"
+        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || '' }}" "${{ steps.precheck.outputs.previous_head_sha:-}}")"
+
+        if [ "$VERDICT" = "request_changes" ]; then
+          VERDICT_PREFIX="⚠️ **Automated recommendation: REQUEST CHANGES**"
+        else
+          VERDICT_PREFIX="✅ **Automated recommendation: APPROVE**"
         fi
 
         {
@@ -478,75 +469,30 @@ runs:
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
         ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
         CLEANUP_PREVIOUS_NATIVE_REVIEWS: ${{ inputs.cleanup_previous_native_reviews }}
+        GITHUB_ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
-        # Sanitize model output: strip internal metadata markers that the model
-        # might have generated, preventing fake markers from interfering with precheck.
-        printf '%s\n' "$REVIEW_MARKDOWN" > review-comment-markdown.raw.md
-        python3 "${{ github.action_path }}/scripts/strip_metadata_markers.py" review-comment-markdown.raw.md
-        # Neutralize upstream PR/issue/commit references so GitHub does not auto-link them.
-        python3 "${{ github.action_path }}/scripts/sanitize_review_markdown.py" review-comment-markdown.raw.md
+        source "${GITHUB_ACTION_PATH}/scripts/publish_helpers.sh"
 
+        # Sanitize model output
+        sanitize_review_markdown "review-comment-markdown.raw.md"
 
-        if [ -z "${PR_NUMBER:-}" ]; then
-          echo "publish_mode=review_comment requires a pull_request event or explicit pr_number" >&2
-          exit 1
-        fi
+        # Validate PR number
+        validate_pr_number "mode=review_comment"
 
-        # Resolve cleanup flag: auto enables for review_comment mode
-        CLEANUP_NATIVE_REVIEWS=false
-        case "$(printf '%s' "${CLEANUP_PREVIOUS_NATIVE_REVIEWS:-auto}" | tr '[:upper:]' '[:lower:]')" in
-          true) CLEANUP_NATIVE_REVIEWS=true ;;
-          false) CLEANUP_NATIVE_REVIEWS=false ;;
-          auto|"") CLEANUP_NATIVE_REVIEWS=true ;;
-          *) echo "Invalid cleanup_previous_native_reviews value; expected auto, true, or false" >&2; exit 1 ;;
-        esac
+        # Resolve cleanup flag and execute cleanup
+        CLEANUP_NATIVE_REVIEWS="$(resolve_cleanup_flag "${CLEANUP_PREVIOUS_NATIVE_REVIEWS:-auto}" "review_comment")"
+        cleanup_native_reviews "$CLEANUP_NATIVE_REVIEWS"
 
-        # Cleanup previous managed native reviews if enabled
-        if [ "$CLEANUP_NATIVE_REVIEWS" = "true" ]; then
-          echo "Cleaning up previous managed native reviews for #$PR_NUMBER"
-          CURRENT_ACTOR="$(gh api user --jq .login 2>/dev/null || echo "")"
-          if [ -n "$CURRENT_ACTOR" ]; then
-            PREV_REVIEWS="$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --paginate --jq '.[] | select(.user.login == "'"$CURRENT_ACTOR"'" and (.body | contains("<!-- ai-pr-reviewer -->"))) | .id' 2>/dev/null || echo "")"
-            if [ -n "$PREV_REVIEWS" ]; then
-              while IFS= read -r REVIEW_ID; do
-                if [ -z "$REVIEW_ID" ]; then continue; fi
-                # Dismiss approval/request-changes reviews to stop stale verdicts from counting
-                REVIEW_STATE="$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --jq '.state // ""' 2>/dev/null || echo "")"
-                if [ "$REVIEW_STATE" = "APPROVED" ] || [ "$REVIEW_STATE" = "CHANGES_REQUESTED" ]; then
-                  if gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/dismissals" --method PUT -f message="Superseded by a newer automated review for this pull request." --jq '.id' >/dev/null 2>&1; then
-                    echo "  Dismissed outdated managed review #$REVIEW_ID ($REVIEW_STATE)"
-                  else
-                    echo "  WARN: Could not dismiss review #$REVIEW_ID (may require additional permissions)" >&2
-                  fi
-                fi
-                # Update body to compact outdated stub (best-effort)
-                OUTDATED_BODY="$(printf '<!-- ai-pr-reviewer -->\n_Outdated: superseded by a newer automated review._')"
-                if ! gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --method PATCH -f body="$OUTDATED_BODY" >/dev/null 2>&1; then
-                  echo "  WARN: Could not update review #$REVIEW_ID body (submitted reviews may be read-only)" >&2
-                else
-                  echo "  Marked review #$REVIEW_ID as outdated/superseded"
-                fi
-              done <<< "$PREV_REVIEWS"
-            else
-              echo "  No previous managed native reviews found for #$PR_NUMBER"
-            fi
-          else
-            echo "  WARN: Could not determine current actor; skipping cleanup" >&2
-          fi
-        fi
-
-        # Resolve effective scope from precheck
+        # Resolve effective scope and review result
         EFFECTIVE_SCOPE="${{ steps.precheck.outputs.effective_review_scope || 'full' }}"
-
-        # Determine review result for metadata marker
         REVIEW_RESULT="clean"
         if [ "$VERDICT" = "request_changes" ]; then
           REVIEW_RESULT="issues"
         fi
 
         # Build metadata marker
-        METADATA_MARKER="<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"${HEAD_SHA:-unknown}\",\"base_sha\":\"${{ github.event.pull_request.base.sha || '' }}\",\"review_scope\":\"${EFFECTIVE_SCOPE}\",\"review_result\":\"${REVIEW_RESULT}\"}"
+        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || '' }}" "")"
 
         # Build the review body with managed marker
         BODY_FILE="review-comment-body.md"
@@ -581,83 +527,35 @@ runs:
         ALLOW_APPROVE: ${{ inputs.allow_approve }}
         APPROVE_FORKS: ${{ inputs.approve_forks }}
         CLEANUP_PREVIOUS_NATIVE_REVIEWS: ${{ inputs.cleanup_previous_native_reviews }}
+        GITHUB_ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
-        # Sanitize model output: strip internal metadata markers that the model
-        # might have generated, preventing fake markers from interfering with precheck.
-        printf '%s\n' "$REVIEW_MARKDOWN" > review-verdict-markdown.raw.md
-        python3 "${{ github.action_path }}/scripts/strip_metadata_markers.py" review-verdict-markdown.raw.md
-        # Neutralize upstream PR/issue/commit references so GitHub does not auto-link them.
-        python3 "${{ github.action_path }}/scripts/sanitize_review_markdown.py" review-verdict-markdown.raw.md
+        source "${GITHUB_ACTION_PATH}/scripts/publish_helpers.sh"
 
+        # Sanitize model output
+        sanitize_review_markdown "review-verdict-markdown.raw.md"
 
-        if [ -z "${PR_NUMBER:-}" ]; then
-          echo "publish_mode=review_verdict requires a pull_request event or explicit pr_number" >&2
-          exit 1
-        fi
+        # Validate PR number
+        validate_pr_number "mode=review_verdict"
 
-        # Resolve cleanup flag: auto enables for review_verdict mode
-        CLEANUP_NATIVE_REVIEWS=false
-        case "$(printf '%s' "${CLEANUP_PREVIOUS_NATIVE_REVIEWS:-auto}" | tr '[:upper:]' '[:lower:]')" in
-          true) CLEANUP_NATIVE_REVIEWS=true ;;
-          false) CLEANUP_NATIVE_REVIEWS=false ;;
-          auto|"") CLEANUP_NATIVE_REVIEWS=true ;;
-          *) echo "Invalid cleanup_previous_native_reviews value; expected auto, true, or false" >&2; exit 1 ;;
-        esac
-
-        # Cleanup previous managed native reviews if enabled
-        if [ "$CLEANUP_NATIVE_REVIEWS" = "true" ]; then
-          echo "Cleaning up previous managed native reviews for #$PR_NUMBER"
-          CURRENT_ACTOR="$(gh api user --jq .login 2>/dev/null || echo "")"
-          if [ -n "$CURRENT_ACTOR" ]; then
-            PREV_REVIEWS="$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --paginate --jq '.[] | select(.user.login == "'"$CURRENT_ACTOR"'" and (.body | contains("<!-- ai-pr-reviewer -->"))) | .id' 2>/dev/null || echo "")"
-            if [ -n "$PREV_REVIEWS" ]; then
-              while IFS= read -r REVIEW_ID; do
-                if [ -z "$REVIEW_ID" ]; then continue; fi
-                # Dismiss approval/request-changes reviews to stop stale verdicts from counting
-                REVIEW_STATE="$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --jq '.state // ""' 2>/dev/null || echo "")"
-                if [ "$REVIEW_STATE" = "APPROVED" ] || [ "$REVIEW_STATE" = "CHANGES_REQUESTED" ]; then
-                  if gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/dismissals" --method PUT -f message="Superseded by a newer automated review for this pull request." --jq '.id' >/dev/null 2>&1; then
-                    echo "  Dismissed outdated managed review #$REVIEW_ID ($REVIEW_STATE)"
-                  else
-                    echo "  WARN: Could not dismiss review #$REVIEW_ID (may require additional permissions)" >&2
-                  fi
-                fi
-                # Update body to compact outdated stub (best-effort)
-                OUTDATED_BODY="$(printf '<!-- ai-pr-reviewer -->\n_Outdated: superseded by a newer automated review._')"
-                if ! gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --method PATCH -f body="$OUTDATED_BODY" >/dev/null 2>&1; then
-                  echo "  WARN: Could not update review #$REVIEW_ID body (submitted reviews may be read-only)" >&2
-                else
-                  echo "  Marked review #$REVIEW_ID as outdated/superseded"
-                fi
-              done <<< "$PREV_REVIEWS"
-            else
-              echo "  No previous managed native reviews found for #$PR_NUMBER"
-            fi
-          else
-            echo "  WARN: Could not determine current actor; skipping cleanup" >&2
-          fi
-        fi
+        # Resolve cleanup flag and execute cleanup
+        CLEANUP_NATIVE_REVIEWS="$(resolve_cleanup_flag "${CLEANUP_PREVIOUS_NATIVE_REVIEWS:-auto}" "review_verdict")"
+        cleanup_native_reviews "$CLEANUP_NATIVE_REVIEWS"
 
         # Determine if the PR is from a fork
         IS_FORK_PR="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' 2>/dev/null || echo false)"
 
-        # Resolve effective scope from precheck
+        # Resolve effective scope and review result
         EFFECTIVE_SCOPE="${{ steps.precheck.outputs.effective_review_scope || 'full' }}"
         PREVIOUS_HEAD_SHA="${{ steps.precheck.outputs.previous_head_sha:-}}"
         BASELINE_CLEAN="${{ steps.precheck.outputs.baseline_clean:-false }}"
-
-        # Determine review result for metadata marker
         REVIEW_RESULT="clean"
         if [ "$VERDICT" = "request_changes" ]; then
           REVIEW_RESULT="issues"
         fi
 
         # Build metadata marker with verdict safety for incremental
-        METADATA_MARKER="<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"${HEAD_SHA:-unknown}\",\"base_sha\":\"${{ github.event.pull_request.base.sha || '' }}\",\"review_scope\":\"${EFFECTIVE_SCOPE}\",\"review_result\":\"${REVIEW_RESULT}\"}"
-        if [ "$EFFECTIVE_SCOPE" = "incremental" ] && [ -n "$PREVIOUS_HEAD_SHA" ]; then
-          METADATA_MARKER="${METADATA_MARKER%,*},\"previous_head_sha\":\"${PREVIOUS_HEAD_SHA}\"}"
-        fi
+        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || '' }}" "$PREVIOUS_HEAD_SHA")"
 
         # Evaluate approval guardrails with baseline check for incremental
         ALLOW_APPROVE_BOOL="$(printf '%s' "$ALLOW_APPROVE" | tr '[:upper:]' '[:lower:]')"
