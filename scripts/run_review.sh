@@ -754,6 +754,7 @@ fi
 build_review_corpus() {
   local corpus_type="${1:-full}"  # 'full' or 'incremental'
 
+  # Build non-standards body first (this is the portion subject to truncation)
   {
     echo "# Changed Manifest Context"
     cat manifest-context.md
@@ -822,8 +823,17 @@ build_review_corpus() {
     echo "# Repository History"
     cat repo-history.truncated.md
     echo
+  } > review-corpus.body.md
+
+  # Truncate only the non-standards body to MAX_CORPUS
+  head -c "$MAX_CORPUS" review-corpus.body.md > review-corpus.body.truncated.md
+
+  # Prepend standards section in full, then append truncated body
+  {
     echo "# Repository Standards and Conventions ($STANDARDS_FILE)"
     cat standards-context.md
+    echo
+    cat review-corpus.body.truncated.md
   } > review-corpus.md
 }
 
@@ -835,7 +845,7 @@ if [[ "$EFFECTIVE_SCOPE" == "incremental" && -n "$PREVIOUS_HEAD_SHA" ]]; then
 else
   build_review_corpus "full"
 fi
-head -c "$MAX_CORPUS" review-corpus.md > review-corpus.truncated.md
+cp review-corpus.md review-corpus.truncated.md
 
 if [[ "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" == "plan_execute_once" ]]; then
   if [[ "$IS_FORK_PR" == "true" ]] && [[ "$(printf '%s' "$TOOL_ENABLE_FOR_FORKS" | tr '[:upper:]' '[:lower:]')" != "true" ]]; then
@@ -858,7 +868,7 @@ EOF
     fi
   fi
   build_review_corpus
-  head -c "$MAX_CORPUS" review-corpus.md > review-corpus.truncated.md
+  cp review-corpus.md review-corpus.truncated.md
 fi
 
 log "Analyzing with $AI_MODEL using $AI_API_FORMAT API format..."

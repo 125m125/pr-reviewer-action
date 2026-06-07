@@ -37,19 +37,21 @@ publish_review_comment         → sanitizes markdown → builds managed comment
 
 ## Review corpus sections (in order)
 
-1. Changed Manifest Context (Helm/K8s manifests)
-2. PR Metadata (JSON from `gh pr view`)
-3. Linked Issue Context (from Fixes/Closes references in PR body)
-4. PR Files (truncated JSON with patches)
-5. Version Hints from Diff
-6. PR Diff (truncated)
-7. Linked Sources (fetched URLs, GitHub releases/compare metadata)
-8. Evidence Providers (user-defined command output)
-9. Tool Harness Findings (planned + executed tool results)
-10. Image Digest Provenance
-11. Repository Impact Scan (git grep hits for extracted terms)
-12. Repository History (git log context for extracted terms)
-13. Repository Standards and Conventions (from CLAUDE.md, AGENTS.md, etc.)
+1. Repository Standards and Conventions (from CLAUDE.md, AGENTS.md, etc.) — always included in full
+2. Changed Manifest Context (Helm/K8s manifests)
+3. PR Metadata (JSON from `gh pr view`)
+4. Linked Issue Context (from Fixes/Closes references in PR body)
+5. PR Files (truncated JSON with patches)
+6. Version Hints from Diff
+7. PR Diff (truncated)
+8. Linked Sources (fetched URLs, GitHub releases/compare metadata)
+9. Evidence Providers (user-defined command output)
+10. Tool Harness Findings (planned + executed tool results)
+11. Image Digest Provenance
+12. Repository Impact Scan (git grep hits for extracted terms)
+13. Repository History (git log context for extracted terms)
+
+Note: `MAX_CORPUS` truncation applies only to sections 2-13; the standards section (1) is always preserved in full.
 
 ## Running tests
 
