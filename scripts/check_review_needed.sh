@@ -17,9 +17,14 @@ if [[ -z "$REPO" || -z "$PR_NUMBER" ]]; then
 fi
 
 # ── Diff fingerprint (unchanged) ──────────────────────────────────────
-# Tolerate a failing `gh pr diff` (network/auth blip) under `set -o pipefail`
-# so the precheck degrades to a fresh review instead of aborting the action.
-current_fingerprint="$( { gh pr diff "$PR_NUMBER" --repo "$REPO" || true; } | git patch-id --stable | awk 'NR == 1 { print $1 }' || true)"
+# Tolerate a failing `gh pr diff` (network/auth blip) so the precheck degrades
+# to a fresh review instead of aborting the action. The diff is saved to
+# pr.diff so run_review.sh can reuse it instead of fetching it a second time —
+# this also guarantees the reviewed diff is the one that was fingerprinted.
+if ! gh pr diff "$PR_NUMBER" --repo "$REPO" > pr.diff 2>/dev/null; then
+  : > pr.diff
+fi
+current_fingerprint="$(git patch-id --stable < pr.diff | awk 'NR == 1 { print $1 }' || true)"
 if [[ -z "$current_fingerprint" ]]; then
   current_fingerprint="empty-diff"
 fi
@@ -222,6 +227,25 @@ if [[ "$SKIP_IF_DIFF_UNCHANGED" == "true" && -n "$last_broad_fingerprint" && "$l
   skip_reason="diff-unchanged"
 fi
 
+# ── Short-circuit when no review will run ─────────────────────────────
+# Scope resolution below costs a PR-object fetch plus (potentially) a compare
+# API call — all of it feeds steps that are gated on should_review=true, so
+# skip it entirely when the review is being skipped.
+if [[ "$should_review" == "false" ]]; then
+  {
+    echo "effective_review_scope=full"
+    echo "previous_head_sha="
+    echo "baseline_clean=false"
+    echo "head_sha="
+    echo "base_sha="
+    echo "is_fork_pr="
+    echo "diff_fingerprint=$broad_fingerprint"
+    echo "should_review=$should_review"
+    echo "skip_reason=$skip_reason"
+  } >> "$OUTPUT_FILE"
+  exit 0
+fi
+
 # ── Review scope resolution ───────────────────────────────────────────
 # Global variables for review scope resolution
 EFFECTIVE_SCOPE=""
@@ -355,14 +379,16 @@ if [[ -n "$last_comment_body" ]]; then
   extract_review_metadata "$last_comment_body"
 fi
 
-# Get current PR head/base SHAs. pr.json is not created until run_review.sh
-# runs (a later step), so reading it here always yielded an empty head SHA and
-# the force-push ancestor guard below never ran. Fetch both from the API in a
-# single call instead.
-pr_head_base_json="$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null || true)"
-[[ -n "$pr_head_base_json" ]] || pr_head_base_json='{}'
-CURRENT_HEAD_SHA="$(printf '%s' "$pr_head_base_json" | jq -r '.head.sha // ""' 2>/dev/null || echo "")"
-CURRENT_BASE_SHA="$(printf '%s' "$pr_head_base_json" | jq -r '.base.sha // ""' 2>/dev/null || echo "")"
+# Get the current PR object once. This is the single PR-object fetch point for
+# the whole action: the head/base SHAs drive scope resolution here, and the
+# object is saved to pr-object.json so run_review.sh (and the publish steps,
+# via the is_fork_pr output) do not have to fetch it again.
+if ! gh api "repos/$REPO/pulls/$PR_NUMBER" > pr-object.json 2>/dev/null; then
+  echo '{}' > pr-object.json
+fi
+CURRENT_HEAD_SHA="$(jq -r '.head.sha // ""' pr-object.json 2>/dev/null || echo "")"
+CURRENT_BASE_SHA="$(jq -r '.base.sha // ""' pr-object.json 2>/dev/null || echo "")"
+IS_FORK_PR="$(jq -r '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' pr-object.json 2>/dev/null || echo "")"
 
 # Resolve effective review scope
 resolve_review_scope "$REVIEW_SCOPE" "$LAST_HEAD_SHA" "$LAST_BASE_SHA" \
@@ -372,6 +398,12 @@ resolve_review_scope "$REVIEW_SCOPE" "$LAST_HEAD_SHA" "$LAST_BASE_SHA" \
 echo "effective_review_scope=$EFFECTIVE_SCOPE" >> "$OUTPUT_FILE"
 echo "previous_head_sha=$PREVIOUS_HEAD_SHA" >> "$OUTPUT_FILE"
 echo "baseline_clean=$BASELINE_CLEAN" >> "$OUTPUT_FILE"
+
+# Forward the PR facts fetched above so later steps can reuse them instead of
+# re-fetching the PR object.
+echo "head_sha=$CURRENT_HEAD_SHA" >> "$OUTPUT_FILE"
+echo "base_sha=$CURRENT_BASE_SHA" >> "$OUTPUT_FILE"
+echo "is_fork_pr=$IS_FORK_PR" >> "$OUTPUT_FILE"
 
 echo "diff_fingerprint=$broad_fingerprint" >> "$OUTPUT_FILE"
 echo "should_review=$should_review" >> "$OUTPUT_FILE"

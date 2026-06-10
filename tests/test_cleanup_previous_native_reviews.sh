@@ -237,6 +237,64 @@ check_exists "README warns about permission requirements" \
   "$(grep -ci 'permission\|warn' "$README_MD" || echo 0)"
 
 echo ""
+echo "=== Functional: cleanup_native_reviews matching + single list query ==="
+
+CLEANUP_TMP="$(mktemp -d)"
+trap 'rm -rf "$CLEANUP_TMP"' EXIT
+mkdir -p "$CLEANUP_TMP/bin"
+CALL_LOG="$CLEANUP_TMP/gh-calls.log"
+: > "$CALL_LOG"
+
+# Review fixtures: 11 carries a custom marker, 22 carries only the legacy
+# v1.1.x JSON metadata marker, 33 is a human review, 44 is unmanaged bot output.
+cat > "$CLEANUP_TMP/reviews.json" <<'JSONEOF'
+[
+  {"id": 11, "state": "APPROVED", "user": {"login": "test-bot"},
+   "body": "<!-- my-marker -->\n<!-- ai-pr-review-sha:abc -->\nold review"},
+  {"id": 22, "state": "CHANGES_REQUESTED", "user": {"login": "test-bot"},
+   "body": "<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"abc\"} -->\nlegacy review"},
+  {"id": 33, "state": "APPROVED", "user": {"login": "human"},
+   "body": "<!-- my-marker -->\nhuman pasted the marker"},
+  {"id": 44, "state": "COMMENTED", "user": {"login": "test-bot"},
+   "body": "unrelated bot output"}
+]
+JSONEOF
+
+cat > "$CLEANUP_TMP/bin/gh" <<SHELLEOF
+#!/usr/bin/env bash
+echo "\$*" >> "$CALL_LOG"
+if [ "\$1" = "api" ] && [ "\$2" = "user" ]; then echo "test-bot"; exit 0; fi
+case "\$*" in
+  *"/reviews --paginate"*) cat "$CLEANUP_TMP/reviews.json" ;;
+  *dismissals*) echo '{"id": 1}' ;;
+  *"--method PATCH"*) echo '{}' ;;
+esac
+exit 0
+SHELLEOF
+chmod +x "$CLEANUP_TMP/bin/gh"
+
+CLEANUP_OUTPUT="$(
+  PATH="$CLEANUP_TMP/bin:$PATH" \
+  GH_TOKEN=test REPO="test/repo" PR_NUMBER=9 COMMENT_MARKER="<!-- my-marker -->" \
+  bash -c 'source "'"$HELPER_SCRIPT"'"; cleanup_native_reviews true' 2>&1
+)"
+
+check_contains "custom-marker review is dismissed" \
+  "$CLEANUP_OUTPUT" "Dismissed outdated managed review #11 (APPROVED)"
+check_contains "legacy JSON-marker review is dismissed" \
+  "$CLEANUP_OUTPUT" "Dismissed outdated managed review #22 (CHANGES_REQUESTED)"
+check_not_contains "human review with pasted marker is untouched" \
+  "$CLEANUP_OUTPUT" "#33"
+check_not_contains "unmanaged bot review is untouched" \
+  "$CLEANUP_OUTPUT" "#44"
+
+# State must come from the list query — no per-review GETs.
+PER_REVIEW_GETS="$(grep -E 'reviews/[0-9]+' "$CALL_LOG" | grep -vc -- '--method' || true)"
+check "review state read from list query (no per-review GET)" "$PER_REVIEW_GETS" "0"
+LIST_QUERIES="$(grep -c '/reviews --paginate' "$CALL_LOG" || true)"
+check "exactly one review list query" "$LIST_QUERIES" "1"
+
+echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 
 if [[ "$FAIL" -gt 0 ]]; then

@@ -126,7 +126,11 @@ chmod +x "$TMPDIR/bin/git"
 run_precheck() {
   local output_file="$TMPDIR/out_$RANDOM$RANDOM"
   printf '%s' "$FIXED_DIFF" > /tmp/testfp_diff
+  # The precheck writes pr.diff / pr-object.json into its CWD; run it in a
+  # scratch workdir so test runs do not litter the repository root.
+  rm -rf "$TMPDIR/work" && mkdir -p "$TMPDIR/work"
   (
+    cd "$TMPDIR/work" || exit 1
     export PATH="$TMPDIR/bin:$PATH"
     export PR_HEAD_SHA="$PR_HEAD_SHA"
     export PR_BASE_SHA="$PR_BASE_SHA"
@@ -177,9 +181,6 @@ set_pr_data() {
   if [ -n "$PR_BASE_SHA" ]; then
     echo "$PR_BASE_SHA" >> "$SHA_TRACK_FILE"
   fi
-  cat > pr.json <<JSONEOF
-{"number":42,"title":"Test PR","headRefOid":"${PR_HEAD_SHA}","baseRefName":"main","headRefName":"feature","author":{"login":"test"},"changedFiles":1,"additions":1,"deletions":0,"files":[],"url":"https://github.com/test/repo/pull/42"}
-JSONEOF
 }
 
 # ── Test 1: review_scope=full always does full review ─────────────────

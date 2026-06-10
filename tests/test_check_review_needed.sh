@@ -42,6 +42,7 @@ index 123..456 644
 
 cat > "$TMPDIR/bin/gh" <<'SHELLEOF'
 #!/usr/bin/env bash
+echo "$*" >> /tmp/testfp_gh_calls.log
 case "$1" in
   "pr")
     case "$2" in
@@ -53,6 +54,8 @@ case "$1" in
       [ -f /tmp/testfp_reviews.json ] && cat /tmp/testfp_reviews.json
     elif echo "$*" | grep -q 'comments'; then
       cat /tmp/testfp_comments.json
+    elif echo "$*" | grep -q 'pulls/42'; then
+      [ -f /tmp/testfp_pr_object.json ] && cat /tmp/testfp_pr_object.json
     fi
     ;;
 esac
@@ -60,10 +63,24 @@ exit 0
 SHELLEOF
 chmod +x "$TMPDIR/bin/gh"
 
+cat > /tmp/testfp_pr_object.json <<'JSONEOF'
+{
+  "number": 42,
+  "head": {"sha": "aaaa111122223333aaaa111122223333aaaa1111", "ref": "feature", "repo": {"full_name": "test/repo"}},
+  "base": {"sha": "bbbb111122223333bbbb111122223333bbbb1111", "ref": "main", "repo": {"full_name": "test/repo"}}
+}
+JSONEOF
+
+# The precheck writes pr.diff / pr-object.json into its CWD; run it in a
+# scratch workdir so test runs do not litter the repository root.
+WORKDIR="$TMPDIR/work"
+
 run_precheck() {
   local output_file="$TMPDIR/out_$RANDOM$RANDOM"
   printf '%s' "$FIXED_DIFF" > /tmp/testfp_diff
+  rm -rf "$WORKDIR" && mkdir -p "$WORKDIR"
   (
+    cd "$WORKDIR" || exit 1
     PATH="$TMPDIR/bin:$PATH" \
     REPO="test/repo" \
     PR_NUMBER=42 \
@@ -127,7 +144,9 @@ set_empty_comments() {
 run_precheck_empty_diff() {
   local output_file="$TMPDIR/out_$RANDOM$RANDOM"
   printf '' > /tmp/testfp_diff
+  rm -rf "$WORKDIR" && mkdir -p "$WORKDIR"
   (
+    cd "$WORKDIR" || exit 1
     PATH="$TMPDIR/bin:$PATH" \
     REPO="test/repo" \
     PR_NUMBER=42 \
@@ -259,6 +278,40 @@ set_comments "<!-- ai-pr-reviewer -->
 APPROVE"
 RESULT="$(PUBLISH_MODE=review_verdict run_precheck)"
 check "should_review=true when only an issue comment matches (review_verdict)" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
+
+# ── Test 13: skip path short-circuits the PR-object fetch ─────────────
+echo ""
+echo "=== Test 13: should_review=false short-circuits scope resolution ==="
+rm -f /tmp/testfp_reviews.json
+set_empty_comments
+OUTPUT_FP_SC="$(run_precheck)"
+BROAD_FP_SC="$(echo "$OUTPUT_FP_SC" | grep '^diff_fingerprint=' | head -1 | cut -d= -f2)"
+set_comments "<!-- ai-pr-reviewer -->
+<!-- ai-pr-review-fingerprint:${BROAD_FP_SC} -->
+APPROVE"
+: > /tmp/testfp_gh_calls.log
+RESULT="$(run_precheck)"
+check "should_review=false on matching fingerprint" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "false"
+PULLS_FETCHES="$(grep -c 'api repos/test/repo/pulls/42$' /tmp/testfp_gh_calls.log || true)"
+check "PR object is not fetched when skipping" "$PULLS_FETCHES" "0"
+check "skip path still emits scope output" "$(echo "$RESULT" | grep -c '^effective_review_scope=')" "1"
+
+# ── Test 14: review path emits PR facts and reusable files ───────────
+echo ""
+echo "=== Test 14: review path forwards head/base SHA, fork flag, and files ==="
+set_empty_comments
+: > /tmp/testfp_gh_calls.log
+RESULT="$(run_precheck)"
+check "should_review=true" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
+check "head_sha output forwarded" "$(echo "$RESULT" | grep '^head_sha=' | head -1 | cut -d= -f2)" "aaaa111122223333aaaa111122223333aaaa1111"
+check "base_sha output forwarded" "$(echo "$RESULT" | grep '^base_sha=' | head -1 | cut -d= -f2)" "bbbb111122223333bbbb111122223333bbbb1111"
+check "is_fork_pr output forwarded" "$(echo "$RESULT" | grep '^is_fork_pr=' | head -1 | cut -d= -f2)" "false"
+check "pr.diff saved for reuse by run_review" "$(test -s "$WORKDIR/pr.diff" && echo yes || echo no)" "yes"
+check "pr-object.json saved for reuse by run_review" "$(test -s "$WORKDIR/pr-object.json" && echo yes || echo no)" "yes"
+PULLS_FETCHES="$(grep -c 'api repos/test/repo/pulls/42$' /tmp/testfp_gh_calls.log || true)"
+check "PR object fetched exactly once" "$PULLS_FETCHES" "1"
+DIFF_FETCHES="$(grep -c '^pr diff' /tmp/testfp_gh_calls.log || true)"
+check "diff fetched exactly once" "$DIFF_FETCHES" "1"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

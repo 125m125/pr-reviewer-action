@@ -353,22 +353,42 @@ apply_all_enforcement(
 section_timer_start "pr-context"
 log "Collecting PR context for #$PR_NUMBER in $REPO..."
 
-gh pr view "$PR_NUMBER" --repo "$REPO" \
-  --json number,title,body,headRefOid,baseRefName,headRefName,author,changedFiles,additions,deletions,files,url > pr.json
+# check_review_needed.sh (the precheck step) already fetched the PR object and
+# the full diff. Reuse them when present so the PR object and diff are each
+# fetched exactly once per run; fall back to fetching for standalone use
+# (smoke test, manual invocation).
+if [[ -s pr-object.json && "$(jq -r '.number // empty' pr-object.json 2>/dev/null)" == "$PR_NUMBER" ]]; then
+  log "Reusing PR object fetched by precheck"
+else
+  gh api "repos/$REPO/pulls/$PR_NUMBER" > pr-object.json
+fi
+jq '{number, title, body, headRefOid: .head.sha, baseRefName: .base.ref, headRefName: .head.ref, author: {login: (.user.login // "")}, changedFiles: .changed_files, additions, deletions, url: .html_url}' \
+  pr-object.json > pr.json
 
-IS_FORK_PR="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' 2>/dev/null || echo false)"
+IS_FORK_PR="$(jq -r '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' pr-object.json 2>/dev/null || echo false)"
 if [[ "$IS_FORK_PR" == "true" ]]; then
   log "Detected cross-repository pull request"
 fi
 
-gh pr diff "$PR_NUMBER" --repo "$REPO" > pr.diff
+if [[ -s pr.diff ]]; then
+  log "Reusing PR diff fetched by precheck"
+else
+  gh pr diff "$PR_NUMBER" --repo "$REPO" > pr.diff
+fi
 truncate_clean pr.diff pr.diff.truncated "$MAX_DIFF" '…[diff truncated to fit context budget]'
 
-gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate > pr-files.raw.json
+# One bounded page instead of --paginate: 100 files is far beyond what the
+# MAX_FILES byte budget keeps anyway, and unbounded pagination on huge PRs
+# both burned API quota and produced concatenated JSON documents.
+gh api "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" > pr-files.raw.json
 # Note: 'patch' is intentionally dropped — the per-file patches duplicate the
 # raw diff that is already embedded in the corpus, and the classifier does not
 # read them. Keeping them here doubled the diff bytes sent to the model.
-jq '[.[] | {filename,status,additions,deletions,changes,previous_filename}]' pr-files.raw.json > pr-files.json
+TOTAL_CHANGED_FILES="$(jq -r '.changedFiles // 0' pr.json 2>/dev/null || echo 0)"
+jq --argjson total "${TOTAL_CHANGED_FILES:-0}" \
+  '[.[] | {filename,status,additions,deletions,changes,previous_filename}]
+   + (if $total > 100 then [{note: "file list truncated to first 100 of \($total) changed files"}] else [] end)' \
+  pr-files.raw.json > pr-files.json
 truncate_clean pr-files.json pr-files.truncated.json "$MAX_FILES" '…[file list truncated]'
 
 jq -r '.body // ""' pr.json > pr-body.txt
@@ -465,6 +485,21 @@ else
 fi
 section_timer_end
 
+# Returns 0 when the URL's host is in ALLOWED_SOURCE_HOSTS.
+url_host_allowed() {
+  local host raw_host candidate
+  host=$(printf '%s' "$1" | sed -E 's#^https?://([^/]+).*#\1#' | tr '[:upper:]' '[:lower:]')
+  IFS=',' read -ra _allowed_hosts <<< "$ALLOWED_SOURCE_HOSTS"
+  for raw_host in "${_allowed_hosts[@]}"; do
+    candidate=$(printf '%s' "$raw_host" | xargs | tr '[:upper:]' '[:lower:]')
+    [ -n "$candidate" ] || continue
+    if [ "$host" = "$candidate" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 section_timer_start "enrichment"
 log "Gathering linked sources..."
 : > linked-sources.md
@@ -473,6 +508,30 @@ if [ -s urls.txt ]; then
   TARGET_VERSION="$(jq -r '.title' pr.json | sed -n 's/.*→ *v\?\([0-9][0-9.]*\).*/\1/p' | head -n1)"
   if [ -z "$TARGET_VERSION" ]; then
     TARGET_VERSION="$(grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' version-hints.truncated.txt 2>/dev/null | sed 's/^v//' | tail -n1 || true)"
+  fi
+
+  # Phase 1: fetch every allowlisted URL body in one parallel curl run instead
+  # of serially (25 URLs x 25s worst-case each). parallel-max covers the full
+  # URL cap so wall-clock is bounded by the single slowest transfer. URLs are
+  # space-free by construction (extracted with a space-excluding grep), so the
+  # unquoted curl-config value cannot smuggle extra directives.
+  : > curl-parallel.cfg
+  i=0
+  while IFS= read -r url; do
+    [ -z "$url" ] && continue
+    i=$((i + 1))
+    [ "$i" -gt 25 ] && break
+    normalized_url="$(printf '%s' "$url" | sed -E 's#^https?://redirect.github.com/#https://github.com/#')"
+    rm -f "source.$i.raw"
+    if url_host_allowed "$normalized_url"; then
+      {
+        echo "url = $normalized_url"
+        echo "output = source.$i.raw"
+      } >> curl-parallel.cfg
+    fi
+  done < urls.txt
+  if [ -s curl-parallel.cfg ]; then
+    curl -q -fsSL --parallel --parallel-max 25 --max-time 25 --config curl-parallel.cfg 2>/dev/null || true
   fi
 
   : > seen-repos.txt
@@ -497,20 +556,10 @@ if [ -s urls.txt ]; then
     } >> linked-sources.md
 
     host=$(printf '%s' "$normalized_url" | sed -E 's#^https?://([^/]+).*#\1#' | tr '[:upper:]' '[:lower:]')
-    allowed=0
-    IFS=',' read -ra allowed_hosts <<< "$ALLOWED_SOURCE_HOSTS"
-    for raw_host in "${allowed_hosts[@]}"; do
-      candidate=$(printf '%s' "$raw_host" | xargs | tr '[:upper:]' '[:lower:]')
-      [ -n "$candidate" ] || continue
-      if [ "$host" = "$candidate" ]; then
-        allowed=1
-        break
-      fi
-    done
 
-    if [ "$allowed" -eq 1 ]; then
-      if curl -fsSL -L --max-time 25 "$normalized_url" -o source.raw 2>/dev/null; then
-        head -c 5000 source.raw | tr $'\0' ' ' > source.tmp
+    if url_host_allowed "$normalized_url"; then
+      if [ -s "source.$i.raw" ]; then
+        head -c 5000 "source.$i.raw" | tr $'\0' ' ' > source.tmp
         if [ -s source.tmp ]; then
           echo '```text' >> linked-sources.md
           cat source.tmp >> linked-sources.md
