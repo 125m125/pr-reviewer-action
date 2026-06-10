@@ -167,6 +167,10 @@ inputs:
     description: Maximum seconds to spend on enrichment (linked source fetching, release metadata, ghcr.io lookups). Exceeding the budget stops further enrichment. Default 60.
     required: false
     default: "60"
+  image_digest_budget_sec:
+    description: Maximum seconds to spend on image digest provenance lookups (registry tokens, manifests, revision compares). 0 disables the budget. Default 60.
+    required: false
+    default: "60"
   evidence_providers_file:
     description: Optional JSON file in the reviewed repository that defines evidence providers to run before review
     required: false
@@ -179,6 +183,10 @@ inputs:
     description: Maximum stdout or stderr bytes captured per evidence provider command
     required: false
     default: "20000"
+  evidence_provider_parallelism:
+    description: Maximum evidence provider commands run concurrently. Set 1 to force serial execution when providers contend on shared files. Default 4.
+    required: false
+    default: "4"
   evidence_blocker_enforcement:
     description: If true, force request_changes when any evidence provider reports blocker severity
     required: false
@@ -424,9 +432,11 @@ runs:
         CONTEXT_LIMIT_MODE: ${{ inputs.context_limit_mode }}
         MODEL_CONTEXT_TOKENS: ${{ inputs.model_context_tokens }}
         ENRICHMENT_BUDGET_SEC: ${{ inputs.enrichment_budget_sec }}
+        IMAGE_DIGEST_BUDGET_SEC: ${{ inputs.image_digest_budget_sec }}
         EVIDENCE_PROVIDERS_FILE: ${{ inputs.evidence_providers_file }}
         EVIDENCE_PROVIDER_TIMEOUT_SEC: ${{ inputs.evidence_provider_timeout_sec }}
         EVIDENCE_PROVIDER_MAX_OUTPUT_BYTES: ${{ inputs.evidence_provider_max_output_bytes }}
+        EVIDENCE_PROVIDER_PARALLELISM: ${{ inputs.evidence_provider_parallelism }}
         EVIDENCE_BLOCKER_ENFORCEMENT: ${{ inputs.evidence_blocker_enforcement }}
         EVIDENCE_ENABLE_FOR_FORKS: ${{ inputs.evidence_enable_for_forks }}
         TOOL_MODE: ${{ inputs.tool_mode }}
@@ -459,7 +469,7 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
         BROAD_FINGERPRINT: ${{ steps.precheck.outputs.diff_fingerprint }}
         VERDICT: ${{ steps.review.outputs.verdict }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
@@ -484,7 +494,7 @@ runs:
         fi
 
         # Build metadata marker
-        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || '' }}" "${{ steps.precheck.outputs.previous_head_sha || '' }}")"
+        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}" "${{ steps.precheck.outputs.previous_head_sha || '' }}")"
         ANALYSIS_SCOPE_SUFFIX=""
         if [ "$EFFECTIVE_SCOPE" = "incremental" ]; then
           ANALYSIS_SCOPE_SUFFIX=" (incremental delta review)"
@@ -521,7 +531,7 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
         VERDICT: ${{ steps.review.outputs.verdict }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
         ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
@@ -551,7 +561,7 @@ runs:
         fi
 
         # Build metadata marker
-        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || '' }}" "")"
+        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}" "")"
         ANALYSIS_SCOPE_SUFFIX=""
         if [ "$EFFECTIVE_SCOPE" = "incremental" ]; then
           ANALYSIS_SCOPE_SUFFIX=" (incremental delta review)"
@@ -592,7 +602,7 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
         VERDICT: ${{ steps.review.outputs.verdict }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
         ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
@@ -616,8 +626,12 @@ runs:
         CLEANUP_NATIVE_REVIEWS="$(resolve_cleanup_flag "${CLEANUP_PREVIOUS_NATIVE_REVIEWS:-auto}" "review_verdict")"
         cleanup_native_reviews "$CLEANUP_NATIVE_REVIEWS"
 
-        # Determine if the PR is from a fork
-        IS_FORK_PR="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' 2>/dev/null || echo false)"
+        # Determine if the PR is from a fork. The precheck step already fetched
+        # the PR object; only fall back to the API when its output is missing.
+        IS_FORK_PR="${{ steps.precheck.outputs.is_fork_pr }}"
+        if [ -z "$IS_FORK_PR" ]; then
+          IS_FORK_PR="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' 2>/dev/null || echo false)"
+        fi
 
         # Resolve effective scope and review result
         EFFECTIVE_SCOPE="${{ steps.precheck.outputs.effective_review_scope || 'full' }}"
@@ -629,7 +643,7 @@ runs:
         fi
 
         # Build metadata marker with verdict safety for incremental
-        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || '' }}" "$PREVIOUS_HEAD_SHA")"
+        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}" "$PREVIOUS_HEAD_SHA")"
         ANALYSIS_SCOPE_SUFFIX=""
         if [ "$EFFECTIVE_SCOPE" = "incremental" ]; then
           ANALYSIS_SCOPE_SUFFIX=" (incremental delta review)"

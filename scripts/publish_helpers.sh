@@ -50,12 +50,23 @@ cleanup_native_reviews() {
   echo "Cleaning up previous managed native reviews for #$PR_NUMBER"
   CURRENT_ACTOR="$(gh api user --jq .login 2>/dev/null || echo "")"
   if [ -n "$CURRENT_ACTOR" ]; then
-    PREV_REVIEWS="$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --paginate --jq '.[] | select(.user.login == "'"$CURRENT_ACTOR"'" and (.body | contains("<!-- ai-pr-reviewer -->"))) | .id' 2>/dev/null || echo "")"
+    # Managed bodies start with the configured marker (or, for reviews created
+    # by older action versions, the bare/JSON "<!-- ai-pr-reviewer" prefix).
+    # Matching both fixes cleanup misses when comment_marker is customized or
+    # when v1.1.x-era reviews carried only the JSON metadata marker (#162).
+    # The list query carries id and state together so no per-review GET is
+    # needed afterwards.
+    PREV_REVIEWS="$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --paginate 2>/dev/null \
+      | jq -r --arg actor "$CURRENT_ACTOR" \
+          --arg marker "${COMMENT_MARKER:-<!-- ai-pr-reviewer -->}" \
+          '.[] | select(.user.login == $actor
+                and (((.body // "") | contains($marker))
+                     or ((.body // "") | startswith("<!-- ai-pr-reviewer"))))
+              | "\(.id)\t\(.state // "")"' 2>/dev/null || echo "")"
     if [ -n "$PREV_REVIEWS" ]; then
-      while IFS= read -r REVIEW_ID; do
+      while IFS=$'\t' read -r REVIEW_ID REVIEW_STATE; do
         if [ -z "$REVIEW_ID" ]; then continue; fi
         # Dismiss approval/request-changes reviews to stop stale verdicts from counting
-        REVIEW_STATE="$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --jq '.state // ""' 2>/dev/null || echo "")"
         if [ "$REVIEW_STATE" = "APPROVED" ] || [ "$REVIEW_STATE" = "CHANGES_REQUESTED" ]; then
           if gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/dismissals" --method PUT -f message="Superseded by a newer automated review for this pull request." --jq '.id' >/dev/null 2>&1; then
             echo "  Dismissed outdated managed review #$REVIEW_ID ($REVIEW_STATE)"

@@ -10,6 +10,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # Ensure the scripts directory is on sys.path so we can import shared helpers.
@@ -585,6 +586,45 @@ def execute_tool_request(
     return tool_result
 
 
+def execute_tool_requests(
+    normalized_requests,
+    workspace_root,
+    allowed_gh_repos,
+    current_repo,
+    allowed_hosts,
+    max_response_bytes,
+    request_timeout,
+):
+    """Execute normalized (tool_name, args) requests concurrently.
+
+    Tools are read-only, so they are safe to run in parallel; results are
+    returned in request order so the markdown/JSON output stays deterministic.
+    """
+    if not normalized_requests:
+        return []
+
+    def _run(pair):
+        tool_name, args = pair
+        return execute_tool_request(
+            tool_name,
+            args,
+            workspace_root,
+            allowed_gh_repos,
+            current_repo,
+            allowed_hosts,
+            max_response_bytes,
+            request_timeout,
+        )
+
+    if len(normalized_requests) == 1:
+        return [_run(normalized_requests[0])]
+
+    with ThreadPoolExecutor(
+        max_workers=min(4, len(normalized_requests))
+    ) as executor:
+        return list(executor.map(_run, normalized_requests))
+
+
 def tool_result_md_lines(index, tool_name, args, tool_result):
     """Generate markdown lines for a single tool result.
 
@@ -853,22 +893,23 @@ def main():
             md_lines.append(f"**Planning warning:** {result['planning_warning']}")
         md_lines.append("")
 
-        for i, raw_req in enumerate(requests_list[:max_requests]):
-            if not isinstance(raw_req, dict):
-                continue
-            tool_name, args = normalize_tool_request(raw_req)
-
-            tool_result = execute_tool_request(
-                tool_name,
-                args,
-                workspace_root,
-                allowed_gh_repos,
-                current_repo,
-                allowed_hosts,
-                max_response_bytes,
-                request_timeout,
-            )
-
+        normalized = [
+            normalize_tool_request(raw_req)
+            for raw_req in requests_list[:max_requests]
+            if isinstance(raw_req, dict)
+        ]
+        tool_results = execute_tool_requests(
+            normalized,
+            workspace_root,
+            allowed_gh_repos,
+            current_repo,
+            allowed_hosts,
+            max_response_bytes,
+            request_timeout,
+        )
+        for i, ((tool_name, args), tool_result) in enumerate(
+            zip(normalized, tool_results)
+        ):
             if tool_result["status"] == "ok":
                 result["executed_request_count"] += 1
 
@@ -919,20 +960,17 @@ def main():
     md_lines.append(f"**Planned requests:** {result['planned_request_count']}")
     md_lines.append("")
 
-    for i, call in enumerate(tool_calls[:max_requests]):
-        tool_name, args = normalize_tool_request(call)
-
-        tool_result = execute_tool_request(
-            tool_name,
-            args,
-            workspace_root,
-            allowed_gh_repos,
-            current_repo,
-            allowed_hosts,
-            max_response_bytes,
-            request_timeout,
-        )
-
+    normalized = [normalize_tool_request(call) for call in tool_calls[:max_requests]]
+    tool_results = execute_tool_requests(
+        normalized,
+        workspace_root,
+        allowed_gh_repos,
+        current_repo,
+        allowed_hosts,
+        max_response_bytes,
+        request_timeout,
+    )
+    for i, ((tool_name, args), tool_result) in enumerate(zip(normalized, tool_results)):
         if tool_result["status"] == "ok":
             result["executed_request_count"] += 1
 

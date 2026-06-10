@@ -1,10 +1,30 @@
 import json
+import os
 import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib import parse
 import subprocess
 import sys
 from typing import Optional
+
+
+def time_budget_deadline():
+    """Return a monotonic deadline from IMAGE_DIGEST_BUDGET_SEC (0 disables)."""
+    raw = os.getenv("IMAGE_DIGEST_BUDGET_SEC", "60").strip()
+    try:
+        budget = int(raw)
+    except ValueError:
+        budget = 60
+    if budget <= 0:
+        return None
+    return time.monotonic() + budget
+
+
+def deadline_exceeded(deadline):
+    return deadline is not None and time.monotonic() >= deadline
 
 
 def http_json(url, headers=None):
@@ -56,7 +76,23 @@ def registry_targets(repo: str):
     raise ValueError(f"unsupported registry for repo {repo}")
 
 
-def fetch_digest_metadata(repo: str, digest: str):
+# Anonymous pull tokens are scoped per repository, so one token serves every
+# digest/manifest/blob request for that repository. Cache them per token URL.
+_TOKEN_CACHE: dict = {}
+_TOKEN_LOCK = threading.Lock()
+
+
+def get_registry_token(token_url: str):
+    with _TOKEN_LOCK:
+        if token_url in _TOKEN_CACHE:
+            return _TOKEN_CACHE[token_url]
+    token = http_json(token_url).get("token")
+    with _TOKEN_LOCK:
+        _TOKEN_CACHE[token_url] = token
+    return token
+
+
+def fetch_digest_metadata(repo: str, digest: str, deadline=None):
     result = {
         "repository": repo,
         "digest": digest,
@@ -71,8 +107,10 @@ def fetch_digest_metadata(repo: str, digest: str):
         "indexManifests": None,
     }
     try:
+        if deadline_exceeded(deadline):
+            raise RuntimeError("image digest time budget exceeded")
         repo_path, token_url, base_url = registry_targets(repo)
-        token = http_json(token_url).get("token")
+        token = get_registry_token(token_url)
         if not token:
             raise RuntimeError("registry token unavailable")
 
@@ -104,6 +142,8 @@ def fetch_digest_metadata(repo: str, digest: str):
         config_digest = (manifest.get("config") or {}).get("digest")
         result["configDigest"] = config_digest
         if config_digest:
+            if deadline_exceeded(deadline):
+                raise RuntimeError("image digest time budget exceeded")
             config = http_json(
                 f"{base_url}/v2/{repo_path}/blobs/{config_digest}",
                 headers={"Authorization": f"Bearer {token}"},
@@ -155,7 +195,10 @@ def guess_repo_from_image(image_repo: str):
 
 
 def fetch_github_compare(
-    repo: Optional[str], old_rev: Optional[str], new_rev: Optional[str]
+    repo: Optional[str],
+    old_rev: Optional[str],
+    new_rev: Optional[str],
+    deadline=None,
 ):
     result = {
         "repo": repo,
@@ -176,6 +219,9 @@ def fetch_github_compare(
         return result
     if not old_rev or not new_rev:
         result["error"] = "revision labels missing"
+        return result
+    if deadline_exceeded(deadline):
+        result["error"] = "image digest time budget exceeded"
         return result
     try:
         data = http_json(
@@ -210,6 +256,56 @@ def fetch_github_compare(
     except Exception as exc:
         result["error"] = str(exc)
     return result
+
+
+def resolve_compare_repo(old_meta: dict, new_meta: dict, image_repo: str):
+    """Pick the GitHub repo to compare revisions against.
+
+    Returns (compare_repo, compare_repo_source, mismatch) where mismatch is
+    an (old_repo, new_repo) tuple when the OCI source labels disagree.
+    """
+    old_repo = github_repo_from_source(old_meta.get("source"))
+    new_repo = github_repo_from_source(new_meta.get("source"))
+    compare_repo = None
+    compare_repo_source = ""
+    mismatch = None
+    if old_repo and new_repo and old_repo == new_repo:
+        compare_repo = old_repo
+        compare_repo_source = "oci-source-label"
+    elif old_repo and not new_repo:
+        compare_repo = old_repo
+        compare_repo_source = "oci-source-label-old"
+    elif new_repo and not old_repo:
+        compare_repo = new_repo
+        compare_repo_source = "oci-source-label-new"
+    elif old_repo and new_repo and old_repo != new_repo:
+        mismatch = (old_repo, new_repo)
+    if not compare_repo:
+        guessed = guess_repo_from_image(image_repo)
+        if guessed:
+            compare_repo = guessed
+            compare_repo_source = "image-repo-heuristic"
+    return compare_repo, compare_repo_source, mismatch
+
+
+def fetch_all_metadata(changes, deadline=None, max_workers=8):
+    """Fetch digest metadata for every unique (repository, digest) in parallel."""
+    pairs = sorted(
+        {(change["repository"], change["old_digest"]) for change in changes}
+        | {(change["repository"], change["new_digest"]) for change in changes}
+    )
+    if not pairs:
+        return {}
+    if len(pairs) == 1:
+        repo, digest = pairs[0]
+        return {pairs[0]: fetch_digest_metadata(repo, digest, deadline)}
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(pairs))) as executor:
+        metas = list(
+            executor.map(
+                lambda pair: fetch_digest_metadata(pair[0], pair[1], deadline), pairs
+            )
+        )
+    return dict(zip(pairs, metas))
 
 
 def short(value):
@@ -314,12 +410,51 @@ def main():
     if not changes:
         lines.append("No image digest changes detected in PR diff.")
     else:
+        deadline = time_budget_deadline()
+
+        # Wave 1: digest metadata for all unique (repo, digest) pairs in
+        # parallel (registry tokens are cached per repo inside).
+        metas = fetch_all_metadata(changes, deadline)
+
+        # Wave 2: revision compares in parallel, deduplicated by
+        # (repo, old_rev, new_rev).
+        prepared = []
+        compare_keys = set()
+        for change in changes:
+            old_meta = metas[(change["repository"], change["old_digest"])]
+            new_meta = metas[(change["repository"], change["new_digest"])]
+            compare_repo, compare_repo_source, mismatch = resolve_compare_repo(
+                old_meta, new_meta, change["repository"]
+            )
+            key = (compare_repo, old_meta.get("revision"), new_meta.get("revision"))
+            compare_keys.add(key)
+            prepared.append(
+                (change, old_meta, new_meta, compare_repo, compare_repo_source, mismatch, key)
+            )
+
+        compare_keys = sorted(compare_keys, key=lambda k: tuple(str(p) for p in k))
+        with ThreadPoolExecutor(max_workers=min(8, len(compare_keys))) as executor:
+            compares = dict(
+                zip(
+                    compare_keys,
+                    executor.map(
+                        lambda key: fetch_github_compare(key[0], key[1], key[2], deadline),
+                        compare_keys,
+                    ),
+                )
+            )
+
         lines.append("# Image Digest Provenance Analysis")
         lines.append("")
-        for idx, change in enumerate(changes, start=1):
-            old_meta = fetch_digest_metadata(change["repository"], change["old_digest"])
-            new_meta = fetch_digest_metadata(change["repository"], change["new_digest"])
-
+        for idx, (
+            change,
+            old_meta,
+            new_meta,
+            compare_repo,
+            compare_repo_source,
+            mismatch,
+            compare_key,
+        ) in enumerate(prepared, start=1):
             lines.append(f"## Image {idx}: {change['repository']}")
             lines.append(f"- File: `{change['file']}`")
             lines.append(f"- Tag/variant: `{change['tag']}`")
@@ -348,30 +483,14 @@ def main():
                     "- Revision changed: **unknown** (missing OCI revision labels)"
                 )
 
-            old_repo = github_repo_from_source(old_meta.get("source"))
-            new_repo = github_repo_from_source(new_meta.get("source"))
-            compare_repo = None
-            compare_repo_source = ""
-            if old_repo and new_repo and old_repo == new_repo:
-                compare_repo = old_repo
-                compare_repo_source = "oci-source-label"
-            elif old_repo and not new_repo:
-                compare_repo = old_repo
-                compare_repo_source = "oci-source-label-old"
-            elif new_repo and not old_repo:
-                compare_repo = new_repo
-                compare_repo_source = "oci-source-label-new"
-            elif old_repo and new_repo and old_repo != new_repo:
+            if mismatch:
                 lines.append(
-                    f"- Root repo mismatch between old/new labels: `{old_repo}` vs `{new_repo}`"
+                    f"- Root repo mismatch between old/new labels: `{mismatch[0]}` vs `{mismatch[1]}`"
                 )
-            if not compare_repo:
-                guessed = guess_repo_from_image(change["repository"])
-                if guessed:
-                    compare_repo = guessed
-                    compare_repo_source = "image-repo-heuristic"
 
-            compare = fetch_github_compare(compare_repo, old_rev, new_rev)
+            # Compare results are shared between changes with the same key, so
+            # copy before stamping the per-change repo source.
+            compare = dict(compares[compare_key])
             compare["repo_source"] = compare_repo_source or None
 
             lines.append(

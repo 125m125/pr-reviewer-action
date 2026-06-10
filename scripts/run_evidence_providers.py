@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # Ensure the scripts directory is on sys.path so we can import shared helpers.
@@ -95,6 +96,124 @@ def parse_findings(payload: object) -> tuple[str, list[dict[str, str]]]:
     return highest, findings[:40]
 
 
+def run_provider(
+    index: int, provider: object, default_timeout: int, default_max_output: int
+) -> dict:
+    """Execute a single evidence provider and return its result entry."""
+    entry = {
+        "id": f"provider-{index}",
+        "status": "invalid",
+        "command": "",
+        "duration_sec": 0.0,
+        "exit_code": None,
+        "provider_severity": "info",
+        "findings": [],
+        "stdout": "",
+        "stderr": "",
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+    }
+
+    if isinstance(provider, dict) and provider.get("id"):
+        entry["id"] = str(provider["id"])
+
+    timeout = default_timeout
+    max_output = default_max_output
+    command = None
+
+    if isinstance(provider, dict):
+        command = provider.get("command")
+        if provider.get("timeout_sec") is not None:
+            try:
+                timeout = max(1, int(provider["timeout_sec"]))
+            except (TypeError, ValueError):
+                timeout = default_timeout
+        if provider.get("max_output_bytes") is not None:
+            try:
+                max_output = max(256, int(provider["max_output_bytes"]))
+            except (TypeError, ValueError):
+                max_output = default_max_output
+
+    if not command:
+        entry["status"] = "invalid"
+        entry["stderr"] = "Missing required field: command"
+        return entry
+
+    start = time.monotonic()
+    try:
+        if isinstance(command, list):
+            args = [str(part) for part in command]
+            entry["command"] = " ".join(shlex.quote(part) for part in args)
+            completed = subprocess.run(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+        else:
+            command_text = str(command)
+            entry["command"] = command_text
+            completed = subprocess.run(
+                ["bash", "-lc", command_text],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+
+        entry["duration_sec"] = round(time.monotonic() - start, 3)
+        entry["exit_code"] = completed.returncode
+        entry["status"] = "ok" if completed.returncode == 0 else "error"
+
+        # --- Secret redaction on stdout/stderr before capturing output ---
+        stdout_text = completed.stdout.decode("utf-8", errors="replace") if completed.stdout else ""
+        stderr_text = completed.stderr.decode("utf-8", errors="replace") if completed.stderr else ""
+        entry["stdout"], entry["stdout_truncated"] = mask_and_truncate(
+            stdout_text, max_output
+        )
+        entry["stderr"], entry["stderr_truncated"] = mask_and_truncate(
+            stderr_text, max_output
+        )
+    except subprocess.TimeoutExpired as exc:
+        entry["duration_sec"] = round(time.monotonic() - start, 3)
+        entry["status"] = "timeout"
+        entry["exit_code"] = None
+        stdout_raw = exc.stdout if isinstance(exc.stdout, bytes) else b""
+        stderr_raw = exc.stderr if isinstance(exc.stderr, bytes) else b""
+
+        # Redact before storing in the summary JSON and markdown.
+        entry["stdout"], entry["stdout_truncated"] = mask_and_truncate(
+            stdout_raw.decode("utf-8", errors="replace") if stdout_raw else "",
+            max_output,
+        )
+        entry["stderr"], entry["stderr_truncated"] = mask_and_truncate(
+            stderr_raw.decode("utf-8", errors="replace") if stderr_raw else "",
+            max_output,
+        )
+
+    # Also redact the stored stdout before JSON-parse attempt so that
+    # any secrets leaking into the parsed output are already gone.
+    entry["stdout"] = mask_secrets(entry["stdout"])
+
+    parsed = None
+    if entry["stdout"].strip():
+        try:
+            parsed = json.loads(entry["stdout"])
+        except json.JSONDecodeError:
+            parsed = None
+
+    if parsed is not None:
+        entry["output_format"] = "json"
+        severity, findings = parse_findings(parsed)
+        entry["provider_severity"] = severity
+        entry["findings"] = findings
+    else:
+        entry["output_format"] = "text"
+
+    return entry
+
+
 def write_outputs(summary: dict, markdown: str) -> None:
     Path("evidence-providers.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
@@ -151,122 +270,26 @@ def main() -> int:
 
     md_lines = ["Evidence providers executed before final review synthesis.", ""]
 
-    for index, provider in enumerate(providers[:25], start=1):
-        entry = {
-            "id": f"provider-{index}",
-            "status": "invalid",
-            "command": "",
-            "duration_sec": 0.0,
-            "exit_code": None,
-            "provider_severity": "info",
-            "findings": [],
-            "stdout": "",
-            "stderr": "",
-            "stdout_truncated": False,
-            "stderr_truncated": False,
-        }
+    # Providers are independent commands, so run them concurrently. Results
+    # keep config order regardless of completion order. Set
+    # EVIDENCE_PROVIDER_PARALLELISM=1 for providers that must run serially
+    # (e.g. they contend on the same working-tree files).
+    parallelism = env_int("EVIDENCE_PROVIDER_PARALLELISM", 4)
+    indexed = list(enumerate(providers[:25], start=1))
 
-        if isinstance(provider, dict) and provider.get("id"):
-            entry["id"] = str(provider["id"])
+    def _run(item: tuple) -> dict:
+        index, provider = item
+        return run_provider(index, provider, default_timeout, default_max_output)
 
-        timeout = default_timeout
-        max_output = default_max_output
-        command = None
+    if len(indexed) <= 1 or parallelism <= 1:
+        entries = [_run(item) for item in indexed]
+    else:
+        with ThreadPoolExecutor(max_workers=min(parallelism, len(indexed))) as executor:
+            entries = list(executor.map(_run, indexed))
 
-        if isinstance(provider, dict):
-            command = provider.get("command")
-            if provider.get("timeout_sec") is not None:
-                try:
-                    timeout = max(1, int(provider["timeout_sec"]))
-                except (TypeError, ValueError):
-                    timeout = default_timeout
-            if provider.get("max_output_bytes") is not None:
-                try:
-                    max_output = max(256, int(provider["max_output_bytes"]))
-                except (TypeError, ValueError):
-                    max_output = default_max_output
-
-        if not command:
-            entry["status"] = "invalid"
-            entry["stderr"] = "Missing required field: command"
-            summary["providers"].append(entry)
-            continue
-
-        start = time.monotonic()
-        try:
-            if isinstance(command, list):
-                args = [str(part) for part in command]
-                entry["command"] = " ".join(shlex.quote(part) for part in args)
-                completed = subprocess.run(
-                    args,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=timeout,
-                    check=False,
-                )
-            else:
-                command_text = str(command)
-                entry["command"] = command_text
-                completed = subprocess.run(
-                    ["bash", "-lc", command_text],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=timeout,
-                    check=False,
-                )
-
-            entry["duration_sec"] = round(time.monotonic() - start, 3)
-            entry["exit_code"] = completed.returncode
-            entry["status"] = "ok" if completed.returncode == 0 else "error"
-
-            # --- Secret redaction on stdout/stderr before capturing output ---
-            stdout_text = completed.stdout.decode("utf-8", errors="replace") if completed.stdout else ""
-            stderr_text = completed.stderr.decode("utf-8", errors="replace") if completed.stderr else ""
-            entry["stdout"], entry["stdout_truncated"] = mask_and_truncate(
-                stdout_text, max_output
-            )
-            entry["stderr"], entry["stderr_truncated"] = mask_and_truncate(
-                stderr_text, max_output
-            )
-        except subprocess.TimeoutExpired as exc:
-            entry["duration_sec"] = round(time.monotonic() - start, 3)
-            entry["status"] = "timeout"
-            entry["exit_code"] = None
-            stdout_raw = exc.stdout if isinstance(exc.stdout, bytes) else b""
-            stderr_raw = exc.stderr if isinstance(exc.stderr, bytes) else b""
-
-            # Redact before storing in the summary JSON and markdown.
-            entry["stdout"], entry["stdout_truncated"] = mask_and_truncate(
-                stdout_raw.decode("utf-8", errors="replace") if stdout_raw else "",
-                max_output,
-            )
-            entry["stderr"], entry["stderr_truncated"] = mask_and_truncate(
-                stderr_raw.decode("utf-8", errors="replace") if stderr_raw else "",
-                max_output,
-            )
-
-        # Also redact the stored stdout before JSON-parse attempt so that
-        # any secrets leaking into the parsed output are already gone.
-        entry["stdout"] = mask_secrets(entry["stdout"])
-
-        parsed = None
-        if entry["stdout"].strip():
-            try:
-                parsed = json.loads(entry["stdout"])
-            except json.JSONDecodeError:
-                parsed = None
-
-        if parsed is not None:
-            entry["output_format"] = "json"
-            severity, findings = parse_findings(parsed)
-            entry["provider_severity"] = severity
-            entry["findings"] = findings
-        else:
-            entry["output_format"] = "text"
-
+    for entry in entries:
         if entry["provider_severity"] == "blocker":
             summary["has_blocker"] = True
-
         summary["providers"].append(entry)
 
     if not summary["providers"]:
