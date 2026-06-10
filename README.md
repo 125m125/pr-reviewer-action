@@ -71,6 +71,8 @@ The classification is purely rule-based — no model calls are involved. It uses
 | `ai_primary_retries` | Number of retries for the primary model | No | `8` |
 | `on_model_failure` | Behavior when primary **and** fallback models fail: `fail` (fail the step) or `notice` (post a visible `request_changes` notice explaining the review could not run — never auto-approves) | No | `fail` |
 | `verdict_policy` | How the final verdict is decided: `model` (the model's own verdict) or `findings_severity_gated` (derived from structured findings: `request_changes` iff any blocker finding; falls back to the model verdict when no findings). Enforcement settings still apply afterwards | No | `model` |
+| `inline_findings` | Attach diff-anchorable structured findings as native line-anchored review comments in `review_comment`/`review_verdict` modes. Ignored for `comment` mode | No | `false` |
+| `inline_findings_max` | Maximum inline review comments per review when `inline_findings=true` | No | `20` |
 | `ai_primary_retry_delay_sec` | Delay between retries in seconds | No | `15` |
 | `allowed_source_hosts` | Comma-separated allowlist for linked URL fetching | No | `github.com,api.github.com,gitlab.com,registry.terraform.io,artifacthub.io` |
 | `system_prompt` | Optional system prompt override | No | bundled prompt |
@@ -558,6 +560,27 @@ With `verdict_policy: findings_severity_gated`, the verdict is derived determini
     ai_model: qwen3-32b
     ai_response_format: json_schema   # schema includes the findings array
     verdict_policy: findings_severity_gated
+```
+
+### Inline review comments from findings
+
+With `inline_findings: "true"` and a native publish mode, findings that carry a `file` + `line` anchoring to the PR diff are attached as **line-anchored review comments**:
+
+- `publish_mode: review_verdict` — the approve/request_changes review itself carries the inline comments (`comments[]` on the reviews API). If GitHub rejects the payload (e.g. an anchor raced a new push), the action falls back to the plain review, so publishing never fails because of inline findings.
+- `publish_mode: review_comment` — the sticky summary comment is published as usual, plus a separate native `COMMENT` review carrying the inline comments. That review includes the managed marker, so the next run's cleanup marks it superseded.
+- `publish_mode: comment` — ignored.
+
+Anchors are validated against the diff before submission (GitHub only accepts comments on lines present in the diff); findings without a valid anchor stay in the review body. Comment bodies are secret-masked and @-mention-neutralized like all published output, and capped by `inline_findings_max` (default 20).
+
+```yaml
+- uses: misospace/pr-reviewer-action@v1
+  with:
+    github_token: ${{ secrets.GITHUB_TOKEN }}
+    ai_base_url: http://llama-server.internal:8080/v1
+    ai_model: qwen3-32b
+    publish_mode: review_verdict
+    verdict_policy: findings_severity_gated
+    inline_findings: "true"
 ```
 
 ### Token-saving with incremental reviews
