@@ -76,9 +76,9 @@ cleanup_native_reviews() {
                    or ((.body // "") | startswith("<!-- ai-pr-reviewer")))
              | select(((.state // "") == "APPROVED" or (.state // "") == "CHANGES_REQUESTED")
                    or (((.body // "") | contains("_Outdated: superseded")) | not))
-             | "\(.id)\t\(.state // "")"' 2>/dev/null || echo "")"
+             | "\(.id)\t\(.node_id // "")\t\(.state // "")"' 2>/dev/null || echo "")"
   if [ -n "$PREV_REVIEWS" ]; then
-    while IFS=$'\t' read -r REVIEW_ID REVIEW_STATE; do
+    while IFS=$'\t' read -r REVIEW_ID REVIEW_NODE_ID REVIEW_STATE; do
       if [ -z "$REVIEW_ID" ]; then continue; fi
       # Dismiss approval/request-changes reviews to stop stale verdicts from counting
       if [ "$REVIEW_STATE" = "APPROVED" ] || [ "$REVIEW_STATE" = "CHANGES_REQUESTED" ]; then
@@ -88,10 +88,26 @@ cleanup_native_reviews() {
           echo "  WARN: Could not dismiss review #$REVIEW_ID (may require additional permissions)" >&2
         fi
       fi
-      # Update body to compact outdated stub (best-effort)
+      # Hide the review in the PR timeline. Dismissal only strikes the verdict;
+      # the full review text stays expanded without this. PullRequestReview
+      # implements GraphQL's Minimizable, the same mechanism as the UI's
+      # "Hide" menu.
+      if [ -n "$REVIEW_NODE_ID" ]; then
+        if gh api graphql \
+            -f query='mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { minimizedComment { isMinimized } } }' \
+            -f id="$REVIEW_NODE_ID" >/dev/null 2>&1; then
+          echo "  Minimized (hidden as outdated) review #$REVIEW_ID"
+        else
+          echo "  WARN: Could not minimize review #$REVIEW_ID (may require additional permissions)" >&2
+        fi
+      fi
+      # Collapse the body to a one-line stub so even an expanded review stays
+      # compact (and so already-processed reviews are skipped next run). The
+      # endpoint is PUT — the previous PATCH was a 404 that the old code
+      # misreported as "reviews may be read-only".
       OUTDATED_BODY="$(printf '<!-- ai-pr-reviewer -->\n_Outdated: superseded by a newer automated review._')"
-      if ! gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --method PATCH -f body="$OUTDATED_BODY" >/dev/null 2>&1; then
-        echo "  WARN: Could not update review #$REVIEW_ID body (submitted reviews may be read-only)" >&2
+      if ! gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --method PUT -f body="$OUTDATED_BODY" >/dev/null 2>&1; then
+        echo "  WARN: Could not update review #$REVIEW_ID body" >&2
       else
         echo "  Marked review #$REVIEW_ID as outdated/superseded"
       fi

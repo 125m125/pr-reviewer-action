@@ -257,13 +257,13 @@ CALL_LOG="$CLEANUP_TMP/gh-calls.log"
 # v1.1.x JSON metadata marker, 33 is a human review, 44 is unmanaged bot output.
 cat > "$CLEANUP_TMP/reviews.json" <<'JSONEOF'
 [
-  {"id": 11, "state": "APPROVED", "user": {"login": "test-bot"},
+  {"id": 11, "node_id": "PRR_node11", "state": "APPROVED", "user": {"login": "test-bot"},
    "body": "<!-- my-marker -->\n<!-- ai-pr-review-sha:abc -->\nold review"},
-  {"id": 22, "state": "CHANGES_REQUESTED", "user": {"login": "test-bot"},
+  {"id": 22, "node_id": "PRR_node22", "state": "CHANGES_REQUESTED", "user": {"login": "test-bot"},
    "body": "<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"abc\"} -->\nlegacy review"},
-  {"id": 33, "state": "APPROVED", "user": {"login": "human"},
+  {"id": 33, "node_id": "PRR_node33", "state": "APPROVED", "user": {"login": "human"},
    "body": "Quoting the bot here: <!-- my-marker -->\nhuman pasted the marker mid-body"},
-  {"id": 44, "state": "COMMENTED", "user": {"login": "test-bot"},
+  {"id": 44, "node_id": "PRR_node44", "state": "COMMENTED", "user": {"login": "test-bot"},
    "body": "unrelated bot output"}
 ]
 JSONEOF
@@ -274,7 +274,8 @@ echo "\$*" >> "$CALL_LOG"
 case "\$*" in
   *"/reviews --paginate"*) cat "$CLEANUP_TMP/reviews.json" ;;
   *dismissals*) echo '{"id": 1}' ;;
-  *"--method PATCH"*) echo '{}' ;;
+  *"api graphql"*) echo '{"data":{"minimizeComment":{"minimizedComment":{"isMinimized":true}}}}' ;;
+  *"--method PUT"*) echo '{}' ;;
 esac
 exit 0
 SHELLEOF
@@ -311,11 +312,11 @@ echo "=== Functional: identity-independent matching (installation tokens) ==="
 # bot identity without ever calling /user.
 cat > "$CLEANUP_TMP/reviews.json" <<'JSONEOF'
 [
-  {"id": 55, "state": "APPROVED", "user": {"login": "github-actions[bot]"},
+  {"id": 55, "node_id": "PRR_node55", "state": "APPROVED", "user": {"login": "github-actions[bot]"},
    "body": "<!-- ai-pr-reviewer -->\nold default-token review"},
-  {"id": 66, "state": "APPROVED", "user": {"login": "its-saffron[bot]"},
+  {"id": 66, "node_id": "PRR_node66", "state": "APPROVED", "user": {"login": "its-saffron[bot]"},
    "body": "<!-- ai-pr-reviewer -->\nold app-token review"},
-  {"id": 77, "state": "APPROVED", "user": {"login": "human"},
+  {"id": 77, "node_id": "PRR_node77", "state": "APPROVED", "user": {"login": "human"},
    "body": "LGTM"}
 ]
 JSONEOF
@@ -332,7 +333,8 @@ fi
 case "\$*" in
   *"/reviews --paginate"*) cat "$CLEANUP_TMP/reviews.json" ;;
   *dismissals*) echo '{"id": 1}' ;;
-  *"--method PATCH"*) echo '{}' ;;
+  *"api graphql"*) echo '{"data":{"minimizeComment":{"minimizedComment":{"isMinimized":true}}}}' ;;
+  *"--method PUT"*) echo '{}' ;;
 esac
 exit 0
 SHELLEOF
@@ -348,6 +350,8 @@ check_contains "default-token bot review is dismissed" \
   "$CLEANUP_OUTPUT" "Dismissed outdated managed review #55 (APPROVED)"
 check_contains "app-token bot review is dismissed (no identity needed)" \
   "$CLEANUP_OUTPUT" "Dismissed outdated managed review #66 (APPROVED)"
+check_contains "reviews are minimized (hidden) in the timeline" \
+  "$CLEANUP_OUTPUT" "Minimized (hidden as outdated) review #55"
 check_not_contains "human review untouched" \
   "$CLEANUP_OUTPUT" "#77"
 check_not_contains "cleanup is not skipped" \

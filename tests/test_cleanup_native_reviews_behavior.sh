@@ -52,7 +52,8 @@ fi
 case "$*" in
   *"/reviews --paginate"*) cat "$FIXTURE" ;;
   *"/dismissals --method PUT"*) echo '{"id": 1}' ;;
-  *"--method PATCH"*) echo '{}' ;;
+  *"api graphql"*) echo '{"data":{"minimizeComment":{"minimizedComment":{"isMinimized":true}}}}' ;;
+  *"--method PUT"*) echo '{}' ;;
   *) echo '{}' ;;
 esac
 MOCK
@@ -68,17 +69,17 @@ unset COMMENT_MARKER
 # publish steps actually emit (marker first line). Review 101 is authored by
 # an app bot, 102 by the default-token bot — author must not matter.
 jq -n '[
-  {id: 101, state: "APPROVED", user: {login: "its-saffron[bot]"},
+  {id: 101, node_id: "PRR_node101", state: "APPROVED", user: {login: "its-saffron[bot]"},
    body: "<!-- ai-pr-reviewer -->\n<!-- ai-pr-reviewer:{\"version\":1} -->\n# AI Automated Review\nLooks fine."},
-  {id: 102, state: "CHANGES_REQUESTED", user: {login: "github-actions[bot]"},
+  {id: 102, node_id: "PRR_node102", state: "CHANGES_REQUESTED", user: {login: "github-actions[bot]"},
    body: "<!-- ai-pr-reviewer:{\"version\":1} -->\nOld-era managed review."},
-  {id: 103, state: "APPROVED", user: {login: "human-reviewer"},
+  {id: 103, node_id: "PRR_node103", state: "APPROVED", user: {login: "human-reviewer"},
    body: "LGTM, nice work"},
-  {id: 104, state: "COMMENTED", user: {login: "another-human"},
+  {id: 104, node_id: "PRR_node104", state: "COMMENTED", user: {login: "another-human"},
    body: "I noticed the bot marker <!-- ai-pr-reviewer --> appears mid-body here."},
-  {id: 105, state: "DISMISSED", user: {login: "its-saffron[bot]"},
+  {id: 105, node_id: "PRR_node105", state: "DISMISSED", user: {login: "its-saffron[bot]"},
    body: "<!-- ai-pr-reviewer -->\n_Outdated: superseded by a newer automated review._"},
-  {id: 106, state: "APPROVED", user: {login: "its-saffron[bot]"},
+  {id: 106, node_id: "PRR_node106", state: "APPROVED", user: {login: "its-saffron[bot]"},
    body: "<!-- ai-pr-reviewer -->\n_Outdated: superseded by a newer automated review._"}
 ]' > "$FIXTURE"
 
@@ -88,22 +89,26 @@ OUT="$(cleanup_native_reviews "true" 2>&1)"
 CALLS="$(cat "$CALLS_LOG")"
 check_contains "app-bot APPROVED review 101 dismissed" "$CALLS" "reviews/101/dismissals --method PUT"
 check_contains "default-bot CHANGES_REQUESTED review 102 dismissed" "$CALLS" "reviews/102/dismissals --method PUT"
-check_contains "review 101 body stubbed" "$CALLS" "reviews/101 --method PATCH"
-check_contains "review 102 body stubbed" "$CALLS" "reviews/102 --method PATCH"
+check_contains "review 101 body stubbed via PUT" "$CALLS" "reviews/101 --method PUT"
+check_contains "review 101 minimized (hidden)" "$CALLS" "PRR_node101"
+check_contains "review 102 body stubbed via PUT" "$CALLS" "reviews/102 --method PUT"
+check_contains "review 102 minimized (hidden)" "$CALLS" "PRR_node102"
 check_not_contains "human review 103 untouched" "$CALLS" "reviews/103"
 check_not_contains "mid-body marker mention 104 untouched" "$CALLS" "reviews/104"
 check_not_contains "already-dismissed stub 105 skipped" "$CALLS" "reviews/105"
+check_not_contains "already-dismissed stub 105 not re-minimized" "$CALLS" "PRR_node105"
 check_contains "stubbed-but-still-APPROVED 106 re-dismissed" "$CALLS" "reviews/106/dismissals --method PUT"
 check_contains "dismissals logged" "$OUT" "Dismissed outdated managed review #101"
+check_contains "minimize logged" "$OUT" "Minimized (hidden as outdated) review #101"
 check_not_contains "no actor lookup performed" "$CALLS" "api user"
 
 echo ""
 echo "=== Custom comment_marker is matched at body start ==="
 : > "$CALLS_LOG"
 jq -n '[
-  {id: 201, state: "APPROVED", user: {login: "its-saffron[bot]"},
+  {id: 201, node_id: "PRR_node201", state: "APPROVED", user: {login: "its-saffron[bot]"},
    body: "<!-- my-custom-marker -->\nManaged with a custom marker."},
-  {id: 202, state: "APPROVED", user: {login: "human"},
+  {id: 202, node_id: "PRR_node202", state: "APPROVED", user: {login: "human"},
    body: "Unrelated approval"}
 ]' > "$FIXTURE"
 COMMENT_MARKER="<!-- my-custom-marker -->" cleanup_native_reviews "true" >/dev/null 2>&1
