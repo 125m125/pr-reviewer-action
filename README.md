@@ -112,6 +112,10 @@ The result is exposed as the `required_checks` output (`complete` / `incomplete`
 | `ai_smart_api_format` | API format for the smart model; defaults to `ai_fallback_api_format`, then `ai_api_format` | No | `""` |
 | `ai_smart_api_key` | API key for the smart model; defaults to `ai_fallback_api_key` | No | `""` |
 | `escalate_on_risk_flags` | Comma-separated `pr_kind`/`risk_flag` names that route to the smart model in `auto` mode | No | security/priority/auth/route/file-serving/path/secret/db list |
+| `escalate_on_incomplete_required_checks` | Escalate fast reviews with unaddressed required checks to the smart model (`auto` mode) | No | `true` |
+| `escalate_on_fast_request_changes` | Escalate fast reviews whose verdict is `request_changes` (`auto` mode) | No | `true` |
+| `escalate_on_fast_low_confidence` | Escalate low-confidence fast reviews (very short, or populated Unknowns section) (`auto` mode) | No | `true` |
+| `escalate_on_tool_or_evidence_blockers` | Escalate when evidence blockers or tool-harness failures exist (`auto` mode) | No | `true` |
 | `ai_primary_retry_delay_sec` | Delay between retries in seconds | No | `15` |
 | `allowed_source_hosts` | Comma-separated allowlist for linked URL fetching | No | `github.com,api.github.com,gitlab.com,registry.terraform.io,artifacthub.io` |
 | `system_prompt` | Optional system prompt override | No | bundled prompt |
@@ -165,7 +169,8 @@ The result is exposed as the `required_checks` output (`complete` / `incomplete`
 | `verdict` | `approve` or `request_changes` |
 | `verdict_source` | `model` or `findings`, per `verdict_policy` |
 | `required_checks` | Required-check validation status: `complete`, `incomplete`, or `none` (validation did not run) |
-| `review_route` | Model route used: `legacy` (routing off), `fast`, or `smart` |
+| `review_route` | Model route used: `legacy` (routing off), `fast`, `smart`, or `escalated` |
+| `escalation_reason` | Comma-separated escalation trigger names when `review_route` is `escalated` (empty otherwise) |
 | `findings` | Normalized structured findings as a JSON array (`[]` when the model produced none) |
 | `review_markdown` | Full markdown review body |
 | `analysis_engine` | Model and endpoint that produced the final result |
@@ -647,6 +652,17 @@ Routing rules:
 - `off` (the default) preserves the existing primary/fallback behavior exactly (`review_route` output reports `legacy`).
 - The retry and failure-fallback machinery is unchanged — routing only picks which model it talks to.
 - The chosen route appears in the `review_route` output, the step summary, and the managed metadata marker; routing config is part of the precheck fingerprint, so changing it forces a fresh review.
+
+#### Escalation of insufficient fast reviews
+
+In `auto` mode, a fast review can also be **escalated after the fact**: the action evaluates the raw fast output and re-runs the review on the smart model when any enabled trigger fires:
+
+- `escalate_on_fast_request_changes` — the fast model wants changes; let the smart model confirm or overturn before a human is summoned.
+- `escalate_on_incomplete_required_checks` — the fast review never discussed one of the classifier's required checks.
+- `escalate_on_fast_low_confidence` — the review is very short or carries a populated "Unknowns or Needs Verification" section.
+- `escalate_on_tool_or_evidence_blockers` — evidence providers reported a blocker or the tool harness failed.
+
+Only the **final** review is published. The fast result is kept on the runner as `ai-output.fast.json` for debugging; if the smart model fails, the fast review is published instead (never a failed run because of escalation). `review_route` reports `escalated` and `escalation_reason` lists the trigger names; both also land in the step summary and the managed metadata marker. Worst case is two model calls per review — the unchanged-diff skip and incremental scope keep that bounded.
 
 ### Token-saving with incremental reviews
 
