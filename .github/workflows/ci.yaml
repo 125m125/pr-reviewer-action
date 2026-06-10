@@ -30,7 +30,7 @@ jobs:
         run: ruby -e 'require "yaml"; YAML.load_file("examples/workflow-self-hosted.yml"); YAML.load_file("examples/workflow-cloud.yml")'
 
       - name: Check shell scripts
-        run: bash -n scripts/check_review_needed.sh && bash -n scripts/run_review.sh && bash -n tests/test_model_failure.sh && bash -n tests/test_step_summary.sh && bash -n scripts/model_call.sh && bash -n tests/smoke_test.sh && bash -n tests/test_check_review_needed.sh && bash -n tests/test_approval_guardrails.sh && bash -n tests/test_tool_harness_enforcement.sh && bash -n tests/test_cleanup_previous_native_reviews.sh && bash -n tests/test_model_call.sh && bash -n tests/test_context_budget.sh
+        run: bash -n scripts/check_review_needed.sh && bash -n scripts/run_review.sh && bash -n tests/test_model_failure.sh && bash -n tests/test_step_summary.sh && bash -n scripts/model_call.sh && bash -n tests/smoke_test.sh && bash -n tests/test_check_review_needed.sh && bash -n tests/test_approval_guardrails.sh && bash -n tests/test_tool_harness_enforcement.sh && bash -n tests/test_cleanup_previous_native_reviews.sh && bash -n tests/test_model_call.sh && bash -n tests/test_context_budget.sh && bash -n tests/test_classification_steering.sh
 
       - name: Check Python scripts
         run: python3 -m py_compile scripts/image_digest_analysis.py scripts/run_evidence_providers.py scripts/run_tool_harness.py tests/mock_openai_server.py tests/test_model_parsing.py tests/test_redact.py tests/test_strip_metadata_markers.py tests/test_evidence_providers.py
@@ -64,3 +64,6 @@ jobs:
 
       - name: Run context-budget tests
         run: bash tests/test_context_budget.sh
+
+      - name: Run classification steering tests
+        run: bash tests/test_classification_steering.sh
