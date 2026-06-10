@@ -393,6 +393,8 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
+        CI_STATUS_CHECK: ${{ inputs.ci_status_check }}
         CI_TIMEOUT_SEC: ${{ inputs.ci_timeout_sec }}
         CI_INTERVAL_SEC: ${{ inputs.ci_interval_sec }}
         CI_SKIP_ON_TIMEOUT: ${{ inputs.ci_skip_on_timeout }}

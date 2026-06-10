@@ -2,17 +2,30 @@
 set -euo pipefail
 
 # ── wait_for_ci.sh ──────────────────────────────────────────────────────
-# Polls GitHub's commit-status API until all checks are final (success/failure),
-# a skip signal is detected, or the timeout expires.
+# Polls GitHub's Checks API (primary signal) and the legacy commit-status
+# API (supplementary) until every external check is final, a failure is
+# detected, or the timeout expires.
+#
+# Two pitfalls this is built around:
+#   1. Repos that only use GitHub Actions never produce legacy commit
+#      statuses, so the combined-status state stays "pending" forever. The
+#      combined state therefore only counts when total_count > 0.
+#   2. The job running this action is itself a check run and would always be
+#      "in_progress". Every job belonging to the current workflow run is
+#      excluded via GITHUB_RUN_ID (check run detail/html URLs carry
+#      /runs/<run_id>/).
 #
 # Exit codes:
-#   0 – All checks reached a terminal state (success or failure).
+#   0 – All external checks reached a terminal state (success/failure/none).
 #   1 – Timeout reached and ci_skip_on_timeout=true (review may proceed anyway).
-#   2 – Fatal error (no token, repo/PR unresolvable, API unrecoverable).
+#   2 – Fatal error (no token, repo/PR unresolvable) or timeout with
+#       ci_skip_on_timeout=false.
 
 GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 REPO="${REPO:-${GITHUB_REPOSITORY:-}}"
 PR_NUMBER="${PR_NUMBER:-}"
+PR_HEAD_SHA="${PR_HEAD_SHA:-}"
+GITHUB_RUN_ID="${GITHUB_RUN_ID:-}"
 CI_STATUS_CHECK="${CI_STATUS_CHECK:-false}"
 CI_TIMEOUT_SEC="${CI_TIMEOUT_SEC:-300}"
 CI_INTERVAL_SEC="${CI_INTERVAL_SEC:-15}"
@@ -46,15 +59,27 @@ get_head_sha() {
   gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha' 2>/dev/null
 }
 
+finalize() {
+  local state="$1"
+  echo "ci_status_final=$state" >> "$OUTPUT_FILE"
+  echo "ci_status_skipped=false" >> "$OUTPUT_FILE"
+  exit 0
+}
+
 # ── Main loop ───────────────────────────────────────────────────────────
 
-sha="$(get_head_sha)"
+# The precheck step already fetched the PR object; reuse its head SHA when
+# forwarded instead of re-fetching.
+sha="$PR_HEAD_SHA"
+if [[ -z "$sha" ]]; then
+  sha="$(get_head_sha)"
+fi
 if [[ -z "$sha" ]]; then
   error "Could not resolve head SHA for #$PR_NUMBER"
   exit 2
 fi
 
-log "Polling commit-status for $sha (timeout=${CI_TIMEOUT_SEC}s, interval=${CI_INTERVAL_SEC}s)..."
+log "Polling CI checks for $sha (timeout=${CI_TIMEOUT_SEC}s, interval=${CI_INTERVAL_SEC}s, own run=${GITHUB_RUN_ID:-none})..."
 
 elapsed=0
 while true; do
@@ -71,54 +96,68 @@ while true; do
     fi
   fi
 
-  response="$(gh api "repos/$REPO/commits/$sha/status" 2>/dev/null || true)"
+  check_runs_response="$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" 2>/dev/null || echo "")"
+  combined_response="$(gh api "repos/$REPO/commits/$sha/status" 2>/dev/null || echo "")"
 
-  if [[ -z "$response" ]]; then
+  if [[ -z "$check_runs_response" && -z "$combined_response" ]]; then
     log "API returned empty; retrying in ${CI_INTERVAL_SEC}s..."
     sleep "$CI_INTERVAL_SEC"
     elapsed=$((elapsed + CI_INTERVAL_SEC))
     continue
   fi
+  [[ -n "$check_runs_response" ]] || check_runs_response='{}'
+  [[ -n "$combined_response" ]] || combined_response='{}'
 
-  # Determine overall state: pending | success | failure | error | neutral
-  overall="$(printf '%s' "$response" | jq -r '.state // "unknown"' 2>/dev/null || echo "unknown")"
+  # Summarize external check runs, excluding every job of our own workflow
+  # run. Conclusions that mean "CI did not pass or did not run" (failure,
+  # timed_out, cancelled, action_required) all count as failed.
+  summary="$(printf '%s' "$check_runs_response" | jq -c --arg run "$GITHUB_RUN_ID" '
+    ([.check_runs[]?
+      | select(
+          $run == ""
+          or ((((.details_url // "") | test("/runs/" + $run + "(/|$)"))
+               or ((.html_url // "") | test("/runs/" + $run + "(/|$)"))) | not)
+        )]) as $ext
+    | {
+        total: ($ext | length),
+        pending: ([$ext[] | select(.status != "completed")] | length),
+        failed: ([$ext[] | select(.status == "completed"
+                  and ((.conclusion // "") as $c
+                       | ($c == "failure" or $c == "timed_out"
+                          or $c == "cancelled" or $c == "action_required")))] | length)
+      }' 2>/dev/null || echo '{"total":0,"pending":0,"failed":0}')"
+  total_checks="$(printf '%s' "$summary" | jq -r '.total' 2>/dev/null || echo 0)"
+  pending_checks="$(printf '%s' "$summary" | jq -r '.pending' 2>/dev/null || echo 0)"
+  failed_checks="$(printf '%s' "$summary" | jq -r '.failed' 2>/dev/null || echo 0)"
 
-  # Check for any non-completed checks in the check-runs API as well (the combined
-  # status API sometimes lags behind). GitHub Checks API statuses are:
-  # queued, in_progress, completed, requested, waiting, stale.
-  # We count all runs where status != "completed" (i.e., still running or queued).
-  pending_checks=0
-  check_runs_response=""
-  if [[ "$overall" != "failure" && "$overall" != "success" ]]; then
-    # Fetch check-runs once and reuse for both pending and failed counts
-    check_runs_response="$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" 2>/dev/null || echo "{}")"
-    pending_checks="$(printf '%s' "$check_runs_response" | jq '[.check_runs[] | select(.status != "completed")] | length' 2>/dev/null || echo 0)"
+  combined_state="$(printf '%s' "$combined_response" | jq -r '.state // "pending"' 2>/dev/null || echo "pending")"
+  combined_total="$(printf '%s' "$combined_response" | jq -r '.total_count // 0' 2>/dev/null || echo 0)"
+
+  # Failure is terminal as soon as either signal reports it.
+  if [[ "$failed_checks" -gt 0 ]]; then
+    log "Detected $failed_checks failed check run(s) — treating as failure"
+    finalize "failure"
+  fi
+  if [[ "$combined_total" -gt 0 && ( "$combined_state" == "failure" || "$combined_state" == "error" ) ]]; then
+    log "Combined commit status reports $combined_state"
+    finalize "failure"
   fi
 
-  if [[ "$overall" == "success" || "$overall" == "failure" ]]; then
-    # Terminal state reached (even a single failure counts as terminal).
-    log "CI checks finalized: $overall"
-    echo "ci_status_final=$overall" >> "$OUTPUT_FILE"
-    echo "ci_status_skipped=false" >> "$OUTPUT_FILE"
-    exit 0
-  fi
-
-  # Detect failed check runs even when the combined status API hasn't caught up yet.
-  # This handles repos that rely primarily on GitHub Checks (not legacy statuses).
-  if [[ -n "$check_runs_response" ]]; then
-    failed_checks="$(printf '%s' "$check_runs_response" | jq '[.check_runs[] | select(.status == "completed" and .conclusion == "failure")] | length' 2>/dev/null || echo 0)"
-    if [[ "$failed_checks" -gt 0 ]]; then
-      log "Detected $failed_checks failed check run(s) before combined status updated — treating as failure"
-      echo "ci_status_final=failure" >> "$OUTPUT_FILE"
-      echo "ci_status_skipped=false" >> "$OUTPUT_FILE"
-      exit 0
+  if [[ "$pending_checks" -eq 0 ]] && \
+     { [[ "$combined_total" -eq 0 ]] || [[ "$combined_state" == "success" ]]; }; then
+    if [[ "$total_checks" -gt 0 || "$combined_total" -gt 0 ]]; then
+      log "CI checks finalized: success (${total_checks} external check run(s), ${combined_total} legacy status(es))"
+      finalize "success"
     fi
-  fi
-
-  if [[ "$pending_checks" -gt 0 ]]; then
-    log "Overall=$overall, $pending_checks check(s) not yet completed — waiting ${CI_INTERVAL_SEC}s..."
+    # No external CI exists at all. Give late-registering checks one grace
+    # window, then proceed instead of burning the full timeout.
+    if [[ "$elapsed" -ge $(( CI_INTERVAL_SEC * 2 )) ]]; then
+      log "No external CI checks found after ${elapsed}s — proceeding without CI gating"
+      finalize "none"
+    fi
+    log "No external CI checks registered yet — waiting ${CI_INTERVAL_SEC}s..."
   else
-    log "Overall=$overall — waiting ${CI_INTERVAL_SEC}s..."
+    log "Pending: ${pending_checks}/${total_checks} external check(s), combined=${combined_state} — waiting ${CI_INTERVAL_SEC}s..."
   fi
 
   sleep "$CI_INTERVAL_SEC"

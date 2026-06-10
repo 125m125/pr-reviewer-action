@@ -161,10 +161,113 @@ check_contains "stores check-runs response for reuse" \
 # ── Test 14: Failed check-run detection before combined status update ──
 echo ""
 echo "=== Test: failed check-run early detection ==="
-check_contains "detects failed check runs before combined status catches up" \
-  "$wait_content" '.conclusion == "failure"'
+check_contains "treats failure conclusions as failed" \
+  "$wait_content" '"failure"'
+check_contains "treats timed_out conclusions as failed" \
+  "$wait_content" '"timed_out"'
 check_contains "logs when failed check runs detected early" \
   "$wait_content" 'failed check run'
+
+# ── Test 15: own-run exclusion and step env wiring ──
+echo ""
+echo "=== Test: own workflow run excluded; step env wiring ==="
+check_contains "script excludes the action's own run via GITHUB_RUN_ID" \
+  "$wait_content" 'GITHUB_RUN_ID'
+check_contains "action.yml passes CI_STATUS_CHECK to the step (script guard)" \
+  "$ci_step_section" "CI_STATUS_CHECK:"
+check_contains "action.yml forwards PR_HEAD_SHA to avoid a re-fetch" \
+  "$ci_step_section" "PR_HEAD_SHA:"
+
+# ── Functional tests with a stubbed gh ──────────────────────────────────
+echo ""
+echo "=== Functional: wait_for_ci.sh against stubbed APIs ==="
+
+CI_TMP="$(mktemp -d)"
+trap 'rm -rf "$CI_TMP"' EXIT
+mkdir -p "$CI_TMP/bin"
+
+cat > "$CI_TMP/bin/gh" <<SHELLEOF
+#!/usr/bin/env bash
+case "\$*" in
+  *check-runs*) cat "$CI_TMP/check-runs.json" ;;
+  *commits*status*) cat "$CI_TMP/combined.json" ;;
+  *pulls*) echo "deadbeef" ;;
+esac
+exit 0
+SHELLEOF
+chmod +x "$CI_TMP/bin/gh"
+
+run_wait() {
+  local output_file="$CI_TMP/out_$RANDOM$RANDOM"
+  local rc=0
+  (
+    PATH="$CI_TMP/bin:$PATH" \
+    GH_TOKEN=test REPO="test/repo" PR_NUMBER=7 \
+    PR_HEAD_SHA="deadbeef" \
+    GITHUB_RUN_ID="999" \
+    CI_STATUS_CHECK=true \
+    CI_TIMEOUT_SEC="${CI_TIMEOUT_SEC_OVERRIDE:-6}" \
+    CI_INTERVAL_SEC=1 \
+    CI_SKIP_ON_TIMEOUT="${CI_SKIP_ON_TIMEOUT_OVERRIDE:-true}" \
+    GITHUB_OUTPUT="$output_file" \
+    bash "$WAIT_SCRIPT" >/dev/null 2>&1
+  ) || rc=$?
+  echo "rc=$rc"
+  cat "$output_file" 2>/dev/null || true
+}
+
+own_run='{"id": 1, "name": "ai-review", "status": "in_progress", "conclusion": null, "details_url": "https://github.com/test/repo/actions/runs/999/job/1", "html_url": "https://github.com/test/repo/actions/runs/999/job/1"}'
+ext_success='{"id": 2, "name": "build", "status": "completed", "conclusion": "success", "details_url": "https://github.com/test/repo/actions/runs/555/job/2", "html_url": "https://github.com/test/repo/actions/runs/555/job/2"}'
+ext_failure='{"id": 3, "name": "test", "status": "completed", "conclusion": "failure", "details_url": "https://github.com/test/repo/actions/runs/556/job/3", "html_url": "https://github.com/test/repo/actions/runs/556/job/3"}'
+ext_pending='{"id": 4, "name": "lint", "status": "in_progress", "conclusion": null, "details_url": "https://github.com/test/repo/actions/runs/557/job/4", "html_url": "https://github.com/test/repo/actions/runs/557/job/4"}'
+
+echo ""
+echo "--- Checks-only repo: external success despite pending combined status ---"
+echo "{\"check_runs\": [$own_run, $ext_success], \"total_count\": 2}" > "$CI_TMP/check-runs.json"
+echo '{"state": "pending", "total_count": 0}' > "$CI_TMP/combined.json"
+RESULT="$(run_wait)"
+check "exit 0 on checks-only success" "$(echo "$RESULT" | grep '^rc=')" "rc=0"
+check_contains "final state is success" "$RESULT" "ci_status_final=success"
+
+echo ""
+echo "--- Own run is the only check: concludes none instead of hanging ---"
+echo "{\"check_runs\": [$own_run], \"total_count\": 1}" > "$CI_TMP/check-runs.json"
+echo '{"state": "pending", "total_count": 0}' > "$CI_TMP/combined.json"
+RESULT="$(run_wait)"
+check "exit 0 when only own run exists" "$(echo "$RESULT" | grep '^rc=')" "rc=0"
+check_contains "final state is none" "$RESULT" "ci_status_final=none"
+
+echo ""
+echo "--- External check failure is terminal ---"
+echo "{\"check_runs\": [$own_run, $ext_failure], \"total_count\": 2}" > "$CI_TMP/check-runs.json"
+echo '{"state": "pending", "total_count": 0}' > "$CI_TMP/combined.json"
+RESULT="$(run_wait)"
+check "exit 0 on failure detection" "$(echo "$RESULT" | grep '^rc=')" "rc=0"
+check_contains "final state is failure" "$RESULT" "ci_status_final=failure"
+
+echo ""
+echo "--- Pending external check leads to timeout + skip ---"
+echo "{\"check_runs\": [$own_run, $ext_pending], \"total_count\": 2}" > "$CI_TMP/check-runs.json"
+echo '{"state": "pending", "total_count": 0}' > "$CI_TMP/combined.json"
+RESULT="$(CI_TIMEOUT_SEC_OVERRIDE=3 run_wait)"
+check "exit 1 on timeout with skip=true" "$(echo "$RESULT" | grep '^rc=')" "rc=1"
+check_contains "skipped output written" "$RESULT" "ci_status_skipped=true"
+
+echo ""
+echo "--- Legacy statuses: combined failure is terminal ---"
+echo '{"check_runs": [], "total_count": 0}' > "$CI_TMP/check-runs.json"
+echo '{"state": "failure", "total_count": 2}' > "$CI_TMP/combined.json"
+RESULT="$(run_wait)"
+check "exit 0 on combined failure" "$(echo "$RESULT" | grep '^rc=')" "rc=0"
+check_contains "final state is failure (combined)" "$RESULT" "ci_status_final=failure"
+
+echo ""
+echo "--- Legacy statuses: combined success is terminal ---"
+echo '{"check_runs": [], "total_count": 0}' > "$CI_TMP/check-runs.json"
+echo '{"state": "success", "total_count": 2}' > "$CI_TMP/combined.json"
+RESULT="$(run_wait)"
+check "exit 0 on combined success" "$(echo "$RESULT" | grep '^rc=')" "rc=0"
+check_contains "final state is success (combined)" "$RESULT" "ci_status_final=success"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
