@@ -112,6 +112,10 @@ AI_SMART_MODEL="${AI_SMART_MODEL:-}"
 AI_SMART_API_FORMAT="${AI_SMART_API_FORMAT:-}"
 AI_SMART_API_KEY="${AI_SMART_API_KEY:-}"
 ESCALATE_ON_RISK_FLAGS="${ESCALATE_ON_RISK_FLAGS:-linked_security_issue,linked_priority_p0,linked_priority_p1,auth_changes,public_route_changes,file_serving_changes,path_handling_changes,secret_handling_changes,db_or_migration_changes}"
+ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS="${ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS:-true}"
+ESCALATE_ON_FAST_REQUEST_CHANGES="${ESCALATE_ON_FAST_REQUEST_CHANGES:-true}"
+ESCALATE_ON_FAST_LOW_CONFIDENCE="${ESCALATE_ON_FAST_LOW_CONFIDENCE:-true}"
+ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS="${ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS:-true}"
 REVIEW_SCOPE="${REVIEW_SCOPE:-auto}"
 EFFECTIVE_SCOPE="${EFFECTIVE_SCOPE:-full}"
 PREVIOUS_HEAD_SHA="${PREVIOUS_HEAD_SHA:-}"
@@ -303,6 +307,11 @@ if [[ -n "$AI_SMART_API_FORMAT" ]] && ! AI_SMART_API_FORMAT="$(normalize_api_for
   error "Invalid AI_SMART_API_FORMAT '$AI_SMART_API_FORMAT'; expected openai or anthropic"
   exit 1
 fi
+
+ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS="$(printf '%s' "$ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS" | tr '[:upper:]' '[:lower:]')"
+ESCALATE_ON_FAST_REQUEST_CHANGES="$(printf '%s' "$ESCALATE_ON_FAST_REQUEST_CHANGES" | tr '[:upper:]' '[:lower:]')"
+ESCALATE_ON_FAST_LOW_CONFIDENCE="$(printf '%s' "$ESCALATE_ON_FAST_LOW_CONFIDENCE" | tr '[:upper:]' '[:lower:]')"
+ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS="$(printf '%s' "$ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS" | tr '[:upper:]' '[:lower:]')"
 
 if [[ -n "$AI_FALLBACK_BASE_URL" && -z "$AI_FALLBACK_MODEL" ]]; then
   error "AI_FALLBACK_MODEL is required when AI_FALLBACK_BASE_URL is set"
@@ -1352,6 +1361,84 @@ else
   fi
 fi
 
+# ── Escalation (#160) ────────────────────────────────────────────────
+# When the fast route produced this review and a configured trigger fires
+# (request_changes, unaddressed required checks, low confidence, blocker
+# signals), re-run the review on the smart model and publish only that
+# result. The fast output is kept as ai-output.fast.json for debugging. A
+# smart-model failure keeps the fast review — strictly better than failing.
+ESCALATION_REASONS=""
+maybe_escalate_review() {
+  [[ "$REVIEW_ROUTING_MODE" == "auto" ]] || return 0
+  [[ "${REVIEW_ROUTE:-legacy}" == "fast" ]] || return 0
+  [[ -n "$SMART_MODEL_RESOLVED" ]] || return 0
+  if [[ "$SMART_BASE_URL" == "$AI_BASE_URL" && "$SMART_MODEL" == "$AI_MODEL" ]]; then
+    return 0  # nothing distinct to escalate to
+  fi
+
+  # Decide on the RAW fast output, before verdict policy / completeness
+  # validation / enforcement mutate it.
+  local decision
+  decision="$(PYTHONPATH="${SCRIPT_DIR}/.." python3 -c "
+from pr_reviewer.escalation import should_escalate
+escalate, reasons = should_escalate(
+    on_incomplete=('$ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS' == 'true'),
+    on_request_changes=('$ESCALATE_ON_FAST_REQUEST_CHANGES' == 'true'),
+    on_low_confidence=('$ESCALATE_ON_FAST_LOW_CONFIDENCE' == 'true'),
+    on_blockers=('$ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS' == 'true'),
+)
+print('yes ' + ','.join(reasons) if escalate else 'no')
+" 2>/dev/null || echo no)"
+  if [[ "$decision" == "no" || -z "$decision" ]]; then
+    log "No escalation triggers fired; keeping the fast review"
+    return 0
+  fi
+  ESCALATION_REASONS="${decision#yes }"
+  log "Escalating to smart model $SMART_MODEL ($ESCALATION_REASONS)"
+
+  cp ai-output.json ai-output.fast.json
+
+  local escalated_user
+  escalated_user="$USER_MESSAGE
+This is an ESCALATED review: a faster preliminary review was judged insufficient (${ESCALATION_REASONS}). Review thoroughly and address every required check explicitly."
+
+  build_model_request \
+    "$SMART_API_FORMAT" \
+    "$SMART_MODEL" \
+    "$SYSTEM_PROMPT" \
+    "$escalated_user" \
+    review-corpus.truncated.md \
+    ai-request.smart.json \
+    "$STREAM_BOOL"
+
+  local attempt smart_ok=0
+  for attempt in 1 2; do
+    echo "Smart model attempt ${attempt}/2: $SMART_MODEL @ $SMART_BASE_URL ($SMART_API_FORMAT)"
+    if curl_model "$SMART_BASE_URL" "$SMART_API_KEY" "$SMART_API_FORMAT" ai-request.smart.json ai-response.smart.json "$STREAM_BOOL" "$AI_REQUEST_TIMEOUT_SEC" "$AI_CONNECT_TIMEOUT_SEC"; then
+      if { [[ "$STREAM_BOOL" != "true" ]] || reassemble_sse_response ai-response.smart.json "$SMART_API_FORMAT"; } && \
+        parse_and_validate ai-response.smart.json; then
+        smart_ok=1
+        break
+      fi
+    fi
+    sleep "$AI_PRIMARY_RETRY_DELAY_SEC"
+  done
+
+  if [[ "$smart_ok" -eq 1 ]]; then
+    REVIEW_ROUTE="escalated"
+    ROUTE_REASON="escalated: ${ESCALATION_REASONS}"
+    ANALYSIS_ENGINE="$SMART_MODEL@$SMART_BASE_URL ($SMART_API_FORMAT)"
+    log "Smart model succeeded; publishing the escalated review"
+  else
+    # parse_and_validate only rewrites ai-output.json on success, but restore
+    # defensively so a partial write can never replace the fast review.
+    cp ai-output.fast.json ai-output.json
+    ESCALATION_REASONS=""
+    log "Smart model failed after escalation; publishing the fast review"
+  fi
+}
+maybe_escalate_review
+
 EVIDENCE_BLOCKER_ENABLED="false"
 if [[ "$(printf '%s' "$EVIDENCE_BLOCKER_ENFORCEMENT" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
   EVIDENCE_BLOCKER_ENABLED="true"
@@ -1370,6 +1457,7 @@ echo "verdict=$(jq -r '.verdict' ai-output.json)" >> "$OUTPUT_FILE"
 echo "verdict_source=$(jq -r '.verdict_source // "model"' ai-output.json)" >> "$OUTPUT_FILE"
 echo "required_checks=$(jq -r '.required_checks // "none"' ai-output.json)" >> "$OUTPUT_FILE"
 echo "review_route=${REVIEW_ROUTE:-legacy}" >> "$OUTPUT_FILE"
+echo "escalation_reason=${ESCALATION_REASONS:-}" >> "$OUTPUT_FILE"
 
 # Use a random heredoc delimiter so model-controlled review text (which can be
 # influenced by prompt injection in the PR diff/title/body) cannot terminate the
