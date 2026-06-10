@@ -179,9 +179,9 @@ inputs:
     required: false
     default: "4"
   tool_planning_timeout_sec:
-    description: Timeout in seconds for the model planning call used by tool harness
+    description: Timeout in seconds for the model planning call used by tool harness. Non-streaming, so set generously for local models with slow prompt eval.
     required: false
-    default: "30"
+    default: "60"
   tool_planning_max_context_bytes:
     description: Maximum corpus bytes passed to the planning model
     required: false
