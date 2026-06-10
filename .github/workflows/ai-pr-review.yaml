@@ -51,8 +51,8 @@ jobs:
           ai_fallback_api_key: ${{ secrets.LITELLM_API_KEY }}
           review_routing_mode: auto
           ai_smart_base_url: ${{ vars.LITELLM_URL }}
-          ai_smart_api_format: ${{ vars.SMART_FORMAT || vars.FALLBACK_FORMAT }}
-          ai_smart_model: ${{ vars.SMART_MODEL || vars.FALLBACK_MODEL }}
+          ai_smart_api_format: ${{ vars.SMART_FORMAT }}
+          ai_smart_model: ${{ vars.SMART_MODEL }}
           ai_smart_api_key: ${{ secrets.LITELLM_API_KEY }}
           context_limit_mode: normal
           tool_mode: plan_execute_loop
