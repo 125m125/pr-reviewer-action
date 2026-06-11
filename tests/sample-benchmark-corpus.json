@@ -1,0 +1,63 @@
+{
+  "benchmark_corpus": [
+    {
+      "number": 110,
+      "repo_full_name": "misospace/pr-reviewer-action",
+      "url": "https://github.com/misospace/pr-reviewer-action/pull/110",
+      "title": "Security audit: first pass",
+      "known_findings": [
+        {
+          "category": "security",
+          "severity": "high",
+          "description": "Hardcoded API key found in configuration file"
+        },
+        {
+          "category": "correctness",
+          "severity": "medium",
+          "description": "Unreachable code after return statement"
+        }
+      ]
+    },
+    {
+      "number": 183,
+      "repo_full_name": "misospace/pr-reviewer-action",
+      "url": "https://github.com/misospace/pr-reviewer-action/pull/183",
+      "title": "Security audit: second pass",
+      "known_findings": [
+        {
+          "category": "security",
+          "severity": "critical",
+          "description": "Command injection via unsanitized user input in shell script"
+        },
+        {
+          "category": "correctness",
+          "severity": "high",
+          "description": "Race condition in concurrent file access"
+        },
+        {
+          "category": "security",
+          "severity": "medium",
+          "description": "Insecure TLS configuration allows downgrade attacks"
+        }
+      ]
+    },
+    {
+      "number": 153,
+      "repo_full_name": "misospace/pr-reviewer-action",
+      "url": "https://github.com/misospace/pr-reviewer-action/pull/153",
+      "title": "Fix HTML comment in metadata marker",
+      "known_findings": [
+        {
+          "category": "correctness",
+          "severity": "low",
+          "description": "Unclosed HTML comment causes invisible content in PR UI"
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "created_at": "2026-06-11T00:00:00Z",
+    "description": "Sample benchmark corpus for A/B eval harness. Uses real PRs from #110, #183 (audit PRs) and #153 as natural candidates per issue #207.",
+    "source_issue": 207
+  }
+}
