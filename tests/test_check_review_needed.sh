@@ -87,6 +87,8 @@ run_precheck() {
     ACTION_REF="${ACTION_REF:-}" \
     AI_MODEL="${AI_MODEL:-gpt-4}" \
     AI_API_FORMAT="${AI_API_FORMAT:-openai}" \
+    AI_REASONING_EFFORT="${AI_REASONING_EFFORT:-}" \
+    AI_VERDICT_REASONING_EFFORT="${AI_VERDICT_REASONING_EFFORT:-}" \
     AI_FALLBACK_MODEL="${AI_FALLBACK_MODEL:-}" \
     ANTHROPIC_VERSION="${ANTHROPIC_VERSION:-2023-06-01}" \
     SYSTEM_PROMPT="${SYSTEM_PROMPT:-}" \
@@ -203,6 +205,17 @@ echo ""
 echo "=== Test 5: Changed tool mode triggers fresh review ==="
 ACTION_REF="v1.0.0" AI_MODEL="gpt-4" AI_API_FORMAT="openai" CONTEXT_LIMIT_MODE="normal" TOOL_MODE="plan_execute_once" SKIP_IF_DIFF_UNCHANGED=true RESULT="$(run_precheck)"
 check "should_review=true when tool_mode changed" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
+
+echo ""
+echo "=== Test 5b: reasoning settings trigger fresh review ==="
+set_comments "<!-- ai-pr-reviewer -->
+<!-- ai-pr-review-fingerprint:${BROAD_FP} -->
+APPROVE"
+ACTION_REF="" AI_MODEL="gpt-4" AI_API_FORMAT="openai" CONTEXT_LIMIT_MODE="normal" TOOL_MODE="off" AI_REASONING_EFFORT="high" AI_VERDICT_REASONING_EFFORT="" RESULT="$(run_precheck)"
+check "should_review=true when general reasoning effort changed" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
+ACTION_REF="" AI_MODEL="gpt-4" AI_API_FORMAT="openai" CONTEXT_LIMIT_MODE="normal" TOOL_MODE="off" AI_REASONING_EFFORT="" AI_VERDICT_REASONING_EFFORT="none" RESULT="$(run_precheck)"
+check "should_review=true when verdict reasoning effort changed" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
+unset AI_REASONING_EFFORT AI_VERDICT_REASONING_EFFORT
 
 # ── Test 6: skip_if_diff_unchanged=false → always review ─────────────
 echo ""

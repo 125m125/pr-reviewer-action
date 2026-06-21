@@ -128,6 +128,36 @@ class TestTokensParam:
         assert "max_completion_tokens" not in payload
 
 
+class TestReasoningEffort:
+    def test_openai_includes_non_empty_value(self):
+        payload = Conversation(system="s").to_request_payload(
+            "openai", "m", reasoning_effort="low"
+        )
+        assert payload["reasoning_effort"] == "low"
+
+    def test_openai_omits_empty_and_none(self):
+        for value in ("", None):
+            payload = Conversation(system="s").to_request_payload(
+                "openai", "m", reasoning_effort=value
+            )
+            assert "reasoning_effort" not in payload
+
+    def test_anthropic_always_omits_value(self):
+        payload = Conversation(system="s").to_request_payload(
+            "anthropic", "m", reasoning_effort="high"
+        )
+        assert "reasoning_effort" not in payload
+
+    def test_verdict_turn_can_use_a_different_value(self):
+        conv = Conversation(system="s")
+        ordinary = conv.to_request_payload("openai", "m", reasoning_effort="high")
+        verdict = conv.to_request_payload(
+            "openai", "m", verdict_turn=True, reasoning_effort="none"
+        )
+        assert ordinary["reasoning_effort"] == "high"
+        assert verdict["reasoning_effort"] == "none"
+
+
 class TestAnthropicCachePrefix:
     """Anthropic prompt caching is opt-in (#263 Part 2): cache_control markers
     on the stable prefix (system + tools). Default off — unchanged wire shape."""

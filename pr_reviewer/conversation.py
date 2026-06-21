@@ -820,6 +820,7 @@ class Conversation:
         verdict_turn: bool = False,
         keep_full_history_on_verdict: bool = False,
         response_format: str | None = None,
+        reasoning_effort: str | None = None,
         tokens_param: str = "max_tokens",
         cache_prefix: bool = False,
     ) -> dict[str, Any]:
@@ -852,6 +853,7 @@ class Conversation:
             verdict_turn=verdict_turn,
             keep_full_history_on_verdict=keep_full_history_on_verdict,
             response_format=response_format,
+            reasoning_effort=reasoning_effort,
             tokens_param=tokens_param,
         )
 
@@ -865,6 +867,7 @@ class Conversation:
         verdict_turn: bool,
         keep_full_history_on_verdict: bool,
         response_format: str | None,
+        reasoning_effort: str | None = None,
         tokens_param: str = "max_tokens",
     ) -> dict[str, Any]:
         system = self.system
@@ -894,6 +897,8 @@ class Conversation:
         payload[field] = max_tokens
         if temperature is not None:
             payload["temperature"] = temperature
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
         if stream:
             payload["stream_options"] = {"include_usage": True}
         # The closing turn drops tools UNCONDITIONALLY — that is the

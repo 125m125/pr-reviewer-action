@@ -464,6 +464,31 @@ def test_native_loop_emits_in_conversation_verdict(monkeypatch, tmp_path):
     assert "the complete unified diff lives here" in user_text
 
 
+def test_native_loop_uses_general_and_verdict_reasoning_efforts(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_REASONING_EFFORT", "high")
+    monkeypatch.setenv("AI_VERDICT_REASONING_EFFORT", "none")
+    monkeypatch.setenv("AI_RESPONSE_FORMAT", "json_schema")
+    (tmp_path / "review-corpus.truncated.md").write_text("# corpus\nfull diff\n")
+    (tmp_path / "machineconfig.yaml.j2").write_text("install: v1.13.4\n")
+    verdict_json = '{"verdict":"approve","review_markdown":"ok","findings":[]}'
+    handled, _result, payloads = _run_capturing(
+        monkeypatch,
+        tmp_path,
+        "openai",
+        [
+            _openai_call("c1", "read_file", '{"path":"machineconfig.yaml.j2"}'),
+            _openai_text("done"),
+            {"choices": [{"message": {"content": verdict_json}}]},
+        ],
+    )
+    assert handled is True
+    assert all(p["reasoning_effort"] == "high" for p in payloads[:-1])
+    verdict_payload = payloads[-1]
+    assert verdict_payload["reasoning_effort"] == "none"
+    assert verdict_payload["response_format"]["type"] == "json_schema"
+    assert verdict_payload["response_format"]["json_schema"]["name"] == "pr_review"
+
+
 def test_native_loop_skips_verdict_for_anthropic(monkeypatch, tmp_path):
     """Anthropic native_loop keeps the standard corpus review: a verdict turn
     after trailing tool_result (user-role) blocks would make adjacent user

@@ -108,6 +108,8 @@ curl_model() {
 #   AI_TEMPERATURE    sampling temperature; empty => omit the field entirely
 #                     (some newer cloud models reject any non-default value)
 #   AI_RESPONSE_FORMAT  OpenAI-compatible structured output: off|json_object|json_schema
+#   AI_REASONING_EFFORT  Optional OpenAI-compatible reasoning effort
+#   AI_VERDICT_REASONING_EFFORT  Optional verdict override; empty inherits the general value
 #   AI_TOKENS_PARAM     OpenAI token-limit field name: max_tokens|max_completion_tokens
 #
 # response_format and the token-field name apply only to OpenAI-format requests
@@ -147,6 +149,7 @@ build_model_request() {
     fi
 
     local rf_json="null"
+    local reasoning_effort="${AI_VERDICT_REASONING_EFFORT:-${AI_REASONING_EFFORT:-}}"
     case "${AI_RESPONSE_FORMAT:-off}" in
       json_object)
         rf_json='{"type":"json_object"}' ;;
@@ -166,11 +169,13 @@ build_model_request() {
       --arg tokfield "$tok_field" \
       --argjson temp "$temp_json" \
       --argjson rf "$rf_json" \
+      --arg reasoning_effort "$reasoning_effort" \
       --rawfile corpus "$corpus_file" \
       '{model:$model,stream:$stream,messages:[{role:"system",content:$system},{role:"user",content:($user + "\n\n" + $corpus)}]}
        + {($tokfield): $max_tokens}
        + (if $temp == null then {} else {temperature:$temp} end)
        + (if $rf == null then {} else {response_format:$rf} end)
+       + (if $reasoning_effort == "" then {} else {reasoning_effort:$reasoning_effort} end)
        + (if $stream then {stream_options:{include_usage:true}} else {} end)' > "$output_file"
   fi
 }

@@ -220,6 +220,7 @@ def drive_tool_loop(
     temperature: float = 0.0,
     stream: bool = False,
     tokens_param: str = "max_tokens",
+    reasoning_effort: str | None = None,
     cache_prefix: bool = False,
     summarize_fn: Callable[[str], str] | None = None,
     time_fn: Callable[[], float] = time.monotonic,
@@ -277,6 +278,7 @@ def drive_tool_loop(
             stream=stream,
             max_tokens=max_tokens,
             temperature=temperature,
+            reasoning_effort=reasoning_effort,
             tokens_param=tokens_param,
             cache_prefix=cache_prefix,
         )

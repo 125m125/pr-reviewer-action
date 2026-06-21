@@ -160,6 +160,14 @@ def test_comment_marker_input_exists():
     )
 
 
+def test_reasoning_inputs_declared_and_wired():
+    content = (_REPO_ROOT / "action.yml").read_text()
+    inputs = parse_action_inputs()
+    assert {"ai_reasoning_effort", "ai_verdict_reasoning_effort"} <= inputs
+    assert "AI_REASONING_EFFORT: ${{ inputs.ai_reasoning_effort }}" in content
+    assert "AI_VERDICT_REASONING_EFFORT: ${{ inputs.ai_verdict_reasoning_effort }}" in content
+
+
 if __name__ == "__main__":
     test_readme_inputs_in_action()
     test_action_inputs_in_readme()

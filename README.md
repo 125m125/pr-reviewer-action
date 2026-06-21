@@ -200,6 +200,8 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `ai_max_tokens` | Maximum completion tokens for primary and fallback final review calls. Required by Anthropic-compatible APIs. **Reasoning models** (those that emit a thinking channel, e.g. Gemma) need this headroom — too low a cap is spent on reasoning, leaving empty content (`finish_reason=length`) so the verdict JSON fails to parse and the review needlessly escalates; raise to `16000`+ for verbose reasoners | No | `8192` |
 | `ai_temperature` | Sampling temperature for the review model. Empty string omits the field (some newer cloud models reject non-default temperature) | No | `0.1` |
 | `ai_response_format` | Structured-output mode for OpenAI-compatible endpoints (incl. LiteLLM): `off`, `json_object`, or `json_schema` (enforces the verdict/review_markdown schema). Ignored for `anthropic`. Improves reliability with smaller local models | No | `off` |
+| `ai_reasoning_effort` | Optional `reasoning_effort` for OpenAI-compatible calls. Empty omits the field; ignored for `anthropic` | No | `""` |
+| `ai_verdict_reasoning_effort` | Optional `reasoning_effort` override for final verdict calls. Empty inherits `ai_reasoning_effort`; ignored for `anthropic` | No | `""` |
 | `ai_tokens_param` | Token-limit field name for OpenAI-compatible requests: `max_tokens` or `max_completion_tokens` (newer OpenAI reasoning models). Ignored for `anthropic` | No | `max_tokens` |
 | `anthropic_version` | `anthropic-version` header used for Anthropic-compatible requests | No | `2023-06-01` |
 
@@ -961,6 +963,15 @@ ai_response_format: json_schema   # vLLM guided decoding, llama.cpp grammars, ne
 ```
 
 If the endpoint rejects the request after enabling this (HTTP 400 mentioning `response_format`), the server does not support that mode — drop back to `json_object` or `off`. Ignored entirely for `ai_api_format: anthropic`.
+
+LM Studio with Qwen 3.6 can keep reasoning enabled during native tool exploration while disabling it only for strict verdict serialization:
+
+```yaml
+ai_api_format: openai
+ai_response_format: json_schema
+ai_reasoning_effort: ""
+ai_verdict_reasoning_effort: none
+```
 
 ### ⏱️ Timeouts, streaming, and retries
 

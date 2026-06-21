@@ -158,6 +158,7 @@ REQ="$TMPDIR/req.json"
 check "openai default: temperature included" "$(jq -r '.temperature' "$REQ")" "0.1"
 check "openai default: max_tokens key present" "$(jq -r 'has("max_tokens")' "$REQ")" "true"
 check "openai default: no response_format" "$(jq -r 'has("response_format")' "$REQ")" "false"
+check "openai default: no reasoning_effort" "$(jq -r 'has("reasoning_effort")' "$REQ")" "false"
 check "openai: corpus appended to user message" \
   "$(jq -r '.messages[1].content' "$REQ" | grep -q 'CORPUS BODY' && echo yes || echo no)" "yes"
 
@@ -175,6 +176,14 @@ check "openai json_schema: findings is nullable (optional for weak models)" \
 check "openai json_schema: finding severity enum" \
   "$(jq -c '.response_format.json_schema.schema.properties.findings.items.properties.severity.enum' "$REQ")" '["blocker","major","minor","info"]'
 
+( AI_MAX_TOKENS=4096; AI_REASONING_EFFORT=high; AI_VERDICT_REASONING_EFFORT=none
+  build_model_request openai m "sys" "usr" "$CORPUS" "$REQ" false )
+check "openai: verdict reasoning override emitted" "$(jq -r '.reasoning_effort' "$REQ")" "none"
+
+( AI_MAX_TOKENS=4096; AI_REASONING_EFFORT=medium; AI_VERDICT_REASONING_EFFORT=""
+  build_model_request openai m "sys" "usr" "$CORPUS" "$REQ" false )
+check "openai: general reasoning effort inherited" "$(jq -r '.reasoning_effort' "$REQ")" "medium"
+
 ( AI_MAX_TOKENS=4096; AI_TOKENS_PARAM=max_completion_tokens
   build_model_request openai m "sys" "usr" "$CORPUS" "$REQ" false )
 check "openai: uses max_completion_tokens" "$(jq -r 'has("max_completion_tokens")' "$REQ")" "true"
@@ -184,10 +193,11 @@ check "openai: drops max_tokens when using max_completion_tokens" "$(jq -r 'has(
   build_model_request openai m "sys" "usr" "$CORPUS" "$REQ" false )
 check "openai: temperature omitted when empty" "$(jq -r 'has("temperature")' "$REQ")" "false"
 
-( AI_MAX_TOKENS=4096; AI_TEMPERATURE=0.1; AI_RESPONSE_FORMAT=json_object
+( AI_MAX_TOKENS=4096; AI_TEMPERATURE=0.1; AI_RESPONSE_FORMAT=json_object; AI_REASONING_EFFORT=high; AI_VERDICT_REASONING_EFFORT=none
   build_model_request anthropic m "sys" "usr" "$CORPUS" "$REQ" false )
 check "anthropic: max_tokens present" "$(jq -r 'has("max_tokens")' "$REQ")" "true"
 check "anthropic: no response_format (unsupported)" "$(jq -r 'has("response_format")' "$REQ")" "false"
+check "anthropic: no reasoning_effort (unsupported)" "$(jq -r 'has("reasoning_effort")' "$REQ")" "false"
 check "anthropic: system field present" "$(jq -r 'has("system")' "$REQ")" "true"
 
 CORPUS="$TMPDIR/corpus.md"

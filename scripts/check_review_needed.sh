@@ -91,6 +91,12 @@ compute_config_hash() {
   if [[ -n "${AI_RESPONSE_FORMAT:-}" ]]; then
     parts+=("response_format:${AI_RESPONSE_FORMAT}")
   fi
+  if [[ -n "${AI_REASONING_EFFORT+x}" ]]; then
+    parts+=("reasoning_effort:${AI_REASONING_EFFORT}")
+  fi
+  if [[ -n "${AI_VERDICT_REASONING_EFFORT+x}" ]]; then
+    parts+=("verdict_reasoning_effort:${AI_VERDICT_REASONING_EFFORT}")
+  fi
   if [[ -n "${AI_TOKENS_PARAM:-}" ]]; then
     parts+=("tokens_param:${AI_TOKENS_PARAM}")
   fi

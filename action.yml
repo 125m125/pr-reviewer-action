@@ -51,6 +51,18 @@ inputs:
       the primary and fallback review calls.
     required: false
     default: "off"
+  ai_reasoning_effort:
+    description: >-
+      Optional reasoning_effort value for OpenAI-compatible model calls. Empty omits the
+      field. Ignored for Anthropic-format endpoints.
+    required: false
+    default: ""
+  ai_verdict_reasoning_effort:
+    description: >-
+      Optional reasoning_effort override for the final structured verdict call. Empty
+      inherits ai_reasoning_effort. Ignored for Anthropic-format endpoints.
+    required: false
+    default: ""
   ai_tokens_param:
     description: >-
       Token-limit field name for OpenAI-compatible requests: max_tokens (default) or
@@ -629,6 +641,8 @@ runs:
         AI_API_FORMAT: ${{ inputs.ai_api_format }}
         AI_TEMPERATURE: ${{ inputs.ai_temperature }}
         AI_RESPONSE_FORMAT: ${{ inputs.ai_response_format }}
+        AI_REASONING_EFFORT: ${{ inputs.ai_reasoning_effort }}
+        AI_VERDICT_REASONING_EFFORT: ${{ inputs.ai_verdict_reasoning_effort }}
         AI_TOKENS_PARAM: ${{ inputs.ai_tokens_param }}
         AI_FALLBACK_MODEL: ${{ inputs.ai_fallback_model }}
         REVIEW_ROUTING_MODE: ${{ inputs.review_routing_mode }}
@@ -717,6 +731,8 @@ runs:
         AI_MAX_TOKENS: ${{ inputs.ai_max_tokens }}
         AI_TEMPERATURE: ${{ inputs.ai_temperature }}
         AI_RESPONSE_FORMAT: ${{ inputs.ai_response_format }}
+        AI_REASONING_EFFORT: ${{ inputs.ai_reasoning_effort }}
+        AI_VERDICT_REASONING_EFFORT: ${{ inputs.ai_verdict_reasoning_effort }}
         AI_TOKENS_PARAM: ${{ inputs.ai_tokens_param }}
         ANTHROPIC_VERSION: ${{ inputs.anthropic_version }}
         AI_FALLBACK_BASE_URL: ${{ inputs.ai_fallback_base_url }}

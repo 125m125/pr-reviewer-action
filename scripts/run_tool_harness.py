@@ -578,6 +578,7 @@ def run_native_loop(
     # truncates as before. The digest call rides the loop's post_fn so its spend
     # is counted in usage_acc and it gets the same streamed-turn fallback.
     summarize_fn = None
+    reasoning_effort = os.getenv("AI_REASONING_EFFORT", "").strip() or None
     if os.getenv("TOOL_LOOP_SUMMARIZE", "false").strip().lower() == "true":
         summarize_max_tokens = env_int_bounded(
             "TOOL_LOOP_SUMMARIZE_MAX_TOKENS", 512, 128, 4096
@@ -592,6 +593,7 @@ def run_native_loop(
                 stream=False,
                 max_tokens=summarize_max_tokens,
                 temperature=0.0,
+                reasoning_effort=reasoning_effort,
                 tokens_param=tokens_param,
             )
             _, summary = extract_tool_calls(post_fn(payload), api_format)
@@ -606,6 +608,7 @@ def run_native_loop(
         budgets=budgets,
         max_tokens=planning_max_tokens,
         stream=stream,
+        reasoning_effort=reasoning_effort,
         tokens_param=tokens_param,
         cache_prefix=True,
         summarize_fn=summarize_fn,
@@ -652,6 +655,10 @@ def run_native_loop(
                 temperature = float(temp_raw) if temp_raw else None
                 rf = os.getenv("AI_RESPONSE_FORMAT", "off").strip().lower()
                 response_format = rf if rf in ("json_object", "json_schema") else None
+                verdict_reasoning_effort = (
+                    os.getenv("AI_VERDICT_REASONING_EFFORT", "").strip()
+                    or reasoning_effort
+                )
                 verdict_payload = conversation.to_request_payload(
                     api_format,
                     model,
@@ -661,6 +668,7 @@ def run_native_loop(
                     verdict_turn=True,
                     keep_full_history_on_verdict=True,
                     response_format=response_format,
+                    reasoning_effort=verdict_reasoning_effort,
                     tokens_param=tokens_param,
                     cache_prefix=True,
                 )
