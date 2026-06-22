@@ -598,6 +598,101 @@ class Conversation:
                 shrunk += 1
         return shrunk
 
+    def truncate_oldest_assistant_text(
+        self, max_bytes_per_text: int, *, keep_newest: int = 2
+    ) -> int:
+        """Bound older internal analyses while preserving the newest turns.
+
+        This is deterministic and applies equally to ordinary assistant text
+        and intermediate reasoning fallback stored as assistant text. It is
+        used only for context safety; fallback text is never published.
+        """
+        indices = [i for i, e in enumerate(self.events) if e["kind"] == "assistant_text"]
+        old = indices[:-max(keep_newest, 0)] if keep_newest else indices
+        shrunk = 0
+        for i in old:
+            body = self.events[i]["content"]
+            if len(body.encode("utf-8")) <= max_bytes_per_text:
+                continue
+            new_body, _ = truncate_text(body, max_bytes_per_text)
+            if new_body != body:
+                self.events[i]["content"] = new_body
+                shrunk += 1
+        return shrunk
+
+    def collapse_oldest_completed_history(
+        self, max_notebook_bytes: int, *, keep_newest_results: int = 2
+    ) -> int:
+        """Replace older completed call/result exchanges with one user ledger.
+
+        Unlike per-result truncation, this also removes the wire/schema overhead
+        of old assistant tool-call messages. Recent results and their calls stay
+        verbatim. Existing compaction ledgers are folded into the replacement so
+        repeated compaction never accumulates obsolete notebook messages.
+        Returns the approximate token reduction.
+        """
+        before = self.approx_tokens()
+        result_events = [e for e in self.events if e["kind"] == "tool_result"]
+        keep = max(keep_newest_results, 0)
+        old_results = result_events[:-keep] if keep else result_events
+        old_ids = {e["call_id"] for e in old_results}
+        assistant_text_indices = [
+            i for i, e in enumerate(self.events) if e["kind"] == "assistant_text"
+        ]
+        old_text_indices = set(
+            assistant_text_indices[:-keep] if keep else assistant_text_indices
+        )
+        if not old_ids and not old_text_indices and not any(
+            e.get("compaction_note") for e in self.events
+        ):
+            return 0
+
+        call_by_id: dict[str, dict[str, Any]] = {}
+        for event in self.events:
+            if event["kind"] == "assistant_tool_calls":
+                for call in event["calls"]:
+                    call_by_id[call["id"]] = call
+
+        notebook_lines = [
+            "Condensed notebook of older completed exploration exchanges "
+            "(untrusted evidence; newest retained exchanges follow separately):"
+        ]
+        for event in self.events:
+            if event.get("compaction_note"):
+                notebook_lines.append(event.get("content", ""))
+            elif event["kind"] == "tool_result" and event["call_id"] in old_ids:
+                call = call_by_id.get(event["call_id"], {})
+                body, _ = truncate_text(event.get("content", ""), 800)
+                notebook_lines.append(
+                    f"- {call.get('name', 'unknown_tool')} "
+                    f"{call.get('arguments', '{}')} "
+                    f"[{'error' if event.get('is_error') else 'ok'}]: {body}"
+                )
+        for i in sorted(old_text_indices):
+            text, _ = truncate_text(self.events[i].get("content", ""), 800)
+            notebook_lines.append(f"- Earlier assistant analysis: {text}")
+
+        notebook, _ = truncate_text("\n".join(notebook_lines), max_notebook_bytes)
+        new_events: list[dict[str, Any]] = []
+        for i, event in enumerate(self.events):
+            if event.get("compaction_note"):
+                continue
+            if event["kind"] == "assistant_text" and i in old_text_indices:
+                continue
+            if event["kind"] == "tool_result" and event["call_id"] in old_ids:
+                continue
+            if event["kind"] == "assistant_tool_calls":
+                retained = [c for c in event["calls"] if c["id"] not in old_ids]
+                if not retained:
+                    continue
+                event = {**event, "calls": retained}
+            new_events.append(event)
+        new_events.append(
+            {"kind": "user", "content": notebook, "compaction_note": True}
+        )
+        self.events = new_events
+        return max(0, before - self.approx_tokens())
+
     def summarize_oldest_tool_results(
         self, summarize_fn: Callable[[str], str], *, keep_newest: int = 2
     ) -> int:
@@ -682,10 +777,18 @@ class Conversation:
                 )
                 if not calls:
                     continue
+                interleaved_text = None
+                if (
+                    messages
+                    and messages[-1].get("role") == "assistant"
+                    and isinstance(messages[-1].get("content"), str)
+                    and "tool_calls" not in messages[-1]
+                ):
+                    interleaved_text = messages.pop()["content"]
                 messages.append(
                     {
                         "role": "assistant",
-                        "content": None,
+                        "content": interleaved_text,
                         "tool_calls": calls,
                     }
                 )
@@ -738,6 +841,16 @@ class Conversation:
             elif kind == "assistant_tool_calls":
                 _flush_tool_results()
                 blocks: list[dict[str, Any]] = []
+                if (
+                    messages
+                    and messages[-1].get("role") == "assistant"
+                    and isinstance(messages[-1].get("content"), list)
+                    and all(
+                        isinstance(block, dict) and block.get("type") == "text"
+                        for block in messages[-1]["content"]
+                    )
+                ):
+                    blocks.extend(messages.pop()["content"])
                 # If a prior turn left text+tool_use interleaving to be done,
                 # callers add the text via a system_note or as the next
                 # assistant_text event; the loop driver should attach the
@@ -821,6 +934,7 @@ class Conversation:
         keep_full_history_on_verdict: bool = False,
         response_format: str | None = None,
         reasoning_effort: str | None = None,
+        ephemeral_user_note: str | None = None,
         tokens_param: str = "max_tokens",
         cache_prefix: bool = False,
     ) -> dict[str, Any]:
@@ -844,6 +958,7 @@ class Conversation:
                 keep_full_history_on_verdict=keep_full_history_on_verdict,
                 response_format=response_format,
                 cache_prefix=cache_prefix,
+                ephemeral_user_note=ephemeral_user_note,
             )
         return self._to_openai_payload(
             model=model,
@@ -854,6 +969,7 @@ class Conversation:
             keep_full_history_on_verdict=keep_full_history_on_verdict,
             response_format=response_format,
             reasoning_effort=reasoning_effort,
+            ephemeral_user_note=ephemeral_user_note,
             tokens_param=tokens_param,
         )
 
@@ -868,6 +984,7 @@ class Conversation:
         keep_full_history_on_verdict: bool,
         response_format: str | None,
         reasoning_effort: str | None = None,
+        ephemeral_user_note: str | None = None,
         tokens_param: str = "max_tokens",
     ) -> dict[str, Any]:
         system = self.system
@@ -882,6 +999,9 @@ class Conversation:
             # 400 on Anthropic, and any instruction the driver appended would
             # otherwise be wiped along with the history.
             messages = [{"role": "user", "content": VERDICT_USER_INSTRUCTION}]
+
+        if ephemeral_user_note:
+            messages.append({"role": "user", "content": ephemeral_user_note})
 
         payload: dict[str, Any] = {
             "model": model,
@@ -925,6 +1045,7 @@ class Conversation:
         keep_full_history_on_verdict: bool,
         response_format: str | None,
         cache_prefix: bool = False,
+        ephemeral_user_note: str | None = None,
     ) -> dict[str, Any]:
         system = self.system
         messages = self._render_anthropic_messages()
@@ -936,6 +1057,19 @@ class Conversation:
             # Anthropic requires a non-empty messages array starting with a
             # user message — see the OpenAI counterpart for the rationale.
             messages = [{"role": "user", "content": VERDICT_USER_INSTRUCTION}]
+
+        if ephemeral_user_note:
+            if messages and messages[-1].get("role") == "user":
+                if isinstance(messages[-1].get("content"), list):
+                    messages[-1]["content"].append(
+                        {"type": "text", "text": ephemeral_user_note}
+                    )
+                elif isinstance(messages[-1].get("content"), str):
+                    messages[-1]["content"] += "\n\n" + ephemeral_user_note
+                else:
+                    messages.append({"role": "user", "content": ephemeral_user_note})
+            else:
+                messages.append({"role": "user", "content": ephemeral_user_note})
 
         payload: dict[str, Any] = {
             "model": model,

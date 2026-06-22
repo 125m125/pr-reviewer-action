@@ -47,6 +47,8 @@ STOP_MAX_ROUNDS = "max-rounds"
 STOP_BUDGET = "tool-call-budget-exhausted"
 STOP_WALL_CLOCK = "wall-clock-exceeded"
 STOP_REQUEST_ERROR = "request-error"
+STOP_TRUNCATED = "truncated-turn"
+STOP_CONTEXT_BUDGET = "context-budget-exhausted"
 
 # Synthetic result bodies. These are model-facing: they must explain the
 # refusal in one sentence so a self-correcting model has something to act on.
@@ -76,6 +78,7 @@ class LoopBudgets:
     # Results kept verbatim when summarizing the rest (the model is actively
     # reasoning over the newest evidence).
     summarize_keep_newest: int = 2
+    model_context_tokens: int = 0
 
 
 def adaptive_loop_budgets(
@@ -86,9 +89,10 @@ def adaptive_loop_budgets(
     review_route: str = "primary",
     risk_flag_count: int = 0,
 ) -> "LoopBudgets":
-    """Right-size the loop budget. A native round is one model turn, so the
-    headroom is 2× the configured rounds (capped at 8); the configured tool-call
-    budget is used as-is.
+    """Apply the documented legacy mapping of two planning turns per round.
+
+    Positive configured call and time limits are used exactly, with no hidden
+    cap or route-dependent reduction.
 
     The budget is the SAME on every route — the route selects the MODEL, never
     the tool budget. An earlier version shallow-capped the primary route (then
@@ -101,7 +105,9 @@ def adaptive_loop_budgets(
     ``review_route``/``risk_flag_count`` are retained for signature stability
     and possible future heuristics.
     """
-    rounds = min(max(max_rounds, 1) * 2, 8)
+    if max_rounds <= 0 or max_tool_calls <= 0 or wall_clock_sec <= 0:
+        raise ValueError("native-loop budgets must be positive")
+    rounds = max_rounds * 2
     return LoopBudgets(
         max_tool_calls=max_tool_calls,
         max_rounds=rounds,
@@ -127,6 +133,55 @@ class LoopOutcome:
     # to a corpus-only review (the plan_execute planner fallback was removed in #304).
     degraded: bool = False
     error: str = ""
+    final_text_source: str = "none"
+    finish_reasons: list[str] = field(default_factory=list)
+    text_sources: list[str] = field(default_factory=list)
+    planning_turns_attempted: int = 0
+    calls_executed: int = 0
+    calls_rejected: int = 0
+    calls_duplicated: int = 0
+    calls_malformed: int = 0
+    truncation_retries: int = 0
+    compaction_runs: int = 0
+    compaction_tokens_removed: int = 0
+
+
+def effective_intermediate_text(
+    message: dict[str, Any], api_format: str
+) -> tuple[str, str]:
+    """Return safe internal assistant text and its source for a loop turn.
+
+    OpenAI reasoning is used only when ordinary content is blank. Callers must
+    not use this helper for final verdict parsing or publish fallback text.
+    """
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content, "content"
+    if api_format == "openai":
+        reasoning = message.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip():
+            return reasoning, "reasoning_fallback"
+    return "", "none"
+
+
+def extract_intermediate_turn(
+    response: dict[str, Any], api_format: str
+) -> tuple[list[dict[str, Any]], str, str, str]:
+    """Return calls, effective text, text source, and provider finish reason."""
+    calls, text = extract_tool_calls(response, api_format)
+    finish_reason = ""
+    source = "content" if text.strip() else "none"
+    if api_format == "openai":
+        choices = response.get("choices")
+        choice = choices[0] if isinstance(choices, list) and choices else {}
+        message = choice.get("message") if isinstance(choice, dict) else {}
+        if not isinstance(message, dict):
+            message = {}
+        text, source = effective_intermediate_text(message, api_format)
+        finish_reason = str(choice.get("finish_reason") or "")
+    else:
+        finish_reason = str(response.get("stop_reason") or "")
+    return calls, text, source, finish_reason
 
 
 def extract_tool_calls(
@@ -244,6 +299,8 @@ def drive_tool_loop(
     started = time_fn()
     calls_executed = 0
     seen_keys: set[str] = set()
+    retry_with_more_tokens = False
+    retry_max_tokens = max_tokens
 
     while outcome.rounds < budgets.max_rounds:
         if time_fn() - started > budgets.wall_clock_sec:
@@ -256,6 +313,7 @@ def drive_tool_loop(
         # preserves salient facts; otherwise (or if it frees nothing / fails)
         # fall back to blunt truncation, which is the guaranteed backstop.
         if conversation.approx_tokens() > budgets.max_conversation_tokens:
+            before_tokens = conversation.approx_tokens()
             summarized = 0
             if summarize_fn is not None:
                 try:
@@ -271,17 +329,54 @@ def drive_tool_loop(
                 conversation.truncate_oldest_tool_results(
                     budgets.truncated_result_bytes
                 )
+            if conversation.approx_tokens() > budgets.max_conversation_tokens:
+                conversation.truncate_oldest_assistant_text(
+                    1000, keep_newest=budgets.summarize_keep_newest
+                )
+            if conversation.approx_tokens() > budgets.max_conversation_tokens:
+                conversation.collapse_oldest_completed_history(
+                    max(1000, min(8000, budgets.max_conversation_tokens * 2)),
+                    keep_newest_results=budgets.summarize_keep_newest,
+                )
+            if conversation.approx_tokens() > budgets.max_conversation_tokens:
+                conversation.collapse_oldest_completed_history(
+                    max(256, min(2000, budgets.max_conversation_tokens)),
+                    keep_newest_results=0,
+                )
+            if conversation.approx_tokens() > budgets.max_conversation_tokens:
+                outcome.stop_reason = STOP_CONTEXT_BUDGET
+                outcome.error = (
+                    "Conversation could not be compacted below the configured "
+                    "planning-context allowance."
+                )
+                break
+            removed = max(0, before_tokens - conversation.approx_tokens())
+            if removed:
+                outcome.compaction_runs += 1
+                outcome.compaction_tokens_removed += removed
+
+        remaining_calls = max(0, budgets.max_tool_calls - calls_executed)
+        remaining_turns = max(0, budgets.max_rounds - outcome.rounds)
+        budget_note = (
+            f"Exploration budget before this turn: {remaining_calls} tool calls "
+            f"and {remaining_turns} planning turns remain. Prioritize unresolved "
+            "correctness risks. Do not repeat completed checks. Stop requesting "
+            "tools when the evidence is sufficient so you can synthesize it."
+        )
 
         payload = conversation.to_request_payload(
             api_format,
             model,
             stream=stream,
-            max_tokens=max_tokens,
+            max_tokens=retry_max_tokens if retry_with_more_tokens else max_tokens,
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             tokens_param=tokens_param,
             cache_prefix=cache_prefix,
+            ephemeral_user_note=budget_note,
         )
+        retry_with_more_tokens = False
+        outcome.planning_turns_attempted += 1
         try:
             response = post_fn(payload)
         except Exception as exc:  # noqa: BLE001 — transport errors end the loop
@@ -290,10 +385,33 @@ def drive_tool_loop(
             break
 
         outcome.rounds += 1
-        calls, text = extract_tool_calls(response, api_format)
+        calls, text, text_source, finish_reason = extract_intermediate_turn(
+            response, api_format
+        )
+        outcome.finish_reasons.append(finish_reason or "unknown")
+        outcome.text_sources.append(text_source)
 
         if not calls:
+            if finish_reason == "length":
+                if outcome.truncation_retries == 0 and outcome.rounds < budgets.max_rounds:
+                    candidate = max_tokens * 2
+                    if budgets.model_context_tokens:
+                        safe_cap = (
+                            budgets.model_context_tokens
+                            - conversation.approx_tokens()
+                            - 1024
+                        )
+                        candidate = min(candidate, safe_cap)
+                    if candidate > max_tokens:
+                        outcome.truncation_retries += 1
+                        retry_max_tokens = candidate
+                        retry_with_more_tokens = True
+                        continue
+                outcome.stop_reason = STOP_TRUNCATED
+                outcome.error = "Model response was truncated before a usable answer or tool call."
+                break
             outcome.final_text = text
+            outcome.final_text_source = text_source
             outcome.stop_reason = (
                 STOP_MODEL_DONE if outcome.tool_calls_issued else STOP_NO_TOOL_CALLS
             )
@@ -325,6 +443,8 @@ def drive_tool_loop(
                 if not isinstance(args, dict):
                     raise ValueError("arguments must be a JSON object")
             except (json.JSONDecodeError, ValueError) as exc:
+                outcome.calls_malformed += 1
+                outcome.calls_rejected += 1
                 plan.append(
                     (call_id, "error",
                      {"error": f"Invalid tool arguments (not a JSON object): {exc}"})
@@ -333,15 +453,19 @@ def drive_tool_loop(
 
             key = _request_key(call["name"], args)
             if key in seen_keys:
+                outcome.calls_duplicated += 1
+                outcome.calls_rejected += 1
                 plan.append((call_id, "dup", {"note": _DUPLICATE_NOTE}))
                 continue
 
             if calls_executed >= budgets.max_tool_calls:
+                outcome.calls_rejected += 1
                 plan.append((call_id, "budget", {"error": _BUDGET_NOTE}))
                 continue
 
             seen_keys.add(key)
             calls_executed += 1
+            outcome.calls_executed = calls_executed
             to_execute[idx] = (call["name"], args)
             plan.append((call_id, "exec", idx))
 
@@ -381,5 +505,9 @@ def drive_tool_loop(
     else:
         outcome.stop_reason = STOP_MAX_ROUNDS
 
-    outcome.degraded = outcome.tool_calls_issued == 0
+    outcome.degraded = (
+        outcome.tool_calls_issued == 0
+        and not outcome.final_text
+        and outcome.stop_reason in (STOP_NO_TOOL_CALLS, STOP_REQUEST_ERROR)
+    )
     return outcome

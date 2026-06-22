@@ -3,8 +3,8 @@
 Acceptance criteria:
   - TOOL_MAX_REQUESTS=1 limits planner prompt and executor to 1 call.
   - TOOL_MAX_REQUESTS=6 allows up to 6 calls.
-  - Invalid/missing values safely fall back to default (4).
-  - Values are bounded within a reasonable range (1-20 per env_int_bounded).
+  - Missing/blank values safely use default (4).
+  - Explicit values must be positive integers and are applied exactly.
 """
 
 import os
@@ -25,7 +25,7 @@ def _import_harness():
 
 
 class TestEnvIntBounded(TestCase):
-    """Test the env_int_bounded helper used to parse TOOL_MAX_REQUESTS."""
+    """Retain coverage for other legacy bounded integer settings."""
 
     def setUp(self):
         self.mod = _import_harness()
@@ -83,21 +83,18 @@ class TestEnvIntBounded(TestCase):
 # programmatically; the budget cap is exercised in test_run_native_loop_wiring.py.
 
 
-class TestMaxRequestsBoundedCall(TestCase):
-    """Test that max_requests is read with proper bounds."""
+class TestMaxRequestsExactCall(TestCase):
+    """Test that max_requests is read without an undocumented upper cap."""
 
     def setUp(self):
         self.mod = _import_harness()
 
-    def test_bounded_call_signature(self):
-        """Verify env_int_bounded is called with correct bounds for TOOL_MAX_REQUESTS."""
+    def test_positive_exact_call_signature(self):
         harness_path = _SCRIPTS_DIR / "run_tool_harness.py"
         source = harness_path.read_text(encoding="utf-8")
 
-        # Should call env_int_bounded with TOOL_MAX_REQUESTS, default 4, min 1, max 20
-        self.assertIn(
-            'env_int_bounded("TOOL_MAX_REQUESTS", 4, 1, 20)', source
-        )
+        self.assertIn('env_positive_int("TOOL_MAX_REQUESTS", 4)', source)
+        self.assertNotIn('env_int_bounded("TOOL_MAX_REQUESTS"', source)
 
 
 if __name__ == "__main__":

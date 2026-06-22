@@ -89,6 +89,8 @@ run_precheck() {
     AI_API_FORMAT="${AI_API_FORMAT:-openai}" \
     AI_REASONING_EFFORT="${AI_REASONING_EFFORT:-}" \
     AI_VERDICT_REASONING_EFFORT="${AI_VERDICT_REASONING_EFFORT:-}" \
+    TOOL_SYNTHESIS_TIMEOUT_SEC="${TOOL_SYNTHESIS_TIMEOUT_SEC:-}" \
+    TOOL_SYNTHESIS_MAX_TOKENS="${TOOL_SYNTHESIS_MAX_TOKENS:-}" \
     AI_FALLBACK_MODEL="${AI_FALLBACK_MODEL:-}" \
     ANTHROPIC_VERSION="${ANTHROPIC_VERSION:-2023-06-01}" \
     SYSTEM_PROMPT="${SYSTEM_PROMPT:-}" \
@@ -216,6 +218,17 @@ check "should_review=true when general reasoning effort changed" "$(echo "$RESUL
 ACTION_REF="" AI_MODEL="gpt-4" AI_API_FORMAT="openai" CONTEXT_LIMIT_MODE="normal" TOOL_MODE="off" AI_REASONING_EFFORT="" AI_VERDICT_REASONING_EFFORT="none" RESULT="$(run_precheck)"
 check "should_review=true when verdict reasoning effort changed" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
 unset AI_REASONING_EFFORT AI_VERDICT_REASONING_EFFORT
+
+echo ""
+echo "=== Test 5c: synthesis budgets trigger fresh review ==="
+set_comments "<!-- ai-pr-reviewer -->
+<!-- ai-pr-review-fingerprint:${BROAD_FP} -->
+APPROVE"
+ACTION_REF="" AI_MODEL="gpt-4" AI_API_FORMAT="openai" CONTEXT_LIMIT_MODE="normal" TOOL_MODE="off" TOOL_SYNTHESIS_TIMEOUT_SEC="300" RESULT="$(run_precheck)"
+check "should_review=true when synthesis timeout changed" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
+ACTION_REF="" AI_MODEL="gpt-4" AI_API_FORMAT="openai" CONTEXT_LIMIT_MODE="normal" TOOL_MODE="off" TOOL_SYNTHESIS_MAX_TOKENS="4096" RESULT="$(run_precheck)"
+check "should_review=true when synthesis tokens changed" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
+unset TOOL_SYNTHESIS_TIMEOUT_SEC TOOL_SYNTHESIS_MAX_TOKENS
 
 # ── Test 6: skip_if_diff_unchanged=false → always review ─────────────
 echo ""

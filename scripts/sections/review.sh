@@ -464,6 +464,12 @@ write_step_summary() {
     echo "| Route | ${REVIEW_ROUTE:-legacy} (${ROUTE_REASON:-}) |"
     echo "| Scope | ${EFFECTIVE_SCOPE} |"
     echo "| Budget | ${budget_desc} |"
+    if [ -f tool-harness.json ] && jq -e '.budget' tool-harness.json >/dev/null 2>&1; then
+      echo "| Native tool calls | configured=$(jq -r '.budget.tool_calls_configured' tool-harness.json), effective=$(jq -r '.budget.tool_calls_effective' tool-harness.json) |"
+      echo "| Native planning turns | configured=$(jq -r '.budget.rounds_configured' tool-harness.json) rounds, effective=$(jq -r '.budget.planning_turns_effective' tool-harness.json) turns |"
+      echo "| Native wall clock | configured=$(jq -r '.budget.wall_clock_configured_sec' tool-harness.json)s, effective=$(jq -r '.budget.wall_clock_effective_sec' tool-harness.json)s |"
+      echo "| Native synthesis timeout | configured=$(jq -r '.budget.synthesis_timeout_configured_sec' tool-harness.json)s, effective reserve=$(jq -r '.budget.synthesis_timeout_effective_sec' tool-harness.json)s |"
+    fi
     echo "| Diff bytes | ${diff_bytes} (truncated: ${diff_trunc}) |"
     echo "| Corpus bytes | ${corpus_bytes} (truncated: ${corpus_trunc}) |"
     echo "| Prompt tokens | ${prompt_tok} |"

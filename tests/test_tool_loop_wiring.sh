@@ -41,8 +41,8 @@ check_contains "TOOL_LOOP_WALL_CLOCK_SEC passed to steps" "$ACTION" 'TOOL_LOOP_W
 echo ""
 echo "=== native_loop harness contracts ==="
 check_contains "harness drives the native loop" "$HARNESS" "handled = run_native_loop("
-check_contains "round budget bounded by TOOL_MAX_ROUNDS" "$HARNESS" 'env_int_bounded("TOOL_MAX_ROUNDS"'
-check_contains "wall-clock budget bounded" "$HARNESS" 'env_int_bounded("TOOL_LOOP_WALL_CLOCK_SEC"'
+check_contains "round budget requires a positive TOOL_MAX_ROUNDS" "$HARNESS" 'env_positive_int("TOOL_MAX_ROUNDS"'
+check_contains "wall-clock budget requires a positive value" "$HARNESS" 'env_positive_int("TOOL_LOOP_WALL_CLOCK_SEC"'
 check_contains "native loop driver imported lazily" "$HARNESS" "from pr_reviewer.tool_loop import"
 check_contains "no-tool-call run degrades to a corpus-only review" "$HARNESS" "if not handled:"
 check_contains "degrade still records native_loop mode" "$HARNESS" 'result["mode"] = "native_loop"'

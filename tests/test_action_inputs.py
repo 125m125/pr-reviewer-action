@@ -168,6 +168,14 @@ def test_reasoning_inputs_declared_and_wired():
     assert "AI_VERDICT_REASONING_EFFORT: ${{ inputs.ai_verdict_reasoning_effort }}" in content
 
 
+def test_synthesis_inputs_declared_and_wired():
+    content = (_REPO_ROOT / "action.yml").read_text()
+    inputs = parse_action_inputs()
+    assert {"tool_synthesis_timeout_sec", "tool_synthesis_max_tokens"} <= inputs
+    assert "TOOL_SYNTHESIS_TIMEOUT_SEC: ${{ inputs.tool_synthesis_timeout_sec }}" in content
+    assert "TOOL_SYNTHESIS_MAX_TOKENS: ${{ inputs.tool_synthesis_max_tokens }}" in content
+
+
 if __name__ == "__main__":
     test_readme_inputs_in_action()
     test_action_inputs_in_readme()

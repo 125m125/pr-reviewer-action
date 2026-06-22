@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -82,6 +83,113 @@ def env_int(name, default_value, min_value):
 def env_int_bounded(name, default_value, min_value, max_value):
     value = env_int(name, default_value, min_value)
     return min(max_value, value)
+
+
+def env_positive_int(name, default_value):
+    """Read an explicit finite positive integer without silently clamping it."""
+    raw = os.getenv(name, str(default_value)).strip()
+    if not raw:
+        raw = str(default_value)
+    if not re.fullmatch(r"[1-9][0-9]*", raw):
+        raise ValueError(f"{name} must be a positive integer (got {raw!r})")
+    return int(raw)
+
+
+def _mask_and_clip(text, max_bytes, *, preserve_tail=False):
+    """Secret-mask and UTF-8 clip to an exact byte ceiling."""
+    masked = mask_secrets(text or "")
+    raw = masked.encode("utf-8", errors="replace")
+    if len(raw) <= max_bytes:
+        return masked, False
+    if max_bytes <= 0:
+        return "", True
+    marker = b"\n...[truncated]...\n"
+    if max_bytes <= len(marker):
+        return raw[:max_bytes].decode("utf-8", errors="ignore"), True
+    room = max_bytes - len(marker)
+    if preserve_tail:
+        head_size = room * 2 // 3
+        clipped = raw[:head_size] + marker + raw[-(room - head_size):]
+    else:
+        clipped = raw[:room] + marker
+    return clipped.decode("utf-8", errors="ignore"), True
+
+
+def _build_internal_notebook(conversation, max_bytes):
+    """Build a bounded newest-first ledger from neutral conversation events."""
+    calls = {}
+    results = []
+    analyses = []
+    for event in conversation.events:
+        if event["kind"] == "assistant_text":
+            text, _ = _mask_and_clip(event.get("content", ""), 2000)
+            analyses.append(text)
+        elif event["kind"] == "assistant_tool_calls":
+            for call in event.get("calls", []):
+                calls[call["id"]] = call
+        elif event["kind"] == "tool_result":
+            call = calls.get(event.get("call_id"), {})
+            body, _ = _mask_and_clip(event.get("content", ""), 1200)
+            results.append(
+                f"- {call.get('name', 'unknown_tool')} "
+                f"{call.get('arguments', '{}')} "
+                f"[{'error' if event.get('is_error') else 'ok'}]: {body}"
+            )
+    sections = []
+    if analyses:
+        sections.append(
+            "## Recent/earlier internal analyses (newest first)\n"
+            + "\n\n".join(reversed(analyses))
+        )
+    if results:
+        sections.append(
+            "## Tool evidence ledger (newest first)\n"
+            + "\n".join(reversed(results))
+        )
+    return _mask_and_clip("\n\n".join(sections), max_bytes)
+
+
+def _compose_review_context(instruction, memo, notebook, corpus, max_bytes):
+    """Compose a bounded memo + ledger + corpus while preserving corpus tail."""
+    labels = (
+        "\n\n## Internal synthesis memo\n",
+        "\n\n## Compact evidence notebook\n",
+        "\n\n## Review corpus\n",
+    )
+    overhead = len((instruction + "".join(labels)).encode("utf-8"))
+    available = max(0, max_bytes - overhead)
+    memo_cap = min(len(mask_secrets(memo or "").encode("utf-8")), available // 4)
+    memo_text, memo_truncated = _mask_and_clip(
+        memo or "No synthesis memo was available.", memo_cap
+    )
+    remaining = max(0, available - len(memo_text.encode("utf-8")))
+    notebook_cap = min(
+        len(mask_secrets(notebook or "").encode("utf-8")), remaining * 35 // 100
+    )
+    notebook_text, notebook_truncated = _mask_and_clip(
+        notebook or "No tool evidence was gathered.", notebook_cap
+    )
+    remaining = max(0, remaining - len(notebook_text.encode("utf-8")))
+    corpus_text, corpus_truncated = _mask_and_clip(
+        corpus, remaining, preserve_tail=True
+    )
+    combined = (
+        instruction
+        + labels[0] + memo_text
+        + labels[1] + notebook_text
+        + labels[2] + corpus_text
+    )
+    combined, final_truncated = _mask_and_clip(
+        combined, max_bytes, preserve_tail=True
+    )
+    details = {
+        "memo_truncated": memo_truncated,
+        "notebook_truncated": notebook_truncated,
+        "corpus_truncated": corpus_truncated,
+        "final_truncated": final_truncated,
+        "bytes": len(combined.encode("utf-8")),
+    }
+    return combined, details
 
 
 def _accumulate_usage(acc, response, api_format):
@@ -321,11 +429,20 @@ TOOL_USE_PREAMBLE = (
 # evidence-gatherer prompt, so the verdict turn swaps to the reviewer prompt and
 # re-injects the full corpus (the loop only saw the compact planning context).
 _VERDICT_CLOSING_INSTRUCTION = (
-    "You have finished gathering evidence (the tool calls and their results "
-    "above). Below is the full review corpus for this PR. Using your "
-    "investigation together with this corpus, produce the final review verdict "
+    "You have finished gathering evidence. Below are an internal synthesis "
+    "memo, a compact evidence notebook, and the review corpus for this PR. "
+    "Using that material, produce the final review verdict "
     "now in the exact output format specified in your instructions. Do not "
     "issue any further tool calls.\n\n"
+)
+
+_SYNTHESIS_INSTRUCTION = (
+    "Exploration is complete and tools are now disabled. Produce a concise "
+    "internal evidence memo covering: demonstrated defects with exact locations; "
+    "important hypotheses disproved; unresolved material unknowns; cross-domain "
+    "behavior and relevant tests; and whether the evidence supports approval. "
+    "Do not output verdict JSON. This memo is internal and will be supplied to "
+    "the final serialization turn."
 )
 
 _SUMMARIZER_SYSTEM = (
@@ -415,6 +532,7 @@ def run_native_loop(
     from pr_reviewer.tool_loop import (  # noqa: PLC0415
         adaptive_loop_budgets,
         drive_tool_loop,
+        extract_intermediate_turn,
         extract_tool_calls,
     )
     from pr_reviewer.mcp_client import (  # noqa: PLC0415
@@ -462,8 +580,70 @@ def run_native_loop(
     # in that case the verdict turn is skipped below (review_system is empty).
     review_system = resolve_review_system_prompt()
     loop_system = (review_system + TOOL_USE_PREAMBLE) if review_system else NATIVE_LOOP_SYSTEM
-    conversation = Conversation(system=loop_system, tool_schemas=tool_schemas)
-    conversation.add_user(
+    max_rounds = env_positive_int("TOOL_MAX_ROUNDS", 3)
+    wall_clock = env_positive_int("TOOL_LOOP_WALL_CLOCK_SEC", 120)
+    synthesis_timeout = env_positive_int("TOOL_SYNTHESIS_TIMEOUT_SEC", 60)
+    synthesis_max_tokens = env_positive_int("TOOL_SYNTHESIS_MAX_TOKENS", 2048)
+    synthesis_reserve = min(synthesis_timeout, max(1, wall_clock // 2))
+    # Right-size the loop to PR risk (#197 §2): the fast route only fires on
+    # low-risk PRs, so they get a shallow loop; risk-flagged / smart-routed PRs
+    # get full depth. REVIEW_ROUTE is exported by run_review.sh; standalone runs
+    # default to legacy (full depth).
+    budgets = adaptive_loop_budgets(
+        max_rounds,
+        max_requests,
+        max(0.001, wall_clock - synthesis_reserve),
+        review_route=os.getenv("REVIEW_ROUTE", "legacy"),
+        risk_flag_count=_classification_risk_flag_count(),
+    )
+    verdict_max_tokens = env_positive_int("AI_MAX_TOKENS", 8192)
+    model_context_tokens = env_positive_int(
+        "MODEL_CONTEXT_TOKENS", verdict_max_tokens + 4096 + 24000
+    )
+    if model_context_tokens <= verdict_max_tokens + 4096:
+        raise ValueError(
+            "MODEL_CONTEXT_TOKENS must exceed AI_MAX_TOKENS by more than 4096 "
+            "tokens so the verdict prompt has a positive input allowance"
+        )
+    if model_context_tokens <= synthesis_max_tokens + 4096:
+        raise ValueError(
+            "MODEL_CONTEXT_TOKENS must exceed TOOL_SYNTHESIS_MAX_TOKENS by more "
+            "than 4096 tokens"
+        )
+    if model_context_tokens <= planning_max_tokens + 4096:
+        raise ValueError(
+            "MODEL_CONTEXT_TOKENS must exceed TOOL_PLANNING_MAX_TOKENS by more "
+            "than 4096 tokens"
+        )
+    budgets.max_conversation_tokens = max(
+        1000, model_context_tokens - planning_max_tokens - 4096
+    )
+    budgets.model_context_tokens = model_context_tokens
+    result["budget"] = {
+        "tool_calls_configured": max_requests,
+        "tool_calls_effective": budgets.max_tool_calls,
+        "rounds_configured": max_rounds,
+        "planning_turns_effective": budgets.max_rounds,
+        "wall_clock_configured_sec": wall_clock,
+        "wall_clock_effective_sec": wall_clock,
+        "synthesis_timeout_configured_sec": synthesis_timeout,
+        "synthesis_timeout_effective_sec": synthesis_reserve,
+        "synthesis_reserve_sec": synthesis_reserve,
+    }
+    native_started = time.monotonic()
+    exploration_deadline = native_started + budgets.wall_clock_sec
+    total_deadline = native_started + wall_clock
+    print(
+        "Native-loop budget:\n"
+        f"  tool calls: configured={max_requests}, effective={budgets.max_tool_calls}\n"
+        f"  planning turns: configured={max_rounds} rounds, effective={budgets.max_rounds} turns\n"
+        f"  total wall clock: configured={wall_clock}s, effective={wall_clock}s "
+        f"(synthesis timeout configured={synthesis_timeout}s, "
+        f"effective reserve={synthesis_reserve}s)",
+        file=sys.stderr,
+    )
+
+    planning_header = (
         f"Repository: {repo}\n"
         f"Review scope: {os.getenv('EFFECTIVE_SCOPE', 'full')}\n"
         f"Allowed repos for gh_api: "
@@ -472,22 +652,28 @@ def run_native_loop(
         f"{', '.join(allowed_hosts) if allowed_hosts else '(none)'}\n"
         + ("web_search is available — use it to find a page's URL when you don't "
            "know it, then web_fetch the best result.\n" if search_url else "")
-        + "\nGather the evidence needed to review this PR corpus:\n\n" + corpus_text
+        + "\nGather the evidence needed to review this PR corpus:\n\n"
     )
-
-    max_rounds = env_int_bounded("TOOL_MAX_ROUNDS", 3, 1, 6)
-    wall_clock = env_int_bounded("TOOL_LOOP_WALL_CLOCK_SEC", 120, 10, 900)
-    # Right-size the loop to PR risk (#197 §2): the fast route only fires on
-    # low-risk PRs, so they get a shallow loop; risk-flagged / smart-routed PRs
-    # get full depth. REVIEW_ROUTE is exported by run_review.sh; standalone runs
-    # default to legacy (full depth).
-    budgets = adaptive_loop_budgets(
-        max_rounds,
-        max_requests,
-        wall_clock,
-        review_route=os.getenv("REVIEW_ROUTE", "legacy"),
-        risk_flag_count=_classification_risk_flag_count(),
+    planning_input_allowance = (
+        (model_context_tokens - planning_max_tokens - 4096) * 3
+        - len(loop_system.encode("utf-8"))
+        - len(planning_header.encode("utf-8"))
     )
+    if planning_input_allowance < 1000:
+        raise ValueError("Configured model context leaves no safe planning input allowance")
+    # Leave deterministic room for the conversation's calls/results instead of
+    # allowing the initial corpus to consume the entire planning window.
+    planning_input_allowance = planning_input_allowance * 60 // 100
+    bounded_corpus_text, planning_context_truncated = _mask_and_clip(
+        corpus_text, planning_input_allowance, preserve_tail=True
+    )
+    result["planning_context"] = {
+        "input_allowance_bytes": planning_input_allowance,
+        "corpus_truncated": planning_context_truncated,
+        "corpus_bytes": len(bounded_corpus_text.encode("utf-8")),
+    }
+    conversation = Conversation(system=loop_system, tool_schemas=tool_schemas)
+    conversation.add_user(planning_header + bounded_corpus_text)
 
     # Stream loop turns by default (mirrors AI_STREAM for the review call) so
     # long thinking-model turns don't 524 behind a short-idle proxy (#204).
@@ -511,14 +697,24 @@ def run_native_loop(
         "cached_prompt_tokens": 0,
     }
 
-    def post_fn(payload):
+    def post_fn(payload, timeout_sec=None, deadline=None):
         # Per-turn fallback: a streamed turn that can't be reassembled — a
         # truncated/garbled SSE body (transport raise) or a 200 error object
         # (error key) — is retried once non-streamed before the loop gives up.
         response = None
+        exploration_phase = timeout_sec is None and deadline is None
+        if timeout_sec is None:
+            timeout_sec = planning_timeout
+        active_deadline = exploration_deadline if exploration_phase else deadline
+
+        def bounded_timeout():
+            if active_deadline is None:
+                return timeout_sec
+            return max(1, min(timeout_sec, int(active_deadline - time.monotonic())))
+
         try:
             response = run_chat_request(
-                base_url, api_format, payload, api_key, planning_timeout
+                base_url, api_format, payload, api_key, bounded_timeout()
             )
             usable = not (payload.get("stream") and response.get("error"))
         except Exception:
@@ -533,7 +729,7 @@ def run_native_loop(
             fallback = {k: v for k, v in payload.items() if k != "stream_options"}
             fallback["stream"] = False
             response = run_chat_request(
-                base_url, api_format, fallback, api_key, planning_timeout
+                base_url, api_format, fallback, api_key, bounded_timeout()
             )
         _accumulate_usage(usage_acc, response, api_format)
         return response
@@ -580,8 +776,8 @@ def run_native_loop(
     summarize_fn = None
     reasoning_effort = os.getenv("AI_REASONING_EFFORT", "").strip() or None
     if os.getenv("TOOL_LOOP_SUMMARIZE", "false").strip().lower() == "true":
-        summarize_max_tokens = env_int_bounded(
-            "TOOL_LOOP_SUMMARIZE_MAX_TOKENS", 512, 128, 4096
+        summarize_max_tokens = env_positive_int(
+            "TOOL_LOOP_SUMMARIZE_MAX_TOKENS", 512
         )
 
         def summarize_fn(block):  # noqa: F811 — None vs callable by config
@@ -596,7 +792,9 @@ def run_native_loop(
                 reasoning_effort=reasoning_effort,
                 tokens_param=tokens_param,
             )
-            _, summary = extract_tool_calls(post_fn(payload), api_format)
+            _, summary, _source, _finish = extract_intermediate_turn(
+                post_fn(payload), api_format
+            )
             return summary
 
     outcome = drive_tool_loop(
@@ -614,6 +812,35 @@ def run_native_loop(
         summarize_fn=summarize_fn,
     )
 
+    def stamp_outcome_diagnostics():
+        result["rounds"] = outcome.rounds
+        result["stop_reason"] = outcome.stop_reason
+        result["planned_request_count"] = outcome.tool_calls_issued
+        result["planning_turns_attempted"] = outcome.planning_turns_attempted
+        result["planning_turns_completed"] = outcome.rounds
+        result["finish_reasons"] = outcome.finish_reasons
+        result["text_sources"] = outcome.text_sources
+        result["truncation_retries"] = outcome.truncation_retries
+        result["tool_call_counts"] = {
+            "issued": outcome.tool_calls_issued,
+            "executed": outcome.calls_executed,
+            "rejected": outcome.calls_rejected,
+            "duplicated": outcome.calls_duplicated,
+            "malformed": outcome.calls_malformed,
+        }
+        result["remaining_budget"] = {
+            "tool_calls": max(0, budgets.max_tool_calls - outcome.calls_executed),
+            "planning_turns": max(0, budgets.max_rounds - outcome.rounds),
+        }
+        result["compaction"] = {
+            "runs": outcome.compaction_runs,
+            "approx_tokens_removed": outcome.compaction_tokens_removed,
+        }
+        if outcome.error:
+            result["loop_error"] = outcome.error
+
+    stamp_outcome_diagnostics()
+
     if outcome.degraded:
         result["native_loop_degraded"] = outcome.stop_reason
         if outcome.error:
@@ -625,6 +852,100 @@ def run_native_loop(
         # native_loop-namespaced key for telemetry symmetry with the success path.
         result["native_loop_usage"] = _usage_with_cache_ratio(usage_acc)
         return False
+
+    # Final deterministic compaction always runs before synthesis/verdict, even
+    # when exploration stopped immediately on a hard budget after a tool batch.
+    context_before_synthesis = conversation.approx_tokens()
+    if context_before_synthesis > budgets.max_conversation_tokens:
+        if summarize_fn is not None:
+            try:
+                conversation.summarize_oldest_tool_results(
+                    summarize_fn, keep_newest=budgets.summarize_keep_newest
+                )
+            except Exception:  # noqa: BLE001 - deterministic truncation is fallback
+                pass
+        conversation.truncate_oldest_tool_results(budgets.truncated_result_bytes)
+        if conversation.approx_tokens() > budgets.max_conversation_tokens:
+            conversation.truncate_oldest_assistant_text(
+                1000, keep_newest=budgets.summarize_keep_newest
+            )
+    context_after_compaction = conversation.approx_tokens()
+    if context_after_compaction < context_before_synthesis:
+        outcome.compaction_runs += 1
+        outcome.compaction_tokens_removed += (
+            context_before_synthesis - context_after_compaction
+        )
+
+    synthesis_input_allowance = (
+        (model_context_tokens - synthesis_max_tokens - 4096) * 3
+        - len(loop_system.encode("utf-8"))
+    )
+    if synthesis_input_allowance < 1000:
+        raise ValueError("Configured model context leaves no safe synthesis input allowance")
+    notebook, notebook_truncated = _build_internal_notebook(
+        conversation, synthesis_input_allowance * 2 // 3
+    )
+
+    # A useful voluntary no-tool completion is already a synthesis memo. Hard
+    # stops and truncated/empty completions receive one dedicated tools-disabled
+    # reasoning turn. reasoning_content fallback is internal only.
+    synthesis_memo = outcome.final_text.strip()
+    synthesis_source = outcome.final_text_source if synthesis_memo else "none"
+    synthesis_ran = False
+    if not synthesis_memo:
+        synthesis_ran = True
+        synthesis_context, synthesis_context_details = _compose_review_context(
+            _SYNTHESIS_INSTRUCTION,
+            "Synthesize from the bounded notebook and planning corpus below.",
+            notebook,
+            corpus_text,
+            synthesis_input_allowance,
+        )
+        synthesis_conversation = Conversation(system=loop_system, tool_schemas=[])
+        synthesis_conversation.add_user(synthesis_context)
+        synthesis_payload = synthesis_conversation.to_request_payload(
+            api_format,
+            model,
+            stream=stream,
+            max_tokens=synthesis_max_tokens,
+            temperature=0.0,
+            verdict_turn=True,
+            keep_full_history_on_verdict=True,
+            reasoning_effort=reasoning_effort,
+            tokens_param=tokens_param,
+            cache_prefix=True,
+        )
+        try:
+            synthesis_response = post_fn(
+                synthesis_payload,
+                synthesis_reserve,
+                deadline=total_deadline,
+            )
+            _, synthesis_memo, synthesis_source, synthesis_finish = (
+                extract_intermediate_turn(synthesis_response, api_format)
+            )
+            result["synthesis_finish_reason"] = synthesis_finish or "unknown"
+        except Exception as exc:  # noqa: BLE001 - verdict can still proceed
+            result["synthesis_error"] = str(exc)
+            synthesis_memo = ""
+            synthesis_source = "none"
+    else:
+        synthesis_context_details = {
+            "memo_truncated": False,
+            "notebook_truncated": notebook_truncated,
+            "corpus_truncated": False,
+            "final_truncated": False,
+            "bytes": 0,
+        }
+
+    result["synthesis"] = {
+        "ran": synthesis_ran,
+        "text_source": synthesis_source,
+        "context_tokens_before": context_before_synthesis,
+        "context_tokens_after_compaction": context_after_compaction,
+        "input_allowance_bytes": synthesis_input_allowance,
+        "input_context": synthesis_context_details,
+    }
 
     # ── In-conversation verdict (#205, Option 1) ─────────────────────────────
     # The loop's final turn produces the review verdict itself — preserving the
@@ -650,7 +971,6 @@ def run_native_loop(
                 else ""
             )
             if verdict_corpus:
-                conversation.add_user(_VERDICT_CLOSING_INSTRUCTION + verdict_corpus)
                 temp_raw = os.getenv("AI_TEMPERATURE", "").strip()
                 temperature = float(temp_raw) if temp_raw else None
                 rf = os.getenv("AI_RESPONSE_FORMAT", "off").strip().lower()
@@ -659,11 +979,31 @@ def run_native_loop(
                     os.getenv("AI_VERDICT_REASONING_EFFORT", "").strip()
                     or reasoning_effort
                 )
-                verdict_payload = conversation.to_request_payload(
+                # Reserve output and prompt headroom below the configured model
+                # context. Component-aware clipping keeps both the corpus head
+                # and its standards-bearing tail when the full body cannot fit.
+                input_byte_allowance = (
+                    (model_context_tokens - verdict_max_tokens - 4096) * 3
+                    - len(loop_system.encode("utf-8"))
+                )
+                if input_byte_allowance < 1000:
+                    raise ValueError(
+                        "Configured model context leaves no safe verdict input allowance"
+                    )
+                internal_context, verdict_context_details = _compose_review_context(
+                    _VERDICT_CLOSING_INSTRUCTION,
+                    synthesis_memo,
+                    notebook,
+                    verdict_corpus,
+                    input_byte_allowance,
+                )
+                verdict_conversation = Conversation(system=loop_system, tool_schemas=[])
+                verdict_conversation.add_user(internal_context)
+                verdict_payload = verdict_conversation.to_request_payload(
                     api_format,
                     model,
                     stream=stream,
-                    max_tokens=env_int_bounded("AI_MAX_TOKENS", 8192, 256, 200000),
+                    max_tokens=verdict_max_tokens,
                     temperature=temperature,
                     verdict_turn=True,
                     keep_full_history_on_verdict=True,
@@ -672,7 +1012,19 @@ def run_native_loop(
                     tokens_param=tokens_param,
                     cache_prefix=True,
                 )
-                verdict_response = post_fn(verdict_payload)
+                result["verdict_context"] = {
+                    "approx_tokens": (
+                        len(json.dumps(verdict_payload, ensure_ascii=False).encode("utf-8"))
+                        + 2
+                    ) // 3,
+                    "truncated": any(
+                        value for key, value in verdict_context_details.items()
+                        if key.endswith("_truncated")
+                    ),
+                    "components": verdict_context_details,
+                    "input_byte_allowance": input_byte_allowance,
+                }
+                verdict_response = post_fn(verdict_payload, planning_timeout)
                 Path("ai-response.primary.json").write_text(
                     json.dumps(verdict_response), encoding="utf-8"
                 )
@@ -686,11 +1038,7 @@ def run_native_loop(
     result["usage"] = _usage_with_cache_ratio(usage_acc)
 
     result["mode"] = "native_loop"
-    result["rounds"] = outcome.rounds
-    result["stop_reason"] = outcome.stop_reason
-    result["planned_request_count"] = outcome.tool_calls_issued
-    if outcome.error:
-        result["loop_error"] = outcome.error
+    stamp_outcome_diagnostics()
 
     # Additive structured trace of executed calls (tool + args + status). The
     # existing `tool_results` array keeps its executor-result shape for
@@ -735,15 +1083,29 @@ def run_native_loop(
         for executed in outcome.executed
         if executed.result.get("status") == "ok"
     ]
-    evidence_digest = build_evidence_digest(digest_entries, outcome.final_text)
+    publishable_summary = (
+        outcome.final_text if outcome.final_text_source == "content" else ""
+    )
+    corpus_synthesis_memo = (
+        synthesis_memo if synthesis_source == "content" else ""
+    )
+    digest_summary = publishable_summary or corpus_synthesis_memo
+    evidence_digest = build_evidence_digest(digest_entries, digest_summary)
     if evidence_digest:
         result["evidence_digest"] = evidence_digest
 
-    if outcome.final_text:
+    if publishable_summary:
         md_lines.append("## Evidence summary (from the tool loop, untrusted)")
         md_lines.append("")
-        summary_text, _ = mask_and_truncate(outcome.final_text, 4000)
+        summary_text, _ = mask_and_truncate(publishable_summary, 4000)
         md_lines.append(summary_text)
+        md_lines.append("")
+
+    if corpus_synthesis_memo and corpus_synthesis_memo != publishable_summary:
+        md_lines.append("## Internal evidence synthesis (untrusted; not review text)")
+        md_lines.append("")
+        memo_text, _ = mask_and_truncate(corpus_synthesis_memo, 6000)
+        md_lines.append(memo_text)
         md_lines.append("")
 
     write_outputs(result, "\n".join(md_lines))
@@ -751,11 +1113,11 @@ def run_native_loop(
 
 
 def main():
-    max_response_bytes = int(os.getenv("TOOL_MAX_RESPONSE_BYTES", "12000"))
-    planning_timeout = int(os.getenv("TOOL_PLANNING_TIMEOUT_SEC", "60"))
-    planning_max_context = int(os.getenv("TOOL_PLANNING_MAX_CONTEXT_BYTES", "50000"))
-    max_requests = env_int_bounded("TOOL_MAX_REQUESTS", 4, 1, 20)
-    request_timeout = env_int_bounded("TOOL_REQUEST_TIMEOUT_SEC", 20, 1, 300)
+    max_response_bytes = env_positive_int("TOOL_MAX_RESPONSE_BYTES", 12000)
+    planning_timeout = env_positive_int("TOOL_PLANNING_TIMEOUT_SEC", 60)
+    planning_max_context = env_positive_int("TOOL_PLANNING_MAX_CONTEXT_BYTES", 50000)
+    max_requests = env_positive_int("TOOL_MAX_REQUESTS", 4)
+    request_timeout = env_positive_int("TOOL_REQUEST_TIMEOUT_SEC", 20)
 
     allowed_hosts_raw = os.getenv("ALLOWED_SOURCE_HOSTS", "github.com,api.github.com")
     allowed_hosts = [h.strip() for h in allowed_hosts_raw.split(",") if h.strip()]
@@ -819,7 +1181,7 @@ def main():
         request_timeout,
         max_requests,
         planning_timeout,
-        int(os.getenv("TOOL_PLANNING_MAX_TOKENS", "400")),
+        env_positive_int("TOOL_PLANNING_MAX_TOKENS", 400),
         result,
     )
     if not handled:

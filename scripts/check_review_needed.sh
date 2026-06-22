@@ -175,6 +175,24 @@ compute_config_hash() {
   if [[ -n "${TOOL_MAX_REQUESTS:-}" ]]; then
     parts+=("tool_max_requests:${TOOL_MAX_REQUESTS}")
   fi
+  if [[ -n "${TOOL_MAX_ROUNDS:-}" ]]; then
+    parts+=("tool_max_rounds:${TOOL_MAX_ROUNDS}")
+  fi
+  if [[ -n "${TOOL_LOOP_WALL_CLOCK_SEC:-}" ]]; then
+    parts+=("tool_loop_wall_clock:${TOOL_LOOP_WALL_CLOCK_SEC}")
+  fi
+  if [[ -n "${TOOL_SYNTHESIS_TIMEOUT_SEC:-}" ]]; then
+    parts+=("tool_synthesis_timeout:${TOOL_SYNTHESIS_TIMEOUT_SEC}")
+  fi
+  if [[ -n "${TOOL_SYNTHESIS_MAX_TOKENS:-}" ]]; then
+    parts+=("tool_synthesis_max_tokens:${TOOL_SYNTHESIS_MAX_TOKENS}")
+  fi
+  if [[ -n "${TOOL_LOOP_SUMMARIZE:-}" ]]; then
+    parts+=("tool_loop_summarize:${TOOL_LOOP_SUMMARIZE}")
+  fi
+  if [[ -n "${TOOL_LOOP_SUMMARIZE_MAX_TOKENS:-}" ]]; then
+    parts+=("tool_loop_summarize_max_tokens:${TOOL_LOOP_SUMMARIZE_MAX_TOKENS}")
+  fi
   if [[ -n "${TOOL_PLANNING_TIMEOUT_SEC:-}" ]]; then
     parts+=("tool_planning_timeout:${TOOL_PLANNING_TIMEOUT_SEC}")
   fi

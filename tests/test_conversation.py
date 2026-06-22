@@ -158,6 +158,50 @@ class TestReasoningEffort:
         assert verdict["reasoning_effort"] == "none"
 
 
+def test_old_assistant_text_compaction_preserves_recent_analysis():
+    conv = Conversation(system="s")
+    for marker in ("old-a", "old-b", "new-a", "new-b"):
+        conv.add_assistant_text(marker + ":" + "x" * 2000)
+    assert conv.truncate_oldest_assistant_text(100, keep_newest=2) == 2
+    texts = [e["content"] for e in conv.events if e["kind"] == "assistant_text"]
+    assert len(texts[0].encode()) <= 100
+    assert len(texts[1].encode()) <= 100
+    assert texts[2].startswith("new-a:") and len(texts[2]) > 100
+    assert texts[3].startswith("new-b:") and len(texts[3]) > 100
+
+
+def test_anthropic_ephemeral_note_merges_into_existing_user_turn():
+    conv = Conversation(system="s")
+    conv.add_user("review")
+    payload = conv.to_request_payload(
+        "anthropic", "m", ephemeral_user_note="budget note"
+    )
+    assert len(payload["messages"]) == 1
+    assert payload["messages"][0] == {
+        "role": "user", "content": "review\n\nbudget note"
+    }
+
+
+def test_completed_history_collapse_keeps_recent_pairs_and_open_call_contract():
+    conv = Conversation(system="s")
+    conv.add_user("review")
+    for i in range(6):
+        conv.add_assistant_text(f"analysis-{i}:" + "x" * 1000)
+        conv.add_assistant_tool_calls([
+            {"id": f"c{i}", "name": "read_file", "arguments": f'{{"path":"{i}"}}'}
+        ])
+        conv.add_tool_result(f"c{i}", {"content": "y" * 2000})
+    before = conv.approx_tokens()
+    removed = conv.collapse_oldest_completed_history(1200, keep_newest_results=2)
+    assert removed > 0
+    assert conv.approx_tokens() < before
+    assert conv.open_tool_call_ids() == set()
+    assert sum(e["kind"] == "tool_result" for e in conv.events) == 2
+    notes = [e for e in conv.events if e.get("compaction_note")]
+    assert len(notes) == 1
+    assert "read_file" in notes[0]["content"]
+
+
 class TestAnthropicCachePrefix:
     """Anthropic prompt caching is opt-in (#263 Part 2): cache_control markers
     on the stable prefix (system + tools). Default off — unchanged wire shape."""

@@ -360,6 +360,16 @@ inputs:
       (all model round-trips plus tool execution). Ignored for other modes.
     required: false
     default: "120"
+  tool_synthesis_timeout_sec:
+    description: >-
+      Timeout reserved inside tool_loop_wall_clock_sec for the terminal,
+      tools-disabled evidence synthesis turn. Must be a positive integer.
+    required: false
+    default: "60"
+  tool_synthesis_max_tokens:
+    description: Maximum completion tokens for the terminal evidence synthesis turn.
+    required: false
+    default: "2048"
   tool_loop_summarize:
     description: >-
       When "true", tool_mode=native_loop folds the oldest tool results into a
@@ -393,7 +403,7 @@ inputs:
   tool_max_rounds:
     description: >-
       Round budget for tool_mode=native_loop, where a round is a single model turn:
-      the loop allows up to twice this value (capped at 8) to leave room for
+      the legacy mapping allows exactly twice this value to leave room for
       one-call-per-turn chains and repair turns. Ignored when tool_mode=off.
     required: false
     default: "3"
@@ -672,6 +682,8 @@ runs:
         TOOL_MCP_SERVERS: ${{ inputs.tool_mcp_servers }}
         TOOL_MCP_TOKEN: ${{ inputs.tool_mcp_token }}
         TOOL_LOOP_WALL_CLOCK_SEC: ${{ inputs.tool_loop_wall_clock_sec }}
+        TOOL_SYNTHESIS_TIMEOUT_SEC: ${{ inputs.tool_synthesis_timeout_sec }}
+        TOOL_SYNTHESIS_MAX_TOKENS: ${{ inputs.tool_synthesis_max_tokens }}
         TOOL_LOOP_SUMMARIZE: ${{ inputs.tool_loop_summarize }}
         TOOL_LOOP_SUMMARIZE_MAX_TOKENS: ${{ inputs.tool_loop_summarize_max_tokens }}
         TOOL_MAX_REQUESTS: ${{ inputs.tool_max_requests }}
@@ -784,6 +796,8 @@ runs:
         TOOL_MCP_SERVERS: ${{ inputs.tool_mcp_servers }}
         TOOL_MCP_TOKEN: ${{ inputs.tool_mcp_token }}
         TOOL_LOOP_WALL_CLOCK_SEC: ${{ inputs.tool_loop_wall_clock_sec }}
+        TOOL_SYNTHESIS_TIMEOUT_SEC: ${{ inputs.tool_synthesis_timeout_sec }}
+        TOOL_SYNTHESIS_MAX_TOKENS: ${{ inputs.tool_synthesis_max_tokens }}
         TOOL_LOOP_SUMMARIZE: ${{ inputs.tool_loop_summarize }}
         TOOL_LOOP_SUMMARIZE_MAX_TOKENS: ${{ inputs.tool_loop_summarize_max_tokens }}
         TOOL_MAX_REQUESTS: ${{ inputs.tool_max_requests }}

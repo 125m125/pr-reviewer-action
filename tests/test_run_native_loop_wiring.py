@@ -20,6 +20,15 @@ import run_tool_harness as rth  # noqa: E402
 from pr_reviewer import transport  # noqa: E402
 
 
+def test_positive_budget_values_are_exact_and_invalid_values_rejected(monkeypatch):
+    monkeypatch.setenv("TOOL_MAX_REQUESTS", "40")
+    assert rth.env_positive_int("TOOL_MAX_REQUESTS", 4) == 40
+    for bad in ("0", "-1", "1.5", "NaN", "inf"):
+        monkeypatch.setenv("TOOL_MAX_REQUESTS", bad)
+        with pytest.raises(ValueError):
+            rth.env_positive_int("TOOL_MAX_REQUESTS", 4)
+
+
 def _openai_call(call_id, name, args):
     return {
         "choices": [
@@ -123,6 +132,84 @@ def test_native_loop_two_hops_writes_outputs(monkeypatch, tmp_path):
     # carried into tool-harness.json (which run_review.sh folds into the marker).
     assert result["evidence_digest"] == "Talos v1.13.4 with k8s v1.36.2."
     assert harness["evidence_digest"] == "Talos v1.13.4 with k8s v1.36.2."
+
+
+def test_reasoning_only_closing_analysis_is_internal_not_published(monkeypatch, tmp_path):
+    (tmp_path / "a.txt").write_text("evidence")
+    reasoning_only = {
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {"content": "\n", "reasoning_content": "private synthesis"},
+        }]
+    }
+    handled, result = _run(
+        monkeypatch, tmp_path,
+        [_openai_call("c1", "read_file", '{"path":"a.txt"}'), reasoning_only],
+    )
+    assert handled is True
+    assert result["synthesis"]["ran"] is False
+    assert result["synthesis"]["text_source"] == "reasoning_fallback"
+    assert "private synthesis" not in (tmp_path / "tool-harness.md").read_text()
+    assert "private synthesis" not in json.dumps(result.get("evidence_digest", ""))
+
+
+def test_tool_cap_runs_terminal_synthesis(monkeypatch, tmp_path):
+    for name in ("a", "b", "c", "d"):
+        (tmp_path / name).write_text(name)
+    batch = {
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": None,
+                "tool_calls": [
+                    {"id": f"c{i}", "type": "function", "function": {
+                        "name": "read_file", "arguments": json.dumps({"path": name})
+                    }}
+                    for i, name in enumerate(("a", "b", "c", "d"), 1)
+                ],
+            },
+        }]
+    }
+    handled, result = _run(
+        monkeypatch, tmp_path, [batch, _openai_text("concise evidence memo")]
+    )
+    assert handled is True
+    assert result["stop_reason"] == "tool-call-budget-exhausted"
+    assert result["synthesis"]["ran"] is True
+    assert result["synthesis"]["text_source"] == "content"
+    assert result["tool_call_counts"]["executed"] == 4
+    assert "concise evidence memo" in (tmp_path / "tool-harness.md").read_text()
+
+
+def test_synthesis_reasoning_fallback_reaches_verdict_but_not_outputs(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_RESPONSE_FORMAT", "json_schema")
+    (tmp_path / "review-corpus.truncated.md").write_text("# corpus\n")
+    for name in ("a", "b", "c", "d"):
+        (tmp_path / name).write_text(name)
+    batch = {"choices": [{
+        "finish_reason": "tool_calls",
+        "message": {"content": None, "tool_calls": [
+            {"id": f"c{i}", "type": "function", "function": {
+                "name": "read_file", "arguments": json.dumps({"path": name})
+            }} for i, name in enumerate(("a", "b", "c", "d"), 1)
+        ]},
+    }]}
+    synthesis = {"choices": [{
+        "finish_reason": "stop",
+        "message": {"content": "\n", "reasoning_content": "PRIVATE SYNTHESIS MEMO"},
+    }]}
+    verdict = _openai_text('{"verdict":"approve","review_markdown":"ok","findings":[]}')
+    handled, result, payloads = _run_capturing(
+        monkeypatch, tmp_path, "openai", [batch, synthesis, verdict]
+    )
+    assert handled is True
+    assert result["synthesis"]["text_source"] == "reasoning_fallback"
+    verdict_user = "\n".join(
+        str(m.get("content") or "") for m in payloads[-1]["messages"]
+        if m.get("role") == "user"
+    )
+    assert "PRIVATE SYNTHESIS MEMO" in verdict_user
+    assert "PRIVATE SYNTHESIS MEMO" not in json.dumps(result)
 
 
 def _make_sse_line(data):
@@ -272,17 +359,15 @@ def test_native_loop_falls_back_to_non_streamed_turn(monkeypatch, tmp_path):
     assert all("stream_options" not in p and p["stream"] is False for p in fallback_payloads)
 
 
-def test_native_loop_degrades_writes_nothing(monkeypatch, tmp_path):
+def test_native_loop_accepts_useful_no_tool_completion(monkeypatch, tmp_path):
     handled, result = _run(
         monkeypatch,
         tmp_path,
         [_openai_text("Looks like a routine patch bump, approve.")],
     )
-    assert handled is False
-    assert result["native_loop_degraded"] == "no-tool-calls"
-    # No output files: the caller (main) falls through to the planner path.
-    assert not (tmp_path / "tool-harness.json").exists()
-    assert not (tmp_path / "tool-harness.md").exists()
+    assert handled is True
+    assert result["stop_reason"] == "no-tool-calls"
+    assert result["synthesis"]["ran"] is False
 
 
 def _capture_summarize_fn(monkeypatch, tmp_path, *, enabled):
@@ -343,7 +428,7 @@ def _openai_text_with_usage(text, *, prompt, completion, cached=0):
     return resp
 
 
-def test_native_loop_degrade_records_native_usage(monkeypatch, tmp_path):
+def test_native_loop_no_tool_completion_records_native_usage(monkeypatch, tmp_path):
     """A turn that burns tokens then declines tools still records its spend.
 
     Before the fix the no-tool-calls degrade returned without stamping usage,
@@ -357,9 +442,8 @@ def test_native_loop_degrade_records_native_usage(monkeypatch, tmp_path):
             "Approve.", prompt=1000, completion=400, cached=600
         )],
     )
-    assert handled is False
-    assert result["native_loop_degraded"] == "no-tool-calls"
-    usage = result["native_loop_usage"]
+    assert handled is True
+    usage = result["usage"]
     assert usage["prompt_tokens"] == 1000
     assert usage["completion_tokens"] == 400
     assert usage["cached_prompt_tokens"] == 600
@@ -395,15 +479,22 @@ def test_native_loop_request_error_records_usage_and_error(monkeypatch, tmp_path
     # Usage block is present (zeroed — the request never returned a body).
     assert result["native_loop_usage"]["prompt_tokens"] == 0
     assert result["native_loop_usage"]["cache_hit_ratio"] == 0.0
+    assert result["planning_turns_attempted"] == 1
+    assert result["tool_call_counts"] == {
+        "issued": 0, "executed": 0, "rejected": 0, "duplicated": 0, "malformed": 0
+    }
+    assert result["remaining_budget"]["tool_calls"] == 4
 
 
-def _run_capturing(monkeypatch, tmp_path, api_format, responses):
+def _run_capturing(monkeypatch, tmp_path, api_format, responses, max_requests=4):
     """Like _run but records every payload sent, for the verdict-turn tests."""
     queue = list(responses)
     payloads = []
 
     def fake_request(base_url, fmt, payload, api_key, timeout_sec):
-        payloads.append(payload)
+        recorded = dict(payload)
+        recorded["_test_timeout_sec"] = timeout_sec
+        payloads.append(recorded)
         assert queue, "model called more times than scripted"
         return queue.pop(0)
 
@@ -421,7 +512,7 @@ def _run_capturing(monkeypatch, tmp_path, api_format, responses):
         "owner/repo", "http://model.local/v1", api_format, "mock-model", "key",
         "# PR Corpus\nbumps kubelet image in machineconfig.yaml.j2",
         {"owner/repo"}, ["talos.dev"], str(tmp_path),
-        12000, 15, 4, 45, 400, result,
+        12000, 15, max_requests, 45, 400, result,
     )
     return handled, result, payloads
 
@@ -487,6 +578,85 @@ def test_native_loop_uses_general_and_verdict_reasoning_efforts(monkeypatch, tmp
     assert verdict_payload["reasoning_effort"] == "none"
     assert verdict_payload["response_format"]["type"] == "json_schema"
     assert verdict_payload["response_format"]["json_schema"]["name"] == "pr_review"
+    assert verdict_payload["_test_timeout_sec"] == 45
+
+
+def test_forty_call_review_is_compacted_within_model_context(monkeypatch, tmp_path):
+    monkeypatch.setenv("MODEL_CONTEXT_TOKENS", "65536")
+    monkeypatch.setenv("AI_MAX_TOKENS", "8192")
+    monkeypatch.setenv("AI_RESPONSE_FORMAT", "json_schema")
+    (tmp_path / "review-corpus.truncated.md").write_text("# full corpus\n" + "D" * 20000)
+    calls = []
+    for i in range(40):
+        name = f"evidence-{i}.txt"
+        (tmp_path / name).write_text(f"material-{i}\n" + "x" * 11900)
+        calls.append({
+            "id": f"c{i}", "type": "function",
+            "function": {"name": "read_file", "arguments": json.dumps({"path": name})},
+        })
+    batch1 = {"choices": [{
+        "finish_reason": "tool_calls",
+        "message": {"content": None, "tool_calls": calls[:20]},
+    }]}
+    batch2 = {"choices": [{
+        "finish_reason": "tool_calls",
+        "message": {"content": None, "tool_calls": calls[20:]},
+    }]}
+    verdict_json = '{"verdict":"approve","review_markdown":"ok","findings":[]}'
+    handled, result, payloads = _run_capturing(
+        monkeypatch, tmp_path, "openai",
+        [batch1, batch2, _openai_text("compact synthesis memo"), _openai_text(verdict_json)],
+        max_requests=40,
+    )
+    assert handled is True
+    assert result["tool_call_counts"]["executed"] == 40
+    assert result["synthesis"]["ran"] is True
+    assert result["compaction"]["runs"] >= 1
+    assert result["verdict_context"]["approx_tokens"] + 8192 < 65536
+    assert len(json.dumps(payloads[1]).encode("utf-8")) // 3 + 4096 < 65536
+    assert "tools" not in payloads[-1]
+    assert "tools" not in payloads[-2]  # synthesis is tools-disabled too
+    assert result["synthesis"]["input_context"]["bytes"] <= result["synthesis"]["input_allowance_bytes"]
+
+
+def test_tiny_model_context_is_rejected_before_requests(monkeypatch, tmp_path):
+    monkeypatch.setenv("MODEL_CONTEXT_TOKENS", "9000")
+    monkeypatch.setenv("AI_MAX_TOKENS", "8192")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="positive input allowance"):
+        rth.run_native_loop(
+            "owner/repo", "http://model.local/v1", "openai", "m", "key",
+            "corpus", {"owner/repo"}, [], str(tmp_path),
+            12000, 15, 4, 45, 400,
+            {"tool_results": [], "executed_request_count": 0},
+        )
+
+
+def test_compact_context_preserves_corpus_head_and_standards_tail():
+    corpus = "HEAD-DIFF\n" + "x" * 20000 + "\n# Repository Standards\nTAIL-STANDARD"
+    context, details = rth._compose_review_context(
+        "instruction", "memo", "notebook", corpus, 5000
+    )
+    assert len(context.encode("utf-8")) <= 5000
+    assert "HEAD-DIFF" in context
+    assert "TAIL-STANDARD" in context
+    assert details["corpus_truncated"] is True
+
+
+def test_internal_notebook_keeps_synthetic_errors_and_is_bounded():
+    from pr_reviewer.conversation import Conversation
+
+    conv = Conversation(system="s")
+    conv.add_assistant_text("recent analysis")
+    conv.add_assistant_tool_calls([
+        {"id": "c1", "name": "read_file", "arguments": '{"path":"a"}'}
+    ])
+    conv.add_tool_result("c1", {"error": "Tool-call budget exhausted"}, is_error=True)
+    notebook, truncated = rth._build_internal_notebook(conv, 300)
+    assert len(notebook.encode("utf-8")) <= 300
+    assert "read_file" in notebook
+    assert "budget exhausted" in notebook.lower()
+    assert truncated is False
 
 
 def test_native_loop_skips_verdict_for_anthropic(monkeypatch, tmp_path):

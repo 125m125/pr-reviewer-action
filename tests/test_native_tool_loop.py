@@ -17,22 +17,24 @@ from pr_reviewer.tool_loop import (
     LoopBudgets,
     adaptive_loop_budgets,
     drive_tool_loop,
+    effective_intermediate_text,
+    extract_intermediate_turn,
     extract_tool_calls,
 )
 
 
 class TestAdaptiveLoopBudgets:
-    """Loop depth is route-independent: 2× the configured rounds (capped at 8)
+    """Loop depth is route-independent: exactly 2× configured rounds
     plus the configured tool-call budget, on every route. The route selects the
     MODEL, never the tool budget — the primary model is fully capable and is no
     longer shallow-capped (the loop self-limits when the model stops calling
     tools)."""
 
-    def test_headroom_doubles_rounds_capped_at_8(self):
+    def test_headroom_doubles_rounds_without_hidden_cap(self):
         b = adaptive_loop_budgets(3, 4, 120.0)
         assert b.max_rounds == 6  # 3 * 2
         assert b.max_tool_calls == 4
-        assert adaptive_loop_budgets(6, 4, 120.0).max_rounds == 8  # capped
+        assert adaptive_loop_budgets(6, 4, 120.0).max_rounds == 12
 
     def test_primary_route_is_not_shallowed(self):
         # Was capped to 2 rounds / 3 calls; now gets the full configured budget.
@@ -151,6 +153,110 @@ def test_extract_malformed_response_is_empty():
     assert text == ""
 
 
+def test_effective_intermediate_content_wins_over_reasoning():
+    text, source = effective_intermediate_text(
+        {"content": "ordinary", "reasoning_content": "hidden"}, "openai"
+    )
+    assert (text, source) == ("ordinary", "content")
+
+
+def test_effective_intermediate_whitespace_falls_back_for_openai():
+    text, source = effective_intermediate_text(
+        {"content": "\n\n", "reasoning_content": "inspect the effect test"},
+        "openai",
+    )
+    assert (text, source) == ("inspect the effect test", "reasoning_fallback")
+
+
+def test_effective_intermediate_blank_and_anthropic_do_not_fallback():
+    assert effective_intermediate_text(
+        {"content": " ", "reasoning_content": " "}, "openai"
+    ) == ("", "none")
+    assert effective_intermediate_text(
+        {"content": " ", "reasoning_content": "hidden"}, "anthropic"
+    ) == ("", "none")
+
+
+def test_qwen_reasoning_fallback_is_preserved_in_next_request():
+    conv = fresh_conversation()
+    payloads = []
+    responses = [
+        {
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "\n\n",
+                    "reasoning_content": "I found a cancellation race; inspect the test.",
+                    "tool_calls": [{
+                        "id": "call-1", "type": "function",
+                        "function": {"name": "read_file", "arguments": '{"path":"src/effect.spec.ts"}'},
+                    }],
+                },
+            }]
+        },
+        openai_text_response("done"),
+    ]
+
+    def post(payload):
+        payloads.append(payload)
+        return responses.pop(0)
+
+    execute, _ = recording_execute()
+    outcome = drive_tool_loop(
+        conv, post, execute, api_format="openai", model="m", budgets=LoopBudgets()
+    )
+    prior = next(m for m in payloads[1]["messages"] if m.get("tool_calls"))
+    assert prior["content"] == "I found a cancellation race; inspect the test."
+    assert outcome.text_sources[0] == "reasoning_fallback"
+
+
+def test_budget_notes_are_correct_and_do_not_accumulate():
+    conv = fresh_conversation()
+    payloads = []
+    responses = [
+        openai_tool_call_response([("c1", "read_file", '{"path":"a"}')]),
+        openai_text_response("done"),
+    ]
+
+    def post(payload):
+        payloads.append(payload)
+        return responses.pop(0)
+
+    execute, _ = recording_execute()
+    drive_tool_loop(
+        conv, post, execute, api_format="openai", model="m",
+        budgets=LoopBudgets(max_tool_calls=3, max_rounds=4),
+    )
+    notes0 = [m for m in payloads[0]["messages"] if "Exploration budget" in str(m.get("content"))]
+    notes1 = [m for m in payloads[1]["messages"] if "Exploration budget" in str(m.get("content"))]
+    assert len(notes0) == len(notes1) == 1
+    assert "3 tool calls and 4 planning turns" in notes0[0]["content"]
+    assert "2 tool calls and 3 planning turns" in notes1[0]["content"]
+
+
+def test_length_without_usable_answer_is_not_model_done():
+    conv = fresh_conversation()
+    truncated = {"choices": [{"finish_reason": "length", "message": {"content": ""}}]}
+    outcome = drive_tool_loop(
+        conv, scripted_post([truncated, truncated]), recording_execute()[0],
+        api_format="openai", model="m", budgets=LoopBudgets(max_rounds=2),
+    )
+    assert outcome.stop_reason == "truncated-turn"
+    assert outcome.truncation_retries == 1
+
+
+def test_wall_clock_stop_before_first_request_still_allows_synthesis_phase():
+    conv = fresh_conversation()
+    times = iter((0.0, 2.0))
+    outcome = drive_tool_loop(
+        conv, scripted_post([]), recording_execute()[0],
+        api_format="openai", model="m",
+        budgets=LoopBudgets(wall_clock_sec=1), time_fn=lambda: next(times),
+    )
+    assert outcome.stop_reason == STOP_WALL_CLOCK
+    assert outcome.degraded is False
+
+
 # ---------------------------------------------------------------------------
 # drive_tool_loop — happy path
 # ---------------------------------------------------------------------------
@@ -260,6 +366,8 @@ def test_tool_call_budget_exhaustion():
     assert outcome.stop_reason == STOP_BUDGET
     assert len(log) == 2  # third call refused, not executed
     assert outcome.tool_calls_issued == 3
+    assert outcome.calls_executed == 2
+    assert outcome.calls_rejected == 1
     # The refused call still got a (synthetic error) result.
     assert conv.open_tool_call_ids() == set()
     budget_notes = [
@@ -496,7 +604,7 @@ def test_no_summarize_fn_truncates_as_before():
 # ---------------------------------------------------------------------------
 
 
-def test_no_tool_calls_degrades():
+def test_no_tool_calls_with_useful_analysis_is_a_valid_early_stop():
     """A model that never calls tools → degraded=True for the planner fallback."""
     conv = fresh_conversation()
     post = scripted_post([openai_text_response("looks fine, approve")])
@@ -504,7 +612,7 @@ def test_no_tool_calls_degrades():
     outcome = drive_tool_loop(
         conv, post, execute, api_format="openai", model="m", budgets=LoopBudgets()
     )
-    assert outcome.degraded is True
+    assert outcome.degraded is False
     assert outcome.stop_reason == STOP_NO_TOOL_CALLS
     assert log == []
 

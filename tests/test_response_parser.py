@@ -148,6 +148,16 @@ class TestTryDecodeJson(TestCase):
 # ---------------------------------------------------------------------------
 
 class TestParseResponse(TestCase):
+    def test_final_verdict_never_uses_reasoning_content(self):
+        response = {
+            "choices": [{"message": {
+                "content": "",
+                "reasoning_content": '{"verdict":"approve","review_markdown":"hidden"}',
+            }}]
+        }
+        with self.assertRaises(SystemExit):
+            parse_response(response)
+
     def test_openai_format(self):
         resp = _make_openai()
         result = parse_response(resp)

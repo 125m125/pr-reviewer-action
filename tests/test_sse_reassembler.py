@@ -97,6 +97,16 @@ class TestReassembleAnthropic:
 
 
 class TestReassembleOpenAI:
+    def test_reasoning_content_deltas_are_reassembled_separately(self):
+        lines = [
+            _make_sse_line({"choices": [{"delta": {"reasoning_content": "inspect "}, "finish_reason": None}]}),
+            _make_sse_line({"choices": [{"delta": {"reasoning_content": "tests"}, "finish_reason": "stop"}]}),
+        ]
+        result = reassemble_sse("\n".join(lines), "openai")
+        message = result["choices"][0]["message"]
+        assert message["content"] == ""
+        assert message["reasoning_content"] == "inspect tests"
+
     def test_basic_completion(self):
         lines = [
             _make_sse_line({"id": "chat_1", "model": "gpt-4o", "choices": [{"index": 0, "delta": {"content": "Hello"}, "finish_reason": None}]}),

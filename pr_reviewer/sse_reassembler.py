@@ -58,14 +58,17 @@ def reassemble_sse(response_text: str, api_format: str) -> dict:
     """
     lines = response_text.splitlines()
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
 
     if api_format == "anthropic":
         result = _reassemble_anthropic(lines, content_parts, tool_calls)
     else:
-        result = _reassemble_openai(lines, content_parts, tool_calls)
+        result = _reassemble_openai(lines, content_parts, reasoning_parts, tool_calls)
 
     message = result["choices"][0]["message"]
+    if reasoning_parts:
+        message["reasoning_content"] = "".join(reasoning_parts)
     if tool_calls:
         # OpenAI's non-streaming shape: {id, type, function: {name, arguments}}
         message["tool_calls"] = tool_calls
@@ -263,6 +266,7 @@ def _reassemble_anthropic(
 def _reassemble_openai(
     lines: list[str],
     content_parts: list[str],
+    reasoning_parts: list[str],
     tool_calls: list[dict[str, Any]],
 ) -> dict:
     finish_reason: str | None = None
@@ -320,6 +324,9 @@ def _reassemble_openai(
                 c = delta.get("content")
                 if isinstance(c, str):
                     content_parts.append(c)
+                reasoning = delta.get("reasoning_content")
+                if isinstance(reasoning, str):
+                    reasoning_parts.append(reasoning)
                 # Tool calls: list shape (newer OpenAI, llama.cpp/LiteLLM)
                 # OR single object (some LiteLLM proxy builds emit a single
                 # delta.tool_calls dict rather than a list). Handle both.
