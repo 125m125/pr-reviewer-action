@@ -16,3 +16,14 @@ def test_huge_json_impact_match_is_deterministically_capped():
     assert "[match truncated]" in first
     assert "impact scan capped" in first
     assert details["truncated"] is True
+
+
+def test_cap_accepts_streams_and_never_exceeds_tiny_total():
+    output, details = cap_impact_lines(
+        iter(["a.json:1:" + ("x" * 1000)]),
+        per_match_bytes=100,
+        per_file_matches=1,
+        total_bytes=32,
+    )
+    assert len(output.encode("utf-8")) <= 32
+    assert details["truncated"] is True

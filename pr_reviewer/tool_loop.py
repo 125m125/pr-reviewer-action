@@ -173,9 +173,7 @@ def detect_textual_tool_intent(text: str) -> list[str]:
     if not isinstance(text, str) or not text:
         return []
     blocks = re.findall(r"<tool_call\b[^>]*>.*?</tool_call\s*>", text, re.I | re.S)
-    return ["qwen_xml_tool_call" for block in blocks if re.search(
-        r"<function\s*=\s*[^>]+>", block, re.I
-    )]
+    return ["qwen_xml_tool_call"] * len(blocks)
 
 
 def effective_intermediate_text(
@@ -436,7 +434,11 @@ def drive_tool_loop(
 
         if not calls:
             if finish_reason == "length":
-                if outcome.truncation_retries == 0 and outcome.rounds < budgets.max_rounds:
+                if (
+                    not textual_repair_pending
+                    and outcome.truncation_retries == 0
+                    and outcome.rounds < budgets.max_rounds
+                ):
                     candidate = max_tokens * 2
                     if budgets.model_context_tokens:
                         safe_cap = (
@@ -569,6 +571,13 @@ def drive_tool_loop(
             break
     else:
         outcome.stop_reason = STOP_MAX_ROUNDS
+
+    # A repair request that ended on a hard stop (transport, time, context, or
+    # truncation) did not execute the previously expressed intent. A clean
+    # no-tool response clears ``textual_repair_pending`` above because the model
+    # may explicitly decide the evidence is no longer needed.
+    if textual_repair_pending:
+        outcome.textual_tool_unexecuted = True
 
     outcome.degraded = (
         outcome.tool_calls_issued == 0

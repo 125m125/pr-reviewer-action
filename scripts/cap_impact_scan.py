@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Iterable
 
 
 def cap_impact_lines(
-    lines: list[str], *, per_match_bytes: int = 500,
+    lines: Iterable[str], *, per_match_bytes: int = 500,
     per_file_matches: int = 5, total_bytes: int = 12000,
 ) -> tuple[str, dict[str, int | bool]]:
     kept: list[str] = []
@@ -26,7 +27,8 @@ def cap_impact_lines(
         encoded = line.encode("utf-8", errors="replace")
         if len(encoded) > per_match_bytes:
             marker = b"...[match truncated]"
-            encoded = encoded[: max(0, per_match_bytes - len(marker))] + marker
+            suffix = marker[:per_match_bytes]
+            encoded = encoded[: max(0, per_match_bytes - len(suffix))] + suffix
             line = encoded.decode("utf-8", errors="ignore")
             truncated_matches += 1
         entry_bytes = len((line + "\n").encode("utf-8"))
@@ -39,17 +41,20 @@ def cap_impact_lines(
 
     was_truncated = bool(truncated_matches or omitted_matches)
     if was_truncated:
-        note = (
-            f"...[impact scan capped: {truncated_matches} long matches shortened; "
-            f"{omitted_matches} matches omitted]"
-        )
-        note_bytes = len((note + "\n").encode("utf-8"))
-        while kept and used + note_bytes > total_bytes:
+        while True:
+            note = (
+                f"...[impact scan capped: {truncated_matches} long matches shortened; "
+                f"{omitted_matches} matches omitted]"
+            )
+            note_bytes = len((note + "\n").encode("utf-8"))
+            if used + note_bytes <= total_bytes or not kept:
+                break
             removed = kept.pop()
             used -= len((removed + "\n").encode("utf-8"))
             omitted_matches += 1
-        kept.append(note)
-        used += note_bytes
+        if note_bytes <= total_bytes:
+            kept.append(note)
+            used += note_bytes
     return "\n".join(kept) + ("\n" if kept else ""), {
         "truncated": was_truncated,
         "truncated_matches": truncated_matches,
@@ -65,7 +70,7 @@ def main() -> None:
     parser.add_argument("--total-bytes", type=int, default=12000)
     args = parser.parse_args()
     output, _ = cap_impact_lines(
-        list(sys.stdin),
+        sys.stdin,
         per_match_bytes=max(64, args.per_match_bytes),
         per_file_matches=max(1, args.per_file_matches),
         total_bytes=max(256, args.total_bytes),

@@ -189,7 +189,8 @@ DB_MIGRATION_PATTERNS = [
 
 _IMPLEMENTATION_FILE = re.compile(rf"\.{_SRC_EXT}$", re.IGNORECASE)
 _FEATURE_SUPPORT_FILE = re.compile(
-    r"(^|/)(tests?|specs?|docs?)(/|$)|(^|/)(prd|openapi)([._/-]|$)|"
+    r"(^|/)(tests?|specs?)(/|$)|(^|[/_.-])prd([/_.-]|$)|"
+    r"(^|/)openapi([._/-]|$)|"
     r"(test|spec)\." + _SRC_EXT + r"$|openapi\.(json|ya?ml)$",
     re.IGNORECASE,
 )
@@ -198,6 +199,56 @@ _LOCALIZATION_FILE = re.compile(
     r"(^|/)[a-z]{2}(?:-[A-Z]{2})?\.json$",
     re.IGNORECASE,
 )
+
+
+def _content_triggering_files(
+    files: list[dict], diff_text: str, patterns: list[re.Pattern[str]]
+) -> list[str]:
+    """Attribute content-pattern matches to concrete non-localization files.
+
+    Prefer per-file API patches, then unified-diff sections. A headerless diff
+    can be attributed only when exactly one eligible file changed; otherwise a
+    flag with guessed or empty support is worse than omitting the weak signal.
+    """
+    eligible = [
+        f.get("filename", "") for f in files
+        if f.get("filename") and not _LOCALIZATION_FILE.search(f["filename"])
+    ]
+    eligible_set = set(eligible)
+    matched: set[str] = set()
+
+    for item in files:
+        filename = item.get("filename", "")
+        patch = item.get("patch")
+        if (
+            filename in eligible_set
+            and isinstance(patch, str)
+            and any(pattern.search(patch) for pattern in patterns)
+        ):
+            matched.add(filename)
+
+    current_file = ""
+    saw_diff_header = False
+    for line in diff_text.splitlines():
+        header = re.match(r"^diff --git a/(.*?) b/(.*)$", line)
+        if header:
+            saw_diff_header = True
+            current_file = header.group(2)
+            continue
+        if (
+            current_file in eligible_set
+            and any(pattern.search(line) for pattern in patterns)
+        ):
+            matched.add(current_file)
+
+    if (
+        not matched
+        and not saw_diff_header
+        and len(eligible) == 1
+        and any(pattern.search(diff_text) for pattern in patterns)
+    ):
+        matched.add(eligible[0])
+    return [filename for filename in eligible if filename in matched]
 
 
 # ---------------------------------------------------------------------------
@@ -309,17 +360,13 @@ def _classify_pr_kind(
     eligible_filenames = [f for f in filenames if not _LOCALIZATION_FILE.search(f)]
     if any(any(pat.search(f) for pat in FILE_SERVING_PATTERNS) for f in eligible_filenames):
         return "file_serving_changes"
-    if eligible_filenames and any(
-        pat.search(diff_text) for pat in FILE_SERVING_CONTENT_PATTERNS
-    ):
+    if _content_triggering_files(files, diff_text, FILE_SERVING_CONTENT_PATTERNS):
         return "file_serving_changes"
 
     # Check path handling changes (in filenames AND diff content)
-    if any(any(pat.search(f) for pat in PATH_HANDLING_PATTERNS) for f in filenames):
+    if any(any(pat.search(f) for pat in PATH_HANDLING_PATTERNS) for f in eligible_filenames):
         return "path_handling_changes"
-    if eligible_filenames and any(
-        pat.search(diff_text) for pat in PATH_HANDLING_CONTENT_PATTERNS
-    ):
+    if _content_triggering_files(files, diff_text, PATH_HANDLING_CONTENT_PATTERNS):
         return "path_handling_changes"
 
     # Default: app code change
@@ -340,9 +387,8 @@ def _detect_risk_flags(
     flags_with_files : dict[str, list[str]]
         Mapping from each file-based risk flag to the file paths that triggered
         it.  Issue-linked flags (linked_security_issue, etc.) have no file
-        attribution and are omitted from this mapping.  When a flag fires only
-        from diff content (no filename match), the mapping contains an empty
-        list for that flag.
+        attribution and are omitted from this mapping. Content-only matches are
+        emitted only when they can be attributed to concrete changed files.
     """
     flags: list[str] = []
     flags_with_files: dict[str, list[str]] = {}
@@ -376,14 +422,8 @@ def _detect_risk_flags(
             f for f in filenames
             if not _LOCALIZATION_FILE.search(f) and any(pat.search(f) for pat in pat_set)
         ]
-        matches_in_diff = any(pat.search(diff_text) for pat in content_pat_set)
-        if matches_in_diff and not triggering_files:
-            # Content-only matches still need deterministic supporting files.
-            # Localization assets are excluded: generic words such as "files"
-            # in translation JSON do not imply path/file-serving behavior.
-            triggering_files = [
-                f for f in filenames if not _LOCALIZATION_FILE.search(f)
-            ]
+        content_files = _content_triggering_files(files, diff_text, content_pat_set)
+        triggering_files = list(dict.fromkeys([*triggering_files, *content_files]))
         if triggering_files:
             if flag not in flags:
                 flags.append(flag)

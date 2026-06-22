@@ -129,6 +129,15 @@ class TestPRKindDependencyUpgrade:
         assert result.pr_kind == "app_code"
         assert "dependency_changes" in result.risk_flags
 
+    def test_unrelated_docs_do_not_hide_a_dependency_upgrade(self):
+        files = [
+            _make_file("src/a.ts"),
+            _make_file("src/b.ts"),
+            _make_file("docs/README.md"),
+            _make_file("package-lock.json"),
+        ]
+        assert _classify_pr_kind(files, '"version": "2.0.0"') == "dependency_upgrade"
+
 
 class TestPRKindK8sManifest:
     @pytest.mark.parametrize("fname", [
@@ -318,6 +327,26 @@ class TestRiskFlagsWithFiles:
         assert "file_serving_changes" not in result.risk_flags
         assert "path_handling_changes" not in result.risk_flags
         assert all(result.risk_flags_with_files.values())
+
+    def test_content_risk_is_attributed_only_to_matching_diff_file(self):
+        files = [_make_file("src/app.py"), _make_file("src/other.py")]
+        diff = (
+            "diff --git a/src/app.py b/src/app.py\n"
+            "+from pathlib import Path\n"
+            "diff --git a/src/other.py b/src/other.py\n"
+            "+value = 1\n"
+        )
+        flags, attribution = _detect_risk_flags(files, diff, [])
+        assert "path_handling_changes" in flags
+        assert attribution["path_handling_changes"] == ["src/app.py"]
+
+    def test_ambiguous_headerless_content_does_not_emit_empty_or_guessed_flag(self):
+        files = [_make_file("src/app.py"), _make_file("src/other.py")]
+        flags, attribution = _detect_risk_flags(
+            files, "+from pathlib import Path\n", []
+        )
+        assert "path_handling_changes" not in flags
+        assert "path_handling_changes" not in attribution
 
     def test_linked_flags_absent_from_attribution(self):
         # Issue-linked flags have no file attribution and must not appear in mapping.

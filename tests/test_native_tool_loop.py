@@ -190,6 +190,10 @@ def test_effective_intermediate_blank_and_anthropic_do_not_fallback():
 
 def test_detects_paired_qwen_markup_but_not_prose():
     assert detect_textual_tool_intent(QWEN_TEXTUAL_CALL) == ["qwen_xml_tool_call"]
+    assert detect_textual_tool_intent("<tool_call>opaque</tool_call>") == [
+        "qwen_xml_tool_call"
+    ]
+    assert detect_textual_tool_intent("<tool_call>unclosed") == []
     assert detect_textual_tool_intent("I should make another tool call later.") == []
 
 
@@ -241,6 +245,26 @@ def test_second_textual_only_response_stops_without_execution():
     assert outcome.stop_reason == "unexecuted-textual-tool-intent"
     assert outcome.textual_tool_unexecuted is True
     assert outcome.rounds == 2
+
+
+def test_truncated_repair_is_not_retried_and_remains_unexecuted():
+    textual = {"choices": [{"finish_reason": "stop", "message": {
+        "content": "", "reasoning_content": QWEN_TEXTUAL_CALL,
+        "tool_calls": [],
+    }}]}
+    truncated = {"choices": [{
+        "finish_reason": "length", "message": {"content": ""}
+    }]}
+    outcome = drive_tool_loop(
+        fresh_conversation(), scripted_post([textual, truncated]),
+        recording_execute()[0], api_format="openai", model="m",
+        budgets=LoopBudgets(max_rounds=6),
+    )
+    assert outcome.stop_reason == "truncated-turn"
+    assert outcome.rounds == 2
+    assert outcome.textual_tool_repair_attempts == 1
+    assert outcome.truncation_retries == 0
+    assert outcome.textual_tool_unexecuted is True
 
 
 def test_native_calls_take_precedence_over_incidental_markup():
