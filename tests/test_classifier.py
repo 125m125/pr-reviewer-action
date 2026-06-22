@@ -115,6 +115,20 @@ class TestPRKindDependencyUpgrade:
         kind = _classify_pr_kind(files, "")
         assert kind == "dependency_upgrade"
 
+    def test_feature_with_generated_version_bump_is_app_code(self):
+        files = [
+            _make_file("backend/src/upload_service.py"),
+            _make_file("frontend/src/upload.component.ts"),
+            _make_file("frontend/src/upload.effects.ts"),
+            _make_file("tests/test_upload.py"),
+            _make_file("docs/upload-prd.md"),
+            _make_file("generated/client/package.json"),
+        ]
+        diff = '-  "version": "1.2.0"\n+  "version": "1.3.0"\n'
+        result = classify_pr(files, diff)
+        assert result.pr_kind == "app_code"
+        assert "dependency_changes" in result.risk_flags
+
 
 class TestPRKindK8sManifest:
     @pytest.mark.parametrize("fname", [
@@ -294,7 +308,16 @@ class TestRiskFlagsWithFiles:
         flags, attribution = _detect_risk_flags(files, diff, [])
         assert "path_handling_changes" in flags
         # app.py itself did not match any path-handling filename pattern
-        assert attribution.get("path_handling_changes", None) == []
+        assert attribution["path_handling_changes"] == ["app.py"]
+
+    def test_translation_only_does_not_trigger_file_or_path_risks(self):
+        files = [_make_file("frontend/assets/i18n/en.json")]
+        diff = '+"uploadFiles": "Upload files from a path"\n'
+        result = classify_pr(files, diff)
+        assert result.pr_kind == "app_code"
+        assert "file_serving_changes" not in result.risk_flags
+        assert "path_handling_changes" not in result.risk_flags
+        assert all(result.risk_flags_with_files.values())
 
     def test_linked_flags_absent_from_attribution(self):
         # Issue-linked flags have no file attribution and must not appear in mapping.

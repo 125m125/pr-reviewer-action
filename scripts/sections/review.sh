@@ -469,6 +469,9 @@ write_step_summary() {
       echo "| Native planning turns | configured=$(jq -r '.budget.rounds_configured' tool-harness.json) rounds, effective=$(jq -r '.budget.planning_turns_effective' tool-harness.json) turns |"
       echo "| Native wall clock | configured=$(jq -r '.budget.wall_clock_configured_sec' tool-harness.json)s, effective=$(jq -r '.budget.wall_clock_effective_sec' tool-harness.json)s |"
       echo "| Native synthesis timeout | configured=$(jq -r '.budget.synthesis_timeout_configured_sec' tool-harness.json)s, effective reserve=$(jq -r '.budget.synthesis_timeout_effective_sec' tool-harness.json)s |"
+      echo "| Textual tool intent | detected=$(jq -r '.textual_tool_intent.detected // false' tool-harness.json), marker counts=$(jq -c '.textual_tool_intent.marker_counts // {}' tool-harness.json), repairs=$(jq -r '.textual_tool_intent.repair_attempts // 0' tool-harness.json), repaired=$(jq -r '.textual_tool_intent.repaired // false' tool-harness.json) |"
+      echo "| Deliberate terminal synthesis | ran=$(jq -r '.synthesis.ran // false' tool-harness.json), reasoning-only=$(jq -r '.synthesis.triggered_by_reasoning_only_completion // false' tool-harness.json) |"
+      echo "| Exploration completeness | $(jq -r '.exploration_completeness // "unknown"' tool-harness.json) |"
     fi
     echo "| Diff bytes | ${diff_bytes} (truncated: ${diff_trunc}) |"
     echo "| Corpus bytes | ${corpus_bytes} (truncated: ${corpus_trunc}) |"

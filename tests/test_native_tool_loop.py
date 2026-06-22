@@ -16,11 +16,22 @@ from pr_reviewer.tool_loop import (
     STOP_WALL_CLOCK,
     LoopBudgets,
     adaptive_loop_budgets,
+    detect_textual_tool_intent,
     drive_tool_loop,
     effective_intermediate_text,
     extract_intermediate_turn,
     extract_tool_calls,
 )
+
+
+QWEN_TEXTUAL_CALL = """Need to inspect the parent.
+<tool_call>
+<function=read_file>
+<parameter=path>
+src/parent.ts
+</parameter>
+</function>
+</tool_call>"""
 
 
 class TestAdaptiveLoopBudgets:
@@ -175,6 +186,75 @@ def test_effective_intermediate_blank_and_anthropic_do_not_fallback():
     assert effective_intermediate_text(
         {"content": " ", "reasoning_content": "hidden"}, "anthropic"
     ) == ("", "none")
+
+
+def test_detects_paired_qwen_markup_but_not_prose():
+    assert detect_textual_tool_intent(QWEN_TEXTUAL_CALL) == ["qwen_xml_tool_call"]
+    assert detect_textual_tool_intent("I should make another tool call later.") == []
+
+
+def test_textual_intent_gets_one_native_repair_and_executes_only_native_call():
+    conv = fresh_conversation()
+    payloads = []
+    responses = [
+        {"choices": [{"finish_reason": "stop", "message": {
+            "content": "", "reasoning_content": QWEN_TEXTUAL_CALL,
+            "tool_calls": [],
+        }}]},
+        openai_tool_call_response([
+            ("native-1", "read_file", '{"path":"src/parent.ts"}')
+        ]),
+        openai_text_response("done"),
+    ]
+
+    def post(payload):
+        payloads.append(payload)
+        return responses.pop(0)
+
+    execute, log = recording_execute()
+    outcome = drive_tool_loop(
+        conv, post, execute, api_format="openai", model="m",
+        budgets=LoopBudgets(max_rounds=4),
+    )
+    assert log == [("read_file", {"path": "src/parent.ts"})]
+    assert outcome.textual_tool_repair_attempts == 1
+    assert outcome.textual_tool_repaired is True
+    repair_users = [
+        str(m.get("content") or "") for m in payloads[1]["messages"]
+        if m.get("role") == "user"
+    ]
+    assert any("returned no native tool_calls" in text for text in repair_users)
+    assert any("planning turns remain" in text for text in repair_users)
+
+
+def test_second_textual_only_response_stops_without_execution():
+    textual = {"choices": [{"finish_reason": "stop", "message": {
+        "content": "", "reasoning_content": QWEN_TEXTUAL_CALL,
+        "tool_calls": [],
+    }}]}
+    execute, log = recording_execute()
+    outcome = drive_tool_loop(
+        fresh_conversation(), scripted_post([textual, textual]), execute,
+        api_format="openai", model="m", budgets=LoopBudgets(max_rounds=6),
+    )
+    assert log == []
+    assert outcome.stop_reason == "unexecuted-textual-tool-intent"
+    assert outcome.textual_tool_unexecuted is True
+    assert outcome.rounds == 2
+
+
+def test_native_calls_take_precedence_over_incidental_markup():
+    execute, log = recording_execute()
+    response = openai_tool_call_response(
+        [("native", "read_file", '{"path":"safe.ts"}')],
+        content=QWEN_TEXTUAL_CALL,
+    )
+    outcome = drive_tool_loop(
+        fresh_conversation(), scripted_post([response, openai_text_response("done")]),
+        execute, api_format="openai", model="m", budgets=LoopBudgets(),
+    )
+    assert log == [("read_file", {"path": "safe.ts"})]
+    assert outcome.textual_tool_intent_detected is False
 
 
 def test_qwen_reasoning_fallback_is_preserved_in_next_request():

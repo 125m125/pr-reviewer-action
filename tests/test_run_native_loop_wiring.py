@@ -144,11 +144,16 @@ def test_reasoning_only_closing_analysis_is_internal_not_published(monkeypatch, 
     }
     handled, result = _run(
         monkeypatch, tmp_path,
-        [_openai_call("c1", "read_file", '{"path":"a.txt"}'), reasoning_only],
+        [
+            _openai_call("c1", "read_file", '{"path":"a.txt"}'),
+            reasoning_only,
+            _openai_text("deliberate synthesis"),
+        ],
     )
     assert handled is True
-    assert result["synthesis"]["ran"] is False
-    assert result["synthesis"]["text_source"] == "reasoning_fallback"
+    assert result["synthesis"]["ran"] is True
+    assert result["synthesis"]["triggered_by_reasoning_only_completion"] is True
+    assert result["synthesis"]["text_source"] == "content"
     assert "private synthesis" not in (tmp_path / "tool-harness.md").read_text()
     assert "private synthesis" not in json.dumps(result.get("evidence_digest", ""))
 
@@ -553,6 +558,43 @@ def test_native_loop_emits_in_conversation_verdict(monkeypatch, tmp_path):
         m.get("content") or "" for m in verdict_payload["messages"] if m["role"] == "user"
     )
     assert "the complete unified diff lives here" in user_text
+
+
+def test_unexecuted_textual_intent_is_internal_and_reaches_synthesis_and_verdict(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("AI_RESPONSE_FORMAT", "json_object")
+    (tmp_path / "review-corpus.truncated.md").write_text("# Full corpus\ndiff\n")
+    raw_reasoning = (
+        "Need the parent.\n<tool_call>\n<function=read_file>\n"
+        "<parameter=path>src/parent.ts</parameter>\n</function>\n</tool_call>"
+    )
+    textual = {"choices": [{"finish_reason": "stop", "message": {
+        "content": "", "reasoning_content": raw_reasoning, "tool_calls": [],
+    }}]}
+    verdict = '{"verdict":"approve","review_markdown":"unknown noted","findings":[]}'
+    handled, result, payloads = _run_capturing(
+        monkeypatch, tmp_path, "openai",
+        [textual, textual, _openai_text("Unresolved evidence remains."), _openai_text(verdict)],
+    )
+    assert handled is True
+    assert result["stop_reason"] == "unexecuted-textual-tool-intent"
+    assert result["textual_tool_intent"] == {
+        "detected": True,
+        "marker_types": ["qwen_xml_tool_call"],
+        "marker_counts": {"qwen_xml_tool_call": 2},
+        "repair_attempts": 1,
+        "repaired": False,
+        "unexecuted": True,
+    }
+    assert result["exploration_completeness"] == "incomplete"
+    assert result["synthesis"]["ran"] is True
+    note = "Exploration ended with unexecuted textual tool intent"
+    for payload in payloads[-2:]:
+        assert note in json.dumps(payload)
+        assert "tools" not in payload
+    assert raw_reasoning not in json.dumps(result)
+    assert raw_reasoning not in (tmp_path / "tool-harness.md").read_text()
 
 
 def test_native_loop_uses_general_and_verdict_reasoning_efforts(monkeypatch, tmp_path):

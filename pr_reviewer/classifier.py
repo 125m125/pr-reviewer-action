@@ -55,6 +55,7 @@ RISK_FLAGS = [
     "path_handling_changes",
     "auth_changes",
     "secret_handling_changes",
+    "dependency_changes",
 ]
 
 
@@ -82,6 +83,12 @@ DEPENDENCY_PATTERNS = [
                r"go\.mod|go\.sum|composer\.lock|mix\.lock|build\.gradle|"
                r"pom\.xml|setup\.py|setup\.cfg|pyproject\.toml|pubspec\.yaml|"
                r"\.npmrc|\.yarnrc)"),
+]
+
+DEPENDENCY_METADATA_PATTERNS = [
+    *DEPENDENCY_PATTERNS,
+    re.compile(r"(^|/)package\.json$", re.IGNORECASE),
+    re.compile(r"(^|/)(client|sdk)[._/-].*\.(json|ya?ml|toml)$", re.IGNORECASE),
 ]
 
 # Kubernetes manifest patterns
@@ -136,6 +143,12 @@ FILE_SERVING_PATTERNS = [
     re.compile(r"serveStatic"),
     re.compile(r"staticfiles?/"),
 ]
+FILE_SERVING_CONTENT_PATTERNS = [
+    re.compile(r"\bsend_file\s*\(", re.IGNORECASE),
+    re.compile(r"\bsend_from_directory\s*\(", re.IGNORECASE),
+    re.compile(r"\bFileServer\s*\(", re.IGNORECASE),
+    re.compile(r"\bserveStatic\s*\(", re.IGNORECASE),
+]
 
 # Path handling changes — match in filenames AND diff content
 PATH_HANDLING_PATTERNS = [
@@ -145,6 +158,13 @@ PATH_HANDLING_PATTERNS = [
     re.compile(r"\.\./|\.\.\\", re.IGNORECASE),  # path traversal
     re.compile(r"sanitize.*path|clean.*path", re.IGNORECASE),
     re.compile(r"path_join|joinpath|resolve.*path", re.IGNORECASE),
+]
+PATH_HANDLING_CONTENT_PATTERNS = [
+    re.compile(r"\bpathlib\b", re.IGNORECASE),
+    re.compile(r"\bos\.path\b", re.IGNORECASE),
+    re.compile(r"\.\./|\.\.\\"),
+    re.compile(r"\b(?:sanitize|clean).*path\b", re.IGNORECASE),
+    re.compile(r"\b(?:path_join|joinpath|resolve_path)\b", re.IGNORECASE),
 ]
 
 # Secret handling changes
@@ -166,6 +186,18 @@ DB_MIGRATION_PATTERNS = [
     re.compile(r"alembic|django.*migrat|sequelize|migrate_", re.IGNORECASE),
     re.compile(r"prisma/schema\.prisma$"),
 ]
+
+_IMPLEMENTATION_FILE = re.compile(rf"\.{_SRC_EXT}$", re.IGNORECASE)
+_FEATURE_SUPPORT_FILE = re.compile(
+    r"(^|/)(tests?|specs?|docs?)(/|$)|(^|/)(prd|openapi)([._/-]|$)|"
+    r"(test|spec)\." + _SRC_EXT + r"$|openapi\.(json|ya?ml)$",
+    re.IGNORECASE,
+)
+_LOCALIZATION_FILE = re.compile(
+    r"(^|/)(i18n|l10n|locales?|translations?)(/|$)|"
+    r"(^|/)[a-z]{2}(?:-[A-Z]{2})?\.json$",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +270,14 @@ def _classify_pr_kind(
         any(pat.search(f) for pat in DEPENDENCY_PATTERNS) for f in filenames
     )
     has_version_bump_val = _has_version_bump(diff_text)
-    if has_dep_file or has_version_bump_val:
+    non_dependency_sources = [
+        name for name in filenames
+        if _IMPLEMENTATION_FILE.search(name)
+        and not any(pat.search(name) for pat in DEPENDENCY_PATTERNS)
+    ]
+    feature_support = any(_FEATURE_SUPPORT_FILE.search(name) for name in filenames)
+    dominant_feature = len(non_dependency_sources) >= 2 and feature_support
+    if (has_dep_file or has_version_bump_val) and not dominant_feature:
         # But exclude k8s manifests that happen to reference versions
         has_k8s = any(
             any(pat.search(f) for pat in K8S_PATTERNS) for f in filenames
@@ -267,15 +306,20 @@ def _classify_pr_kind(
         return "public_route_changes"
 
     # Check file serving changes (in filenames AND diff content)
-    if any(any(pat.search(f) for pat in FILE_SERVING_PATTERNS) for f in filenames):
+    eligible_filenames = [f for f in filenames if not _LOCALIZATION_FILE.search(f)]
+    if any(any(pat.search(f) for pat in FILE_SERVING_PATTERNS) for f in eligible_filenames):
         return "file_serving_changes"
-    if any(pat.search(diff_text) for pat in FILE_SERVING_PATTERNS):
+    if eligible_filenames and any(
+        pat.search(diff_text) for pat in FILE_SERVING_CONTENT_PATTERNS
+    ):
         return "file_serving_changes"
 
     # Check path handling changes (in filenames AND diff content)
     if any(any(pat.search(f) for pat in PATH_HANDLING_PATTERNS) for f in filenames):
         return "path_handling_changes"
-    if any(pat.search(diff_text) for pat in PATH_HANDLING_PATTERNS):
+    if eligible_filenames and any(
+        pat.search(diff_text) for pat in PATH_HANDLING_CONTENT_PATTERNS
+    ):
         return "path_handling_changes"
 
     # Default: app code change
@@ -321,23 +365,37 @@ def _detect_risk_flags(
                 flags.append("linked_priority_p1")
 
     # File-based risk flags (derived from classification patterns)
-    for pat_set, flag in [
-        (FILE_SERVING_PATTERNS, "file_serving_changes"),
-        (PATH_HANDLING_PATTERNS, "path_handling_changes"),
-        (AUTH_PATTERNS, "auth_changes"),
-        (SECRET_HANDLING_PATTERNS, "secret_handling_changes"),
+    for pat_set, content_pat_set, flag in [
+        (FILE_SERVING_PATTERNS, FILE_SERVING_CONTENT_PATTERNS, "file_serving_changes"),
+        (PATH_HANDLING_PATTERNS, PATH_HANDLING_CONTENT_PATTERNS, "path_handling_changes"),
+        (AUTH_PATTERNS, AUTH_PATTERNS, "auth_changes"),
+        (SECRET_HANDLING_PATTERNS, SECRET_HANDLING_PATTERNS, "secret_handling_changes"),
     ]:
         # Collect the specific files that triggered this flag
         triggering_files = [
             f for f in filenames
-            if any(pat.search(f) for pat in pat_set)
+            if not _LOCALIZATION_FILE.search(f) and any(pat.search(f) for pat in pat_set)
         ]
-        matches_in_diff = any(pat.search(diff_text) for pat in pat_set)
-        if triggering_files or matches_in_diff:
+        matches_in_diff = any(pat.search(diff_text) for pat in content_pat_set)
+        if matches_in_diff and not triggering_files:
+            # Content-only matches still need deterministic supporting files.
+            # Localization assets are excluded: generic words such as "files"
+            # in translation JSON do not imply path/file-serving behavior.
+            triggering_files = [
+                f for f in filenames if not _LOCALIZATION_FILE.search(f)
+            ]
+        if triggering_files:
             if flag not in flags:
                 flags.append(flag)
-            # Record file attribution (empty list when only diff content matched)
+            # Record deterministic non-empty file attribution.
             flags_with_files[flag] = triggering_files
+
+    dependency_files = [
+        f for f in filenames if any(pat.search(f) for pat in DEPENDENCY_METADATA_PATTERNS)
+    ]
+    if dependency_files and _classify_pr_kind(files, diff_text) != "dependency_upgrade":
+        flags.append("dependency_changes")
+        flags_with_files["dependency_changes"] = dependency_files
 
     return flags, flags_with_files
 
@@ -352,6 +410,9 @@ KIND_CHECKS: dict[str, list[str]] = {
     "dependency_upgrade": [
         "check for breaking API changes in updated dependencies",
         "run full test suite after upgrade",
+    ],
+    "dependency_changes": [
+        "verify accompanying dependency metadata matches the implementation change",
     ],
     "k8s_manifest": [
         "validate manifest against target cluster version",

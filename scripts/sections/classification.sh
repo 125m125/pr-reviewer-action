@@ -35,7 +35,10 @@ if [ -s terms.txt ]; then
       echo
       echo "### git grep hits"
       echo '```text'
-      git grep -n -- "$term" -- . 2>/dev/null | head -n 60 || true
+      git grep -n -- "$term" -- . 2>/dev/null \
+        | head -n 60 \
+        | python3 "$SCRIPT_DIR/cap_impact_scan.py" \
+            --per-match-bytes 500 --per-file-matches 5 --total-bytes 12000 || true
       echo '```'
       echo
     } >> repo-impact.md

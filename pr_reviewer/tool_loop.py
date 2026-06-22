@@ -33,6 +33,7 @@ review (the plan_execute planner fallback was removed in #304).
 from __future__ import annotations
 
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -49,6 +50,15 @@ STOP_WALL_CLOCK = "wall-clock-exceeded"
 STOP_REQUEST_ERROR = "request-error"
 STOP_TRUNCATED = "truncated-turn"
 STOP_CONTEXT_BUDGET = "context-budget-exhausted"
+STOP_UNEXECUTED_TEXTUAL_TOOL_INTENT = "unexecuted-textual-tool-intent"
+
+_TEXTUAL_TOOL_REPAIR_NOTE = (
+    "Your previous response contained textual tool-call markup, but the API "
+    "returned no native tool_calls, so nothing was executed. If that evidence "
+    "is still needed, issue the calls now through the provided native tool API. "
+    "Do not write or repeat textual tool-call markup. If it is no longer needed, "
+    "state that explicitly and finish the investigation."
+)
 
 # Synthetic result bodies. These are model-facing: they must explain the
 # refusal in one sentence so a self-correcting model has something to act on.
@@ -79,6 +89,7 @@ class LoopBudgets:
     # reasoning over the newest evidence).
     summarize_keep_newest: int = 2
     model_context_tokens: int = 0
+    max_textual_tool_repairs: int = 1
 
 
 def adaptive_loop_budgets(
@@ -144,6 +155,27 @@ class LoopOutcome:
     truncation_retries: int = 0
     compaction_runs: int = 0
     compaction_tokens_removed: int = 0
+    textual_tool_intent_detected: bool = False
+    textual_tool_intent_markers: list[str] = field(default_factory=list)
+    textual_tool_repair_attempts: int = 0
+    textual_tool_repaired: bool = False
+    textual_tool_unexecuted: bool = False
+
+
+def detect_textual_tool_intent(text: str) -> list[str]:
+    """Return stable marker identifiers, never parsed tools or arguments.
+
+    Detection is deliberately limited to paired structured markup. Prose about
+    a "tool call" is not an execution protocol and must not trigger repair.
+    One identifier is returned per complete block so callers can report a
+    bounded count without retaining or logging the untrusted text.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+    blocks = re.findall(r"<tool_call\b[^>]*>.*?</tool_call\s*>", text, re.I | re.S)
+    return ["qwen_xml_tool_call" for block in blocks if re.search(
+        r"<function\s*=\s*[^>]+>", block, re.I
+    )]
 
 
 def effective_intermediate_text(
@@ -301,6 +333,7 @@ def drive_tool_loop(
     seen_keys: set[str] = set()
     retry_with_more_tokens = False
     retry_max_tokens = max_tokens
+    textual_repair_pending = False
 
     while outcome.rounds < budgets.max_rounds:
         if time_fn() - started > budgets.wall_clock_sec:
@@ -363,6 +396,9 @@ def drive_tool_loop(
             "correctness risks. Do not repeat completed checks. Stop requesting "
             "tools when the evidence is sufficient so you can synthesize it."
         )
+        if textual_repair_pending:
+            budget_note = _TEXTUAL_TOOL_REPAIR_NOTE + "\n\n" + budget_note
+            outcome.textual_tool_repair_attempts += 1
 
         payload = conversation.to_request_payload(
             api_format,
@@ -391,6 +427,13 @@ def drive_tool_loop(
         outcome.finish_reasons.append(finish_reason or "unknown")
         outcome.text_sources.append(text_source)
 
+        # Real API tool calls always win. Textual pseudo-calls are never parsed
+        # or executed; they only trigger one bounded request to reissue them via
+        # the native schema.
+        if calls and textual_repair_pending:
+            outcome.textual_tool_repaired = True
+            textual_repair_pending = False
+
         if not calls:
             if finish_reason == "length":
                 if outcome.truncation_retries == 0 and outcome.rounds < budgets.max_rounds:
@@ -410,6 +453,28 @@ def drive_tool_loop(
                 outcome.stop_reason = STOP_TRUNCATED
                 outcome.error = "Model response was truncated before a usable answer or tool call."
                 break
+            markers = detect_textual_tool_intent(text)
+            if markers:
+                outcome.textual_tool_intent_detected = True
+                outcome.textual_tool_intent_markers.extend(markers)
+                if text:
+                    conversation.add_assistant_text(text)
+                if (
+                    not textual_repair_pending
+                    and outcome.textual_tool_repair_attempts
+                    < budgets.max_textual_tool_repairs
+                    and outcome.rounds < budgets.max_rounds
+                ):
+                    textual_repair_pending = True
+                    continue
+                outcome.textual_tool_unexecuted = True
+                outcome.stop_reason = STOP_UNEXECUTED_TEXTUAL_TOOL_INTENT
+                outcome.error = (
+                    "Exploration ended with structured textual tool intent that "
+                    "was not reissued as native tool calls."
+                )
+                break
+            textual_repair_pending = False
             outcome.final_text = text
             outcome.final_text_source = text_source
             outcome.stop_reason = (
