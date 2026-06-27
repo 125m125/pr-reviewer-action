@@ -90,7 +90,12 @@ PRIMARY_OK=0
 # call. A parse failure (degraded/oversized/garbled verdict) falls through to
 # the standard corpus review below, so this only ever adds capability.
 NATIVE_VERDICT_USED=0
-if [[ "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" == "native_loop" ]] \
+if [[ "$REVIEW_STRATEGY" != "single" ]] && [ -s specialist-ai-output.json ]; then
+  log "Using validated specialist review output; skipping the standard whole-PR model call"
+  cp specialist-ai-output.json ai-output.json
+  PRIMARY_OK=1
+  NATIVE_VERDICT_USED=1
+elif [[ "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" == "native_loop" ]] \
   && [[ "$(jq -r '.native_loop_verdict_produced // false' tool-harness.json 2>/dev/null)" == "true" ]] \
   && [ -s ai-response.primary.json ]; then
   log "native_loop produced an in-conversation verdict; using it and skipping the separate review call"
@@ -208,7 +213,11 @@ annotate_analysis_engine() {
 }
 
 if [ "$PRIMARY_OK" -eq 1 ]; then
-  ANALYSIS_ENGINE="$(annotate_analysis_engine "$AI_MODEL@$AI_BASE_URL ($AI_API_FORMAT)" primary)"
+  if [[ "$REVIEW_STRATEGY" == "single" ]]; then
+    ANALYSIS_ENGINE="$(annotate_analysis_engine "$AI_MODEL@$AI_BASE_URL ($AI_API_FORMAT)" primary)"
+  else
+    ANALYSIS_ENGINE="specialists@$AI_BASE_URL ($AI_API_FORMAT; sequential hybrid plan)"
+  fi
   echo "Primary model succeeded"
 else
   TRY_FALLBACK=1
@@ -256,6 +265,7 @@ fi
 # for debugging. A smart-model failure keeps the primary review.
 ESCALATION_REASONS=""
 maybe_escalate_review() {
+  [[ "$REVIEW_STRATEGY" == "single" ]] || return 0
   [[ "$REVIEW_ROUTING_MODE" == "auto" ]] || return 0
   [[ "${REVIEW_ROUTE:-legacy}" == "primary" ]] || return 0
   [[ -n "$SMART_MODEL_RESOLVED" ]] || return 0
@@ -342,7 +352,8 @@ if [[ "$(printf '%s' "$EVIDENCE_BLOCKER_ENFORCEMENT" | tr '[:upper:]' '[:lower:]
 fi
 
 TOOL_FAILURE_ENABLED="false"
-if [[ "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" != "off" ]] && \
+if [[ "$REVIEW_STRATEGY" == "single" ]] && \
+  [[ "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" != "off" ]] && \
   [[ "$(printf '%s' "$TOOL_FAILURE_ENFORCEMENT" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
   TOOL_FAILURE_ENABLED="true"
 fi
@@ -355,6 +366,12 @@ echo "verdict_source=$(jq -r '.verdict_source // "model"' ai-output.json)" >> "$
 echo "required_checks=$(jq -r '.required_checks // "none"' ai-output.json)" >> "$OUTPUT_FILE"
 echo "review_route=${REVIEW_ROUTE:-legacy}" >> "$OUTPUT_FILE"
 echo "escalation_reason=${ESCALATION_REASONS:-}" >> "$OUTPUT_FILE"
+echo "review_strategy=$REVIEW_STRATEGY" >> "$OUTPUT_FILE"
+if [[ "$REVIEW_STRATEGY" != "single" && -f specialist-review-artifact.json ]]; then
+  echo "specialist_artifact=$(pwd)/specialist-review-artifact.json" >> "$OUTPUT_FILE"
+else
+  echo "specialist_artifact=" >> "$OUTPUT_FILE"
+fi
 
 # Use a random heredoc delimiter so model-controlled review text (which can be
 # influenced by prompt injection in the PR diff/title/body) cannot terminate the

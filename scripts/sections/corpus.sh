@@ -193,8 +193,24 @@ fi
 cp review-corpus.md review-corpus.truncated.md
 section_timer_end
 
+SPECIALIST_PIPELINE_ENABLED="false"
+case "$REVIEW_STRATEGY" in specialists|specialists_evaluate) SPECIALIST_PIPELINE_ENABLED="true" ;; esac
+
+if [[ "$SPECIALIST_PIPELINE_ENABLED" == "true" ]]; then
+  section_timer_start "specialist-review"
+  log "Running generic specialist review strategy: $REVIEW_STRATEGY"
+  if ! IS_FORK_PR="$IS_FORK_PR" python3 "$SCRIPT_DIR/run_specialist_reviews.py"; then
+    error "Specialist review pipeline failed"
+    exit 1
+  fi
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" && -s specialist-review-summary.md ]]; then
+    cat specialist-review-summary.md >> "$GITHUB_STEP_SUMMARY"
+  fi
+  section_timer_end
+fi
+
 case "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" in native_loop) TOOL_HARNESS_ENABLED="true" ;; *) TOOL_HARNESS_ENABLED="false" ;; esac
-if [[ "$TOOL_HARNESS_ENABLED" == "true" ]]; then
+if [[ "$TOOL_HARNESS_ENABLED" == "true" && "$SPECIALIST_PIPELINE_ENABLED" != "true" ]]; then
   if [[ "$IS_FORK_PR" == "true" ]] && [[ "$(printf '%s' "$TOOL_ENABLE_FOR_FORKS" | tr '[:upper:]' '[:lower:]')" != "true" ]]; then
     cat > tool-harness.md <<'EOF'
 Tool harness was skipped for a cross-repository pull request. Set tool_enable_for_forks=true to override.

@@ -73,6 +73,69 @@ inputs:
     description: Anthropic API version header used when ai_api_format or ai_fallback_api_format is anthropic
     required: false
     default: "2023-06-01"
+  review_strategy:
+    description: >-
+      Review orchestration: single (existing behavior), specialists_evaluate
+      (run and record the specialist pipeline without publishing), or specialists
+      (publish the validated specialist result).
+    required: false
+    default: "single"
+  specialist_config_file:
+    description: Optional PR-branch JSON file defining components, specialist recipes, and authoritative exclusions.
+    required: false
+    default: ".github/ai-review-specialists.json"
+  specialist_planner_max_tool_calls:
+    description: Maximum read-only tool calls available to the specialist planning scout.
+    required: false
+    default: "8"
+  specialist_max_initial_passes:
+    description: Maximum sequential specialist passes selected for the initial wave.
+    required: false
+    default: "6"
+  specialist_max_followup_passes:
+    description: Maximum sequential specialist passes in the critic-requested follow-up wave.
+    required: false
+    default: "2"
+  specialist_max_tool_calls_per_pass:
+    description: Maximum read-only tool calls available to each specialist pass.
+    required: false
+    default: "20"
+  specialist_tool_mode:
+    description: Specialist evidence mode, native_loop (read-only tools) or packet (preassembled corpus only).
+    required: false
+    default: "native_loop"
+  specialist_planner_model:
+    description: Optional planner model; empty inherits ai_model.
+    required: false
+    default: ""
+  specialist_model:
+    description: Optional specialist model; empty inherits ai_model.
+    required: false
+    default: ""
+  specialist_critic_model:
+    description: Optional critic model; empty inherits specialist_model then ai_model.
+    required: false
+    default: ""
+  specialist_aggregator_model:
+    description: Optional final candidate-ranking model; empty inherits ai_model.
+    required: false
+    default: ""
+  specialist_pass_timeout_sec:
+    description: Per-model-request timeout for specialist strategies.
+    required: false
+    default: "600"
+  specialist_max_tokens:
+    description: Maximum completion tokens for planner, specialist, critic, and aggregator turns.
+    required: false
+    default: "4096"
+  specialist_planner_max_context_bytes:
+    description: Maximum diff/context bytes supplied to the planning scout before tool exploration.
+    required: false
+    default: "60000"
+  specialist_packet_max_bytes:
+    description: Maximum review-corpus bytes supplied to one specialist pass.
+    required: false
+    default: "90000"
   ai_fallback_base_url:
     description: Optional base URL of a fallback AI API
     required: false
@@ -616,6 +679,12 @@ outputs:
   cache_hit_ratio:
     description: Prompt-cache hit ratio for this review (0.0-1.0, from the tool harness in native_loop mode; empty when unavailable)
     value: ${{ steps.review.outputs.cache_hit_ratio }}
+  review_strategy:
+    description: Effective review strategy (single, specialists_evaluate, or specialists)
+    value: ${{ steps.review.outputs.review_strategy }}
+  specialist_artifact:
+    description: Absolute path to the machine-readable specialist evaluation artifact when specialist mode ran
+    value: ${{ steps.review.outputs.specialist_artifact }}
 
 runs:
   using: composite
@@ -654,6 +723,21 @@ runs:
         AI_REASONING_EFFORT: ${{ inputs.ai_reasoning_effort }}
         AI_VERDICT_REASONING_EFFORT: ${{ inputs.ai_verdict_reasoning_effort }}
         AI_TOKENS_PARAM: ${{ inputs.ai_tokens_param }}
+        REVIEW_STRATEGY: ${{ inputs.review_strategy }}
+        SPECIALIST_CONFIG_FILE: ${{ inputs.specialist_config_file }}
+        SPECIALIST_PLANNER_MAX_TOOL_CALLS: ${{ inputs.specialist_planner_max_tool_calls }}
+        SPECIALIST_MAX_INITIAL_PASSES: ${{ inputs.specialist_max_initial_passes }}
+        SPECIALIST_MAX_FOLLOWUP_PASSES: ${{ inputs.specialist_max_followup_passes }}
+        SPECIALIST_MAX_TOOL_CALLS_PER_PASS: ${{ inputs.specialist_max_tool_calls_per_pass }}
+        SPECIALIST_TOOL_MODE: ${{ inputs.specialist_tool_mode }}
+        SPECIALIST_PASS_TIMEOUT_SEC: ${{ inputs.specialist_pass_timeout_sec }}
+        SPECIALIST_MAX_TOKENS: ${{ inputs.specialist_max_tokens }}
+        SPECIALIST_PLANNER_MAX_CONTEXT_BYTES: ${{ inputs.specialist_planner_max_context_bytes }}
+        SPECIALIST_PACKET_MAX_BYTES: ${{ inputs.specialist_packet_max_bytes }}
+        SPECIALIST_PLANNER_MODEL: ${{ inputs.specialist_planner_model }}
+        SPECIALIST_MODEL: ${{ inputs.specialist_model }}
+        SPECIALIST_CRITIC_MODEL: ${{ inputs.specialist_critic_model }}
+        SPECIALIST_AGGREGATOR_MODEL: ${{ inputs.specialist_aggregator_model }}
         AI_FALLBACK_MODEL: ${{ inputs.ai_fallback_model }}
         REVIEW_ROUTING_MODE: ${{ inputs.review_routing_mode }}
         AI_PRIMARY_MODEL: ${{ inputs.ai_primary_model }}
@@ -746,6 +830,21 @@ runs:
         AI_REASONING_EFFORT: ${{ inputs.ai_reasoning_effort }}
         AI_VERDICT_REASONING_EFFORT: ${{ inputs.ai_verdict_reasoning_effort }}
         AI_TOKENS_PARAM: ${{ inputs.ai_tokens_param }}
+        REVIEW_STRATEGY: ${{ inputs.review_strategy }}
+        SPECIALIST_CONFIG_FILE: ${{ inputs.specialist_config_file }}
+        SPECIALIST_PLANNER_MAX_TOOL_CALLS: ${{ inputs.specialist_planner_max_tool_calls }}
+        SPECIALIST_MAX_INITIAL_PASSES: ${{ inputs.specialist_max_initial_passes }}
+        SPECIALIST_MAX_FOLLOWUP_PASSES: ${{ inputs.specialist_max_followup_passes }}
+        SPECIALIST_MAX_TOOL_CALLS_PER_PASS: ${{ inputs.specialist_max_tool_calls_per_pass }}
+        SPECIALIST_TOOL_MODE: ${{ inputs.specialist_tool_mode }}
+        SPECIALIST_PLANNER_MODEL: ${{ inputs.specialist_planner_model }}
+        SPECIALIST_MODEL: ${{ inputs.specialist_model }}
+        SPECIALIST_CRITIC_MODEL: ${{ inputs.specialist_critic_model }}
+        SPECIALIST_AGGREGATOR_MODEL: ${{ inputs.specialist_aggregator_model }}
+        SPECIALIST_PASS_TIMEOUT_SEC: ${{ inputs.specialist_pass_timeout_sec }}
+        SPECIALIST_MAX_TOKENS: ${{ inputs.specialist_max_tokens }}
+        SPECIALIST_PLANNER_MAX_CONTEXT_BYTES: ${{ inputs.specialist_planner_max_context_bytes }}
+        SPECIALIST_PACKET_MAX_BYTES: ${{ inputs.specialist_packet_max_bytes }}
         ANTHROPIC_VERSION: ${{ inputs.anthropic_version }}
         AI_FALLBACK_BASE_URL: ${{ inputs.ai_fallback_base_url }}
         AI_FALLBACK_API_FORMAT: ${{ inputs.ai_fallback_api_format }}
@@ -834,7 +933,7 @@ runs:
       # block makes a duplicate-key manifest error structurally impossible.
       # All per-mode inline `${{ }}` expressions are hoisted into env so the
       # run body is pure bash dispatching on $PUBLISH_MODE.
-      if: steps.precheck.outputs.should_review == 'true' && (inputs.publish_mode == 'review_comment' || inputs.publish_mode == 'review_verdict' || (inputs.publish_mode == 'comment' && inputs.publish_review_comment == 'true'))
+      if: steps.precheck.outputs.should_review == 'true' && inputs.review_strategy != 'specialists_evaluate' && (inputs.publish_mode == 'review_comment' || inputs.publish_mode == 'review_verdict' || (inputs.publish_mode == 'comment' && inputs.publish_review_comment == 'true'))
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}

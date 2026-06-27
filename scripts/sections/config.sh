@@ -87,6 +87,21 @@ BASELINE_CLEAN="${BASELINE_CLEAN:-true}"
 REVIEW_SCOPE="${REVIEW_SCOPE:-auto}"
 EFFECTIVE_SCOPE="${EFFECTIVE_SCOPE:-full}"
 PREVIOUS_HEAD_SHA="${PREVIOUS_HEAD_SHA:-}"
+REVIEW_STRATEGY="${REVIEW_STRATEGY:-single}"
+SPECIALIST_CONFIG_FILE="${SPECIALIST_CONFIG_FILE:-.github/ai-review-specialists.json}"
+SPECIALIST_PLANNER_MAX_TOOL_CALLS="${SPECIALIST_PLANNER_MAX_TOOL_CALLS:-8}"
+SPECIALIST_MAX_INITIAL_PASSES="${SPECIALIST_MAX_INITIAL_PASSES:-6}"
+SPECIALIST_MAX_FOLLOWUP_PASSES="${SPECIALIST_MAX_FOLLOWUP_PASSES:-2}"
+SPECIALIST_MAX_TOOL_CALLS_PER_PASS="${SPECIALIST_MAX_TOOL_CALLS_PER_PASS:-20}"
+SPECIALIST_TOOL_MODE="${SPECIALIST_TOOL_MODE:-native_loop}"
+SPECIALIST_PLANNER_MODEL="${SPECIALIST_PLANNER_MODEL:-}"
+SPECIALIST_MODEL="${SPECIALIST_MODEL:-}"
+SPECIALIST_CRITIC_MODEL="${SPECIALIST_CRITIC_MODEL:-}"
+SPECIALIST_AGGREGATOR_MODEL="${SPECIALIST_AGGREGATOR_MODEL:-}"
+SPECIALIST_PASS_TIMEOUT_SEC="${SPECIALIST_PASS_TIMEOUT_SEC:-600}"
+SPECIALIST_MAX_TOKENS="${SPECIALIST_MAX_TOKENS:-4096}"
+SPECIALIST_PLANNER_MAX_CONTEXT_BYTES="${SPECIALIST_PLANNER_MAX_CONTEXT_BYTES:-60000}"
+SPECIALIST_PACKET_MAX_BYTES="${SPECIALIST_PACKET_MAX_BYTES:-90000}"
 # Per-check CI results written by wait_for_ci.sh when ci_status_check=true.
 # Empty/absent when CI gating is off or no external checks ran.
 CI_CHECKS_FILE="${CI_CHECKS_FILE:-}"
@@ -251,6 +266,35 @@ for _positive_budget_name in \
   fi
 done
 unset _positive_budget_name _positive_budget_value
+
+case "$(printf '%s' "$REVIEW_STRATEGY" | tr '[:upper:]' '[:lower:]')" in
+  single|specialists|specialists_evaluate)
+    REVIEW_STRATEGY="$(printf '%s' "$REVIEW_STRATEGY" | tr '[:upper:]' '[:lower:]')" ;;
+  *)
+    error "Invalid REVIEW_STRATEGY '$REVIEW_STRATEGY'; expected single, specialists, or specialists_evaluate"
+    exit 1 ;;
+esac
+
+case "$(printf '%s' "$SPECIALIST_TOOL_MODE" | tr '[:upper:]' '[:lower:]')" in
+  native_loop|packet)
+    SPECIALIST_TOOL_MODE="$(printf '%s' "$SPECIALIST_TOOL_MODE" | tr '[:upper:]' '[:lower:]')" ;;
+  *)
+    error "Invalid SPECIALIST_TOOL_MODE '$SPECIALIST_TOOL_MODE'; expected native_loop or packet"
+    exit 1 ;;
+esac
+
+for _specialist_budget_name in \
+  SPECIALIST_PLANNER_MAX_TOOL_CALLS SPECIALIST_MAX_INITIAL_PASSES \
+  SPECIALIST_MAX_FOLLOWUP_PASSES SPECIALIST_MAX_TOOL_CALLS_PER_PASS \
+  SPECIALIST_PASS_TIMEOUT_SEC SPECIALIST_MAX_TOKENS \
+  SPECIALIST_PLANNER_MAX_CONTEXT_BYTES SPECIALIST_PACKET_MAX_BYTES; do
+  _specialist_budget_value="${!_specialist_budget_name}"
+  if [[ ! "$_specialist_budget_value" =~ ^[1-9][0-9]*$ ]]; then
+    error "Invalid ${_specialist_budget_name} '${_specialist_budget_value}'; expected a positive integer"
+    exit 1
+  fi
+done
+unset _specialist_budget_name _specialist_budget_value
 
 case "$VERDICT_POLICY" in
   model|findings_severity_gated) ;;

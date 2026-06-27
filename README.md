@@ -208,6 +208,79 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 </details>
 
 <details>
+<summary><b>Specialist reviews</b> — generic topology, model-planned focuses, sequential local inference</summary>
+
+| Input | Description | Required | Default |
+|-------|-------------|----------|---------|
+| `review_strategy` | `single` preserves the existing path; `specialists_evaluate` runs the complete specialist pipeline without publishing; `specialists` publishes its validated result | No | `single` |
+| `specialist_config_file` | Optional PR-branch JSON file defining component hints, structured recipes, and authoritative exclusions. A changed policy file is disclosed in the review | No | `.github/ai-review-specialists.json` |
+| `specialist_planner_max_tool_calls` | Maximum read-only calls available to the topology/diff planning scout | No | `8` |
+| `specialist_max_initial_passes` | Maximum sequential specialist passes in the initial wave | No | `6` |
+| `specialist_max_followup_passes` | Maximum sequential passes in the critic's single follow-up wave | No | `2` |
+| `specialist_max_tool_calls_per_pass` | Maximum read-only calls available to each specialist pass | No | `20` |
+| `specialist_tool_mode` | `native_loop` lets each specialist explore with read-only tools; `packet` uses only its bounded preassembled corpus | No | `native_loop` |
+| `specialist_planner_model` | Planning/scout model; empty inherits `ai_model` | No | `""` |
+| `specialist_model` | Specialist model; empty inherits `ai_model` | No | `""` |
+| `specialist_critic_model` | Critic model; empty inherits `specialist_model`, then `ai_model` | No | `""` |
+| `specialist_aggregator_model` | Candidate-ranking model; empty inherits `ai_model` | No | `""` |
+| `specialist_pass_timeout_sec` | Per-model-request timeout for specialist strategies | No | `600` |
+| `specialist_max_tokens` | Completion-token ceiling for planner, specialist, critic, and aggregator turns | No | `4096` |
+| `specialist_planner_max_context_bytes` | Diff/context bytes supplied to the planner before tool exploration | No | `60000` |
+| `specialist_packet_max_bytes` | Review-corpus bytes supplied to one specialist | No | `90000` |
+
+Specialist mode derives a generic component topology from manifests, paths,
+file roles, contracts, and deterministic risk flags. A bounded planning call may
+inspect the repository and returns a strict list of free-form focuses. The runner
+merges that plan with matching repository recipes and deterministic fallbacks,
+applies exclusions, and runs every selected pass sequentially. A critic may
+request one bounded follow-up wave. Only evidence-backed, in-scope candidates
+survive deterministic validation; the final model can rank candidate IDs but
+cannot add findings.
+
+The configured pass and tool limits are literal ceilings. The job summary reports
+selected and omitted focuses, applied exclusions, model requests, runtime, and the
+computed maximum specialist tool budget. `specialists_evaluate` writes
+`specialist-review-artifact.json` and exposes its path as `specialist_artifact`,
+but the publish step is unconditionally skipped.
+
+The optional policy file uses this structured version-1 schema:
+
+```json
+{
+  "version": 1,
+  "components": [{
+    "id": "python-worker",
+    "paths": ["worker/**"],
+    "responsibilities": ["background processing"],
+    "related_components": ["contracts"],
+    "contracts": ["event messages"],
+    "invariants": ["delivery remains idempotent"]
+  }],
+  "recipes": [{
+    "id": "worker-delivery",
+    "match": {"component_ids_any": ["python-worker"], "file_roles_any": ["messaging"]},
+    "title": "Worker delivery",
+    "objective": "Trace acknowledgement, retry, and persistence behavior.",
+    "lenses": ["background-work-retry-idempotency"],
+    "seed_paths": ["worker/messaging/**"],
+    "related_paths": ["contracts/**"],
+    "invariants": ["failed work is retried without duplicate effects"],
+    "priority": "high"
+  }],
+  "exclude": {"paths": [], "components": [], "lenses": [], "recipes": []}
+}
+```
+
+Every populated `match` group must match; values inside a group use `any`
+semantics. Exclusions are authoritative for specialist scheduling and are
+disclosed when applied. They do not disable existing classifier, verdict, or
+publication guardrails. Recipes are structured data rendered through an
+action-owned prompt; they cannot provide commands, models, custom budgets, or
+complete prompt replacements.
+
+</details>
+
+<details>
 <summary><b>Fallback & failure handling</b> — fallback endpoint, retries, failure behavior</summary>
 
 | Input | Description | Required | Default |

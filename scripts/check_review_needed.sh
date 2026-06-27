@@ -107,6 +107,34 @@ compute_config_hash() {
     parts+=("anthropic_version:${ANTHROPIC_VERSION}")
   fi
 
+  # Generic specialist orchestration. Include both policy content and every
+  # explicit budget/model choice so changing review breadth forces a fresh run.
+  if [[ -n "${REVIEW_STRATEGY:-}" ]]; then
+    parts+=("review_strategy:${REVIEW_STRATEGY}")
+  fi
+  if [[ "${REVIEW_STRATEGY:-single}" != "single" ]]; then
+    for specialist_name in \
+      SPECIALIST_PLANNER_MODEL SPECIALIST_MODEL SPECIALIST_CRITIC_MODEL \
+      SPECIALIST_AGGREGATOR_MODEL SPECIALIST_PLANNER_MAX_TOOL_CALLS \
+      SPECIALIST_MAX_INITIAL_PASSES SPECIALIST_MAX_FOLLOWUP_PASSES \
+      SPECIALIST_MAX_TOOL_CALLS_PER_PASS SPECIALIST_TOOL_MODE \
+      SPECIALIST_PASS_TIMEOUT_SEC SPECIALIST_MAX_TOKENS \
+      SPECIALIST_PLANNER_MAX_CONTEXT_BYTES SPECIALIST_PACKET_MAX_BYTES; do
+      specialist_value="${!specialist_name:-}"
+      [[ -n "$specialist_value" ]] && parts+=("${specialist_name}:${specialist_value}")
+    done
+    unset specialist_name specialist_value
+    if [[ -n "${SPECIALIST_CONFIG_FILE:-}" ]]; then
+      if [[ -f "$SPECIALIST_CONFIG_FILE" ]]; then
+        local specialist_hash
+        specialist_hash="$(sha256sum "$SPECIALIST_CONFIG_FILE" | awk '{print $1}')"
+        parts+=("specialist_config:${SPECIALIST_CONFIG_FILE}:${specialist_hash}")
+      else
+        parts+=("specialist_config:${SPECIALIST_CONFIG_FILE}:missing")
+      fi
+    fi
+  fi
+
   # System prompt (inline content or file hash)
   if [[ -n "${SYSTEM_PROMPT:-}" ]]; then
     local phash
