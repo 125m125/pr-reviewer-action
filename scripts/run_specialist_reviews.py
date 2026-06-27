@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import sys
@@ -74,6 +75,75 @@ the supplied candidate IDs. Use request_changes when a blocker or major finding 
 present; otherwise approve. Include every supplied ID exactly once."""
 
 
+STRING_ARRAY = {"type": "array", "items": {"type": "string"}}
+FOCUS_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "id": {"type": "string"}, "title": {"type": "string"},
+        "objective": {"type": "string"}, "rationale": {"type": "string"},
+        "lenses": STRING_ARRAY, "seed_paths": STRING_ARRAY,
+        "related_paths": STRING_ARRAY, "related_symbols": STRING_ARRAY,
+        "invariants": STRING_ARRAY, "expected_evidence": STRING_ARRAY,
+        "priority": {"type": "string", "enum": ["critical", "high", "normal", "low"]},
+    },
+    "required": ["id", "title", "objective", "rationale", "lenses", "seed_paths",
+                 "related_paths", "related_symbols", "invariants", "expected_evidence", "priority"],
+}
+ROLE_SCHEMAS: dict[str, dict[str, Any]] = {
+    "planner": {
+        "type": "object", "additionalProperties": False,
+        "properties": {"summary": {"type": "string"}, "focuses": {"type": "array", "items": FOCUS_SCHEMA},
+                       "coverage_notes": STRING_ARRAY},
+        "required": ["summary", "focuses", "coverage_notes"],
+    },
+    "specialist": {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "domain": {"type": "string"},
+            "completion_status": {"type": "string", "enum": ["complete", "incomplete"]},
+            "inspected_files": STRING_ARRAY, "unchecked_material_files": STRING_ARRAY,
+            "invariants_checked": STRING_ARRAY,
+            "findings": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "severity": {"type": "string", "enum": ["blocker", "major", "minor", "info"]},
+                    "category": {"type": "string", "enum": ["bug", "security", "performance", "style", "docs", "question", "other"]},
+                    "file": {"type": "string"}, "line": {"type": ["integer", "null"]},
+                    "claim": {"type": "string"}, "evidence": STRING_ARRAY,
+                    "causal_chain": {"type": "string"},
+                },
+                "required": ["severity", "category", "file", "line", "claim", "evidence", "causal_chain"],
+            }},
+            "unknowns": STRING_ARRAY,
+        },
+        "required": ["domain", "completion_status", "inspected_files", "unchecked_material_files",
+                     "invariants_checked", "findings", "unknowns"],
+    },
+    "critic": {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "dispositions": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {"candidate_key": {"type": "string"},
+                               "decision": {"type": "string", "enum": ["keep", "reject"]},
+                               "reason": {"type": "string"}},
+                "required": ["candidate_key", "decision", "reason"],
+            }},
+            "followup_focuses": {"type": "array", "items": FOCUS_SCHEMA},
+            "coverage_notes": STRING_ARRAY,
+        },
+        "required": ["dispositions", "followup_focuses", "coverage_notes"],
+    },
+    "aggregator": {
+        "type": "object", "additionalProperties": False,
+        "properties": {"verdict": {"type": "string", "enum": ["approve", "request_changes"]},
+                       "ordered_finding_ids": STRING_ARRAY},
+        "required": ["verdict", "ordered_finding_ids"],
+    },
+}
+
+
 def env_int(name: str, default: int) -> int:
     raw = os.getenv(name, str(default)).strip()
     if not raw:
@@ -138,6 +208,11 @@ class SequentialModelRunner:
         self.context_tokens = env_int("MODEL_CONTEXT_TOKENS", 65536)
         self.tokens_param = os.getenv("AI_TOKENS_PARAM", "max_tokens")
         self.reasoning_effort = os.getenv("AI_REASONING_EFFORT", "").strip() or None
+        verdict_effort = os.getenv("AI_VERDICT_REASONING_EFFORT", "").strip()
+        self.verdict_reasoning_effort = verdict_effort or self.reasoning_effort
+        self.response_format = os.getenv("AI_RESPONSE_FORMAT", "off").strip().lower() or "off"
+        if self.response_format not in {"off", "json_object", "json_schema"}:
+            raise ValueError("AI_RESPONSE_FORMAT must be off, json_object, or json_schema")
         self.stream = os.getenv("AI_STREAM", "true").lower() == "true"
         self.workspace = str(Path.cwd())
         self.current_repo = os.getenv("REPO", "")
@@ -164,29 +239,69 @@ class SequentialModelRunner:
             return os.getenv("SPECIALIST_MODEL", "").strip() or os.environ["AI_MODEL"]
         return os.environ["AI_MODEL"]
 
-    def _post(self, payload: dict[str, Any], role: str) -> dict[str, Any]:
+    def _post(
+        self, payload: dict[str, Any], role: str,
+        *, compact_fallback_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         started = time.monotonic()
+        structured_fallback = False
+        original_error = ""
+
+        def unstructured_retry() -> dict[str, Any]:
+            nonlocal structured_fallback
+            structured_fallback = True
+            candidate = compact_fallback_payload or payload
+            candidate = {key: value for key, value in candidate.items()
+                         if key not in {"response_format", "stream_options"}}
+            candidate["stream"] = False
+            try:
+                return run_chat_request(
+                    self.base_url, self.api_format, candidate, self.api_key, self.timeout
+                )
+            except Exception as final_exc:
+                final_error = mask_secrets(str(final_exc))[:1000]
+                raise RuntimeError(
+                    f"structured output request failed: {original_error}; "
+                    f"unstructured fallback failed: {final_error}"
+                ) from final_exc
+
         try:
             response = run_chat_request(
                 self.base_url, self.api_format, payload, self.api_key, self.timeout
             )
             usable = not (payload.get("stream") and response.get("error"))
-        except Exception:
-            if not payload.get("stream"):
-                raise
+            if not usable:
+                original_error = mask_secrets(json.dumps(response.get("error")))[:1000]
+        except Exception as exc:
             usable = False
+            original_error = mask_secrets(str(exc))[:1000]
+            provider_rejected = bool(getattr(exc, "provider_rejected", False))
+            if not payload.get("stream") or provider_rejected:
+                if "response_format" not in payload:
+                    raise
+                response = unstructured_retry()
+                usable = True
         if not usable:
             fallback = {key: value for key, value in payload.items() if key != "stream_options"}
             fallback["stream"] = False
-            response = run_chat_request(
-                self.base_url, self.api_format, fallback, self.api_key, self.timeout
-            )
+            try:
+                response = run_chat_request(
+                    self.base_url, self.api_format, fallback, self.api_key, self.timeout
+                )
+            except Exception as exc:
+                if "response_format" not in payload:
+                    raise
+                original_error = original_error or mask_secrets(str(exc))[:1000]
+                response = unstructured_retry()
         usage = response.get("usage") if isinstance(response, dict) else {}
         self.requests.append({
             "role": role,
             "model": payload.get("model"),
             "duration_sec": round(time.monotonic() - started, 3),
             "usage": usage if isinstance(usage, dict) else {},
+            "response_format": self.response_format if "response_format" in payload else "off",
+            "structured_output_fallback": structured_fallback,
+            "structured_output_error": original_error if structured_fallback else "",
         })
         return response
 
@@ -205,13 +320,16 @@ class SequentialModelRunner:
             self.api_format, model, stream=self.stream,
             max_tokens=max_tokens or self.max_tokens, temperature=0.0,
             verdict_turn=True, keep_full_history_on_verdict=True,
-            response_format="json_object" if self.api_format == "openai" else None,
-            reasoning_effort=self.reasoning_effort,
+            response_format=self.response_format if self.api_format == "openai" else None,
+            response_schema=ROLE_SCHEMAS[role], response_schema_name=f"specialist_{role}",
+            reasoning_effort=self.verdict_reasoning_effort,
             tokens_param=self.tokens_param, cache_prefix=True,
         )
         response = self._post(payload, role)
         _, text, source, finish = extract_intermediate_turn(response, self.api_format)
-        return extract_json(text), {"text_source": source, "finish_reason": finish}
+        request_diag = self.requests[-1] if self.requests else {}
+        return extract_json(text), {"text_source": source, "finish_reason": finish,
+                                    "request": request_diag}
 
     def agent(
         self, role: str, system: str, user: str, max_tools: int,
@@ -251,11 +369,28 @@ class SequentialModelRunner:
                 self.api_format, model, stream=self.stream,
                 max_tokens=self.max_tokens, temperature=0.0, verdict_turn=True,
                 keep_full_history_on_verdict=True,
-                response_format="json_object" if self.api_format == "openai" else None,
-                reasoning_effort=self.reasoning_effort,
+                response_format=self.response_format if self.api_format == "openai" else None,
+                response_schema=ROLE_SCHEMAS[role], response_schema_name=f"specialist_{role}",
+                reasoning_effort=self.verdict_reasoning_effort,
                 tokens_param=self.tokens_param, cache_prefix=True,
             )
-            response = self._post(payload, role)
+            compact = Conversation(system=system)
+            evidence = [{"tool": call.tool, "arguments": call.args, "result": call.result}
+                        for call in outcome.executed]
+            compact.add_user(
+                "Finalize the assigned investigation as JSON only. Preserve supported findings.\n\n"
+                + terminal_instruction + "\n\nAssigned context (bounded):\n"
+                + user[:12000] + "\n\nExecuted evidence (bounded):\n"
+                + json.dumps(evidence, ensure_ascii=False)[:16000]
+                + "\n\nLatest internal analysis (bounded):\n" + (text or "")[-12000:]
+            )
+            compact_payload = compact.to_request_payload(
+                self.api_format, model, stream=False, max_tokens=self.max_tokens,
+                temperature=0.0, verdict_turn=True, keep_full_history_on_verdict=True,
+                response_format=None, reasoning_effort=self.verdict_reasoning_effort,
+                tokens_param=self.tokens_param, cache_prefix=True,
+            )
+            response = self._post(payload, role, compact_fallback_payload=compact_payload)
             _, text, source, finish = extract_intermediate_turn(response, self.api_format)
             value = extract_json(text)
         else:
@@ -273,6 +408,7 @@ class SequentialModelRunner:
             "inspected_files": list(dict.fromkeys(inspected)),
             "text_source": source,
             "finish_reason": finish,
+            "request": self.requests[-1] if self.requests else {},
         }
 
 
@@ -300,10 +436,69 @@ def planning_context(topology: dict[str, Any], config: dict[str, Any]) -> str:
     )
 
 
+def focus_topology(focus: dict[str, Any], topology: dict[str, Any]) -> dict[str, Any]:
+    """Return a bounded component/relationship slice relevant to one focus."""
+    patterns = [*focus.get("seed_paths", []), *focus.get("related_paths", [])]
+    changed = topology.get("changed_files", [])
+    matched_paths = [path for path in changed if any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)]
+    component_ids = {topology.get("path_components", {}).get(path) for path in matched_paths}
+    component_ids.discard(None)
+    for component in topology.get("components", []):
+        if component.get("id") in focus.get("related_symbols", []):
+            component_ids.add(component["id"])
+    relationships = []
+    for item in topology.get("relationships", []):
+        if item.get("source") in component_ids or item.get("target") in component_ids:
+            relationships.append(item)
+            component_ids.update((item.get("source"), item.get("target")))
+    component_ids.discard(None)
+    limit = env_int("SPECIALIST_TOPOLOGY_LIST_LIMIT", 25)
+    components = [item for item in topology.get("components", []) if item.get("id") in component_ids]
+    sliced_paths = [path for path in changed if topology.get("path_components", {}).get(path) in component_ids]
+    truncated = len(components) > limit or len(sliced_paths) > limit or len(relationships) > limit
+    return {
+        "components": components[:limit], "relationships": relationships[:limit],
+        "changed_files": sliced_paths[:limit],
+        "risk_flags": topology.get("risk_flags", [])[:limit],
+        "pr_kind": topology.get("pr_kind", "unknown"),
+        "truncation": {"truncated": truncated, "list_limit": limit,
+                       "marker": "additional focus context omitted" if truncated else ""},
+    }
+
+
+def focused_review_material(focus_slice: dict[str, Any]) -> str:
+    """Build a small packet from PR metadata and only the focus-related diff blocks."""
+    metadata = load_json("pr.json", {})
+    if isinstance(metadata, dict):
+        metadata = {key: metadata.get(key) for key in (
+            "title", "body", "baseRefName", "headRefName", "additions", "deletions"
+        ) if key in metadata}
+    diff_path = Path("pr.diff.truncated")
+    if not diff_path.is_file():
+        diff_path = Path("pr.diff")
+    if diff_path.is_file():
+        diff = diff_path.read_text(encoding="utf-8", errors="replace")
+        blocks = diff.split("diff --git ")
+        wanted = set(focus_slice.get("changed_files", []))
+        selected = ["diff --git " + block for block in blocks[1:]
+                    if block.splitlines() and block.splitlines()[0] in {
+                        f"a/{path} b/{path}" for path in wanted
+                    }]
+        diff_text = "".join(selected)
+    else:
+        diff_text = Path("review-corpus.truncated.md").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    return (
+        "PR metadata:\n" + json.dumps(metadata, ensure_ascii=False)[:8000]
+        + "\n\nFocus-related diff:\n```diff\n" + diff_text + "\n```"
+    )
+
+
 def focus_prompt(focus: dict[str, Any], topology: dict[str, Any], prior: dict[str, Any] | None = None, gaps: list[str] | None = None) -> str:
-    corpus = Path("review-corpus.truncated.md").read_text(encoding="utf-8", errors="replace")
-    corpus_cap = env_int("SPECIALIST_PACKET_MAX_BYTES", 90000)
-    corpus = corpus.encode("utf-8")[:corpus_cap].decode("utf-8", errors="ignore")
+    packet_cap = env_int("SPECIALIST_PACKET_MAX_BYTES", 60000)
+    topology_slice = focus_topology(focus, topology)
+    corpus = focused_review_material(topology_slice)
     schema = {
         "domain": focus["id"], "completion_status": "complete|incomplete",
         "inspected_files": ["path"], "unchecked_material_files": ["path"],
@@ -313,14 +508,19 @@ def focus_prompt(focus: dict[str, Any], topology: dict[str, Any], prior: dict[st
     }
     text = (
         "Assigned focus:\n" + json.dumps(focus, ensure_ascii=False)
-        + "\n\nRelevant topology:\n" + json.dumps(topology, ensure_ascii=False)
+        + "\n\nRelevant topology:\n" + json.dumps(topology_slice, ensure_ascii=False)
         + "\n\nRequired report schema:\n" + json.dumps(schema)
     )
     if prior is not None:
         text += "\n\nPrior partial report (preserve supported findings):\n" + json.dumps(prior, ensure_ascii=False)
     if gaps:
         text += "\n\nRunner-detected coverage gaps that must be addressed:\n- " + "\n- ".join(gaps)
-    return text + "\n\nReview corpus:\n" + corpus
+    prefix = text + "\n\nFocused review material (bounded):\n"
+    remaining = max(0, packet_cap - len(prefix.encode("utf-8")) - 80)
+    encoded = corpus.encode("utf-8")
+    corpus = encoded[:remaining].decode("utf-8", errors="ignore")
+    marker = "\n[review corpus truncated for this specialist]" if len(encoded) > remaining else ""
+    return prefix + corpus + marker
 
 
 def run_focus(
@@ -439,6 +639,7 @@ def render_review(candidates: list[dict[str, Any]], order: list[str], notice: st
 
 def main() -> int:
     started = time.monotonic()
+    Path("specialist-ai-output.json").unlink(missing_ok=True)
     strategy = os.getenv("REVIEW_STRATEGY", "single").lower()
     if strategy not in {"specialists", "specialists_evaluate"}:
         raise ValueError("specialist runner requires a specialist review strategy")
@@ -509,16 +710,48 @@ def main() -> int:
         print(f"Running specialist: {focus['id']}", file=sys.stderr)
         try:
             report, diagnostics = run_focus(runner, focus, topology, tools_per_pass, tool_mode)
+            status = "valid" if report.get("completion_status") == "complete" else "incomplete"
+            reports.append(report)
         except Exception as exc:  # noqa: BLE001 - remaining passes must continue
-            report = {
-                "domain": focus["id"], "completion_status": "incomplete",
-                "inspected_files": [], "unchecked_material_files": focus.get("seed_paths", []),
-                "invariants_checked": [], "findings": [],
-                "unknowns": [mask_secrets(str(exc))[:1000]], "coverage_gaps": ["specialist call failed"],
-            }
+            status = "failed"
             diagnostics = [{"error": mask_secrets(str(exc))[:1000]}]
-        reports.append(report)
-        pass_diagnostics.append({"focus": focus, "calls": diagnostics})
+        pass_diagnostics.append({"focus": focus, "status": status, "calls": diagnostics})
+
+    successful_initial = sum(item["status"] != "failed" for item in pass_diagnostics)
+    failed_initial = sum(item["status"] == "failed" for item in pass_diagnostics)
+    if successful_initial == 0:
+        duration = round(time.monotonic() - started, 3)
+        artifact = {
+            "strategy": strategy, "evaluation_status": "failed",
+            "fallback_status": "standard_review" if strategy == "specialists" else "publication_gated",
+            "configuration": config, "configuration_path": config_path,
+            "configuration_changed": config_changed, "topology": topology,
+            "planner": {"degraded": planner_degraded, "error": planner_error, "diagnostics": planner_diag},
+            "schedule": schedule, "passes": pass_diagnostics, "reports": [],
+            "pass_counts": {"succeeded": 0, "failed": failed_initial},
+            "critic": {"status": "skipped", "reason": "no valid specialist reports"},
+            "followup_schedule": {"selected": [], "omitted": [], "applied_exclusions": []},
+            "validation": {"accepted": [], "rejected": []},
+            "aggregator": {"status": "skipped"}, "model_requests": runner.requests,
+            "duration_sec": duration,
+        }
+        dump_json("specialist-review-artifact.json", artifact)
+        Path("specialist-review-summary.md").write_text(
+            "# Specialist review\n\n"
+            f"- Strategy: `{strategy}`\n- Evaluation: `failed`\n"
+            f"- Planner: `{'degraded' if planner_degraded else 'complete'}`\n"
+            f"- Specialist passes: 0 succeeded, {failed_initial} failed\n"
+            f"- Fallback: `{'standard whole-PR review' if strategy == 'specialists' else 'publication gated'}`\n"
+            f"- Model requests: {len(runner.requests)}\n- Duration: {duration}s\n",
+            encoding="utf-8",
+        )
+        print(
+            f"All {failed_initial} specialist pass(es) failed; "
+            + ("continuing to the standard whole-PR reviewer" if strategy == "specialists"
+               else "evaluation remains publication-gated"),
+            file=sys.stderr,
+        )
+        return 0
 
     try:
         critic_raw, critic_diag = runner.one_shot(
@@ -535,16 +768,12 @@ def main() -> int:
         print(f"Running critic follow-up specialist: {focus['id']}", file=sys.stderr)
         try:
             report, diagnostics = run_focus(runner, focus, topology, tools_per_pass, tool_mode)
+            status = "valid" if report.get("completion_status") == "complete" else "incomplete"
+            reports.append(report)
         except Exception as exc:  # noqa: BLE001
-            report = {
-                "domain": focus["id"], "completion_status": "incomplete",
-                "inspected_files": [], "unchecked_material_files": focus.get("seed_paths", []),
-                "invariants_checked": [], "findings": [],
-                "unknowns": [mask_secrets(str(exc))[:1000]], "coverage_gaps": ["follow-up failed"],
-            }
+            status = "failed"
             diagnostics = [{"error": mask_secrets(str(exc))[:1000]}]
-        reports.append(report)
-        pass_diagnostics.append({"focus": focus, "calls": diagnostics})
+        pass_diagnostics.append({"focus": focus, "status": status, "calls": diagnostics})
 
     try:
         final_critic_raw, final_critic_diag = runner.one_shot(
@@ -589,11 +818,16 @@ def main() -> int:
     notice = policy_notice(config_path, config_changed, [
         *schedule["applied_exclusions"], *followup_schedule["applied_exclusions"],
     ])
+    succeeded = sum(item["status"] != "failed" for item in pass_diagnostics)
+    failed = sum(item["status"] == "failed" for item in pass_diagnostics)
+    coverage_notice = f"> Specialist coverage: {succeeded} pass(es) succeeded, {failed} failed."
+    notice = (notice.rstrip() + "\n\n" if notice else "") + coverage_notice
     review = render_review(accepted, order, notice)
     dump_json("specialist-ai-output.json", review)
 
     artifact = {
         "strategy": strategy,
+        "evaluation_status": "complete" if failed == 0 else "incomplete",
         "configuration": config,
         "configuration_path": config_path,
         "configuration_changed": config_changed,
@@ -601,6 +835,7 @@ def main() -> int:
         "planner": {"degraded": planner_degraded, "error": planner_error, "diagnostics": planner_diag},
         "schedule": schedule,
         "passes": pass_diagnostics,
+        "pass_counts": {"succeeded": succeeded, "failed": failed},
         "reports": reports,
         "critic": {"initial": critic, "initial_diagnostics": critic_diag, "final": final_critic, "final_diagnostics": final_critic_diag},
         "followup_schedule": followup_schedule,
@@ -623,6 +858,7 @@ def main() -> int:
         f"- Planner: `{'degraded' if planner_degraded else 'complete'}`\n"
         f"- Initial focuses: {', '.join(item['id'] for item in schedule['selected']) or '(none)'}\n"
         f"- Follow-up focuses: {', '.join(item['id'] for item in followup_schedule['selected']) or '(none)'}\n"
+        f"- Specialist passes: {succeeded} succeeded, {failed} failed\n"
         f"- Accepted candidates: {len(accepted)}\n"
         f"- Rejected candidates: {len(validation['rejected'])}\n"
         f"- Model requests: {len(runner.requests)}\n"

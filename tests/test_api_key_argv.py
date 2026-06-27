@@ -95,5 +95,22 @@ class TestApiKeyOutOfArgv:
         assert 'odd\\"key' in cap.config_content
 
 
+def test_http_error_preserves_status_and_redacted_body():
+    completed = types.SimpleNamespace(
+        returncode=0,
+        stdout='{"error":"Bearer abcdefghijklmnopqrstuvwxyz123456 was rejected"}\n400',
+        stderr="",
+    )
+    with mock.patch.object(transport, "safe_run", return_value=completed):
+        with pytest.raises(transport.ModelRequestError) as raised:
+            transport.run_chat_request(
+                "http://localhost:11434/v1", "openai",
+                {"model": "m", "messages": [], "stream": False}, "", 5,
+            )
+    assert raised.value.status == 400
+    assert raised.value.provider_rejected is True
+    assert "abcdefghijklmnopqrstuvwxyz123456" not in str(raised.value)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

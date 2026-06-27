@@ -1,5 +1,8 @@
 import importlib.util
+import json
 from pathlib import Path
+
+import pytest
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "run_specialist_reviews.py"
@@ -119,7 +122,9 @@ def test_specialist_config_must_stay_in_repository(monkeypatch, tmp_path):
 def test_single_strategy_guard_remains_in_review_script():
     review = (Path(__file__).parents[1] / "scripts" / "sections" / "review.sh").read_text(encoding="utf-8")
     assert '[[ "$REVIEW_STRATEGY" == "single" ]] || return 0' in review
-    assert '[[ "$REVIEW_STRATEGY" != "single" ]] && [ -s specialist-ai-output.json ]' in review
+    assert 'SPECIALIST_EVALUATION_STATUS=' in review
+    assert '"$SPECIALIST_EVALUATION_STATUS" == "complete"' in review
+    assert '"$REVIEW_STRATEGY" == "specialists_evaluate" && "$SPECIALIST_EVALUATION_STATUS" == "failed"' in review
     corpus = (Path(__file__).parents[1] / "scripts" / "sections" / "corpus.sh").read_text(encoding="utf-8")
     assert 'IS_FORK_PR="$IS_FORK_PR" python3 "$SCRIPT_DIR/run_specialist_reviews.py"' in corpus
 
@@ -184,7 +189,9 @@ def test_main_runs_dynamic_plan_specialists_two_critic_turns_and_aggregator(monk
     artifact = __import__("json").loads((tmp_path / "specialist-review-artifact.json").read_text())
     assert output["verdict"] == "request_changes"
     assert output["findings"][0]["message"] == "Changed value is ignored"
+    assert "Specialist coverage: 1 pass(es) succeeded, 0 failed" in output["review_markdown"]
     assert artifact["strategy"] == "specialists_evaluate"
+    assert artifact["evaluation_status"] == "complete"
     assert EndToEndRunner.last.roles == ["planner", "specialist", "critic", "critic", "aggregator"]
 
 
@@ -208,3 +215,166 @@ def test_main_planner_failure_uses_deterministic_fallback(monkeypatch, tmp_path)
     artifact = __import__("json").loads((tmp_path / "specialist-review-artifact.json").read_text())
     assert artifact["planner"]["degraded"] is True
     assert artifact["schedule"]["selected"][0]["source"] == "deterministic"
+
+
+def _runner_env(monkeypatch, *, response_format="json_schema", api_format="openai"):
+    monkeypatch.setenv("AI_BASE_URL", "http://model.test/v1")
+    monkeypatch.setenv("AI_MODEL", "model")
+    monkeypatch.setenv("AI_API_FORMAT", api_format)
+    monkeypatch.setenv("AI_RESPONSE_FORMAT", response_format)
+    monkeypatch.setenv("AI_STREAM", "false")
+
+
+@pytest.mark.parametrize("role", ["planner", "specialist", "critic", "aggregator"])
+def test_role_specific_json_schemas_are_used(monkeypatch, role):
+    _runner_env(monkeypatch)
+    captured = []
+
+    def fake_request(_base, api_format, payload, _key, _timeout):
+        captured.append(payload)
+        assert api_format == "openai"
+        return {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(runner_module, "run_chat_request", fake_request)
+    runner_module.SequentialModelRunner().one_shot(role, "system", "user")
+    formatter = captured[0]["response_format"]
+    assert formatter["type"] == "json_schema"
+    assert formatter["json_schema"]["name"] == f"specialist_{role}"
+    assert formatter["json_schema"]["schema"] == runner_module.ROLE_SCHEMAS[role]
+
+
+@pytest.mark.parametrize("configured,expected", [("json_object", "json_object"), ("off", None)])
+def test_configured_openai_response_format(monkeypatch, configured, expected):
+    _runner_env(monkeypatch, response_format=configured)
+    captured = []
+    monkeypatch.setattr(
+        runner_module, "run_chat_request",
+        lambda _b, _a, payload, _k, _t: captured.append(payload) or
+        {"choices": [{"message": {"content": "{}"}}]},
+    )
+    runner_module.SequentialModelRunner().one_shot("aggregator", "system", "user")
+    if expected:
+        assert captured[0]["response_format"] == {"type": expected}
+    else:
+        assert "response_format" not in captured[0]
+
+
+def test_anthropic_omits_openai_response_format(monkeypatch):
+    _runner_env(monkeypatch, api_format="anthropic")
+    captured = []
+    monkeypatch.setattr(
+        runner_module, "run_chat_request",
+        lambda _b, _a, payload, _k, _t: captured.append(payload) or
+        {"content": [{"type": "text", "text": "{}"}], "stop_reason": "end_turn"},
+    )
+    runner_module.SequentialModelRunner().one_shot("critic", "system", "user")
+    assert "response_format" not in captured[0]
+
+
+def test_structured_rejection_retries_once_without_format(monkeypatch):
+    _runner_env(monkeypatch)
+    calls = []
+
+    def fake_request(_base, _api, payload, _key, _timeout):
+        calls.append(payload)
+        if len(calls) == 1:
+            raise RuntimeError("HTTP 400: unsupported response_format Bearer abcdefghijklmnopqrstuvwxyz123456")
+        return {"choices": [{"message": {"content": '{"ordered_finding_ids":[],"verdict":"approve"}'}}]}
+
+    monkeypatch.setattr(runner_module, "run_chat_request", fake_request)
+    raw, diagnostics = runner_module.SequentialModelRunner().one_shot(
+        "aggregator", "system", "JSON only"
+    )
+    assert raw["verdict"] == "approve"
+    assert len(calls) == 2
+    assert "response_format" in calls[0] and "response_format" not in calls[1]
+    assert diagnostics["request"]["structured_output_fallback"] is True
+    assert "abcdefghijklmnopqrstuvwxyz123456" not in diagnostics["request"]["structured_output_error"]
+
+
+def test_both_structured_and_unstructured_failures_keep_redacted_diagnostics(monkeypatch):
+    _runner_env(monkeypatch)
+    calls = []
+
+    def fail(_base, _api, payload, _key, _timeout):
+        calls.append(payload)
+        if "response_format" in payload:
+            raise RuntimeError("HTTP 400 Bearer abcdefghijklmnopqrstuvwxyz123456")
+        raise RuntimeError("fallback parse transport failure")
+
+    monkeypatch.setattr(runner_module, "run_chat_request", fail)
+    with pytest.raises(RuntimeError) as raised:
+        runner_module.SequentialModelRunner().one_shot("critic", "system", "user")
+    assert len(calls) == 2
+    assert "structured output request failed" in str(raised.value)
+    assert "unstructured fallback failed" in str(raised.value)
+    assert "abcdefghijklmnopqrstuvwxyz123456" not in str(raised.value)
+
+
+def test_verdict_reasoning_effort_is_separate(monkeypatch):
+    _runner_env(monkeypatch, response_format="off")
+    monkeypatch.setenv("AI_REASONING_EFFORT", "high")
+    monkeypatch.setenv("AI_VERDICT_REASONING_EFFORT", "none")
+    captured = []
+    monkeypatch.setattr(
+        runner_module, "run_chat_request",
+        lambda _b, _a, payload, _k, _t: captured.append(payload) or
+        {"choices": [{"message": {"content": "{}"}}]},
+    )
+    runner = runner_module.SequentialModelRunner()
+    runner.one_shot("planner", "system", "user")
+    assert runner.reasoning_effort == "high"
+    assert captured[0]["reasoning_effort"] == "none"
+
+
+@pytest.mark.parametrize(
+    ("strategy", "fallback"),
+    [("specialists", "standard_review"), ("specialists_evaluate", "publication_gated")],
+)
+def test_total_specialist_failure_never_writes_clean_output(monkeypatch, tmp_path, strategy, fallback):
+    _write_minimal_review_workspace(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REVIEW_STRATEGY", strategy)
+    monkeypatch.setenv("AI_MODEL", "test-model")
+    monkeypatch.setenv("AI_BASE_URL", "http://unused/v1")
+
+    class FailedPassRunner(EndToEndRunner):
+        def agent(self, role, system, user, max_tools, terminal_instruction):
+            if role == "planner":
+                return super().agent(role, system, user, max_tools, terminal_instruction)
+            raise RuntimeError("closing request failed")
+
+    monkeypatch.setattr(runner_module, "SequentialModelRunner", FailedPassRunner)
+    monkeypatch.setattr(runner_module, "tracked_paths", lambda: ["pyproject.toml", "a.py"])
+    assert runner_module.main() == 0
+    assert not (tmp_path / "specialist-ai-output.json").exists()
+    artifact = json.loads((tmp_path / "specialist-review-artifact.json").read_text())
+    assert artifact["evaluation_status"] == "failed"
+    assert artifact["fallback_status"] == fallback
+    assert artifact["pass_counts"]["succeeded"] == 0
+    assert artifact["passes"][0]["status"] == "failed"
+
+
+def test_focus_prompt_slices_topology_and_marks_truncation(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SPECIALIST_PACKET_MAX_BYTES", "1000")
+    (tmp_path / "review-corpus.truncated.md").write_text("corpus " * 1000)
+    (tmp_path / "pr.diff.truncated").write_text(
+        "diff --git a/api/a.py b/api/a.py\n--- a/api/a.py\n+++ b/api/a.py\n"
+        + ("+relevant change\n" * 200)
+        + "diff --git a/unrelated/b.py b/unrelated/b.py\n--- a/unrelated/b.py\n+++ b/unrelated/b.py\n+noise\n"
+    )
+    focus = {"id": "api", "seed_paths": ["api/**"], "related_paths": [], "related_symbols": []}
+    topology = {
+        "changed_files": ["api/a.py", "unrelated/b.py"],
+        "path_components": {"api/a.py": "api", "unrelated/b.py": "unrelated"},
+        "components": [
+            {"id": "api", "changed_files": ["api/a.py"]},
+            {"id": "unrelated", "changed_files": ["unrelated/b.py"]},
+        ],
+        "relationships": [], "risk_flags": [], "pr_kind": "app_code",
+    }
+    prompt = runner_module.focus_prompt(focus, topology)
+    assert "api/a.py" in prompt and "unrelated/b.py" not in prompt and "+noise" not in prompt
+    assert "[review corpus truncated for this specialist]" in prompt
+    assert len(prompt.encode()) <= 1000

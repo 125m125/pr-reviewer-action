@@ -22,6 +22,20 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from redact import mask_secrets  # noqa: E402
 
 
+class ModelRequestError(RuntimeError):
+    """A redacted model transport or provider error."""
+
+    def __init__(self, message, *, status=None, body="", timeout=False):
+        super().__init__(message)
+        self.status = status
+        self.body = body
+        self.timeout = timeout
+
+    @property
+    def provider_rejected(self):
+        return self.status is not None and 400 <= self.status < 500
+
+
 def safe_run(args, timeout_sec):
     """Run a command and capture stdout/stderr with a timeout."""
     try:
@@ -55,12 +69,14 @@ def run_chat_request(base_url, api_format, payload, api_key, timeout_sec):
     curl_args = [
         "curl",
         "-q",
-        "-fsSL",
+        "-sSL",
         "--max-time",
         str(timeout_sec),
         endpoint,
         "-H",
         "Content-Type: application/json",
+        "--write-out",
+        "\n%{http_code}",
     ]
     if api_format == "anthropic":
         curl_args.extend(["-H", f"anthropic-version: {os.getenv('ANTHROPIC_VERSION', '2023-06-01')}"])
@@ -105,14 +121,31 @@ def run_chat_request(base_url, api_format, payload, api_key, timeout_sec):
                 pass
 
     if isinstance(completed, dict) and completed.get("timeout"):
-        raise RuntimeError("planner model request timed out")
+        raise ModelRequestError("model request timed out", timeout=True)
     if completed.returncode != 0:
         stderr = mask_secrets((completed.stderr or "").strip())
         if len(stderr) > 500:
             stderr = stderr[:500] + "...[truncated]"
-        raise RuntimeError(
-            f"planner model request failed with exit code {completed.returncode}"
+        raise ModelRequestError(
+            f"model request failed with exit code {completed.returncode}"
             + (f": {stderr}" if stderr else "")
+        )
+
+    output = completed.stdout or ""
+    body, separator, status_text = output.rpartition("\n")
+    if separator and status_text.isdigit() and len(status_text) == 3:
+        status = int(status_text)
+    else:  # Test doubles and older curl wrappers may not append a status.
+        body, status = output, 200
+    if status >= 400:
+        redacted = mask_secrets(body.strip())
+        if len(redacted) > 1000:
+            redacted = redacted[:1000] + "...[truncated]"
+        raise ModelRequestError(
+            f"model provider rejected request with HTTP {status}"
+            + (f": {redacted}" if redacted else ""),
+            status=status,
+            body=redacted,
         )
 
     if streaming:
@@ -121,5 +154,5 @@ def run_chat_request(base_url, api_format, payload, api_key, timeout_sec):
         # (some servers reply 200 + an error object instead of events).
         from pr_reviewer.sse_reassembler import reassemble_sse  # noqa: PLC0415
 
-        return reassemble_sse(completed.stdout, api_format)
-    return json.loads(completed.stdout)
+        return reassemble_sse(body, api_format)
+    return json.loads(body)

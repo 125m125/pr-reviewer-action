@@ -90,9 +90,27 @@ PRIMARY_OK=0
 # call. A parse failure (degraded/oversized/garbled verdict) falls through to
 # the standard corpus review below, so this only ever adds capability.
 NATIVE_VERDICT_USED=0
-if [[ "$REVIEW_STRATEGY" != "single" ]] && [ -s specialist-ai-output.json ]; then
+SPECIALIST_EVALUATION_STATUS="$(jq -r '.evaluation_status // "unknown"' specialist-review-artifact.json 2>/dev/null || echo unknown)"
+if [[ "$REVIEW_STRATEGY" != "single" ]] && [ -s specialist-ai-output.json ] \
+  && [[ "$SPECIALIST_EVALUATION_STATUS" == "complete" || "$SPECIALIST_EVALUATION_STATUS" == "incomplete" ]]; then
   log "Using validated specialist review output; skipping the standard whole-PR model call"
   cp specialist-ai-output.json ai-output.json
+  PRIMARY_OK=1
+  NATIVE_VERDICT_USED=1
+elif [[ "$REVIEW_STRATEGY" == "specialists_evaluate" && "$SPECIALIST_EVALUATION_STATUS" == "failed" ]]; then
+  log "Specialist evaluation failed; recording a publication-gated failure without running the standard reviewer"
+  python3 - > ai-output.json <<'PY'
+import json
+print(json.dumps({
+    "verdict": "request_changes",
+    "review_markdown": (
+        "## Specialist evaluation did not complete\n\n"
+        "No specialist pass returned a valid structured report. This evaluation is publication-gated; "
+        "see the specialist artifact and job summary for diagnostics.\n"
+    ),
+    "findings": [],
+}))
+PY
   PRIMARY_OK=1
   NATIVE_VERDICT_USED=1
 elif [[ "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" == "native_loop" ]] \

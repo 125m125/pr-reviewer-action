@@ -158,6 +158,21 @@ class TestReasoningEffort:
         assert verdict["reasoning_effort"] == "none"
 
 
+def test_verdict_turn_accepts_a_role_specific_json_schema():
+    schema = {
+        "type": "object", "additionalProperties": False,
+        "properties": {"summary": {"type": "string"}}, "required": ["summary"],
+    }
+    payload = Conversation(system="s").to_request_payload(
+        "openai", "m", verdict_turn=True, response_format="json_schema",
+        response_schema=schema, response_schema_name="planner",
+    )
+    assert payload["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "planner", "strict": True, "schema": schema},
+    }
+
+
 def test_old_assistant_text_compaction_preserves_recent_analysis():
     conv = Conversation(system="s")
     for marker in ("old-a", "old-b", "new-a", "new-b"):

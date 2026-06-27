@@ -57,10 +57,15 @@ def test_single_component_repository_uses_repository_fallback():
         ("infra/helm/deployment.yaml", "deployment"),
         ("db/migrations/V1.sql", "migration"),
         ("generated/client.ts", "generated"),
+        ("pnpm-lock.yaml", "build-manifest"),
     ],
 )
 def test_file_role_detection(path, role):
     assert role in classify_file_roles(path)
+
+
+def test_pnpm_lock_is_not_implementation():
+    assert "implementation" not in classify_file_roles("pnpm-lock.yaml")
 
 
 def test_config_components_recipes_and_all_match_groups(tmp_path):

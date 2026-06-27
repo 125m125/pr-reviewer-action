@@ -933,6 +933,8 @@ class Conversation:
         verdict_turn: bool = False,
         keep_full_history_on_verdict: bool = False,
         response_format: str | None = None,
+        response_schema: dict[str, Any] | None = None,
+        response_schema_name: str | None = None,
         reasoning_effort: str | None = None,
         ephemeral_user_note: str | None = None,
         tokens_param: str = "max_tokens",
@@ -968,6 +970,8 @@ class Conversation:
             verdict_turn=verdict_turn,
             keep_full_history_on_verdict=keep_full_history_on_verdict,
             response_format=response_format,
+            response_schema=response_schema,
+            response_schema_name=response_schema_name,
             reasoning_effort=reasoning_effort,
             ephemeral_user_note=ephemeral_user_note,
             tokens_param=tokens_param,
@@ -983,6 +987,8 @@ class Conversation:
         verdict_turn: bool,
         keep_full_history_on_verdict: bool,
         response_format: str | None,
+        response_schema: dict[str, Any] | None = None,
+        response_schema_name: str | None = None,
         reasoning_effort: str | None = None,
         ephemeral_user_note: str | None = None,
         tokens_param: str = "max_tokens",
@@ -1029,7 +1035,17 @@ class Conversation:
             if response_format == "json_object":
                 payload["response_format"] = {"type": "json_object"}
             elif response_format == "json_schema":
-                payload["response_format"] = _OPENAI_VERDICT_JSON_SCHEMA
+                if response_schema is None:
+                    payload["response_format"] = _OPENAI_VERDICT_JSON_SCHEMA
+                else:
+                    payload["response_format"] = {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": response_schema_name or "structured_response",
+                            "strict": True,
+                            "schema": response_schema,
+                        },
+                    }
         else:
             payload["tools"] = [_tool_to_openai(s) for s in self.tool_schemas]
         return payload

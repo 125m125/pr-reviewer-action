@@ -34,6 +34,11 @@ MANIFEST_NAMES = {
     "setup.cfg", "requirements.txt", "Pipfile", "Cargo.toml", "go.mod",
     "Gemfile", "composer.json", "mix.exs", "pubspec.yaml", "Package.swift",
 }
+LOCKFILE_NAMES = {
+    "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock",
+    "poetry.lock", "pdm.lock", "pipfile.lock", "cargo.lock", "gemfile.lock",
+    "composer.lock", "pubspec.lock",
+}
 
 LANGUAGES = {
     ".py": "python", ".java": "java", ".kt": "kotlin", ".kts": "kotlin",
@@ -103,7 +108,7 @@ def classify_file_roles(path: str) -> list[str]:
         roles.append("messaging")
     if re.search(r"(^|/)(deploy|helm|k8s|kubernetes|ansible|terraform|ci)(/|$)|dockerfile|\.github/workflows", low):
         roles.append("deployment")
-    if name in MANIFEST_NAMES or name.endswith((".lock", "lock.json")):
+    if name in MANIFEST_NAMES or name in LOCKFILE_NAMES or name.endswith((".lock", "lock.json")):
         roles.append("build-manifest")
     if re.search(r"(^|/)(config|configuration|settings)(/|$)|\.(ini|toml|properties)$", low):
         roles.append("configuration")
@@ -196,14 +201,21 @@ def build_topology(
                 seen.add(key)
 
     contract_components = [
-        item["id"] for item in components.values() if "schema-contract" in item["file_roles"]
+        item for item in components.values() if "schema-contract" in item["file_roles"]
     ]
     if contract_components and len(components) > 1:
-        for contract_id in contract_components:
-            for target in components:
-                if target == contract_id:
+        consumer_roles = {"implementation", "messaging", "persistence", "trust-boundary"}
+        for contract in contract_components:
+            contract_names = set(contract.get("contracts", []))
+            for target_id, target in components.items():
+                if target_id == contract["id"]:
                     continue
-                key = (contract_id, target, "changed shared contract")
+                shared_identity = contract_names.intersection(target.get("contracts", []))
+                changed_consumer = consumer_roles.intersection(target["file_roles"])
+                if not shared_identity and not changed_consumer:
+                    continue
+                reason = "shared contract identity" if shared_identity else "changed contract consumer/producer"
+                key = (contract["id"], target_id, reason)
                 if key not in seen:
                     relationships.append({"source": key[0], "target": key[1], "reason": key[2]})
                     seen.add(key)
