@@ -9,6 +9,7 @@ from pr_reviewer.specialists import (
     classify_file_roles,
     coverage_gaps,
     deterministic_focuses,
+    empty_config,
     load_specialist_config,
     normalize_focus,
     normalize_specialist_report,
@@ -157,8 +158,86 @@ def test_schedule_is_bounded_deduplicated_and_priority_ordered():
     recipes = [normalize_focus({**same, "id": "r", "priority": "high"}, source="recipe")]
     fallback = [normalize_focus({"id": "other", "title": "Other", "objective": "Other", "lenses": ["test-observability"], "seed_paths": ["a.py"]}, source="deterministic")]
     schedule = schedule_focuses(planner, recipes, fallback, config, topology, 1)
-    assert schedule["selected"][0]["id"] == "r"
+    assert schedule["selected"][0]["id"] == "p"
+    assert schedule["selected"][0]["source_ids"] == ["p", "r"]
+    assert schedule["merge_decisions"]
     assert len(schedule["omitted"]) == 1
+
+
+def test_authorization_variants_merge_but_lifecycle_and_identity_do_not():
+    topology = {
+        "changed_files": ["app/api.py", "app/cache.py"],
+        "path_components": {"app/api.py": "app", "app/cache.py": "app"},
+        "components": [{"id": "app"}], "relationships": [], "risk_flags": ["auth_changes"],
+    }
+    auth = [normalize_focus({
+        "id": "backend-security", "title": "Backend authorization",
+        "objective": "Verify endpoint authorization and access control",
+        "lenses": ["trust-boundary-security"], "seed_paths": ["app/api.py"],
+        "invariants": ["authorization is enforced at the endpoint"], "priority": "critical",
+    })]
+    recipe = [normalize_focus({
+        "id": "entrypoint-auth", "title": "Entrypoint authorization",
+        "objective": "Verify endpoint authorization for callers",
+        "lenses": ["trust-boundary-security"], "seed_paths": ["app/api.py"],
+        "invariants": ["authorization is enforced at the endpoint"], "priority": "high",
+    }, source="recipe")]
+    lifecycle = normalize_focus({
+        "id": "frontend-lifecycle", "title": "Reactive request lifecycle",
+        "objective": "Check cancellation and reset state",
+        "lenses": ["state-lifecycle-concurrency"], "seed_paths": ["app/cache.py"],
+    })
+    identity = normalize_focus({
+        "id": "persistence-identity", "title": "Persistence identity mapping",
+        "objective": "Check season and episode cache identity",
+        "lenses": ["data-integrity-persistence"], "seed_paths": ["app/cache.py"],
+    })
+    schedule = schedule_focuses(auth + [lifecycle, identity], recipe, [], empty_config(), topology, 6)
+    assert any(set(item["source_ids"]) == {"backend-security", "entrypoint-auth"}
+               for item in schedule["selected"])
+    selected_ids = {item["id"] for item in schedule["selected"]}
+    assert {"frontend-lifecycle", "persistence-identity"}.issubset(selected_ids)
+
+
+def test_marginal_selection_preserves_planner_component_and_lens_diversity():
+    topology = {
+        "changed_files": ["api/a.py", "ui/a.ts", "db/a.py"],
+        "path_components": {"api/a.py": "api", "ui/a.ts": "ui", "db/a.py": "db"},
+        "components": [{"id": item} for item in ("api", "ui", "db")],
+        "relationships": [{"source": "api", "target": "ui", "reason": "contract"}],
+        "risk_flags": [],
+    }
+    planner = [normalize_focus({
+        "id": "ui-life", "title": "UI lifecycle", "objective": "Check request cancellation",
+        "lenses": ["state-lifecycle-concurrency"], "seed_paths": ["ui/a.ts"], "priority": "normal",
+    })]
+    recipes = [normalize_focus({
+        "id": f"api-{i}", "title": f"API recipe {i}", "objective": "Check API authorization",
+        "lenses": ["trust-boundary-security"], "seed_paths": ["api/a.py"], "priority": "high",
+    }, source="recipe") for i in range(3)]
+    fallback = [normalize_focus({
+        "id": "db-scout", "title": "DB scout", "objective": "Inspect persistence broadly",
+        "lenses": ["component-correctness", "data-integrity-persistence"],
+        "seed_paths": ["db/a.py"], "priority": "normal",
+    }, source="deterministic")]
+    selected = schedule_focuses(planner, recipes, fallback, empty_config(), topology, 3)["selected"]
+    ids = {item["id"] for item in selected}
+    assert "ui-life" in ids and "db-scout" in ids
+
+
+def test_generated_artifact_availability_accounts_for_workspace_outputs():
+    config = empty_config()
+    config["generated_artifacts"] = [{
+        "id": "client", "source_of_truth": ["api/openapi.yaml"],
+        "generator_config": ["pom.xml"], "output_paths": ["target/generated-sources/**"],
+    }]
+    missing = build_topology(files("api/openapi.yaml"), {}, ["pom.xml", "api/openapi.yaml"], config)
+    assert missing["generated_artifacts"][0]["availability"] == "not-generated-in-review-workspace"
+    present = build_topology(
+        files("api/openapi.yaml"), {}, ["pom.xml", "api/openapi.yaml"], config,
+        workspace_paths=["target/generated-sources/Client.java"],
+    )
+    assert present["generated_artifacts"][0]["availability"] == "available-in-review-workspace"
 
 
 def test_deterministic_fallback_is_generic_and_adds_interaction_focus():

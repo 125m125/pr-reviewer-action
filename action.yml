@@ -470,6 +470,14 @@ inputs:
       one-call-per-turn chains and repair turns. Ignored when tool_mode=off.
     required: false
     default: "3"
+  tool_max_consecutive_no_progress_rounds:
+    description: Advanced safety bound for consecutive duplicate, malformed, failed, or exhausted-budget rounds before terminal synthesis
+    required: false
+    default: "2"
+  tool_max_repeated_call_sets:
+    description: Advanced safety bound for recurrence of the same duplicate-only canonical call set before terminal synthesis
+    required: false
+    default: "3"
   tool_planning_timeout_sec:
     description: Timeout in seconds for the model planning call used by tool harness. Set generously for local models with slow prompt eval; native_loop streams turns by default (ai_stream) to avoid short-idle-proxy timeouts.
     required: false
@@ -772,6 +780,8 @@ runs:
         TOOL_LOOP_SUMMARIZE_MAX_TOKENS: ${{ inputs.tool_loop_summarize_max_tokens }}
         TOOL_MAX_REQUESTS: ${{ inputs.tool_max_requests }}
         TOOL_MAX_ROUNDS: ${{ inputs.tool_max_rounds }}
+        TOOL_MAX_CONSECUTIVE_NO_PROGRESS_ROUNDS: ${{ inputs.tool_max_consecutive_no_progress_rounds }}
+        TOOL_MAX_REPEATED_CALL_SETS: ${{ inputs.tool_max_repeated_call_sets }}
         TOOL_PLANNING_TIMEOUT_SEC: ${{ inputs.tool_planning_timeout_sec }}
         TOOL_PLANNING_MAX_CONTEXT_BYTES: ${{ inputs.tool_planning_max_context_bytes }}
         TOOL_PLANNING_MAX_TOKENS: ${{ inputs.tool_planning_max_tokens }}
@@ -901,6 +911,8 @@ runs:
         TOOL_LOOP_SUMMARIZE_MAX_TOKENS: ${{ inputs.tool_loop_summarize_max_tokens }}
         TOOL_MAX_REQUESTS: ${{ inputs.tool_max_requests }}
         TOOL_MAX_ROUNDS: ${{ inputs.tool_max_rounds }}
+        TOOL_MAX_CONSECUTIVE_NO_PROGRESS_ROUNDS: ${{ inputs.tool_max_consecutive_no_progress_rounds }}
+        TOOL_MAX_REPEATED_CALL_SETS: ${{ inputs.tool_max_repeated_call_sets }}
         TOOL_PLANNING_TIMEOUT_SEC: ${{ inputs.tool_planning_timeout_sec }}
         TOOL_PLANNING_MAX_CONTEXT_BYTES: ${{ inputs.tool_planning_max_context_bytes }}
         TOOL_PLANNING_MAX_TOKENS: ${{ inputs.tool_planning_max_tokens }}

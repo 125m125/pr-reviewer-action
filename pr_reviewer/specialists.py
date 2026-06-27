@@ -148,11 +148,13 @@ def build_topology(
     classification: dict[str, Any] | None,
     tracked_paths: Iterable[str],
     config: dict[str, Any] | None = None,
+    workspace_paths: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     classification = classification or {}
     config = config or empty_config()
     changed = [_posix(item.get("filename")) for item in pr_files if item.get("filename")]
     tracked = [_posix(path) for path in tracked_paths]
+    present = set(tracked) | {_posix(path) for path in (workspace_paths or [])}
     roots = discover_component_roots(tracked)
     configured = config.get("components", [])
     components: dict[str, dict[str, Any]] = {}
@@ -227,6 +229,30 @@ def build_topology(
         for role in classify_file_roles(path):
             if len(available_role_paths[role]) < 25:
                 available_role_paths[role].append(path)
+    generated_artifacts = []
+    configured_artifacts = config.get("generated_artifacts", [])
+    if configured_artifacts:
+        candidates = configured_artifacts
+    else:
+        sources = [path for path in tracked if "schema-contract" in classify_file_roles(path)]
+        manifests = [path for path in tracked if "build-manifest" in classify_file_roles(path)]
+        candidates = [{
+            "id": f"generated-{_slug(PurePosixPath(source).stem)}",
+            "source_of_truth": [source],
+            "generator_config": manifests[:10],
+            "output_paths": ["target/generated-sources/**", "build/generated/**", "src/generated/**"],
+        } for source in sources[:10]]
+    for artifact in candidates:
+        outputs = artifact.get("output_paths", [])
+        available = any(_match(path, outputs) for path in present)
+        generated_artifacts.append({
+            "id": _slug(artifact.get("id"), "generated-artifact"),
+            "availability": "available-in-review-workspace" if available
+                            else "not-generated-in-review-workspace",
+            "source_of_truth": [_posix(v) for v in artifact.get("source_of_truth", [])][:20],
+            "generator_config": [_posix(v) for v in artifact.get("generator_config", [])][:20],
+            "output_paths": [_posix(v) for v in outputs][:20],
+        })
     return {
         "changed_files": changed,
         "components": list(components.values()),
@@ -237,11 +263,12 @@ def build_topology(
         "available_role_paths": dict(available_role_paths),
         "risk_flags": _strings(classification.get("risk_flags")),
         "pr_kind": str(classification.get("pr_kind") or "unknown"),
+        "generated_artifacts": generated_artifacts,
     }
 
 
 def empty_config() -> dict[str, Any]:
-    return {"version": 1, "components": [], "recipes": [], "exclude": {
+    return {"version": 1, "components": [], "recipes": [], "generated_artifacts": [], "exclude": {
         "paths": [], "components": [], "lenses": [], "recipes": [],
     }}
 
@@ -286,6 +313,15 @@ def load_specialist_config(path: str | Path) -> dict[str, Any]:
             "priority": _priority(raw.get("priority")),
             "source": "recipe",
         })
+    for raw in data.get("generated_artifacts", []):
+        if not isinstance(raw, dict) or not raw.get("id"):
+            raise ValueError("every generated artifact requires an id")
+        result["generated_artifacts"].append({
+            "id": _slug(raw["id"]),
+            "source_of_truth": [_posix(v) for v in _strings(raw.get("source_of_truth"), limit=50)],
+            "generator_config": [_posix(v) for v in _strings(raw.get("generator_config"), limit=50)],
+            "output_paths": [_posix(v) for v in _strings(raw.get("output_paths"), limit=50)],
+        })
     exclude = data.get("exclude") if isinstance(data.get("exclude"), dict) else {}
     result["exclude"] = {
         "paths": [_posix(v) for v in _strings(exclude.get("paths"), limit=100)],
@@ -308,8 +344,9 @@ def normalize_focus(raw: Any, *, source: str = "planner", index: int = 0) -> dic
     objective = str(raw.get("objective") or "").strip()[:1000]
     if not title or not objective:
         return None
+    focus_id = _slug(raw.get("id") or title, f"focus-{index + 1}")
     return {
-        "id": _slug(raw.get("id") or title, f"focus-{index + 1}"),
+        "id": focus_id,
         "title": title,
         "objective": objective,
         "rationale": str(raw.get("rationale") or "")[:1000],
@@ -321,6 +358,7 @@ def normalize_focus(raw: Any, *, source: str = "planner", index: int = 0) -> dic
         "expected_evidence": _strings(raw.get("expected_evidence"), limit=50, chars=200),
         "priority": _priority(raw.get("priority")),
         "source": source,
+        "source_ids": _strings(raw.get("source_ids"), limit=20) or [focus_id],
     }
 
 
@@ -465,40 +503,145 @@ def schedule_focuses(
     topology: dict[str, Any],
     max_passes: int,
 ) -> dict[str, Any]:
-    candidates = [item for item in [*recipes, *planner, *fallback] if item]
+    candidates = [item for item in [*planner, *recipes, *fallback] if item]
     candidates, exclusions = apply_exclusions(candidates, config, topology)
-    deduped: list[dict[str, Any]] = []
-    signatures: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+    merged: list[dict[str, Any]] = []
+    merge_decisions: list[dict[str, Any]] = []
     for focus in candidates:
-        signature = (
-            tuple(sorted(focus.get("lenses", []))),
-            tuple(sorted(focus.get("seed_paths", []))),
-        )
-        if signature in signatures:
+        target = next((item for item in merged if _focuses_substantially_overlap(
+            item, focus, topology)), None)
+        if target is None:
+            merged.append(dict(focus))
             continue
-        # Deterministic component focuses are a fail-safe, not an extra tax.
-        # Drop one when a recipe/planner focus already covers the same concrete
-        # seed scope through an overlapping lens; retain distinct lenses on the
-        # same file because they represent genuinely different investigations.
-        if focus.get("source") == "deterministic" and any(
-            set(existing.get("seed_paths", [])) == set(focus.get("seed_paths", []))
-            and bool(set(existing.get("lenses", [])).intersection(focus.get("lenses", [])))
-            and existing.get("source") != "deterministic"
-            for existing in deduped
-        ):
-            continue
-        signatures.add(signature)
-        deduped.append(focus)
-    source_bonus = {"recipe": 6, "planner": 4, "deterministic": 0, "critic": 8}
-    deduped.sort(key=lambda item: (
-        -(PRIORITY_SCORE[item["priority"]] + source_bonus.get(item.get("source"), 0)),
-        item["id"],
-    ))
+        absorbed_id = focus["id"]
+        for field, limit in (("lenses", 20), ("seed_paths", 30), ("related_paths", 30),
+                             ("related_symbols", 40), ("invariants", 40),
+                             ("expected_evidence", 40), ("source_ids", 20)):
+            target[field] = list(dict.fromkeys(
+                [*target.get(field, []), *focus.get(field, [])]
+            ))[:limit]
+        if PRIORITY_SCORE[focus["priority"]] > PRIORITY_SCORE[target["priority"]]:
+            target["priority"] = focus["priority"]
+        target["sources"] = list(dict.fromkeys([
+            *target.get("sources", [target.get("source")]), focus.get("source")
+        ]))
+        merge_decisions.append({
+            "kept": target["id"], "merged": absorbed_id,
+            "source_ids": target["source_ids"],
+            "reason": "substantial shared component/path and investigation ownership",
+        })
+
+    selected: list[dict[str, Any]] = []
+    remaining = list(merged)
+    covered: set[str] = set()
+    selection_log: list[dict[str, Any]] = []
+    while remaining and len(selected) < max_passes:
+        scored = [(_marginal_focus_score(item, topology, covered), item) for item in remaining]
+        score, chosen = max(scored, key=lambda pair: (pair[0],
+                                                       PRIORITY_SCORE[pair[1]["priority"]],
+                                                       pair[1]["source"] == "planner",
+                                                       pair[1]["id"]))
+        features = _focus_features(chosen, topology)
+        chosen = dict(chosen)
+        chosen["marginal_coverage_score"] = score
+        chosen["coverage_features"] = sorted(features)
+        selected.append(chosen)
+        newly_covered = features - covered
+        covered.update(features)
+        remaining.remove(next(item for item in remaining if item["id"] == chosen["id"]))
+        selection_log.append({"focus": chosen["id"], "score": score,
+                              "new_features": sorted(newly_covered),
+                              "reason": "highest marginal uncovered coverage"})
+
+    omitted = []
+    for item in remaining:
+        candidate = dict(item)
+        candidate["marginal_coverage_score"] = _marginal_focus_score(item, topology, covered)
+        candidate["omission_reason"] = "pass limit reached after higher marginal coverage focuses"
+        omitted.append(candidate)
     return {
-        "selected": deduped[:max_passes],
-        "omitted": deduped[max_passes:],
+        "selected": selected,
+        "omitted": omitted,
         "applied_exclusions": exclusions,
+        "merge_decisions": merge_decisions,
+        "selection_log": selection_log,
     }
+
+
+_FOCUS_STOP = {"the", "and", "for", "from", "with", "into", "review", "trace",
+               "verify", "change", "changed", "behavior", "correctness", "component"}
+
+
+def _focus_terms(focus: dict[str, Any]) -> set[str]:
+    value = " ".join(str(focus.get(field) or "") for field in
+                     ("title", "objective", "rationale"))
+    return {word for word in re.findall(r"[a-z0-9]+", value.lower())
+            if len(word) >= 4 and word not in _FOCUS_STOP}
+
+
+def _focus_components(focus: dict[str, Any], topology: dict[str, Any]) -> set[str]:
+    result: set[str] = set()
+    for path in topology.get("changed_files", []):
+        if _match(path, [*focus.get("seed_paths", []), *focus.get("related_paths", [])]):
+            component = topology.get("path_components", {}).get(path)
+            if component:
+                result.add(component)
+    component_ids = {item.get("id") for item in topology.get("components", [])}
+    result.update(set(focus.get("related_symbols", [])).intersection(component_ids))
+    return result
+
+
+def _focuses_substantially_overlap(left: dict[str, Any], right: dict[str, Any],
+                                    topology: dict[str, Any]) -> bool:
+    lenses = set(left.get("lenses", [])) & set(right.get("lenses", []))
+    paths = set(left.get("seed_paths", [])) & set(right.get("seed_paths", []))
+    components = _focus_components(left, topology) & _focus_components(right, topology)
+    symbols = set(left.get("related_symbols", [])) & set(right.get("related_symbols", []))
+    terms_a, terms_b = _focus_terms(left), _focus_terms(right)
+    term_ratio = len(terms_a & terms_b) / max(1, min(len(terms_a), len(terms_b)))
+    invariants_a = {word for value in left.get("invariants", []) for word in re.findall(r"[a-z0-9]+", value.lower())}
+    invariants_b = {word for value in right.get("invariants", []) for word in re.findall(r"[a-z0-9]+", value.lower())}
+    invariant_overlap = len((invariants_a & invariants_b) - _FOCUS_STOP) >= 2
+    # A shared boundary is not enough: distinct persistence identity and
+    # protocol propagation ownership remain separate without lens/invariant similarity.
+    ownership_overlap = bool(lenses) or term_ratio >= 0.45 or invariant_overlap
+    scope_overlap = bool(paths or components or symbols)
+    return scope_overlap and ownership_overlap and sum((bool(lenses), bool(paths),
+                                                        bool(components), bool(symbols),
+                                                        term_ratio >= 0.45,
+                                                        invariant_overlap)) >= 3
+
+
+def _focus_features(focus: dict[str, Any], topology: dict[str, Any]) -> set[str]:
+    features = {f"component:{item}" for item in _focus_components(focus, topology)}
+    features.update(f"lens:{item}" for item in focus.get("lenses", []))
+    features.update(f"invariant:{item}" for item in _focus_terms({
+        "title": " ".join(focus.get("invariants", [])), "objective": "", "rationale": ""
+    }))
+    components = _focus_components(focus, topology)
+    for rel in topology.get("relationships", []):
+        if rel.get("source") in components or rel.get("target") in components:
+            features.add(f"relationship:{rel.get('source')}->{rel.get('target')}")
+    for flag in topology.get("risk_flags", []):
+        if "trust-boundary-security" in focus.get("lenses", []) or flag.lower() in " ".join(_focus_terms(focus)):
+            features.add(f"risk:{flag}")
+    if "component-correctness" in focus.get("lenses", []):
+        features.add("role:broad-scout")
+    if focus.get("source") == "recipe":
+        features.add(f"recipe:{focus['id']}")
+    return features
+
+
+def _marginal_focus_score(focus: dict[str, Any], topology: dict[str, Any],
+                          covered: set[str]) -> int:
+    features = _focus_features(focus, topology)
+    new = features - covered
+    weights = {"component": 16, "relationship": 15, "lens": 10, "risk": 14,
+               "invariant": 5, "recipe": 4, "role": 5}
+    score = PRIORITY_SCORE[focus["priority"]]
+    score += sum(weights.get(item.split(":", 1)[0], 2) for item in new)
+    score -= sum(4 for item in features & covered)
+    return score
 
 
 def normalize_specialist_report(raw: Any, focus: dict[str, Any]) -> dict[str, Any]:
@@ -665,10 +808,14 @@ def _same_root_cause(left: dict[str, Any], right: dict[str, Any]) -> bool:
     stop = {"the", "and", "that", "this", "with", "from", "when", "then", "into", "for", "not"}
 
     def tokens(value: Any) -> set[str]:
-        return {
-            token for token in re.findall(r"[a-z0-9]+", str(value or "").lower())
-            if len(token) >= 3 and token not in stop
-        }
+        result = set()
+        for token in re.findall(r"[a-z0-9]+", str(value or "").lower()):
+            if len(token) < 3 or token in stop:
+                continue
+            if token.startswith("cancel"):
+                token = "cancel"
+            result.add(token)
+        return result
 
     for field, threshold in (("causal_chain", 0.65), ("claim", 0.7)):
         a, b = tokens(left.get(field)), tokens(right.get(field))

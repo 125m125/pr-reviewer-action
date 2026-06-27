@@ -51,6 +51,8 @@ STOP_REQUEST_ERROR = "request-error"
 STOP_TRUNCATED = "truncated-turn"
 STOP_CONTEXT_BUDGET = "context-budget-exhausted"
 STOP_UNEXECUTED_TEXTUAL_TOOL_INTENT = "unexecuted-textual-tool-intent"
+STOP_STAGNATION = "no-progress-stagnation"
+STOP_REPETITIVE_TEXT = "repetitive-assistant-text"
 
 _TEXTUAL_TOOL_REPAIR_NOTE = (
     "Your previous response contained textual tool-call markup, but the API "
@@ -62,9 +64,9 @@ _TEXTUAL_TOOL_REPAIR_NOTE = (
 
 # Synthetic result bodies. These are model-facing: they must explain the
 # refusal in one sentence so a self-correcting model has something to act on.
-_DUPLICATE_NOTE = (
-    "Duplicate request: this exact tool call already ran in this conversation. "
-    "Reuse the earlier result instead of repeating the call."
+_STAGNATION_NOTE = (
+    "Exploration was stopped because recent rounds requested no new evidence. "
+    "Do not request more tools; synthesize the report from the existing evidence."
 )
 _BUDGET_NOTE = (
     "Tool-call budget exhausted: this call was not executed. "
@@ -90,6 +92,8 @@ class LoopBudgets:
     summarize_keep_newest: int = 2
     model_context_tokens: int = 0
     max_textual_tool_repairs: int = 1
+    max_consecutive_no_progress_rounds: int = 2
+    max_repeated_call_sets: int = 3
 
 
 def adaptive_loop_budgets(
@@ -160,6 +164,16 @@ class LoopOutcome:
     textual_tool_repair_attempts: int = 0
     textual_tool_repaired: bool = False
     textual_tool_unexecuted: bool = False
+    duplicate_only_rounds: int = 0
+    no_progress_rounds: int = 0
+    max_consecutive_no_progress: int = 0
+    repeated_call_set_max: int = 0
+    stagnation_stop_reason: str = ""
+    preserved_truncated_bytes: int = 0
+    preserved_truncated_tokens: int = 0
+    continuation_attempts: int = 0
+    terminal_synthesis_recovered: bool = False
+    repetitive_text_detected: bool = False
 
 
 def detect_textual_tool_intent(text: str) -> list[str]:
@@ -293,6 +307,31 @@ def _request_key(name: str, args: dict[str, Any]) -> str:
     return f"{name}:{json.dumps(args, sort_keys=True, separators=(',', ':'))}"
 
 
+def _normalise_assistant_text(text: str) -> str:
+    paragraphs = [re.sub(r"\s+", " ", item).strip().lower()
+                  for item in re.split(r"\n\s*\n", text or "")]
+    return "\n\n".join(item for item in paragraphs if item)
+
+
+def repetitive_assistant_text(text: str, previous: str = "") -> bool:
+    """Detect only obvious repetition; this intentionally does no semantic judging."""
+    current = _normalise_assistant_text(text)
+    if not current:
+        return False
+    if previous and current == _normalise_assistant_text(previous) and len(current) >= 80:
+        return True
+    if len(current) < 600:
+        return False
+    paragraphs = [item for item in current.split("\n\n") if len(item) >= 80]
+    if len(paragraphs) < 3:
+        return False
+    counts: dict[str, int] = {}
+    for item in paragraphs:
+        counts[item] = counts.get(item, 0) + 1
+    repeated = max((len(item) * count for item, count in counts.items() if count >= 3), default=0)
+    return repeated >= int(len(current) * 0.6)
+
+
 def drive_tool_loop(
     conversation: Conversation,
     post_fn: Callable[[dict[str, Any]], dict[str, Any]],
@@ -329,8 +368,10 @@ def drive_tool_loop(
     started = time_fn()
     calls_executed = 0
     seen_keys: set[str] = set()
-    retry_with_more_tokens = False
-    retry_max_tokens = max_tokens
+    successful_results: dict[str, dict[str, Any]] = {}
+    consecutive_no_progress = 0
+    duplicate_call_sets: dict[tuple[str, ...], int] = {}
+    previous_assistant_text = ""
     textual_repair_pending = False
 
     while outcome.rounds < budgets.max_rounds:
@@ -394,6 +435,12 @@ def drive_tool_loop(
             "correctness risks. Do not repeat completed checks. Stop requesting "
             "tools when the evidence is sufficient so you can synthesize it."
         )
+        if consecutive_no_progress:
+            allowance = max(0, budgets.max_consecutive_no_progress_rounds - consecutive_no_progress)
+            budget_note += (
+                f" No-progress allowance remaining: {allowance} round(s); another "
+                "duplicate cycle may end exploration."
+            )
         if textual_repair_pending:
             budget_note = _TEXTUAL_TOOL_REPAIR_NOTE + "\n\n" + budget_note
             outcome.textual_tool_repair_attempts += 1
@@ -402,14 +449,13 @@ def drive_tool_loop(
             api_format,
             model,
             stream=stream,
-            max_tokens=retry_max_tokens if retry_with_more_tokens else max_tokens,
+            max_tokens=max_tokens,
             temperature=temperature,
             reasoning_effort=reasoning_effort,
             tokens_param=tokens_param,
             cache_prefix=cache_prefix,
             ephemeral_user_note=budget_note,
         )
-        retry_with_more_tokens = False
         outcome.planning_turns_attempted += 1
         try:
             response = post_fn(payload)
@@ -424,6 +470,11 @@ def drive_tool_loop(
         )
         outcome.finish_reasons.append(finish_reason or "unknown")
         outcome.text_sources.append(text_source)
+        repetitive = repetitive_assistant_text(text, previous_assistant_text)
+        if text:
+            previous_assistant_text = text
+        if repetitive:
+            outcome.repetitive_text_detected = True
 
         # Real API tool calls always win. Textual pseudo-calls are never parsed
         # or executed; they only trigger one bounded request to reissue them via
@@ -434,24 +485,12 @@ def drive_tool_loop(
 
         if not calls:
             if finish_reason == "length":
-                if (
-                    not textual_repair_pending
-                    and outcome.truncation_retries == 0
-                    and outcome.rounds < budgets.max_rounds
-                ):
-                    candidate = max_tokens * 2
-                    if budgets.model_context_tokens:
-                        safe_cap = (
-                            budgets.model_context_tokens
-                            - conversation.approx_tokens()
-                            - 1024
-                        )
-                        candidate = min(candidate, safe_cap)
-                    if candidate > max_tokens:
-                        outcome.truncation_retries += 1
-                        retry_max_tokens = candidate
-                        retry_with_more_tokens = True
-                        continue
+                if text:
+                    conversation.add_assistant_text(text)
+                    outcome.final_text = text
+                    outcome.final_text_source = text_source
+                    outcome.preserved_truncated_bytes = len(text.encode("utf-8"))
+                    outcome.preserved_truncated_tokens = max(1, len(text) // 4)
                 outcome.stop_reason = STOP_TRUNCATED
                 outcome.error = "Model response was truncated before a usable answer or tool call."
                 break
@@ -475,6 +514,15 @@ def drive_tool_loop(
                     "Exploration ended with structured textual tool intent that "
                     "was not reissued as native tool calls."
                 )
+                break
+            if repetitive:
+                if text:
+                    conversation.add_assistant_text(text)
+                conversation.add_system_note(_STAGNATION_NOTE)
+                outcome.final_text = text
+                outcome.final_text_source = text_source
+                outcome.stop_reason = STOP_REPETITIVE_TEXT
+                outcome.stagnation_stop_reason = "repetitive-text"
                 break
             textual_repair_pending = False
             outcome.final_text = text
@@ -500,6 +548,7 @@ def drive_tool_loop(
         # the original call order to preserve the open-call contract.
         plan: list[tuple[str, str, Any]] = []  # (call_id, kind, data) in order
         to_execute: dict[int, tuple[str, dict[str, Any]]] = {}
+        round_keys: list[str] = []
         for idx, call in enumerate(calls):
             call_id = call["id"]
             # Arguments arrive as an opaque JSON string (#233 contract); parse
@@ -519,10 +568,21 @@ def drive_tool_loop(
                 continue
 
             key = _request_key(call["name"], args)
+            round_keys.append(key)
             if key in seen_keys:
                 outcome.calls_duplicated += 1
                 outcome.calls_rejected += 1
-                plan.append((call_id, "dup", {"note": _DUPLICATE_NOTE}))
+                if key in successful_results:
+                    replay = dict(successful_results[key])
+                    replay["replayed_duplicate"] = True
+                    replay["canonical_request_key"] = key
+                    plan.append((call_id, "dup", replay))
+                else:
+                    plan.append((call_id, "dup", {
+                        "error": "Duplicate non-successful request; retrying it cannot provide new evidence.",
+                        "replayed_duplicate": True,
+                        "canonical_request_key": key,
+                    }))
                 continue
 
             if calls_executed >= budgets.max_tool_calls:
@@ -551,9 +611,10 @@ def drive_tool_loop(
                     results_by_idx[futures[fut]] = fut.result()
 
         # Apply results in call order (synthetic refusals inline).
+        successful_this_round = 0
         for call_id, kind, data in plan:
             if kind != "exec":
-                conversation.add_tool_result(call_id, data, is_error=True)
+                conversation.add_tool_result(call_id, data, is_error=kind != "dup")
                 continue
             name, args = to_execute[data]
             result = results_by_idx[data]
@@ -565,6 +626,44 @@ def drive_tool_loop(
                 result.get("result", {}),
                 is_error=result.get("status") != "ok",
             )
+            if result.get("status") == "ok":
+                key = _request_key(name, args)
+                successful_results[key] = {
+                    "tool": result.get("tool", name),
+                    "status": "ok",
+                    "result": result.get("result", {}),
+                    "provenance": "original_bounded_tool_result",
+                }
+                successful_this_round += 1
+
+        duplicate_only = bool(plan) and all(kind == "dup" for _, kind, _ in plan)
+        if duplicate_only:
+            outcome.duplicate_only_rounds += 1
+            signature = tuple(sorted(round_keys))
+            duplicate_call_sets[signature] = duplicate_call_sets.get(signature, 0) + 1
+            outcome.repeated_call_set_max = max(outcome.repeated_call_set_max,
+                                                duplicate_call_sets[signature])
+        if successful_this_round:
+            consecutive_no_progress = 0
+        else:
+            consecutive_no_progress += 1
+            outcome.no_progress_rounds += 1
+            outcome.max_consecutive_no_progress = max(
+                outcome.max_consecutive_no_progress, consecutive_no_progress
+            )
+
+        repeated_set_stop = duplicate_only and duplicate_call_sets.get(
+            tuple(sorted(round_keys)), 0
+        ) >= budgets.max_repeated_call_sets
+        if (consecutive_no_progress >= budgets.max_consecutive_no_progress_rounds
+                or repeated_set_stop or repetitive):
+            conversation.add_system_note(_STAGNATION_NOTE)
+            outcome.stop_reason = STOP_REPETITIVE_TEXT if repetitive else STOP_STAGNATION
+            outcome.stagnation_stop_reason = (
+                "repetitive-text" if repetitive else
+                "repeated-call-set" if repeated_set_stop else "consecutive-no-progress"
+            )
+            break
 
         if calls_executed >= budgets.max_tool_calls:
             outcome.stop_reason = STOP_BUDGET

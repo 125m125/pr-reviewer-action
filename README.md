@@ -231,9 +231,11 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 Specialist mode derives a generic component topology from manifests, paths,
 file roles, contracts, and deterministic risk flags. A bounded planning call may
 inspect the repository and returns a strict list of free-form focuses. The runner
-merges that plan with matching repository recipes and deterministic fallbacks,
-applies exclusions, and runs every selected pass sequentially. A critic may
-request one bounded follow-up wave. Only evidence-backed, in-scope candidates
+merges overlapping plan/recipe/fallback ownership, then selects passes by marginal
+component, relationship, lens, invariant, risk, and repository-recipe coverage.
+Each pass receives the full compact coworker roster plus a provisional coverage
+ledger from earlier passes. A critic may request one bounded follow-up wave only
+for omitted coverage, contradictions, or specifically missing evidence. Only evidence-backed, in-scope candidates
 survive deterministic validation; the final model can rank candidate IDs but
 cannot add findings.
 
@@ -267,6 +269,12 @@ The optional policy file uses this structured version-1 schema:
     "invariants": ["failed work is retried without duplicate effects"],
     "priority": "high"
   }],
+  "generated_artifacts": [{
+    "id": "openapi-client",
+    "source_of_truth": ["api/openapi.yaml"],
+    "generator_config": ["pom.xml"],
+    "output_paths": ["target/generated-sources/**"]
+  }],
   "exclude": {"paths": [], "components": [], "lenses": [], "recipes": []}
 }
 ```
@@ -277,6 +285,10 @@ disclosed when applied. They do not disable existing classifier, verdict, or
 publication guardrails. Recipes are structured data rendered through an
 action-owned prompt; they cannot provide commands, models, custom budgets, or
 complete prompt replacements.
+Generated-artifact availability is derived from tracked files and actual workspace
+outputs (including ignored build products). When a configured output is absent,
+specialists are directed to its source specification, generator configuration,
+handwritten consumers/implementations, and tests instead of repeating searches.
 
 </details>
 
@@ -394,6 +406,8 @@ complete prompt replacements.
 | `tool_mode` | Tool harness mode: `off` or `native_loop` (the `plan_execute_*` planner modes were removed in 2.0) | No | `off` |
 | `tool_max_requests` | Maximum tool requests executed in one harness run (total across the loop) | No | `4` |
 | `tool_max_rounds` | Configured round budget for `tool_mode=native_loop`; the legacy mapping permits exactly twice this many planning turns, with no hidden cap | No | `3` |
+| `tool_max_consecutive_no_progress_rounds` | Advanced safety bound: stop exploration after this many consecutive duplicate, malformed, failed, or exhausted-budget rounds and synthesize from existing evidence | No | `2` |
+| `tool_max_repeated_call_sets` | Advanced safety bound: stop when the same duplicate-only canonical call set recurs this many times | No | `3` |
 | `tool_loop_wall_clock_sec` | Total wall-clock ceiling for native exploration plus terminal synthesis | No | `120` |
 | `tool_synthesis_timeout_sec` | Timeout reserved within the total native-loop wall clock for the terminal tools-disabled synthesis turn | No | `60` |
 | `tool_synthesis_max_tokens` | Maximum completion tokens for the terminal evidence synthesis memo | No | `2048` |
@@ -653,7 +667,7 @@ Evidence providers are **disabled by default on cross-repository pull requests**
     tool_min_successful_requests: "1"
 ```
 
-In `native_loop` mode the reviewing model uses its provider's native tool-calling API (OpenAI `tool_calls` / Anthropic `tool_use`). The tool schemas are sent with the request and the model holds the conversation: it issues a call, sees the result appended as a real tool-result turn, and decides the next call from what came back — so a chain like "read the machineconfig → extract the platform version → fetch that version's published compatibility matrix" is expressed natively, with each hop conditioned on the previous one's content rather than guessed up front. Each request receives an ephemeral note with the remaining call/turn allowance. `tool_max_requests` is the exact execution cap; the legacy rounds mapping permits exactly `2 × tool_max_rounds` planning turns without a hidden maximum. Positive configured values are never clamped or raised automatically. `tool_loop_wall_clock_sec` covers exploration plus a reserved terminal synthesis phase (`tool_synthesis_timeout_sec`, `tool_synthesis_max_tokens`). The effective synthesis reserve is the smaller of the configured synthesis timeout and half the total wall clock, leaving time for both phases; configured and effective values are logged and shown in the step summary. Reaching a call, turn, or exploration-time limit stops tool execution and triggers one tools-disabled, reasoning-enabled evidence synthesis turn before the strict verdict turn. Malformed, duplicate, and over-budget calls receive synthetic results but do not count as executions.
+In `native_loop` mode the reviewing model uses its provider's native tool-calling API (OpenAI `tool_calls` / Anthropic `tool_use`). The tool schemas are sent with the request and the model holds the conversation: it issues a call, sees the result appended as a real tool-result turn, and decides the next call from what came back — so a chain like "read the machineconfig → extract the platform version → fetch that version's published compatibility matrix" is expressed natively, with each hop conditioned on the previous one's content rather than guessed up front. Each request receives an ephemeral note with the remaining call/turn/no-progress allowance. Successful duplicate calls replay the original bounded result without re-execution or budget charge. `tool_max_requests` is the exact execution cap; the legacy rounds mapping permits exactly `2 × tool_max_rounds` planning turns without a hidden maximum. Positive configured values are never clamped or raised automatically. `tool_loop_wall_clock_sec` covers exploration plus a reserved terminal synthesis phase (`tool_synthesis_timeout_sec`, `tool_synthesis_max_tokens`). The effective synthesis reserve is the smaller of the configured synthesis timeout and half the total wall clock, leaving time for both phases; configured and effective values are logged and shown in the step summary. Reaching a call, turn, no-progress, repetition, or exploration-time limit stops tool execution and triggers one tools-disabled, reasoning-enabled evidence synthesis turn before the strict verdict turn. Length-truncated analysis is retained as bounded internal synthesis input instead of restarting with a doubled output budget. Malformed, duplicate, and over-budget calls receive synthetic results but do not count as executions.
 
 For intermediate OpenAI turns only, blank `content` falls back internally to nonblank `reasoning_content`, allowing servers such as LM Studio/Qwen to carry analysis into the next tool turn. Ordinary `content` always wins; Anthropic is unchanged; and final verdict parsing never consumes `reasoning_content`. Fallback reasoning is not copied into review markdown, logs, or action outputs. Streamed reasoning deltas are reassembled with the same boundary.
 

@@ -346,7 +346,8 @@ def test_length_without_usable_answer_is_not_model_done():
         api_format="openai", model="m", budgets=LoopBudgets(max_rounds=2),
     )
     assert outcome.stop_reason == "truncated-turn"
-    assert outcome.truncation_retries == 1
+    assert outcome.truncation_retries == 0
+    assert outcome.rounds == 1
 
 
 def test_wall_clock_stop_before_first_request_still_allows_synthesis_phase():
@@ -797,6 +798,80 @@ def test_duplicate_call_not_reexecuted_and_free():
     assert [a["path"] for _, a in log] == ["a.txt", "b.txt"]
     assert conv.open_tool_call_ids() == set()
     assert outcome.stop_reason == STOP_BUDGET
+
+
+def test_duplicate_replays_success_and_two_duplicate_cycles_stop():
+    conv = fresh_conversation()
+    post = scripted_post([
+        openai_tool_call_response([("c1", "read_file", '{"path":"a.txt"}')]),
+        openai_tool_call_response([("c2", "read_file", '{"path":"a.txt"}')]),
+        openai_tool_call_response([("c3", "read_file", '{"path":"a.txt"}')]),
+    ])
+    execute, log = recording_execute()
+    outcome = drive_tool_loop(
+        conv, post, execute, api_format="openai", model="m",
+        budgets=LoopBudgets(max_tool_calls=5, max_rounds=8),
+    )
+    assert len(log) == 1
+    replays = [item for item in conv.events if item["kind"] == "tool_result"
+               and "replayed_duplicate" in item["content"]]
+    assert len(replays) == 2 and "content" in replays[0]["content"]
+    assert outcome.stop_reason == "no-progress-stagnation"
+    assert outcome.duplicate_only_rounds == 2
+
+
+def test_alternating_call_sets_cannot_evade_guard_and_new_success_resets():
+    responses = [
+        openai_tool_call_response([(f"a{i}", "read_file", '{"path":"a"}')])
+        if i % 2 == 0 else
+        openai_tool_call_response([(f"b{i}", "read_file", '{"path":"b"}')])
+        for i in range(8)
+    ]
+    outcome = drive_tool_loop(
+        fresh_conversation(), scripted_post(responses), recording_execute()[0],
+        api_format="openai", model="m",
+        budgets=LoopBudgets(max_tool_calls=10, max_rounds=10,
+                            max_consecutive_no_progress_rounds=20,
+                            max_repeated_call_sets=3),
+    )
+    assert outcome.stop_reason == "no-progress-stagnation"
+    assert outcome.stagnation_stop_reason == "repeated-call-set"
+
+    reset = drive_tool_loop(
+        fresh_conversation(), scripted_post([
+            openai_tool_call_response([("x1", "read_file", '{"path":"x"}')]),
+            openai_tool_call_response([("x2", "read_file", '{"path":"x"}')]),
+            openai_tool_call_response([("y1", "read_file", '{"path":"y"}')]),
+            openai_tool_call_response([("y2", "read_file", '{"path":"y"}')]),
+            openai_text_response("done"),
+        ]), recording_execute()[0], api_format="openai", model="m",
+        budgets=LoopBudgets(max_tool_calls=5, max_rounds=8),
+    )
+    assert reset.stop_reason == STOP_MODEL_DONE
+    assert reset.max_consecutive_no_progress == 1
+
+
+def test_repeated_paragraphs_stop_and_truncated_text_is_preserved():
+    paragraph = "This internal analysis paragraph repeats without adding new evidence. " * 3
+    repeated = "\n\n".join([paragraph] * 4)
+    outcome = drive_tool_loop(
+        fresh_conversation(), scripted_post([openai_text_response(repeated)]),
+        recording_execute()[0], api_format="openai", model="m",
+    )
+    assert outcome.stop_reason == "repetitive-assistant-text"
+    assert outcome.repetitive_text_detected is True
+
+    truncated = {"choices": [{"finish_reason": "length", "message": {
+        "content": "Saved partial reasoning about a cancellation race."
+    }}]}
+    preserved = drive_tool_loop(
+        fresh_conversation(), scripted_post([truncated]), recording_execute()[0],
+        api_format="openai", model="m",
+    )
+    assert preserved.stop_reason == "truncated-turn"
+    assert preserved.final_text.startswith("Saved partial")
+    assert preserved.preserved_truncated_bytes > 0
+    assert preserved.truncation_retries == 0
 
 
 def test_anthropic_loop_round_trip():

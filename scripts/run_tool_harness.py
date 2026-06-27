@@ -627,6 +627,12 @@ def run_native_loop(
         1000, model_context_tokens - planning_max_tokens - 4096
     )
     budgets.model_context_tokens = model_context_tokens
+    budgets.max_consecutive_no_progress_rounds = env_positive_int(
+        "TOOL_MAX_CONSECUTIVE_NO_PROGRESS_ROUNDS", 2
+    )
+    budgets.max_repeated_call_sets = env_positive_int(
+        "TOOL_MAX_REPEATED_CALL_SETS", 3
+    )
     result["budget"] = {
         "tool_calls_configured": max_requests,
         "tool_calls_effective": budgets.max_tool_calls,
@@ -637,6 +643,8 @@ def run_native_loop(
         "synthesis_timeout_configured_sec": synthesis_timeout,
         "synthesis_timeout_effective_sec": synthesis_reserve,
         "synthesis_reserve_sec": synthesis_reserve,
+        "max_consecutive_no_progress_rounds": budgets.max_consecutive_no_progress_rounds,
+        "max_repeated_call_sets": budgets.max_repeated_call_sets,
     }
     native_started = time.monotonic()
     exploration_deadline = native_started + budgets.wall_clock_sec
@@ -844,6 +852,19 @@ def run_native_loop(
             "runs": outcome.compaction_runs,
             "approx_tokens_removed": outcome.compaction_tokens_removed,
         }
+        result["progress"] = {
+            "duplicate_only_rounds": outcome.duplicate_only_rounds,
+            "no_progress_rounds": outcome.no_progress_rounds,
+            "max_consecutive_no_progress": outcome.max_consecutive_no_progress,
+            "repeated_call_set_max": outcome.repeated_call_set_max,
+            "stagnation_stop_reason": outcome.stagnation_stop_reason,
+            "repetitive_text_detected": outcome.repetitive_text_detected,
+        }
+        result["truncation"] = {
+            "preserved_bytes": outcome.preserved_truncated_bytes,
+            "preserved_approx_tokens": outcome.preserved_truncated_tokens,
+            "continuation_attempts": outcome.continuation_attempts,
+        }
         marker_counts = {
             marker: outcome.textual_tool_intent_markers.count(marker)
             for marker in sorted(set(outcome.textual_tool_intent_markers))
@@ -922,7 +943,14 @@ def run_native_loop(
     # reasoning-only stop is an ambiguous scratchpad: retain it as internal
     # input, then cross an explicit tools-disabled synthesis boundary.
     closing_text = outcome.final_text.strip()
-    synthesis_memo = closing_text if outcome.final_text_source == "content" else ""
+    force_terminal_synthesis = outcome.stop_reason in {
+        "truncated-turn", "no-progress-stagnation", "repetitive-assistant-text"
+    }
+    synthesis_memo = (
+        closing_text
+        if outcome.final_text_source == "content" and not force_terminal_synthesis
+        else ""
+    )
     synthesis_source = outcome.final_text_source if synthesis_memo else "none"
     synthesis_ran = False
     if not synthesis_memo:
@@ -988,6 +1016,9 @@ def run_native_loop(
         "context_tokens_after_compaction": context_after_compaction,
         "input_allowance_bytes": synthesis_input_allowance,
         "input_context": synthesis_context_details,
+        "recovered_after_truncation": bool(
+            outcome.stop_reason == "truncated-turn" and synthesis_memo.strip()
+        ),
     }
 
     # ── In-conversation verdict (#205, Option 1) ─────────────────────────────

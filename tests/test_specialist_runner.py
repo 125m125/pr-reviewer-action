@@ -327,6 +327,38 @@ def test_verdict_reasoning_effort_is_separate(monkeypatch):
     assert captured[0]["reasoning_effort"] == "none"
 
 
+def test_truncated_specialist_analysis_is_recovered_by_terminal_synthesis(monkeypatch):
+    _runner_env(monkeypatch)
+    captured = []
+    report = {
+        "domain": "focus", "completion_status": "complete",
+        "inspected_files": [], "unchecked_material_files": [],
+        "invariants_checked": ["identity"], "findings": [], "unknowns": [],
+    }
+
+    def fake_request(_base, _api, payload, _key, _timeout):
+        captured.append(payload)
+        if len(captured) == 1:
+            return {"choices": [{"finish_reason": "length", "message": {
+                "content": "Partial analysis found an identity mismatch but ended mid-sentence"
+            }}]}
+        return {"choices": [{"finish_reason": "stop", "message": {
+            "content": json.dumps(report)
+        }}]}
+
+    monkeypatch.setattr(runner_module, "run_chat_request", fake_request)
+    value, diagnostics = runner_module.SequentialModelRunner().agent(
+        "specialist", "system", "assigned focus", 2,
+        terminal_instruction="Return strict JSON now.",
+    )
+    assert value == report
+    assert len(captured) == 2
+    assert captured[0]["max_tokens"] == captured[1]["max_tokens"]
+    assert diagnostics["preserved_truncated_bytes"] > 0
+    assert diagnostics["continuation_attempts"] == 0
+    assert diagnostics["terminal_synthesis_recovered"] is True
+
+
 @pytest.mark.parametrize(
     ("strategy", "fallback"),
     [("specialists", "standard_review"), ("specialists_evaluate", "publication_gated")],
@@ -378,3 +410,71 @@ def test_focus_prompt_slices_topology_and_marks_truncation(monkeypatch, tmp_path
     assert "api/a.py" in prompt and "unrelated/b.py" not in prompt and "+noise" not in prompt
     assert "[review corpus truncated for this specialist]" in prompt
     assert len(prompt.encode()) <= 1000
+
+
+def test_roster_ledger_and_guidance_are_bounded_structured_context(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pr.diff.truncated").write_text("", encoding="utf-8")
+    (tmp_path / "standards-context.capped.md").write_text(
+        "Generated OpenAPI outputs are intentionally gitignored; inspect the specification.",
+        encoding="utf-8",
+    )
+    topology = {
+        "changed_files": ["ui/a.ts", "api/a.py"],
+        "path_components": {"ui/a.ts": "ui", "api/a.py": "api"},
+        "components": [{"id": "ui"}, {"id": "api"}], "relationships": [],
+        "risk_flags": [], "pr_kind": "app_code",
+    }
+    focuses = [
+        {"id": "ui", "title": "UI", "seed_paths": ["ui/**"], "related_paths": [],
+         "lenses": ["state-lifecycle-concurrency"], "invariants": ["requests reset"]},
+        {"id": "api", "title": "API", "seed_paths": ["api/**"], "related_paths": [],
+         "lenses": ["protocol-contract-compatibility"], "invariants": ["arguments agree"]},
+    ]
+    roster = runner_module.specialist_roster(focuses, topology)
+    assert {item["id"] for item in roster} == {"ui", "api"}
+    reports = [{"domain": "ui", "inspected_files": ["ui/a.ts"], "coverage_gaps": [],
+                "findings": [{"file": "ui/a.ts", "line": 1, "claim": "race"}]}]
+    passes = [{"focus": focuses[0], "status": "valid", "calls": [{"raw_reasoning": "secret"}]}]
+    ledger = runner_module.build_coverage_ledger(reports, passes, topology)
+    assert "raw_reasoning" not in json.dumps(ledger)
+    prompt = runner_module.focus_prompt(focuses[1], topology, roster=roster, ledger=ledger)
+    assert "Generated OpenAPI outputs" in prompt
+    assert "Coworker roster" in prompt and "Provisional coverage ledger" in prompt
+
+
+def test_critic_followup_reconfirmation_rejected_but_omitted_gap_accepted():
+    topology = {
+        "changed_files": ["api/a.py", "ui/a.ts"],
+        "path_components": {"api/a.py": "api", "ui/a.ts": "ui"},
+    }
+    finding = {"file": "api/a.py", "line": 2, "claim": "authorization missing",
+               "evidence": ["line"], "causal_chain": "request -> access"}
+    reports = [{"domain": "api-auth", "completion_status": "complete",
+                "coverage_gaps": [], "inspected_files": ["api/a.py"], "findings": [finding]}]
+    schedule = {"omitted": [{"id": "ui-life", "lenses": ["state-lifecycle-concurrency"],
+                              "seed_paths": ["ui/a.ts"], "related_paths": []}]}
+    confirm = {"id": "confirm", "objective": "Reconfirm authorization", "rationale": "confirm",
+               "seed_paths": ["api/a.py"], "related_paths": [], "lenses": ["trust-boundary-security"]}
+    gap = {"id": "ui-gap", "objective": "Inspect omitted lifecycle", "rationale": "uncovered component",
+           "seed_paths": ["ui/a.ts"], "related_paths": [], "lenses": ["state-lifecycle-concurrency"]}
+    accepted, rejected = runner_module.filter_critic_followups(
+        [confirm, gap], schedule, reports,
+        [{"candidate_key": runner_module.candidate_key(finding), "decision": "keep"}], topology,
+    )
+    assert [item["id"] for item in accepted] == ["ui-gap"]
+    assert rejected[0]["reason"] == "rechecks an already-kept supported candidate"
+
+
+def test_unavailable_generated_read_returns_non_retryable_guidance(monkeypatch):
+    _runner_env(monkeypatch)
+    runner = runner_module.SequentialModelRunner()
+    runner.generated_artifacts = [{
+        "id": "client", "availability": "not-generated-in-review-workspace",
+        "output_paths": ["target/generated-sources/**"],
+        "source_of_truth": ["api/openapi.yaml"], "generator_config": ["pom.xml"],
+    }]
+    result = runner._execute("read_file", {"path": "target/generated-sources/Client.java"})
+    assert result["status"] == "error"
+    assert result["result"]["non_retryable"] is True
+    assert "Repeated searches" in result["result"]["guidance"]
