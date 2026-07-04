@@ -462,16 +462,14 @@ class SequentialModelRunner:
             compact_payload = compact.to_request_payload(
                 self.api_format, model, stream=False, max_tokens=self.max_tokens,
                 temperature=0.0, verdict_turn=True, keep_full_history_on_verdict=True,
-                response_format=None, reasoning_effort=self.verdict_reasoning_effort,
+                response_format=self.response_format if self.api_format == "openai" else None,
+                response_schema=ROLE_SCHEMAS[role],
+                response_schema_name=f"specialist_{role}_compact",
+                reasoning_effort=self.verdict_reasoning_effort,
                 tokens_param=self.tokens_param, cache_prefix=True,
             )
-            # A truncated turn already consumed its useful context budget. Send the
-            # bounded synthesis request directly so the model keeps the latest
-            # reasoning and evidence without replaying the oversized conversation.
-            request_payload = compact_payload if turn_truncated else payload
             response = self._post(
-                request_payload, role,
-                compact_fallback_payload=compact_payload if not turn_truncated else None,
+                payload, role, compact_fallback_payload=compact_payload,
             )
             _, text, source, finish = extract_intermediate_turn(response, self.api_format)
             value = extract_json(text)
@@ -490,6 +488,10 @@ class SequentialModelRunner:
             "text_source": source,
             "finish_reason": finish,
             "turn_truncated": turn_truncated,
+            "had_truncated_turn": any(
+                reason.strip().lower() in {"length", "max_tokens"}
+                for reason in outcome.finish_reasons
+            ),
             "request": self.requests[-1] if self.requests else {},
             "calls_duplicated": outcome.calls_duplicated,
             "duplicate_only_rounds": outcome.duplicate_only_rounds,

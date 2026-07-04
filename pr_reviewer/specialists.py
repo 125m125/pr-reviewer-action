@@ -340,17 +340,20 @@ def _priority(value: Any) -> str:
 def normalize_focus(raw: Any, *, source: str = "planner", index: int = 0) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
-    title = str(raw.get("title") or raw.get("id") or "").strip()[:160]
+    title = str(raw.get("title") or raw.get("id") or raw.get("name") or "").strip()[:160]
     objective = str(raw.get("objective") or "").strip()[:1000]
     if not title or not objective:
         return None
     focus_id = _slug(raw.get("id") or title, f"focus-{index + 1}")
+    lenses = raw.get("lenses")
+    if lenses is None and raw.get("lens") is not None:
+        lenses = [raw["lens"]]
     return {
         "id": focus_id,
         "title": title,
         "objective": objective,
         "rationale": str(raw.get("rationale") or "")[:1000],
-        "lenses": [_slug(v) for v in _strings(raw.get("lenses"), limit=20)],
+        "lenses": [_slug(v) for v in _strings(lenses, limit=20)],
         "seed_paths": [_posix(v) for v in _strings(raw.get("seed_paths"), limit=100)],
         "related_paths": [_posix(v) for v in _strings(raw.get("related_paths"), limit=100)],
         "related_symbols": _strings(raw.get("related_symbols"), limit=100, chars=200),

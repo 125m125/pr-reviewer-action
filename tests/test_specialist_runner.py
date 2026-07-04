@@ -349,7 +349,7 @@ def test_verdict_reasoning_effort_is_separate(monkeypatch):
     assert captured[0]["reasoning_effort"] == "none"
 
 
-def test_truncated_specialist_analysis_is_recovered_by_terminal_synthesis(monkeypatch):
+def test_truncated_specialist_analysis_continues_before_terminal_synthesis(monkeypatch):
     _runner_env(monkeypatch)
     captured = []
     report = {
@@ -377,8 +377,10 @@ def test_truncated_specialist_analysis_is_recovered_by_terminal_synthesis(monkey
     assert len(captured) == 2
     assert captured[0]["max_tokens"] == captured[1]["max_tokens"]
     assert diagnostics["preserved_truncated_bytes"] > 0
-    assert diagnostics["continuation_attempts"] == 0
-    assert diagnostics["terminal_synthesis_recovered"] is True
+    assert diagnostics["continuation_attempts"] == 1
+    assert diagnostics["had_truncated_turn"] is True
+    assert diagnostics["terminal_synthesis_attempted"] is False
+    assert diagnostics["terminal_synthesis_recovered"] is False
 
 
 def test_parseable_length_limited_report_is_still_recovered(monkeypatch):
@@ -407,11 +409,51 @@ def test_parseable_length_limited_report_is_still_recovered(monkeypatch):
 
     assert value == recovered
     assert len(captured) == 2
-    compact_prompt = captured[1]["messages"][-1]["content"]
-    assert json.dumps(partial) in compact_prompt
-    assert diagnostics["turn_truncated"] is True
+    continuation_messages = captured[1]["messages"]
+    assert any(json.dumps(partial) in str(item.get("content"))
+               for item in continuation_messages)
+    assert captured[1]["tools"]
+    assert diagnostics["had_truncated_turn"] is True
+    assert diagnostics["turn_truncated"] is False
+    assert diagnostics["terminal_synthesis_attempted"] is False
+    assert diagnostics["terminal_synthesis_recovered"] is False
+
+
+def test_repeated_truncation_terminal_synthesis_keeps_conversation_history(monkeypatch):
+    _runner_env(monkeypatch)
+    captured = []
+    report = {
+        "domain": "focus", "completion_status": "complete",
+        "inspected_files": [], "unchecked_material_files": [],
+        "invariants_checked": [], "findings": [], "unknowns": [],
+    }
+
+    def fake_request(_base, _api, payload, _key, _timeout):
+        captured.append(payload)
+        if len(captured) <= 2:
+            return {"choices": [{"finish_reason": "length", "message": {
+                "content": f"partial reasoning turn {len(captured)}"
+            }}]}
+        return {"choices": [{"finish_reason": "stop", "message": {
+            "content": json.dumps(report)
+        }}]}
+
+    monkeypatch.setattr(runner_module, "run_chat_request", fake_request)
+    value, diagnostics = runner_module.SequentialModelRunner().agent(
+        "specialist", "system", "assigned focus", 2,
+        terminal_instruction="Return strict JSON now.",
+    )
+
+    assert value == report
+    assert len(captured) == 3
+    terminal_messages = captured[2]["messages"]
+    assert any("partial reasoning turn 1" in str(item.get("content"))
+               for item in terminal_messages)
+    assert any("partial reasoning turn 2" in str(item.get("content"))
+               for item in terminal_messages)
+    assert captured[2]["response_format"]["type"] == "json_schema"
+    assert diagnostics["continuation_attempts"] == 1
     assert diagnostics["terminal_synthesis_attempted"] is True
-    assert diagnostics["terminal_synthesis_recovered"] is True
 
 
 @pytest.mark.parametrize(

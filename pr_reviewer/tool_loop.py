@@ -94,6 +94,7 @@ class LoopBudgets:
     max_textual_tool_repairs: int = 1
     max_consecutive_no_progress_rounds: int = 2
     max_repeated_call_sets: int = 3
+    max_truncation_continuations: int = 1
 
 
 def adaptive_loop_budgets(
@@ -441,7 +442,10 @@ def drive_tool_loop(
                 f" No-progress allowance remaining: {allowance} round(s); another "
                 "duplicate cycle may end exploration."
             )
-        if textual_repair_pending:
+        if (
+            textual_repair_pending
+            and outcome.textual_tool_repair_attempts < budgets.max_textual_tool_repairs
+        ):
             budget_note = _TEXTUAL_TOOL_REPAIR_NOTE + "\n\n" + budget_note
             outcome.textual_tool_repair_attempts += 1
 
@@ -491,6 +495,19 @@ def drive_tool_loop(
                     outcome.final_text_source = text_source
                     outcome.preserved_truncated_bytes = len(text.encode("utf-8"))
                     outcome.preserved_truncated_tokens = max(1, len(text) // 4)
+                if (
+                    outcome.continuation_attempts < budgets.max_truncation_continuations
+                    and outcome.rounds < budgets.max_rounds
+                ):
+                    outcome.continuation_attempts += 1
+                    conversation.add_user(
+                        "Your previous turn was cut off by the completion-token limit. "
+                        "Continue the same investigation from that reasoning. You may "
+                        "still use the available tools when evidence is missing; otherwise "
+                        "finish with the requested structured answer. Do not restart or "
+                        "repeat completed analysis."
+                    )
+                    continue
                 outcome.stop_reason = STOP_TRUNCATED
                 outcome.error = "Model response was truncated before a usable answer or tool call."
                 break

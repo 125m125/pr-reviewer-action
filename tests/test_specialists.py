@@ -118,6 +118,20 @@ def test_planner_accepts_arbitrary_focus_names_and_rejects_empty_plan():
         validate_planner_plan({"focuses": []})
 
 
+def test_planner_repairs_common_name_and_singular_lens_aliases():
+    plan = validate_planner_plan({
+        "summary": "frontend change", "focuses": [{
+            "name": "Recommendation action flow",
+            "objective": "Trace the new season-detail dispatch",
+            "lens": "interaction-data-flow",
+        }],
+    })
+
+    assert plan["focuses"][0]["id"] == "recommendation-action-flow"
+    assert plan["focuses"][0]["title"] == "Recommendation action flow"
+    assert plan["focuses"][0]["lenses"] == ["interaction-data-flow"]
+
+
 def test_authoritative_exclusions_strip_lenses_and_drop_fully_excluded_focus():
     topology = {
         "changed_files": ["worker/a.py", "docs/a.md"],

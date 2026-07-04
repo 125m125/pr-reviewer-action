@@ -256,14 +256,15 @@ def test_truncated_repair_is_not_retried_and_remains_unexecuted():
         "finish_reason": "length", "message": {"content": ""}
     }]}
     outcome = drive_tool_loop(
-        fresh_conversation(), scripted_post([textual, truncated]),
+        fresh_conversation(), scripted_post([textual, truncated, truncated]),
         recording_execute()[0], api_format="openai", model="m",
         budgets=LoopBudgets(max_rounds=6),
     )
     assert outcome.stop_reason == "truncated-turn"
-    assert outcome.rounds == 2
+    assert outcome.rounds == 3
     assert outcome.textual_tool_repair_attempts == 1
     assert outcome.truncation_retries == 0
+    assert outcome.continuation_attempts == 1
     assert outcome.textual_tool_unexecuted is True
 
 
@@ -347,7 +348,8 @@ def test_length_without_usable_answer_is_not_model_done():
     )
     assert outcome.stop_reason == "truncated-turn"
     assert outcome.truncation_retries == 0
-    assert outcome.rounds == 1
+    assert outcome.continuation_attempts == 1
+    assert outcome.rounds == 2
 
 
 def test_wall_clock_stop_before_first_request_still_allows_synthesis_phase():
@@ -865,13 +867,51 @@ def test_repeated_paragraphs_stop_and_truncated_text_is_preserved():
         "content": "Saved partial reasoning about a cancellation race."
     }}]}
     preserved = drive_tool_loop(
-        fresh_conversation(), scripted_post([truncated]), recording_execute()[0],
+        fresh_conversation(), scripted_post([truncated, truncated]), recording_execute()[0],
         api_format="openai", model="m",
     )
     assert preserved.stop_reason == "truncated-turn"
     assert preserved.final_text.startswith("Saved partial")
     assert preserved.preserved_truncated_bytes > 0
     assert preserved.truncation_retries == 0
+    assert preserved.continuation_attempts == 1
+
+
+def test_truncated_turn_continues_same_conversation_with_tools_available():
+    conv = fresh_conversation()
+    payloads = []
+    responses = iter([
+        {"choices": [{"finish_reason": "length", "message": {
+            "content": "I need to inspect the reducer before concluding."
+        }}]},
+        openai_tool_call_response([("r1", "read_file", '{"path":"reducer.py"}')]),
+        openai_text_response('{"findings": []}'),
+    ])
+
+    def post(payload):
+        payloads.append(payload)
+        return next(responses)
+
+    outcome = drive_tool_loop(
+        conv, post, recording_execute()[0], api_format="openai", model="m",
+        budgets=LoopBudgets(max_tool_calls=2, max_rounds=4),
+    )
+
+    assert outcome.stop_reason == STOP_MODEL_DONE
+    assert outcome.continuation_attempts == 1
+    assert outcome.calls_executed == 1
+    assert len(payloads) == 3
+    messages = payloads[1]["messages"]
+    prior_index = next(
+        index for index, message in enumerate(messages)
+        if message["role"] == "assistant" and "inspect the reducer" in message["content"]
+    )
+    continuation_index = next(
+        index for index, message in enumerate(messages)
+        if message["role"] == "user" and "Continue the same investigation" in message["content"]
+    )
+    assert continuation_index > prior_index
+    assert payloads[1]["tools"]
 
 
 def test_anthropic_loop_round_trip():
