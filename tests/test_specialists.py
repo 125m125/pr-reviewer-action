@@ -225,6 +225,35 @@ def test_marginal_selection_preserves_planner_component_and_lens_diversity():
     assert "ui-life" in ids and "db-scout" in ids
 
 
+def test_schedule_stops_when_remaining_focus_has_no_positive_marginal_coverage():
+    topology = {
+        "changed_files": ["app/a.py", "app/b.py"],
+        "path_components": {"app/a.py": "app", "app/b.py": "app"},
+        "components": [{"id": "app"}], "relationships": [], "risk_flags": [],
+    }
+    lenses = [
+        "component-correctness", "test-observability", "interaction-data-flow",
+        "state-lifecycle-concurrency", "protocol-contract-compatibility",
+        "resource-boundary-numeric",
+    ]
+    focuses = [
+        normalize_focus({
+            "id": "primary", "title": "Alpha", "objective": "Investigate quasar",
+            "lenses": lenses, "seed_paths": ["app/a.py"], "priority": "high",
+        }),
+        normalize_focus({
+            "id": "redundant", "title": "Omega", "objective": "Examine nebula",
+            "lenses": lenses, "seed_paths": ["app/b.py"], "priority": "low",
+        }),
+    ]
+
+    schedule = schedule_focuses(focuses, [], [], empty_config(), topology, 6)
+
+    assert [item["id"] for item in schedule["selected"]] == ["primary"]
+    assert schedule["omitted"][0]["id"] == "redundant"
+    assert schedule["omitted"][0]["omission_reason"] == "no positive marginal coverage"
+
+
 def test_generated_artifact_availability_accounts_for_workspace_outputs():
     config = empty_config()
     config["generated_artifacts"] = [{

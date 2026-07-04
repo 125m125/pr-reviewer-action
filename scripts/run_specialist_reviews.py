@@ -432,8 +432,13 @@ class SequentialModelRunner:
                 value = extract_json(text)
             except ValueError:
                 value = None
-        terminal_synthesis_attempted = value is None
-        if value is None:
+        finish = outcome.finish_reasons[-1] if outcome.finish_reasons else ""
+        turn_truncated = (
+            outcome.stop_reason == "truncated-turn"
+            or finish.strip().lower() in {"length", "max_tokens"}
+        )
+        terminal_synthesis_attempted = value is None or turn_truncated
+        if terminal_synthesis_attempted:
             conversation.add_user(terminal_instruction)
             payload = conversation.to_request_payload(
                 self.api_format, model, stream=self.stream,
@@ -460,12 +465,18 @@ class SequentialModelRunner:
                 response_format=None, reasoning_effort=self.verdict_reasoning_effort,
                 tokens_param=self.tokens_param, cache_prefix=True,
             )
-            response = self._post(payload, role, compact_fallback_payload=compact_payload)
+            # A truncated turn already consumed its useful context budget. Send the
+            # bounded synthesis request directly so the model keeps the latest
+            # reasoning and evidence without replaying the oversized conversation.
+            request_payload = compact_payload if turn_truncated else payload
+            response = self._post(
+                request_payload, role,
+                compact_fallback_payload=compact_payload if not turn_truncated else None,
+            )
             _, text, source, finish = extract_intermediate_turn(response, self.api_format)
             value = extract_json(text)
         else:
             source = outcome.final_text_source
-            finish = outcome.finish_reasons[-1] if outcome.finish_reasons else ""
         inspected = [
             call.args.get("path") for call in outcome.executed
             if call.tool == "read_file" and call.result.get("status") == "ok" and call.args.get("path")
@@ -478,6 +489,7 @@ class SequentialModelRunner:
             "inspected_files": list(dict.fromkeys(inspected)),
             "text_source": source,
             "finish_reason": finish,
+            "turn_truncated": turn_truncated,
             "request": self.requests[-1] if self.requests else {},
             "calls_duplicated": outcome.calls_duplicated,
             "duplicate_only_rounds": outcome.duplicate_only_rounds,
@@ -492,7 +504,7 @@ class SequentialModelRunner:
             "terminal_synthesis_attempted": terminal_synthesis_attempted,
             "terminal_synthesis_recovered": bool(
                 terminal_synthesis_attempted and value is not None
-                and outcome.stop_reason == "truncated-turn"
+                and turn_truncated
             ),
         }
 
@@ -835,6 +847,16 @@ def render_review(candidates: list[dict[str, Any]], order: list[str], notice: st
     }
 
 
+def initial_fallback_focuses(
+    planner_focuses: list[dict[str, Any]], *, planner_degraded: bool,
+    topology: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Use deterministic focuses only when dynamic planning did not succeed."""
+    if planner_degraded or not planner_focuses:
+        return deterministic_focuses(topology)
+    return []
+
+
 def main() -> int:
     started = time.monotonic()
     Path("specialist-ai-output.json").unlink(missing_ok=True)
@@ -899,7 +921,10 @@ def main() -> int:
         print(f"Specialist planner degraded: {planner_error}", file=sys.stderr)
 
     schedule = schedule_focuses(
-        planner_focuses, recipe_focuses(config, topology), deterministic_focuses(topology),
+        planner_focuses, recipe_focuses(config, topology),
+        initial_fallback_focuses(
+            planner_focuses, planner_degraded=planner_degraded, topology=topology,
+        ),
         config, topology, max_initial,
     )
     print("Selected specialist focuses: " + ", ".join(item["id"] for item in schedule["selected"]), file=sys.stderr)

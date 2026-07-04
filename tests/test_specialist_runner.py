@@ -192,7 +192,29 @@ def test_main_runs_dynamic_plan_specialists_two_critic_turns_and_aggregator(monk
     assert "Specialist coverage: 1 pass(es) succeeded, 0 failed" in output["review_markdown"]
     assert artifact["strategy"] == "specialists_evaluate"
     assert artifact["evaluation_status"] == "complete"
+    assert all(
+        "deterministic" not in item.get("sources", [item.get("source")])
+        for item in artifact["schedule"]["selected"]
+    )
     assert EndToEndRunner.last.roles == ["planner", "specialist", "critic", "critic", "aggregator"]
+
+
+def test_planner_fallback_focuses_only_when_plan_is_degraded():
+    topology = {
+        "changed_files": ["a.py"],
+        "components": [{"id": "repository", "changed_files": ["a.py"],
+                        "file_roles": [], "invariants": []}],
+        "path_components": {"a.py": "repository"},
+        "relationships": [], "risk_flags": [],
+    }
+    planner_focuses = [{"id": "planned"}]
+
+    assert runner_module.initial_fallback_focuses(
+        planner_focuses, planner_degraded=False, topology=topology
+    ) == []
+    assert runner_module.initial_fallback_focuses(
+        [], planner_degraded=True, topology=topology
+    )[0]["source"] == "deterministic"
 
 
 def test_main_planner_failure_uses_deterministic_fallback(monkeypatch, tmp_path):
@@ -356,6 +378,39 @@ def test_truncated_specialist_analysis_is_recovered_by_terminal_synthesis(monkey
     assert captured[0]["max_tokens"] == captured[1]["max_tokens"]
     assert diagnostics["preserved_truncated_bytes"] > 0
     assert diagnostics["continuation_attempts"] == 0
+    assert diagnostics["terminal_synthesis_recovered"] is True
+
+
+def test_parseable_length_limited_report_is_still_recovered(monkeypatch):
+    _runner_env(monkeypatch)
+    captured = []
+    partial = {
+        "domain": "focus", "completion_status": "complete",
+        "inspected_files": ["a.py"], "unchecked_material_files": [],
+        "invariants_checked": ["identity"], "findings": [], "unknowns": [],
+    }
+    recovered = {**partial, "unknowns": ["recovery retained the bounded analysis"]}
+
+    def fake_request(_base, _api, payload, _key, _timeout):
+        captured.append(payload)
+        response = partial if len(captured) == 1 else recovered
+        finish = "length" if len(captured) == 1 else "stop"
+        return {"choices": [{"finish_reason": finish, "message": {
+            "content": json.dumps(response)
+        }}]}
+
+    monkeypatch.setattr(runner_module, "run_chat_request", fake_request)
+    value, diagnostics = runner_module.SequentialModelRunner().agent(
+        "specialist", "system", "assigned focus", 2,
+        terminal_instruction="Return strict JSON now.",
+    )
+
+    assert value == recovered
+    assert len(captured) == 2
+    compact_prompt = captured[1]["messages"][-1]["content"]
+    assert json.dumps(partial) in compact_prompt
+    assert diagnostics["turn_truncated"] is True
+    assert diagnostics["terminal_synthesis_attempted"] is True
     assert diagnostics["terminal_synthesis_recovered"] is True
 
 

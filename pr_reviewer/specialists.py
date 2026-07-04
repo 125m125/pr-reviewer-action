@@ -535,12 +535,16 @@ def schedule_focuses(
     remaining = list(merged)
     covered: set[str] = set()
     selection_log: list[dict[str, Any]] = []
+    exhausted_marginal_coverage = False
     while remaining and len(selected) < max_passes:
         scored = [(_marginal_focus_score(item, topology, covered), item) for item in remaining]
         score, chosen = max(scored, key=lambda pair: (pair[0],
                                                        PRIORITY_SCORE[pair[1]["priority"]],
                                                        pair[1]["source"] == "planner",
                                                        pair[1]["id"]))
+        if score <= 0:
+            exhausted_marginal_coverage = True
+            break
         features = _focus_features(chosen, topology)
         chosen = dict(chosen)
         chosen["marginal_coverage_score"] = score
@@ -557,7 +561,10 @@ def schedule_focuses(
     for item in remaining:
         candidate = dict(item)
         candidate["marginal_coverage_score"] = _marginal_focus_score(item, topology, covered)
-        candidate["omission_reason"] = "pass limit reached after higher marginal coverage focuses"
+        candidate["omission_reason"] = (
+            "no positive marginal coverage" if exhausted_marginal_coverage
+            else "pass limit reached after higher marginal coverage focuses"
+        )
         omitted.append(candidate)
     return {
         "selected": selected,
