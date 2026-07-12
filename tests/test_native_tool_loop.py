@@ -12,6 +12,7 @@ from pr_reviewer.tool_loop import (
     STOP_MAX_ROUNDS,
     STOP_MODEL_DONE,
     STOP_NO_TOOL_CALLS,
+    STOP_REPETITIVE_TEXT,
     STOP_REQUEST_ERROR,
     STOP_WALL_CLOCK,
     LoopBudgets,
@@ -222,6 +223,7 @@ def test_textual_intent_gets_one_native_repair_and_executes_only_native_call():
     )
     assert log == [("read_file", {"path": "src/parent.ts"})]
     assert outcome.textual_tool_repair_attempts == 1
+    assert outcome.consecutive_textual_tool_repair_attempts == 0
     assert outcome.textual_tool_repaired is True
     repair_users = [
         str(m.get("content") or "") for m in payloads[1]["messages"]
@@ -229,6 +231,29 @@ def test_textual_intent_gets_one_native_repair_and_executes_only_native_call():
     ]
     assert any("returned no native tool_calls" in text for text in repair_users)
     assert any("planning turns remain" in text for text in repair_users)
+
+
+def test_successful_native_repair_resets_consecutive_budget_for_later_textual_intent():
+    textual = {"choices": [{"finish_reason": "stop", "message": {
+        "content": "", "reasoning_content": QWEN_TEXTUAL_CALL,
+        "tool_calls": [],
+    }}]}
+    responses = [
+        textual,
+        openai_tool_call_response([("native-1", "read_file", '{"path":"a.ts"}')]),
+        textual,
+        openai_tool_call_response([("native-2", "read_file", '{"path":"b.ts"}')]),
+        openai_text_response("done"),
+    ]
+    execute, log = recording_execute()
+    outcome = drive_tool_loop(
+        fresh_conversation(), scripted_post(responses), execute,
+        api_format="openai", model="m", budgets=LoopBudgets(max_rounds=8),
+    )
+    assert log == [("read_file", {"path": "a.ts"}), ("read_file", {"path": "b.ts"})]
+    assert outcome.textual_tool_repair_attempts == 2
+    assert outcome.consecutive_textual_tool_repair_attempts == 0
+    assert outcome.stop_reason == STOP_MODEL_DONE
 
 
 def test_second_textual_only_response_stops_without_execution():
@@ -875,6 +900,21 @@ def test_repeated_paragraphs_stop_and_truncated_text_is_preserved():
     assert preserved.preserved_truncated_bytes > 0
     assert preserved.truncation_retries == 0
     assert preserved.continuation_attempts == 1
+
+
+def test_repeated_length_limited_text_stops_before_consuming_all_continuations():
+    paragraph = "The cursor invariant remains unresolved; inspect the same path again. " * 12
+    truncated = {"choices": [{"finish_reason": "length", "message": {
+        "content": paragraph
+    }}]}
+    outcome = drive_tool_loop(
+        fresh_conversation(), scripted_post([truncated, truncated, truncated]),
+        recording_execute()[0], api_format="openai", model="m",
+        budgets=LoopBudgets(max_rounds=8, max_truncation_continuations=3),
+    )
+    assert outcome.stop_reason == STOP_REPETITIVE_TEXT
+    assert outcome.repetitive_text_detected is True
+    assert outcome.continuation_attempts == 1
 
 
 def test_truncated_turn_continues_same_conversation_with_tools_available():

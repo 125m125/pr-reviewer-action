@@ -87,7 +87,11 @@ inputs:
   specialist_planner_max_tool_calls:
     description: Maximum read-only tool calls available to the specialist planning scout.
     required: false
-    default: "8"
+    default: "2"
+  specialist_planner_max_tokens:
+    description: Maximum completion tokens for the bounded specialist planning scout.
+    required: false
+    default: "2048"
   specialist_max_initial_passes:
     description: Maximum sequential specialist passes selected for the initial wave.
     required: false
@@ -125,9 +129,13 @@ inputs:
     required: false
     default: "600"
   specialist_max_tokens:
-    description: Maximum completion tokens for planner, specialist, critic, and aggregator turns.
+    description: Maximum completion tokens for specialist, critic, and aggregator turns.
     required: false
     default: "4096"
+  specialist_max_truncation_continuations:
+    description: Maximum continuation turns after a specialist response reaches the completion-token limit.
+    required: false
+    default: "2"
   specialist_planner_max_context_bytes:
     description: Maximum diff/context bytes supplied to the planning scout before tool exploration.
     required: false
@@ -734,12 +742,14 @@ runs:
         REVIEW_STRATEGY: ${{ inputs.review_strategy }}
         SPECIALIST_CONFIG_FILE: ${{ inputs.specialist_config_file }}
         SPECIALIST_PLANNER_MAX_TOOL_CALLS: ${{ inputs.specialist_planner_max_tool_calls }}
+        SPECIALIST_PLANNER_MAX_TOKENS: ${{ inputs.specialist_planner_max_tokens }}
         SPECIALIST_MAX_INITIAL_PASSES: ${{ inputs.specialist_max_initial_passes }}
         SPECIALIST_MAX_FOLLOWUP_PASSES: ${{ inputs.specialist_max_followup_passes }}
         SPECIALIST_MAX_TOOL_CALLS_PER_PASS: ${{ inputs.specialist_max_tool_calls_per_pass }}
         SPECIALIST_TOOL_MODE: ${{ inputs.specialist_tool_mode }}
         SPECIALIST_PASS_TIMEOUT_SEC: ${{ inputs.specialist_pass_timeout_sec }}
         SPECIALIST_MAX_TOKENS: ${{ inputs.specialist_max_tokens }}
+        SPECIALIST_MAX_TRUNCATION_CONTINUATIONS: ${{ inputs.specialist_max_truncation_continuations }}
         SPECIALIST_PLANNER_MAX_CONTEXT_BYTES: ${{ inputs.specialist_planner_max_context_bytes }}
         SPECIALIST_PACKET_MAX_BYTES: ${{ inputs.specialist_packet_max_bytes }}
         SPECIALIST_PLANNER_MODEL: ${{ inputs.specialist_planner_model }}
@@ -843,6 +853,7 @@ runs:
         REVIEW_STRATEGY: ${{ inputs.review_strategy }}
         SPECIALIST_CONFIG_FILE: ${{ inputs.specialist_config_file }}
         SPECIALIST_PLANNER_MAX_TOOL_CALLS: ${{ inputs.specialist_planner_max_tool_calls }}
+        SPECIALIST_PLANNER_MAX_TOKENS: ${{ inputs.specialist_planner_max_tokens }}
         SPECIALIST_MAX_INITIAL_PASSES: ${{ inputs.specialist_max_initial_passes }}
         SPECIALIST_MAX_FOLLOWUP_PASSES: ${{ inputs.specialist_max_followup_passes }}
         SPECIALIST_MAX_TOOL_CALLS_PER_PASS: ${{ inputs.specialist_max_tool_calls_per_pass }}
@@ -853,6 +864,7 @@ runs:
         SPECIALIST_AGGREGATOR_MODEL: ${{ inputs.specialist_aggregator_model }}
         SPECIALIST_PASS_TIMEOUT_SEC: ${{ inputs.specialist_pass_timeout_sec }}
         SPECIALIST_MAX_TOKENS: ${{ inputs.specialist_max_tokens }}
+        SPECIALIST_MAX_TRUNCATION_CONTINUATIONS: ${{ inputs.specialist_max_truncation_continuations }}
         SPECIALIST_PLANNER_MAX_CONTEXT_BYTES: ${{ inputs.specialist_planner_max_context_bytes }}
         SPECIALIST_PACKET_MAX_BYTES: ${{ inputs.specialist_packet_max_bytes }}
         ANTHROPIC_VERSION: ${{ inputs.anthropic_version }}

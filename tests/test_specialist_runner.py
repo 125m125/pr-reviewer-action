@@ -349,6 +349,82 @@ def test_verdict_reasoning_effort_is_separate(monkeypatch):
     assert captured[0]["reasoning_effort"] == "none"
 
 
+def test_planner_uses_separate_small_token_budget(monkeypatch):
+    _runner_env(monkeypatch, response_format="off")
+    monkeypatch.setenv("SPECIALIST_MAX_TOKENS", "8192")
+    captured = []
+    monkeypatch.setattr(
+        runner_module,
+        "run_chat_request",
+        lambda _b, _a, payload, _k, _t: captured.append(payload) or
+        {"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}]},
+    )
+    runner_module.SequentialModelRunner().one_shot("planner", "system", "map this PR")
+    assert captured[0]["max_tokens"] == 2048
+
+
+def test_planning_context_keeps_changed_docs_when_diff_needs_smart_truncation(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SPECIALIST_PLANNER_MAX_CONTEXT_BYTES", "2600")
+    (tmp_path / "README.adoc").write_text(
+        "Requirements: vector rebuilds must preserve cursor progress.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pr-files.json").write_text(
+        json.dumps([
+            {"filename": "README.adoc", "status": "modified", "additions": 1, "deletions": 0},
+            {"filename": "src/worker.py", "status": "modified", "additions": 90, "deletions": 2},
+        ]),
+        encoding="utf-8",
+    )
+    (tmp_path / "pr.diff").write_text(
+        "diff --git a/src/worker.py b/src/worker.py\n"
+        + "@@ -1,1 +1,100 @@\n"
+        + ("+worker implementation line\n" * 100)
+        + "diff --git a/README.adoc b/README.adoc\n"
+        + "@@ -1,1 +1,2 @@\n"
+        + "+Documentation change marker.\n",
+        encoding="utf-8",
+    )
+    topology = {
+        "pr_kind": "app_code", "risk_flags": ["stateful"],
+        "changed_files": ["README.adoc", "src/worker.py"],
+        "path_components": {"README.adoc": "repo", "src/worker.py": "worker"},
+        "components": [
+            {"id": "repo", "root": "", "languages": [], "file_roles": ["documentation"]},
+            {"id": "worker", "root": "src", "languages": ["python"], "file_roles": ["implementation"]},
+        ],
+        "relationships": [],
+    }
+    text = runner_module.planning_context(topology, {})
+    assert "Requirements: vector rebuilds must preserve cursor progress." in text
+    assert "README.adoc" in text and "src/worker.py" in text
+    assert "smartly truncated" in text
+    assert len(text.encode("utf-8")) <= 2600
+
+
+def test_planning_context_passes_full_diff_when_total_context_fits(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SPECIALIST_PLANNER_MAX_CONTEXT_BYTES", "12000")
+    (tmp_path / "pr-files.json").write_text(
+        '[{"filename":"src/worker.py","status":"modified","additions":2,"deletions":1}]',
+        encoding="utf-8",
+    )
+    diff = "diff --git a/src/worker.py b/src/worker.py\n@@ -1,1 +1,2 @@\n-old\n+new behavior\n"
+    (tmp_path / "pr.diff").write_text(diff, encoding="utf-8")
+    topology = {
+        "pr_kind": "app_code", "risk_flags": [],
+        "changed_files": ["src/worker.py"],
+        "path_components": {"src/worker.py": "worker"},
+        "components": [], "relationships": [],
+    }
+    text = runner_module.planning_context(topology, {})
+    assert "PR diff (full; within planner budget)" in text
+    assert diff in text
+
+
 def test_truncated_specialist_analysis_continues_before_terminal_synthesis(monkeypatch):
     _runner_env(monkeypatch)
     captured = []
@@ -430,7 +506,7 @@ def test_repeated_truncation_terminal_synthesis_keeps_conversation_history(monke
 
     def fake_request(_base, _api, payload, _key, _timeout):
         captured.append(payload)
-        if len(captured) <= 2:
+        if len(captured) <= 3:
             return {"choices": [{"finish_reason": "length", "message": {
                 "content": f"partial reasoning turn {len(captured)}"
             }}]}
@@ -445,14 +521,16 @@ def test_repeated_truncation_terminal_synthesis_keeps_conversation_history(monke
     )
 
     assert value == report
-    assert len(captured) == 3
-    terminal_messages = captured[2]["messages"]
+    assert len(captured) == 4
+    terminal_messages = captured[3]["messages"]
     assert any("partial reasoning turn 1" in str(item.get("content"))
                for item in terminal_messages)
     assert any("partial reasoning turn 2" in str(item.get("content"))
                for item in terminal_messages)
-    assert captured[2]["response_format"]["type"] == "json_schema"
-    assert diagnostics["continuation_attempts"] == 1
+    assert any("partial reasoning turn 3" in str(item.get("content"))
+               for item in terminal_messages)
+    assert captured[3]["response_format"]["type"] == "json_schema"
+    assert diagnostics["continuation_attempts"] == 2
     assert diagnostics["terminal_synthesis_attempted"] is True
 
 

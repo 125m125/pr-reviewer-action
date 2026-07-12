@@ -214,7 +214,8 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 |-------|-------------|----------|---------|
 | `review_strategy` | `single` preserves the existing path; `specialists_evaluate` runs the complete specialist pipeline without publishing; `specialists` publishes its validated result | No | `single` |
 | `specialist_config_file` | Optional PR-branch JSON file defining component hints, structured recipes, and authoritative exclusions. A changed policy file is disclosed in the review | No | `.github/ai-review-specialists.json` |
-| `specialist_planner_max_tool_calls` | Maximum read-only calls available to the topology/diff planning scout | No | `8` |
+| `specialist_planner_max_tool_calls` | Maximum read-only calls available to the bounded topology/diff planning scout | No | `2` |
+| `specialist_planner_max_tokens` | Completion-token ceiling for the bounded planning scout | No | `2048` |
 | `specialist_max_initial_passes` | Maximum sequential specialist passes in the initial wave | No | `6` |
 | `specialist_max_followup_passes` | Maximum sequential passes in the critic's single follow-up wave | No | `2` |
 | `specialist_max_tool_calls_per_pass` | Maximum read-only calls available to each specialist pass | No | `20` |
@@ -224,7 +225,8 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_critic_model` | Critic model; empty inherits `specialist_model`, then `ai_model` | No | `""` |
 | `specialist_aggregator_model` | Candidate-ranking model; empty inherits `ai_model` | No | `""` |
 | `specialist_pass_timeout_sec` | Per-model-request timeout for specialist strategies | No | `600` |
-| `specialist_max_tokens` | Completion-token ceiling for planner, specialist, critic, and aggregator turns | No | `4096` |
+| `specialist_max_tokens` | Completion-token ceiling for specialist, critic, and aggregator turns | No | `4096` |
+| `specialist_max_truncation_continuations` | Maximum continuation turns after a specialist response reaches the completion-token limit | No | `2` |
 | `specialist_planner_max_context_bytes` | Diff/context bytes supplied to the planner before tool exploration | No | `60000` |
 | `specialist_packet_max_bytes` | Review-corpus bytes supplied to one specialist | No | `90000` |
 

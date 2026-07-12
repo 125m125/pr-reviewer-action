@@ -92,6 +92,7 @@ class LoopBudgets:
     summarize_keep_newest: int = 2
     model_context_tokens: int = 0
     max_textual_tool_repairs: int = 1
+    max_total_textual_tool_repairs: int = 3
     max_consecutive_no_progress_rounds: int = 2
     max_repeated_call_sets: int = 3
     max_truncation_continuations: int = 1
@@ -163,6 +164,7 @@ class LoopOutcome:
     textual_tool_intent_detected: bool = False
     textual_tool_intent_markers: list[str] = field(default_factory=list)
     textual_tool_repair_attempts: int = 0
+    consecutive_textual_tool_repair_attempts: int = 0
     textual_tool_repaired: bool = False
     textual_tool_unexecuted: bool = False
     duplicate_only_rounds: int = 0
@@ -374,6 +376,7 @@ def drive_tool_loop(
     duplicate_call_sets: dict[tuple[str, ...], int] = {}
     previous_assistant_text = ""
     textual_repair_pending = False
+    consecutive_textual_tool_repairs = 0
 
     while outcome.rounds < budgets.max_rounds:
         if time_fn() - started > budgets.wall_clock_sec:
@@ -444,10 +447,13 @@ def drive_tool_loop(
             )
         if (
             textual_repair_pending
-            and outcome.textual_tool_repair_attempts < budgets.max_textual_tool_repairs
+            and consecutive_textual_tool_repairs < budgets.max_textual_tool_repairs
+            and outcome.textual_tool_repair_attempts < budgets.max_total_textual_tool_repairs
         ):
             budget_note = _TEXTUAL_TOOL_REPAIR_NOTE + "\n\n" + budget_note
             outcome.textual_tool_repair_attempts += 1
+            consecutive_textual_tool_repairs += 1
+            outcome.consecutive_textual_tool_repair_attempts = consecutive_textual_tool_repairs
 
         payload = conversation.to_request_payload(
             api_format,
@@ -483,11 +489,38 @@ def drive_tool_loop(
         # Real API tool calls always win. Textual pseudo-calls are never parsed
         # or executed; they only trigger one bounded request to reissue them via
         # the native schema.
-        if calls and textual_repair_pending:
-            outcome.textual_tool_repaired = True
-            textual_repair_pending = False
-
         if not calls:
+            markers = detect_textual_tool_intent(text)
+            if markers:
+                outcome.textual_tool_intent_detected = True
+                outcome.textual_tool_intent_markers.extend(markers)
+                if text:
+                    conversation.add_assistant_text(text)
+                if (
+                    not textual_repair_pending
+                    and consecutive_textual_tool_repairs < budgets.max_textual_tool_repairs
+                    and outcome.textual_tool_repair_attempts
+                    < budgets.max_total_textual_tool_repairs
+                    and outcome.rounds < budgets.max_rounds
+                ):
+                    textual_repair_pending = True
+                    continue
+                outcome.textual_tool_unexecuted = True
+                outcome.stop_reason = STOP_UNEXECUTED_TEXTUAL_TOOL_INTENT
+                outcome.error = (
+                    "Exploration ended with structured textual tool intent that "
+                    "was not reissued as native tool calls."
+                )
+                break
+            if repetitive:
+                if text:
+                    conversation.add_assistant_text(text)
+                conversation.add_system_note(_STAGNATION_NOTE)
+                outcome.final_text = text
+                outcome.final_text_source = text_source
+                outcome.stop_reason = STOP_REPETITIVE_TEXT
+                outcome.stagnation_stop_reason = "repetitive-text"
+                break
             if finish_reason == "length":
                 if text:
                     conversation.add_assistant_text(text)
@@ -510,36 +543,6 @@ def drive_tool_loop(
                     continue
                 outcome.stop_reason = STOP_TRUNCATED
                 outcome.error = "Model response was truncated before a usable answer or tool call."
-                break
-            markers = detect_textual_tool_intent(text)
-            if markers:
-                outcome.textual_tool_intent_detected = True
-                outcome.textual_tool_intent_markers.extend(markers)
-                if text:
-                    conversation.add_assistant_text(text)
-                if (
-                    not textual_repair_pending
-                    and outcome.textual_tool_repair_attempts
-                    < budgets.max_textual_tool_repairs
-                    and outcome.rounds < budgets.max_rounds
-                ):
-                    textual_repair_pending = True
-                    continue
-                outcome.textual_tool_unexecuted = True
-                outcome.stop_reason = STOP_UNEXECUTED_TEXTUAL_TOOL_INTENT
-                outcome.error = (
-                    "Exploration ended with structured textual tool intent that "
-                    "was not reissued as native tool calls."
-                )
-                break
-            if repetitive:
-                if text:
-                    conversation.add_assistant_text(text)
-                conversation.add_system_note(_STAGNATION_NOTE)
-                outcome.final_text = text
-                outcome.final_text_source = text_source
-                outcome.stop_reason = STOP_REPETITIVE_TEXT
-                outcome.stagnation_stop_reason = "repetitive-text"
                 break
             textual_repair_pending = False
             outcome.final_text = text
@@ -662,6 +665,15 @@ def drive_tool_loop(
                                                 duplicate_call_sets[signature])
         if successful_this_round:
             consecutive_no_progress = 0
+            if textual_repair_pending:
+                textual_repair_pending = False
+                consecutive_textual_tool_repairs = 0
+                outcome.consecutive_textual_tool_repair_attempts = 0
+                outcome.textual_tool_repaired = True
+        elif calls and textual_repair_pending:
+            # The model returned to the native protocol, but the executor did
+            # not produce usable evidence. Do not grant a fresh repair budget.
+            textual_repair_pending = False
         else:
             consecutive_no_progress += 1
             outcome.no_progress_rounds += 1
