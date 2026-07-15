@@ -1,6 +1,7 @@
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -457,6 +458,88 @@ def test_truncated_specialist_analysis_continues_before_terminal_synthesis(monke
     assert diagnostics["had_truncated_turn"] is True
     assert diagnostics["terminal_synthesis_attempted"] is False
     assert diagnostics["terminal_synthesis_recovered"] is False
+
+
+def test_stream_watchdog_uses_one_compact_recovery_without_repeated_text(monkeypatch):
+    _runner_env(monkeypatch)
+    monkeypatch.setenv("AI_STREAM", "true")
+    captured = []
+    report = {
+        "domain": "focus", "completion_status": "complete",
+        "inspected_files": [], "unchecked_material_files": [],
+        "invariants_checked": ["identity"], "findings": [], "unknowns": [],
+    }
+    repeated = "I'll list the same files again. " * 200
+
+    def fake_request(_base, _api, payload, _key, _timeout, **kwargs):
+        captured.append((payload, kwargs))
+        if len(captured) == 1:
+            return {
+                "stream_watchdog_triggered": True,
+                "stream_watchdog_reason": "repeated-paragraph",
+                "choices": [{"finish_reason": "stop", "message": {
+                    "content": repeated,
+                }}],
+            }
+        return {"choices": [{"finish_reason": "stop", "message": {
+            "content": json.dumps(report),
+        }}]}
+
+    monkeypatch.setattr(runner_module, "run_chat_request", fake_request)
+    value, diagnostics = runner_module.SequentialModelRunner().agent(
+        "specialist", "system", "assigned focus", 2,
+        terminal_instruction="Return strict JSON now.",
+    )
+
+    assert value == report
+    assert len(captured) == 2
+    first_payload, first_kwargs = captured[0]
+    recovery_payload, recovery_kwargs = captured[1]
+    assert first_payload["stream"] is True
+    assert first_kwargs["stream_watchdog"] is not None
+    assert recovery_payload["stream"] is False
+    assert recovery_payload["max_tokens"] == 2048
+    assert repeated not in json.dumps(recovery_payload)
+    assert "Continue the same investigation" not in json.dumps(recovery_payload)
+    assert recovery_kwargs == {}
+    assert diagnostics["stream_watchdog_triggered"] is True
+    assert diagnostics["stream_watchdog_reason"] == "repeated-paragraph"
+
+
+def test_specialist_context_cap_and_temperature_are_separate(monkeypatch):
+    _runner_env(monkeypatch, response_format="off")
+    monkeypatch.setenv("MODEL_CONTEXT_TOKENS", "262144")
+    monkeypatch.setenv("SPECIALIST_MAX_CONVERSATION_TOKENS", "96000")
+    monkeypatch.setenv("SPECIALIST_TEMPERATURE", "0.25")
+    seen = {}
+    report = {"domain": "focus", "completion_status": "complete"}
+
+    def fake_drive(_conversation, _post, _execute, **kwargs):
+        seen["budgets"] = kwargs["budgets"]
+        seen["max_tokens"] = kwargs["max_tokens"]
+        seen["temperature"] = kwargs["temperature"]
+        return SimpleNamespace(
+            final_text=json.dumps(report), final_text_source="content",
+            stop_reason="no-tool-calls", finish_reasons=["stop"],
+            tool_calls_issued=0, calls_executed=0, executed=[],
+            continuation_attempts=0, preserved_truncated_bytes=0,
+            preserved_truncated_tokens=0, repetitive_text_detected=False,
+            stream_watchdog_triggered=False, stream_watchdog_reason="",
+            rounds=1, calls_duplicated=0, duplicate_only_rounds=0,
+            no_progress_rounds=0, max_consecutive_no_progress=0,
+            repeated_call_set_max=0, stagnation_stop_reason="",
+        )
+
+    monkeypatch.setattr(runner_module, "drive_tool_loop", fake_drive)
+    value, _diagnostics = runner_module.SequentialModelRunner().agent(
+        "specialist", "system", "assigned focus", 2,
+        terminal_instruction="Return strict JSON now.",
+    )
+
+    assert value == report
+    assert seen["budgets"].max_conversation_tokens == 96000
+    assert seen["max_tokens"] == 4096
+    assert seen["temperature"] == 0.25
 
 
 def test_parseable_length_limited_report_is_still_recovered(monkeypatch):

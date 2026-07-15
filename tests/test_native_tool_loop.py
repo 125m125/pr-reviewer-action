@@ -14,6 +14,7 @@ from pr_reviewer.tool_loop import (
     STOP_NO_TOOL_CALLS,
     STOP_REPETITIVE_TEXT,
     STOP_REQUEST_ERROR,
+    STOP_STREAM_WATCHDOG,
     STOP_WALL_CLOCK,
     LoopBudgets,
     adaptive_loop_budgets,
@@ -915,6 +916,30 @@ def test_repeated_length_limited_text_stops_before_consuming_all_continuations()
     assert outcome.stop_reason == STOP_REPETITIVE_TEXT
     assert outcome.repetitive_text_detected is True
     assert outcome.continuation_attempts == 1
+
+
+def test_stream_watchdog_stops_without_continuation_or_partial_text():
+    repeated = "same analysis " * 80
+    response = {
+        "stream_watchdog_triggered": True,
+        "stream_watchdog_reason": "repeated-paragraph",
+        "choices": [{"finish_reason": "stop", "message": {
+            "content": repeated,
+        }}],
+    }
+    conv = fresh_conversation()
+    payloads = []
+    outcome = drive_tool_loop(
+        conv, lambda payload: (payloads.append(payload) or response),
+        recording_execute()[0], api_format="openai", model="m",
+    )
+
+    assert outcome.stop_reason == STOP_STREAM_WATCHDOG
+    assert outcome.stream_watchdog_triggered is True
+    assert outcome.stream_watchdog_reason == "repeated-paragraph"
+    assert outcome.continuation_attempts == 0
+    assert len(payloads) == 1
+    assert all(repeated not in event.get("content", "") for event in conv.events)
 
 
 def test_truncated_turn_continues_same_conversation_with_tools_available():

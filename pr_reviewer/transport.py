@@ -11,7 +11,9 @@ import os
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 # mask_secrets lives in scripts/redact.py; ensure scripts/ is importable when
 # this package module is loaded on its own.
@@ -36,6 +38,18 @@ class ModelRequestError(RuntimeError):
         return self.status is not None and 400 <= self.status < 500
 
 
+@dataclass
+class StreamingResult:
+    """Captured result from a line-oriented curl streaming request."""
+
+    stdout: str
+    stderr: str
+    returncode: int
+    timed_out: bool = False
+    interrupted: bool = False
+    watchdog_reason: str = ""
+
+
 def safe_run(args, timeout_sec):
     """Run a command and capture stdout/stderr with a timeout."""
     try:
@@ -54,7 +68,75 @@ def safe_run(args, timeout_sec):
             "stderr": (exc.stderr or "") if isinstance(exc.stderr, str) else "",
         }
 
-def run_chat_request(base_url, api_format, payload, api_key, timeout_sec):
+
+def safe_run_streaming(
+    args,
+    timeout_sec,
+    on_line: Callable[[str], bool],
+) -> StreamingResult:
+    """Run curl while allowing a caller to interrupt an SSE response."""
+
+    process = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    output: list[str] = []
+    stderr = ""
+    interrupted = False
+    timed_out = False
+    try:
+        if process.stdout is not None:
+            for line in process.stdout:
+                output.append(line)
+                if on_line(line):
+                    interrupted = True
+                    process.terminate()
+                    break
+        try:
+            tail_stdout, stderr = process.communicate(
+                timeout=2 if interrupted else timeout_sec
+            )
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            process.kill()
+            tail_stdout, stderr = process.communicate()
+            if not stderr:
+                stderr = exc.stderr or ""
+        if not interrupted and tail_stdout:
+            output.append(tail_stdout)
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        process.kill()
+        tail_stdout, stderr = process.communicate()
+        output.append(tail_stdout or "")
+        if not stderr:
+            stderr = exc.stderr or ""
+    finally:
+        if process.stdout is not None and hasattr(process.stdout, "close"):
+            process.stdout.close()
+
+    return StreamingResult(
+        stdout="".join(output),
+        stderr=stderr or "",
+        returncode=process.returncode,
+        timed_out=timed_out,
+        interrupted=interrupted,
+        watchdog_reason=(getattr(on_line, "reason", "") if interrupted else ""),
+    )
+
+
+def run_chat_request(
+    base_url,
+    api_format,
+    payload,
+    api_key,
+    timeout_sec,
+    *,
+    stream_watchdog=None,
+):
     """POST a wire-ready chat payload via curl and return the parsed JSON.
 
     Transport for the native tool-calling loop (#203): the payload is built
@@ -110,7 +192,15 @@ def run_chat_request(base_url, api_format, payload, api_key, timeout_sec):
         payload_path = payload_file.name
 
     try:
-        completed = safe_run(curl_args + ["--data", f"@{payload_path}"], timeout_sec + 5)
+        command = curl_args + ["--data", f"@{payload_path}"]
+        if streaming and stream_watchdog is not None:
+            completed = safe_run_streaming(
+                command,
+                timeout_sec + 5,
+                stream_watchdog,
+            )
+        else:
+            completed = safe_run(command, timeout_sec + 5)
     finally:
         for cleanup_path in (payload_path, auth_config_path):
             if cleanup_path is None:
@@ -120,9 +210,12 @@ def run_chat_request(base_url, api_format, payload, api_key, timeout_sec):
             except OSError:
                 pass
 
-    if isinstance(completed, dict) and completed.get("timeout"):
+    if (isinstance(completed, dict) and completed.get("timeout")) or (
+        not isinstance(completed, dict) and getattr(completed, "timed_out", False)
+    ):
         raise ModelRequestError("model request timed out", timeout=True)
-    if completed.returncode != 0:
+    interrupted = bool(getattr(completed, "interrupted", False))
+    if completed.returncode != 0 and not interrupted:
         stderr = mask_secrets((completed.stderr or "").strip())
         if len(stderr) > 500:
             stderr = stderr[:500] + "...[truncated]"
@@ -154,5 +247,11 @@ def run_chat_request(base_url, api_format, payload, api_key, timeout_sec):
         # (some servers reply 200 + an error object instead of events).
         from pr_reviewer.sse_reassembler import reassemble_sse  # noqa: PLC0415
 
-        return reassemble_sse(body, api_format)
+        response = reassemble_sse(body, api_format)
+        if interrupted:
+            response["stream_watchdog_triggered"] = True
+            response["stream_watchdog_reason"] = (
+                getattr(completed, "watchdog_reason", "") or "stream-watchdog"
+            )
+        return response
     return json.loads(body)

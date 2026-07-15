@@ -132,6 +132,22 @@ inputs:
     description: Maximum completion tokens for specialist, critic, and aggregator turns.
     required: false
     default: "4096"
+  specialist_recovery_max_tokens:
+    description: Maximum completion tokens for one compact recovery after a specialist repetition watchdog stop.
+    required: false
+    default: "2048"
+  specialist_max_conversation_tokens:
+    description: Maximum approximate transcript tokens retained by one specialist conversation; independent of model_context_tokens.
+    required: false
+    default: "96000"
+  specialist_temperature:
+    description: Sampling temperature for streamed specialist exploration turns.
+    required: false
+    default: "0.0"
+  specialist_stream_watchdog:
+    description: Interrupt streamed specialist turns that repeat paragraphs or blocks and recover once from compact evidence.
+    required: false
+    default: "true"
   specialist_max_truncation_continuations:
     description: Maximum continuation turns after a specialist response reaches the completion-token limit.
     required: false
@@ -749,6 +765,10 @@ runs:
         SPECIALIST_TOOL_MODE: ${{ inputs.specialist_tool_mode }}
         SPECIALIST_PASS_TIMEOUT_SEC: ${{ inputs.specialist_pass_timeout_sec }}
         SPECIALIST_MAX_TOKENS: ${{ inputs.specialist_max_tokens }}
+        SPECIALIST_RECOVERY_MAX_TOKENS: ${{ inputs.specialist_recovery_max_tokens }}
+        SPECIALIST_MAX_CONVERSATION_TOKENS: ${{ inputs.specialist_max_conversation_tokens }}
+        SPECIALIST_TEMPERATURE: ${{ inputs.specialist_temperature }}
+        SPECIALIST_STREAM_WATCHDOG: ${{ inputs.specialist_stream_watchdog }}
         SPECIALIST_MAX_TRUNCATION_CONTINUATIONS: ${{ inputs.specialist_max_truncation_continuations }}
         SPECIALIST_PLANNER_MAX_CONTEXT_BYTES: ${{ inputs.specialist_planner_max_context_bytes }}
         SPECIALIST_PACKET_MAX_BYTES: ${{ inputs.specialist_packet_max_bytes }}
@@ -864,6 +884,10 @@ runs:
         SPECIALIST_AGGREGATOR_MODEL: ${{ inputs.specialist_aggregator_model }}
         SPECIALIST_PASS_TIMEOUT_SEC: ${{ inputs.specialist_pass_timeout_sec }}
         SPECIALIST_MAX_TOKENS: ${{ inputs.specialist_max_tokens }}
+        SPECIALIST_RECOVERY_MAX_TOKENS: ${{ inputs.specialist_recovery_max_tokens }}
+        SPECIALIST_MAX_CONVERSATION_TOKENS: ${{ inputs.specialist_max_conversation_tokens }}
+        SPECIALIST_TEMPERATURE: ${{ inputs.specialist_temperature }}
+        SPECIALIST_STREAM_WATCHDOG: ${{ inputs.specialist_stream_watchdog }}
         SPECIALIST_MAX_TRUNCATION_CONTINUATIONS: ${{ inputs.specialist_max_truncation_continuations }}
         SPECIALIST_PLANNER_MAX_CONTEXT_BYTES: ${{ inputs.specialist_planner_max_context_bytes }}
         SPECIALIST_PACKET_MAX_BYTES: ${{ inputs.specialist_packet_max_bytes }}

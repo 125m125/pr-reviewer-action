@@ -226,9 +226,21 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_aggregator_model` | Candidate-ranking model; empty inherits `ai_model` | No | `""` |
 | `specialist_pass_timeout_sec` | Per-model-request timeout for specialist strategies | No | `600` |
 | `specialist_max_tokens` | Completion-token ceiling for specialist, critic, and aggregator turns | No | `4096` |
+| `specialist_recovery_max_tokens` | Completion-token ceiling for the one compact recovery after a repetition watchdog stop | No | `2048` |
+| `specialist_max_conversation_tokens` | Approximate transcript ceiling for one specialist conversation; independent of `model_context_tokens` | No | `96000` |
+| `specialist_temperature` | Sampling temperature for streamed specialist exploration turns; keep `0.0` for deterministic behavior or experiment with a modest value | No | `0.0` |
+| `specialist_stream_watchdog` | Interrupt streamed specialist output after repeated paragraphs/blocks and recover once from compact evidence | No | `true` |
 | `specialist_max_truncation_continuations` | Maximum continuation turns after a specialist response reaches the completion-token limit | No | `2` |
 | `specialist_planner_max_context_bytes` | Diff/context bytes supplied to the planner before tool exploration | No | `60000` |
 | `specialist_packet_max_bytes` | Review-corpus bytes supplied to one specialist | No | `90000` |
+
+For a large local-model review, keep `model_context_tokens` set to the model's
+actual provider window (for example `262144`) while keeping each specialist's
+conversation bounded. A practical baseline is `ai_stream: "true"`,
+`specialist_max_tokens: "4096"`, `specialist_recovery_max_tokens: "2048"`, and
+`specialist_max_conversation_tokens: "96000"`. The stream watchdog detects
+repeated paragraphs or blocks, discards the polluted partial turn, and performs
+one compact recovery request instead of continuing the same transcript.
 
 Specialist mode derives a generic component topology from manifests, paths,
 file roles, contracts, and deterministic risk flags. A bounded planning call may

@@ -53,6 +53,7 @@ STOP_CONTEXT_BUDGET = "context-budget-exhausted"
 STOP_UNEXECUTED_TEXTUAL_TOOL_INTENT = "unexecuted-textual-tool-intent"
 STOP_STAGNATION = "no-progress-stagnation"
 STOP_REPETITIVE_TEXT = "repetitive-assistant-text"
+STOP_STREAM_WATCHDOG = "stream-repetition-watchdog"
 
 _TEXTUAL_TOOL_REPAIR_NOTE = (
     "Your previous response contained textual tool-call markup, but the API "
@@ -177,6 +178,8 @@ class LoopOutcome:
     continuation_attempts: int = 0
     terminal_synthesis_recovered: bool = False
     repetitive_text_detected: bool = False
+    stream_watchdog_triggered: bool = False
+    stream_watchdog_reason: str = ""
 
 
 def detect_textual_tool_intent(text: str) -> list[str]:
@@ -480,6 +483,17 @@ def drive_tool_loop(
         )
         outcome.finish_reasons.append(finish_reason or "unknown")
         outcome.text_sources.append(text_source)
+        if isinstance(response, dict) and response.get("stream_watchdog_triggered"):
+            outcome.stream_watchdog_triggered = True
+            outcome.stream_watchdog_reason = str(
+                response.get("stream_watchdog_reason") or "stream-watchdog"
+            )
+            outcome.stop_reason = STOP_STREAM_WATCHDOG
+            outcome.error = (
+                "Exploration was interrupted because the streamed assistant output "
+                "repeated itself."
+            )
+            break
         repetitive = repetitive_assistant_text(text, previous_assistant_text)
         if text:
             previous_assistant_text = text

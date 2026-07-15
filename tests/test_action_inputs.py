@@ -176,6 +176,21 @@ def test_synthesis_inputs_declared_and_wired():
     assert "TOOL_SYNTHESIS_MAX_TOKENS: ${{ inputs.tool_synthesis_max_tokens }}" in content
 
 
+def test_specialist_watchdog_inputs_are_declared_and_wired():
+    content = (_REPO_ROOT / "action.yml").read_text()
+    inputs = parse_action_inputs()
+    expected = {
+        "specialist_stream_watchdog",
+        "specialist_recovery_max_tokens",
+        "specialist_max_conversation_tokens",
+        "specialist_temperature",
+    }
+    assert expected <= inputs
+    for name in expected:
+        env_name = name.upper()
+        assert f"{env_name}: ${{{{ inputs.{name} }}}}" in content
+
+
 if __name__ == "__main__":
     test_readme_inputs_in_action()
     test_action_inputs_in_readme()
