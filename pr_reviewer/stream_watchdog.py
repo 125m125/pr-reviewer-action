@@ -77,6 +77,11 @@ class StreamWatchdog:
             self._check_blocks()
         return self.triggered
 
+    def __call__(self, line: str) -> bool:
+        """Make the watchdog directly usable as a transport line callback."""
+
+        return self.feed_sse_line(line)
+
     def _extract_delta(self, event: dict[str, Any]) -> tuple[str, bool]:
         if self.api_format == "anthropic":
             event_type = event.get("type")

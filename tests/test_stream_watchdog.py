@@ -88,3 +88,11 @@ def test_malformed_and_short_repeated_input_is_ignored():
     assert watchdog.feed_sse_line("event: message") is False
     assert watchdog.feed_sse_line(_openai_text("yes " * 100)) is False
     assert watchdog.triggered is False
+
+
+def test_watchdog_is_callable_for_stream_transport():
+    watchdog = StreamWatchdog("openai", min_repetitions=2)
+
+    assert watchdog(_openai_text(PARAGRAPH, reasoning=True)) is False
+    assert watchdog(_openai_text("\n\n" + PARAGRAPH, reasoning=True)) is True
+    assert watchdog.reason == "repeated-paragraph"
