@@ -143,7 +143,12 @@ class ExecutedCall:
 @dataclass
 class LoopOutcome:
     executed: list[ExecutedCall] = field(default_factory=list)
+    # Network request/response round-trips, including tool-only turns.
     rounds: int = 0
+    # Planning responses only. A response containing native tool calls is
+    # progress toward evidence, but does not consume this budget.
+    planning_rounds: int = 0
+    tool_only_rounds: int = 0
     tool_calls_issued: int = 0  # everything the model asked for, incl. refused
     stop_reason: str = STOP_NO_TOOL_CALLS
     final_text: str = ""
@@ -154,6 +159,8 @@ class LoopOutcome:
     final_text_source: str = "none"
     finish_reasons: list[str] = field(default_factory=list)
     text_sources: list[str] = field(default_factory=list)
+    # Kept for the tool-harness output contract; unlike ``rounds`` this counts
+    # only responses that are actually planning turns.
     planning_turns_attempted: int = 0
     calls_executed: int = 0
     calls_rejected: int = 0
@@ -381,7 +388,7 @@ def drive_tool_loop(
     textual_repair_pending = False
     consecutive_textual_tool_repairs = 0
 
-    while outcome.rounds < budgets.max_rounds:
+    while outcome.planning_rounds < budgets.max_rounds:
         if time_fn() - started > budgets.wall_clock_sec:
             outcome.stop_reason = STOP_WALL_CLOCK
             break
@@ -435,7 +442,7 @@ def drive_tool_loop(
                 outcome.compaction_tokens_removed += removed
 
         remaining_calls = max(0, budgets.max_tool_calls - calls_executed)
-        remaining_turns = max(0, budgets.max_rounds - outcome.rounds)
+        remaining_turns = max(0, budgets.max_rounds - outcome.planning_rounds)
         budget_note = (
             f"Exploration budget before this turn: {remaining_calls} tool calls "
             f"and {remaining_turns} planning turns remain. Prioritize unresolved "
@@ -469,7 +476,6 @@ def drive_tool_loop(
             cache_prefix=cache_prefix,
             ephemeral_user_note=budget_note,
         )
-        outcome.planning_turns_attempted += 1
         try:
             response = post_fn(payload)
         except Exception as exc:  # noqa: BLE001 — transport errors end the loop
@@ -481,6 +487,11 @@ def drive_tool_loop(
         calls, text, text_source, finish_reason = extract_intermediate_turn(
             response, api_format
         )
+        if calls:
+            outcome.tool_only_rounds += 1
+        else:
+            outcome.planning_rounds += 1
+            outcome.planning_turns_attempted += 1
         outcome.finish_reasons.append(finish_reason or "unknown")
         outcome.text_sources.append(text_source)
         if isinstance(response, dict) and response.get("stream_watchdog_triggered"):
@@ -515,7 +526,7 @@ def drive_tool_loop(
                     and consecutive_textual_tool_repairs < budgets.max_textual_tool_repairs
                     and outcome.textual_tool_repair_attempts
                     < budgets.max_total_textual_tool_repairs
-                    and outcome.rounds < budgets.max_rounds
+                    and outcome.planning_rounds < budgets.max_rounds
                 ):
                     textual_repair_pending = True
                     continue
@@ -544,7 +555,7 @@ def drive_tool_loop(
                     outcome.preserved_truncated_tokens = max(1, len(text) // 4)
                 if (
                     outcome.continuation_attempts < budgets.max_truncation_continuations
-                    and outcome.rounds < budgets.max_rounds
+                    and outcome.planning_rounds < budgets.max_rounds
                 ):
                     outcome.continuation_attempts += 1
                     conversation.add_user(

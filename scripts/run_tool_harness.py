@@ -833,7 +833,9 @@ def run_native_loop(
         result["stop_reason"] = outcome.stop_reason
         result["planned_request_count"] = outcome.tool_calls_issued
         result["planning_turns_attempted"] = outcome.planning_turns_attempted
-        result["planning_turns_completed"] = outcome.rounds
+        result["planning_turns_completed"] = outcome.planning_rounds
+        result["model_request_round_trips"] = outcome.rounds
+        result["tool_only_rounds"] = outcome.tool_only_rounds
         result["finish_reasons"] = outcome.finish_reasons
         result["text_sources"] = outcome.text_sources
         result["truncation_retries"] = outcome.truncation_retries
@@ -846,7 +848,7 @@ def run_native_loop(
         }
         result["remaining_budget"] = {
             "tool_calls": max(0, budgets.max_tool_calls - outcome.calls_executed),
-            "planning_turns": max(0, budgets.max_rounds - outcome.rounds),
+            "planning_turns": max(0, budgets.max_rounds - outcome.planning_rounds),
         }
         result["compaction"] = {
             "runs": outcome.compaction_runs,
@@ -1133,7 +1135,9 @@ def run_native_loop(
 
     md_lines = ["# Tool Harness Results", ""]
     md_lines.append(f"**Planned requests:** {outcome.tool_calls_issued}")
-    md_lines.append(f"**Loop rounds:** {outcome.rounds}")
+    md_lines.append(f"**Model request round-trips:** {outcome.rounds}")
+    md_lines.append(f"**Planning turns:** {outcome.planning_rounds}")
+    md_lines.append(f"**Tool-only rounds:** {outcome.tool_only_rounds}")
     md_lines.append(f"**Stop reason:** {outcome.stop_reason}")
     md_lines.append("")
 

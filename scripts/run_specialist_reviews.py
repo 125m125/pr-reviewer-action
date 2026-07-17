@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -413,6 +414,62 @@ class SequentialModelRunner:
             os.getenv("SEARCH_URL", ""), env_int("TOOL_MAX_SEARCH_RESULTS", 5),
         )
 
+    def _watchdog_recovery_conversation(
+        self, system: str, user: str, executed: list[dict[str, Any]],
+    ) -> Conversation:
+        """Create a clean exploration context without the interrupted turn."""
+        evidence = json.dumps(executed, ensure_ascii=False)
+        instruction = (
+            "A previous streamed assistant turn was interrupted because it repeated "
+            "its own analysis. Its partial response was discarded. Resume the assigned "
+            "exploration from the original context and executed evidence below. Do not "
+            "reconstruct or repeat the interrupted reasoning. Continue using native "
+            "tool calls when additional evidence is needed; do not finalize until the "
+            "evidence is sufficient.\n\n"
+        )
+        recovery_user = (
+            instruction
+            + "Original assigned context (preserved in full when it fits the model context):\n"
+            + (user or "")
+            + "\n\nExecuted tool evidence (untrusted data):\n"
+            + evidence
+        )
+        # Leave room for the recovery response, tool schemas, and wire overhead.
+        # Normal large-review packets remain unmodified; clipping is only a
+        # fallback for a genuinely oversized recovery request.
+        input_budget_bytes = max(
+            16_000,
+            (self.context_tokens - self.recovery_max_tokens - 16_000) * 4,
+        )
+        if len(recovery_user.encode("utf-8")) > input_budget_bytes:
+            evidence_header = "\n\nExecuted tool evidence (untrusted data):\n"
+            fixed = instruction + "Original assigned context:\n"
+            remaining = input_budget_bytes - len(
+                (fixed + (user or "") + evidence_header).encode("utf-8")
+            )
+            if remaining >= 0:
+                evidence = _clip_utf8(
+                    evidence, remaining,
+                    "\n[executed evidence clipped to fit the model context]",
+                )
+                recovery_user = fixed + (user or "") + evidence_header + evidence
+            else:
+                user_budget = max(1_000, input_budget_bytes - len(
+                    (fixed + evidence_header).encode("utf-8")
+                ))
+                recovery_user = (
+                    fixed + _clip_utf8(
+                        user or "", user_budget,
+                        "\n[assigned context clipped to fit the model context]",
+                    ) + evidence_header + _clip_utf8(
+                        evidence, 1_000,
+                        "\n[executed evidence clipped to fit the model context]",
+                    )
+                )
+        recovery = Conversation(system=system, tool_schemas=list(TOOL_SCHEMAS))
+        recovery.add_user(recovery_user)
+        return recovery
+
     def one_shot(self, role: str, system: str, user: str, *, max_tokens: int | None = None) -> tuple[Any, dict[str, Any]]:
         model = self.model(role)
         role_max_tokens = max_tokens or self.max_tokens_for_role(role)
@@ -474,6 +531,67 @@ class SequentialModelRunner:
             tokens_param=self.tokens_param, reasoning_effort=self.reasoning_effort,
             cache_prefix=True,
         )
+        watchdog_recovery = bool(
+            outcome.stream_watchdog_triggered
+            or outcome.stagnation_stop_reason == "repetitive-text"
+        )
+        recovery_conversation = None
+        watchdog_exploration_resumed = False
+        if watchdog_recovery:
+            evidence = [{
+                "tool": call.tool, "arguments": call.args, "result": call.result,
+            } for call in outcome.executed]
+            recovery_conversation = self._watchdog_recovery_conversation(
+                system, user, evidence,
+            )
+            remaining_calls = max(0, max_tools - outcome.calls_executed)
+            if remaining_calls:
+                watchdog_exploration_resumed = True
+                recovery_budgets = replace(
+                    budgets,
+                    max_tool_calls=remaining_calls,
+                    max_rounds=max(4, remaining_calls * 2 + 2),
+                )
+                resumed = drive_tool_loop(
+                    recovery_conversation, post, self._execute,
+                    api_format=self.api_format, model=model, budgets=recovery_budgets,
+                    max_tokens=role_max_tokens, temperature=self.temperature, stream=self.stream,
+                    tokens_param=self.tokens_param, reasoning_effort=self.reasoning_effort,
+                    cache_prefix=True,
+                )
+                resumed.executed = outcome.executed + resumed.executed
+                for field in (
+                    "rounds", "planning_rounds", "tool_only_rounds",
+                    "planning_turns_attempted",
+                    "tool_calls_issued", "calls_executed", "calls_rejected",
+                    "calls_duplicated", "calls_malformed", "truncation_retries",
+                    "compaction_runs", "compaction_tokens_removed",
+                    "textual_tool_repair_attempts", "no_progress_rounds",
+                    "duplicate_only_rounds",
+                    "preserved_truncated_bytes", "preserved_truncated_tokens",
+                    "continuation_attempts",
+                ):
+                    setattr(resumed, field, getattr(outcome, field) + getattr(resumed, field))
+                for field in ("max_consecutive_no_progress", "repeated_call_set_max"):
+                    setattr(resumed, field, max(getattr(outcome, field), getattr(resumed, field)))
+                resumed.finish_reasons = outcome.finish_reasons + resumed.finish_reasons
+                resumed.text_sources = outcome.text_sources + resumed.text_sources
+                resumed.textual_tool_intent_detected |= outcome.textual_tool_intent_detected
+                resumed.textual_tool_intent_markers = (
+                    outcome.textual_tool_intent_markers + resumed.textual_tool_intent_markers
+                )
+                resumed.repetitive_text_detected |= outcome.repetitive_text_detected
+                resumed.textual_tool_repaired |= outcome.textual_tool_repaired
+                resumed.textual_tool_unexecuted |= outcome.textual_tool_unexecuted
+                resumed.stream_watchdog_triggered |= outcome.stream_watchdog_triggered
+                resumed.stream_watchdog_reason = (
+                    resumed.stream_watchdog_reason or outcome.stream_watchdog_reason
+                )
+                resumed.stagnation_stop_reason = (
+                    resumed.stagnation_stop_reason or outcome.stagnation_stop_reason
+                )
+                outcome = resumed
+                conversation = recovery_conversation
         text = outcome.final_text
         value = None
         if text:
@@ -488,43 +606,51 @@ class SequentialModelRunner:
         )
         terminal_synthesis_attempted = value is None or turn_truncated
         if terminal_synthesis_attempted:
-            watchdog_recovery = bool(
-                outcome.stream_watchdog_triggered
-                or outcome.stagnation_stop_reason == "repetitive-text"
-            )
             compact = Conversation(system=system)
             evidence = [{"tool": call.tool, "arguments": call.args, "result": call.result}
                         for call in outcome.executed]
-            recovery_instruction = (
-                "The previous generation was interrupted because it repeated its own "
-                "analysis. Do not continue or reconstruct that reasoning. Reassess "
-                "only the assigned focus using the supplied evidence. Do not reopen "
-                "a resolved invariant without new contradictory evidence. Return the "
-                "requested JSON only."
-                if watchdog_recovery else ""
-            )
-            compact.add_user(
-                "Finalize the assigned investigation as JSON only. Preserve supported findings.\n\n"
-                + recovery_instruction + "\n\n" + terminal_instruction
-                + "\n\nAssigned context (bounded):\n"
-                + user[:12000] + "\n\nExecuted evidence (bounded):\n"
-                + json.dumps(evidence, ensure_ascii=False)[:16000]
-                + "\n\nLatest internal analysis (bounded):\n"
-                + ("" if watchdog_recovery else (text or "")[-12000:])
-            )
-            compact_payload = compact.to_request_payload(
-                self.api_format, model, stream=False,
-                max_tokens=self.recovery_max_tokens if watchdog_recovery else role_max_tokens,
-                temperature=0.0, verdict_turn=True, keep_full_history_on_verdict=True,
-                response_format=self.response_format if self.api_format == "openai" else None,
-                response_schema=ROLE_SCHEMAS[role],
-                response_schema_name=f"specialist_{role}_compact",
-                reasoning_effort=self.verdict_reasoning_effort,
-                tokens_param=self.tokens_param, cache_prefix=True,
-            )
             if watchdog_recovery:
-                response = self._post(compact_payload, role)
+                if recovery_conversation is None:
+                    recovery_conversation = self._watchdog_recovery_conversation(
+                        system, user, evidence,
+                    )
+                if text:
+                    recovery_conversation.add_assistant_text(text)
+                recovery_conversation.add_user(
+                    "Finalize the assigned investigation as JSON only. Preserve supported "
+                    "findings.\n\n" + terminal_instruction
+                )
+                payload = recovery_conversation.to_request_payload(
+                    self.api_format, model, stream=False,
+                    max_tokens=self.recovery_max_tokens, temperature=0.0,
+                    verdict_turn=True, keep_full_history_on_verdict=True,
+                    response_format=self.response_format if self.api_format == "openai" else None,
+                    response_schema=ROLE_SCHEMAS[role],
+                    response_schema_name=f"specialist_{role}_recovery",
+                    reasoning_effort=self.verdict_reasoning_effort,
+                    tokens_param=self.tokens_param, cache_prefix=True,
+                )
+                response = self._post(payload, role)
             else:
+                compact.add_user(
+                    "Finalize the assigned investigation as JSON only. Preserve supported findings.\n\n"
+                    + terminal_instruction
+                    + "\n\nAssigned context (bounded):\n"
+                    + user[:12000] + "\n\nExecuted evidence (bounded):\n"
+                    + json.dumps(evidence, ensure_ascii=False)[:16000]
+                    + "\n\nLatest internal analysis (bounded):\n"
+                    + (text or "")[-12000:]
+                )
+                compact_payload = compact.to_request_payload(
+                    self.api_format, model, stream=False,
+                    max_tokens=role_max_tokens, temperature=0.0,
+                    verdict_turn=True, keep_full_history_on_verdict=True,
+                    response_format=self.response_format if self.api_format == "openai" else None,
+                    response_schema=ROLE_SCHEMAS[role],
+                    response_schema_name=f"specialist_{role}_compact",
+                    reasoning_effort=self.verdict_reasoning_effort,
+                    tokens_param=self.tokens_param, cache_prefix=True,
+                )
                 conversation.add_user(terminal_instruction)
                 payload = conversation.to_request_payload(
                     self.api_format, model, stream=self.stream,
@@ -551,6 +677,8 @@ class SequentialModelRunner:
             "tool_calls_issued": outcome.tool_calls_issued,
             "tool_calls_executed": outcome.calls_executed,
             "rounds": outcome.rounds,
+            "planning_rounds": getattr(outcome, "planning_rounds", outcome.rounds),
+            "tool_only_rounds": getattr(outcome, "tool_only_rounds", 0),
             "inspected_files": list(dict.fromkeys(inspected)),
             "text_source": source,
             "finish_reason": finish,
@@ -569,6 +697,7 @@ class SequentialModelRunner:
             "repetitive_text_detected": outcome.repetitive_text_detected,
             "stream_watchdog_triggered": outcome.stream_watchdog_triggered,
             "stream_watchdog_reason": outcome.stream_watchdog_reason,
+            "watchdog_exploration_resumed": watchdog_exploration_resumed,
             "preserved_truncated_bytes": outcome.preserved_truncated_bytes,
             "preserved_truncated_tokens": outcome.preserved_truncated_tokens,
             "continuation_attempts": outcome.continuation_attempts,

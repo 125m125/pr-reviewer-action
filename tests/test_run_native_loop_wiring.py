@@ -484,7 +484,8 @@ def test_native_loop_request_error_records_usage_and_error(monkeypatch, tmp_path
     # Usage block is present (zeroed — the request never returned a body).
     assert result["native_loop_usage"]["prompt_tokens"] == 0
     assert result["native_loop_usage"]["cache_hit_ratio"] == 0.0
-    assert result["planning_turns_attempted"] == 1
+    assert result["planning_turns_attempted"] == 0
+    assert result["model_request_round_trips"] == 0
     assert result["tool_call_counts"] == {
         "issued": 0, "executed": 0, "rejected": 0, "duplicated": 0, "malformed": 0
     }

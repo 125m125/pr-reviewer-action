@@ -9,7 +9,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pr_reviewer.conversation import Conversation
 from pr_reviewer.tool_loop import (
     STOP_BUDGET,
-    STOP_MAX_ROUNDS,
     STOP_MODEL_DONE,
     STOP_NO_TOOL_CALLS,
     STOP_REPETITIVE_TEXT,
@@ -362,7 +361,9 @@ def test_budget_notes_are_correct_and_do_not_accumulate():
     notes1 = [m for m in payloads[1]["messages"] if "Exploration budget" in str(m.get("content"))]
     assert len(notes0) == len(notes1) == 1
     assert "3 tool calls and 4 planning turns" in notes0[0]["content"]
-    assert "2 tool calls and 3 planning turns" in notes1[0]["content"]
+    # The preceding response was tool-only progress, so it consumed a tool
+    # call but not a planning turn.
+    assert "2 tool calls and 4 planning turns" in notes1[0]["content"]
 
 
 def test_length_without_usable_answer_is_not_model_done():
@@ -418,6 +419,26 @@ def test_two_hop_chain_then_stop():
     assert outcome.degraded is False
     # Every issued call id got a result (the open-call contract).
     assert conv.open_tool_call_ids() == set()
+
+
+def test_tool_only_turns_do_not_consume_planning_round_budget():
+    """A native tool-call response is progress, even when it has no prose."""
+    conv = fresh_conversation()
+    post = scripted_post([
+        openai_tool_call_response([("c1", "read_file", '{"path": "a.txt"}')]),
+        openai_text_response("done"),
+    ])
+    execute, _ = recording_execute()
+
+    outcome = drive_tool_loop(
+        conv, post, execute, api_format="openai", model="m",
+        budgets=LoopBudgets(max_tool_calls=2, max_rounds=1),
+    )
+
+    assert outcome.stop_reason == STOP_MODEL_DONE
+    assert outcome.rounds == 2
+    assert outcome.planning_rounds == 1
+    assert outcome.tool_only_rounds == 1
 
 
 def test_parallel_calls_in_one_round():
@@ -511,9 +532,10 @@ def test_tool_call_budget_exhaustion():
     assert len(budget_notes) == 1
 
 
-def test_max_rounds_cap():
+def test_tool_call_budget_caps_tool_only_rounds():
     conv = fresh_conversation()
-    # Model would keep calling forever with fresh args each round.
+    # Tool-only rounds are allowed to continue until the independent evidence
+    # budget is exhausted; they do not consume the planning-round budget.
     responses = [
         openai_tool_call_response([(f"c{i}", "read_file", json.dumps({"path": f"f{i}"}))])
         for i in range(10)
@@ -526,10 +548,12 @@ def test_max_rounds_cap():
         execute,
         api_format="openai",
         model="m",
-        budgets=LoopBudgets(max_rounds=3, max_tool_calls=100),
+        budgets=LoopBudgets(max_rounds=3, max_tool_calls=3),
     )
-    assert outcome.stop_reason == STOP_MAX_ROUNDS
+    assert outcome.stop_reason == STOP_BUDGET
     assert outcome.rounds == 3
+    assert outcome.planning_rounds == 0
+    assert outcome.tool_only_rounds == 3
     assert len(log) == 3
 
 

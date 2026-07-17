@@ -460,7 +460,7 @@ def test_truncated_specialist_analysis_continues_before_terminal_synthesis(monke
     assert diagnostics["terminal_synthesis_recovered"] is False
 
 
-def test_stream_watchdog_uses_one_compact_recovery_without_repeated_text(monkeypatch):
+def test_stream_watchdog_resumes_clean_exploration_before_final_recovery(monkeypatch):
     _runner_env(monkeypatch)
     monkeypatch.setenv("AI_STREAM", "true")
     captured = []
@@ -470,6 +470,7 @@ def test_stream_watchdog_uses_one_compact_recovery_without_repeated_text(monkeyp
         "invariants_checked": ["identity"], "findings": [], "unknowns": [],
     }
     repeated = "I'll list the same files again. " * 200
+    assigned = "BEGIN ASSIGNED CONTEXT\n" + ("important context " * 2000) + "\nEND ASSIGNED CONTEXT"
 
     def fake_request(_base, _api, payload, _key, _timeout, **kwargs):
         captured.append((payload, kwargs))
@@ -487,7 +488,7 @@ def test_stream_watchdog_uses_one_compact_recovery_without_repeated_text(monkeyp
 
     monkeypatch.setattr(runner_module, "run_chat_request", fake_request)
     value, diagnostics = runner_module.SequentialModelRunner().agent(
-        "specialist", "system", "assigned focus", 2,
+        "specialist", "system", assigned, 2,
         terminal_instruction="Return strict JSON now.",
     )
 
@@ -497,13 +498,15 @@ def test_stream_watchdog_uses_one_compact_recovery_without_repeated_text(monkeyp
     recovery_payload, recovery_kwargs = captured[1]
     assert first_payload["stream"] is True
     assert first_kwargs["stream_watchdog"] is not None
-    assert recovery_payload["stream"] is False
-    assert recovery_payload["max_tokens"] == 2048
+    assert recovery_payload["stream"] is True
+    assert recovery_payload["max_tokens"] == 4096
+    assert "END ASSIGNED CONTEXT" in json.dumps(recovery_payload)
     assert repeated not in json.dumps(recovery_payload)
     assert "Continue the same investigation" not in json.dumps(recovery_payload)
-    assert recovery_kwargs == {}
+    assert recovery_kwargs["stream_watchdog"] is not None
     assert diagnostics["stream_watchdog_triggered"] is True
     assert diagnostics["stream_watchdog_reason"] == "repeated-paragraph"
+    assert diagnostics["watchdog_exploration_resumed"] is True
 
 
 def test_specialist_context_cap_and_temperature_are_separate(monkeypatch):
