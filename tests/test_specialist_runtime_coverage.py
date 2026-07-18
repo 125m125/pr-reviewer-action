@@ -137,3 +137,45 @@ def test_stable_ids_do_not_merge_distinct_subjects_with_the_same_slug():
     implementation_ids = [item.id for item in obligations if item.required_evidence == ("implementation",)]
     assert len(implementation_ids) == 2
     assert len(set(implementation_ids)) == 2
+
+
+def test_independent_recipe_requires_independent_verification():
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy
+
+    policy = ReviewPolicy.minimal(recipes=(RecipePolicy(
+        id="security", title="Security", objective="Independently assess the boundary",
+        execution="independent", match={"file_roles_any": ("implementation",)},
+        expected_evidence=("boundary",),
+    ),))
+
+    obligations = derive_obligations(
+        {"changed_files": ["src/main.py"], "file_roles": ["implementation"]}, {}, policy
+    )
+
+    recipe_obligation = next(item for item in obligations if item.recipe_id == "security")
+    assert recipe_obligation.requires_independent_verification is True
+
+
+def test_recipe_lifecycle_statuses_survive_tuple_materialization():
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger, derive_obligations
+    from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy
+
+    policy = ReviewPolicy(
+        recipes=(
+            RecipePolicy(id="disabled", title="Disabled", objective="No-op", expected_evidence=("tests",)),
+            RecipePolicy(id="unmatched", title="Unmatched", objective="No-op",
+                         match={"file_roles_any": ("messaging",)}, expected_evidence=("tests",)),
+        ),
+        exclude={"paths": (), "components": (), "lenses": (), "recipes": ("disabled",)},
+    )
+
+    materialized = tuple(derive_obligations(
+        {"changed_files": ["src/main.py"], "file_roles": ["implementation"]}, {}, policy
+    ))
+
+    assert CoverageLedger(materialized).recipe_statuses() == {
+        "disabled": "suppressed_by_policy", "unmatched": "not_applicable",
+    }
+    bookkeeping = [item for item in materialized if item.recipe_status is not None]
+    assert all(not item.mandatory and not item.required_evidence for item in bookkeeping)

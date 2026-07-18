@@ -65,6 +65,7 @@ class CoverageObligation:
     explanation: str = ""
     recipe_id: str | None = None
     mandatory: bool = True
+    recipe_status: RecipeStatus | None = None
 
     @property
     def id(self) -> str:

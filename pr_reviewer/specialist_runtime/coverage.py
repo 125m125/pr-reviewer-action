@@ -40,19 +40,6 @@ def _obligation_id(origin: str, subject: str, evidence_category: str) -> str:
     )
 
 
-class DerivedObligations(tuple[CoverageObligation, ...]):
-    """Tuple-compatible obligations carrying recipe applicability decisions."""
-
-    def __new__(
-        cls,
-        obligations: Iterable[CoverageObligation] = (),
-        recipe_statuses: Mapping[str, RecipeStatus] | None = None,
-    ) -> "DerivedObligations":
-        result = super().__new__(cls, obligations)
-        result.initial_recipe_statuses = dict(recipe_statuses or {})
-        return result
-
-
 def _add_obligation(
     obligations: dict[str, CoverageObligation],
     *,
@@ -61,6 +48,10 @@ def _add_obligation(
     evidence_category: str,
     risk_tier: str = "normal",
     recipe_id: str | None = None,
+    requires_independent_verification: bool = False,
+    required_evidence_categories: tuple[str, ...] | None = None,
+    mandatory: bool = True,
+    recipe_status: RecipeStatus | None = None,
     scope: Iterable[str] = (),
     seed_hints: Iterable[str] = (),
     explanation: str,
@@ -70,13 +61,18 @@ def _add_obligation(
         obligation_id=obligation_id,
         origin=origin,
         subject=subject,
-        required_evidence_categories=(evidence_category,),
+        required_evidence_categories=(
+            (evidence_category,) if required_evidence_categories is None else required_evidence_categories
+        ),
         satisfaction_predicates=("recorded_evidence",),
         risk_tier=risk_tier,
+        requires_independent_verification=requires_independent_verification,
         scope=tuple(scope),
         seed_hints=tuple(seed_hints),
         explanation=explanation,
         recipe_id=recipe_id,
+        mandatory=mandatory,
+        recipe_status=recipe_status,
     ))
 
 
@@ -229,24 +225,40 @@ def derive_obligations(
             _add_obligation(
                 obligations, origin="recipe", subject=recipe.id, evidence_category=category,
                 risk_tier=recipe.priority, recipe_id=recipe.id,
+                requires_independent_verification=recipe.execution == "independent",
                 scope=changed_files, seed_hints=recipe.seed_paths or changed_files,
                 explanation=f"Repository recipe '{recipe.id}' requires {category} evidence.",
             )
 
-    return DerivedObligations(
-        (obligations[obligation_id] for obligation_id in sorted(obligations)), recipe_states
-    )
+    for recipe_id, status in recipe_states.items():
+        if status not in {RecipeStatus.NOT_APPLICABLE, RecipeStatus.SUPPRESSED_BY_POLICY}:
+            continue
+        _add_obligation(
+            obligations, origin="recipe-accounting", subject=recipe_id,
+            evidence_category=f"status-{status.value}", recipe_id=recipe_id,
+            required_evidence_categories=(), mandatory=False, recipe_status=status,
+            explanation=f"Recipe '{recipe_id}' is {status.value}.",
+        )
+
+    return tuple(obligations[obligation_id] for obligation_id in sorted(obligations))
 
 
 class CoverageLedger:
     """Mutable evidence-to-obligation accounting with immutable obligations."""
 
     def __init__(self, obligations: Iterable[CoverageObligation]) -> None:
-        self._obligations = {item.obligation_id: item for item in obligations}
+        items = tuple(obligations)
+        self._recipe_states: dict[str, RecipeStatus] = {}
+        self._obligations = {}
+        for item in items:
+            if item.recipe_status is not None:
+                if item.mandatory or item.required_evidence_categories or not item.recipe_id:
+                    raise ValueError("recipe accounting obligations must be non-mandatory and evidence-free")
+                self._recipe_states[item.recipe_id] = item.recipe_status
+                continue
+            self._obligations[item.obligation_id] = item
         self._evidence: dict[str, set[str]] = {item_id: set() for item_id in self._obligations}
         self._unresolved: set[str] = set()
-        initial = getattr(obligations, "initial_recipe_statuses", {})
-        self._recipe_states: dict[str, RecipeStatus] = dict(initial)
         for obligation in self._obligations.values():
             if obligation.recipe_id:
                 self._recipe_states.setdefault(obligation.recipe_id, RecipeStatus.ASSIGNED)
