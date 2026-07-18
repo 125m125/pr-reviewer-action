@@ -255,9 +255,13 @@ def _with_primary_ownership(assignments: tuple[Assignment, ...]) -> tuple[Assign
 
 
 def _deadline_turn_capacity(config: RuntimeConfig) -> int:
+    return _per_lane_deadline_turn_capacity(config) * config.concurrency
+
+
+def _per_lane_deadline_turn_capacity(config: RuntimeConfig) -> int:
     exploration_percent = config.phase_shares.initial + config.phase_shares.followup
     exploration_seconds = (config.review_deadline_sec * exploration_percent) // 100
-    return (exploration_seconds // config.model_request_timeout_sec) * config.concurrency
+    return exploration_seconds // config.model_request_timeout_sec
 
 
 def _validate_budget(assignments: tuple[Assignment, ...], config: RuntimeConfig) -> list[str]:
@@ -267,6 +271,8 @@ def _validate_budget(assignments: tuple[Assignment, ...], config: RuntimeConfig)
     for assignment in assignments:
         if assignment.estimated_turns > config.session_limits.model_turns:
             errors.append(f"assignment '{assignment.id}' estimated turns exceed per-session limit")
+        if assignment.estimated_turns > _per_lane_deadline_turn_capacity(config):
+            errors.append(f"assignment '{assignment.id}' estimated turns exceed per-lane deadline turn capacity")
     if sum(item.estimated_turns for item in assignments) > _deadline_turn_capacity(config):
         errors.append("estimated turns exceed deadline turn capacity")
     return errors
@@ -362,7 +368,7 @@ def _fallback_assignment(key: str, obligations: tuple[CoverageObligation, ...], 
         recipe_ids=tuple(sorted({item.recipe_id for item in obligations if item.recipe_id})),
         lenses=("deterministic-coverage",), seed_paths=seed_paths, boundary_paths=boundary_paths,
         expected_evidence=tuple(sorted({category for item in obligations for category in item.required_evidence_categories})),
-        estimated_turns=min(config.session_limits.model_turns, max(1, len(obligations))),
+        estimated_turns=len(obligations),
         priority=_priority(obligations),
     )
 
@@ -376,20 +382,43 @@ def fallback_assignment_plan(
     for obligation in _validated_assignable_obligations(obligations):
         groups[_fallback_group(obligation, components)].append(obligation)
     ordered = sorted(groups.items(), key=lambda item: (_PRIORITY_RANK[_priority(item[1])], item[0]))
+    per_assignment_capacity = min(
+        runtime_config.session_limits.model_turns,
+        _per_lane_deadline_turn_capacity(runtime_config),
+    )
+    candidates: list[tuple[str, list[CoverageObligation]]] = []
+    pre_overflow: list[CoverageObligation] = []
+    for key, group in ordered:
+        items = sorted(group, key=lambda item: item.id)
+        isolated = key.startswith("recipe:dedicated:") or key.startswith("recipe:independent:")
+        if per_assignment_capacity <= 0:
+            pre_overflow.extend(items)
+        elif isolated:
+            if len(items) > per_assignment_capacity:
+                pre_overflow.extend(items)
+            else:
+                candidates.append((key, items))
+        else:
+            chunks = [items[index:index + per_assignment_capacity]
+                      for index in range(0, len(items), per_assignment_capacity)]
+            for index, chunk in enumerate(chunks, start=1):
+                chunk_key = key if len(chunks) == 1 else f"{key}:chunk:{index}"
+                candidates.append((chunk_key, chunk))
     assignments: list[Assignment] = []
     turns_used = 0
     overflow_groups: list[tuple[str, list[CoverageObligation]]] = []
-    for index, (key, items) in enumerate(ordered):
+    for index, (key, items) in enumerate(candidates):
         assignment = _fallback_assignment(key, tuple(sorted(items, key=lambda item: item.id)), runtime_config)
         if len(assignments) >= runtime_config.max_sessions or (
             turns_used + assignment.estimated_turns > _deadline_turn_capacity(runtime_config)
         ):
-            overflow_groups = ordered[index:]
+            overflow_groups = candidates[index:]
             break
         assignments.append(assignment)
         turns_used += assignment.estimated_turns
     unassigned = tuple(sorted(
-        obligation.id for _, items in overflow_groups for obligation in items
+        [obligation.id for obligation in pre_overflow]
+        + [obligation.id for _, items in overflow_groups for obligation in items]
     ))
     return AssignmentPlan(
         assignments=_with_primary_ownership(tuple(assignments)),
