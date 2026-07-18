@@ -105,3 +105,26 @@ def test_artifact_projection_rejects_duplicate_and_missing_sequences():
         )
     with pytest.raises(ValueError, match="missing"):
         projector.project([RunEvent(sequence=2, kind="run_started")])
+
+
+def test_event_payload_deep_snapshot_isolated_from_caller_and_artifact_mutation():
+    caller_payload = {"nested": {"values": ["original"]}}
+    event = RunEvent(sequence=1, kind="run_started", payload=caller_payload)
+    artifact = RunArtifactProjector().project([event])
+
+    caller_payload["nested"]["values"].append("caller mutation")
+
+    assert event.payload["nested"]["values"] == ("original",)
+    assert artifact["events"][0]["payload"]["nested"]["values"] == ["original"]
+
+
+def test_budget_snapshot_returns_a_fresh_immutable_value():
+    ledger = BudgetLedger(BudgetLimits(model_turns=2, tool_calls=1, recoveries=1))
+
+    first = ledger.snapshot()
+    second = ledger.snapshot()
+    ledger.record_model_turn()
+
+    assert first == second
+    assert first is not second
+    assert first.model_turns == 0

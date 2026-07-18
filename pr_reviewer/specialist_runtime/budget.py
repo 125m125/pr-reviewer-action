@@ -107,7 +107,7 @@ class BudgetLedger:
         )
 
     def snapshot(self) -> BudgetUsage:
-        return self._usage
+        return replace(self._usage)
 
     def remaining_model_turns(self) -> int:
         return max(0, self._limits.model_turns - self._usage.model_turns)

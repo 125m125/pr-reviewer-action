@@ -7,6 +7,30 @@ from types import MappingProxyType
 from typing import Mapping
 
 
+def _freeze_json(value: object) -> object:
+    """Take a deterministic immutable snapshot of JSON-like payload data."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("event payload object keys must be strings")
+        return MappingProxyType(
+            {key: _freeze_json(value[key]) for key in sorted(value)}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item) for item in value)
+    raise TypeError("event payload values must be JSON-like")
+
+
+def _clone_json(value: object) -> object:
+    """Return a detached mutable JSON-like projection of a frozen payload."""
+    if isinstance(value, Mapping):
+        return {key: _clone_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_clone_json(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True)
 class RunEvent:
     sequence: int
@@ -18,7 +42,10 @@ class RunEvent:
             raise ValueError("event sequence must be a positive integer")
         if not self.kind:
             raise ValueError("event kind must be non-empty")
-        object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
+        frozen_payload = _freeze_json(self.payload)
+        if not isinstance(frozen_payload, Mapping):
+            raise TypeError("event payload must be a JSON-like object")
+        object.__setattr__(self, "payload", frozen_payload)
 
 
 class RunArtifactProjector:
@@ -37,12 +64,14 @@ class RunArtifactProjector:
                     f"missing event sequence {expected_sequence} before {event.sequence}"
                 )
             expected_sequence += 1
-            payload = dict(event.payload)
+            payload = _clone_json(event.payload)
+            if not isinstance(payload, dict):
+                raise TypeError("event payload must be a JSON-like object")
             projected_events.append(
                 {"sequence": event.sequence, "kind": event.kind, "payload": payload}
             )
             if event.kind == "run_started":
-                artifact.update(payload)
+                artifact.update(_clone_json(event.payload))
             elif event.kind == "phase_changed":
-                artifact["phase"] = payload.get("phase")
+                artifact["phase"] = _clone_json(event.payload.get("phase"))
         return artifact
