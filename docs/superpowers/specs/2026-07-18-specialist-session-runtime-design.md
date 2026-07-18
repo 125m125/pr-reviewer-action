@@ -860,7 +860,40 @@ The branch is mergeable when:
 - Operators can explain every session restart, budget change, coverage decision,
   source access, finding disposition, and verdict from the artifact.
 
-## 20. Explicit non-goals
+## 20. Downstream-project migration handoff
+
+Implementation includes a concise agent-facing migration document at
+`docs/migrations/specialist-session-runtime.md`. It is a required release
+deliverable, not a post-release follow-up.
+
+The handoff contains:
+
+- A changelog of externally visible review-process behavior.
+- A table of added, changed, retained, deprecated, and removed action properties,
+  including the recommended value for large multilingual repositories and why.
+- A before/after workflow example for GitHub and OpenAI-compatible endpoints.
+- A repository migration checklist covering `.github/ai-review-rules.md`,
+  `.github/ai-review-specialists.json`, the configured `system_prompt_file`, the
+  current-branch source allowlist/policy, workflow permissions, action version pin,
+  model-role overrides, concurrency, deadline, and publishing mode.
+- Guidance for migrating version-1 components and recipes into coverage,
+  `dedicated`, or `independent` execution policies.
+- Guidance on writing concise repository prompt additions instead of copying the
+  bundled system prompt.
+- The security consequence of current-branch source rules and the expectation that
+  a human inspects policy changes before manually triggering a review.
+- Expected sticky-handoff, resolvable-review-note, artifact, and degraded-run
+  behavior so project agents can update their own repository rules and tests.
+- A troubleshooting section for missing recipes, uncovered obligations, denied web
+  sources, non-resolvable notes, model incompatibility, deadline exhaustion, and
+  publishing permissions.
+
+README input tables and example workflows must link to this migration document.
+The implementation plan and final release verification must check that the handoff
+matches the actual input names, defaults, schemas, and behavior delivered by the
+code.
+
+## 21. Explicit non-goals
 
 - Building a general-purpose agent workflow framework.
 - Supporting arbitrary model-supplied shell commands.
