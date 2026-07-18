@@ -1,6 +1,12 @@
 """Evidence provenance and immutable wave-snapshot behavior."""
 
-from pr_reviewer.specialist_runtime.evidence import EvidenceStore, canonical_evidence_key
+from dataclasses import replace
+
+from pr_reviewer.specialist_runtime.evidence import (
+    EvidenceProvenance,
+    EvidenceStore,
+    canonical_evidence_key,
+)
 
 
 def test_duplicate_success_reuses_evidence_without_claiming_independence():
@@ -97,10 +103,118 @@ def test_snapshot_remains_immutable_when_later_session_imports_existing_evidence
         tool="read_file",
         arguments={"path": "a.py"},
         result={"status": "ok", "result": {"content": "x = 1"}},
+        provenance=EvidenceProvenance(head_sha="head-a", retrieved_at=100.0, max_age_hours=1),
     )
     snapshot = store.snapshot()
 
-    store.import_into_session("S2", first.id)
+    store.add_tool_result(
+        session_id="S2",
+        tool="read_file",
+        arguments={"path": "a.py"},
+        result={"status": "ok", "result": {"content": "x = 1"}},
+        provenance=EvidenceProvenance(head_sha="head-a", retrieved_at=200.0, max_age_hours=1),
+        now=200.0,
+    )
 
     assert snapshot.records[0].imported_by == ("S1",)
+    assert snapshot.records[0].provenance.retrieved_at == 100.0
     assert store.lookup_canonical(first.id).imported_by == ("S1", "S2")
+
+
+def test_retained_evidence_redacts_nested_arguments_and_url_metadata():
+    store = EvidenceStore()
+    secret = "supersecretvalue"
+    record = store.add_tool_result(
+        session_id="S1",
+        tool="web_fetch",
+        arguments={
+            "credentials": {"token": secret},
+            "url": f"https://alice:{secret}@Docs.Example.com/api?access_token={secret}&page=1",
+        },
+        result={"status": "ok", "result": {"content": "public"}},
+        provenance=EvidenceProvenance(
+            original_url=f"https://alice:{secret}@docs.example.com/original?token={secret}",
+            final_url=f"https://bob:{secret}@docs.example.com/final?api_key={secret}",
+        ),
+    )
+
+    retained = "\n".join((
+        record.arguments,
+        record.source_identity,
+        record.provenance.original_url or "",
+        record.provenance.final_url or "",
+        record.canonical_key,
+        repr(store.snapshot()),
+    ))
+    assert secret not in retained
+    assert "alice@" not in retained
+    assert "bob@" not in retained
+    assert record.redacted is True
+
+
+def test_head_policy_rule_and_final_source_changes_prevent_canonical_reuse():
+    store = EvidenceStore()
+    baseline = EvidenceProvenance(
+        head_sha="head-a",
+        policy_hash="policy-a",
+        policy_rule_id="rule-a",
+        final_url="https://docs.example.com/v1",
+    )
+    first = store.add_tool_result(
+        session_id="S1", tool="web_fetch", arguments={"url": "https://docs.example.com/v1"},
+        result={"status": "ok", "result": {"content": "same"}}, provenance=baseline,
+    )
+
+    for index, provenance in enumerate((
+        replace(baseline, head_sha="head-b"),
+        replace(baseline, policy_hash="policy-b"),
+        replace(baseline, policy_rule_id="rule-b"),
+        replace(baseline, final_url="https://docs.example.com/v2"),
+    ), start=2):
+        record = store.add_tool_result(
+            session_id=f"S{index}", tool="web_fetch", arguments={"url": "https://docs.example.com/v1"},
+            result={"status": "ok", "result": {"content": "same"}}, provenance=provenance,
+        )
+        assert record.id != first.id
+        assert record.collector_session_id == f"S{index}"
+
+
+def test_expired_evidence_is_refetched_but_fresh_retrieval_time_does_not_change_identity():
+    store = EvidenceStore()
+    first = store.add_tool_result(
+        session_id="S1", tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "result": {"content": "x = 1"}},
+        provenance=EvidenceProvenance(retrieved_at=1_000.0, max_age_hours=1), now=2_000.0,
+    )
+    reused = store.add_tool_result(
+        session_id="S2", tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "result": {"content": "x = 1"}},
+        provenance=EvidenceProvenance(retrieved_at=2_000.0, max_age_hours=1), now=2_000.0,
+    )
+    refreshed = store.add_tool_result(
+        session_id="S3", tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "result": {"content": "x = 1"}},
+        provenance=EvidenceProvenance(retrieved_at=5_000.0, max_age_hours=1), now=5_000.0,
+    )
+
+    assert reused.id == first.id
+    assert refreshed.id != first.id
+    assert refreshed.collector_session_id == "S3"
+
+
+def test_provenance_and_evidence_relationships_are_immutable_values():
+    store = EvidenceStore()
+    supersedes = ["E-old"]
+    contradicts = ["E-conflict"]
+    record = store.add_tool_result(
+        session_id="S1", tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "result": {"content": "x = 1"}},
+        provenance=EvidenceProvenance(head_sha="head-a", policy_hash="policy-a"),
+        supersedes=supersedes, contradicts=contradicts,
+    )
+    supersedes.append("caller-mutation")
+    contradicts.append("caller-mutation")
+
+    assert record.supersedes == ("E-old",)
+    assert record.contradicts == ("E-conflict",)
+    assert record.provenance.head_sha == "head-a"
