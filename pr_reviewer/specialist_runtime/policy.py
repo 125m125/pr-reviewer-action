@@ -62,7 +62,7 @@ def _repository_paths(value: Any, *, field_name: str, limit: int = 100) -> tuple
     paths = []
     for item in _strings(value, field_name=field_name, limit=limit):
         normalized = _posix(item)
-        if not normalized or normalized == ".." or normalized.startswith("../"):
+        if not normalized or ".." in normalized.split("/"):
             raise ValueError(f"{field_name} must contain repository-relative paths")
         paths.append(normalized)
     return tuple(paths)

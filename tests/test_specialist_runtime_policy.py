@@ -90,3 +90,21 @@ def test_runtime_config_uses_direct_defaults_and_legacy_aliases():
 def test_runtime_config_rejects_invalid_phase_share_shape():
     with pytest.raises(ValueError, match="phase shares"):
         RuntimeConfig.from_env({"SPECIALIST_PHASE_SHARES": "[]"})
+
+
+@pytest.mark.parametrize("fragment", [
+    {"components": [{"id": "worker", "paths": ["safe/../../outside"]}]},
+    {"recipes": [{"id": "recipe", "seed_paths": ["safe/../../outside"]}]},
+    {"recipes": [{"id": "recipe", "related_paths": ["safe/../../outside"]}]},
+    {"recipes": [{"id": "recipe", "match": {"paths_any": ["safe/../../outside"]}}]},
+    {"generated_artifacts": [{"id": "generated", "source_of_truth": ["safe/../../outside"]}]},
+    {"generated_artifacts": [{"id": "generated", "generator_config": ["safe/../../outside"]}]},
+    {"generated_artifacts": [{"id": "generated", "output_paths": ["safe/../../outside"]}]},
+    {"exclude": {"paths": ["safe/../../outside"]}},
+])
+def test_repository_policy_paths_reject_any_parent_segment(tmp_path, fragment):
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({"version": 2, **fragment}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="repository-relative paths"):
+        load_review_policy(path)
