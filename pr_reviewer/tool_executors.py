@@ -27,6 +27,13 @@ from redact import mask_and_truncate, mask_secrets  # noqa: E402
 # source of truth); _resolve_workspace_path reuses GH_DENY_SUBSTRINGS to block
 # the same sensitive segments in filesystem paths.
 from pr_reviewer.platform import GH_DENY_SUBSTRINGS  # noqa: E402
+from pr_reviewer.specialist_runtime.web_evidence import (  # noqa: E402
+    SearchProvider,
+    SecureFetcher,
+    SearxngSearchProvider,
+    SourcePolicy,
+    discover,
+)
 
 
 SENSITIVE_PATH_RE = re.compile(
@@ -239,60 +246,60 @@ def gh_api(endpoint, allowed_repos, current_repo, request_timeout=25):
     from pr_reviewer.platform import gh_api as _platform_gh_api
     return _platform_gh_api(endpoint, allowed_repos, current_repo, request_timeout)
 
-def web_fetch(url, allowed_hosts, request_timeout=25):
-    """Fetch a URL using the same host-allowlist logic."""
-    parsed = urllib.parse.urlparse(url)
-    host = parsed.hostname or ""
-
-    if not allowlisted_host(host, allowed_hosts):
-        return {"error": f"Host not allowlisted: {host}"}
-
+def web_fetch(
+    url,
+    allowed_hosts,
+    request_timeout=25,
+    *,
+    source_policy=None,
+    secure_fetcher=None,
+    evidence_store=None,
+    session_id="tool-harness",
+    model_identity="",
+):
+    """Retrieve typed evidence through the redirect- and DNS-safe boundary."""
     try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "ai-pr-reviewer/1.0"},
+        if source_policy is None:
+            host = urllib.parse.urlparse(url).hostname or ""
+            if not allowlisted_host(host, allowed_hosts):
+                return {"error": f"Host not allowlisted: {host}"}
+        policy = source_policy or SourcePolicy.from_hosts(allowed_hosts)
+        fetcher = secure_fetcher or SecureFetcher(
+            policy, timeout=request_timeout, evidence_store=evidence_store,
         )
-        with urllib.request.urlopen(req, timeout=request_timeout) as resp:
-            raw = resp.read()
-            text = raw.decode("utf-8", errors="replace")
-            return {"content": text[:10000]}
+        return fetcher.fetch(
+            url, session_id=session_id, model_identity=model_identity,
+        ).as_dict()
     except Exception as exc:
         return {"error": str(exc)}
 
-def web_search(query, search_url, request_timeout=20, max_results=5):
-    """Query a configured search engine (SearXNG JSON API) for a free-text query.
-
-    ``search_url`` is the engine's search endpoint (e.g.
-    ``https://search.example.com/search``); the query and ``format=json`` are
-    appended. Returns ``{"results": [{title, url, snippet}], ...}`` capped at
-    ``max_results``, or ``{"error": ...}``. The endpoint is a single trusted,
-    operator-configured URL — unlike web_fetch it is not host-allowlisted,
-    because the model supplies only the query string, never the host.
-    """
+def web_search(
+    query,
+    search_url,
+    request_timeout=20,
+    max_results=5,
+    *,
+    source_policy=None,
+    provider: SearchProvider | None = None,
+    search_scan_limit=25,
+):
+    """Return policy-filtered discovery metadata, never raw search output."""
     if not search_url:
         return {"error": "Search is not configured (no search_url)."}
-    sep = "&" if urllib.parse.urlparse(search_url).query else "?"
-    full = f"{search_url}{sep}" + urllib.parse.urlencode({"q": query, "format": "json"})
     try:
-        req = urllib.request.Request(
-            full,
-            headers={"User-Agent": "ai-pr-reviewer/1.0", "Accept": "application/json"},
+        policy = source_policy or SourcePolicy(())
+        search_provider = provider or SearxngSearchProvider(
+            search_url, request_timeout=request_timeout,
         )
-        with urllib.request.urlopen(req, timeout=request_timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        return discover(
+            query,
+            search_provider,
+            policy,
+            search_scan_limit=search_scan_limit,
+            tool_max_search_results=max_results,
+        ).as_dict()
     except Exception as exc:
         return {"error": str(exc)}
-
-    results = []
-    for item in (data.get("results") or [])[:max_results]:
-        if not isinstance(item, dict):
-            continue
-        results.append({
-            "title": str(item.get("title", ""))[:300],
-            "url": str(item.get("url", "")),
-            "snippet": str(item.get("content", ""))[:500],
-        })
-    return {"results": results}
 
 def run_command(command, workspace_root, request_timeout=30):
     """Execute a named read-only command definition.
@@ -350,6 +357,14 @@ def execute_tool_request(
     request_timeout,
     search_url="",
     max_search_results=5,
+    *,
+    source_policy=None,
+    search_provider=None,
+    secure_fetcher=None,
+    evidence_store=None,
+    session_id="tool-harness",
+    model_identity="",
+    search_scan_limit=25,
 ):
     """Execute a single tool request and return the result dict.
 
@@ -430,23 +445,47 @@ def execute_tool_request(
             url = args.get("url", "")
             if not url:
                 raise ValueError("Missing 'url' argument")
-            res = web_fetch(url, allowed_hosts, request_timeout)
+            res = web_fetch(
+                url,
+                allowed_hosts,
+                request_timeout,
+                source_policy=source_policy,
+                secure_fetcher=secure_fetcher,
+                evidence_store=evidence_store,
+                session_id=session_id,
+                model_identity=model_identity,
+            )
             if res.get("error"):
                 raise ValueError(res["error"])
-            content_text = res.get("content", "")
-            text, _ = mask_and_truncate(content_text, max_response_bytes)
-            tool_result["result"] = {"content": text}
+            content_text, truncated = mask_and_truncate(
+                res.get("content", ""), max_response_bytes
+            )
+            tool_result["result"] = {
+                **res,
+                "content": content_text,
+                "truncated": bool(res.get("truncated")) or truncated,
+            }
 
         elif tool_name == "web_search":
             query = args.get("query", "")
             if not query:
                 raise ValueError("Missing 'query' argument")
-            res = web_search(query, search_url, request_timeout, max_search_results)
+            policy = source_policy or SourcePolicy.from_hosts(allowed_hosts)
+            res = web_search(
+                query,
+                search_url,
+                request_timeout,
+                max_search_results,
+                source_policy=policy,
+                provider=search_provider,
+                search_scan_limit=search_scan_limit,
+            )
             if res.get("error"):
                 raise ValueError(res["error"])
-            text = json.dumps(res.get("results", []), separators=(",", ":"))
-            text, _ = mask_and_truncate(text, max_response_bytes)
-            tool_result["result"] = {"results": text}
+            encoded = json.dumps(res, ensure_ascii=False, separators=(",", ":"))
+            if len(encoded.encode("utf-8")) > max_response_bytes:
+                raise ValueError("Filtered search discovery exceeds tool response limit")
+            tool_result["result"] = res
 
         elif tool_name == "run_command":
             command = args.get("command", "")

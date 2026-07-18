@@ -158,7 +158,7 @@ def test_web_search_query_cannot_change_host(tmp_path, monkeypatch):
         def __exit__(self, *a):
             return False
 
-        def read(self):
+        def read(self, size=-1):
             return b'{"results": []}'
 
     def fake_urlopen(req, timeout=0):

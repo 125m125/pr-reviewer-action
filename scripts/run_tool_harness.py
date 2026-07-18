@@ -56,6 +56,7 @@ from pr_reviewer.tool_executors import (  # noqa: E402
     web_fetch,
     web_search,
 )
+from pr_reviewer.specialist_runtime.web_evidence import SourcePolicy  # noqa: E402
 
 
 def normalize_repo_name(value):
@@ -534,8 +535,8 @@ def run_native_loop(
         sys.path.insert(0, repo_root)
     from pr_reviewer.conversation import (  # noqa: PLC0415
         TOOL_SCHEMAS,
-        WEB_SEARCH_SCHEMA,
         Conversation,
+        web_tool_schemas,
     )
     from pr_reviewer.tool_loop import (  # noqa: PLC0415
         adaptive_loop_budgets,
@@ -550,12 +551,12 @@ def run_native_loop(
     )
     from pr_reviewer.evidence_memory import build_evidence_digest  # noqa: PLC0415
 
-    # web_search is advertised only when a search endpoint is configured.
+    # Discovery is useful only when both the operator fixed an endpoint and
+    # current source rules give it approved URLs to return.
     search_url = os.getenv("SEARCH_URL", "").strip()
     max_search_results = env_int_bounded("TOOL_MAX_SEARCH_RESULTS", 5, 1, 15)
-    tool_schemas = list(TOOL_SCHEMAS)
-    if search_url:
-        tool_schemas.append(WEB_SEARCH_SCHEMA)
+    source_policy = SourcePolicy.from_hosts(allowed_hosts)
+    tool_schemas = web_tool_schemas(search_url, source_policy)
 
     # Read-only MCP tools (#245), allowlisted via TOOL_MCP_SERVERS. Fork-gating
     # happens upstream in run_review.sh (the env is blanked on fork PRs unless
@@ -666,8 +667,9 @@ def run_native_loop(
         f"{', '.join(sorted(allowed_gh_api_repos)) if allowed_gh_api_repos else '(none)'}\n"
         f"Allowed hosts for web_fetch: "
         f"{', '.join(allowed_hosts) if allowed_hosts else '(none)'}\n"
-        + ("web_search is available — use it to find a page's URL when you don't "
-           "know it, then web_fetch the best result.\n" if search_url else "")
+        + ("web_search is available for discovery only; web_fetch an approved "
+           "result before relying on it as evidence.\n"
+           if search_url and source_policy.has_approved_sources else "")
         + "\nGather the evidence needed to review this PR corpus:\n\n"
     )
     planning_input_allowance = (
@@ -780,6 +782,7 @@ def run_native_loop(
             request_timeout,
             search_url,
             max_search_results,
+            source_policy=source_policy,
         )
 
     # Result summarization between rounds (#197 §2): when the conversation

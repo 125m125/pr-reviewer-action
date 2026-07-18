@@ -163,8 +163,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "web_fetch",
         "description": (
-            "Fetch a URL whose host is allowlisted; output truncated to ~10 KB "
-            "of decoded text. Prefer a structured API endpoint over an HTML "
+            "Fetch an HTTPS URL approved by the current source policy. The "
+            "executor rechecks host/path policy and public DNS addresses on "
+            "every redirect, normalizes and masks content, and returns typed "
+            "external evidence with provenance. Prefer a structured API "
+            "endpoint over an HTML "
             "release/compare page (HTML often 404s or is JS-rendered): for "
             "github.com use gh_api; for a Gitea/Forgejo host fetch its "
             "/api/v1/... JSON (e.g. .../releases/tags/TAG or "
@@ -229,10 +232,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 WEB_SEARCH_SCHEMA: dict[str, Any] = {
     "name": "web_search",
     "description": (
-        "Search the web via the action's configured search engine. Returns a "
-        "ranked list of {title, url, snippet}. Use it to find an authoritative "
-        "page (release notes, a support/compatibility matrix, an advisory) when "
-        "you do not already know its exact URL, then web_fetch the best result."
+        "Discover URLs through the action's fixed search provider. Search is "
+        "not evidence: approved-source results may include bounded snippets, "
+        "while unapproved results contain metadata only. Use web_fetch on an "
+        "approved result before relying on it for any claim."
     ),
     "parameters": {
         "type": "object",
@@ -246,6 +249,18 @@ WEB_SEARCH_SCHEMA: dict[str, Any] = {
         "additionalProperties": False,
     },
 }
+
+
+def web_tool_schemas(search_url: str, source_policy: Any) -> list[dict[str, Any]]:
+    """Build the catalogue, advertising discovery only when it can be safe."""
+    schemas = list(TOOL_SCHEMAS)
+    if (
+        str(search_url or "").strip()
+        and source_policy is not None
+        and bool(getattr(source_policy, "has_approved_sources", False))
+    ):
+        schemas.append(WEB_SEARCH_SCHEMA)
+    return schemas
 
 # Per-tool result cap applied when re-adding tool output to the conversation
 # (bytes). Roughly tracks the executor's own internal caps so a tool's
