@@ -231,7 +231,7 @@ Version 2 accepts these top-level keys and rejects unknown security-sensitive ke
 }
 ```
 
-Recipe `execution` is exactly `coverage`, `dedicated`, or `independent`. Source rules require a concrete lowercase host and support `include_subdomains`, `path_prefixes`, `classification`, and `max_age_hours`; only HTTPS is allowed. Keep `pr_reviewer.specialists.load_specialist_config` as a warning compatibility facade that returns the migrated policy's legacy projection until Task 16 removes old callers.
+Recipe `execution` is exactly `coverage`, `dedicated`, or `independent`. Source rules require a concrete lowercase host and support `include_subdomains`, `path_prefixes`, `classification`, and `max_age_hours`; only HTTPS is allowed. Keep `pr_reviewer.specialists.load_specialist_config` as a warning compatibility facade that returns the migrated policy's legacy projection until Task 17 removes old callers.
 
 - [ ] **Step 4: Add runtime environment parsing tests**
 
@@ -909,7 +909,7 @@ Test this exact sequence for `review_comment`: update sticky handoff, query mana
 
 - [ ] **Step 4: Implement publisher and compatibility wrappers**
 
-Invoke `gh api graphql` with argument lists, never shell-expanded model text. Use `platform_comment_sticky` for the handoff. Preserve human-resolved threads; do not silently unresolve. Convert existing scripts into wrappers until Task 16 removes dead branches.
+Invoke `gh api graphql` with argument lists, never shell-expanded model text. Use `platform_comment_sticky` for the handoff. Preserve human-resolved threads; do not silently unresolve. Convert existing scripts into wrappers until Task 17 removes dead branches.
 
 - [ ] **Step 5: Run publication/security regressions**
 

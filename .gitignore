@@ -25,3 +25,6 @@ Thumbs.db
 
 # Mock server artifacts
 test_uploads/
+
+# Local subagent-driven development progress
+.superpowers/
