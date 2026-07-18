@@ -75,6 +75,7 @@ def _add_obligation(
     evidence_category: str,
     risk_tier: str = "normal",
     recipe_id: str | None = None,
+    recipe_execution: str | None = None,
     requires_independent_verification: bool = False,
     required_evidence_categories: tuple[str, ...] | None = None,
     mandatory: bool = True,
@@ -97,6 +98,7 @@ def _add_obligation(
         seed_hints=tuple(seed_hints),
         explanation=explanation,
         recipe_id=recipe_id,
+        recipe_execution=recipe_execution,
         mandatory=mandatory,
     ))
 
@@ -250,6 +252,7 @@ def derive_obligations(
             _add_obligation(
                 obligations, origin="recipe", subject=recipe.id, evidence_category=category,
                 risk_tier=recipe.priority, recipe_id=recipe.id,
+                recipe_execution=recipe.execution,
                 requires_independent_verification=recipe.execution == "independent",
                 scope=changed_files, seed_hints=recipe.seed_paths or changed_files,
                 explanation=f"Repository recipe '{recipe.id}' requires {category} evidence.",

@@ -64,6 +64,7 @@ class CoverageObligation:
     seed_hints: tuple[str, ...] = ()
     explanation: str = ""
     recipe_id: str | None = None
+    recipe_execution: str | None = None
     mandatory: bool = True
 
     @property

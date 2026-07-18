@@ -157,6 +157,26 @@ def test_independent_recipe_requires_independent_verification():
 
     recipe_obligation = next(item for item in obligations if item.recipe_id == "security")
     assert recipe_obligation.requires_independent_verification is True
+    assert recipe_obligation.recipe_execution == "independent"
+
+
+@pytest.mark.parametrize("execution", ["coverage", "dedicated", "independent"])
+def test_matching_recipe_obligation_retains_execution_policy(execution):
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy
+
+    policy = ReviewPolicy.minimal(recipes=(RecipePolicy(
+        id="delivery", title="Delivery", objective="Trace delivery",
+        execution=execution, match={"file_roles_any": ("implementation",)},
+        expected_evidence=("consumer",),
+    ),))
+
+    obligations = derive_obligations(
+        {"changed_files": ["src/main.py"], "file_roles": ["implementation"]}, {}, policy
+    )
+
+    recipe_obligation = next(item for item in obligations if item.recipe_id == "delivery")
+    assert recipe_obligation.recipe_execution == execution
 
 
 def test_recipe_lifecycle_statuses_survive_tuple_materialization():
