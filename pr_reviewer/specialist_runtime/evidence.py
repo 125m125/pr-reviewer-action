@@ -359,16 +359,20 @@ class EvidenceStore:
         sanitized_arguments, arguments_redacted = _sanitize_value(arguments)
         sanitized_provenance, provenance_redacted = _sanitize_provenance(provenance)
         if source is None:
+            sanitized_source = None
             source_redacted = False
         elif "://" in str(source):
-            _, source_redacted = _sanitize_url(source)
+            sanitized_source, source_redacted = _sanitize_url(source)
         else:
-            _, source_redacted = _sanitize_value(str(source))
+            sanitized_source, source_redacted = _sanitize_value(str(source))
+            sanitized_source = str(sanitized_source)
+        canonical_supersedes = self._canonical_relationship_ids(supersedes)
+        canonical_contradicts = self._canonical_relationship_ids(contradicts)
         content, redacted, truncated = _bounded_content(
             _result_content(result), self._max_content_bytes
         )
         canonical_key = canonical_evidence_key(
-            tool, sanitized_arguments, result, source=source, provenance=sanitized_provenance,
+            tool, sanitized_arguments, result, source=sanitized_source, provenance=sanitized_provenance,
             max_content_bytes=self._max_content_bytes,
         )
         if status in _SUCCESS_STATUSES and canonical_key in self._successful_canonical:
@@ -381,7 +385,7 @@ class EvidenceStore:
                 self._records[evidence_id] = updated
                 return updated
 
-        source_identity = _source_identity(sanitized_arguments, source)
+        source_identity = _source_identity(sanitized_arguments, sanitized_source)
         source_path = None
         raw_path = sanitized_arguments.get(
             "path", sanitized_arguments.get("file", sanitized_arguments.get("repository_path"))
@@ -413,8 +417,8 @@ class EvidenceStore:
             truncated=truncated,
             redacted=redacted or arguments_redacted or provenance_redacted or source_redacted,
             imported_by=(session_id,),
-            supersedes=tuple(str(item) for item in supersedes),
-            contradicts=tuple(str(item) for item in contradicts),
+            supersedes=canonical_supersedes,
+            contradicts=canonical_contradicts,
         )
         self._records[record.id] = record
         if record.is_usable_for_coverage:
@@ -424,26 +428,51 @@ class EvidenceStore:
     @staticmethod
     def _is_fresh(record: EvidenceRecord, now: float) -> bool:
         provenance = record.provenance
-        if provenance.retrieved_at is None or provenance.max_age_hours is None:
+        if provenance.max_age_hours is None:
             return True
+        if provenance.retrieved_at is None:
+            return False
         return now < provenance.retrieved_at + provenance.max_age_hours * 3600
 
-    def import_into_session(self, session_id: str, evidence_id: str) -> EvidenceRecord:
+    def _canonical_relationship_ids(self, evidence_ids: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+        if isinstance(evidence_ids, str):
+            raise ValueError("evidence relationships must be a sequence of known record IDs")
+        canonical_ids: list[str] = []
+        for evidence_id in evidence_ids:
+            if not isinstance(evidence_id, str) or not evidence_id.strip():
+                raise ValueError("evidence relationships must be non-empty known record IDs")
+            record = self._records.get(evidence_id)
+            if record is None:
+                raise ValueError("evidence relationship must reference a known record")
+            canonical_ids.append(record.canonical_key)
+        return tuple(canonical_ids)
+
+    def import_into_session(
+        self, session_id: str, evidence_id: str, *, now: float | None = None,
+    ) -> EvidenceRecord:
         """Record evidence reuse while retaining the original collector."""
         session_id = str(session_id).strip()
         if not session_id:
             raise ValueError("session_id must be non-empty")
         record = self._records[evidence_id]
+        current_time = time.time() if now is None else float(now)
+        if not self._is_fresh(record, current_time):
+            raise ValueError("evidence is not reusable because it is stale or lacks a retrieval timestamp")
         imported_by = tuple(sorted(set(record.imported_by) | {session_id}))
         updated = replace(record, imported_by=imported_by)
         self._records[evidence_id] = updated
         return updated
 
-    def lookup_canonical(self, canonical_key: str) -> EvidenceRecord | None:
+    def lookup_canonical(
+        self, canonical_key: str, *, now: float | None = None,
+    ) -> EvidenceRecord | None:
         """Find reusable successful evidence by canonical key or evidence ID."""
         evidence_id = self._successful_canonical.get(canonical_key, canonical_key)
         record = self._records.get(evidence_id)
-        return record if record and record.is_usable_for_coverage else None
+        current_time = time.time() if now is None else float(now)
+        if not record or not record.is_usable_for_coverage or not self._is_fresh(record, current_time):
+            return None
+        return record
 
     def snapshot(self) -> EvidenceSnapshot:
         """Freeze the store's current records for a later wave's stable view."""

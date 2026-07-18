@@ -2,6 +2,8 @@
 
 from dataclasses import replace
 
+import pytest
+
 from pr_reviewer.specialist_runtime.evidence import (
     EvidenceProvenance,
     EvidenceStore,
@@ -118,7 +120,7 @@ def test_snapshot_remains_immutable_when_later_session_imports_existing_evidence
 
     assert snapshot.records[0].imported_by == ("S1",)
     assert snapshot.records[0].provenance.retrieved_at == 100.0
-    assert store.lookup_canonical(first.id).imported_by == ("S1", "S2")
+    assert store.lookup_canonical(first.id, now=200.0).imported_by == ("S1", "S2")
 
 
 def test_retained_evidence_redacts_nested_arguments_and_url_metadata():
@@ -191,21 +193,30 @@ def test_expired_evidence_is_refetched_but_fresh_retrieval_time_does_not_change_
         result={"status": "ok", "result": {"content": "x = 1"}},
         provenance=EvidenceProvenance(retrieved_at=2_000.0, max_age_hours=1), now=2_000.0,
     )
+    before_stale_import = store.snapshot()
+    assert store.lookup_canonical(first.id, now=5_000.0) is None
+    with pytest.raises(ValueError, match="not reusable"):
+        store.import_into_session("S3", first.id, now=5_000.0)
     refreshed = store.add_tool_result(
-        session_id="S3", tool="read_file", arguments={"path": "a.py"},
+        session_id="S4", tool="read_file", arguments={"path": "a.py"},
         result={"status": "ok", "result": {"content": "x = 1"}},
         provenance=EvidenceProvenance(retrieved_at=5_000.0, max_age_hours=1), now=5_000.0,
     )
 
     assert reused.id == first.id
+    assert before_stale_import.records[0].imported_by == ("S1", "S2")
     assert refreshed.id != first.id
-    assert refreshed.collector_session_id == "S3"
+    assert refreshed.collector_session_id == "S4"
 
 
 def test_provenance_and_evidence_relationships_are_immutable_values():
     store = EvidenceStore()
-    supersedes = ["E-old"]
-    contradicts = ["E-conflict"]
+    prior = store.add_tool_result(
+        session_id="S0", tool="read_file", arguments={"path": "old.py"},
+        result={"status": "ok", "result": {"content": "old"}},
+    )
+    supersedes = [prior.id]
+    contradicts = [prior.id]
     record = store.add_tool_result(
         session_id="S1", tool="read_file", arguments={"path": "a.py"},
         result={"status": "ok", "result": {"content": "x = 1"}},
@@ -215,6 +226,56 @@ def test_provenance_and_evidence_relationships_are_immutable_values():
     supersedes.append("caller-mutation")
     contradicts.append("caller-mutation")
 
-    assert record.supersedes == ("E-old",)
-    assert record.contradicts == ("E-conflict",)
+    assert record.supersedes == (prior.canonical_key,)
+    assert record.contradicts == (prior.canonical_key,)
     assert record.provenance.head_sha == "head-a"
+
+
+def test_age_governed_evidence_without_timestamp_is_not_reusable_from_any_path():
+    store = EvidenceStore()
+    original = store.add_tool_result(
+        session_id="S1", tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "result": {"content": "x = 1"}},
+        provenance=EvidenceProvenance(max_age_hours=1), now=100.0,
+    )
+    snapshot = store.snapshot()
+
+    assert store.lookup_canonical(original.id, now=100.0) is None
+    with pytest.raises(ValueError, match="not reusable"):
+        store.import_into_session("S2", original.id, now=100.0)
+    refreshed = store.add_tool_result(
+        session_id="S3", tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "result": {"content": "x = 1"}},
+        provenance=EvidenceProvenance(max_age_hours=1), now=100.0,
+    )
+
+    assert snapshot.records[0].imported_by == ("S1",)
+    assert refreshed.id != original.id
+
+
+def test_explicit_non_url_source_is_sanitized_before_storage_and_identity():
+    store = EvidenceStore()
+    secret = "supersecretvalue"
+    record = store.add_tool_result(
+        session_id="S1", tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "result": {"content": "public"}},
+        source=f"token={secret}",
+    )
+
+    retained = "\n".join((
+        record.arguments, record.source_identity, record.canonical_key, repr(store.snapshot()),
+    ))
+    assert secret not in retained
+    assert record.redacted is True
+
+
+def test_unknown_or_secret_bearing_relationship_ids_are_rejected_without_recording_them():
+    store = EvidenceStore()
+    with pytest.raises(ValueError, match="known record"):
+        store.add_tool_result(
+            session_id="S1", tool="read_file", arguments={"path": "a.py"},
+            result={"status": "ok", "result": {"content": "public"}},
+            supersedes=("evidence:supersecretvalue",),
+        )
+
+    assert store.snapshot().records == ()
