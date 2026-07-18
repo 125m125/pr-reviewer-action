@@ -58,6 +58,9 @@ merge readiness.
    the human authorization boundary for changed policy and source access.
 8. **Security remains deterministic.** Models cannot widen source access, tool
    access, budgets, verdict policy, or mandatory coverage.
+9. **Publishing separates handoff from evidence.** The sticky comment helps a
+   human plan the review; resolvable finding threads contain detailed claims and
+   evidence.
 
 ## 4. Top-level architecture
 
@@ -264,6 +267,20 @@ A schema-versioned policy file on the reviewed head/current branch may:
 - Define source-access rules.
 - Configure approval and publishing policy.
 
+Existing version-1 `components` remain authoritative topology knowledge. Matching
+version-1 `recipes` are migrated into named mandatory coverage obligations rather
+than treated as advisory candidate specialists. A recipe's identity and terminal
+coverage status remain visible even when the assignment planner groups its work
+into a more specialized model-created session.
+
+Each recipe may declare an execution policy:
+
+- `coverage` (default): its obligations are mandatory, but the planner may group
+  them into a coherent specialist assignment.
+- `dedicated`: its obligations require a distinct named specialist session.
+- `independent`: its obligations require a separate assessment whose initial
+  checkpoint is not exposed to another specialist's conclusions.
+
 The manual trigger is the human authorization boundary. A changed policy is
 effective for that same review. The run must prominently disclose a policy change,
 record its diff or a bounded summary, and record the exact head SHA and policy hash
@@ -287,6 +304,7 @@ A coverage obligation has:
 - Redundancy requirement.
 - Scope and seed hints.
 - Explanation suitable for the artifact.
+- Repository recipe ID when the obligation originates from a configured recipe.
 
 Example obligations include:
 
@@ -299,6 +317,19 @@ Example obligations include:
 Models cannot remove, weaken, or mark mandatory obligations satisfied. A model may
 challenge applicability with evidence; the deterministic engine applies the
 configured applicability predicate and records the decision.
+
+Every configured recipe receives an explicit lifecycle status; `assigned` is an
+intermediate state and all other applicable states are terminal:
+
+- `not_applicable`
+- `assigned`
+- `covered`
+- `partially_covered`
+- `unresolved`
+- `suppressed_by_policy`
+
+The artifact records the specialist assignment that owned each applicable recipe,
+including cases where a model-created focus was more specialized than the recipe.
 
 ## 8. Assignment planning and overlap
 
@@ -564,7 +595,12 @@ finding without existing evidence.
 
 The finalizer receives adjudicated candidates, coverage state, material unknowns,
 repository policy, and PR intent. It does not receive every raw transcript. It
-renders the human review and recommends a verdict.
+produces two separate structured products rather than one markdown blob:
+
+- `ReviewHandoff`, optimized for the human reviewer's task planning.
+- `FindingNote[]`, optimized for evidence, discussion, and resolution.
+
+The finalizer also recommends a verdict.
 
 Deterministic policy then enforces:
 
@@ -584,14 +620,81 @@ output stays concise.
 
 One GitHub publisher interface supports:
 
-- Managed sticky comment.
-- Review comment with validated inline findings.
-- Guarded native approve/request-changes review with validated inline findings.
+- `comment`: managed sticky handoff only, with links to retained run artifacts.
+- `review_comment`: managed sticky handoff plus resolvable line/file finding
+  threads submitted as a non-verdict review.
+- `review_verdict`: the same handoff and finding threads plus guarded native
+  approve/request-changes state.
 
-Publishing consumes only the final policy result and normalized public review. It
-does not inspect raw model transcripts. Existing sanitation, reserved-marker
-stripping, inline anchoring, prior-review cleanup, and finding-thread resolution
-should be reused.
+`review_comment` is the default specialist publishing mode because it preserves
+the handoff/detail separation without allowing the action to approve or block a
+merge. Selecting `comment` is an explicit reduced-detail mode; it does not place
+finding evidence back into the sticky handoff.
+
+### 15.1 Sticky human-review handoff
+
+The managed sticky comment is intentionally concise and must not duplicate the
+detailed finding notes. It contains:
+
+- Recommendation and review status.
+- A short change map describing what behavior and components the human should
+  expect to have changed.
+- What the AI reviewed, including selected specialist focuses, contributed
+  repository recipes, and major coverage boundaries.
+- Finding count, severity distribution, and one-line themes, with links to the
+  detailed threads rather than full claims and evidence.
+- Suggested human-review focus ordered by risk, contradiction, missing evidence,
+  cross-component consequence, and weak verification.
+- Material unknowns, degraded sessions, and areas not fully covered.
+- External-source allowlist requests with purpose and related obligation.
+- Compact coverage and recovery disclosure.
+
+The handoff must explicitly state that focus suggestions do not reduce the human's
+responsibility to review the complete change. It should help divide attention, not
+claim that unlisted areas are safe.
+
+Human-focus suggestions are derived from structured coverage, risk, evidence, and
+session state. They are not a restatement of every finding and are not generated
+from unsupported model confidence.
+
+### 15.2 Detailed finding notes
+
+In `review_comment` and `review_verdict`, each accepted finding is published as its
+own managed GitHub review thread. A note contains:
+
+- Concise claim and severity.
+- Exact changed causal file and line when available.
+- User-visible consequence and causal chain.
+- Supporting and contradicting evidence.
+- External source citations where used.
+- Suggested manual verification or fix validation.
+- Stable root-cause fingerprint and managed metadata.
+
+Anchor selection follows this order:
+
+1. A defensible changed diff line becomes a `LINE` review thread.
+2. A finding tied to a changed file but not one defensible line becomes a `FILE`
+   review thread.
+3. A candidate with no honest changed causal file is not published as an
+   actionable finding thread; it becomes a handoff unknown or recheck item.
+
+Both line- and file-level review threads are resolvable on GitHub. Re-review uses
+the root-cause fingerprint to locate the existing thread. A still-open finding
+receives a reply with current evidence. A fixed finding receives a resolution
+reply and is resolved through GitHub's review-thread API when permissions allow.
+Human-resolved threads are not silently reopened; contradictory new evidence
+creates an explicit reply or a new finding according to repository policy.
+
+The sticky handoff links to finding threads but never embeds their detailed
+evidence.
+
+### 15.3 Publisher inputs and failure behavior
+
+Publishing consumes only the final policy result, `ReviewHandoff`, and normalized
+`FindingNote[]`. It does not inspect raw model transcripts. Existing sanitation,
+reserved-marker stripping, line anchoring, prior-review cleanup, and
+finding-thread resolution should be reused and extended for file-level GraphQL
+review threads.
 
 Publishing failure is recorded separately from review completion and follows a
 bounded retry policy without rerunning analysis.
@@ -664,9 +767,11 @@ One machine-readable artifact is authoritative for:
 - Lifetime budget consumption.
 - Evidence metadata, provenance, freshness, and truncation.
 - Coverage decisions.
+- Repository recipe applicability, assignment, and terminal coverage status.
 - Candidate findings, contradictions, and critic dispositions.
 - Unknowns and source-access requests.
 - Recovery and degradation events.
+- Rendered human-review handoff and finding-thread IDs/URLs/resolution state.
 - Final verdict provenance and publishing result.
 
 Raw secrets are never stored. Large evidence bodies and full transcripts may be
@@ -708,6 +813,15 @@ Automated tests must prove:
 - Unapproved pages are never fetched and their snippets are never exposed.
 - Redirects cannot escape source policy or reach private network space.
 - Published findings resolve to retained evidence.
+- Every matching repository recipe contributes accounted obligations and remains
+  traceable through assignment and terminal coverage status.
+- The sticky comment contains a human-review handoff without detailed evidence
+  duplication.
+- In `review_comment` and `review_verdict`, accepted findings publish as
+  individual resolvable line- or file-level threads; candidates without an honest
+  changed causal file become unknowns or recheck items.
+- Re-review updates and resolves managed finding threads without silently reopening
+  human-resolved discussions.
 - The finalization reserve cannot be consumed by exploration.
 - A failed model role has a bounded deterministic degradation path.
 
@@ -734,5 +848,5 @@ The branch is mergeable when:
 - Requiring multiple model providers for independent verification.
 - Preserving Anthropic- or Forgejo-specific specialist behavior in the new core.
 - Publishing raw specialist reasoning or full diagnostic transcripts.
+- Using the sticky comment as the detailed finding database.
 - Inferring defects solely from missing evidence.
-
