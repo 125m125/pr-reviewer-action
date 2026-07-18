@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import re
+from dataclasses import dataclass
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -40,6 +41,32 @@ def _obligation_id(origin: str, subject: str, evidence_category: str) -> str:
     )
 
 
+@dataclass(frozen=True)
+class _RecipeAccountingObligation(CoverageObligation):
+    """Private, tuple-safe lifecycle marker excluded from evidence work."""
+
+    recipe_status: RecipeStatus = RecipeStatus.NOT_APPLICABLE
+
+
+def _recipe_accounting_obligation(
+    recipe_id: str,
+    status: RecipeStatus,
+) -> _RecipeAccountingObligation:
+    evidence_category = f"status-{status.value}"
+    obligation_id = _obligation_id("recipe-accounting", recipe_id, evidence_category)
+    return _RecipeAccountingObligation(
+        obligation_id=obligation_id,
+        origin="recipe-accounting",
+        subject=recipe_id,
+        required_evidence_categories=(),
+        satisfaction_predicates=(f"recipe_status:{status.value}",),
+        explanation=f"Recipe '{recipe_id}' is {status.value}.",
+        recipe_id=recipe_id,
+        mandatory=False,
+        recipe_status=status,
+    )
+
+
 def _add_obligation(
     obligations: dict[str, CoverageObligation],
     *,
@@ -51,7 +78,6 @@ def _add_obligation(
     requires_independent_verification: bool = False,
     required_evidence_categories: tuple[str, ...] | None = None,
     mandatory: bool = True,
-    recipe_status: RecipeStatus | None = None,
     scope: Iterable[str] = (),
     seed_hints: Iterable[str] = (),
     explanation: str,
@@ -72,7 +98,6 @@ def _add_obligation(
         explanation=explanation,
         recipe_id=recipe_id,
         mandatory=mandatory,
-        recipe_status=recipe_status,
     ))
 
 
@@ -233,12 +258,8 @@ def derive_obligations(
     for recipe_id, status in recipe_states.items():
         if status not in {RecipeStatus.NOT_APPLICABLE, RecipeStatus.SUPPRESSED_BY_POLICY}:
             continue
-        _add_obligation(
-            obligations, origin="recipe-accounting", subject=recipe_id,
-            evidence_category=f"status-{status.value}", recipe_id=recipe_id,
-            required_evidence_categories=(), mandatory=False, recipe_status=status,
-            explanation=f"Recipe '{recipe_id}' is {status.value}.",
-        )
+        marker = _recipe_accounting_obligation(recipe_id, status)
+        obligations.setdefault(marker.obligation_id, marker)
 
     return tuple(obligations[obligation_id] for obligation_id in sorted(obligations))
 
@@ -251,7 +272,7 @@ class CoverageLedger:
         self._recipe_states: dict[str, RecipeStatus] = {}
         self._obligations = {}
         for item in items:
-            if item.recipe_status is not None:
+            if isinstance(item, _RecipeAccountingObligation):
                 if item.mandatory or item.required_evidence_categories or not item.recipe_id:
                     raise ValueError("recipe accounting obligations must be non-mandatory and evidence-free")
                 self._recipe_states[item.recipe_id] = item.recipe_status

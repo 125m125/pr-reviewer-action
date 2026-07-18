@@ -1,3 +1,5 @@
+import pytest
+
 from pr_reviewer.specialist_runtime.types import CoverageObligation
 
 
@@ -174,8 +176,26 @@ def test_recipe_lifecycle_statuses_survive_tuple_materialization():
         {"changed_files": ["src/main.py"], "file_roles": ["implementation"]}, {}, policy
     ))
 
-    assert CoverageLedger(materialized).recipe_statuses() == {
+    ledger = CoverageLedger(materialized)
+    assert ledger.recipe_statuses() == {
         "disabled": "suppressed_by_policy", "unmatched": "not_applicable",
     }
-    bookkeeping = [item for item in materialized if item.recipe_status is not None]
+    bookkeeping = [item for item in materialized if not item.mandatory and not item.required_evidence]
     assert all(not item.mandatory and not item.required_evidence for item in bookkeeping)
+    with pytest.raises(KeyError, match="unknown coverage obligation"):
+        ledger.attach_evidence(bookkeeping[0].id, "E-marker")
+
+
+def test_public_coverage_obligation_has_no_lifecycle_field():
+    obligation = CoverageObligation(
+        obligation_id="topology:src-main:implementation",
+        origin="topology",
+        subject="src/main.py",
+        required_evidence_categories=("implementation",),
+    )
+
+    assert obligation.mandatory is True
+    assert obligation.id == obligation.obligation_id
+    assert obligation.required_evidence == obligation.required_evidence_categories
+    assert "recipe_status" not in CoverageObligation.__dataclass_fields__
+    assert not hasattr(obligation, "recipe_status")
