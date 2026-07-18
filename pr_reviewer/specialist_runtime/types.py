@@ -64,6 +64,17 @@ class CoverageObligation:
     seed_hints: tuple[str, ...] = ()
     explanation: str = ""
     recipe_id: str | None = None
+    mandatory: bool = True
+
+    @property
+    def id(self) -> str:
+        """Compatibility alias for the stable obligation identifier."""
+        return self.obligation_id
+
+    @property
+    def required_evidence(self) -> tuple[str, ...]:
+        """Compatibility alias for the required evidence categories."""
+        return self.required_evidence_categories
 
 
 @dataclass(frozen=True)
