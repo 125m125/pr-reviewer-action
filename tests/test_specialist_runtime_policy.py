@@ -108,3 +108,24 @@ def test_repository_policy_paths_reject_any_parent_segment(tmp_path, fragment):
 
     with pytest.raises(ValueError, match="repository-relative paths"):
         load_review_policy(path)
+
+
+@pytest.mark.parametrize("unsafe_path", [r"C:\outside\**", "/outside/**"])
+@pytest.mark.parametrize("fragment_builder", [
+    lambda path: {"components": [{"id": "worker", "paths": [path]}]},
+    lambda path: {"recipes": [{"id": "recipe", "seed_paths": [path]}]},
+    lambda path: {"recipes": [{"id": "recipe", "related_paths": [path]}]},
+    lambda path: {"recipes": [{"id": "recipe", "match": {"paths_any": [path]}}]},
+    lambda path: {"generated_artifacts": [{"id": "generated", "source_of_truth": [path]}]},
+    lambda path: {"generated_artifacts": [{"id": "generated", "generator_config": [path]}]},
+    lambda path: {"generated_artifacts": [{"id": "generated", "output_paths": [path]}]},
+    lambda path: {"exclude": {"paths": [path]}},
+])
+def test_repository_policy_paths_reject_rooted_and_drive_qualified_forms(
+    tmp_path, unsafe_path, fragment_builder
+):
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({"version": 2, **fragment_builder(unsafe_path)}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="repository-relative paths"):
+        load_review_policy(path)

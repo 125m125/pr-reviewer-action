@@ -61,8 +61,14 @@ def _strings(value: Any, *, field_name: str, limit: int = 100, chars: int = 1000
 def _repository_paths(value: Any, *, field_name: str, limit: int = 100) -> tuple[str, ...]:
     paths = []
     for item in _strings(value, field_name=field_name, limit=limit):
-        normalized = _posix(item)
-        if not normalized or ".." in normalized.split("/"):
+        slash_normalized = item.replace("\\", "/")
+        normalized = _posix(slash_normalized)
+        if (
+            not normalized
+            or slash_normalized.startswith("/")
+            or re.match(r"^[A-Za-z]:", slash_normalized)
+            or ".." in normalized.split("/")
+        ):
             raise ValueError(f"{field_name} must contain repository-relative paths")
         paths.append(normalized)
     return tuple(paths)
