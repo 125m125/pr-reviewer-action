@@ -325,6 +325,37 @@ def test_fallback_overflows_oversized_dedicated_recipe_group(topology):
     assert plan.unassigned_obligation_ids == tuple(item.id for item in obligations)
 
 
+def test_fallback_globally_prioritizes_post_chunk_risk(topology):
+    obligations = (
+        CoverageObligation(
+            obligation_id="topology:worker:a-critical", origin="topology", subject="worker",
+            required_evidence_categories=("critical",), risk_tier="critical",
+            scope=("worker/a.py",),
+        ),
+        CoverageObligation(
+            obligation_id="topology:worker:z-low", origin="topology", subject="worker",
+            required_evidence_categories=("low",), risk_tier="low",
+            scope=("worker/a.py",),
+        ),
+        CoverageObligation(
+            obligation_id="topology:queue:m-high", origin="topology", subject="queue",
+            required_evidence_categories=("high",), risk_tier="high",
+            scope=("queue/consumer.py",),
+        ),
+    )
+    two_lanes = RuntimeConfig(
+        review_deadline_sec=375, model_request_timeout_sec=300, concurrency=2, max_sessions=2,
+        session_limits=BudgetLimits(model_turns=12, tool_calls=20, recoveries=1),
+    )
+
+    plan = fallback_assignment_plan(obligations, topology, two_lanes)
+    assigned_ids = {item_id for item in plan.assignments for item_id in item.obligation_ids}
+
+    assert [item.priority for item in plan.assignments] == ["critical", "high"]
+    assert "topology:queue:m-high" in assigned_ids
+    assert plan.unassigned_obligation_ids == ("topology:worker:z-low",)
+
+
 def test_planner_prompt_includes_immutable_obligation_ids_only(obligations, topology, runtime_config):
     prompt = planner_prompt(obligations, topology, runtime_config)
 

@@ -404,6 +404,7 @@ def fallback_assignment_plan(
             for index, chunk in enumerate(chunks, start=1):
                 chunk_key = key if len(chunks) == 1 else f"{key}:chunk:{index}"
                 candidates.append((chunk_key, chunk))
+    candidates.sort(key=lambda item: (_PRIORITY_RANK[_priority(item[1])], item[0]))
     assignments: list[Assignment] = []
     turns_used = 0
     overflow_groups: list[tuple[str, list[CoverageObligation]]] = []
