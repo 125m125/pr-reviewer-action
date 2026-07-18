@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 from typing import Any
 
@@ -42,6 +42,7 @@ class Assignment:
     estimated_turns: int
     priority: str
     overlap_justification: str = ""
+    primary_obligation_ids: tuple[str, ...] = ()
 
     @property
     def assignment_id(self) -> str:
@@ -58,6 +59,18 @@ class AssignmentPlan:
 def _assignable_obligations(obligations: Iterable[CoverageObligation]) -> tuple[CoverageObligation, ...]:
     """Exclude Task 3's non-mandatory, evidence-free lifecycle bookkeeping."""
     return tuple(item for item in obligations if item.mandatory and item.required_evidence_categories)
+
+
+def _validated_assignable_obligations(
+    obligations: Iterable[CoverageObligation],
+) -> tuple[CoverageObligation, ...]:
+    items = tuple(obligations)
+    missing_evidence = sorted(item.id for item in items if item.mandatory and not item.required_evidence_categories)
+    if missing_evidence:
+        raise AssignmentPlanError(
+            "mandatory obligation has no required evidence: " + ", ".join(missing_evidence)
+        )
+    return _assignable_obligations(items)
 
 
 def _strings(value: Any, field: str, errors: list[str], *, allow_empty: bool = False) -> tuple[str, ...]:
@@ -205,7 +218,9 @@ def _validate_recipe_execution(
     return errors
 
 
-def _validate_overlap(assignments: tuple[Assignment, ...]) -> list[str]:
+def _validate_overlap(
+    assignments: tuple[Assignment, ...], obligation_by_id: Mapping[str, CoverageObligation],
+) -> list[str]:
     errors: list[str] = []
     owners: dict[str, list[Assignment]] = defaultdict(list)
     for assignment in assignments:
@@ -214,11 +229,35 @@ def _validate_overlap(assignments: tuple[Assignment, ...]) -> list[str]:
     for obligation_id, shared in sorted(owners.items()):
         if len(shared) < 2:
             continue
+        if _priority((obligation_by_id[obligation_id],)) not in {"critical", "high"}:
+            errors.append(f"shared obligation '{obligation_id}' is only allowed for high or critical risk")
         if any(not assignment.overlap_justification for assignment in shared):
             errors.append(f"shared obligation '{obligation_id}' requires overlap justification")
-        if len({(assignment.objective, assignment.lenses) for assignment in shared}) == 1:
+        if len({assignment.objective for assignment in shared}) != len(shared) or (
+            len({assignment.lenses for assignment in shared}) != len(shared)
+        ):
             errors.append(f"shared obligation '{obligation_id}' has no distinct analytical focus")
     return errors
+
+
+def _with_primary_ownership(assignments: tuple[Assignment, ...]) -> tuple[Assignment, ...]:
+    owners: dict[str, list[str]] = defaultdict(list)
+    for assignment in assignments:
+        for obligation_id in assignment.obligation_ids:
+            owners[obligation_id].append(assignment.id)
+    primary_by_assignment: dict[str, list[str]] = defaultdict(list)
+    for obligation_id, assignment_ids in owners.items():
+        primary_by_assignment[min(assignment_ids)].append(obligation_id)
+    return tuple(
+        replace(assignment, primary_obligation_ids=tuple(sorted(primary_by_assignment[assignment.id])))
+        for assignment in assignments
+    )
+
+
+def _deadline_turn_capacity(config: RuntimeConfig) -> int:
+    exploration_percent = config.phase_shares.initial + config.phase_shares.followup
+    exploration_seconds = (config.review_deadline_sec * exploration_percent) // 100
+    return (exploration_seconds // config.model_request_timeout_sec) * config.concurrency
 
 
 def _validate_budget(assignments: tuple[Assignment, ...], config: RuntimeConfig) -> list[str]:
@@ -228,10 +267,8 @@ def _validate_budget(assignments: tuple[Assignment, ...], config: RuntimeConfig)
     for assignment in assignments:
         if assignment.estimated_turns > config.session_limits.model_turns:
             errors.append(f"assignment '{assignment.id}' estimated turns exceed per-session limit")
-        if assignment.estimated_turns > config.review_deadline_sec:
-            errors.append(f"assignment '{assignment.id}' estimated turns exceed review deadline")
-    if sum(item.estimated_turns for item in assignments) > config.review_deadline_sec * config.concurrency:
-        errors.append("estimated turns exceed deadline capacity")
+    if sum(item.estimated_turns for item in assignments) > _deadline_turn_capacity(config):
+        errors.append("estimated turns exceed deadline turn capacity")
     return errors
 
 
@@ -241,7 +278,7 @@ def validate_assignment_plan(
 ) -> AssignmentPlan:
     """Validate model grouping; the immutable obligation set remains authoritative."""
     del topology
-    assignable = _assignable_obligations(obligations)
+    assignable = _validated_assignable_obligations(obligations)
     obligation_by_id = {item.id: item for item in assignable}
     errors: list[str] = []
     if len(obligation_by_id) != len(assignable):
@@ -261,12 +298,22 @@ def validate_assignment_plan(
     missing = sorted(set(obligation_by_id) - assigned_ids)
     if missing:
         errors.append(f"unassigned mandatory obligations: {', '.join(missing)}")
-    errors.extend(_validate_overlap(assignments))
+    for assignment in assignments:
+        effective_priority = _priority(
+            obligation_by_id[obligation_id] for obligation_id in assignment.obligation_ids
+            if obligation_id in obligation_by_id
+        )
+        if assignment.priority != effective_priority:
+            errors.append(
+                f"assignment '{assignment.id}' priority must equal immutable risk "
+                f"'{effective_priority}'"
+            )
+    errors.extend(_validate_overlap(assignments, obligation_by_id))
     errors.extend(_validate_recipe_execution(assignments, obligation_by_id))
     errors.extend(_validate_budget(assignments, runtime_config))
     if errors:
         raise AssignmentPlanError(errors)
-    return AssignmentPlan(assignments=assignments)
+    return AssignmentPlan(assignments=_with_primary_ownership(assignments))
 
 
 def repair_prompt(errors: Iterable[str], previous_plan: Mapping[str, Any]) -> dict[str, Any]:
@@ -326,15 +373,28 @@ def fallback_assignment_plan(
     """Create a policy-preserving deterministic plan, recording capacity overflow."""
     groups: dict[str, list[CoverageObligation]] = defaultdict(list)
     components = _component_paths(topology)
-    for obligation in _assignable_obligations(obligations):
+    for obligation in _validated_assignable_obligations(obligations):
         groups[_fallback_group(obligation, components)].append(obligation)
     ordered = sorted(groups.items(), key=lambda item: (_PRIORITY_RANK[_priority(item[1])], item[0]))
-    assignments = tuple(
-        _fallback_assignment(key, tuple(sorted(items, key=lambda item: item.id)), runtime_config)
-        for key, items in ordered[:runtime_config.max_sessions]
+    assignments: list[Assignment] = []
+    turns_used = 0
+    overflow_groups: list[tuple[str, list[CoverageObligation]]] = []
+    for index, (key, items) in enumerate(ordered):
+        assignment = _fallback_assignment(key, tuple(sorted(items, key=lambda item: item.id)), runtime_config)
+        if len(assignments) >= runtime_config.max_sessions or (
+            turns_used + assignment.estimated_turns > _deadline_turn_capacity(runtime_config)
+        ):
+            overflow_groups = ordered[index:]
+            break
+        assignments.append(assignment)
+        turns_used += assignment.estimated_turns
+    unassigned = tuple(sorted(
+        obligation.id for _, items in overflow_groups for obligation in items
+    ))
+    return AssignmentPlan(
+        assignments=_with_primary_ownership(tuple(assignments)),
+        unassigned_obligation_ids=unassigned,
     )
-    unassigned = tuple(sorted(obligation.id for _, items in ordered[runtime_config.max_sessions:] for obligation in items))
-    return AssignmentPlan(assignments=assignments, unassigned_obligation_ids=unassigned)
 
 
 def planner_prompt(
@@ -352,7 +412,7 @@ def planner_prompt(
                 "recipe_execution": _recipe_execution(item),
                 "requires_independent_verification": item.requires_independent_verification,
             }
-            for item in _assignable_obligations(obligations)
+            for item in _validated_assignable_obligations(obligations)
         },
         "topology": topology,
         "budget": {
@@ -360,5 +420,6 @@ def planner_prompt(
             "concurrency": runtime_config.concurrency,
             "max_sessions": runtime_config.max_sessions,
             "max_turns_per_session": runtime_config.session_limits.model_turns,
+            "deadline_turn_capacity": _deadline_turn_capacity(runtime_config),
         },
     }

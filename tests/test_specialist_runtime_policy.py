@@ -78,11 +78,13 @@ def test_source_rule_normalizes_valid_https_policy(tmp_path):
 def test_runtime_config_uses_direct_defaults_and_legacy_aliases():
     config = RuntimeConfig.from_env({
         "SPECIALIST_MAX_TOOL_CALLS_PER_PASS": "17",
+        "AI_REQUEST_TIMEOUT_SEC": "42",
         "SPECIALIST_PHASE_SHARES": '{"planning":10,"initial":60,"followup":20,"finalization":10}',
     })
 
     assert config.review_deadline_sec == 7200
     assert config.concurrency == 1
+    assert config.model_request_timeout_sec == 42
     assert config.session_limits.tool_calls == 17
     assert config.deprecation_warnings == ("specialist_max_tool_calls_per_pass",)
 

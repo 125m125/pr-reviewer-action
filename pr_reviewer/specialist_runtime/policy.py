@@ -178,6 +178,7 @@ class ReviewPolicy:
 @dataclass(frozen=True)
 class RuntimeConfig:
     review_deadline_sec: int = 7200
+    model_request_timeout_sec: int = 300
     phase_shares: PhaseShares = field(default_factory=PhaseShares)
     concurrency: int = 1
     max_sessions: int = 8
@@ -222,6 +223,7 @@ class RuntimeConfig:
 
         return cls(
             review_deadline_sec=setting("SPECIALIST_REVIEW_DEADLINE_SEC", 7200),
+            model_request_timeout_sec=setting("AI_REQUEST_TIMEOUT_SEC", 300),
             phase_shares=phase_shares,
             concurrency=setting("SPECIALIST_CONCURRENCY", 1),
             max_sessions=setting(

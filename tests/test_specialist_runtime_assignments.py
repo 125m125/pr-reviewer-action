@@ -28,6 +28,7 @@ def topology():
 def runtime_config():
     return RuntimeConfig(
         review_deadline_sec=60,
+        model_request_timeout_sec=1,
         concurrency=2,
         max_sessions=4,
         session_limits=BudgetLimits(model_turns=12, tool_calls=20, recoveries=1),
@@ -112,6 +113,18 @@ def test_planner_cannot_omit_recipe_obligation(obligations, topology, runtime_co
         validate_assignment_plan(raw, obligations, topology, runtime_config)
 
 
+def test_mandatory_obligation_without_evidence_rejects_prompt_and_plan(topology, runtime_config):
+    obligations = (CoverageObligation(
+        obligation_id="mandatory:missing-evidence", origin="risk-rule", subject="unknown",
+        required_evidence_categories=(), mandatory=True,
+    ),)
+
+    with pytest.raises(AssignmentPlanError, match="mandatory obligation has no required evidence"):
+        planner_prompt(obligations, topology, runtime_config)
+    with pytest.raises(AssignmentPlanError, match="mandatory obligation has no required evidence"):
+        validate_assignment_plan({"assignments": []}, obligations, topology, runtime_config)
+
+
 def test_model_created_focus_preserves_recipe_identity(obligations, topology, runtime_config):
     plan = validate_assignment_plan(complete_plan_for(obligations), obligations, topology, runtime_config)
 
@@ -144,6 +157,56 @@ def test_shared_obligation_requires_overlap_justification(obligations, topology,
         validate_assignment_plan(raw, obligations, topology, runtime_config)
 
 
+def test_shared_high_risk_obligation_has_deterministic_primary_owner(obligations, topology, runtime_config):
+    raw = complete_plan_for(obligations)
+    raw["assignments"][0]["overlap_justification"] = "Independent delivery perspective"
+    raw["assignments"].append(assignment(
+        "topology:worker:implementation", id="a-independent-worker",
+        title="Independent worker risk", objective="Challenge worker failure handling",
+        lenses=["failure-analysis"], expected_evidence=["implementation"],
+        boundary_paths=[], overlap_justification="Independent delivery perspective",
+    ))
+
+    plan = validate_assignment_plan(raw, obligations, topology, runtime_config)
+    by_id = {item.id: item for item in plan.assignments}
+
+    assert by_id["a-independent-worker"].primary_obligation_ids == (
+        "topology:worker:implementation",
+    )
+    assert "topology:worker:implementation" not in by_id["queue-loss-boundary"].primary_obligation_ids
+
+
+def test_normal_risk_obligation_cannot_have_shared_ownership(obligations, topology, runtime_config):
+    normal = CoverageObligation(
+        obligation_id="topology:queue:normal", origin="topology", subject="queue",
+        required_evidence_categories=("queue",), scope=("queue/consumer.py",),
+    )
+    raw = complete_plan_for(obligations + (normal,))
+    raw["assignments"][0]["obligation_ids"].append(normal.id)
+    raw["assignments"][0]["expected_evidence"].append("queue")
+    raw["assignments"][0]["overlap_justification"] = "Cross-check queue behavior"
+    raw["assignments"].append(assignment(
+        normal.id, id="queue-cross-check", title="Queue cross-check",
+        objective="Independently inspect queue behavior", lenses=["queue"],
+        seed_paths=["queue/consumer.py"], boundary_paths=[], expected_evidence=["queue"],
+        priority="normal", overlap_justification="Cross-check queue behavior",
+    ))
+
+    with pytest.raises(AssignmentPlanError, match="only allowed for high or critical"):
+        validate_assignment_plan(raw, obligations + (normal,), topology, runtime_config)
+
+
+@pytest.mark.parametrize("priority", ["normal", "critical"])
+def test_planner_priority_must_equal_immutable_obligation_risk(
+    obligations, topology, runtime_config, priority,
+):
+    raw = complete_plan_for(obligations)
+    raw["assignments"][0]["priority"] = priority
+
+    with pytest.raises(AssignmentPlanError, match="priority must equal immutable risk"):
+        validate_assignment_plan(raw, obligations, topology, runtime_config)
+
+
 def test_dedicated_and_independent_recipes_are_isolated(obligations, topology, runtime_config):
     raw = complete_plan_for(obligations)
     raw["assignments"][0]["obligation_ids"].append("recipe:release:artifact")
@@ -159,17 +222,15 @@ def test_dedicated_and_independent_recipes_are_isolated(obligations, topology, r
         validate_assignment_plan(raw, obligations, topology, runtime_config)
 
 
-def test_session_and_turn_caps_make_plan_infeasible(obligations, topology, runtime_config):
+def test_deadline_turn_capacity_rejects_plan_without_other_caps(obligations, topology):
     raw = complete_plan_for(obligations)
-    raw["assignments"].append(assignment("topology:worker:implementation", id="extra",
-                                           overlap_justification="Independent follow-up"))
-    small = RuntimeConfig(
-        review_deadline_sec=2, concurrency=1, max_sessions=3,
-        session_limits=BudgetLimits(model_turns=2, tool_calls=2, recoveries=1),
+    deadline_only = RuntimeConfig(
+        review_deadline_sec=900, model_request_timeout_sec=300, concurrency=1, max_sessions=4,
+        session_limits=BudgetLimits(model_turns=12, tool_calls=20, recoveries=1),
     )
 
-    with pytest.raises(AssignmentPlanError, match="session cap|estimated turns|deadline"):
-        validate_assignment_plan(raw, obligations, topology, small)
+    with pytest.raises(AssignmentPlanError, match="deadline turn capacity"):
+        validate_assignment_plan(raw, obligations, topology, deadline_only)
 
 
 def test_repair_prompt_contains_only_errors_and_previous_plan(obligations):
@@ -185,7 +246,7 @@ def test_repair_prompt_contains_only_errors_and_previous_plan(obligations):
 
 def test_fallback_prioritizes_high_risk_and_keeps_capacity_overflow_explicit(topology, obligations):
     config = RuntimeConfig(
-        review_deadline_sec=60, concurrency=1, max_sessions=2,
+        review_deadline_sec=60, model_request_timeout_sec=1, concurrency=1, max_sessions=2,
         session_limits=BudgetLimits(model_turns=12, tool_calls=20, recoveries=1),
     )
 
@@ -197,6 +258,18 @@ def test_fallback_prioritizes_high_risk_and_keeps_capacity_overflow_explicit(top
     assert set(plan.unassigned_obligation_ids).union(assigned_ids) == {
         item.id for item in obligations if item.mandatory and item.required_evidence
     }
+    assert plan.unassigned_obligation_ids
+
+
+def test_fallback_stops_at_deadline_turn_capacity(topology, obligations):
+    config = RuntimeConfig(
+        review_deadline_sec=900, model_request_timeout_sec=300, concurrency=1, max_sessions=4,
+        session_limits=BudgetLimits(model_turns=12, tool_calls=20, recoveries=1),
+    )
+
+    plan = fallback_assignment_plan(obligations, topology, config)
+
+    assert len(plan.assignments) == 2
     assert plan.unassigned_obligation_ids
 
 
