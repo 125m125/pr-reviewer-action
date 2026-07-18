@@ -10,6 +10,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import warnings
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
@@ -274,62 +275,15 @@ def empty_config() -> dict[str, Any]:
 
 
 def load_specialist_config(path: str | Path) -> dict[str, Any]:
-    candidate = Path(path)
-    if not candidate.is_file():
-        return empty_config()
-    data = json.loads(candidate.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or data.get("version") != 1:
-        raise ValueError("specialist config must be a JSON object with version 1")
-    result = empty_config()
-    for raw in data.get("components", []):
-        if not isinstance(raw, dict) or not raw.get("id"):
-            raise ValueError("every specialist component requires an id")
-        result["components"].append({
-            "id": _slug(raw["id"]),
-            "paths": [_posix(v) for v in _strings(raw.get("paths"), limit=100)],
-            "responsibilities": _strings(raw.get("responsibilities")),
-            "related_components": [_slug(v) for v in _strings(raw.get("related_components"))],
-            "contracts": _strings(raw.get("contracts")),
-            "invariants": _strings(raw.get("invariants")),
-        })
-    for raw in data.get("recipes", []):
-        if not isinstance(raw, dict) or not raw.get("id"):
-            raise ValueError("every specialist recipe requires an id")
-        match = raw.get("match") if isinstance(raw.get("match"), dict) else {}
-        result["recipes"].append({
-            "id": _slug(raw["id"]),
-            "match": {
-                key: _strings(match.get(key), limit=100)
-                for key in ("paths_any", "component_ids_any", "risk_flags_any", "file_roles_any")
-                if _strings(match.get(key), limit=100)
-            },
-            "title": str(raw.get("title") or raw["id"])[:160],
-            "objective": str(raw.get("objective") or "Review the matched change for correctness.")[:1000],
-            "lenses": [_slug(v) for v in _strings(raw.get("lenses"))],
-            "seed_paths": [_posix(v) for v in _strings(raw.get("seed_paths"), limit=100)],
-            "related_paths": [_posix(v) for v in _strings(raw.get("related_paths"), limit=100)],
-            "invariants": _strings(raw.get("invariants")),
-            "expected_evidence": _strings(raw.get("expected_evidence")),
-            "priority": _priority(raw.get("priority")),
-            "source": "recipe",
-        })
-    for raw in data.get("generated_artifacts", []):
-        if not isinstance(raw, dict) or not raw.get("id"):
-            raise ValueError("every generated artifact requires an id")
-        result["generated_artifacts"].append({
-            "id": _slug(raw["id"]),
-            "source_of_truth": [_posix(v) for v in _strings(raw.get("source_of_truth"), limit=50)],
-            "generator_config": [_posix(v) for v in _strings(raw.get("generator_config"), limit=50)],
-            "output_paths": [_posix(v) for v in _strings(raw.get("output_paths"), limit=50)],
-        })
-    exclude = data.get("exclude") if isinstance(data.get("exclude"), dict) else {}
-    result["exclude"] = {
-        "paths": [_posix(v) for v in _strings(exclude.get("paths"), limit=100)],
-        "components": [_slug(v) for v in _strings(exclude.get("components"), limit=100)],
-        "lenses": [_slug(v) for v in _strings(exclude.get("lenses"), limit=100)],
-        "recipes": [_slug(v) for v in _strings(exclude.get("recipes"), limit=100)],
-    }
-    return result
+    """Compatibility adapter retained until the legacy specialist callers are removed."""
+    warnings.warn(
+        "load_specialist_config is deprecated; use load_review_policy instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    from pr_reviewer.specialist_runtime.policy import load_review_policy
+
+    return load_review_policy(path).legacy_projection()
 
 
 def _priority(value: Any) -> str:
