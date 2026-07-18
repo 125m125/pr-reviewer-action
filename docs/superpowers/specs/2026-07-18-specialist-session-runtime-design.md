@@ -598,7 +598,8 @@ repository policy, and PR intent. It does not receive every raw transcript. It
 produces two separate structured products rather than one markdown blob:
 
 - `ReviewHandoff`, optimized for the human reviewer's task planning.
-- `FindingNote[]`, optimized for evidence, discussion, and resolution.
+- `ReviewNote[]`, optimized for evidence, discussion, and resolution. Note
+  kinds include `finding`, `verification_request`, and `source_access_request`.
 
 The finalizer also recommends a verdict.
 
@@ -634,33 +635,43 @@ finding evidence back into the sticky handoff.
 ### 15.1 Sticky human-review handoff
 
 The managed sticky comment is intentionally concise and must not duplicate the
-detailed finding notes. It contains:
+detailed review notes. It contains:
 
 - Recommendation and review status.
 - A short change map describing what behavior and components the human should
   expect to have changed.
 - What the AI reviewed, including selected specialist focuses, contributed
   repository recipes, and major coverage boundaries.
-- Finding count, severity distribution, and one-line themes, with links to the
-  detailed threads rather than full claims and evidence.
-- Suggested human-review focus ordered by risk, contradiction, missing evidence,
-  cross-component consequence, and weak verification.
-- Material unknowns, degraded sessions, and areas not fully covered.
-- External-source allowlist requests with purpose and related obligation.
-- Compact coverage and recovery disclosure.
+- An optional single-line open-thread status, such as the number of unresolved
+  notes and highest material severity. It never lists every finding.
+- An optional aggregate finding theme only when multiple notes genuinely share a
+  useful pattern, such as persistence boundaries or authorization. Disparate
+  findings do not receive an artificial theme.
+- At most a few high-level human-review emphasis areas derived from risk,
+  cross-component consequences, contradiction, or weak verification. Detailed
+  claims remain in their threads.
+- An optional compact coverage warning when degraded sessions or missing evidence
+  materially limit confidence, linked to diagnostics rather than expanded inline.
+- An optional count/link for open external-source requests; host, purpose, and
+  related evidence requirements remain in their dedicated notes.
+
+Sections and fields with no clear orientation value are omitted. The handoff must
+not include a finding-by-finding index, unknown-by-unknown list, or detailed
+recovery telemetry.
 
 The handoff must explicitly state that focus suggestions do not reduce the human's
 responsibility to review the complete change. It should help divide attention, not
 claim that unlisted areas are safe.
 
 Human-focus suggestions are derived from structured coverage, risk, evidence, and
-session state. They are not a restatement of every finding and are not generated
-from unsupported model confidence.
+session state. They are not a restatement of every finding, unknown, or request and
+are not generated from unsupported model confidence.
 
-### 15.2 Detailed finding notes
+### 15.2 Detailed review notes
 
-In `review_comment` and `review_verdict`, each accepted finding is published as its
-own managed GitHub review thread. A note contains:
+In `review_comment` and `review_verdict`, each accepted finding and each specific
+manual-verification or source-access request is published as its own managed GitHub
+review note. Finding notes contain:
 
 - Concise claim and severity.
 - Exact changed causal file and line when available.
@@ -670,20 +681,29 @@ own managed GitHub review thread. A note contains:
 - Suggested manual verification or fix validation.
 - Stable root-cause fingerprint and managed metadata.
 
+Verification and source-access notes contain their precise question, related
+coverage obligation, evidence already checked, reason human input or new source
+access is needed, and stable managed metadata. They do not pretend that an unknown
+is a defect.
+
 Anchor selection follows this order:
 
 1. A defensible changed diff line becomes a `LINE` review thread.
-2. A finding tied to a changed file but not one defensible line becomes a `FILE`
+2. A note tied to a changed file but not one defensible line becomes a `FILE`
    review thread.
-3. A candidate with no honest changed causal file is not published as an
-   actionable finding thread; it becomes a handoff unknown or recheck item.
+3. A finding with no honest changed causal file is not published as an actionable
+   defect; it becomes a verification request instead.
+4. A verification or source-access request with no honest changed-file anchor is
+   published as a dedicated managed general PR comment. GitHub cannot mark a
+   general PR comment resolved, so this fallback and its limitation are recorded.
 
 Both line- and file-level review threads are resolvable on GitHub. Re-review uses
-the root-cause fingerprint to locate the existing thread. A still-open finding
-receives a reply with current evidence. A fixed finding receives a resolution
-reply and is resolved through GitHub's review-thread API when permissions allow.
-Human-resolved threads are not silently reopened; contradictory new evidence
-creates an explicit reply or a new finding according to repository policy.
+the stable note fingerprint to locate the existing thread or managed comment. A
+still-open note receives a reply with current evidence. A fixed finding or answered
+request receives a resolution reply and is resolved through GitHub's review-thread
+API when permissions allow. Human-resolved threads are not silently reopened;
+contradictory new evidence creates an explicit reply or a new finding according to
+repository policy.
 
 The sticky handoff links to finding threads but never embeds their detailed
 evidence.
@@ -691,7 +711,7 @@ evidence.
 ### 15.3 Publisher inputs and failure behavior
 
 Publishing consumes only the final policy result, `ReviewHandoff`, and normalized
-`FindingNote[]`. It does not inspect raw model transcripts. Existing sanitation,
+`ReviewNote[]`. It does not inspect raw model transcripts. Existing sanitation,
 reserved-marker stripping, line anchoring, prior-review cleanup, and
 finding-thread resolution should be reused and extended for file-level GraphQL
 review threads.
@@ -771,7 +791,7 @@ One machine-readable artifact is authoritative for:
 - Candidate findings, contradictions, and critic dispositions.
 - Unknowns and source-access requests.
 - Recovery and degradation events.
-- Rendered human-review handoff and finding-thread IDs/URLs/resolution state.
+- Rendered human-review handoff and review-note IDs/URLs/resolution state.
 - Final verdict provenance and publishing result.
 
 Raw secrets are never stored. Large evidence bodies and full transcripts may be
@@ -815,11 +835,12 @@ Automated tests must prove:
 - Published findings resolve to retained evidence.
 - Every matching repository recipe contributes accounted obligations and remains
   traceable through assignment and terminal coverage status.
-- The sticky comment contains a human-review handoff without detailed evidence
-  duplication.
+- The sticky comment contains a sparse, conditional human-review handoff without
+  per-finding, per-unknown, or detailed-evidence duplication.
 - In `review_comment` and `review_verdict`, accepted findings publish as
-  individual resolvable line- or file-level threads; candidates without an honest
-  changed causal file become unknowns or recheck items.
+  individual resolvable line- or file-level threads; specific verification and
+  source-access requests publish as separate notes, using managed general comments
+  only when no honest changed-file anchor exists.
 - Re-review updates and resolves managed finding threads without silently reopening
   human-resolved discussions.
 - The finalization reserve cannot be consumed by exploration.
