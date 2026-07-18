@@ -226,8 +226,8 @@ def test_provenance_and_evidence_relationships_are_immutable_values():
     supersedes.append("caller-mutation")
     contradicts.append("caller-mutation")
 
-    assert record.supersedes == (prior.canonical_key,)
-    assert record.contradicts == (prior.canonical_key,)
+    assert record.supersedes == (prior.id,)
+    assert record.contradicts == (prior.id,)
     assert record.provenance.head_sha == "head-a"
 
 
@@ -279,3 +279,48 @@ def test_unknown_or_secret_bearing_relationship_ids_are_rejected_without_recordi
         )
 
     assert store.snapshot().records == ()
+
+
+def test_relationships_retain_exact_refresh_and_failed_attempt_ids_for_snapshot_lookup():
+    store = EvidenceStore()
+    initial = store.add_tool_result(
+        session_id="S1", tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "result": {"content": "x = 1"}},
+        provenance=EvidenceProvenance(retrieved_at=0.0, max_age_hours=1), now=0.0,
+    )
+    refreshed = store.add_tool_result(
+        session_id="S2", tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "result": {"content": "x = 1"}},
+        provenance=EvidenceProvenance(retrieved_at=4_000.0, max_age_hours=1), now=4_000.0,
+    )
+    failed = store.add_tool_result(
+        session_id="S3", tool="read_file", arguments={"path": "a.py"},
+        result={"status": "error", "error": "not found"},
+    )
+    related = store.add_tool_result(
+        session_id="S4", tool="read_file", arguments={"path": "b.py"},
+        result={"status": "ok", "result": {"content": "y = 2"}},
+        supersedes=(refreshed.id,), contradicts=(failed.id,),
+    )
+    snapshot = store.snapshot()
+
+    assert refreshed.id != initial.id
+    assert related.supersedes == (refreshed.id,)
+    assert related.contradicts == (failed.id,)
+    assert snapshot.get(related.supersedes[0]) == refreshed
+    assert snapshot.get(related.contradicts[0]) == failed
+
+
+def test_exported_canonical_key_sanitizes_non_url_source_before_hashing():
+    first = canonical_evidence_key(
+        "read_file", {"path": "a.py"}, {"status": "ok", "result": {"content": "x"}},
+        source="token=supersecretvalue",
+    )
+    second = canonical_evidence_key(
+        "read_file", {"path": "a.py"}, {"status": "ok", "result": {"content": "x"}},
+        source="token=anothersecretvalue",
+    )
+
+    assert first == second
+    assert "supersecretvalue" not in first
+    assert "anothersecretvalue" not in first

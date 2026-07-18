@@ -146,6 +146,15 @@ def _source_identity(arguments: Mapping[str, Any], source: str | None = None) ->
     return ""
 
 
+def _sanitize_source(source: str | None) -> tuple[str | None, bool]:
+    if source is None:
+        return None, False
+    if "://" in str(source):
+        return _sanitize_url(source)
+    sanitized, redacted = _sanitize_value(str(source))
+    return str(sanitized), redacted
+
+
 def _bounded_content(content: str, max_content_bytes: int) -> tuple[str, bool, bool]:
     if max_content_bytes <= 0:
         raise ValueError("max_content_bytes must be positive")
@@ -230,10 +239,11 @@ def canonical_evidence_key(
     """Return a deterministic identity for a bounded, safely stored result."""
     content, _, _ = _bounded_content(_result_content(result), max_content_bytes)
     sanitized_provenance, _ = _sanitize_provenance(provenance)
+    sanitized_source, _ = _sanitize_source(source)
     identity = {
         "tool": str(tool).strip(),
         "arguments": _normalize_value(arguments),
-        "source": _source_identity(arguments, source),
+        "source": _source_identity(arguments, sanitized_source),
         "status": _result_status(result),
         "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         "provenance": _provenance_identity(sanitized_provenance),
@@ -358,14 +368,7 @@ class EvidenceStore:
         status = _result_status(result)
         sanitized_arguments, arguments_redacted = _sanitize_value(arguments)
         sanitized_provenance, provenance_redacted = _sanitize_provenance(provenance)
-        if source is None:
-            sanitized_source = None
-            source_redacted = False
-        elif "://" in str(source):
-            sanitized_source, source_redacted = _sanitize_url(source)
-        else:
-            sanitized_source, source_redacted = _sanitize_value(str(source))
-            sanitized_source = str(sanitized_source)
+        sanitized_source, source_redacted = _sanitize_source(source)
         canonical_supersedes = self._canonical_relationship_ids(supersedes)
         canonical_contradicts = self._canonical_relationship_ids(contradicts)
         content, redacted, truncated = _bounded_content(
@@ -444,7 +447,7 @@ class EvidenceStore:
             record = self._records.get(evidence_id)
             if record is None:
                 raise ValueError("evidence relationship must reference a known record")
-            canonical_ids.append(record.canonical_key)
+            canonical_ids.append(record.id)
         return tuple(canonical_ids)
 
     def import_into_session(
