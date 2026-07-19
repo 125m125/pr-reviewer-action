@@ -585,6 +585,45 @@ class _SlowDripResponse:
         return b"x"
 
 
+class _BlockingChunkFramingResponse:
+    def __init__(self) -> None:
+        self.read_calls = 0
+        self.read_started = threading.Event()
+        self.release = threading.Event()
+        self._state_lock = threading.Lock()
+        self._active_reads = 0
+        self.max_active_reads = 0
+        self.concurrent_access = False
+
+    @property
+    def status(self) -> int:
+        with self._state_lock:
+            if self._active_reads:
+                self.concurrent_access = True
+        return 200
+
+    def getheaders(self):
+        with self._state_lock:
+            if self._active_reads:
+                self.concurrent_access = True
+        return [("content-type", "text/plain"), ("transfer-encoding", "chunked")]
+
+    def read1(self, size: int) -> bytes:
+        self.read_calls += 1
+        if self.read_calls == 1:
+            return b"x"
+        with self._state_lock:
+            self._active_reads += 1
+            self.max_active_reads = max(self.max_active_reads, self._active_reads)
+        self.read_started.set()
+        try:
+            self.release.wait()
+            return b""
+        finally:
+            with self._state_lock:
+                self._active_reads -= 1
+
+
 class _ImmediateConnection:
     def __init__(self, response) -> None:
         self.sock = _FakeSocket()
@@ -648,6 +687,124 @@ def test_transport_slow_drip_body_uses_read_one_and_obeys_elapsed_deadline():
     assert elapsed < 0.2
     assert response.read1_calls >= 2
     assert connection.closed is True
+
+
+def test_transport_blocked_chunk_framing_returns_at_deadline_without_shared_response():
+    response = _BlockingChunkFramingResponse()
+    connection = _ImmediateConnection(response)
+    guard = web._BoundedBlockingCallGuard(max_outstanding=2)
+    transport = StdlibHttpTransport(
+        connection_factory=lambda *args: connection,
+        blocking_guard=guard,
+    )
+    outcome: dict[str, object] = {}
+
+    def invoke() -> None:
+        try:
+            outcome["response"] = transport.request(_transport_request(0.05))
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            outcome["error"] = exc
+
+    caller = threading.Thread(target=invoke, daemon=True)
+    caller.start()
+    assert response.read_started.wait(0.2)
+    try:
+        caller.join(0.2)
+        assert caller.is_alive() is False
+        assert isinstance(outcome.get("error"), SourceDenied)
+        assert "deadline" in str(outcome["error"])
+        assert connection.closed is True
+        assert guard.outstanding == 1
+        assert response.max_active_reads == 1
+        assert response.concurrent_access is False
+    finally:
+        response.release.set()
+        caller.join(0.2)
+    release_deadline = time.monotonic() + 0.2
+    while guard.outstanding and time.monotonic() < release_deadline:
+        time.sleep(0.005)
+    assert guard.outstanding == 0
+
+
+def test_guard_thread_construction_failure_rolls_back_capacity():
+    calls = 0
+
+    def thread_factory(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("thread construction failed")
+        return threading.Thread(**kwargs)
+
+    guard = web._BoundedBlockingCallGuard(
+        max_outstanding=1, thread_factory=thread_factory,
+    )
+    with pytest.raises(RuntimeError, match="construction"):
+        guard.run(
+            lambda: "never", deadline=time.monotonic() + 1,
+            monotonic=time.monotonic, name="test construction",
+        )
+
+    assert guard.outstanding == 0
+    assert guard.run(
+        lambda: "ok", deadline=time.monotonic() + 1,
+        monotonic=time.monotonic, name="test recovery",
+    ) == "ok"
+    assert guard.outstanding == 0
+
+
+def test_guard_thread_start_failure_rolls_back_capacity():
+    calls = 0
+
+    class StartFailure:
+        def start(self) -> None:
+            raise RuntimeError("thread start failed")
+
+    def thread_factory(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return StartFailure()
+        return threading.Thread(**kwargs)
+
+    guard = web._BoundedBlockingCallGuard(
+        max_outstanding=1, thread_factory=thread_factory,
+    )
+    with pytest.raises(RuntimeError, match="start"):
+        guard.run(
+            lambda: "never", deadline=time.monotonic() + 1,
+            monotonic=time.monotonic, name="test start",
+        )
+
+    assert guard.outstanding == 0
+    assert guard.run(
+        lambda: "ok", deadline=time.monotonic() + 1,
+        monotonic=time.monotonic, name="test recovery",
+    ) == "ok"
+    assert guard.outstanding == 0
+
+
+def test_guard_deadline_crossed_after_start_invokes_timeout_callback():
+    release = threading.Event()
+    timeout_called = threading.Event()
+    times = iter((0.0, 2.0))
+    guard = web._BoundedBlockingCallGuard(max_outstanding=1)
+
+    def on_timeout() -> None:
+        timeout_called.set()
+        release.set()
+
+    try:
+        with pytest.raises(SourceDenied, match="deadline"):
+            guard.run(
+                lambda: release.wait(), deadline=1.0,
+                monotonic=lambda: next(times), name="test deadline",
+                on_timeout=on_timeout,
+            )
+
+        assert timeout_called.is_set()
+    finally:
+        release.set()
 
 
 def test_two_argument_resolver_timeouts_retain_bounded_slots_and_fail_fast():

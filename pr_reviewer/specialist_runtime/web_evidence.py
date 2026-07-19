@@ -643,13 +643,19 @@ class _BoundedBlockingCallGuard:
     unbounded succession of daemon threads.
     """
 
-    def __init__(self, *, max_outstanding: int = 4) -> None:
+    def __init__(
+        self,
+        *,
+        max_outstanding: int = 4,
+        thread_factory: Callable[..., threading.Thread] = threading.Thread,
+    ) -> None:
         if max_outstanding <= 0:
             raise ValueError("blocking-call capacity must be positive")
         self._max_outstanding = max_outstanding
         self._slots = threading.BoundedSemaphore(max_outstanding)
         self._state_lock = threading.Lock()
         self._outstanding = 0
+        self._thread_factory = thread_factory
 
     @property
     def outstanding(self) -> int:
@@ -671,6 +677,18 @@ class _BoundedBlockingCallGuard:
         with self._state_lock:
             self._outstanding += 1
         outcome: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+        release_lock = threading.Lock()
+        slot_released = False
+
+        def release_slot_once() -> None:
+            nonlocal slot_released
+            with release_lock:
+                if slot_released:
+                    return
+                slot_released = True
+                with self._state_lock:
+                    self._outstanding -= 1
+                self._slots.release()
 
         def worker() -> None:
             try:
@@ -679,21 +697,34 @@ class _BoundedBlockingCallGuard:
                 except BaseException as exc:  # noqa: BLE001 - returned to caller
                     outcome.put((False, exc))
             finally:
-                with self._state_lock:
-                    self._outstanding -= 1
-                self._slots.release()
+                release_slot_once()
 
-        thread = threading.Thread(
-            target=worker, daemon=True, name=f"secure-web-{name}",
-        )
-        thread.start()
-        thread.join(_remaining(deadline, monotonic))
-        if thread.is_alive():
+        try:
+            thread = self._thread_factory(
+                target=worker, daemon=True, name=f"secure-web-{name}",
+            )
+            thread.start()
+        except BaseException:
+            release_slot_once()
+            raise
+
+        def notify_timeout() -> None:
             if on_timeout is not None:
                 try:
                     on_timeout()
                 except Exception:
                     pass
+
+        try:
+            join_timeout = _remaining(deadline, monotonic)
+        except SourceDenied as exc:
+            notify_timeout()
+            raise SourceDenied(
+                f"{name} exceeded the web operation hard deadline"
+            ) from exc
+        thread.join(join_timeout)
+        if thread.is_alive():
+            notify_timeout()
             raise SourceDenied(f"{name} exceeded the web operation hard deadline")
         succeeded, value = outcome.get_nowait()
         if not succeeded:
@@ -850,7 +881,14 @@ class StdlibHttpTransport:
             size = 0
             while size <= request.max_bytes:
                 connection.sock.settimeout(_remaining(deadline, self._monotonic))
-                chunk = read_one(min(16 * 1024, request.max_bytes + 1 - size))
+                read_size = min(16 * 1024, request.max_bytes + 1 - size)
+                chunk = self._blocking_guard.run(
+                    lambda: read_one(read_size),
+                    deadline=deadline,
+                    monotonic=self._monotonic,
+                    name="response body",
+                    on_timeout=abort_connection,
+                )
                 _remaining(deadline, self._monotonic)
                 if not chunk:
                     break
