@@ -1,23 +1,31 @@
-"""Evidence-authoritative candidate adjudication and runtime verdict policy."""
+"""Evidence-authoritative adjudication, verdict policy, and review products."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import hashlib
-import re
+import html
 from pathlib import PurePosixPath
+import re
+import unicodedata
 from typing import Any, Iterable, Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 from pr_reviewer.enforcement import RuntimeVerdictPolicyResult, derive_runtime_verdict
 
-from .evidence import EvidenceSnapshot, EvidenceStore
-from .types import CandidateFinding, ReviewHandoff, ReviewNote, ReviewNoteKind
+from .coverage import evidence_satisfies_obligation
+from .evidence import EvidenceRecord, EvidenceSnapshot, EvidenceStore
+from .types import CandidateFinding, CoverageObligation, ReviewHandoff, ReviewNote, ReviewNoteKind
+from .web_evidence import SourceAccessRequest
 
 
 _CRITIC_ACTIONS = frozenset({
     "keep", "reject", "merge", "request_verification", "downgrade_unknown",
 })
 _SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
+_GENERIC_THEMES = frozenset({"bug", "correctness", "finding", "general", "info", "other"})
+_ORIENTATION_LIMIT = 160
+_NOTE_VALUE_LIMIT = 1000
 
 
 @dataclass(frozen=True)
@@ -29,58 +37,288 @@ class CandidateDisposition:
 
 
 @dataclass(frozen=True)
+class EvidenceCitation:
+    evidence_id: str
+    category: str
+    tool: str
+    source: str
+    content_hash: str
+
+
+@dataclass(frozen=True)
+class AcceptedFinding:
+    candidate_id: str
+    root_cause_fingerprint: str
+    claim: str
+    user_visible_consequence: str
+    affected_file: str
+    line: int | None
+    causal_chain: str
+    severity: str
+    category: str
+    supporting_evidence_ids: tuple[str, ...]
+    contradicting_evidence_ids: tuple[str, ...]
+    related_obligation_ids: tuple[str, ...]
+    citations: tuple[EvidenceCitation, ...]
+    manual_validation: str
+    collector_session_id: str = ""
+    model_identity: str = ""
+    contributor_candidate_ids: tuple[str, ...] = ()
+
+    @property
+    def affected_location(self) -> str:
+        return self.affected_file + (f":{self.line}" if self.line is not None else "")
+
+
+@dataclass(frozen=True)
+class CandidateVerificationRequest:
+    candidate: CandidateFinding
+    reason: str
+
+
+@dataclass(frozen=True)
+class ReviewHandoffContext:
+    recommendation: str = ""
+    status: str = ""
+    change_map: tuple[str, ...] = ()
+    specialist_focuses: tuple[str, ...] = ()
+    recipe_ids: tuple[str, ...] = ()
+    coverage_boundaries: tuple[str, ...] = ()
+    unresolved_thread_count: int = 0
+    highest_thread_severity: str | None = None
+    review_emphasis: tuple[str, ...] = ()
+    material_coverage_limited: bool = False
+    diagnostics_url: str | None = None
+    source_access_requests: tuple[SourceAccessRequest, ...] = ()
+    access_request_url: str | None = None
+
+
+@dataclass(frozen=True)
 class AdjudicatedReview:
-    accepted: tuple[CandidateFinding, ...] = ()
+    accepted: tuple[AcceptedFinding, ...] = ()
     rejected: tuple[CandidateDisposition, ...] = ()
-    verification_requests: tuple[CandidateFinding, ...] = ()
+    verification_requests: tuple[CandidateVerificationRequest, ...] = ()
     unknowns: tuple[CandidateFinding, ...] = ()
     dispositions: tuple[CandidateDisposition, ...] = ()
 
 
-def _normalized_text(value: object) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
+def _unicode(value: object) -> str:
+    return unicodedata.normalize("NFKC", str(value or ""))
 
 
-def _normalized_location(value: object) -> tuple[str, int | None]:
-    raw = str(value or "").strip().replace("\\", "/")
+def _identity_text(value: object) -> str:
+    text = _unicode(value).casefold()
+    text = re.sub(r"(==|!=|<=|>=|&&|\|\||[=!<>])", r" \1 ", text)
+    text = re.sub(r"[^\w\s=!<>|&]+", " ", text, flags=re.UNICODE)
+    return " ".join(text.split())
+
+
+def _path(value: object) -> tuple[str, int | None, str]:
+    raw = _unicode(value).strip().replace("\\", "/")
+    if not raw:
+        return "", None, "missing"
     match = re.fullmatch(r"(.+?)(?::(\d+))?", raw)
     path_text = match.group(1) if match else raw
-    line = int(match.group(2)) if match and match.group(2) else None
+    raw_line = int(match.group(2)) if match and match.group(2) else None
+    line = raw_line if raw_line is not None and raw_line > 0 else None
     while path_text.startswith("./"):
         path_text = path_text[2:]
-    path = str(PurePosixPath(path_text)) if path_text else ""
+    normalized = str(PurePosixPath(path_text)) if path_text else ""
     if (
-        path in {"", "."}
-        or path.startswith("/")
-        or re.match(r"^[a-zA-Z]:/", path)
-        or ".." in PurePosixPath(path).parts
+        normalized in {"", "."}
+        or normalized.startswith("/")
+        or re.match(r"^[A-Za-z]:/", normalized)
+        or ".." in PurePosixPath(normalized).parts
     ):
-        return "", line
-    return path, line
+        return "", line, "invalid"
+    return normalized, line, "ok"
+
+
+def _stable_strings(values: object) -> tuple[str, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
+        return ()
+    return tuple(sorted({_unicode(item).strip() for item in values if _unicode(item).strip()}))
+
+
+def _normalized_severity(value: object) -> str:
+    severity = _unicode(value).strip().lower()
+    return severity if severity in _SEVERITY_RANK else "info"
 
 
 def _normalized_candidate(candidate: CandidateFinding) -> CandidateFinding:
-    path, line = _normalized_location(candidate.affected_location)
-    location = path + (f":{line}" if path and line is not None else "")
-    identity = "\x1f".join((
-        path.casefold(),
-        _normalized_text(candidate.category),
-        _normalized_text(candidate.claim),
-    ))
+    affected_file, line, _ = _path(candidate.affected_location)
+    claim_identity = _identity_text(candidate.claim)
+    causal_identity = _identity_text(candidate.causal_chain)
+    category = _identity_text(candidate.category).replace(" ", "-")
+    identity = "\x1f".join((affected_file, category, claim_identity, causal_identity))
     fingerprint = "finding:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
     return replace(
         candidate,
         root_cause_fingerprint=fingerprint,
-        affected_location=location,
-        category=_normalized_text(candidate.category).replace(" ", "-"),
-        severity=(
-            severity if (severity := str(candidate.severity).strip().lower()) in _SEVERITY_RANK
-            else "info"
-        ),
-        supporting_evidence_ids=tuple(sorted(set(candidate.supporting_evidence_ids))),
-        contradicting_evidence_ids=tuple(sorted(set(candidate.contradicting_evidence_ids))),
-        related_obligation_ids=tuple(sorted(set(candidate.related_obligation_ids))),
+        affected_location=affected_file + (f":{line}" if affected_file and line else ""),
+        severity=_normalized_severity(candidate.severity),
+        category=category,
+        supporting_evidence_ids=_stable_strings(candidate.supporting_evidence_ids),
+        contradicting_evidence_ids=_stable_strings(candidate.contradicting_evidence_ids),
+        related_obligation_ids=_stable_strings(candidate.related_obligation_ids),
     )
+
+
+def _merge_identity(candidate: CandidateFinding) -> tuple[str, str, str]:
+    affected_file, _, _ = _path(candidate.affected_location)
+    return (
+        affected_file,
+        _identity_text(candidate.category),
+        _identity_text(candidate.causal_chain),
+    )
+
+
+def _snapshot(evidence: EvidenceStore | EvidenceSnapshot) -> EvidenceSnapshot:
+    if isinstance(evidence, EvidenceStore):
+        return evidence.snapshot()
+    if isinstance(evidence, EvidenceSnapshot):
+        return evidence
+    raise TypeError("evidence must be an EvidenceStore or EvidenceSnapshot")
+
+
+def _controller_state(
+    obligations: Mapping[str, CoverageObligation],
+    changed_files: Iterable[str],
+) -> tuple[dict[str, CoverageObligation], tuple[str, ...]]:
+    if not isinstance(obligations, Mapping):
+        raise TypeError("obligations must be a controller-owned mapping")
+    normalized_obligations: dict[str, CoverageObligation] = {}
+    for raw_id, obligation in obligations.items():
+        if not isinstance(obligation, CoverageObligation):
+            raise TypeError("obligations must contain CoverageObligation values")
+        obligation_id = _unicode(raw_id).strip()
+        if not obligation_id or obligation_id != obligation.id:
+            raise ValueError("obligation mapping keys must match obligation IDs")
+        normalized_obligations[obligation_id] = obligation
+    if isinstance(changed_files, (str, bytes)) or not isinstance(changed_files, Iterable):
+        raise TypeError("changed_files must be a controller-owned iterable")
+    normalized_changed = []
+    for item in changed_files:
+        changed_file, _, state = _path(item)
+        if state != "ok":
+            raise ValueError("changed_files must contain repository-relative paths")
+        normalized_changed.append(changed_file)
+    return normalized_obligations, tuple(sorted(set(normalized_changed)))
+
+
+def _citation(record: EvidenceRecord) -> EvidenceCitation:
+    provenance = record.provenance
+    source = (
+        provenance.final_url
+        or provenance.original_url
+        or record.source_identity
+        or record.source_path
+        or "retained-tool-result"
+    )
+    return EvidenceCitation(
+        evidence_id=record.id,
+        category=record.category,
+        tool=record.tool,
+        source=_unicode(source),
+        content_hash=record.content_hash,
+    )
+
+
+def _candidate_from_accepted(value: AcceptedFinding | CandidateFinding) -> CandidateFinding | None:
+    if isinstance(value, CandidateFinding):
+        return value
+    if not isinstance(value, AcceptedFinding):
+        return None
+    return CandidateFinding(
+        candidate_id=value.candidate_id,
+        root_cause_fingerprint=value.root_cause_fingerprint,
+        claim=value.claim,
+        affected_location=value.affected_location,
+        causal_chain=value.causal_chain,
+        severity=value.severity,
+        category=value.category,
+        supporting_evidence_ids=value.supporting_evidence_ids,
+        contradicting_evidence_ids=value.contradicting_evidence_ids,
+        related_obligation_ids=value.related_obligation_ids,
+        collector_session_id=value.collector_session_id,
+        model_identity=value.model_identity,
+    )
+
+
+def _authorize(
+    value: AcceptedFinding | CandidateFinding,
+    *,
+    records: Mapping[str, EvidenceRecord],
+    obligations: Mapping[str, CoverageObligation],
+    changed_files: tuple[str, ...],
+) -> tuple[AcceptedFinding | None, str]:
+    raw_candidate = _candidate_from_accepted(value)
+    if raw_candidate is None:
+        return None, "unsupported-accepted-value"
+    raw_file, _, location_state = _path(raw_candidate.affected_location)
+    candidate = _normalized_candidate(raw_candidate)
+    affected_file, line, _ = _path(candidate.affected_location)
+    if location_state != "ok" or not affected_file:
+        return None, "missing-changed-causal-file"
+    if affected_file not in changed_files:
+        return None, "off-change-causal-file"
+    if not _identity_text(candidate.claim) or not _identity_text(candidate.causal_chain):
+        return None, "missing-required-finding-detail"
+    if not candidate.related_obligation_ids:
+        return None, "missing-related-obligation"
+    if any(obligation_id not in obligations for obligation_id in candidate.related_obligation_ids):
+        return None, "unknown-related-obligation"
+    supporting_records = [records.get(item) for item in candidate.supporting_evidence_ids]
+    if not supporting_records or any(record is None for record in supporting_records):
+        return None, "missing-retained-evidence"
+    usable_support = [record for record in supporting_records if record and record.is_usable_for_coverage]
+    if len(usable_support) != len(supporting_records):
+        return None, "unusable-retained-evidence"
+    related = tuple(obligations[item] for item in candidate.related_obligation_ids)
+    satisfying = tuple(sorted(
+        (
+            record for record in usable_support
+            if any(evidence_satisfies_obligation(record, obligation) for obligation in related)
+        ),
+        key=lambda item: item.id,
+    ))
+    if not satisfying:
+        return None, "evidence-does-not-satisfy-related-obligation"
+    contradiction_records = [records.get(item) for item in candidate.contradicting_evidence_ids]
+    if any(record is None for record in contradiction_records):
+        return None, "missing-retained-evidence"
+    if any(record and not record.is_usable_for_coverage for record in contradiction_records):
+        return None, "unusable-retained-evidence"
+    contradictions = tuple(sorted(
+        (record for record in contradiction_records if record), key=lambda item: item.id
+    ))
+    citations = tuple(_citation(record) for record in (*satisfying, *contradictions))
+    manual_validation = (
+        f"Validate the corrected behavior in {affected_file} against coverage obligations "
+        + ", ".join(candidate.related_obligation_ids)
+        + "."
+    )
+    return AcceptedFinding(
+        candidate_id=candidate.candidate_id,
+        root_cause_fingerprint=candidate.root_cause_fingerprint,
+        claim=candidate.claim,
+        user_visible_consequence=candidate.claim,
+        affected_file=affected_file,
+        line=line,
+        causal_chain=candidate.causal_chain,
+        severity=candidate.severity,
+        category=candidate.category,
+        supporting_evidence_ids=tuple(record.id for record in satisfying),
+        contradicting_evidence_ids=tuple(record.id for record in contradictions),
+        related_obligation_ids=candidate.related_obligation_ids,
+        citations=citations,
+        manual_validation=manual_validation,
+        collector_session_id=candidate.collector_session_id,
+        model_identity=candidate.model_identity,
+        contributor_candidate_ids=(candidate.candidate_id,),
+    ), ""
 
 
 def _decision_rows(critic_result: object) -> tuple[Mapping[str, Any], ...]:
@@ -95,42 +333,32 @@ def _decision_rows(critic_result: object) -> tuple[Mapping[str, Any], ...]:
                 {"candidate_id": key, "action": value}
                 for key, value in critic_result.items()
             )
-    if not isinstance(critic_result, Iterable) or isinstance(critic_result, (str, bytes)):
+    if isinstance(critic_result, (str, bytes)) or not isinstance(critic_result, Iterable):
         return ()
     return tuple(item for item in critic_result if isinstance(item, Mapping))
 
 
-def _evidence_snapshot(evidence: EvidenceStore | EvidenceSnapshot) -> EvidenceSnapshot:
-    if isinstance(evidence, EvidenceStore):
-        return evidence.snapshot()
-    if isinstance(evidence, EvidenceSnapshot):
-        return evidence
-    raise TypeError("evidence must be an EvidenceStore or EvidenceSnapshot")
-
-
-def _authority_reason(
-    candidate: CandidateFinding,
-    records: Mapping[str, object],
-    known_obligation_ids: set[str] | None,
-) -> str | None:
-    if not candidate.supporting_evidence_ids:
-        return "missing-retained-evidence"
-    referenced = candidate.supporting_evidence_ids + candidate.contradicting_evidence_ids
-    if any(evidence_id not in records for evidence_id in referenced):
-        return "missing-retained-evidence"
-    if any(
-        not records[evidence_id].is_usable_for_coverage
-        for evidence_id in referenced
-    ):
-        return "unusable-retained-evidence"
-    if not candidate.related_obligation_ids:
-        return "missing-related-obligation"
-    if known_obligation_ids is not None and any(
-        obligation_id not in known_obligation_ids
-        for obligation_id in candidate.related_obligation_ids
-    ):
-        return "unknown-related-obligation"
-    return None
+def _merge_findings(group: Iterable[AcceptedFinding], representative_id: str) -> AcceptedFinding:
+    values = tuple(sorted(group, key=lambda item: item.candidate_id))
+    representative = next(item for item in values if item.candidate_id == representative_id)
+    citations = {citation.evidence_id: citation for item in values for citation in item.citations}
+    return replace(
+        representative,
+        severity=max(values, key=lambda item: _SEVERITY_RANK[item.severity]).severity,
+        supporting_evidence_ids=tuple(sorted({
+            evidence_id for item in values for evidence_id in item.supporting_evidence_ids
+        })),
+        contradicting_evidence_ids=tuple(sorted({
+            evidence_id for item in values for evidence_id in item.contradicting_evidence_ids
+        })),
+        related_obligation_ids=tuple(sorted({
+            obligation_id for item in values for obligation_id in item.related_obligation_ids
+        })),
+        citations=tuple(citations[key] for key in sorted(citations)),
+        contributor_candidate_ids=tuple(sorted({
+            contributor for item in values for contributor in item.contributor_candidate_ids
+        })),
+    )
 
 
 def adjudicate_candidates(
@@ -138,286 +366,345 @@ def adjudicate_candidates(
     critic_result: object,
     evidence: EvidenceStore | EvidenceSnapshot,
     *,
-    obligations: Iterable[object] | None = None,
-    changed_files: Iterable[str] | None = None,
+    obligations: Mapping[str, CoverageObligation],
+    changed_files: Iterable[str],
 ) -> AdjudicatedReview:
-    """Apply critic dispositions without granting the critic content authority."""
-    snapshot = _evidence_snapshot(evidence)
-    records = {record.id: record for record in snapshot.records}
-    known_obligation_ids = None
-    if obligations is not None:
-        known_obligation_ids = {
-            str(getattr(item, "obligation_id", getattr(item, "id", ""))).strip()
-            for item in obligations
-        }
-        known_obligation_ids.discard("")
-    normalized_changed = None
-    if changed_files is not None:
-        normalized_changed = {
-            path for item in changed_files if (path := _normalized_location(item)[0])
-        }
-
+    """Adjudicate candidates against immutable controller-owned authority."""
+    obligation_map, changed = _controller_state(obligations, changed_files)
+    records = {record.id: record for record in _snapshot(evidence).records}
     candidate_by_id: dict[str, CandidateFinding] = {}
     duplicate_ids: set[str] = set()
-    invalid_location_ids: set[str] = set()
-    for item in candidates:
-        if not isinstance(item, CandidateFinding):
+    for value in candidates:
+        if not isinstance(value, CandidateFinding):
             raise TypeError("candidates must contain CandidateFinding values")
-        if item.candidate_id in candidate_by_id:
-            duplicate_ids.add(item.candidate_id)
+        candidate_id = _unicode(value.candidate_id).strip()
+        if not candidate_id:
+            raise ValueError("candidate IDs must be non-empty")
+        if candidate_id in candidate_by_id:
+            duplicate_ids.add(candidate_id)
             continue
-        if str(item.affected_location).strip() and not _normalized_location(item.affected_location)[0]:
-            invalid_location_ids.add(item.candidate_id)
-        candidate_by_id[item.candidate_id] = _normalized_candidate(item)
+        candidate_by_id[candidate_id] = _normalized_candidate(value)
 
     decisions: dict[str, Mapping[str, Any]] = {}
     for row in _decision_rows(critic_result):
-        candidate_id = str(row.get("candidate_id", row.get("id", ""))).strip()
+        candidate_id = _unicode(row.get("candidate_id", row.get("id", ""))).strip()
         if candidate_id in candidate_by_id and candidate_id not in decisions:
             decisions[candidate_id] = row
 
-    accepted: list[CandidateFinding] = []
-    rejected: list[CandidateDisposition] = []
-    verification: list[CandidateFinding] = []
-    unknowns: list[CandidateFinding] = []
-    dispositions: list[CandidateDisposition] = []
-    merge_sources: dict[str, list[CandidateFinding]] = {}
+    accepted: dict[str, AcceptedFinding] = {}
+    rejected: dict[str, CandidateDisposition] = {}
+    verification: dict[str, CandidateVerificationRequest] = {}
+    unknowns: dict[str, CandidateFinding] = {}
+    dispositions: dict[str, CandidateDisposition] = {}
+    merge_sources: dict[str, list[AcceptedFinding]] = {}
 
     for candidate_id in sorted(candidate_by_id):
         candidate = candidate_by_id[candidate_id]
         decision = decisions.get(candidate_id)
-        action = str(decision.get("action", "")).strip().lower() if decision else ""
-        target_id = str(
+        action = _unicode(decision.get("action", "")).strip().lower() if decision else ""
+        target_id = _unicode(
             decision.get("target_id", decision.get("merge_into", ""))
         ).strip() if decision else ""
         if candidate_id in duplicate_ids:
             disposition = CandidateDisposition(candidate_id, "reject", "duplicate-candidate-id")
-            rejected.append(disposition)
-            dispositions.append(disposition)
+            rejected[candidate_id] = disposition
+            dispositions[candidate_id] = disposition
             continue
         if action not in _CRITIC_ACTIONS:
             reason = "invalid-critic-action" if action else "missing-critic-action"
             disposition = CandidateDisposition(candidate_id, "reject", reason)
-            rejected.append(disposition)
-            dispositions.append(disposition)
+            rejected[candidate_id] = disposition
+            dispositions[candidate_id] = disposition
             continue
         if action == "reject":
-            disposition = CandidateDisposition(
-                candidate_id, action, str(decision.get("reason") or "critic-rejected")
-            )
-            rejected.append(disposition)
-            dispositions.append(disposition)
-            continue
-        if action == "request_verification":
-            disposition = CandidateDisposition(candidate_id, action, "critic-requested-verification")
-            verification.append(candidate)
-            dispositions.append(disposition)
+            disposition = CandidateDisposition(candidate_id, action, "critic-rejected")
+            rejected[candidate_id] = disposition
+            dispositions[candidate_id] = disposition
             continue
         if action == "downgrade_unknown":
-            disposition = CandidateDisposition(candidate_id, action, "critic-downgraded-to-unknown")
-            unknowns.append(candidate)
-            dispositions.append(disposition)
+            unknowns[candidate_id] = candidate
+            dispositions[candidate_id] = CandidateDisposition(
+                candidate_id, action, "critic-downgraded-to-unknown"
+            )
+            continue
+        if action == "request_verification":
+            verification[candidate_id] = CandidateVerificationRequest(
+                candidate, "critic-requested-verification"
+            )
+            dispositions[candidate_id] = CandidateDisposition(
+                candidate_id, action, "critic-requested-verification"
+            )
+            continue
+        authorized, reason = _authorize(
+            candidate, records=records, obligations=obligation_map, changed_files=changed
+        )
+        if authorized is None:
+            verification[candidate_id] = CandidateVerificationRequest(candidate, reason)
+            dispositions[candidate_id] = CandidateDisposition(
+                candidate_id, "request_verification", reason
+            )
             continue
         if action == "merge":
             target = candidate_by_id.get(target_id)
-            if target is None:
+            if target is None or _merge_identity(target) != _merge_identity(candidate):
                 disposition = CandidateDisposition(
                     candidate_id, "reject", "invalid-merge-target", target_id or None
                 )
-                rejected.append(disposition)
-                dispositions.append(disposition)
+                rejected[candidate_id] = disposition
+                dispositions[candidate_id] = disposition
                 continue
-            if target.root_cause_fingerprint != candidate.root_cause_fingerprint:
-                disposition = CandidateDisposition(
-                    candidate_id, "reject", "merge-root-cause-mismatch", target_id
-                )
-                rejected.append(disposition)
-                dispositions.append(disposition)
-                continue
-            path, _ = _normalized_location(candidate.affected_location)
-            reason = _authority_reason(candidate, records, known_obligation_ids)
-            if (
-                normalized_changed is not None
-                and (
-                    candidate_id in invalid_location_ids
-                    or (path and path not in normalized_changed)
-                )
-            ):
-                reason = "not-a-changed-causal-file"
-            if reason:
-                disposition = CandidateDisposition(candidate_id, "reject", reason, target_id)
-                rejected.append(disposition)
-                dispositions.append(disposition)
-                continue
-            merge_sources.setdefault(target_id, []).append(candidate)
+            merge_sources.setdefault(target_id, []).append(authorized)
             continue
+        accepted[candidate_id] = authorized
+        dispositions[candidate_id] = CandidateDisposition(candidate_id, "keep", "accepted")
 
-        path, _ = _normalized_location(candidate.affected_location)
-        reason = _authority_reason(candidate, records, known_obligation_ids)
-        if (
-            normalized_changed is not None
-            and (
-                candidate_id in invalid_location_ids
-                or (path and path not in normalized_changed)
-            )
-        ):
-            reason = "not-a-changed-causal-file"
-        if reason:
-            disposition = CandidateDisposition(candidate_id, "reject", reason)
-            rejected.append(disposition)
-            dispositions.append(disposition)
-            continue
-        accepted.append(candidate)
-        dispositions.append(CandidateDisposition(candidate_id, action, "accepted"))
-
-    accepted_by_id = {candidate.candidate_id: candidate for candidate in accepted}
     for target_id in sorted(merge_sources):
-        target = accepted_by_id.get(target_id)
-        sources = sorted(merge_sources[target_id], key=lambda item: item.candidate_id)
+        sources = merge_sources[target_id]
+        target = accepted.get(target_id)
         if target is None:
             for source in sources:
-                disposition = CandidateDisposition(
-                    source.candidate_id, "reject", "merge-target-not-accepted", target_id
+                verification[source.candidate_id] = CandidateVerificationRequest(
+                    candidate_by_id[source.candidate_id], "merge-target-not-authoritative"
                 )
-                rejected.append(disposition)
-                dispositions.append(disposition)
+                dispositions[source.candidate_id] = CandidateDisposition(
+                    source.candidate_id, "request_verification",
+                    "merge-target-not-authoritative", target_id,
+                )
             continue
-        group = (target, *sources)
-        merged_target = replace(
-            target,
-            severity=max(group, key=lambda item: _SEVERITY_RANK[item.severity]).severity,
-            supporting_evidence_ids=tuple(sorted({
-                evidence_id for item in group for evidence_id in item.supporting_evidence_ids
-            })),
-            contradicting_evidence_ids=tuple(sorted({
-                evidence_id for item in group for evidence_id in item.contradicting_evidence_ids
-            })),
-            related_obligation_ids=tuple(sorted({
-                obligation_id for item in group for obligation_id in item.related_obligation_ids
-            })),
-        )
-        accepted_by_id[target_id] = merged_target
+        accepted[target_id] = _merge_findings((target, *sources), target_id)
         for source in sources:
-            dispositions.append(CandidateDisposition(source.candidate_id, "merge", "merged", target_id))
-
-    accepted = [accepted_by_id[item.candidate_id] for item in accepted]
-
-    # Exact semantic duplicates retained by the critic collapse deterministically.
-    by_fingerprint: dict[str, list[CandidateFinding]] = {}
-    for candidate in accepted:
-        by_fingerprint.setdefault(candidate.root_cause_fingerprint, []).append(candidate)
-    deduplicated: list[CandidateFinding] = []
-    for fingerprint in sorted(by_fingerprint):
-        group = sorted(by_fingerprint[fingerprint], key=lambda item: item.candidate_id)
-        representative = group[0]
-        if len(group) > 1:
-            representative = replace(
-                representative,
-                severity=max(group, key=lambda item: _SEVERITY_RANK[item.severity]).severity,
-                supporting_evidence_ids=tuple(sorted({
-                    evidence_id for item in group for evidence_id in item.supporting_evidence_ids
-                })),
-                contradicting_evidence_ids=tuple(sorted({
-                    evidence_id for item in group for evidence_id in item.contradicting_evidence_ids
-                })),
-                related_obligation_ids=tuple(sorted({
-                    obligation_id for item in group for obligation_id in item.related_obligation_ids
-                })),
+            dispositions[source.candidate_id] = CandidateDisposition(
+                source.candidate_id, "merge", "merged", target_id
             )
-        deduplicated.append(representative)
+
+    by_fingerprint: dict[str, list[AcceptedFinding]] = {}
+    for finding in accepted.values():
+        by_fingerprint.setdefault(finding.root_cause_fingerprint, []).append(finding)
+    deduplicated: dict[str, AcceptedFinding] = {}
+    for fingerprint in sorted(by_fingerprint):
+        group = tuple(sorted(by_fingerprint[fingerprint], key=lambda item: item.candidate_id))
+        representative_id = group[0].candidate_id
+        deduplicated[representative_id] = _merge_findings(group, representative_id)
+        dispositions[representative_id] = CandidateDisposition(
+            representative_id, "keep", "accepted"
+        )
+        for contributor in group[1:]:
+            dispositions[contributor.candidate_id] = CandidateDisposition(
+                contributor.candidate_id, "merge", "semantic-duplicate", representative_id
+            )
 
     return AdjudicatedReview(
-        accepted=tuple(deduplicated),
-        rejected=tuple(rejected),
-        verification_requests=tuple(sorted(verification, key=lambda item: item.candidate_id)),
-        unknowns=tuple(sorted(unknowns, key=lambda item: item.candidate_id)),
-        dispositions=tuple(dispositions),
+        accepted=tuple(deduplicated[key] for key in sorted(deduplicated)),
+        rejected=tuple(rejected[key] for key in sorted(rejected)),
+        verification_requests=tuple(verification[key] for key in sorted(verification)),
+        unknowns=tuple(unknowns[key] for key in sorted(unknowns)),
+        dispositions=tuple(dispositions[key] for key in sorted(dispositions)),
     )
+
+
+def _revalidated_findings(
+    values: Iterable[object],
+    *,
+    evidence: EvidenceStore | EvidenceSnapshot,
+    obligations: Mapping[str, CoverageObligation],
+    changed_files: Iterable[str],
+) -> tuple[tuple[AcceptedFinding, ...], tuple[CandidateVerificationRequest, ...]]:
+    obligation_map, changed = _controller_state(obligations, changed_files)
+    records = {record.id: record for record in _snapshot(evidence).records}
+    accepted: list[AcceptedFinding] = []
+    verification: list[CandidateVerificationRequest] = []
+    for value in values:
+        candidate = _candidate_from_accepted(value) if isinstance(value, (AcceptedFinding, CandidateFinding)) else None
+        if candidate is None:
+            continue
+        authorized, reason = _authorize(
+            value, records=records, obligations=obligation_map, changed_files=changed
+        )
+        if authorized is None:
+            verification.append(CandidateVerificationRequest(_normalized_candidate(candidate), reason))
+        else:
+            accepted.append(authorized)
+    accepted.sort(key=lambda item: (item.root_cause_fingerprint, item.candidate_id))
+    verification.sort(key=lambda item: item.candidate.candidate_id)
+    return tuple(accepted), tuple(verification)
 
 
 def apply_runtime_verdict_policy(
     *,
     model_verdict: str,
-    accepted: Iterable[object],
     unresolved: Iterable[object],
     allow_approve: bool,
+    evidence: EvidenceStore | EvidenceSnapshot,
+    obligations: Mapping[str, CoverageObligation],
+    changed_files: Iterable[str],
+    review: AdjudicatedReview | None = None,
+    accepted: Iterable[object] | None = None,
     policy: Mapping[str, Any] | None = None,
 ) -> RuntimeVerdictPolicyResult:
-    """Apply the shared pure runtime policy to adjudicated, supported inputs."""
+    """Revalidate authority before any accepted finding can affect verdict."""
+    if review is not None and accepted is not None:
+        raise ValueError("provide review or accepted, not both")
+    values = review.accepted if isinstance(review, AdjudicatedReview) else tuple(accepted or ())
+    authoritative, _ = _revalidated_findings(
+        values, evidence=evidence, obligations=obligations, changed_files=changed_files
+    )
+    obligation_map, _ = _controller_state(obligations, changed_files)
+    unresolved_controller_values: list[CoverageObligation] = []
+    for item in unresolved:
+        if isinstance(item, str):
+            obligation_id = item
+        elif isinstance(item, Mapping):
+            obligation_id = _unicode(item.get("obligation_id", item.get("id", ""))).strip()
+        else:
+            obligation_id = _unicode(getattr(item, "obligation_id", getattr(item, "id", ""))).strip()
+        if obligation_id in obligation_map:
+            unresolved_controller_values.append(obligation_map[obligation_id])
     return derive_runtime_verdict(
         model_verdict=model_verdict,
-        accepted=accepted,
-        unresolved=unresolved,
+        supported_findings={item.candidate_id: item.severity for item in authoritative},
+        unresolved=tuple(unresolved_controller_values),
         allow_approve=allow_approve,
         policy=policy,
     )
 
 
-def _state_value(state: object, name: str, default: Any = None) -> Any:
-    if isinstance(state, Mapping):
-        return state.get(name, default)
-    return getattr(state, name, default)
-
-
-def _clean_strings(value: object, *, limit: int | None = None) -> tuple[str, ...]:
-    if value is None or isinstance(value, (str, bytes)):
-        items = (value,) if isinstance(value, str) else ()
-    elif isinstance(value, Iterable):
-        items = tuple(value)
-    else:
-        items = ()
-    cleaned = tuple(dict.fromkeys(
-        str(item).strip() for item in items if str(item).strip()
-    ))
-    return cleaned if limit is None else cleaned[:limit]
-
-
-def _single_line(value: object) -> str:
-    return " ".join(str(value or "").split())
-
-
-def _aggregate_theme(findings: Iterable[object]) -> str | None:
-    categories = tuple(
-        _normalized_text(_state_value(item, "category", "")).replace(" ", "-")
-        for item in findings
-    )
-    material = tuple(category for category in categories if category)
-    generic_categories = {"bug", "correctness", "finding", "general", "info", "other"}
+def _orientation(value: object) -> str | None:
+    raw = _unicode(value).strip()
+    lowered = raw.casefold()
     if (
-        len(material) < 2
-        or len(set(material)) != 1
-        or material[0] in generic_categories
+        not raw
+        or "\n" in raw
+        or "\r" in raw
+        or re.match(r"^\s*(?:#{1,6}|[-*+]\s|>\s)", raw)
+        or any(marker in lowered for marker in ("evidence:", "unknown:", "<!--", "```"))
     ):
         return None
-    return material[0]
+    plain = re.sub(r"[`*_{}\[\]<>#|()]", "", raw)
+    plain = " ".join(plain.split())[:_ORIENTATION_LIMIT].strip()
+    return plain or None
 
 
-def build_review_handoff(state: object) -> ReviewHandoff:
-    """Build a sparse orientation aid without finding or evidence detail."""
-    recommendation = str(_state_value(state, "recommendation", "")).strip()
-    status = str(_state_value(state, "status", "")).strip()
-    change_map = _clean_strings(_state_value(state, "change_map", ()))
-    specialist_focuses = _clean_strings(
-        _state_value(state, "specialist_focuses", _state_value(state, "reviewed_focuses", ()))
+def _orientation_values(
+    values: Iterable[object],
+    *,
+    limit: int,
+    forbidden_detail: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    forbidden = tuple(
+        identity for item in forbidden_detail
+        if len(identity := _identity_text(item)) >= 8
     )
-    recipes = _clean_strings(_state_value(state, "recipes", ()))
-    boundaries = _clean_strings(_state_value(state, "coverage_boundaries", ()))
-    reviewed_focuses = tuple(dict.fromkeys((*specialist_focuses, *recipes, *boundaries)))
-    thread_status = _single_line(_state_value(state, "thread_status", "")) or None
-    finding_theme = _aggregate_theme(
-        _state_value(state, "findings", _state_value(state, "accepted", ()))
+    cleaned = set()
+    for value in values:
+        orientation = _orientation(value)
+        identity = _identity_text(orientation or "")
+        if orientation and not any(
+            identity == detail or identity in detail or detail in identity
+            for detail in forbidden
+        ):
+            cleaned.add(orientation)
+    cleaned.discard(None)
+    return tuple(sorted(cleaned))[:limit]
+
+
+def _aggregate_theme(findings: Iterable[AcceptedFinding]) -> str | None:
+    categories = tuple(sorted({item.category for item in findings if item.category}))
+    if len(categories) != 1 or categories[0] in _GENERIC_THEMES:
+        return None
+    if sum(1 for _ in findings) < 2:
+        return None
+    return categories[0]
+
+
+def build_review_handoff(
+    context: ReviewHandoffContext,
+    *,
+    review: AdjudicatedReview | None,
+    evidence: EvidenceStore | EvidenceSnapshot,
+    obligations: Mapping[str, CoverageObligation],
+    changed_files: Iterable[str],
+) -> ReviewHandoff:
+    """Build orientation exclusively from typed controller context."""
+    if not isinstance(context, ReviewHandoffContext):
+        raise TypeError("context must be a ReviewHandoffContext")
+    obligation_map, _ = _controller_state(obligations, changed_files)
+    authoritative, _ = _revalidated_findings(
+        review.accepted if isinstance(review, AdjudicatedReview) else (),
+        evidence=evidence,
+        obligations=obligation_map,
+        changed_files=changed_files,
     )
-    review_emphasis = _clean_strings(_state_value(state, "review_emphasis", ()), limit=3)
-    coverage_warning = _single_line(_state_value(state, "coverage_warning", "")) or None
-    source_requests = _state_value(
-        state, "source_access_requests", _state_value(state, "source_requests", ())
+    recommendation_map = {
+        "approve": "Approve",
+        "request_changes": "Request changes",
+        "human_review_required": "Human review required",
+    }
+    status_map = {
+        "complete": "AI review complete",
+        "degraded": "AI review completed with material coverage limits",
+        "incomplete": "AI review incomplete",
+    }
+    recommendation = recommendation_map.get(_unicode(context.recommendation).strip().lower(), "")
+    status = status_map.get(_unicode(context.status).strip().lower(), "")
+    detail_values: list[str] = []
+    if isinstance(review, AdjudicatedReview):
+        for value in review.accepted:
+            candidate = _candidate_from_accepted(value) if isinstance(value, (AcceptedFinding, CandidateFinding)) else None
+            if candidate is not None:
+                detail_values.extend((candidate.claim, candidate.causal_chain))
+                detail_values.extend(candidate.supporting_evidence_ids)
+                detail_values.extend(candidate.contradicting_evidence_ids)
+        detail_values.extend(item.claim for item in review.unknowns if isinstance(item, CandidateFinding))
+        for item in review.verification_requests:
+            if isinstance(item, CandidateVerificationRequest):
+                detail_values.extend((item.candidate.claim, item.candidate.causal_chain))
+            elif isinstance(item, CandidateFinding):
+                detail_values.extend((item.claim, item.causal_chain))
+    detail_values.extend(record.id for record in _snapshot(evidence).records)
+    forbidden_detail = tuple(detail_values)
+    change_map = _orientation_values(
+        context.change_map, limit=6, forbidden_detail=forbidden_detail
     )
-    explicit_count = _state_value(state, "access_request_count", None)
-    if explicit_count is None:
-        access_request_count = len(tuple(source_requests or ()))
-    else:
-        access_request_count = max(0, int(explicit_count))
-    access_request_url = str(_state_value(state, "access_request_url", "")).strip() or None
+    specialist_focuses = _orientation_values(
+        context.specialist_focuses, limit=6, forbidden_detail=forbidden_detail
+    )
+    recipes = _orientation_values(
+        context.recipe_ids, limit=6, forbidden_detail=forbidden_detail
+    )
+    boundaries = _orientation_values(
+        context.coverage_boundaries, limit=6, forbidden_detail=forbidden_detail
+    )
+    reviewed_focuses = tuple(sorted(set((*specialist_focuses, *recipes, *boundaries))))
+    review_emphasis = _orientation_values(
+        context.review_emphasis, limit=3, forbidden_detail=forbidden_detail
+    )
+    thread_count = (
+        context.unresolved_thread_count
+        if isinstance(context.unresolved_thread_count, int)
+        and not isinstance(context.unresolved_thread_count, bool)
+        and context.unresolved_thread_count > 0
+        else 0
+    )
+    thread_severity = _normalized_severity(context.highest_thread_severity)
+    thread_status = None
+    if thread_count:
+        thread_status = f"{thread_count} unresolved review note(s); highest material severity: {thread_severity}."
+    theme = _aggregate_theme(authoritative)
+    diagnostics = _canonical_request_url(context.diagnostics_url or "")
+    diagnostics_url = diagnostics[1] if diagnostics else None
+    coverage_warning = None
+    if context.material_coverage_limited:
+        coverage_warning = "Material evidence or session coverage is incomplete."
+        if diagnostics_url:
+            coverage_warning += f" Diagnostics: {diagnostics_url}"
+    valid_source_notes = {
+        note.fingerprint: note
+        for item in context.source_access_requests
+        if (note := _source_note(item, obligations=obligation_map)) is not None
+    }
+    access_count = len(valid_source_notes)
+    access = _canonical_request_url(context.access_request_url or "")
+    access_url = access[1] if access else None
 
     lines = ["## AI Review Handoff"]
     if recommendation:
@@ -436,78 +723,96 @@ def build_review_handoff(state: object) -> ReviewHandoff:
             lines.append("- Coverage boundaries: " + "; ".join(boundaries))
     if thread_status:
         lines.extend(("", f"**Thread status:** {thread_status}"))
-    if finding_theme:
-        lines.extend(("", f"**Aggregate finding theme:** {finding_theme}"))
+    if theme:
+        lines.extend(("", f"**Aggregate finding theme:** {theme}"))
     if review_emphasis:
-        lines.extend(("", "### Human review focus", "", *[
-            f"- {item}" for item in review_emphasis
-        ]))
+        lines.extend(("", "### Human review focus", "", *[f"- {item}" for item in review_emphasis]))
     lines.extend((
         "",
         "These focus suggestions do not reduce responsibility to review the complete change.",
     ))
     if coverage_warning:
         lines.extend(("", f"**Material coverage warning:** {coverage_warning}"))
-    if access_request_count:
-        access_text = f"{access_request_count} open"
-        if access_request_url:
-            access_text = f"[{access_text}]({access_request_url})"
+    if access_count:
+        access_text = f"{access_count} open"
+        if access_url:
+            access_text = f"[{access_text}]({access_url})"
         lines.extend(("", f"**Source access requests:** {access_text}"))
-
     return ReviewHandoff(
         markdown="\n".join(lines).strip() + "\n",
         recommendation=recommendation,
         change_map=change_map,
         reviewed_focuses=reviewed_focuses,
         thread_status=thread_status,
-        finding_theme=finding_theme,
+        finding_theme=theme,
         review_emphasis=review_emphasis,
         coverage_warning=coverage_warning,
-        access_request_count=access_request_count,
-        access_request_url=access_request_url,
+        access_request_count=access_count,
+        access_request_url=access_url,
     )
 
 
-def _stable_request_fingerprint(
+def _quoted(value: object, *, limit: int = _NOTE_VALUE_LIMIT) -> str:
+    single_line = " ".join(_unicode(value).split())[:limit]
+    return "<code>" + html.escape(single_line, quote=True) + "</code>"
+
+
+def _valid_line(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _request_fingerprint(
     kind: ReviewNoteKind,
     text: str,
     obligation_ids: tuple[str, ...],
     file: str | None,
+    extra_identity: tuple[str, ...] = (),
 ) -> str:
-    identity = "\x1f".join((kind.value, _normalized_text(text), "|".join(obligation_ids), file or ""))
+    identity = "\x1f".join((
+        kind.value, _identity_text(text), "|".join(obligation_ids), file or "", *extra_identity,
+    ))
     return f"{kind.value}:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def _request_note(
-    request: object,
+def _verification_note(
+    request: CandidateVerificationRequest,
     *,
-    kind: ReviewNoteKind,
-    retained_records: Mapping[str, object],
+    records: Mapping[str, EvidenceRecord],
+    obligations: Mapping[str, CoverageObligation],
+    changed_files: tuple[str, ...],
 ) -> ReviewNote | None:
-    text = str(
-        _state_value(request, "question", _state_value(request, "purpose", _state_value(request, "reason", "")))
-    ).strip()
-    obligation_ids = tuple(sorted(_clean_strings(
-        _state_value(request, "related_obligation_ids", _state_value(request, "obligation_ids", ()))
-    )))
-    if not text or not obligation_ids:
+    candidate = _normalized_candidate(request.candidate)
+    if not _identity_text(candidate.claim):
         return None
-    requested_evidence = _clean_strings(_state_value(request, "evidence_ids", ()))
+    obligation_ids = tuple(
+        item for item in candidate.related_obligation_ids if item in obligations
+    )
+    file, line, state = _path(candidate.affected_location)
+    if state != "ok" or file not in changed_files:
+        file, line = "", None
     evidence_ids = tuple(sorted(
-        item for item in requested_evidence
-        if item in retained_records and retained_records[item].is_usable_for_coverage
+        item for item in candidate.supporting_evidence_ids + candidate.contradicting_evidence_ids
+        if item in records and records[item].is_usable_for_coverage
     ))
-    raw_file = _state_value(request, "file", "")
-    file, parsed_line = _normalized_location(raw_file)
-    line_value = _state_value(request, "line", parsed_line)
-    line = int(line_value) if line_value not in (None, "") else None
-    label = "Verification request" if kind is ReviewNoteKind.VERIFICATION_REQUEST else "Source access request"
-    markdown = f"### {label}\n\n{text}"
+    markdown = (
+        "### Verification request\n\n"
+        "**Question:** Verify whether this potential issue is present before treating it as a defect: "
+        + _quoted(candidate.claim)
+        + "\n\n**Why human input is needed:** " + _quoted(request.reason)
+    )
     if evidence_ids:
-        markdown += "\n\nEvidence already checked: " + ", ".join(f"`{item}`" for item in evidence_ids)
+        markdown += "\n\n**Retained evidence already checked:** " + ", ".join(
+            _quoted(item, limit=160) for item in evidence_ids
+        )
     return ReviewNote(
-        kind=kind,
-        fingerprint=_stable_request_fingerprint(kind, text, obligation_ids, file or None),
+        kind=ReviewNoteKind.VERIFICATION_REQUEST,
+        fingerprint=_request_fingerprint(
+            ReviewNoteKind.VERIFICATION_REQUEST,
+            candidate.claim,
+            obligation_ids,
+            file or None,
+            (request.reason,),
+        ),
         markdown=markdown,
         related_obligation_ids=obligation_ids,
         evidence_ids=evidence_ids,
@@ -516,105 +821,203 @@ def _request_note(
     )
 
 
+def _mapping_verification(
+    value: object,
+    *,
+    obligations: Mapping[str, CoverageObligation],
+    changed_files: tuple[str, ...],
+    records: Mapping[str, EvidenceRecord],
+) -> ReviewNote | None:
+    if not isinstance(value, Mapping):
+        return None
+    allowed = {
+        "question", "reason", "related_obligation_ids", "obligation_ids",
+        "evidence_ids", "file", "line",
+    }
+    if set(value) - allowed:
+        return None
+    question = _unicode(value.get("question", "")).strip()
+    if not question:
+        return None
+    obligation_ids = _stable_strings(
+        value.get("related_obligation_ids", value.get("obligation_ids", ()))
+    )
+    if not obligation_ids or any(item not in obligations for item in obligation_ids):
+        return None
+    file, parsed_line, state = _path(value.get("file", ""))
+    if state != "ok" or file not in changed_files:
+        file, parsed_line = "", None
+    line = _valid_line(value.get("line"))
+    if "line" not in value:
+        line = parsed_line
+    evidence_ids = tuple(sorted(
+        item for item in _stable_strings(value.get("evidence_ids", ()))
+        if item in records and records[item].is_usable_for_coverage
+    ))
+    reason = _unicode(value.get("reason", "")).strip() or "Human confirmation is required to resolve this coverage question."
+    markdown = (
+        "### Verification request\n\n**Question:** " + _quoted(question)
+        + "\n\n**Why human input is needed:** " + _quoted(reason)
+    )
+    if evidence_ids:
+        markdown += "\n\n**Retained evidence already checked:** " + ", ".join(
+            _quoted(item, limit=160) for item in evidence_ids
+        )
+    return ReviewNote(
+        kind=ReviewNoteKind.VERIFICATION_REQUEST,
+        fingerprint=_request_fingerprint(
+            ReviewNoteKind.VERIFICATION_REQUEST, question, obligation_ids, file or None, (reason,)
+        ),
+        markdown=markdown,
+        related_obligation_ids=obligation_ids,
+        evidence_ids=evidence_ids,
+        file=file or None,
+        line=line,
+    )
+
+
+def _source_request(value: object) -> SourceAccessRequest | None:
+    if isinstance(value, SourceAccessRequest):
+        return value
+    if not isinstance(value, Mapping):
+        return None
+    allowed = {"kind", "host", "candidate_url", "obligation_id", "purpose", "authority_reason"}
+    if set(value) - allowed or value.get("kind", "source_access_request") != "source_access_request":
+        return None
+    fields = {
+        key: _unicode(value.get(key, "")).strip()
+        for key in ("host", "candidate_url", "obligation_id", "purpose", "authority_reason")
+    }
+    if not all(fields[key] for key in ("host", "candidate_url", "obligation_id", "purpose")):
+        return None
+    return SourceAccessRequest(**fields)
+
+
+def _canonical_request_url(value: str) -> tuple[str, str] | None:
+    parsed = urlsplit(_unicode(value).strip())
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return None
+    host = parsed.hostname.casefold()
+    url = urlunsplit(("https", host, parsed.path or "/", parsed.query, ""))
+    return host, url
+
+
+def _source_note(
+    value: object,
+    *,
+    obligations: Mapping[str, CoverageObligation],
+) -> ReviewNote | None:
+    request = _source_request(value)
+    if request is None or request.obligation_id not in obligations:
+        return None
+    canonical = _canonical_request_url(request.candidate_url)
+    if canonical is None:
+        return None
+    url_host, url = canonical
+    host = _unicode(request.host).strip().casefold()
+    if host != url_host:
+        return None
+    reason = request.authority_reason or "Repository source policy requires human authorization before retrieval."
+    markdown = (
+        "### Source access request\n\n"
+        "**Host:** " + _quoted(host, limit=253)
+        + "\n\n**Candidate URL:** " + _quoted(url)
+        + "\n\n**Purpose:** " + _quoted(request.purpose)
+        + "\n\n**Why human input is needed:** " + _quoted(reason)
+        + "\n\nDiscovery metadata is not review evidence; retrieval remains pending approval."
+    )
+    return ReviewNote(
+        kind=ReviewNoteKind.SOURCE_ACCESS_REQUEST,
+        fingerprint=_request_fingerprint(
+            ReviewNoteKind.SOURCE_ACCESS_REQUEST,
+            request.purpose,
+            (request.obligation_id,),
+            None,
+            (host, url),
+        ),
+        markdown=markdown,
+        related_obligation_ids=(request.obligation_id,),
+        evidence_ids=(),
+    )
+
+
+def _finding_note(finding: AcceptedFinding) -> ReviewNote:
+    citation_lines = []
+    for citation in finding.citations:
+        citation_lines.append(
+            "- ID " + _quoted(citation.evidence_id, limit=160)
+            + "; category " + _quoted(citation.category, limit=100)
+            + "; tool " + _quoted(citation.tool, limit=100)
+            + "; source " + _quoted(citation.source)
+            + "; content hash " + _quoted(citation.content_hash, limit=80)
+        )
+    markdown = (
+        f"### {finding.severity.title()} finding\n\n"
+        "**Claim:** " + _quoted(finding.claim)
+        + "\n\n**User-visible consequence:** " + _quoted(finding.user_visible_consequence)
+        + "\n\n**Causal chain:** " + _quoted(finding.causal_chain)
+        + "\n\n**Evidence provenance / citations:**\n"
+        + "\n".join(citation_lines)
+        + "\n\n**Suggested validation:** " + _quoted(finding.manual_validation)
+    )
+    return ReviewNote(
+        kind=ReviewNoteKind.FINDING,
+        fingerprint=finding.root_cause_fingerprint,
+        markdown=markdown,
+        related_obligation_ids=finding.related_obligation_ids,
+        evidence_ids=tuple(citation.evidence_id for citation in finding.citations),
+        file=finding.affected_file,
+        line=finding.line,
+        severity=finding.severity,
+    )
+
+
 def build_review_notes(
     review: AdjudicatedReview,
     evidence: EvidenceStore | EvidenceSnapshot,
     publishing_mode: str = "review_comment",
     *,
+    obligations: Mapping[str, CoverageObligation],
+    changed_files: Iterable[str],
     verification_requests: Iterable[object] = (),
     source_access_requests: Iterable[object] = (),
 ) -> tuple[ReviewNote, ...]:
-    """Build typed detailed notes exclusively from adjudicated public inputs."""
+    """Build typed notes only after defensive controller-state revalidation."""
     if publishing_mode == "comment":
         return ()
     if publishing_mode not in {"review_comment", "review_verdict"}:
         raise ValueError("publishing_mode must be comment, review_comment, or review_verdict")
     if not isinstance(review, AdjudicatedReview):
         raise TypeError("review must be an AdjudicatedReview")
-    snapshot = _evidence_snapshot(evidence)
+    obligation_map, changed = _controller_state(obligations, changed_files)
+    snapshot = _snapshot(evidence)
     records = {record.id: record for record in snapshot.records}
-    notes: list[ReviewNote] = []
-
-    for candidate in sorted(review.accepted, key=lambda item: item.root_cause_fingerprint):
-        support = tuple(
-            records[evidence_id] for evidence_id in candidate.supporting_evidence_ids
-            if evidence_id in records and records[evidence_id].is_usable_for_coverage
-        )
-        contradictions = tuple(
-            records[evidence_id] for evidence_id in candidate.contradicting_evidence_ids
-            if evidence_id in records and records[evidence_id].is_usable_for_coverage
-        )
-        if (
-            not support
-            or len(support) != len(candidate.supporting_evidence_ids)
-            or len(contradictions) != len(candidate.contradicting_evidence_ids)
-            or not candidate.related_obligation_ids
-        ):
-            continue
-        file, line = _normalized_location(candidate.affected_location)
-        evidence_ids = tuple(record.id for record in (*support, *contradictions))
-        if not file:
-            text = (
-                "Please verify whether this potential issue is present before treating it as a defect: "
-                + candidate.claim
-            )
-            notes.append(ReviewNote(
-                kind=ReviewNoteKind.VERIFICATION_REQUEST,
-                fingerprint=_stable_request_fingerprint(
-                    ReviewNoteKind.VERIFICATION_REQUEST,
-                    candidate.root_cause_fingerprint,
-                    candidate.related_obligation_ids,
-                    None,
-                ),
-                markdown=f"### Verification request\n\n{text}",
-                related_obligation_ids=candidate.related_obligation_ids,
-                evidence_ids=evidence_ids,
-                severity=None,
-            ))
-            continue
-        markdown = [
-            f"### {candidate.severity.title()} finding",
-            "",
-            candidate.claim,
-        ]
-        if candidate.causal_chain:
-            markdown.extend(("", f"**Causal chain:** {candidate.causal_chain}"))
-        markdown.extend(("", "**Supporting evidence:**"))
-        markdown.extend(f"- `{record.id}`: {record.content}" for record in support)
-        if contradictions:
-            markdown.extend(("", "**Contradicting evidence:**"))
-            markdown.extend(f"- `{record.id}`: {record.content}" for record in contradictions)
-        notes.append(ReviewNote(
-            kind=ReviewNoteKind.FINDING,
-            fingerprint=candidate.root_cause_fingerprint,
-            markdown="\n".join(markdown),
-            related_obligation_ids=candidate.related_obligation_ids,
-            evidence_ids=evidence_ids,
-            file=file,
-            line=line,
-            severity=candidate.severity,
-        ))
-
-    implicit_verification = tuple(
-        {
-            "question": "Please verify this unresolved candidate before treating it as a defect: " + candidate.claim,
-            "related_obligation_ids": candidate.related_obligation_ids,
-            "evidence_ids": candidate.supporting_evidence_ids + candidate.contradicting_evidence_ids,
-            "file": candidate.affected_location,
-        }
-        for candidate in review.verification_requests
+    authoritative, defensive_verification = _revalidated_findings(
+        review.accepted, evidence=snapshot, obligations=obligation_map, changed_files=changed
     )
-    for request in (*implicit_verification, *tuple(verification_requests)):
-        note = _request_note(
-            request, kind=ReviewNoteKind.VERIFICATION_REQUEST, retained_records=records
+    notes: list[ReviewNote] = [_finding_note(item) for item in authoritative]
+    candidate_requests: list[CandidateVerificationRequest] = []
+    for item in review.verification_requests:
+        if isinstance(item, CandidateVerificationRequest):
+            candidate_requests.append(item)
+        elif isinstance(item, CandidateFinding):
+            candidate_requests.append(CandidateVerificationRequest(item, "Human verification is required."))
+    candidate_requests.extend(defensive_verification)
+    for request in sorted(candidate_requests, key=lambda item: item.candidate.candidate_id):
+        note = _verification_note(
+            request, records=records, obligations=obligation_map, changed_files=changed
         )
         if note is not None:
             notes.append(note)
-    for request in source_access_requests:
-        note = _request_note(
-            request, kind=ReviewNoteKind.SOURCE_ACCESS_REQUEST, retained_records=records
+    for value in verification_requests:
+        note = _mapping_verification(
+            value, obligations=obligation_map, changed_files=changed, records=records
         )
         if note is not None:
             notes.append(note)
-
-    return tuple(sorted(notes, key=lambda item: (item.kind.value, item.fingerprint)))
+    for value in source_access_requests:
+        note = _source_note(value, obligations=obligation_map)
+        if note is not None:
+            notes.append(note)
+    unique = {(note.kind.value, note.fingerprint): note for note in notes}
+    return tuple(unique[key] for key in sorted(unique))

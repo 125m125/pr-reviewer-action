@@ -34,7 +34,7 @@ def _field(value: object, name: str, default: Any = None) -> Any:
 def derive_runtime_verdict(
     *,
     model_verdict: str,
-    accepted: Iterable[object],
+    supported_findings: Mapping[str, str],
     unresolved: Iterable[object],
     allow_approve: bool,
     policy: Mapping[str, Any] | None = None,
@@ -50,19 +50,20 @@ def derive_runtime_verdict(
     )
     if configured is None:
         blocking_severities = {"blocker", "major"}
-    elif isinstance(configured, str):
-        blocking_severities = {configured.strip().lower()}
-    else:
+    elif isinstance(configured, (list, tuple, set, frozenset)) and all(
+        isinstance(item, str) for item in configured
+    ):
         blocking_severities = {
             str(item).strip().lower() for item in configured if str(item).strip()
-        }
+        }.intersection({"blocker", "major"})
+    else:
+        blocking_severities = set()
 
-    findings = tuple(accepted)
     blocking_findings = tuple(sorted(
-        str(_field(item, "candidate_id", _field(item, "id", "")))
-        for item in findings
-        if str(_field(item, "severity", "info")).strip().lower() in blocking_severities
-        and str(_field(item, "candidate_id", _field(item, "id", ""))).strip()
+        str(finding_id).strip()
+        for finding_id, severity in supported_findings.items()
+        if str(finding_id).strip()
+        and str(severity).strip().lower() in blocking_severities
     ))
 
     unresolved_items = tuple(unresolved)
