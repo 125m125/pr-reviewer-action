@@ -92,17 +92,6 @@ class SessionOwnership:
             raise ValueError("session ownership requires a non-empty session_id")
         if not isinstance(self.assignment_id, str) or not self.assignment_id.strip():
             raise ValueError("session ownership requires a non-empty assignment_id")
-        ownership_sets = (
-            set(self.primary_obligation_ids),
-            set(self.secondary_obligation_ids),
-            set(self.independent_obligation_ids),
-        )
-        if any(
-            left.intersection(right)
-            for index, left in enumerate(ownership_sets)
-            for right in ownership_sets[index + 1:]
-        ):
-            raise ValueError("primary, secondary, and independent ownership must be distinct")
         for field_name in (
             "primary_obligation_ids", "secondary_obligation_ids",
             "independent_obligation_ids",
@@ -513,15 +502,16 @@ def _assignment_ownership(
             (),
             tuple(sorted(assignment.independent_obligation_ids)),
         )
-    non_primary = set(assignment.obligation_ids) - primary
+    assigned = set(assignment.obligation_ids)
+    non_primary = assigned - primary
     independent = {
-        obligation_id for obligation_id in non_primary
+        obligation_id for obligation_id in assigned
         if obligation_id in obligation_by_id
         and obligation_by_id[obligation_id].requires_independent_verification
     }
     return (
         tuple(sorted(primary)),
-        tuple(sorted(non_primary - independent)),
+        tuple(sorted(non_primary)),
         tuple(sorted(independent)),
     )
 

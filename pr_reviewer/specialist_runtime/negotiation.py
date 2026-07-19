@@ -43,15 +43,16 @@ def _assignment_ownership(
             tuple(sorted(primary)), (),
             tuple(sorted(assignment.independent_obligation_ids)),
         )
-    non_primary = set(assignment.obligation_ids) - primary
+    assigned = set(assignment.obligation_ids)
+    non_primary = assigned - primary
     independent = {
-        obligation_id for obligation_id in non_primary
+        obligation_id for obligation_id in assigned
         if obligation_id in obligation_by_id
         and obligation_by_id[obligation_id].requires_independent_verification
     }
     return (
         tuple(sorted(primary)),
-        tuple(sorted(non_primary - independent)),
+        tuple(sorted(non_primary)),
         tuple(sorted(independent)),
     )
 

@@ -4,7 +4,7 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
-from pr_reviewer.specialist_runtime.assignments import Assignment
+from pr_reviewer.specialist_runtime.assignments import Assignment, validate_assignment_plan
 from pr_reviewer.specialist_runtime.coverage import (
     CoverageLedger,
     SessionOwnership,
@@ -19,6 +19,7 @@ from pr_reviewer.specialist_runtime.negotiation import (
     fallback_next_action,
     validate_negotiation,
 )
+from pr_reviewer.specialist_runtime.policy import RuntimeConfig
 from pr_reviewer.specialist_runtime.types import (
     CoverageObligation,
     ObligationStatus,
@@ -424,7 +425,9 @@ def test_planner_independent_owner_fresh_evidence_satisfies_obligation():
     ledger = CoverageLedger((required,))
     planner_assignment = assignment("A-independent", ("OB1",), primary=())
     ownership = SessionOwnership(
-        "independent-session", "A-independent", independent_obligation_ids=("OB1",),
+        "independent-session", "A-independent",
+        secondary_obligation_ids=("OB1",),
+        independent_obligation_ids=("OB1",),
     )
     store = EvidenceStore()
     fresh = store.add_tool_result(
@@ -449,6 +452,90 @@ def test_planner_independent_owner_fresh_evidence_satisfies_obligation():
     )
 
     assert result.snapshot.obligation_statuses == (("OB1", ObligationStatus.COVERED),)
+
+
+def test_validated_sole_independent_owner_is_primary_and_independent_collector():
+    required = replace(
+        obligation("OB1"),
+        requires_independent_verification=True,
+        recipe_id="independent-check",
+        recipe_execution="independent",
+    )
+    plan = validate_assignment_plan({"assignments": [{
+        "id": "A-independent",
+        "title": "Independent verification",
+        "objective": "Independently verify the relevant test behavior.",
+        "obligation_ids": ["OB1"],
+        "lenses": ["independent-verification"],
+        "seed_paths": ["tests/test_a.py"],
+        "boundary_paths": [],
+        "expected_evidence": ["tests"],
+        "estimated_turns": 1,
+        "priority": "normal",
+        "overlap_justification": "",
+    }]}, (required,), {}, RuntimeConfig())
+    planner_assignment = plan.assignments[0]
+    assert planner_assignment.primary_obligation_ids == ("OB1",)
+    ownership = SessionOwnership(
+        "independent-session",
+        planner_assignment.id,
+        primary_obligation_ids=("OB1",),
+        independent_obligation_ids=("OB1",),
+    )
+    assert ownership.obligation_ids == ("OB1",)
+
+    fresh_store = EvidenceStore()
+    fresh = fresh_store.add_tool_result(
+        session_id="independent-session",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "fresh independent collection"},
+        category="tests",
+    )
+    fresh_ledger = CoverageLedger((required,))
+    fresh_result = reconcile_wave(
+        fresh_ledger,
+        wave_start_coverage=fresh_ledger.snapshot(),
+        checkpoints=(SessionCheckpoint(
+            session_id="independent-session",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(fresh.id,),
+        ),),
+        evidence=fresh_store.snapshot(),
+        assignments=plan.assignments,
+        session_ownership=(ownership,),
+    )
+
+    imported_store = EvidenceStore()
+    imported = imported_store.add_tool_result(
+        session_id="other-collector",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "other collector evidence"},
+        category="tests",
+    )
+    imported_store.import_into_session("independent-session", imported.id)
+    imported_ledger = CoverageLedger((required,))
+    imported_result = reconcile_wave(
+        imported_ledger,
+        wave_start_coverage=imported_ledger.snapshot(),
+        checkpoints=(SessionCheckpoint(
+            session_id="independent-session",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(imported.id,),
+            imported_evidence_ids=(imported.id,),
+        ),),
+        evidence=imported_store.snapshot(),
+        assignments=plan.assignments,
+        session_ownership=(ownership,),
+    )
+
+    assert fresh_result.snapshot.obligation_statuses == (
+        ("OB1", ObligationStatus.COVERED),
+    )
+    assert imported_result.snapshot.obligation_statuses == (
+        ("OB1", ObligationStatus.PENDING),
+    )
 
 
 @pytest.mark.parametrize(
