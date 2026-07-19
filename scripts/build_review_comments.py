@@ -20,19 +20,18 @@ Environment:
 import hashlib
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
+_ACTION_ROOT = _SCRIPTS_DIR.parent
+for _path in (str(_SCRIPTS_DIR), str(_ACTION_ROOT)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
+from pr_reviewer.github_review_notes import legacy_diff_positions as diff_positions  # noqa: E402
 from redact import mask_secrets  # noqa: E402
 from sanitize_review_markdown import sanitize_markdown  # noqa: E402
-
-
-_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 _SEVERITY_LABELS = {
     "blocker": "🛑 Blocker",
@@ -87,57 +86,6 @@ def commentable_lines(diff_text: str) -> dict:
     new-side lines GitHub accepts for a review comment with side=RIGHT.
     """
     return {path: set(mapping) for path, mapping in diff_positions(diff_text).items()}
-
-
-def diff_positions(diff_text: str) -> dict:
-    """Map new-side file path -> {new_line: diff-relative position}.
-
-    GitHub review comments use the final-file line plus ``side=RIGHT``.
-    Forgejo/Gitea review comments use ``new_position`` instead: a position in
-    the file's patch body. Track both from the same hunk walk so the two
-    publish backends anchor the same validated finding lines.
-    """
-    positions_by_path: dict = {}
-    current_path = None
-    new_line = 0
-    diff_position = 0
-    in_hunk = False
-
-    for raw in diff_text.splitlines():
-        if raw.startswith("diff --git "):
-            current_path = None
-            in_hunk = False
-            diff_position = 0
-            continue
-        if raw.startswith("+++ "):
-            target = raw[4:].strip()
-            if target == "/dev/null":
-                current_path = None
-            else:
-                current_path = target[2:] if target.startswith("b/") else target
-            continue
-        match = _HUNK_RE.match(raw)
-        if match:
-            new_line = int(match.group(1))
-            in_hunk = True
-            continue
-        if not in_hunk or current_path is None:
-            continue
-        if raw.startswith("\\"):
-            # "\ No newline at end of file" is metadata, not a diff slot.
-            continue
-
-        diff_position += 1
-        if raw.startswith("+"):
-            positions_by_path.setdefault(current_path, {})[new_line] = diff_position
-            new_line += 1
-        elif raw.startswith("-"):
-            continue
-        else:
-            positions_by_path.setdefault(current_path, {})[new_line] = diff_position
-            new_line += 1
-
-    return positions_by_path
 
 
 def _safe_path(path) -> bool:
