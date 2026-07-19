@@ -62,8 +62,15 @@ class WaveResult:
     results: tuple[AssignmentResult, ...]
     failures: tuple[WaveFailure, ...]
     not_started: tuple[str, ...]
+    cancelled_assignment_ids: tuple[str, ...]
+    in_flight_assignment_ids: tuple[str, ...]
     evidence_ids: tuple[str, ...]
     coverage_projection: tuple[tuple[str, ObligationStatus], ...]
+
+
+@dataclass(frozen=True)
+class _WorkerDeclined:
+    """A submitted worker observed cutoff before constructing its session."""
 
 
 def _assignment_id(assignment: object) -> str:
@@ -133,9 +140,13 @@ class SessionScheduler:
         now = self.clock()
         return lease.active(now=now) and self.deadline.exploration_allowed(now=now)
 
-    def _run_assignment(self, assignment: object, lease: SessionLease) -> SessionResult:
+    def _run_assignment(
+        self, assignment: object, lease: SessionLease,
+    ) -> SessionResult | _WorkerDeclined:
         # Factory construction belongs inside the worker so each worker owns all
         # mutable session state. Only the frozen wave snapshot crosses workers.
+        if not self._can_launch(lease):
+            return _WorkerDeclined()
         session = self.session_factory(assignment, lease, self.wave_snapshot)
         return session.explore()
 
@@ -157,57 +168,89 @@ class SessionScheduler:
         })
 
         remaining = deque(ordered)
-        active: dict[Future[SessionResult], object] = {}
+        active: dict[Future[SessionResult | _WorkerDeclined], object] = {}
         completed: dict[str, SessionResult] = {}
         failed: dict[str, str] = {}
+        declined: set[str] = set()
+        cancelled: set[str] = set()
+        in_flight: set[str] = set()
+
+        def collect(future: Future[SessionResult | _WorkerDeclined]) -> None:
+            assignment = active.pop(future)
+            assignment_id = _assignment_id(assignment)
+            if future.cancelled():
+                cancelled.add(assignment_id)
+                return
+            try:
+                outcome = future.result()
+            except Exception as exc:  # noqa: BLE001 - isolate one specialist failure
+                failed[assignment_id] = f"{type(exc).__name__}: {exc}"
+                return
+            if isinstance(outcome, _WorkerDeclined):
+                declined.add(assignment_id)
+            else:
+                completed[assignment_id] = outcome
 
         executor = ThreadPoolExecutor(max_workers=self.concurrency)
+        cutoff_reached = False
         try:
-            while remaining and len(active) < self.concurrency and self._can_launch(lease):
-                assignment = remaining.popleft()
+            # Admission is stable and may queue more work than the executor can
+            # immediately run. Every queued worker independently rechecks cutoff
+            # before constructing mutable session state.
+            while remaining:
+                if not self._can_launch(lease):
+                    cutoff_reached = True
+                    break
+                assignment = remaining[0]
                 assignment_id = _assignment_id(assignment)
-                self._emit("session_started", {"assignment_id": assignment_id})
-                active[executor.submit(self._run_assignment, assignment, lease)] = assignment
+                self._emit("session_admitted", {"assignment_id": assignment_id})
+                # Event sinks are synchronous admission work and may consume the
+                # last available phase time. Recheck immediately before submit.
+                if not self._can_launch(lease):
+                    cutoff_reached = True
+                    break
+                future = executor.submit(self._run_assignment, assignment, lease)
+                active[future] = assignment
+                remaining.popleft()
+                self._emit("session_queued", {"assignment_id": assignment_id})
+                if not self._can_launch(lease):
+                    cutoff_reached = True
+                    break
 
-            cutoff_reached = not self._can_launch(lease)
-            while active:
-                if cutoff_reached:
-                    # A Future may be queued briefly even though at most one is
-                    # submitted per worker. Cancel only work that has not begun;
-                    # running sessions retain their bounded phase lease.
-                    for future in tuple(active):
-                        if future.cancel():
-                            active.pop(future)
-                    if not active:
-                        break
-
-                timeout = None if cutoff_reached else lease.remaining(now=self.clock())
+            while active and not cutoff_reached:
+                if not self._can_launch(lease):
+                    cutoff_reached = True
+                    break
+                timeout = lease.remaining(now=self.clock())
+                if timeout <= 0:
+                    cutoff_reached = True
+                    break
                 done, _ = wait(active, timeout=timeout, return_when=FIRST_COMPLETED)
                 if not done:
                     cutoff_reached = True
-                    continue
+                    break
                 for future in done:
-                    assignment = active.pop(future)
-                    assignment_id = _assignment_id(assignment)
-                    try:
-                        completed[assignment_id] = future.result()
-                    except Exception as exc:  # noqa: BLE001 - isolate one specialist failure
-                        failed[assignment_id] = f"{type(exc).__name__}: {exc}"
-
+                    collect(future)
                 if not self._can_launch(lease):
                     cutoff_reached = True
-                while (
-                    not cutoff_reached
-                    and remaining
-                    and len(active) < self.concurrency
-                    and self._can_launch(lease)
-                ):
-                    assignment = remaining.popleft()
-                    assignment_id = _assignment_id(assignment)
-                    self._emit("session_started", {"assignment_id": assignment_id})
-                    active[executor.submit(self._run_assignment, assignment, lease)] = assignment
+
+            if cutoff_reached:
+                # Capture already-completed futures first, cancel only futures
+                # that have not begun, then classify non-cancellable work as
+                # in-flight without waiting into the finalization reserve.
+                for future in tuple(active):
+                    if future.done():
+                        collect(future)
+                for future in tuple(active):
+                    if future.cancel():
+                        collect(future)
+                for future in tuple(active):
+                    if future.done():
+                        collect(future)
+                    else:
+                        in_flight.add(_assignment_id(active.pop(future)))
         finally:
-            executor.shutdown(wait=True, cancel_futures=False)
+            executor.shutdown(wait=not cutoff_reached, cancel_futures=cutoff_reached)
 
         stable_results = tuple(
             AssignmentResult(assignment_id, completed[assignment_id])
@@ -219,10 +262,11 @@ class SessionScheduler:
             for assignment_id in ordered_ids
             if assignment_id in failed
         )
-        not_started = tuple(
-            assignment_id for assignment_id in ordered_ids
-            if assignment_id not in completed and assignment_id not in failed
-        )
+        never_submitted = {_assignment_id(item) for item in remaining}
+        not_started_set = never_submitted | declined
+        not_started = tuple(item for item in ordered_ids if item in not_started_set)
+        cancelled_assignment_ids = tuple(item for item in ordered_ids if item in cancelled)
+        in_flight_assignment_ids = tuple(item for item in ordered_ids if item in in_flight)
 
         evidence_ids = set(self.wave_snapshot.evidence.evidence_ids)
         coverage = dict(self.wave_snapshot.coverage.obligation_statuses)
@@ -234,24 +278,37 @@ class SessionScheduler:
                     coverage.get(obligation_id), ObligationStatus(status)
                 )
 
-        for item in stable_results:
-            self._emit("session_completed", {"assignment_id": item.assignment_id})
-        for item in stable_failures:
-            self._emit("session_failed", {
-                "assignment_id": item.assignment_id,
-                "error": item.error,
-            })
+        result_by_id = {item.assignment_id: item for item in stable_results}
+        failure_by_id = {item.assignment_id: item for item in stable_failures}
+        for assignment_id in ordered_ids:
+            if assignment_id in result_by_id:
+                self._emit("session_completed", {"assignment_id": assignment_id})
+            elif assignment_id in failure_by_id:
+                self._emit("session_failed", {
+                    "assignment_id": assignment_id,
+                    "error": failure_by_id[assignment_id].error,
+                })
+            elif assignment_id in not_started_set:
+                self._emit("session_not_started", {"assignment_id": assignment_id})
+            elif assignment_id in cancelled:
+                self._emit("session_cancelled", {"assignment_id": assignment_id})
+            elif assignment_id in in_flight:
+                self._emit("session_in_flight", {"assignment_id": assignment_id})
         self._emit("wave_completed", {
             "phase": normalized_phase.value,
             "completed": tuple(item.assignment_id for item in stable_results),
             "failed": tuple(item.assignment_id for item in stable_failures),
             "not_started": not_started,
+            "cancelled": cancelled_assignment_ids,
+            "in_flight": in_flight_assignment_ids,
         })
         return WaveResult(
             phase=normalized_phase,
             results=stable_results,
             failures=stable_failures,
             not_started=not_started,
+            cancelled_assignment_ids=cancelled_assignment_ids,
+            in_flight_assignment_ids=in_flight_assignment_ids,
             evidence_ids=tuple(sorted(evidence_ids)),
             coverage_projection=tuple(sorted(coverage.items())),
         )

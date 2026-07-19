@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from threading import Condition
+from threading import Condition, Event, Thread, current_thread
 
 from pr_reviewer.specialist_runtime.assignments import Assignment
 from pr_reviewer.specialist_runtime.budget import RunDeadline
@@ -166,11 +166,14 @@ def test_finalization_reserve_blocks_new_exploration():
     result = scheduler.run_wave(assignments, RunPhase.INITIAL)
 
     assert result.not_started == ("S1", "S2")
+    assert result.cancelled_assignment_ids == ()
+    assert result.in_flight_assignment_ids == ()
     assert started == []
 
 
 def test_high_risk_starts_first_and_cutoff_stops_pending_work():
     clock = FakeClock(20.0)
+    cutoff_set = Event()
     started = []
     results = {
         name: session_result(
@@ -185,6 +188,7 @@ def test_high_risk_starts_first_and_cutoff_stops_pending_work():
 
         def advance_to_cutoff():
             clock.value = deadline().cutoff_for(RunPhase.INITIAL)
+            cutoff_set.set()
 
         return FakeSession(
             results[item.id],
@@ -194,6 +198,11 @@ def test_high_risk_starts_first_and_cutoff_stops_pending_work():
     scheduler = SessionScheduler(
         deadline=deadline(), session_factory=factory,
         wave_snapshot=empty_snapshot(), concurrency=1, clock=clock,
+        event_sink=lambda kind, payload: (
+            cutoff_set.wait(1.0)
+            if kind == "session_queued" and payload.get("assignment_id") == "critical"
+            else None
+        ),
     )
 
     result = scheduler.run_wave(
@@ -208,6 +217,8 @@ def test_high_risk_starts_first_and_cutoff_stops_pending_work():
     assert started == ["critical"]
     assert tuple(item.assignment_id for item in result.results) == ("critical",)
     assert result.not_started == ("normal", "low")
+    assert result.cancelled_assignment_ids == ()
+    assert result.in_flight_assignment_ids == ()
 
 
 def test_every_session_gets_same_wave_snapshot_and_phase_bounded_lease():
@@ -269,3 +280,205 @@ def test_default_concurrency_is_one_and_does_not_share_mutable_session_state():
     assert max_active == 1
     assert len(sessions) == 2
     assert sessions[0] is not sessions[1]
+
+
+def test_cutoff_crossing_inside_slow_event_sink_prevents_submission_and_false_start():
+    clock = FakeClock(20.0)
+    events = []
+    factories = []
+
+    def sink(kind, payload):
+        events.append((kind, payload.get("assignment_id")))
+        if kind == "session_admitted":
+            clock.value = deadline().cutoff_for(RunPhase.INITIAL)
+
+    def factory(item, lease, snapshot):
+        factories.append(item.id)
+        raise AssertionError("cutoff assignment must not construct a session")
+
+    result = SessionScheduler(
+        deadline=deadline(), session_factory=factory, wave_snapshot=empty_snapshot(),
+        concurrency=1, clock=clock, event_sink=sink,
+    ).run_wave((assignment("S1", "critical"),), RunPhase.INITIAL)
+
+    assert factories == []
+    assert result.not_started == ("S1",)
+    assert result.cancelled_assignment_ids == ()
+    assert result.in_flight_assignment_ids == ()
+    assert events == [
+        ("wave_started", None),
+        ("session_admitted", "S1"),
+        ("session_not_started", "S1"),
+        ("wave_completed", None),
+    ]
+    assert all(kind != "session_started" for kind, _ in events)
+
+
+def test_submitted_pending_future_is_cancelled_but_running_future_is_in_flight():
+    clock = FakeClock(20.0)
+    worker_started = Event()
+    release_worker = Event()
+    worker_finished = Event()
+    returned = Event()
+    events = []
+    outcome = {}
+
+    class BlockingSession(FakeSession):
+        def explore(self):
+            worker_started.set()
+            assert release_worker.wait(1.0)
+            try:
+                return super().explore()
+            finally:
+                worker_finished.set()
+
+    def factory(item, lease, snapshot):
+        return BlockingSession(session_result(
+            item.id, evidence_ids=(),
+            statuses=((f"OB-{item.id}", ObligationStatus.PENDING),),
+        ))
+
+    def sink(kind, payload):
+        events.append((kind, payload.get("assignment_id")))
+        if kind == "session_queued" and payload.get("assignment_id") == "S1":
+            assert worker_started.wait(1.0)
+        if kind == "session_queued" and payload.get("assignment_id") == "S2":
+            clock.value = deadline().cutoff_for(RunPhase.INITIAL)
+
+    scheduler = SessionScheduler(
+        deadline=deadline(), session_factory=factory, wave_snapshot=empty_snapshot(),
+        concurrency=1, clock=clock, event_sink=sink,
+    )
+
+    def run():
+        try:
+            outcome["result"] = scheduler.run_wave(
+                (assignment("S1", "critical"), assignment("S2", "low")),
+                RunPhase.INITIAL,
+            )
+        finally:
+            returned.set()
+
+    runner = Thread(target=run)
+    runner.start()
+    returned_before_release = returned.wait(0.5)
+    release_worker.set()
+    runner.join(1.0)
+    assert returned_before_release, "scheduler waited for an in-flight session at cutoff"
+    assert not runner.is_alive()
+    assert worker_finished.wait(1.0)
+
+    result = outcome["result"]
+    assert result.results == ()
+    assert result.failures == ()
+    assert result.not_started == ()
+    assert result.cancelled_assignment_ids == ("S2",)
+    assert result.in_flight_assignment_ids == ("S1",)
+    assert events == [
+        ("wave_started", None),
+        ("session_admitted", "S1"),
+        ("session_queued", "S1"),
+        ("session_admitted", "S2"),
+        ("session_queued", "S2"),
+        ("session_in_flight", "S1"),
+        ("session_cancelled", "S2"),
+        ("wave_completed", None),
+    ]
+
+
+def test_worker_declines_session_construction_when_cutoff_crosses_after_submit():
+    queued = Event()
+    factories = []
+
+    class WorkerGuardClock:
+        def __call__(self):
+            if current_thread().name.startswith("ThreadPoolExecutor"):
+                assert queued.wait(1.0)
+                return deadline().cutoff_for(RunPhase.INITIAL)
+            return 20.0
+
+    def sink(kind, payload):
+        if kind == "session_queued":
+            queued.set()
+
+    def factory(item, lease, snapshot):
+        factories.append(item.id)
+        raise AssertionError("worker cutoff guard must run before factory")
+
+    result = SessionScheduler(
+        deadline=deadline(), session_factory=factory, wave_snapshot=empty_snapshot(),
+        concurrency=1, clock=WorkerGuardClock(), event_sink=sink,
+    ).run_wave((assignment("S1", "critical"),), RunPhase.INITIAL)
+
+    assert factories == []
+    assert result.not_started == ("S1",)
+    assert result.cancelled_assignment_ids == ()
+    assert result.in_flight_assignment_ids == ()
+
+
+def test_session_exception_is_a_stable_failure_not_not_started():
+    events = []
+
+    class BrokenSession:
+        def explore(self):
+            raise RuntimeError("provider exploded")
+
+    result = SessionScheduler(
+        deadline=deadline(), session_factory=lambda *_: BrokenSession(),
+        wave_snapshot=empty_snapshot(), concurrency=1, clock=FakeClock(20.0),
+        event_sink=lambda kind, payload: events.append(
+            (kind, payload.get("assignment_id"))
+        ),
+    ).run_wave((assignment("S1", "critical"),), RunPhase.INITIAL)
+
+    assert result.results == ()
+    assert tuple((item.assignment_id, item.error) for item in result.failures) == (
+        ("S1", "RuntimeError: provider exploded"),
+    )
+    assert result.not_started == ()
+    assert result.cancelled_assignment_ids == ()
+    assert result.in_flight_assignment_ids == ()
+    assert events == [
+        ("wave_started", None),
+        ("session_admitted", "S1"),
+        ("session_queued", "S1"),
+        ("session_failed", "S1"),
+        ("wave_completed", None),
+    ]
+
+
+def test_terminal_event_order_is_risk_id_stable_not_completion_order():
+    completion = OrderedCompletion(("S2", "S1"))
+    events = []
+
+    def factory(item, lease, snapshot):
+        return FakeSession(
+            session_result(
+                item.id, evidence_ids=(),
+                statuses=((f"OB-{item.id}", ObligationStatus.COVERED),),
+            ),
+            before_result=lambda: completion.complete(item.id),
+        )
+
+    result = SessionScheduler(
+        deadline=deadline(), session_factory=factory, wave_snapshot=empty_snapshot(),
+        concurrency=2, clock=FakeClock(20.0),
+        event_sink=lambda kind, payload: events.append(
+            (kind, payload.get("assignment_id"))
+        ),
+    ).run_wave(
+        (assignment("S2", "normal"), assignment("S1", "critical")),
+        RunPhase.INITIAL,
+    )
+
+    assert tuple(item.assignment_id for item in result.results) == ("S1", "S2")
+    assert events == [
+        ("wave_started", None),
+        ("session_admitted", "S1"),
+        ("session_queued", "S1"),
+        ("session_admitted", "S2"),
+        ("session_queued", "S2"),
+        ("session_completed", "S1"),
+        ("session_completed", "S2"),
+        ("wave_completed", None),
+    ]
