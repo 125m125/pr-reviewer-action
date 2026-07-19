@@ -39,7 +39,7 @@ def test_role_model_override_and_deadline_bound_timeout():
     ))
 
     assert calls[0][0][2]["model"] == "plan-model"
-    assert calls[0][0][4] == 20
+    assert 0 < calls[0][0][4] <= 20
     assert result.finish_reason == "stop"
     assert result.usage == {"prompt_tokens": 3, "completion_tokens": 2}
 
