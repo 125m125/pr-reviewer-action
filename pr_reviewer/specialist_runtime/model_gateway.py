@@ -164,18 +164,20 @@ class OpenAIModelGateway:
         This adapter keeps the legacy sequential runner on the same transport
         behavior while new runtime callers use :meth:`complete` directly.
         """
+        if timeout_sec <= 0 or not math.isfinite(timeout_sec):
+            raise ValueError("timeout_sec must be a positive finite number")
         started = time.monotonic()
+        if deadline_at is not None and not math.isfinite(deadline_at):
+            raise ValueError("deadline_at must be finite")
+        # A logical turn has one deadline, including every physical retry. A
+        # supplied run-level deadline takes precedence; direct legacy callers
+        # receive the timeout-derived deadline automatically.
+        effective_deadline = deadline_at if deadline_at is not None else started + timeout_sec
         structured_fallback = False
         original_error = ""
 
         def request_timeout() -> float:
-            if timeout_sec <= 0 or not math.isfinite(timeout_sec):
-                raise ValueError("timeout_sec must be a positive finite number")
-            if deadline_at is None:
-                return timeout_sec
-            if not math.isfinite(deadline_at):
-                raise ValueError("deadline_at must be finite")
-            remaining = deadline_at - time.monotonic()
+            remaining = effective_deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("model request deadline exceeded before transport")
             return min(timeout_sec, remaining)
