@@ -295,6 +295,13 @@ class CoverageLedger:
         self._evidence[obligation_id].add(str(evidence_id))
         self._unresolved.discard(obligation_id)
 
+    def obligation(self, obligation_id: str) -> CoverageObligation:
+        """Return immutable obligation metadata for deterministic association."""
+        try:
+            return self._obligations[obligation_id]
+        except KeyError as exc:
+            raise KeyError(f"unknown coverage obligation: {obligation_id}") from exc
+
     def mark_unresolved(self, obligation_id: str) -> None:
         if obligation_id not in self._obligations:
             raise KeyError(f"unknown coverage obligation: {obligation_id}")

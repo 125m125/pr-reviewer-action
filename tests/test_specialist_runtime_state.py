@@ -2,7 +2,12 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
-from pr_reviewer.specialist_runtime.budget import BudgetExceeded, BudgetLedger, RunDeadline
+from pr_reviewer.specialist_runtime.budget import (
+    BudgetExceeded,
+    BudgetLedger,
+    RunDeadline,
+    SessionLease,
+)
 from pr_reviewer.specialist_runtime.events import RunArtifactProjector, RunEvent
 from pr_reviewer.specialist_runtime.types import BudgetLimits, PhaseShares, RunPhase
 
@@ -92,6 +97,28 @@ def test_deadline_is_an_immutable_value():
 
     with pytest.raises(FrozenInstanceError):
         deadline.deadline_sec = 20.0
+
+
+def test_session_lease_bounds_request_timeout_and_expires_at_absolute_deadline():
+    lease = SessionLease(phase=RunPhase.FOLLOWUP, deadline_at=125.0)
+
+    assert lease.remaining(now=120.0) == 5.0
+    assert lease.active(now=124.999)
+    assert lease.request_timeout(20.0, now=120.0) == 5.0
+    assert lease.request_timeout(2.0, now=120.0) == 2.0
+    assert not lease.active(now=125.0)
+    with pytest.raises(TimeoutError, match="followup session lease expired"):
+        lease.request_timeout(20.0, now=125.0)
+
+
+def test_run_deadline_creates_phase_lease_from_absolute_cutoff():
+    deadline = RunDeadline(100.0, 100.0, PhaseShares())
+
+    exploration = deadline.lease_for(RunPhase.FOLLOWUP)
+    finalization = deadline.lease_for(RunPhase.FINALIZATION)
+
+    assert exploration == SessionLease(RunPhase.FOLLOWUP, 190.0)
+    assert finalization == SessionLease(RunPhase.FINALIZATION, 200.0)
 
 
 def test_artifact_projection_rejects_duplicate_and_missing_sequences():

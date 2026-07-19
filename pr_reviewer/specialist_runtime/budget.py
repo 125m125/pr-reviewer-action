@@ -117,6 +117,39 @@ class BudgetLedger:
 
 
 @dataclass(frozen=True)
+class SessionLease:
+    """Absolute phase lease used to bound specialist model requests."""
+
+    phase: RunPhase
+    deadline_at: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "phase", RunPhase(self.phase))
+        if not isfinite(self.deadline_at):
+            raise ValueError("session lease deadline_at must be finite")
+
+    def remaining(self, *, now: float | None = None) -> float:
+        current = time.monotonic() if now is None else now
+        return max(0.0, self.deadline_at - current)
+
+    def active(self, *, now: float | None = None) -> bool:
+        return self.remaining(now=now) > 0
+
+    def request_timeout(
+        self,
+        configured_timeout: float,
+        *,
+        now: float | None = None,
+    ) -> float:
+        if not isfinite(configured_timeout) or configured_timeout <= 0:
+            raise ValueError("configured request timeout must be positive and finite")
+        remaining = self.remaining(now=now)
+        if remaining <= 0:
+            raise TimeoutError(f"{self.phase.value} session lease expired")
+        return min(float(configured_timeout), remaining)
+
+
+@dataclass(frozen=True)
 class RunDeadline:
     """Absolute phase cutoffs that preserve the finalization reserve."""
 
@@ -146,6 +179,10 @@ class RunDeadline:
 
     def cutoff_for(self, phase: RunPhase) -> float:
         return self._cutoffs[RunPhase(phase)]
+
+    def lease_for(self, phase: RunPhase) -> SessionLease:
+        normalized = RunPhase(phase)
+        return SessionLease(normalized, self.cutoff_for(normalized))
 
     def remaining(self, *, now: float | None = None) -> float:
         current = time.monotonic() if now is None else now

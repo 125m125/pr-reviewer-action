@@ -314,10 +314,22 @@ def extract_tool_calls(
     return calls, "".join(text_parts)
 
 
-def _request_key(name: str, args: dict[str, Any]) -> str:
+def native_tool_request_key(name: str, args: dict[str, Any]) -> str:
+    """Return the stable native-tool identity shared by continuous sessions."""
     # Mirrors scripts/run_tool_harness.py request_key so dedup behaves the
     # same in both harness modes.
     return f"{name}:{json.dumps(args, sort_keys=True, separators=(',', ':'))}"
+
+
+def decode_native_tool_arguments(arguments: Any) -> dict[str, Any]:
+    """Decode one native call's opaque arguments into an object."""
+    if arguments is None or arguments == "":
+        value = {}
+    else:
+        value = json.loads(arguments) if isinstance(arguments, str) else arguments
+    if not isinstance(value, dict):
+        raise ValueError("arguments must be a JSON object")
+    return value
 
 
 def _normalise_assistant_text(text: str) -> str:
@@ -600,9 +612,7 @@ def drive_tool_loop(
             # here, and on failure answer with a repairable error instead of
             # crashing the loop — weak models misquote JSON.
             try:
-                args = json.loads(call["arguments"]) if call["arguments"] else {}
-                if not isinstance(args, dict):
-                    raise ValueError("arguments must be a JSON object")
+                args = decode_native_tool_arguments(call["arguments"])
             except (json.JSONDecodeError, ValueError) as exc:
                 outcome.calls_malformed += 1
                 outcome.calls_rejected += 1
@@ -612,7 +622,7 @@ def drive_tool_loop(
                 )
                 continue
 
-            key = _request_key(call["name"], args)
+            key = native_tool_request_key(call["name"], args)
             round_keys.append(key)
             if key in seen_keys:
                 outcome.calls_duplicated += 1
@@ -672,7 +682,7 @@ def drive_tool_loop(
                 is_error=result.get("status") != "ok",
             )
             if result.get("status") == "ok":
-                key = _request_key(name, args)
+                key = native_tool_request_key(name, args)
                 successful_results[key] = {
                     "tool": result.get("tool", name),
                     "status": "ok",
