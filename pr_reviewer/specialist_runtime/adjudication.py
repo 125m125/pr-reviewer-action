@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import (
+    dataclass,
+    fields as dataclass_fields,
+    is_dataclass,
+    replace,
+)
 from enum import Enum
 import hashlib
 import html
+import json
 from pathlib import PurePosixPath
 import re
 import unicodedata
@@ -65,6 +71,8 @@ class AcceptedFinding:
     collector_session_id: str = ""
     model_identity: str = ""
     contributor_candidate_ids: tuple[str, ...] = ()
+    user_visible_consequences: tuple[str, ...] = ()
+    manual_validations: tuple[str, ...] = ()
 
     @property
     def affected_location(self) -> str:
@@ -145,9 +153,38 @@ def _unicode(value: object) -> str:
 
 def _identity_text(value: object) -> str:
     text = _unicode(value).casefold()
-    text = re.sub(r"(==|!=|<=|>=|&&|\|\||[+*/%\-=!<>])", r" \1 ", text)
-    text = re.sub(r"[^\w\s+*/%\-=!<>|&]+", " ", text, flags=re.UNICODE)
-    return " ".join(text.split())
+    semantic = "".join(
+        character
+        if character.isspace()
+        or unicodedata.category(character)[0] in {"L", "N", "P", "S"}
+        else " "
+        for character in text
+    )
+    return " ".join(semantic.split())
+
+
+def _detail_identity(value: object) -> str:
+    text = _identity_text(value)
+    start = 0
+    end = len(text)
+    while start < end and unicodedata.category(text[start])[0] in {"P", "S"}:
+        start += 1
+    while end > start and unicodedata.category(text[end - 1])[0] in {"P", "S"}:
+        end -= 1
+    return text[start:end].strip()
+
+
+def _stable_detail_values(values: Iterable[object]) -> tuple[str, ...]:
+    by_identity: dict[str, str] = {}
+    for value in values:
+        normalized = _unicode(value).strip()
+        identity = _detail_identity(normalized)
+        if not identity:
+            continue
+        current = by_identity.get(identity)
+        if current is None or normalized < current:
+            by_identity[identity] = normalized
+    return tuple(by_identity[key] for key in sorted(by_identity))
 
 
 def _path(value: object) -> tuple[str, int | None, str]:
@@ -313,13 +350,29 @@ def _authorize(
         return None, "missing-changed-causal-file"
     if affected_file not in changed_files:
         return None, "off-change-causal-file"
-    if (
-        not _identity_text(candidate.claim)
-        or not _identity_text(candidate.causal_chain)
-        or not _identity_text(candidate.user_visible_consequence)
-        or not _identity_text(candidate.manual_validation)
-    ):
+    if not _identity_text(candidate.claim) or not _identity_text(candidate.causal_chain):
         return None, "missing-required-finding-detail"
+    raw_consequences = (
+        value.user_visible_consequences
+        if isinstance(value, AcceptedFinding) and value.user_visible_consequences
+        else (candidate.user_visible_consequence,)
+    )
+    raw_validations = (
+        value.manual_validations
+        if isinstance(value, AcceptedFinding) and value.manual_validations
+        else (candidate.manual_validation,)
+    )
+    consequences = _stable_detail_values(raw_consequences)
+    validations = _stable_detail_values(raw_validations)
+    if not consequences or not validations:
+        return None, "missing-required-finding-detail"
+    claim_identity = _detail_identity(candidate.claim)
+    consequence_identities = {_detail_identity(item) for item in consequences}
+    if claim_identity in consequence_identities or any(
+        _detail_identity(item) in {claim_identity, *consequence_identities}
+        for item in validations
+    ):
+        return None, "non-distinct-required-finding-detail"
     if not candidate.related_obligation_ids:
         return None, "missing-related-obligation"
     if any(obligation_id not in obligations for obligation_id in candidate.related_obligation_ids):
@@ -355,7 +408,7 @@ def _authorize(
         root_cause_fingerprint=candidate.root_cause_fingerprint,
         deduplication_key=_deduplication_key(candidate),
         claim=candidate.claim,
-        user_visible_consequence=candidate.user_visible_consequence,
+        user_visible_consequence=consequences[0],
         affected_file=affected_file,
         line=line,
         causal_chain=candidate.causal_chain,
@@ -366,7 +419,9 @@ def _authorize(
         related_obligation_ids=candidate.related_obligation_ids,
         supporting_citations=supporting_citations,
         contradicting_citations=contradicting_citations,
-        manual_validation=candidate.manual_validation,
+        manual_validation=validations[0],
+        user_visible_consequences=consequences,
+        manual_validations=validations,
         collector_session_id=candidate.collector_session_id,
         model_identity=candidate.model_identity,
         contributor_candidate_ids=(candidate.candidate_id,),
@@ -401,6 +456,19 @@ def _merge_findings(group: Iterable[AcceptedFinding], representative_id: str) ->
         citation.evidence_id: citation
         for item in values for citation in item.contradicting_citations
     }
+    consequences = _stable_detail_values(
+        detail
+        for item in values
+        for detail in (
+            item.user_visible_consequences
+            or (item.user_visible_consequence,)
+        )
+    )
+    validations = _stable_detail_values(
+        detail
+        for item in values
+        for detail in (item.manual_validations or (item.manual_validation,))
+    )
     return replace(
         representative,
         severity=max(values, key=lambda item: _SEVERITY_RANK[item.severity]).severity,
@@ -419,6 +487,10 @@ def _merge_findings(group: Iterable[AcceptedFinding], representative_id: str) ->
         contradicting_citations=tuple(
             contradicting_citations[key] for key in sorted(contradicting_citations)
         ),
+        user_visible_consequence=consequences[0],
+        manual_validation=validations[0],
+        user_visible_consequences=consequences,
+        manual_validations=validations,
         contributor_candidate_ids=tuple(sorted({
             contributor for item in values for contributor in item.contributor_candidate_ids
         })),
@@ -636,6 +708,58 @@ def _exact_detail(value: object) -> str:
     return " ".join(_unicode(value).casefold().split())
 
 
+def _detail_scalars(value: object, *, _seen: set[int] | None = None) -> tuple[str, ...]:
+    seen = _seen if _seen is not None else set()
+    if value is None:
+        return ()
+    if isinstance(value, Enum):
+        return _detail_scalars(value.value, _seen=seen)
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        values = [value]
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            decoded = None
+        if decoded is not None and not isinstance(decoded, str):
+            values.extend(_detail_scalars(decoded, _seen=seen))
+        return tuple(values)
+    if isinstance(value, bool):
+        return ("true" if value else "false",)
+    if isinstance(value, (int, float)):
+        return (str(value),)
+
+    identity = id(value)
+    if identity in seen:
+        return ()
+    seen.add(identity)
+    if is_dataclass(value) and not isinstance(value, type):
+        return tuple(
+            detail
+            for field in sorted(dataclass_fields(value), key=lambda item: item.name)
+            for detail in _detail_scalars(getattr(value, field.name), _seen=seen)
+        )
+    if isinstance(value, Mapping):
+        return tuple(
+            detail
+            for key, item in sorted(value.items(), key=lambda pair: _unicode(pair[0]))
+            for part in (key, item)
+            for detail in _detail_scalars(part, _seen=seen)
+        )
+    if isinstance(value, (set, frozenset)):
+        values: Iterable[object] = sorted(value, key=_unicode)
+    elif isinstance(value, Iterable):
+        values = value
+    else:
+        return ()
+    return tuple(
+        detail
+        for item in values
+        for detail in _detail_scalars(item, _seen=seen)
+    )
+
+
 def _topic_values(
     values: object,
     *,
@@ -730,38 +854,22 @@ def build_review_handoff(
     }
     recommendation = recommendation_map.get(_unicode(context.recommendation).strip().lower(), "")
     status = status_map.get(_unicode(context.status).strip().lower(), "")
-    detail_values: list[str] = []
+    snapshot = _snapshot(evidence)
+    detail_roots: list[object] = []
     if isinstance(review, AdjudicatedReview):
-        for value in review.accepted:
-            candidate = _candidate_from_accepted(value) if isinstance(value, (AcceptedFinding, CandidateFinding)) else None
-            if candidate is not None:
-                detail_values.extend((candidate.claim, candidate.causal_chain))
-                detail_values.extend((
-                    candidate.user_visible_consequence, candidate.manual_validation,
-                ))
-                detail_values.extend(candidate.supporting_evidence_ids)
-                detail_values.extend(candidate.contradicting_evidence_ids)
-        detail_values.extend(item.claim for item in review.unknowns if isinstance(item, CandidateFinding))
-        for item in review.verification_requests:
-            if isinstance(item, CandidateVerificationRequest):
-                detail_values.extend((item.candidate.claim, item.candidate.causal_chain))
-            elif isinstance(item, CandidateFinding):
-                detail_values.extend((item.claim, item.causal_chain))
-    for record in _snapshot(evidence).records:
-        detail_values.extend((
-            record.id,
-            record.canonical_key,
-            record.content,
-            record.content_hash,
-            record.source_identity,
-            record.source_path or "",
-            record.provenance.original_url or "",
-            record.provenance.final_url or "",
-            record.provenance.policy_hash or "",
-            record.provenance.policy_rule_id or "",
+        detail_roots.extend((
+            review.accepted,
+            review.unknowns,
+            review.verification_requests,
         ))
+    detail_roots.extend((
+        context.source_access_requests,
+        snapshot.records,
+    ))
     forbidden = frozenset(
-        value for item in detail_values if (value := _exact_detail(item))
+        value
+        for item in _detail_scalars(tuple(detail_roots))
+        if (value := _exact_detail(item))
     )
     change_topics = _topic_values(
         context.change_topics, forbidden=forbidden, limit=6
@@ -1015,6 +1123,8 @@ def _canonical_request_url(value: str) -> tuple[str, str] | None:
         or not host_value
         or parsed.username is not None
         or parsed.password is not None
+        or parsed.netloc.rsplit("@", 1)[-1].endswith(":")
+        or (port is not None and not 1 <= port <= 65535)
     ):
         return None
     host = host_value.casefold()
@@ -1078,10 +1188,21 @@ def _finding_note(finding: AcceptedFinding) -> ReviewNote:
         return lines
     supporting_lines = citation_lines(finding.supporting_citations)
     contradicting_lines = citation_lines(finding.contradicting_citations)
+    consequence_lines = [
+        "- " + _quoted(item)
+        for item in (
+            finding.user_visible_consequences
+            or (finding.user_visible_consequence,)
+        )
+    ]
+    validation_lines = [
+        "- " + _quoted(item)
+        for item in (finding.manual_validations or (finding.manual_validation,))
+    ]
     markdown = (
         f"### {finding.severity.title()} finding\n\n"
         "**Claim:** " + _quoted(finding.claim)
-        + "\n\n**User-visible consequence:** " + _quoted(finding.user_visible_consequence)
+        + "\n\n**User-visible consequence:**\n" + "\n".join(consequence_lines)
         + "\n\n**Causal chain:** " + _quoted(finding.causal_chain)
         + "\n\n**Supporting evidence provenance / citations:**\n"
         + "\n".join(supporting_lines)
@@ -1090,7 +1211,7 @@ def _finding_note(finding: AcceptedFinding) -> ReviewNote:
             + "\n".join(contradicting_lines)
             if contradicting_lines else ""
         )
-        + "\n\n**Suggested validation:** " + _quoted(finding.manual_validation)
+        + "\n\n**Suggested validation:**\n" + "\n".join(validation_lines)
     )
     return ReviewNote(
         kind=ReviewNoteKind.FINDING,

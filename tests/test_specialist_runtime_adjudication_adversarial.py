@@ -6,6 +6,7 @@ import pytest
 
 from pr_reviewer.specialist_runtime.adjudication import (
     AdjudicatedReview,
+    CandidateVerificationRequest,
     ReviewHandoffContext,
     ReviewOrientationTopic,
     adjudicate_candidates,
@@ -13,13 +14,21 @@ from pr_reviewer.specialist_runtime.adjudication import (
     build_review_handoff,
     build_review_notes,
 )
-from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+from pr_reviewer.specialist_runtime.evidence import (
+    EvidenceProvenance,
+    EvidenceSnapshot,
+    EvidenceStore,
+)
 from pr_reviewer.specialist_runtime.types import (
     CandidateFinding,
     CoverageObligation,
     ReviewNoteKind,
 )
-from pr_reviewer.specialist_runtime.web_evidence import SourceAccessRequest
+from pr_reviewer.specialist_runtime.web_evidence import (
+    SearchCandidate,
+    SourceAccessRequest,
+    source_access_request,
+)
 
 
 CHANGED_FILES = ("src/store.py",)
@@ -190,11 +199,16 @@ def test_fingerprint_preserves_operators_negation_and_non_latin_claims():
 @pytest.mark.parametrize(
     ("first_claim", "second_claim"),
     [
+        ("flags ^ mask", "flags mask"),
         ("balance + 1 overflows", "balance - 1 overflows"),
         ("count * 2 is persisted", "count / 2 is persisted"),
         ("count % 2 is zero", "count = 2 is zero"),
         ("ready && valid", "ready || valid"),
         ("!ready", "ready"),
+        ("ready ? primary : fallback", "ready primary fallback"),
+        ("size ≤ limit", "size limit"),
+        ("size ≥ limit", "size limit"),
+        ("size ≠ limit", "size limit"),
     ],
 )
 def test_public_fingerprint_preserves_arithmetic_and_boolean_operators(
@@ -269,6 +283,8 @@ def test_explicit_critic_merge_combines_distinct_claims_under_same_causal_root()
         target,
         candidate_id="candidate-b",
         claim="The duplicate write emits two audit events",
+        user_visible_consequence="Operators see duplicate audit entries for one action.",
+        manual_validation="Trigger one retry and verify the audit log has one entry.",
     )
 
     review = adjudicate_candidates(
@@ -287,11 +303,65 @@ def test_explicit_critic_merge_combines_distinct_claims_under_same_causal_root()
     )
 
     assert len(review.accepted) == 1
-    assert review.accepted[0].candidate_id == target.candidate_id
-    assert review.accepted[0].contributor_candidate_ids == ("candidate-a", "candidate-b")
+    finding = review.accepted[0]
+    assert finding.candidate_id == target.candidate_id
+    assert finding.contributor_candidate_ids == ("candidate-a", "candidate-b")
+    assert set(finding.user_visible_consequences) == {
+        target.user_visible_consequence,
+        consequence.user_visible_consequence,
+    }
+    assert set(finding.manual_validations) == {
+        target.manual_validation,
+        consequence.manual_validation,
+    }
     assert next(
         item for item in review.dispositions if item.candidate_id == consequence.candidate_id
     ).action == "merge"
+
+    notes = build_review_notes(
+        review,
+        store,
+        "review_comment",
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert len(notes) == 1
+    assert all(
+        detail in notes[0].markdown
+        for detail in (*finding.user_visible_consequences, *finding.manual_validations)
+    )
+
+
+def test_duplicate_consequence_or_validation_placeholder_downgrades_to_verification():
+    store, evidence_id = _store()
+    complete = _candidate(evidence_ids=(evidence_id,))
+    candidates = (
+        replace(
+            complete,
+            candidate_id="claim-as-consequence",
+            user_visible_consequence=f"  {complete.claim.upper()}!  ",
+        ),
+        replace(
+            complete,
+            candidate_id="claim-as-validation",
+            manual_validation=f" {complete.claim.upper()} ",
+        ),
+        replace(
+            complete,
+            candidate_id="consequence-as-validation",
+            manual_validation=complete.user_visible_consequence.upper(),
+        ),
+    )
+
+    review = _adjudicate(candidates, store)
+
+    assert review.accepted == ()
+    assert tuple(item.reason for item in review.verification_requests) == (
+        "non-distinct-required-finding-detail",
+        "non-distinct-required-finding-detail",
+        "non-distinct-required-finding-detail",
+    )
 
 
 def test_real_source_access_requests_include_context_and_distinguish_url():
@@ -325,14 +395,15 @@ def test_real_source_access_requests_include_context_and_distinguish_url():
 
 def test_source_access_request_preserves_non_default_port_in_identity_and_display():
     store, _ = _store()
-    first = SourceAccessRequest(
-        host="docs.example.com",
-        candidate_url="https://docs.example.com/schema/v1",
-        obligation_id="obligation-store",
-        purpose="Confirm the deployed schema.",
+    first = source_access_request(
+        SearchCandidate(None, "https://docs.example.com/schema/v1"),
+        "obligation-store",
+        "Confirm the deployed schema.",
     )
-    second = replace(
-        first, candidate_url="https://docs.example.com:8443/schema/v1"
+    second = source_access_request(
+        SearchCandidate(None, "https://docs.example.com:8443/schema/v1"),
+        "obligation-store",
+        "Confirm the deployed schema.",
     )
 
     notes = build_review_notes(
@@ -351,13 +422,16 @@ def test_source_access_request_preserves_non_default_port_in_identity_and_displa
 
 def test_source_access_request_removes_default_https_port_from_identity():
     store, _ = _store()
-    first = SourceAccessRequest(
-        host="docs.example.com",
-        candidate_url="https://docs.example.com/schema/v1",
-        obligation_id="obligation-store",
-        purpose="Confirm the deployed schema.",
+    first = source_access_request(
+        SearchCandidate(None, "https://docs.example.com/schema/v1"),
+        "obligation-store",
+        "Confirm the deployed schema.",
     )
-    second = replace(first, candidate_url="https://docs.example.com:443/schema/v1")
+    second = source_access_request(
+        SearchCandidate(None, "https://docs.example.com:443/schema/v1"),
+        "obligation-store",
+        "Confirm the deployed schema.",
+    )
 
     notes = build_review_notes(
         AdjudicatedReview(),
@@ -376,7 +450,9 @@ def test_source_access_request_removes_default_https_port_from_identity():
     "candidate_url",
     (
         "https://user:pass@docs.example.com/schema/v1",
+        "https://docs.example.com:/schema/v1",
         "https://docs.example.com:bad/schema/v1",
+        "https://docs.example.com:0/schema/v1",
         "https://docs.example.com:99999/schema/v1",
     ),
 )
@@ -558,6 +634,158 @@ def test_handoff_excludes_exact_evidence_content_source_id_and_hash():
     assert (record.source_path or "not-present") not in handoff.markdown
     assert "safe-component" in handoff.markdown
     assert "safe-recipe" in handoff.markdown
+
+
+def test_handoff_recursively_excludes_unknown_request_obligation_and_source_details():
+    store, evidence_id = _store()
+    accepted_review = _adjudicate((_candidate(evidence_ids=(evidence_id,)),), store)
+    unknown = _candidate(
+        "unknown-candidate",
+        claim="unknown-claim",
+        evidence_ids=(evidence_id,),
+        obligation_ids=("unknown-obligation",),
+        consequence="unknown-consequence",
+        manual_validation="unknown-validation",
+    )
+    verification = _candidate(
+        "verification-candidate",
+        claim="verification-claim",
+        evidence_ids=(evidence_id,),
+        obligation_ids=("verification-obligation",),
+        consequence="verification-consequence",
+        manual_validation="verification-validation",
+    )
+    review = replace(
+        accepted_review,
+        unknowns=(unknown,),
+        verification_requests=(
+            CandidateVerificationRequest(verification, "verification-reason"),
+        ),
+    )
+    source_request = SourceAccessRequest(
+        host="source-host",
+        candidate_url="https://source-host/source-path",
+        obligation_id="source-obligation",
+        purpose="Database and persistence",
+        authority_reason="source-authority",
+    )
+    injected = (
+        "unknown-candidate",
+        "unknown-claim",
+        "unknown-obligation",
+        "unknown-consequence",
+        "unknown-validation",
+        "verification-candidate",
+        "verification-claim",
+        "verification-obligation",
+        "verification-consequence",
+        "verification-validation",
+        "verification-reason",
+        "source-host",
+        "source-obligation",
+        "source-authority",
+    )
+    context = ReviewHandoffContext(
+        change_topics=(ReviewOrientationTopic.DATABASE,),
+        component_ids=(*injected, "safe-component"),
+        recipe_ids=injected,
+        source_access_requests=(source_request,),
+    )
+
+    handoff = build_review_handoff(
+        context,
+        review=review,
+        evidence=store,
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert all(item not in handoff.markdown for item in injected)
+    assert "Database and persistence" not in handoff.markdown
+    assert "safe-component" in handoff.markdown
+
+
+def test_handoff_recursively_excludes_every_evidence_record_and_provenance_field():
+    store = EvidenceStore()
+    record = store.add_tool_result(
+        session_id="collector-metadata",
+        model_identity="model-metadata",
+        tool="tool-metadata",
+        arguments={"path": "metadata-path", "selector": "argument-topic"},
+        result={"status": "ok", "content": "evidence-content"},
+        category="evidence-category",
+        source="source-metadata",
+        mime_type="mime-topic",
+        provenance=EvidenceProvenance(
+            head_sha="head-sha",
+            policy_hash="policy-hash",
+            policy_rule_id="Database and persistence",
+            source_classification="source-classification",
+            original_url="provenance-original",
+            final_url="provenance-final",
+            retrieved_at=1234.5,
+            max_age_hours=6.5,
+        ),
+        now=1234.5,
+    )
+    obligation = _obligation(category="evidence-category")
+    review = _adjudicate(
+        (_candidate(evidence_ids=(record.id,)),),
+        store,
+        obligations=_controller_obligations(obligation),
+    )
+    record = replace(
+        record,
+        source_identity="source-identity",
+        imported_by=("imported-session",),
+        supersedes=("superseded-evidence",),
+        contradicts=("contradicted-evidence",),
+        truncated=True,
+        redacted=False,
+    )
+    snapshot = EvidenceSnapshot((record,))
+    injected = (
+        "evidence-category",
+        "collector-metadata",
+        "model-metadata",
+        "tool-metadata",
+        "argument-topic",
+        "source-identity",
+        "metadata-path",
+        "ok",
+        "evidence-content",
+        record.content_hash,
+        "mime-topic",
+        "true",
+        "false",
+        "imported-session",
+        "superseded-evidence",
+        "contradicted-evidence",
+        "head-sha",
+        "policy-hash",
+        "source-classification",
+        "provenance-original",
+        "provenance-final",
+        "1234.5",
+        "6.5",
+    )
+    context = ReviewHandoffContext(
+        change_topics=(ReviewOrientationTopic.DATABASE,),
+        component_ids=(*injected, "safe-component"),
+        recipe_ids=injected,
+    )
+
+    handoff = build_review_handoff(
+        context,
+        review=review,
+        evidence=snapshot,
+        obligations=_controller_obligations(obligation),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert all(item not in handoff.markdown for item in injected)
+    assert "Database and persistence" not in handoff.markdown
+    assert "safe-component" in handoff.markdown
 
 
 def test_category_disguised_as_claim_cannot_be_aggregate_theme():

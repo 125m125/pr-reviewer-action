@@ -76,6 +76,59 @@ def test_unapproved_candidate_creates_request_without_fetching():
     assert provider.limits == [25]
 
 
+def test_source_access_request_preserves_validated_non_default_port():
+    discovery = discover(
+        "schema behavior",
+        FakeSearchProvider([
+            SearchCandidate(None, "https://docs.example.com:8443/schema/v1")
+        ]),
+        source_policy(),
+    )
+    request = source_access_request(
+        discovery.unapproved[0],
+        "OB-schema",
+        "confirm schema",
+    )
+
+    assert discovery.unapproved[0].host == "docs.example.com"
+    assert request.host == "docs.example.com"
+    assert request.candidate_url == "https://docs.example.com:8443/schema/v1"
+
+
+def test_source_access_request_canonicalizes_default_https_port():
+    plain = source_access_request(
+        SearchCandidate(None, "https://docs.example.com/schema/v1"),
+        "OB-schema",
+        "confirm schema",
+    )
+    explicit_default = source_access_request(
+        SearchCandidate(None, "https://docs.example.com:443/schema/v1"),
+        "OB-schema",
+        "confirm schema",
+    )
+
+    assert explicit_default.candidate_url == plain.candidate_url
+
+
+@pytest.mark.parametrize(
+    "candidate_url",
+    (
+        "https://user:pass@docs.example.com/schema/v1",
+        "https://docs.example.com:/schema/v1",
+        "https://docs.example.com:bad/schema/v1",
+        "https://docs.example.com:0/schema/v1",
+        "https://docs.example.com:99999/schema/v1",
+    ),
+)
+def test_source_access_request_rejects_unsafe_or_invalid_authority(candidate_url):
+    with pytest.raises(ValueError, match="requires a valid URL authority"):
+        source_access_request(
+            SearchCandidate(None, candidate_url),
+            "OB-schema",
+            "confirm schema",
+        )
+
+
 def test_discovery_scans_bounded_results_and_caps_approved_output():
     provider = FakeSearchProvider([
         SearchCandidate(str(index), f"https://docs.example.com/{index}", "snippet")
@@ -524,13 +577,13 @@ def test_denied_metadata_strips_authority_query_and_suspicious_path():
 
     discovery = discover("api", provider, source_policy())
     denied = discovery.unapproved[0]
-    request = source_access_request(denied, "OB-api", "verify behavior")
     serialized = discovery.to_tool_result()
 
-    assert denied.host == "evil.example"
+    assert denied.host == ""
     assert denied.path == "/[REDACTED]"
-    assert denied.url == "https://evil.example/[REDACTED]"
-    assert request.candidate_url == denied.url
+    assert denied.url == ""
+    with pytest.raises(ValueError, match="requires a valid URL authority"):
+        source_access_request(denied, "OB-api", "verify behavior")
     assert all(marker not in serialized for marker in (
         "user", "pass", "q=", "secret", "frag", "hostile title", "hostile snippet",
     ))

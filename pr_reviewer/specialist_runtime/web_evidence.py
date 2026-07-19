@@ -348,6 +348,8 @@ class SourcePolicy:
             return SourceDecision(False, host, path, reason="URL requires a host")
         if parsed.username is not None or parsed.password is not None:
             return SourceDecision(False, host, path, reason="URL credentials are forbidden")
+        if _authority_has_empty_port(parsed.netloc):
+            return SourceDecision(False, host, path, reason="URL port is empty")
         if parsed.fragment:
             return SourceDecision(False, host, path, reason="URL fragments are forbidden")
         if port not in (None, 443):
@@ -401,6 +403,11 @@ def _normalize_hostname(host: str | None) -> str:
         return host.rstrip(".").encode("idna").decode("ascii").lower()
     except UnicodeError:
         return ""
+
+
+def _authority_has_empty_port(netloc: str) -> bool:
+    authority = str(netloc).rsplit("@", 1)[-1]
+    return authority.endswith(":")
 
 
 _MAX_URL_DECODE_PASSES = 3
@@ -491,9 +498,16 @@ def _safe_discovery_url(url: str) -> tuple[str, str, str]:
     try:
         parsed = urlsplit(str(url).strip())
         host = _normalize_hostname(parsed.hostname)
+        port = parsed.port
     except ValueError:
         return "", "", "/[REDACTED]"
-    if not host:
+    if (
+        not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or _authority_has_empty_port(parsed.netloc)
+        or (port is not None and not 1 <= port <= 65535)
+    ):
         return "", "", "/[REDACTED]"
     host = mask_secrets(host)[:253]
     path, path_error = _decode_url_component(parsed.path or "/", component="path")
@@ -504,7 +518,10 @@ def _safe_discovery_url(url: str) -> tuple[str, str, str]:
         or any(_looks_high_entropy(token) for token in _TOKEN_RE.findall(path))
     )
     safe_path = "/[REDACTED]" if suspicious else _encode_path(path)[:300]
-    return f"https://{host}{safe_path}", host, safe_path
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None and port != 443:
+        netloc = f"{netloc}:{port}"
+    return f"https://{netloc}{safe_path}", host, safe_path
 
 
 _CREDENTIAL_QUERY_RE = re.compile(
@@ -607,7 +624,7 @@ def source_access_request(
 ) -> SourceAccessRequest:
     safe_url, safe_host, _ = _safe_discovery_url(candidate.url)
     if not safe_host:
-        raise ValueError("source access candidate requires a host")
+        raise ValueError("source access candidate requires a valid URL authority")
     if not str(obligation_id).strip() or not str(purpose).strip():
         raise ValueError("source access request requires obligation_id and purpose")
     return SourceAccessRequest(

@@ -123,7 +123,7 @@ def test_fingerprint_normalizes_file_category_claim_and_ignores_line():
     equivalent = replace(
         first,
         candidate_id="candidate-2",
-        claim="  A RETRY can duplicate   the write. ",
+        claim="  A RETRY can duplicate   the write ",
         affected_location="src/store.py:99",
         category="Database",
         causal_chain="  THE retry repeats a write after an ambiguous response. ",
