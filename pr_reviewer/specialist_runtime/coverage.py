@@ -84,6 +84,7 @@ class SessionOwnership:
     session_id: str
     assignment_id: str
     primary_obligation_ids: tuple[str, ...] = ()
+    secondary_obligation_ids: tuple[str, ...] = ()
     independent_obligation_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -91,9 +92,21 @@ class SessionOwnership:
             raise ValueError("session ownership requires a non-empty session_id")
         if not isinstance(self.assignment_id, str) or not self.assignment_id.strip():
             raise ValueError("session ownership requires a non-empty assignment_id")
-        if set(self.primary_obligation_ids).intersection(self.independent_obligation_ids):
-            raise ValueError("primary and independent ownership must be distinct")
-        for field_name in ("primary_obligation_ids", "independent_obligation_ids"):
+        ownership_sets = (
+            set(self.primary_obligation_ids),
+            set(self.secondary_obligation_ids),
+            set(self.independent_obligation_ids),
+        )
+        if any(
+            left.intersection(right)
+            for index, left in enumerate(ownership_sets)
+            for right in ownership_sets[index + 1:]
+        ):
+            raise ValueError("primary, secondary, and independent ownership must be distinct")
+        for field_name in (
+            "primary_obligation_ids", "secondary_obligation_ids",
+            "independent_obligation_ids",
+        ):
             values = getattr(self, field_name)
             if any(not isinstance(item, str) or not item.strip() for item in values):
                 raise ValueError(f"{field_name} must contain non-empty strings")
@@ -102,9 +115,11 @@ class SessionOwnership:
 
     @property
     def obligation_ids(self) -> tuple[str, ...]:
-        return tuple(sorted(set(self.primary_obligation_ids).union(
-            self.independent_obligation_ids
-        )))
+        return tuple(sorted(
+            set(self.primary_obligation_ids)
+            .union(self.secondary_obligation_ids)
+            .union(self.independent_obligation_ids)
+        ))
 
 
 def _normalized_path(value: object) -> str:
@@ -489,18 +504,91 @@ def _assignment_id(assignment: Assignment | SpecialistAssignment) -> str:
 
 def _assignment_ownership(
     assignment: Assignment | SpecialistAssignment,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    primary = tuple(sorted(assignment.primary_obligation_ids))
-    independent = tuple(sorted(
-        assignment.independent_obligation_ids
-        if isinstance(assignment, SpecialistAssignment) else ()
-    ))
-    return primary, independent
+    obligation_by_id: Mapping[str, CoverageObligation],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    primary = set(assignment.primary_obligation_ids)
+    if isinstance(assignment, SpecialistAssignment):
+        return (
+            tuple(sorted(primary)),
+            (),
+            tuple(sorted(assignment.independent_obligation_ids)),
+        )
+    non_primary = set(assignment.obligation_ids) - primary
+    independent = {
+        obligation_id for obligation_id in non_primary
+        if obligation_id in obligation_by_id
+        and obligation_by_id[obligation_id].requires_independent_verification
+    }
+    return (
+        tuple(sorted(primary)),
+        tuple(sorted(non_primary - independent)),
+        tuple(sorted(independent)),
+    )
+
+
+def _validated_wave_start(
+    snapshot: CoverageSnapshot,
+    obligation_by_id: Mapping[str, CoverageObligation],
+    records: Mapping[str, EvidenceRecord],
+) -> tuple[
+    dict[str, ObligationStatus],
+    dict[str, set[str]],
+    set[str],
+]:
+    if not isinstance(snapshot, CoverageSnapshot):
+        raise TypeError("wave_start_coverage must be a CoverageSnapshot")
+    status_ids = [obligation_id for obligation_id, _ in snapshot.obligation_statuses]
+    evidence_ids = [obligation_id for obligation_id, _ in snapshot.evidence_by_obligation]
+    if len(set(status_ids)) != len(status_ids):
+        raise ValueError("wave-start coverage has duplicate obligation statuses")
+    if len(set(evidence_ids)) != len(evidence_ids):
+        raise ValueError("wave-start coverage has duplicate evidence entries")
+    expected_ids = set(obligation_by_id)
+    if set(status_ids) != expected_ids or set(evidence_ids) != expected_ids:
+        raise ValueError("wave-start coverage must contain every ledger obligation exactly once")
+
+    statuses = dict(snapshot.obligation_statuses)
+    seeded_evidence: dict[str, set[str]] = {}
+    for obligation_id, raw_evidence_ids in snapshot.evidence_by_obligation:
+        if len(set(raw_evidence_ids)) != len(raw_evidence_ids):
+            raise ValueError(f"wave-start evidence for '{obligation_id}' contains duplicates")
+        obligation = obligation_by_id[obligation_id]
+        retained: set[str] = set()
+        for evidence_id in raw_evidence_ids:
+            record = records.get(evidence_id)
+            if record is None:
+                raise ValueError(f"wave-start coverage references unknown evidence: {evidence_id}")
+            if not evidence_satisfies_obligation(record, obligation):
+                raise ValueError(
+                    f"wave-start evidence does not satisfy obligation '{obligation_id}'"
+                )
+            retained.add(evidence_id)
+        seeded_evidence[obligation_id] = retained
+
+    allowed_statuses = {
+        ObligationStatus.PENDING,
+        ObligationStatus.COVERED,
+        ObligationStatus.UNRESOLVED,
+    }
+    for obligation_id, status in statuses.items():
+        if status not in allowed_statuses:
+            raise ValueError(f"unsupported wave-start status for '{obligation_id}'")
+        has_evidence = bool(seeded_evidence[obligation_id])
+        if (status is ObligationStatus.COVERED) != has_evidence:
+            raise ValueError(
+                f"wave-start status/evidence mismatch for obligation '{obligation_id}'"
+            )
+    unresolved = {
+        obligation_id for obligation_id, status in statuses.items()
+        if status is ObligationStatus.UNRESOLVED
+    }
+    return statuses, seeded_evidence, unresolved
 
 
 def reconcile_wave(
     ledger: CoverageLedger,
     *,
+    wave_start_coverage: CoverageSnapshot,
     checkpoints: Iterable[SessionCheckpoint],
     evidence: EvidenceSnapshot,
     assignments: Iterable[Assignment | SpecialistAssignment],
@@ -513,12 +601,10 @@ def reconcile_wave(
         raise TypeError("evidence must be an EvidenceSnapshot")
 
     obligation_by_id = {item.id: item for item in ledger.obligations()}
-    before = ledger.obligation_statuses()
     records = {record.id: record for record in evidence.records}
-    reconciled_evidence: dict[str, set[str]] = {
-        obligation_id: set() for obligation_id in obligation_by_id
-    }
-    reconciled_unresolved: set[str] = set()
+    before, reconciled_evidence, reconciled_unresolved = _validated_wave_start(
+        wave_start_coverage, obligation_by_id, records
+    )
     assignment_by_id: dict[str, Assignment | SpecialistAssignment] = {}
     for assignment in assignments:
         assignment_id = _assignment_id(assignment)
@@ -538,9 +624,13 @@ def reconcile_wave(
                 f"session '{ownership.session_id}' references unknown assignment "
                 f"'{ownership.assignment_id}'"
             )
-        expected_primary, expected_independent = _assignment_ownership(assignment)
+        expected_primary, expected_secondary, expected_independent = _assignment_ownership(
+            assignment, obligation_by_id
+        )
         if tuple(sorted(ownership.primary_obligation_ids)) != expected_primary:
             raise ValueError("session primary ownership differs from its assignment")
+        if tuple(sorted(ownership.secondary_obligation_ids)) != expected_secondary:
+            raise ValueError("session secondary ownership differs from its assignment")
         if tuple(sorted(ownership.independent_obligation_ids)) != expected_independent:
             raise ValueError("session independent ownership differs from its assignment")
         unknown_ids = sorted(set(ownership.obligation_ids) - set(obligation_by_id))
@@ -551,7 +641,9 @@ def reconcile_wave(
     for checkpoint in sorted(tuple(checkpoints), key=lambda item: item.session_id):
         ownership = owned_by_session.get(checkpoint.session_id)
         if ownership is None:
-            continue
+            raise ValueError(
+                f"checkpoint references unknown durable session: {checkpoint.session_id}"
+            )
         owned_ids = ownership.obligation_ids
         referenced_ids = tuple(sorted(set(
             checkpoint.evidence_ids + checkpoint.imported_evidence_ids

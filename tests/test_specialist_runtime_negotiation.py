@@ -155,6 +155,7 @@ def test_reconcile_wave_uses_evidence_predicates_not_declared_coverage():
 
     result = reconcile_wave(
         ledger,
+        wave_start_coverage=ledger.snapshot(),
         checkpoints=(checkpoint,),
         evidence=store.snapshot(),
         assignments=(assignment("S1", ("OB1", "OB2")),),
@@ -212,6 +213,7 @@ def test_reconciliation_maps_durable_session_to_specialist_assignment_ownership(
 
     result = reconcile_wave(
         ledger,
+        wave_start_coverage=ledger.snapshot(),
         checkpoints=(SessionCheckpoint(
             session_id="durable-session-9",
             state=SessionState.CHECKPOINT,
@@ -247,12 +249,14 @@ def test_independent_owner_cannot_satisfy_obligation_with_imported_evidence():
         category="tests",
     )
     store.import_into_session("independent-session", imported.id)
+    wave_start_coverage = ledger.snapshot()
     # SpecialistSession may optimistically attach checkpoint evidence before the
     # controller's post-wave reconciliation. The controller must remove it.
     ledger.attach_evidence("OB1", imported.id)
 
     result = reconcile_wave(
         ledger,
+        wave_start_coverage=wave_start_coverage,
         checkpoints=(SessionCheckpoint(
             session_id="independent-session",
             state=SessionState.CHECKPOINT,
@@ -291,6 +295,7 @@ def test_independent_owner_fresh_collection_satisfies_independent_obligation():
 
     result = reconcile_wave(
         ledger,
+        wave_start_coverage=ledger.snapshot(),
         checkpoints=(SessionCheckpoint(
             session_id="independent-session",
             state=SessionState.CHECKPOINT,
@@ -298,6 +303,148 @@ def test_independent_owner_fresh_collection_satisfies_independent_obligation():
         ),),
         evidence=store.snapshot(),
         assignments=(specialist_assignment,),
+        session_ownership=(ownership,),
+    )
+
+    assert result.snapshot.obligation_statuses == (("OB1", ObligationStatus.COVERED),)
+
+
+def test_wave_start_baseline_retains_prior_coverage_and_counts_current_gain():
+    obligations = (
+        obligation("OB1"),
+        obligation("OB2", category="implementation", path="src/a.py"),
+    )
+    store = EvidenceStore()
+    prior = store.add_tool_result(
+        session_id="prior-session",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "prior test evidence"},
+        category="tests",
+    )
+    current = store.add_tool_result(
+        session_id="current-session",
+        tool="read_file",
+        arguments={"path": "src/a.py"},
+        result={"status": "ok", "content": "current implementation evidence"},
+        category="implementation",
+    )
+    baseline_ledger = CoverageLedger(obligations)
+    baseline_ledger.attach_evidence("OB1", prior.id)
+    live_ledger = CoverageLedger(obligations)
+    live_ledger.attach_evidence("OB1", prior.id)
+    live_ledger.attach_evidence("OB2", current.id)  # optimistic current-wave attachment
+    assignments = (
+        SpecialistAssignment(
+            assignment_id="prior-assignment", objective="Prior tests",
+            primary_obligation_ids=("OB1",),
+        ),
+        SpecialistAssignment(
+            assignment_id="current-assignment", objective="Current implementation",
+            primary_obligation_ids=("OB2",),
+        ),
+    )
+    ownership = (
+        SessionOwnership(
+            "prior-session", "prior-assignment", primary_obligation_ids=("OB1",),
+        ),
+        SessionOwnership(
+            "current-session", "current-assignment", primary_obligation_ids=("OB2",),
+        ),
+    )
+
+    result = reconcile_wave(
+        live_ledger,
+        wave_start_coverage=baseline_ledger.snapshot(),
+        checkpoints=(SessionCheckpoint(
+            session_id="current-session",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(current.id,),
+        ),),
+        evidence=store.snapshot(),
+        assignments=assignments,
+        session_ownership=ownership,
+    )
+
+    assert result.snapshot.obligation_statuses == (
+        ("OB1", ObligationStatus.COVERED),
+        ("OB2", ObligationStatus.COVERED),
+    )
+    assert result.newly_covered_obligation_ids == ("OB2",)
+
+
+def test_unknown_checkpoint_session_fails_closed():
+    required = obligation("OB1")
+    ledger = CoverageLedger((required,))
+    specialist_assignment = SpecialistAssignment(
+        assignment_id="A1", objective="Tests", primary_obligation_ids=("OB1",),
+    )
+
+    with pytest.raises(ValueError, match="unknown durable session"):
+        reconcile_wave(
+            ledger,
+            wave_start_coverage=ledger.snapshot(),
+            checkpoints=(SessionCheckpoint(
+                session_id="rogue-session", state=SessionState.CHECKPOINT,
+            ),),
+            evidence=EvidenceStore().snapshot(),
+            assignments=(specialist_assignment,),
+            session_ownership=(SessionOwnership(
+                "known-session", "A1", primary_obligation_ids=("OB1",),
+            ),),
+        )
+
+
+def test_planner_secondary_owner_can_be_selected_for_consultation():
+    assignments = (
+        assignment("A1", ("OB1",), primary=("OB1",)),
+        assignment("A2", ("OB1",), primary=()),
+    )
+    ownership = (
+        SessionOwnership("S1", "A1", primary_obligation_ids=("OB1",)),
+        SessionOwnership("S2", "A2", secondary_obligation_ids=("OB1",)),
+    )
+    state = state_for(
+        assignments=assignments,
+        session_ownership=ownership,
+        resources=(
+            SessionResources("S1", remaining_model_turns=3, lease_remaining_sec=100.0),
+            SessionResources("S2", remaining_model_turns=3, lease_remaining_sec=100.0),
+        ),
+    )
+    raw = resume_raw(kind="consult", session_id="S2", estimated_turns=1)
+
+    proposal = validate_negotiation(raw, state)
+
+    assert proposal.actions[0].session_id == "S2"
+
+
+def test_planner_independent_owner_fresh_evidence_satisfies_obligation():
+    required = replace(obligation("OB1"), requires_independent_verification=True)
+    ledger = CoverageLedger((required,))
+    planner_assignment = assignment("A-independent", ("OB1",), primary=())
+    ownership = SessionOwnership(
+        "independent-session", "A-independent", independent_obligation_ids=("OB1",),
+    )
+    store = EvidenceStore()
+    fresh = store.add_tool_result(
+        session_id="independent-session",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "fresh independent evidence"},
+        category="tests",
+    )
+
+    result = reconcile_wave(
+        ledger,
+        wave_start_coverage=ledger.snapshot(),
+        checkpoints=(SessionCheckpoint(
+            session_id="independent-session",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(fresh.id,),
+        ),),
+        evidence=store.snapshot(),
+        assignments=(planner_assignment,),
         session_ownership=(ownership,),
     )
 

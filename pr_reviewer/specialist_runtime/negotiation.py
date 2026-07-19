@@ -35,13 +35,24 @@ def _assignment_id(assignment: Assignment | SpecialistAssignment) -> str:
 
 def _assignment_ownership(
     assignment: Assignment | SpecialistAssignment,
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    obligation_by_id: Mapping[str, CoverageObligation],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    primary = set(assignment.primary_obligation_ids)
+    if isinstance(assignment, SpecialistAssignment):
+        return (
+            tuple(sorted(primary)), (),
+            tuple(sorted(assignment.independent_obligation_ids)),
+        )
+    non_primary = set(assignment.obligation_ids) - primary
+    independent = {
+        obligation_id for obligation_id in non_primary
+        if obligation_id in obligation_by_id
+        and obligation_by_id[obligation_id].requires_independent_verification
+    }
     return (
-        tuple(sorted(assignment.primary_obligation_ids)),
-        tuple(sorted(
-            assignment.independent_obligation_ids
-            if isinstance(assignment, SpecialistAssignment) else ()
-        )),
+        tuple(sorted(primary)),
+        tuple(sorted(non_primary - independent)),
+        tuple(sorted(independent)),
     )
 
 
@@ -119,13 +130,18 @@ class NegotiationState:
         assignment_by_id = {
             _assignment_id(item): item for item in self.assignments
         }
+        obligation_by_id = {item.id: item for item in self.obligations}
         for ownership in self.session_ownership:
             assignment = assignment_by_id.get(ownership.assignment_id)
             if assignment is None:
                 raise ValueError("session ownership must reference an existing assignment")
-            expected_primary, expected_independent = _assignment_ownership(assignment)
+            expected_primary, expected_secondary, expected_independent = _assignment_ownership(
+                assignment, obligation_by_id
+            )
             if tuple(sorted(ownership.primary_obligation_ids)) != expected_primary:
                 raise ValueError("session primary ownership differs from its assignment")
+            if tuple(sorted(ownership.secondary_obligation_ids)) != expected_secondary:
+                raise ValueError("session secondary ownership differs from its assignment")
             if tuple(sorted(ownership.independent_obligation_ids)) != expected_independent:
                 raise ValueError("session independent ownership differs from its assignment")
         if set(resource_ids) - set(ownership_session_ids):
