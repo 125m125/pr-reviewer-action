@@ -7,12 +7,14 @@ import hashlib
 import re
 from dataclasses import dataclass
 from collections.abc import Iterable, Mapping
+from pathlib import PurePosixPath
 from typing import Any
 
 from pr_reviewer.specialists import classify_file_roles
 
+from .evidence import EvidenceRecord, EvidenceSnapshot
 from .policy import RecipePolicy, ReviewPolicy
-from .types import CoverageObligation, ObligationStatus, RecipeStatus
+from .types import CoverageObligation, ObligationStatus, RecipeStatus, SessionCheckpoint
 
 
 def _slug(value: object, fallback: str = "review") -> str:
@@ -55,6 +57,55 @@ class CoverageSnapshot:
     obligation_statuses: tuple[tuple[str, ObligationStatus], ...]
     recipe_statuses: tuple[tuple[str, str], ...]
     evidence_by_obligation: tuple[tuple[str, tuple[str, ...]], ...]
+
+
+@dataclass(frozen=True)
+class CoverageReconciliation:
+    """Immutable controller projection after one completed work wave."""
+
+    snapshot: CoverageSnapshot
+    newly_covered_obligation_ids: tuple[str, ...]
+    uncovered_obligation_ids: tuple[str, ...]
+    attempted_unresolved_obligation_ids: tuple[str, ...]
+    never_covered_obligation_ids: tuple[str, ...]
+
+
+def _normalized_path(value: object) -> str:
+    path = str(value).strip().replace("\\", "/")
+    if not path:
+        return ""
+    normalized = str(PurePosixPath(path))
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.strip("/")
+
+
+def evidence_satisfies_obligation(
+    record: EvidenceRecord,
+    obligation: CoverageObligation,
+) -> bool:
+    """Apply the runtime's deterministic evidence satisfaction predicates."""
+    if not record.is_usable_for_coverage:
+        return False
+    predicates = set(obligation.satisfaction_predicates)
+    if predicates and "recorded_evidence" not in predicates:
+        return False
+    scoped_paths = tuple(dict.fromkeys((*obligation.scope, *obligation.seed_hints)))
+    if scoped_paths:
+        source_path = _normalized_path(record.source_path or "")
+        if not source_path:
+            return False
+        return any(
+            source_path == scope_path or source_path.startswith(scope_path + "/")
+            for raw_path in scoped_paths
+            if (scope_path := _normalized_path(raw_path))
+        )
+    category = record.category.strip().lower()
+    return bool(category) and category in {
+        item.strip().lower()
+        for item in obligation.required_evidence_categories
+        if item.strip()
+    }
 
 
 def _recipe_accounting_obligation(
@@ -311,6 +362,10 @@ class CoverageLedger:
         except KeyError as exc:
             raise KeyError(f"unknown coverage obligation: {obligation_id}") from exc
 
+    def obligations(self) -> tuple[CoverageObligation, ...]:
+        """Return the immutable obligation set in stable identifier order."""
+        return tuple(self._obligations[key] for key in sorted(self._obligations))
+
     def mark_unresolved(self, obligation_id: str) -> None:
         if obligation_id not in self._obligations:
             raise KeyError(f"unknown coverage obligation: {obligation_id}")
@@ -357,6 +412,85 @@ class CoverageLedger:
                 for obligation_id in sorted(self._evidence)
             ),
         )
+
+
+def reconcile_wave(
+    ledger: CoverageLedger,
+    *,
+    checkpoints: Iterable[SessionCheckpoint],
+    evidence: EvidenceSnapshot,
+    assignments: Iterable[object],
+) -> CoverageReconciliation:
+    """Reconcile a wave without trusting specialist-declared coverage states."""
+    if not isinstance(ledger, CoverageLedger):
+        raise TypeError("ledger must be a CoverageLedger")
+    if not isinstance(evidence, EvidenceSnapshot):
+        raise TypeError("evidence must be an EvidenceSnapshot")
+
+    obligation_by_id = {item.id: item for item in ledger.obligations()}
+    before = ledger.obligation_statuses()
+    records = {record.id: record for record in evidence.records}
+    owned_by_session: dict[str, tuple[str, ...]] = {}
+    for item in assignments:
+        session_id = str(
+            getattr(item, "id", None) or getattr(item, "assignment_id", None) or ""
+        ).strip()
+        if not session_id:
+            raise ValueError("assignment must have a non-empty id")
+        if session_id in owned_by_session:
+            raise ValueError(f"duplicate assignment/session id: {session_id}")
+        raw_ids = getattr(item, "obligation_ids", ())
+        owned_by_session[session_id] = tuple(sorted({
+            str(obligation_id).strip()
+            for obligation_id in raw_ids
+            if str(obligation_id).strip() in obligation_by_id
+        }))
+
+    for checkpoint in sorted(tuple(checkpoints), key=lambda item: item.session_id):
+        owned_ids = owned_by_session.get(checkpoint.session_id, ())
+        referenced_ids = tuple(sorted(set(
+            checkpoint.evidence_ids + checkpoint.imported_evidence_ids
+        )))
+        for obligation_id in owned_ids:
+            obligation = obligation_by_id[obligation_id]
+            for evidence_id in referenced_ids:
+                record = records.get(evidence_id)
+                if record is not None and evidence_satisfies_obligation(record, obligation):
+                    ledger.attach_evidence(obligation_id, evidence_id)
+
+        declared_unresolved = set(checkpoint.unknowns)
+        declared_unresolved.update(
+            obligation_id
+            for obligation_id, status in checkpoint.obligation_statuses
+            if status is ObligationStatus.UNRESOLVED
+        )
+        for obligation_id in sorted(declared_unresolved.intersection(owned_ids)):
+            ledger.mark_unresolved(obligation_id)
+
+    snapshot = ledger.snapshot()
+    after = dict(snapshot.obligation_statuses)
+    newly_covered = tuple(sorted(
+        obligation_id for obligation_id, status in after.items()
+        if status is ObligationStatus.COVERED
+        and before.get(obligation_id) is not ObligationStatus.COVERED
+    ))
+    uncovered = tuple(sorted(
+        obligation_id for obligation_id, status in after.items()
+        if obligation_by_id[obligation_id].mandatory
+        and status is not ObligationStatus.COVERED
+    ))
+    attempted = tuple(sorted(
+        obligation_id for obligation_id in uncovered
+        if after[obligation_id] is ObligationStatus.UNRESOLVED
+    ))
+    never_covered = tuple(sorted(set(uncovered) - set(attempted)))
+    return CoverageReconciliation(
+        snapshot=snapshot,
+        newly_covered_obligation_ids=newly_covered,
+        uncovered_obligation_ids=uncovered,
+        attempted_unresolved_obligation_ids=attempted,
+        never_covered_obligation_ids=never_covered,
+    )
 
 
 def evaluate_coverage(
