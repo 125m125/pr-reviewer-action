@@ -5,6 +5,7 @@ from dataclasses import replace
 from pr_reviewer.specialist_runtime.adjudication import (
     AdjudicatedReview,
     ReviewHandoffContext,
+    ReviewOrientationTopic,
     adjudicate_candidates,
     apply_runtime_verdict_policy,
     build_review_handoff,
@@ -58,6 +59,8 @@ def _candidate(
     obligation_ids: tuple[str, ...] = ("obligation-1",),
     severity: str = "major",
     causal_chain: str = "The retry repeats a write after an ambiguous response.",
+    consequence: str = "A user action can be persisted twice.",
+    manual_validation: str = "Force an ambiguous retry and verify exactly one write is persisted.",
 ) -> CandidateFinding:
     return CandidateFinding(
         candidate_id=candidate_id,
@@ -72,6 +75,8 @@ def _candidate(
         related_obligation_ids=obligation_ids,
         collector_session_id="session-1",
         model_identity="specialist-model",
+        user_visible_consequence=consequence,
+        manual_validation=manual_validation,
     )
 
 
@@ -254,11 +259,17 @@ def test_handoff_is_sparse_and_uses_only_genuine_structured_theme():
     context = ReviewHandoffContext(
         recommendation="request_changes",
         status="complete",
-        change_map=("Persistence and retry behavior",),
-        specialist_focuses=("database correctness",),
+        change_topics=(ReviewOrientationTopic.DATABASE,),
+        component_ids=("store",),
+        specialist_topics=(ReviewOrientationTopic.DATABASE,),
         recipe_ids=("transaction-boundaries",),
-        coverage_boundaries=("repository-only",),
-        review_emphasis=("Persistence", "Failure recovery", "Cross-service contract", "Extra"),
+        coverage_boundary_topics=(ReviewOrientationTopic.TEST_COVERAGE,),
+        review_emphasis_topics=(
+            ReviewOrientationTopic.DATABASE,
+            ReviewOrientationTopic.FAILURE_RECOVERY,
+            ReviewOrientationTopic.CROSS_COMPONENT_CONTRACTS,
+            ReviewOrientationTopic.SECURITY,
+        ),
     )
 
     handoff = build_review_handoff(
@@ -316,8 +327,26 @@ def test_review_comment_builds_typed_detailed_finding_note():
     assert note.related_obligation_ids == ("obligation-1",)
     assert note.file == "src/store.py"
     assert note.line == 41
-    assert "Evidence provenance" in note.markdown
+    assert "Supporting evidence provenance" in note.markdown
     assert "Suggested validation" in note.markdown
+    assert "A user action can be persisted twice" in note.markdown
+    assert "Force an ambiguous retry" in note.markdown
+
+
+def test_missing_structured_consequence_or_validation_downgrades_to_verification():
+    store, evidence_id = _store()
+    complete = _candidate(evidence_ids=(evidence_id,))
+    candidates = (
+        replace(complete, candidate_id="missing-consequence", user_visible_consequence=""),
+        replace(complete, candidate_id="missing-validation", manual_validation=""),
+    )
+
+    review = _adjudicate(candidates, {item.candidate_id: "keep" for item in candidates}, store)
+
+    assert review.accepted == ()
+    assert tuple(item.reason for item in review.verification_requests) == (
+        "missing-required-finding-detail", "missing-required-finding-detail",
+    )
 
 
 def test_comment_mode_does_not_move_detailed_findings_into_handoff_or_notes():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from enum import Enum
 import hashlib
 import html
 from pathlib import PurePosixPath
@@ -23,8 +24,6 @@ _CRITIC_ACTIONS = frozenset({
     "keep", "reject", "merge", "request_verification", "downgrade_unknown",
 })
 _SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
-_GENERIC_THEMES = frozenset({"bug", "correctness", "finding", "general", "info", "other"})
-_ORIENTATION_LIMIT = 160
 _NOTE_VALUE_LIMIT = 1000
 
 
@@ -49,6 +48,7 @@ class EvidenceCitation:
 class AcceptedFinding:
     candidate_id: str
     root_cause_fingerprint: str
+    deduplication_key: str
     claim: str
     user_visible_consequence: str
     affected_file: str
@@ -59,7 +59,8 @@ class AcceptedFinding:
     supporting_evidence_ids: tuple[str, ...]
     contradicting_evidence_ids: tuple[str, ...]
     related_obligation_ids: tuple[str, ...]
-    citations: tuple[EvidenceCitation, ...]
+    supporting_citations: tuple[EvidenceCitation, ...]
+    contradicting_citations: tuple[EvidenceCitation, ...]
     manual_validation: str
     collector_session_id: str = ""
     model_identity: str = ""
@@ -69,6 +70,10 @@ class AcceptedFinding:
     def affected_location(self) -> str:
         return self.affected_file + (f":{self.line}" if self.line is not None else "")
 
+    @property
+    def citations(self) -> tuple[EvidenceCitation, ...]:
+        return self.supporting_citations + self.contradicting_citations
+
 
 @dataclass(frozen=True)
 class CandidateVerificationRequest:
@@ -76,17 +81,49 @@ class CandidateVerificationRequest:
     reason: str
 
 
+class ReviewOrientationTopic(str, Enum):
+    DATABASE = "database"
+    AUTHORIZATION = "authorization"
+    CACHING = "caching"
+    CONCURRENCY = "concurrency"
+    API_CONTRACTS = "api_contracts"
+    FAILURE_RECOVERY = "failure_recovery"
+    CROSS_COMPONENT_CONTRACTS = "cross_component_contracts"
+    TEST_COVERAGE = "test_coverage"
+    GENERATED_ARTIFACTS = "generated_artifacts"
+    DEPLOYMENT = "deployment"
+    SOURCE_POLICY = "source_policy"
+    SECURITY = "security"
+
+
+_TOPIC_LABELS = {
+    ReviewOrientationTopic.DATABASE: "Database and persistence",
+    ReviewOrientationTopic.AUTHORIZATION: "Authorization boundaries",
+    ReviewOrientationTopic.CACHING: "Caching and invalidation",
+    ReviewOrientationTopic.CONCURRENCY: "Concurrency and ordering",
+    ReviewOrientationTopic.API_CONTRACTS: "API and schema contracts",
+    ReviewOrientationTopic.FAILURE_RECOVERY: "Failure recovery",
+    ReviewOrientationTopic.CROSS_COMPONENT_CONTRACTS: "Cross-component contracts",
+    ReviewOrientationTopic.TEST_COVERAGE: "Test coverage",
+    ReviewOrientationTopic.GENERATED_ARTIFACTS: "Generated artifacts",
+    ReviewOrientationTopic.DEPLOYMENT: "Deployment and runtime configuration",
+    ReviewOrientationTopic.SOURCE_POLICY: "External source policy",
+    ReviewOrientationTopic.SECURITY: "Security-sensitive behavior",
+}
+
+
 @dataclass(frozen=True)
 class ReviewHandoffContext:
     recommendation: str = ""
     status: str = ""
-    change_map: tuple[str, ...] = ()
-    specialist_focuses: tuple[str, ...] = ()
+    change_topics: tuple[ReviewOrientationTopic, ...] = ()
+    component_ids: tuple[str, ...] = ()
+    specialist_topics: tuple[ReviewOrientationTopic, ...] = ()
     recipe_ids: tuple[str, ...] = ()
-    coverage_boundaries: tuple[str, ...] = ()
+    coverage_boundary_topics: tuple[ReviewOrientationTopic, ...] = ()
     unresolved_thread_count: int = 0
     highest_thread_severity: str | None = None
-    review_emphasis: tuple[str, ...] = ()
+    review_emphasis_topics: tuple[ReviewOrientationTopic, ...] = ()
     material_coverage_limited: bool = False
     diagnostics_url: str | None = None
     source_access_requests: tuple[SourceAccessRequest, ...] = ()
@@ -108,8 +145,8 @@ def _unicode(value: object) -> str:
 
 def _identity_text(value: object) -> str:
     text = _unicode(value).casefold()
-    text = re.sub(r"(==|!=|<=|>=|&&|\|\||[=!<>])", r" \1 ", text)
-    text = re.sub(r"[^\w\s=!<>|&]+", " ", text, flags=re.UNICODE)
+    text = re.sub(r"(==|!=|<=|>=|&&|\|\||[+*/%\-=!<>])", r" \1 ", text)
+    text = re.sub(r"[^\w\s+*/%\-=!<>|&]+", " ", text, flags=re.UNICODE)
     return " ".join(text.split())
 
 
@@ -150,9 +187,8 @@ def _normalized_severity(value: object) -> str:
 def _normalized_candidate(candidate: CandidateFinding) -> CandidateFinding:
     affected_file, line, _ = _path(candidate.affected_location)
     claim_identity = _identity_text(candidate.claim)
-    causal_identity = _identity_text(candidate.causal_chain)
     category = _identity_text(candidate.category).replace(" ", "-")
-    identity = "\x1f".join((affected_file, category, claim_identity, causal_identity))
+    identity = "\x1f".join((affected_file, category, claim_identity))
     fingerprint = "finding:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
     return replace(
         candidate,
@@ -164,6 +200,17 @@ def _normalized_candidate(candidate: CandidateFinding) -> CandidateFinding:
         contradicting_evidence_ids=_stable_strings(candidate.contradicting_evidence_ids),
         related_obligation_ids=_stable_strings(candidate.related_obligation_ids),
     )
+
+
+def _deduplication_key(candidate: CandidateFinding) -> str:
+    affected_file, _, _ = _path(candidate.affected_location)
+    identity = "\x1f".join((
+        affected_file,
+        _identity_text(candidate.category),
+        _identity_text(candidate.claim),
+        _identity_text(candidate.causal_chain),
+    ))
+    return "dedup:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def _merge_identity(candidate: CandidateFinding) -> tuple[str, str, str]:
@@ -244,6 +291,8 @@ def _candidate_from_accepted(value: AcceptedFinding | CandidateFinding) -> Candi
         related_obligation_ids=value.related_obligation_ids,
         collector_session_id=value.collector_session_id,
         model_identity=value.model_identity,
+        user_visible_consequence=value.user_visible_consequence,
+        manual_validation=value.manual_validation,
     )
 
 
@@ -264,7 +313,12 @@ def _authorize(
         return None, "missing-changed-causal-file"
     if affected_file not in changed_files:
         return None, "off-change-causal-file"
-    if not _identity_text(candidate.claim) or not _identity_text(candidate.causal_chain):
+    if (
+        not _identity_text(candidate.claim)
+        or not _identity_text(candidate.causal_chain)
+        or not _identity_text(candidate.user_visible_consequence)
+        or not _identity_text(candidate.manual_validation)
+    ):
         return None, "missing-required-finding-detail"
     if not candidate.related_obligation_ids:
         return None, "missing-related-obligation"
@@ -294,17 +348,14 @@ def _authorize(
     contradictions = tuple(sorted(
         (record for record in contradiction_records if record), key=lambda item: item.id
     ))
-    citations = tuple(_citation(record) for record in (*satisfying, *contradictions))
-    manual_validation = (
-        f"Validate the corrected behavior in {affected_file} against coverage obligations "
-        + ", ".join(candidate.related_obligation_ids)
-        + "."
-    )
+    supporting_citations = tuple(_citation(record) for record in satisfying)
+    contradicting_citations = tuple(_citation(record) for record in contradictions)
     return AcceptedFinding(
         candidate_id=candidate.candidate_id,
         root_cause_fingerprint=candidate.root_cause_fingerprint,
+        deduplication_key=_deduplication_key(candidate),
         claim=candidate.claim,
-        user_visible_consequence=candidate.claim,
+        user_visible_consequence=candidate.user_visible_consequence,
         affected_file=affected_file,
         line=line,
         causal_chain=candidate.causal_chain,
@@ -313,8 +364,9 @@ def _authorize(
         supporting_evidence_ids=tuple(record.id for record in satisfying),
         contradicting_evidence_ids=tuple(record.id for record in contradictions),
         related_obligation_ids=candidate.related_obligation_ids,
-        citations=citations,
-        manual_validation=manual_validation,
+        supporting_citations=supporting_citations,
+        contradicting_citations=contradicting_citations,
+        manual_validation=candidate.manual_validation,
         collector_session_id=candidate.collector_session_id,
         model_identity=candidate.model_identity,
         contributor_candidate_ids=(candidate.candidate_id,),
@@ -341,7 +393,14 @@ def _decision_rows(critic_result: object) -> tuple[Mapping[str, Any], ...]:
 def _merge_findings(group: Iterable[AcceptedFinding], representative_id: str) -> AcceptedFinding:
     values = tuple(sorted(group, key=lambda item: item.candidate_id))
     representative = next(item for item in values if item.candidate_id == representative_id)
-    citations = {citation.evidence_id: citation for item in values for citation in item.citations}
+    supporting_citations = {
+        citation.evidence_id: citation
+        for item in values for citation in item.supporting_citations
+    }
+    contradicting_citations = {
+        citation.evidence_id: citation
+        for item in values for citation in item.contradicting_citations
+    }
     return replace(
         representative,
         severity=max(values, key=lambda item: _SEVERITY_RANK[item.severity]).severity,
@@ -354,7 +413,12 @@ def _merge_findings(group: Iterable[AcceptedFinding], representative_id: str) ->
         related_obligation_ids=tuple(sorted({
             obligation_id for item in values for obligation_id in item.related_obligation_ids
         })),
-        citations=tuple(citations[key] for key in sorted(citations)),
+        supporting_citations=tuple(
+            supporting_citations[key] for key in sorted(supporting_citations)
+        ),
+        contradicting_citations=tuple(
+            contradicting_citations[key] for key in sorted(contradicting_citations)
+        ),
         contributor_candidate_ids=tuple(sorted({
             contributor for item in values for contributor in item.contributor_candidate_ids
         })),
@@ -479,7 +543,7 @@ def adjudicate_candidates(
 
     by_fingerprint: dict[str, list[AcceptedFinding]] = {}
     for finding in accepted.values():
-        by_fingerprint.setdefault(finding.root_cause_fingerprint, []).append(finding)
+        by_fingerprint.setdefault(finding.deduplication_key, []).append(finding)
     deduplicated: dict[str, AcceptedFinding] = {}
     for fingerprint in sorted(by_fingerprint):
         group = tuple(sorted(by_fingerprint[fingerprint], key=lambda item: item.candidate_id))
@@ -568,52 +632,72 @@ def apply_runtime_verdict_policy(
     )
 
 
-def _orientation(value: object) -> str | None:
-    raw = _unicode(value).strip()
-    lowered = raw.casefold()
-    if (
-        not raw
-        or "\n" in raw
-        or "\r" in raw
-        or re.match(r"^\s*(?:#{1,6}|[-*+]\s|>\s)", raw)
-        or any(marker in lowered for marker in ("evidence:", "unknown:", "<!--", "```"))
-    ):
-        return None
-    plain = re.sub(r"[`*_{}\[\]<>#|()]", "", raw)
-    plain = " ".join(plain.split())[:_ORIENTATION_LIMIT].strip()
-    return plain or None
+def _exact_detail(value: object) -> str:
+    return " ".join(_unicode(value).casefold().split())
 
 
-def _orientation_values(
-    values: Iterable[object],
+def _topic_values(
+    values: object,
     *,
+    forbidden: frozenset[str],
     limit: int,
-    forbidden_detail: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
-    forbidden = tuple(
-        identity for item in forbidden_detail
-        if len(identity := _identity_text(item)) >= 8
-    )
-    cleaned = set()
+    if isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
+        return ()
+    labels = {
+        _TOPIC_LABELS[item]
+        for item in values
+        if isinstance(item, ReviewOrientationTopic)
+        and _exact_detail(_TOPIC_LABELS[item]) not in forbidden
+    }
+    return tuple(sorted(labels))[:limit]
+
+
+def _structured_ids(
+    values: object,
+    *,
+    forbidden: frozenset[str],
+    limit: int,
+) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Iterable):
+        return ()
+    result = set()
     for value in values:
-        orientation = _orientation(value)
-        identity = _identity_text(orientation or "")
-        if orientation and not any(
-            identity == detail or identity in detail or detail in identity
-            for detail in forbidden
+        if not isinstance(value, str):
+            continue
+        normalized = _unicode(value).strip().casefold()
+        if (
+            not re.fullmatch(r"[a-z0-9][a-z0-9._/\-]{0,159}", normalized)
+            or _exact_detail(normalized) in forbidden
         ):
-            cleaned.add(orientation)
-    cleaned.discard(None)
-    return tuple(sorted(cleaned))[:limit]
+            continue
+        result.add(normalized)
+    return tuple(sorted(result))[:limit]
 
 
-def _aggregate_theme(findings: Iterable[AcceptedFinding]) -> str | None:
-    categories = tuple(sorted({item.category for item in findings if item.category}))
-    if len(categories) != 1 or categories[0] in _GENERIC_THEMES:
+def _category_topic(value: str) -> ReviewOrientationTopic | None:
+    normalized = _unicode(value).strip().casefold().replace("-", "_")
+    try:
+        return ReviewOrientationTopic(normalized)
+    except ValueError:
         return None
-    if sum(1 for _ in findings) < 2:
-        return None
-    return categories[0]
+
+
+def _aggregate_theme(
+    findings: Iterable[AcceptedFinding],
+    *,
+    forbidden: frozenset[str],
+) -> tuple[str | None, str | None]:
+    values = tuple(findings)
+    topics = tuple(_category_topic(item.category) for item in values)
+    material = {item for item in topics if item is not None}
+    if len(values) < 2 or len(material) != 1 or any(item is None for item in topics):
+        return None, None
+    topic = next(iter(material))
+    label = _TOPIC_LABELS[topic]
+    if _exact_detail(label) in forbidden:
+        return None, None
+    return topic.value, label
 
 
 def build_review_handoff(
@@ -652,6 +736,9 @@ def build_review_handoff(
             candidate = _candidate_from_accepted(value) if isinstance(value, (AcceptedFinding, CandidateFinding)) else None
             if candidate is not None:
                 detail_values.extend((candidate.claim, candidate.causal_chain))
+                detail_values.extend((
+                    candidate.user_visible_consequence, candidate.manual_validation,
+                ))
                 detail_values.extend(candidate.supporting_evidence_ids)
                 detail_values.extend(candidate.contradicting_evidence_ids)
         detail_values.extend(item.claim for item in review.unknowns if isinstance(item, CandidateFinding))
@@ -660,23 +747,44 @@ def build_review_handoff(
                 detail_values.extend((item.candidate.claim, item.candidate.causal_chain))
             elif isinstance(item, CandidateFinding):
                 detail_values.extend((item.claim, item.causal_chain))
-    detail_values.extend(record.id for record in _snapshot(evidence).records)
-    forbidden_detail = tuple(detail_values)
-    change_map = _orientation_values(
-        context.change_map, limit=6, forbidden_detail=forbidden_detail
+    for record in _snapshot(evidence).records:
+        detail_values.extend((
+            record.id,
+            record.canonical_key,
+            record.content,
+            record.content_hash,
+            record.source_identity,
+            record.source_path or "",
+            record.provenance.original_url or "",
+            record.provenance.final_url or "",
+            record.provenance.policy_hash or "",
+            record.provenance.policy_rule_id or "",
+        ))
+    forbidden = frozenset(
+        value for item in detail_values if (value := _exact_detail(item))
     )
-    specialist_focuses = _orientation_values(
-        context.specialist_focuses, limit=6, forbidden_detail=forbidden_detail
+    change_topics = _topic_values(
+        context.change_topics, forbidden=forbidden, limit=6
     )
-    recipes = _orientation_values(
-        context.recipe_ids, limit=6, forbidden_detail=forbidden_detail
+    component_ids = _structured_ids(
+        context.component_ids, forbidden=forbidden, limit=6
     )
-    boundaries = _orientation_values(
-        context.coverage_boundaries, limit=6, forbidden_detail=forbidden_detail
+    change_map = tuple(sorted({
+        *change_topics, *(f"Component: {item}" for item in component_ids),
+    }))
+    specialist_focuses = _topic_values(
+        context.specialist_topics, forbidden=forbidden, limit=6
+    )
+    recipe_ids = _structured_ids(
+        context.recipe_ids, forbidden=forbidden, limit=6
+    )
+    recipes = tuple(f"Repository recipe: {item}" for item in recipe_ids)
+    boundaries = _topic_values(
+        context.coverage_boundary_topics, forbidden=forbidden, limit=6
     )
     reviewed_focuses = tuple(sorted(set((*specialist_focuses, *recipes, *boundaries))))
-    review_emphasis = _orientation_values(
-        context.review_emphasis, limit=3, forbidden_detail=forbidden_detail
+    review_emphasis = _topic_values(
+        context.review_emphasis_topics, forbidden=forbidden, limit=3
     )
     thread_count = (
         context.unresolved_thread_count
@@ -689,7 +797,7 @@ def build_review_handoff(
     thread_status = None
     if thread_count:
         thread_status = f"{thread_count} unresolved review note(s); highest material severity: {thread_severity}."
-    theme = _aggregate_theme(authoritative)
+    theme, theme_label = _aggregate_theme(authoritative, forbidden=forbidden)
     diagnostics = _canonical_request_url(context.diagnostics_url or "")
     diagnostics_url = diagnostics[1] if diagnostics else None
     coverage_warning = None
@@ -723,8 +831,8 @@ def build_review_handoff(
             lines.append("- Coverage boundaries: " + "; ".join(boundaries))
     if thread_status:
         lines.extend(("", f"**Thread status:** {thread_status}"))
-    if theme:
-        lines.extend(("", f"**Aggregate finding theme:** {theme}"))
+    if theme_label:
+        lines.extend(("", f"**Aggregate finding theme:** {theme_label}"))
     if review_emphasis:
         lines.extend(("", "### Human review focus", "", *[f"- {item}" for item in review_emphasis]))
     lines.extend((
@@ -787,6 +895,8 @@ def _verification_note(
     obligation_ids = tuple(
         item for item in candidate.related_obligation_ids if item in obligations
     )
+    if not obligation_ids:
+        return None
     file, line, state = _path(candidate.affected_location)
     if state != "ok" or file not in changed_files:
         file, line = "", None
@@ -894,11 +1004,24 @@ def _source_request(value: object) -> SourceAccessRequest | None:
 
 
 def _canonical_request_url(value: str) -> tuple[str, str] | None:
-    parsed = urlsplit(_unicode(value).strip())
-    if parsed.scheme.lower() != "https" or not parsed.hostname:
+    try:
+        parsed = urlsplit(_unicode(value).strip())
+        host_value = parsed.hostname
+        port = parsed.port
+    except ValueError:
         return None
-    host = parsed.hostname.casefold()
-    url = urlunsplit(("https", host, parsed.path or "/", parsed.query, ""))
+    if (
+        parsed.scheme.lower() != "https"
+        or not host_value
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    host = host_value.casefold()
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None and port != 443:
+        netloc = f"{netloc}:{port}"
+    url = urlunsplit(("https", netloc, parsed.path or "/", parsed.query, ""))
     return host, url
 
 
@@ -942,22 +1065,31 @@ def _source_note(
 
 
 def _finding_note(finding: AcceptedFinding) -> ReviewNote:
-    citation_lines = []
-    for citation in finding.citations:
-        citation_lines.append(
-            "- ID " + _quoted(citation.evidence_id, limit=160)
-            + "; category " + _quoted(citation.category, limit=100)
-            + "; tool " + _quoted(citation.tool, limit=100)
-            + "; source " + _quoted(citation.source)
-            + "; content hash " + _quoted(citation.content_hash, limit=80)
-        )
+    def citation_lines(citations: tuple[EvidenceCitation, ...]) -> list[str]:
+        lines = []
+        for citation in citations:
+            lines.append(
+                "- ID " + _quoted(citation.evidence_id, limit=160)
+                + "; category " + _quoted(citation.category, limit=100)
+                + "; tool " + _quoted(citation.tool, limit=100)
+                + "; source " + _quoted(citation.source)
+                + "; content hash " + _quoted(citation.content_hash, limit=80)
+            )
+        return lines
+    supporting_lines = citation_lines(finding.supporting_citations)
+    contradicting_lines = citation_lines(finding.contradicting_citations)
     markdown = (
         f"### {finding.severity.title()} finding\n\n"
         "**Claim:** " + _quoted(finding.claim)
         + "\n\n**User-visible consequence:** " + _quoted(finding.user_visible_consequence)
         + "\n\n**Causal chain:** " + _quoted(finding.causal_chain)
-        + "\n\n**Evidence provenance / citations:**\n"
-        + "\n".join(citation_lines)
+        + "\n\n**Supporting evidence provenance / citations:**\n"
+        + "\n".join(supporting_lines)
+        + (
+            "\n\n**Contradicting evidence provenance / citations:**\n"
+            + "\n".join(contradicting_lines)
+            if contradicting_lines else ""
+        )
         + "\n\n**Suggested validation:** " + _quoted(finding.manual_validation)
     )
     return ReviewNote(

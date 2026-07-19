@@ -122,6 +122,8 @@ class CandidateFinding:
     collector_session_id: str = ""
     model_identity: str = ""
     confidence_rationale: str = ""
+    user_visible_consequence: str = ""
+    manual_validation: str = ""
 
 
 @dataclass(frozen=True)

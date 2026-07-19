@@ -69,10 +69,27 @@ def derive_runtime_verdict(
     unresolved_items = tuple(unresolved)
     blocking_obligations: list[str] = []
     unknown_obligations: list[str] = []
-    high_risk_tiers = {
-        str(item).strip().lower()
-        for item in settings.get("high_risk_tiers", ("high", "critical"))
-    }
+    supported_high_risk_tiers = {"critical", "high"}
+    configured_high_risk_tiers = settings.get("high_risk_tiers")
+    if configured_high_risk_tiers is None:
+        high_risk_tiers = supported_high_risk_tiers
+    elif isinstance(
+        configured_high_risk_tiers, (list, tuple, set, frozenset)
+    ) and all(isinstance(item, str) for item in configured_high_risk_tiers):
+        normalized_high_risk_tiers = {
+            item.strip().lower()
+            for item in configured_high_risk_tiers
+            if item.strip()
+        }
+        if (
+            not normalized_high_risk_tiers
+            or not normalized_high_risk_tiers.issubset(supported_high_risk_tiers)
+        ):
+            high_risk_tiers = supported_high_risk_tiers
+        else:
+            high_risk_tiers = normalized_high_risk_tiers
+    else:
+        high_risk_tiers = supported_high_risk_tiers
     blocking_policies = {
         "block", "blocking", "request_changes", "block_when_unresolved",
     }

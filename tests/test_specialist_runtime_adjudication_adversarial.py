@@ -7,6 +7,7 @@ import pytest
 from pr_reviewer.specialist_runtime.adjudication import (
     AdjudicatedReview,
     ReviewHandoffContext,
+    ReviewOrientationTopic,
     adjudicate_candidates,
     apply_runtime_verdict_policy,
     build_review_handoff,
@@ -77,6 +78,8 @@ def _candidate(
     severity: str = "major",
     category: str = "database",
     obligation_ids: tuple[str, ...] = ("obligation-store",),
+    consequence: str = "A user action can be persisted twice.",
+    manual_validation: str = "Force an ambiguous retry and verify only one write and audit event.",
 ) -> CandidateFinding:
     return CandidateFinding(
         candidate_id=candidate_id,
@@ -90,6 +93,8 @@ def _candidate(
         related_obligation_ids=obligation_ids,
         collector_session_id="session-1",
         model_identity="specialist",
+        user_visible_consequence=consequence,
+        manual_validation=manual_validation,
     )
 
 
@@ -182,6 +187,45 @@ def test_fingerprint_preserves_operators_negation_and_non_latin_claims():
     assert len(set(fingerprints)) == 3
 
 
+@pytest.mark.parametrize(
+    ("first_claim", "second_claim"),
+    [
+        ("balance + 1 overflows", "balance - 1 overflows"),
+        ("count * 2 is persisted", "count / 2 is persisted"),
+        ("count % 2 is zero", "count = 2 is zero"),
+        ("ready && valid", "ready || valid"),
+        ("!ready", "ready"),
+    ],
+)
+def test_public_fingerprint_preserves_arithmetic_and_boolean_operators(
+    first_claim: str, second_claim: str,
+):
+    store, evidence_id = _store()
+    first = _candidate("first", evidence_ids=(evidence_id,), claim=first_claim)
+    second = _candidate("second", evidence_ids=(evidence_id,), claim=second_claim)
+
+    first_review = _adjudicate((first,), store)
+    second_review = _adjudicate((second,), store)
+
+    assert first_review.accepted[0].root_cause_fingerprint != second_review.accepted[0].root_cause_fingerprint
+
+
+def test_public_fingerprint_is_stable_across_causal_rewording():
+    store, evidence_id = _store()
+    first = _candidate("first", evidence_ids=(evidence_id,))
+    reworded = replace(
+        first,
+        candidate_id="second",
+        causal_chain="An ambiguous result causes the write operation to run again.",
+    )
+
+    first_review = _adjudicate((first,), store)
+    second_review = _adjudicate((reworded,), store)
+
+    assert first_review.accepted[0].root_cause_fingerprint == second_review.accepted[0].root_cause_fingerprint
+    assert first_review.accepted[0].deduplication_key != second_review.accepted[0].deduplication_key
+
+
 def test_exact_dedup_records_contributor_to_representative_disposition():
     store, evidence_id = _store()
     first = _candidate("candidate-a", evidence_ids=(evidence_id,))
@@ -212,7 +256,8 @@ def test_same_claim_with_opposite_causal_root_is_not_exact_dedup():
     assert tuple(item.candidate_id for item in review.accepted) == (
         "candidate-a", "candidate-b",
     )
-    assert len({item.root_cause_fingerprint for item in review.accepted}) == 2
+    assert len({item.root_cause_fingerprint for item in review.accepted}) == 1
+    assert len({item.deduplication_key for item in review.accepted}) == 2
 
 
 def test_explicit_critic_merge_combines_distinct_claims_under_same_causal_root():
@@ -278,6 +323,84 @@ def test_real_source_access_requests_include_context_and_distinguish_url():
     assert all(note.evidence_ids == () for note in notes)
 
 
+def test_source_access_request_preserves_non_default_port_in_identity_and_display():
+    store, _ = _store()
+    first = SourceAccessRequest(
+        host="docs.example.com",
+        candidate_url="https://docs.example.com/schema/v1",
+        obligation_id="obligation-store",
+        purpose="Confirm the deployed schema.",
+    )
+    second = replace(
+        first, candidate_url="https://docs.example.com:8443/schema/v1"
+    )
+
+    notes = build_review_notes(
+        AdjudicatedReview(),
+        store,
+        "review_comment",
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+        source_access_requests=(first, second),
+    )
+
+    assert len(notes) == 2
+    assert len({note.fingerprint for note in notes}) == 2
+    assert any("docs.example.com:8443/schema/v1" in note.markdown for note in notes)
+
+
+def test_source_access_request_removes_default_https_port_from_identity():
+    store, _ = _store()
+    first = SourceAccessRequest(
+        host="docs.example.com",
+        candidate_url="https://docs.example.com/schema/v1",
+        obligation_id="obligation-store",
+        purpose="Confirm the deployed schema.",
+    )
+    second = replace(first, candidate_url="https://docs.example.com:443/schema/v1")
+
+    notes = build_review_notes(
+        AdjudicatedReview(),
+        store,
+        "review_comment",
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+        source_access_requests=(first, second),
+    )
+
+    assert len(notes) == 1
+    assert ":443" not in notes[0].markdown
+
+
+@pytest.mark.parametrize(
+    "candidate_url",
+    (
+        "https://user:pass@docs.example.com/schema/v1",
+        "https://docs.example.com:bad/schema/v1",
+        "https://docs.example.com:99999/schema/v1",
+    ),
+)
+def test_source_access_request_rejects_userinfo_and_invalid_ports(candidate_url: str):
+    store, _ = _store()
+    request = SourceAccessRequest(
+        host="docs.example.com",
+        candidate_url=candidate_url,
+        obligation_id="obligation-store",
+        purpose="Confirm the deployed schema.",
+    )
+
+    notes = build_review_notes(
+        AdjudicatedReview(),
+        store,
+        "review_comment",
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+        source_access_requests=(request,),
+    )
+
+    assert notes == ()
+
+
 def test_handoff_counts_only_controller_valid_source_access_requests():
     store, _ = _store()
     valid = SourceAccessRequest(
@@ -311,11 +434,12 @@ def test_sparse_handoff_rejects_multiline_markdown_and_detail_injection():
     context = ReviewHandoffContext(
         recommendation="request_changes",
         status="complete",
-        change_map=("src/store.py", "# Finding\nA failed retry duplicates the write"),
-        specialist_focuses=("database", "Evidence: secret detail"),
-        recipe_ids=("transaction-boundaries",),
-        coverage_boundaries=("repository-only",),
-        review_emphasis=("persistence", "unknown: private detail"),
+        change_topics=(ReviewOrientationTopic.DATABASE,),
+        component_ids=("src/store.py", "# Finding\nA failed retry duplicates the write"),
+        specialist_topics=(ReviewOrientationTopic.DATABASE,),
+        recipe_ids=("transaction-boundaries", "Evidence: secret detail"),
+        coverage_boundary_topics=(ReviewOrientationTopic.TEST_COVERAGE,),
+        review_emphasis_topics=(ReviewOrientationTopic.FAILURE_RECOVERY,),
     )
 
     handoff = build_review_handoff(
@@ -330,7 +454,7 @@ def test_sparse_handoff_rejects_multiline_markdown_and_detail_injection():
     assert "secret detail" not in handoff.markdown
     assert "private detail" not in handoff.markdown
     assert "# Finding" not in handoff.markdown
-    assert handoff.change_map == ("src/store.py",)
+    assert handoff.change_map == ("Database and persistence",)
     assert "review the complete change" in handoff.markdown
 
 
@@ -350,9 +474,9 @@ def test_sparse_handoff_rejects_single_line_finding_and_unknown_injection():
         changed_files=CHANGED_FILES,
     )
     context = ReviewHandoffContext(
-        change_map=(finding.claim, "src/store.py"),
-        specialist_focuses=(unknown.claim, "database"),
-        review_emphasis=(finding.claim,),
+        component_ids=(finding.claim, unknown.claim, "src/store.py"),
+        specialist_topics=(ReviewOrientationTopic.DATABASE,),
+        review_emphasis_topics=(ReviewOrientationTopic.DATABASE,),
     )
 
     handoff = build_review_handoff(
@@ -365,7 +489,101 @@ def test_sparse_handoff_rejects_single_line_finding_and_unknown_injection():
 
     assert finding.claim not in handoff.markdown
     assert unknown.claim not in handoff.markdown
-    assert handoff.change_map == ("src/store.py",)
+    assert handoff.change_map == ()
+
+
+def test_handoff_taxonomy_excludes_short_claims_and_preserves_useful_topic():
+    store, evidence_id = _store(content="database")
+    auth = _candidate(
+        "auth", evidence_ids=(evidence_id,), claim="Auth", category="authorization"
+    )
+    cache = _candidate(
+        "cache", evidence_ids=(evidence_id,), claim="Cache", category="caching"
+    )
+    review = adjudicate_candidates(
+        (auth, cache),
+        {auth.candidate_id: "keep", cache.candidate_id: "downgrade_unknown"},
+        store,
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+    context = ReviewHandoffContext(
+        change_topics=(ReviewOrientationTopic.DATABASE,),
+        component_ids=("auth", "cache", "database-worker"),
+        specialist_topics=(ReviewOrientationTopic.DATABASE,),
+        review_emphasis_topics=(ReviewOrientationTopic.DATABASE,),
+    )
+
+    handoff = build_review_handoff(
+        context,
+        review=review,
+        evidence=store,
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert "Auth" not in handoff.markdown
+    assert "Cache" not in handoff.markdown
+    assert "database-worker" in handoff.markdown
+    assert "Database and persistence" in handoff.markdown
+
+
+def test_handoff_excludes_exact_evidence_content_source_id_and_hash():
+    store, evidence_id = _store(content="sensitive-evidence-topic")
+    record = store.snapshot().get(evidence_id)
+    assert record is not None
+    candidate = _candidate(evidence_ids=(evidence_id,))
+    review = _adjudicate((candidate,), store)
+    context = ReviewHandoffContext(
+        component_ids=(
+            "sensitive-evidence-topic",
+            record.content_hash,
+            evidence_id,
+            "safe-component",
+        ),
+        recipe_ids=(record.source_path or "", "safe-recipe"),
+    )
+
+    handoff = build_review_handoff(
+        context,
+        review=review,
+        evidence=store,
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert "sensitive-evidence-topic" not in handoff.markdown
+    assert record.content_hash not in handoff.markdown
+    assert evidence_id not in handoff.markdown
+    assert (record.source_path or "not-present") not in handoff.markdown
+    assert "safe-component" in handoff.markdown
+    assert "safe-recipe" in handoff.markdown
+
+
+def test_category_disguised_as_claim_cannot_be_aggregate_theme():
+    store, evidence_id = _store()
+    candidates = (
+        _candidate("one", evidence_ids=(evidence_id,), claim="credential-leak", category="credential-leak"),
+        _candidate(
+            "two",
+            evidence_ids=(evidence_id,),
+            claim="credential-leak",
+            category="credential-leak",
+            causal_chain="A separate causal explanation for the same disguised category.",
+        ),
+    )
+    review = _adjudicate(candidates, store)
+
+    handoff = build_review_handoff(
+        ReviewHandoffContext(),
+        review=review,
+        evidence=store,
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert handoff.finding_theme is None
+    assert "credential-leak" not in handoff.markdown
 
 
 def test_notes_quote_bounded_single_line_values_and_never_raw_evidence():
@@ -390,11 +608,40 @@ def test_notes_quote_bounded_single_line_values_and_never_raw_evidence():
     markdown = notes[0].markdown
     assert "javascript:" not in markdown
     assert raw_evidence not in markdown
-    assert "Evidence provenance" in markdown
+    assert "Supporting evidence provenance" in markdown
     assert "User-visible consequence" in markdown
     assert "Causal chain" in markdown
     assert "Suggested validation" in markdown
     assert "\n# Finding" not in markdown
+
+
+def test_finding_note_separates_supporting_and_contradicting_provenance():
+    store, supporting_id = _store()
+    contradiction = store.add_tool_result(
+        session_id="session-2",
+        tool="read_file",
+        arguments={"path": "src/store.py"},
+        result={"status": "ok", "content": "A test suggests retries are idempotent."},
+        category="tests",
+    )
+    candidate = _candidate(evidence_ids=(supporting_id,))
+    candidate = replace(candidate, contradicting_evidence_ids=(contradiction.id,))
+    review = _adjudicate((candidate,), store)
+
+    notes = build_review_notes(
+        review,
+        store,
+        "review_comment",
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert len(notes) == 1
+    finding = review.accepted[0]
+    assert tuple(item.evidence_id for item in finding.supporting_citations) == (supporting_id,)
+    assert tuple(item.evidence_id for item in finding.contradicting_citations) == (contradiction.id,)
+    assert "Supporting evidence provenance" in notes[0].markdown
+    assert "Contradicting evidence provenance" in notes[0].markdown
 
 
 @pytest.mark.parametrize("line", [True, False, 0, -1, "7", object()])
@@ -419,6 +666,36 @@ def test_malformed_optional_request_line_is_safe_file_or_general_note(line: obje
     assert len(notes) == 1
     assert notes[0].file == "src/store.py"
     assert notes[0].line is None
+
+
+@pytest.mark.parametrize("obligation_ids", [(), ("not-controller-owned",)])
+def test_candidate_verification_without_known_obligation_stays_private(
+    obligation_ids: tuple[str, ...],
+):
+    store, evidence_id = _store()
+    candidate = _candidate(
+        evidence_ids=(evidence_id,),
+        location="",
+        obligation_ids=obligation_ids,
+    )
+    review = adjudicate_candidates(
+        (candidate,),
+        {candidate.candidate_id: "keep"},
+        store,
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    notes = build_review_notes(
+        review,
+        store,
+        "review_comment",
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert review.accepted == ()
+    assert notes == ()
 
 
 @pytest.mark.parametrize(
@@ -462,3 +739,54 @@ def test_malformed_severity_configuration_fails_closed_without_crashing(configur
 
     assert result.verdict == "approve"
     assert result.blocking_finding_ids == ()
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        "critical",
+        42,
+        ("unknown",),
+        ("critical", "unknown"),
+        {"unknown"},
+        object(),
+    ],
+)
+def test_invalid_high_risk_tier_configuration_uses_secure_default(configured: object):
+    obligation = _obligation(
+        risk_tier="high", unresolved_policy="block_when_unresolved"
+    )
+
+    result = apply_runtime_verdict_policy(
+        model_verdict="approve",
+        review=AdjudicatedReview(),
+        unresolved=(obligation,),
+        allow_approve=True,
+        evidence=EvidenceStore(),
+        obligations=_controller_obligations(obligation),
+        changed_files=CHANGED_FILES,
+        policy={"high_risk_tiers": configured},
+    )
+
+    assert result.verdict == "request_changes"
+    assert result.source == "incomplete-high-risk-coverage"
+
+
+def test_supported_high_risk_tier_subset_remains_configurable():
+    obligation = _obligation(
+        risk_tier="high", unresolved_policy="block_when_unresolved"
+    )
+
+    result = apply_runtime_verdict_policy(
+        model_verdict="approve",
+        review=AdjudicatedReview(),
+        unresolved=(obligation,),
+        allow_approve=True,
+        evidence=EvidenceStore(),
+        obligations=_controller_obligations(obligation),
+        changed_files=CHANGED_FILES,
+        policy={"high_risk_tiers": ("critical",)},
+    )
+
+    assert result.verdict == "approve"
+    assert result.unknown_obligation_ids == (obligation.obligation_id,)
