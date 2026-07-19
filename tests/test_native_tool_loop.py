@@ -159,6 +159,71 @@ def test_extract_anthropic_tool_use_blocks():
     assert text == "I will read the file. "
 
 
+def test_extract_openai_rejects_blank_and_duplicate_normalized_call_ids():
+    response = openai_tool_call_response([
+        ("  ", "read_file", '{}'),
+        (" dup ", " read_file ", '{"path":"a.py"}'),
+        ("dup", "git_grep", '{"pattern":"x"}'),
+        ("named", "   ", '{}'),
+    ])
+
+    calls, _ = extract_tool_calls(response, "openai")
+
+    assert calls == [{
+        "id": "dup", "name": "read_file", "arguments": '{"path":"a.py"}',
+    }]
+
+
+def test_extract_anthropic_rejects_blank_and_duplicate_normalized_call_ids():
+    response = {
+        "stop_reason": "tool_use",
+        "content": [
+            {"type": "tool_use", "id": "  ", "name": "read_file", "input": {}},
+            {"type": "tool_use", "id": " dup ", "name": " read_file ",
+             "input": {"path": "a.py"}},
+            {"type": "tool_use", "id": "dup", "name": "git_grep",
+             "input": {"pattern": "x"}},
+            {"type": "tool_use", "id": "named", "name": "   ", "input": {}},
+        ],
+    }
+
+    calls, _ = extract_tool_calls(response, "anthropic")
+
+    assert len(calls) == 1
+    assert calls[0]["id"] == "dup"
+    assert calls[0]["name"] == "read_file"
+    assert json.loads(calls[0]["arguments"]) == {"path": "a.py"}
+
+
+def test_malformed_provider_calls_keep_assistant_and_tool_results_paired():
+    conversation = fresh_conversation()
+    response = openai_tool_call_response([
+        (" dup ", " read_file ", '{"path":"a.py"}'),
+        ("dup", "git_grep", '{"pattern":"x"}'),
+        (" ", "read_file", '{"path":"orphan.py"}'),
+    ])
+    execute, log = recording_execute()
+
+    drive_tool_loop(
+        conversation,
+        scripted_post([response, openai_text_response("done")]),
+        execute,
+        api_format="openai",
+        model="m",
+    )
+
+    assistant_ids = [
+        call["id"]
+        for event in conversation.events if event["kind"] == "assistant_tool_calls"
+        for call in event["calls"]
+    ]
+    result_ids = [
+        event["call_id"] for event in conversation.events if event["kind"] == "tool_result"
+    ]
+    assert assistant_ids == result_ids == ["dup"]
+    assert log == [("read_file", {"path": "a.py"})]
+
+
 def test_extract_malformed_response_is_empty():
     calls, text = extract_tool_calls({"unexpected": True}, "openai")
     assert calls == []

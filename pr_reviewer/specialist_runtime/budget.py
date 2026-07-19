@@ -65,6 +65,40 @@ class BudgetLedger:
             output_tokens=usage.output_tokens + output_tokens,
         )
 
+    def reserve_model_turn(self) -> None:
+        """Charge one provider turn before transport without estimating usage."""
+        usage = self._usage
+        if usage.model_turns + 1 > self._limits.model_turns:
+            raise BudgetExhausted("model turn limit exhausted")
+        self._usage = replace(usage, model_turns=usage.model_turns + 1)
+
+    def record_model_usage(
+        self,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+    ) -> None:
+        """Charge provider-reported usage, retaining it even when it exceeds limits."""
+        if input_tokens < 0 or output_tokens < 0:
+            raise ValueError("token counts cannot be negative")
+        usage = self._usage
+        charged = replace(
+            usage,
+            input_tokens=usage.input_tokens + input_tokens,
+            output_tokens=usage.output_tokens + output_tokens,
+        )
+        self._usage = charged
+        if (
+            self._limits.input_tokens is not None
+            and charged.input_tokens > self._limits.input_tokens
+        ):
+            raise BudgetExhausted("input token limit exhausted")
+        if (
+            self._limits.output_tokens is not None
+            and charged.output_tokens > self._limits.output_tokens
+        ):
+            raise BudgetExhausted("output token limit exhausted")
+
     def reserve_tool_calls(self, count: int) -> None:
         if not isinstance(count, int) or count <= 0:
             raise ValueError("tool call reservation must be positive")
@@ -111,6 +145,16 @@ class BudgetLedger:
 
     def remaining_model_turns(self) -> int:
         return max(0, self._limits.model_turns - self._usage.model_turns)
+
+    def remaining_input_tokens(self) -> int | None:
+        if self._limits.input_tokens is None:
+            return None
+        return max(0, self._limits.input_tokens - self._usage.input_tokens)
+
+    def remaining_output_tokens(self) -> int | None:
+        if self._limits.output_tokens is None:
+            return None
+        return max(0, self._limits.output_tokens - self._usage.output_tokens)
 
     def remaining_tool_calls(self) -> int:
         return max(0, self._limits.tool_calls - self._usage.tool_calls)

@@ -5,10 +5,18 @@ from dataclasses import dataclass
 import pytest
 
 from pr_reviewer.conversation import Conversation
-from pr_reviewer.specialist_runtime.budget import BudgetLedger, SessionLease
+from pr_reviewer.specialist_runtime.budget import (
+    BudgetExhausted,
+    BudgetLedger,
+    SessionLease,
+)
 from pr_reviewer.specialist_runtime.assignments import Assignment
 from pr_reviewer.specialist_runtime.coverage import CoverageLedger
-from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+from pr_reviewer.specialist_runtime.evidence import (
+    EvidenceRecord,
+    EvidenceStore,
+    canonical_evidence_key,
+)
 from pr_reviewer.specialist_runtime.model_gateway import ModelTurnResult
 from pr_reviewer.specialist_runtime.session import SpecialistSession
 from pr_reviewer.specialist_runtime.types import (
@@ -51,6 +59,7 @@ class RecordedRequest:
     messages: str
     tools_enabled: bool
     deadline_at: float | None
+    max_tokens: int
 
     def messages_contain(self, value):
         return value in self.messages
@@ -66,9 +75,13 @@ class ScriptedGateway:
             messages=json.dumps(request.conversation._render_openai_messages()),
             tools_enabled=request.tools_enabled,
             deadline_at=request.deadline_at,
+            max_tokens=request.max_tokens,
         ))
         assert self.responses, "model called more times than scripted"
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 def final_response(summary="reviewed", recommendation="approve"):
@@ -96,9 +109,10 @@ def invalid_response(text="not-json"):
 
 def make_session(
     gateway, *, tool_calls=4, model_turns=8, recoveries=1,
-    execute_tool=None, lease=None, assignment=None,
+    execute_tool=None, lease=None, assignment=None, obligations=None,
+    budget_limits=None, max_tokens=1024,
 ):
-    obligations = (
+    obligations = obligations or (
         CoverageObligation(
             obligation_id="OB-code", origin="test", subject="a.py",
             required_evidence_categories=("implementation",), scope=("a.py",),
@@ -124,11 +138,75 @@ def make_session(
         session_id="S1", assignment=assignment, conversation=conversation,
         gateway=gateway, execute_tool=execute_tool, evidence_store=EvidenceStore(),
         coverage=CoverageLedger(obligations),
-        budget=BudgetLedger(BudgetLimits(
+        budget=BudgetLedger(budget_limits or BudgetLimits(
             model_turns=model_turns, tool_calls=tool_calls, recoveries=recoveries,
         )),
-        lease=lease, request_timeout_sec=30.0, max_tokens=1024,
+        lease=lease, request_timeout_sec=30.0, max_tokens=max_tokens,
     )
+
+
+def test_model_gateway_exception_still_charges_reserved_turn():
+    gateway = ScriptedGateway([RuntimeError("provider unavailable")])
+    session = make_session(gateway)
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        session.explore()
+
+    assert session.budget.snapshot().model_turns == 1
+    assert len(gateway.requests) == 1
+
+
+def test_session_bounds_output_and_rejects_input_before_transport():
+    bounded_gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    bounded = make_session(
+        bounded_gateway,
+        budget_limits=BudgetLimits(
+            model_turns=2, tool_calls=1, recoveries=1,
+            output_tokens=4,
+        ),
+    )
+
+    bounded.explore()
+
+    assert bounded_gateway.requests[0].max_tokens == 4
+
+    refused_gateway = ScriptedGateway([])
+    refused = make_session(
+        refused_gateway,
+        budget_limits=BudgetLimits(
+            model_turns=2, tool_calls=1, recoveries=1,
+            input_tokens=1,
+        ),
+    )
+    with pytest.raises(BudgetExhausted, match="input token limit exhausted"):
+        refused.explore()
+    assert refused_gateway.requests == []
+    assert refused.budget.snapshot().model_turns == 0
+
+
+def test_actual_token_overflow_remains_charged_without_retry():
+    response = checkpoint_response(inspected=[], unresolved=[])
+    response = ModelTurnResult(**{
+        **response.__dict__,
+        "usage": {"prompt_tokens": 3, "completion_tokens": 5},
+    })
+    gateway = ScriptedGateway([response])
+    session = make_session(
+        gateway,
+        budget_limits=BudgetLimits(
+            model_turns=2, tool_calls=1, recoveries=1,
+            output_tokens=4,
+        ),
+    )
+
+    with pytest.raises(BudgetExhausted, match="output token limit exhausted"):
+        session.explore()
+
+    assert session.budget.snapshot().model_turns == 1
+    assert session.budget.snapshot().output_tokens == 5
+    assert len(gateway.requests) == 1
 
 
 def test_coverage_feedback_resumes_same_conversation_and_budget():
@@ -210,6 +288,23 @@ def test_recovery_preserves_tool_deduplication_identity():
     assert "replayed_duplicate" in json.dumps(session.conversation.events)
 
 
+def test_failed_recovery_admission_preserves_prior_observable_state():
+    gateway = ScriptedGateway([])
+    session = make_session(gateway, recoveries=1)
+    session.recover("context-pressure")
+    prior_state = session.state
+    prior_conversation = session.conversation
+    prior_checkpoint = session.latest_checkpoint
+
+    with pytest.raises(BudgetExhausted, match="recovery limit exhausted"):
+        session.recover("context-pressure")
+
+    assert session.state is prior_state
+    assert session.conversation is prior_conversation
+    assert session.latest_checkpoint is prior_checkpoint
+    assert session.budget.snapshot().recoveries == 1
+
+
 def test_no_progress_guard_requests_checkpoint_instead_of_final_report():
     repeated = tool_call_response("read_file", {"path": "a.py"}, call_id="repeat")
     gateway = ScriptedGateway([
@@ -286,6 +381,30 @@ def test_tool_result_enters_conversation_only_after_evidence_redaction():
     assert "[REDACTED]" in retained
 
 
+def test_tool_deduplication_retains_only_sanitized_evidence_records():
+    secret = "raw-dedup-secret"
+
+    def execute_tool(name, arguments):
+        return {
+            "tool": name,
+            "status": "ok",
+            "result": {"content": f"token={secret}"},
+        }
+
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, execute_tool=execute_tool)
+
+    session.explore()
+
+    retained = tuple(session._successful_requests.values())
+    assert retained
+    assert all(isinstance(record, EvidenceRecord) for record in retained)
+    assert secret not in repr(retained)
+
+
 def test_inspected_path_cannot_cover_an_unrelated_obligation_scope():
     gateway = ScriptedGateway([
         tool_call_response("read_file", {"path": "a.py"}),
@@ -298,6 +417,73 @@ def test_inspected_path_cannot_cover_an_unrelated_obligation_scope():
 
     assert statuses["OB-code"].value == "covered"
     assert statuses["OB-tests"].value == "pending"
+
+
+def test_declared_evidence_cannot_cover_an_unrelated_obligation_scope():
+    executor_result = {
+        "tool": "read_file", "status": "ok",
+        "result": {"content": "contents:a.py"},
+    }
+    evidence_id = canonical_evidence_key(
+        "read_file", {"path": "a.py"}, executor_result,
+    )
+    checkpoint = checkpoint_response(inspected=[], unresolved=[])
+    raw = json.loads(checkpoint.text)
+    raw["evidence_by_obligation"] = {"OB-tests": [evidence_id]}
+    checkpoint = ModelTurnResult(**{**checkpoint.__dict__, "text": json.dumps(raw)})
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        checkpoint,
+    ])
+
+    result = make_session(gateway).explore()
+
+    assert dict(result.checkpoint.obligation_statuses)["OB-tests"].value == "pending"
+    assert "OB-tests" in result.checkpoint.unknowns
+
+
+def test_model_cannot_remove_a_deterministic_mandatory_gap():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=[]),
+    ])
+
+    result = make_session(gateway).explore()
+
+    assert set(result.checkpoint.unknowns) == {"OB-code", "OB-tests"}
+    assert result.checkpoint.proposed_next_actions == result.checkpoint.unknowns
+
+
+def test_unscoped_obligation_requires_matching_evidence_category():
+    executor_result = {
+        "tool": "read_file", "status": "ok",
+        "result": {"content": "contents:a.py"},
+    }
+    evidence_id = canonical_evidence_key(
+        "read_file", {"path": "a.py"}, executor_result,
+    )
+    obligation = CoverageObligation(
+        obligation_id="OB-unscoped", origin="test", subject="repository",
+        required_evidence_categories=("tool-result",),
+    )
+    assignment = SpecialistAssignment(
+        assignment_id="assignment-unscoped", objective="Review repository evidence",
+        primary_obligation_ids=("OB-unscoped",),
+    )
+    checkpoint = checkpoint_response(inspected=[], unresolved=[])
+    raw = json.loads(checkpoint.text)
+    raw["evidence_by_obligation"] = {"OB-unscoped": [evidence_id]}
+    checkpoint = ModelTurnResult(**{**checkpoint.__dict__, "text": json.dumps(raw)})
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        checkpoint,
+    ])
+
+    result = make_session(
+        gateway, obligations=(obligation,), assignment=assignment,
+    ).explore()
+
+    assert dict(result.checkpoint.obligation_statuses)["OB-unscoped"].value == "covered"
+    assert result.checkpoint.unknowns == ()
 
 
 def test_session_consumes_task_three_assignment_contract():
@@ -355,7 +541,7 @@ def test_finalize_falls_back_to_structured_checkpoint_after_one_repair():
     assert result.state.value == "complete"
     assert result.degraded is True
     assert result.report["source"] == "checkpoint-fallback"
-    assert result.report["unknowns"] == ["OB-code"]
+    assert result.report["unknowns"] == ["OB-code", "OB-tests"]
 
 
 def test_finalize_falls_back_when_schema_repair_has_no_lifetime_turn_left():
@@ -375,6 +561,62 @@ def test_finalize_falls_back_when_schema_repair_has_no_lifetime_turn_left():
     assert len(gateway.requests) == 2
 
 
+def test_initial_finalization_budget_exhaustion_caches_one_fallback():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway, model_turns=1)
+    session.explore()
+
+    first = session.finalize()
+    second = session.finalize()
+
+    assert first is second
+    assert first.state.value == "complete"
+    assert first.degraded is True
+    assert first.report["source"] == "checkpoint-fallback"
+    assert len(gateway.requests) == 1
+
+
+def test_provider_exception_during_initial_finalization_caches_fallback():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        RuntimeError("provider unavailable"),
+    ])
+    session = make_session(gateway)
+    session.explore()
+
+    first = session.finalize()
+    second = session.finalize()
+
+    assert first is second
+    assert first.state.value == "complete"
+    assert first.degraded is True
+    assert first.report["source"] == "checkpoint-fallback"
+    assert first.budget.model_turns == 2
+    assert len(gateway.requests) == 2
+
+
+def test_provider_exception_during_finalization_repair_caches_fallback():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        invalid_response(),
+        RuntimeError("repair provider unavailable"),
+    ])
+    session = make_session(gateway)
+    session.explore()
+
+    first = session.finalize()
+    second = session.finalize()
+
+    assert first is second
+    assert first.state.value == "complete"
+    assert first.degraded is True
+    assert first.report["source"] == "checkpoint-fallback"
+    assert first.budget.model_turns == 3
+    assert len(gateway.requests) == 3
+
+
 def test_expired_lease_refuses_exploration_and_finalization_requests():
     lease = SessionLease(RunPhase.FOLLOWUP, deadline_at=0.0)
     explore_gateway = ScriptedGateway([])
@@ -385,8 +627,12 @@ def test_expired_lease_refuses_exploration_and_finalization_requests():
 
     finalize_gateway = ScriptedGateway([])
     finalize_session = make_session(finalize_gateway, lease=lease)
-    with pytest.raises(TimeoutError, match="session lease expired"):
-        finalize_session.finalize()
+    first = finalize_session.finalize()
+    second = finalize_session.finalize()
 
     assert explore_gateway.requests == []
     assert finalize_gateway.requests == []
+    assert first is second
+    assert first.state.value == "complete"
+    assert first.degraded is True
+    assert first.report["source"] == "checkpoint-fallback"

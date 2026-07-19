@@ -52,6 +52,27 @@ def test_model_turn_token_limit_is_atomic():
     )
 
 
+def test_reserved_model_turn_records_actual_usage_even_when_tokens_overflow():
+    ledger = BudgetLedger(BudgetLimits(
+        model_turns=2, tool_calls=1, recoveries=1,
+        input_tokens=10, output_tokens=8,
+    ))
+    ledger.reserve_model_turn()
+    ledger.record_model_usage(input_tokens=7, output_tokens=3)
+
+    assert ledger.remaining_input_tokens() == 3
+    assert ledger.remaining_output_tokens() == 5
+
+    ledger.reserve_model_turn()
+    with pytest.raises(BudgetExceeded, match="token limit exhausted"):
+        ledger.record_model_usage(input_tokens=4, output_tokens=6)
+
+    snapshot = ledger.snapshot()
+    assert snapshot.model_turns == 2
+    assert snapshot.input_tokens == 11
+    assert snapshot.output_tokens == 9
+
+
 def test_tool_reservation_rejects_an_unavailable_batch_without_mutation():
     ledger = BudgetLedger(BudgetLimits(model_turns=1, tool_calls=3, recoveries=1))
     ledger.reserve_tool_calls(2)

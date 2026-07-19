@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
+from pathlib import PurePosixPath
 from typing import Any, Callable, Mapping
 
 from pr_reviewer.conversation import Conversation
@@ -15,6 +16,8 @@ from .evidence import EvidenceRecord, EvidenceStore
 from .model_gateway import ModelGateway, ModelTurnRequest, ModelTurnResult
 from .types import (
     BudgetUsage,
+    CoverageObligation,
+    ObligationStatus,
     SessionCheckpoint,
     SessionState,
     SpecialistAssignment,
@@ -92,6 +95,41 @@ def _json_object(text: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _normalized_path(value: object) -> str:
+    path = str(value).strip().replace("\\", "/")
+    if not path:
+        return ""
+    normalized = str(PurePosixPath(path))
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.strip("/")
+
+
+def _evidence_matches_obligation(
+    record: EvidenceRecord,
+    obligation: CoverageObligation,
+) -> bool:
+    """Apply deterministic path/category authority to one evidence mapping."""
+    if not record.is_usable_for_coverage:
+        return False
+    scoped_paths = tuple(dict.fromkeys((*obligation.scope, *obligation.seed_hints)))
+    if scoped_paths:
+        source_path = _normalized_path(record.source_path or "")
+        if not source_path:
+            return False
+        return any(
+            source_path == scope_path or source_path.startswith(scope_path + "/")
+            for raw_path in scoped_paths
+            if (scope_path := _normalized_path(raw_path))
+        )
+    category = record.category.strip().lower()
+    return bool(category) and category in {
+        item.strip().lower()
+        for item in obligation.required_evidence_categories
+        if item.strip()
+    }
+
+
 @dataclass(frozen=True)
 class SessionResult:
     """Detached projection of current or completed specialist state."""
@@ -146,9 +184,9 @@ class SpecialistSession:
         self.max_context_tokens = max_context_tokens
         self.recovery_evidence_bytes = recovery_evidence_bytes
         self.state = SessionState.CREATED
-        self.latest_checkpoint = self._project_checkpoint(())
         self._current_gaps = self._assigned_obligation_ids()
-        self._successful_requests: dict[str, tuple[dict[str, Any], EvidenceRecord]] = {}
+        self.latest_checkpoint = self._project_checkpoint(())
+        self._successful_requests: dict[str, EvidenceRecord] = {}
         self._final_result: SessionResult | None = None
         if not self.conversation.events:
             self.conversation.add_user(self._assignment_prompt())
@@ -181,17 +219,31 @@ class SpecialistSession:
         return tuple(dict.fromkeys((*primary, *all_ids, *independent)))
 
     def _request(self, *, tools_enabled: bool, schema: dict[str, Any] | None) -> ModelTurnResult:
-        if self.budget.remaining_model_turns() <= 0:
-            raise BudgetExhausted("model turn limit exhausted")
+        estimated_input_tokens = self.conversation.approx_tokens()
+        remaining_input_tokens = self.budget.remaining_input_tokens()
+        if (
+            remaining_input_tokens is not None
+            and estimated_input_tokens > remaining_input_tokens
+        ):
+            raise BudgetExhausted("input token limit exhausted")
+        remaining_output_tokens = self.budget.remaining_output_tokens()
+        if remaining_output_tokens is not None and remaining_output_tokens <= 0:
+            raise BudgetExhausted("output token limit exhausted")
+        request_max_tokens = (
+            self.max_tokens
+            if remaining_output_tokens is None
+            else min(self.max_tokens, remaining_output_tokens)
+        )
         timeout = self.lease.request_timeout(self.request_timeout_sec)
+        self.budget.reserve_model_turn()
         result = self.gateway.complete(ModelTurnRequest(
-            role="specialist", conversation=self.conversation, max_tokens=self.max_tokens,
+            role="specialist", conversation=self.conversation, max_tokens=request_max_tokens,
             response_schema=schema, tools_enabled=tools_enabled, timeout_sec=timeout,
             deadline_at=self.lease.deadline_at, stream=self.stream,
             response_schema_name=("specialist_checkpoint" if schema is _CHECKPOINT_SCHEMA
                                   else "specialist_final" if schema is _FINAL_SCHEMA else None),
         ))
-        self.budget.record_model_turn(
+        self.budget.record_model_usage(
             input_tokens=int(result.usage.get("prompt_tokens", 0) or 0),
             output_tokens=int(result.usage.get("completion_tokens", 0) or 0),
         )
@@ -244,7 +296,7 @@ class SpecialistSession:
                 self.budget.record_tool_rejection("duplicate tool request")
                 self.conversation.add_tool_result(
                     call_id,
-                    {"evidence_id": prior[1].id, "replayed_duplicate": True},
+                    {"evidence_id": prior.id, "replayed_duplicate": True},
                 )
                 continue
             try:
@@ -275,7 +327,7 @@ class SpecialistSession:
                 is_error=is_error,
             )
             if record.is_usable_for_coverage:
-                self._successful_requests[key] = (result, record)
+                self._successful_requests[key] = record
                 progressed = True
         return progressed
 
@@ -315,9 +367,12 @@ class SpecialistSession:
             return None
         retained = {record.id: record for record in self.evidence_store.snapshot().records}
         evidence_ids = [item for item in _strings(raw.get("evidence_ids")) if item in retained]
-        inspected = set(_strings(raw.get("inspected")))
+        inspected = {_normalized_path(item) for item in _strings(raw.get("inspected"))}
         for record in retained.values():
-            if record.is_usable_for_coverage and record.source_path in inspected:
+            if (
+                record.is_usable_for_coverage
+                and _normalized_path(record.source_path or "") in inspected
+            ):
                 evidence_ids.append(record.id)
         evidence_ids = list(dict.fromkeys(evidence_ids))
         unresolved = _strings(raw.get("unresolved"))
@@ -329,26 +384,22 @@ class SpecialistSession:
                     continue
                 for evidence_id in _strings(ids):
                     record = retained.get(evidence_id)
-                    if record is not None and record.is_usable_for_coverage:
+                    obligation = self.coverage.obligation(obligation_id)
+                    if record is not None and _evidence_matches_obligation(record, obligation):
                         self.coverage.attach_evidence(obligation_id, evidence_id)
+                        evidence_ids.append(evidence_id)
         # The compact `inspected` checkpoint form associates retained inspected
         # evidence with covered assignment obligations; arbitrary IDs never do.
-        for obligation_id in assigned.difference(unresolved):
+        for obligation_id in assigned:
             obligation = self.coverage.obligation(obligation_id)
-            scoped_paths = tuple(dict.fromkeys((*obligation.scope, *obligation.seed_hints)))
             for evidence_id in evidence_ids:
                 record = retained[evidence_id]
-                if not record.source_path or not scoped_paths:
-                    continue
-                if any(
-                    record.source_path == path.replace("\\", "/").strip("/")
-                    or record.source_path.startswith(path.replace("\\", "/").strip("/") + "/")
-                    for path in scoped_paths
-                ):
+                if _evidence_matches_obligation(record, obligation):
                     self.coverage.attach_evidence(obligation_id, evidence_id)
         for obligation_id in assigned.intersection(unresolved):
             self.coverage.mark_unresolved(obligation_id)
-        self._current_gaps = tuple(item for item in unresolved if item in assigned)
+        self._current_gaps = self._derive_current_gaps()
+        evidence_ids = list(dict.fromkeys(evidence_ids))
         return SessionCheckpoint(
             session_id=self.session_id,
             state=SessionState.CHECKPOINT,
@@ -357,9 +408,24 @@ class SpecialistSession:
             candidate_finding_ids=_strings(raw.get("candidate_finding_ids")),
             obligation_statuses=tuple(sorted(self.coverage.obligation_statuses().items())),
             invariants_evaluated=_strings(raw.get("invariants_evaluated")),
-            unknowns=_strings(raw.get("unknowns")),
-            proposed_next_actions=_strings(raw.get("proposed_next_actions")),
+            unknowns=self._current_gaps,
+            proposed_next_actions=self._current_gaps,
         )
+
+    def _derive_current_gaps(self) -> tuple[str, ...]:
+        statuses = self.coverage.obligation_statuses()
+        gaps: list[str] = []
+        for obligation_id in self._assigned_obligation_ids():
+            try:
+                obligation = self.coverage.obligation(obligation_id)
+            except KeyError:
+                continue
+            if (
+                obligation.mandatory
+                and statuses.get(obligation_id) is not ObligationStatus.COVERED
+            ):
+                gaps.append(obligation_id)
+        return tuple(gaps)
 
     def _project_checkpoint(self, gaps: tuple[str, ...]) -> SessionCheckpoint:
         for obligation_id in gaps:
@@ -367,6 +433,7 @@ class SpecialistSession:
                 self.coverage.mark_unresolved(obligation_id)
             except KeyError:
                 continue
+        self._current_gaps = self._derive_current_gaps()
         return SessionCheckpoint(
             session_id=self.session_id,
             state=SessionState.CHECKPOINT,
@@ -375,8 +442,8 @@ class SpecialistSession:
                 if record.is_usable_for_coverage
             ),
             obligation_statuses=tuple(sorted(self.coverage.obligation_statuses().items())),
-            unknowns=tuple(gaps),
-            proposed_next_actions=tuple(gaps),
+            unknowns=self._current_gaps,
+            proposed_next_actions=self._current_gaps,
         )
 
     def apply_coverage_feedback(self, gaps: list[str] | tuple[str, ...]) -> None:
@@ -391,7 +458,10 @@ class SpecialistSession:
                 + json.dumps(normalized)
             )
             self.budget.reset_no_progress_streak("material controller feedback")
-        self._current_gaps = normalized
+            for obligation_id in normalized:
+                if obligation_id in self._assigned_obligation_ids():
+                    self.coverage.mark_unresolved(obligation_id)
+        self._current_gaps = self._derive_current_gaps()
 
     def _compact_conversation(self) -> None:
         self.conversation.truncate_oldest_tool_results(2_000)
@@ -425,8 +495,8 @@ class SpecialistSession:
         if self._final_result is not None:
             return self._final_result
         self.lease.request_timeout(self.request_timeout_sec)
-        self.state = SessionState.RECOVERY
         self.budget.record_recovery(normalized)
+        self.state = SessionState.RECOVERY
 
         # Bound the abandoned transcript using the established compaction
         # helpers before retaining it for diagnostics/replacement.
@@ -480,35 +550,39 @@ class SpecialistSession:
         """Finalize once with tools disabled and one bounded schema repair."""
         if self._final_result is not None:
             return self._final_result
-        self.lease.request_timeout(self.request_timeout_sec)
-        self.state = SessionState.FINALIZING
-        self.conversation.add_user(
-            "Finalize this specialist assessment once from the latest checkpoint and "
-            "retained evidence. Return only the requested JSON; tools are disabled."
-        )
-        turn = self._request(tools_enabled=False, schema=_FINAL_SCHEMA)
-        if turn.text:
-            self.conversation.add_assistant_text(turn.text)
-        report = self._final_report_from_text(turn.text)
-        degraded = False
-        if report is None:
+        try:
+            self.lease.request_timeout(self.request_timeout_sec)
+            self.state = SessionState.FINALIZING
             self.conversation.add_user(
-                "Schema repair: return exactly one final JSON object with non-empty "
-                "summary and recommendation fields. Tools remain disabled."
+                "Finalize this specialist assessment once from the latest checkpoint and "
+                "retained evidence. Return only the requested JSON; tools are disabled."
             )
-            try:
+            turn = self._request(tools_enabled=False, schema=_FINAL_SCHEMA)
+            if turn.text:
+                self.conversation.add_assistant_text(turn.text)
+            report = self._final_report_from_text(turn.text)
+            if report is None:
+                self.conversation.add_user(
+                    "Schema repair: return exactly one final JSON object with non-empty "
+                    "summary and recommendation fields. Tools remain disabled."
+                )
                 repair = self._request(tools_enabled=False, schema=_FINAL_SCHEMA)
-            except (BudgetExhausted, TimeoutError):
-                repair = None
-            if repair is not None:
                 if repair.text:
                     self.conversation.add_assistant_text(repair.text)
                 report = self._final_report_from_text(repair.text)
+        except Exception:  # noqa: BLE001 - provider/admission failure degrades once
+            return self._cache_checkpoint_fallback()
         if report is None:
-            degraded = True
-            report = self._checkpoint_fallback_report()
+            return self._cache_checkpoint_fallback()
         self.state = SessionState.COMPLETE
-        self._final_result = self._snapshot(report=report, degraded=degraded)
+        self._final_result = self._snapshot(report=report, degraded=False)
+        return self._final_result
+
+    def _cache_checkpoint_fallback(self) -> SessionResult:
+        self.state = SessionState.COMPLETE
+        self._final_result = self._snapshot(
+            report=self._checkpoint_fallback_report(), degraded=True,
+        )
         return self._final_result
 
     def _final_report_from_text(self, text: str) -> dict[str, Any] | None:

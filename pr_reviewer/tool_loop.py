@@ -253,6 +253,21 @@ def extract_tool_calls(
     """
     calls: list[dict[str, Any]] = []
     text_parts: list[str] = []
+    seen_call_ids: set[str] = set()
+
+    def append_call(call_id: object, name: object, arguments: str) -> None:
+        if not isinstance(call_id, str) or not isinstance(name, str):
+            return
+        normalized_id = call_id.strip()
+        normalized_name = name.strip()
+        if not normalized_id or not normalized_name or normalized_id in seen_call_ids:
+            return
+        seen_call_ids.add(normalized_id)
+        calls.append({
+            "id": normalized_id,
+            "name": normalized_name,
+            "arguments": arguments,
+        })
 
     if api_format == "anthropic":
         content = response.get("content")
@@ -265,8 +280,6 @@ def extract_tool_calls(
                 elif block.get("type") == "tool_use":
                     call_id = block.get("id")
                     name = block.get("name")
-                    if not isinstance(call_id, str) or not isinstance(name, str):
-                        continue
                     raw_input = block.get("input")
                     try:
                         arguments = json.dumps(
@@ -276,7 +289,7 @@ def extract_tool_calls(
                         )
                     except (TypeError, ValueError):
                         arguments = str(raw_input)
-                    calls.append({"id": call_id, "name": name, "arguments": arguments})
+                    append_call(call_id, name, arguments)
         return calls, "".join(text_parts)
 
     # OpenAI format
@@ -296,8 +309,6 @@ def extract_tool_calls(
             fn = raw.get("function") if isinstance(raw.get("function"), dict) else {}
             call_id = raw.get("id")
             name = fn.get("name") or raw.get("name")
-            if not isinstance(call_id, str) or not isinstance(name, str):
-                continue
             args = fn.get("arguments")
             if args is None:
                 args = raw.get("arguments")
@@ -310,7 +321,7 @@ def extract_tool_calls(
                     )
                 except (TypeError, ValueError):
                     args = str(args)
-            calls.append({"id": call_id, "name": name, "arguments": args})
+            append_call(call_id, name, args)
     return calls, "".join(text_parts)
 
 
