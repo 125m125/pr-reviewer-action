@@ -502,7 +502,8 @@ def _safe_discovery_url(url: str) -> tuple[str, str, str]:
     except ValueError:
         return "", "", "/[REDACTED]"
     if (
-        not host
+        parsed.scheme.lower() != "https"
+        or not host
         or parsed.username is not None
         or parsed.password is not None
         or _authority_has_empty_port(parsed.netloc)

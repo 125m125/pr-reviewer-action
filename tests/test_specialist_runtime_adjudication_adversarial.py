@@ -788,6 +788,112 @@ def test_handoff_recursively_excludes_every_evidence_record_and_provenance_field
     assert "safe-component" in handoff.markdown
 
 
+def test_handoff_rechecks_every_dynamic_value_after_prefix_and_rendering():
+    store = EvidenceStore()
+    rendered_details = (
+        "Database and persistence",
+        "Component: safe-component",
+        "Repository recipe: safe-recipe",
+        "Approve",
+        "AI review complete",
+        "2 unresolved review note(s); highest material severity: major.",
+        "Material evidence or session coverage is incomplete.",
+    )
+    records = tuple(
+        store.add_tool_result(
+            session_id="session-1",
+            tool="read_file",
+            arguments={"path": "src/store.py" if index == 0 else f"metadata/{index}"},
+            result={"status": "ok", "content": detail},
+            category="implementation",
+        )
+        for index, detail in enumerate(rendered_details)
+    )
+    candidates = (
+        _candidate("one", evidence_ids=(records[0].id,)),
+        _candidate(
+            "two",
+            evidence_ids=(records[0].id,),
+            claim="A separate retry path duplicates the write",
+            causal_chain="A separate retry branch repeats the write.",
+        ),
+    )
+    review = _adjudicate(candidates, store)
+    context = ReviewHandoffContext(
+        recommendation="approve",
+        status="complete",
+        change_topics=(ReviewOrientationTopic.DATABASE,),
+        component_ids=("safe-component",),
+        specialist_topics=(ReviewOrientationTopic.DATABASE,),
+        recipe_ids=("safe-recipe",),
+        coverage_boundary_topics=(ReviewOrientationTopic.DATABASE,),
+        unresolved_thread_count=2,
+        highest_thread_severity="major",
+        review_emphasis_topics=(ReviewOrientationTopic.DATABASE,),
+        material_coverage_limited=True,
+    )
+
+    handoff = build_review_handoff(
+        context,
+        review=review,
+        evidence=store,
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert all(detail not in handoff.markdown for detail in rendered_details)
+    assert handoff.recommendation == ""
+    assert handoff.change_map == ()
+    assert handoff.reviewed_focuses == ()
+    assert handoff.thread_status is None
+    assert handoff.finding_theme is None
+    assert handoff.review_emphasis == ()
+    assert handoff.coverage_warning is None
+
+
+def test_handoff_omits_detail_derived_diagnostics_and_candidate_access_urls():
+    diagnostics_url = "https://artifacts.example.test/run/diagnostics"
+    store = EvidenceStore()
+    store.add_tool_result(
+        session_id="session-1",
+        tool="read_file",
+        arguments={"path": "src/store.py"},
+        result={"status": "ok", "content": "implementation evidence"},
+        category="implementation",
+        provenance=EvidenceProvenance(
+            original_url="https://ARTIFACTS.example.test:443/run/diagnostics"
+        ),
+    )
+    source_url = "https://sources.example.test:8443/schema/v1"
+    request = SourceAccessRequest(
+        host="sources.example.test",
+        candidate_url=source_url,
+        obligation_id="obligation-store",
+        purpose="Confirm the external schema.",
+    )
+    context = ReviewHandoffContext(
+        material_coverage_limited=True,
+        diagnostics_url=diagnostics_url,
+        source_access_requests=(request,),
+        access_request_url=source_url,
+    )
+
+    handoff = build_review_handoff(
+        context,
+        review=AdjudicatedReview(),
+        evidence=store,
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert diagnostics_url not in handoff.markdown
+    assert source_url not in handoff.markdown
+    assert handoff.coverage_warning == "Material evidence or session coverage is incomplete."
+    assert handoff.access_request_count == 1
+    assert handoff.access_request_url is None
+    assert "**Source access requests:** 1 open" in handoff.markdown
+
+
 def test_category_disguised_as_claim_cannot_be_aggregate_theme():
     store, evidence_id = _store()
     candidates = (

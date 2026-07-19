@@ -113,6 +113,10 @@ def test_source_access_request_canonicalizes_default_https_port():
 @pytest.mark.parametrize(
     "candidate_url",
     (
+        "http://docs.example.com:8443/schema/v1",
+        "ftp://docs.example.com/schema/v1",
+        "//docs.example.com:8443/schema/v1",
+        "docs.example.com/schema/v1",
         "https://user:pass@docs.example.com/schema/v1",
         "https://docs.example.com:/schema/v1",
         "https://docs.example.com:bad/schema/v1",
@@ -127,6 +131,16 @@ def test_source_access_request_rejects_unsafe_or_invalid_authority(candidate_url
             "OB-schema",
             "confirm schema",
         )
+
+
+def test_source_access_request_preserves_case_normalized_https_scheme():
+    request = source_access_request(
+        SearchCandidate(None, "HTTPS://docs.example.com:8443/schema/v1"),
+        "OB-schema",
+        "confirm schema",
+    )
+
+    assert request.candidate_url == "https://docs.example.com:8443/schema/v1"
 
 
 def test_discovery_scans_bounded_results_and_caps_approved_output():

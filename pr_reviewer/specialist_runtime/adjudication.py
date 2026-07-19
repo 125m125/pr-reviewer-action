@@ -866,30 +866,61 @@ def build_review_handoff(
         context.source_access_requests,
         snapshot.records,
     ))
-    forbidden = frozenset(
-        value
-        for item in _detail_scalars(tuple(detail_roots))
-        if (value := _exact_detail(item))
-    )
+    detail_values = _detail_scalars(tuple(detail_roots))
+    forbidden_values = {
+        value for item in detail_values if (value := _exact_detail(item))
+    }
+    for item in detail_values:
+        canonical = _canonical_request_url(item)
+        if canonical is not None:
+            forbidden_values.add(_exact_detail(canonical[1]))
+    forbidden = frozenset(forbidden_values)
+
+    def renderable(*values: object) -> bool:
+        normalized = tuple(_exact_detail(value) for value in values)
+        return bool(normalized) and all(
+            value and value not in forbidden for value in normalized
+        )
+
+    if not renderable(recommendation, f"Recommendation: {recommendation}"):
+        recommendation = ""
+    if not renderable(status, f"Status: {status}"):
+        status = ""
     change_topics = _topic_values(
         context.change_topics, forbidden=forbidden, limit=6
     )
     component_ids = _structured_ids(
         context.component_ids, forbidden=forbidden, limit=6
     )
-    change_map = tuple(sorted({
-        *change_topics, *(f"Component: {item}" for item in component_ids),
-    }))
+    components = tuple(
+        rendered
+        for item in component_ids
+        if renderable(rendered := f"Component: {item}")
+    )
+    change_map = tuple(sorted({*change_topics, *components}))
     specialist_focuses = _topic_values(
         context.specialist_topics, forbidden=forbidden, limit=6
     )
     recipe_ids = _structured_ids(
         context.recipe_ids, forbidden=forbidden, limit=6
     )
-    recipes = tuple(f"Repository recipe: {item}" for item in recipe_ids)
+    recipes = tuple(
+        rendered
+        for item in recipe_ids
+        if renderable(rendered := f"Repository recipe: {item}")
+    )
     boundaries = _topic_values(
         context.coverage_boundary_topics, forbidden=forbidden, limit=6
     )
+    specialist_line = "Specialist focus: " + "; ".join(specialist_focuses)
+    if specialist_focuses and not renderable(specialist_line):
+        specialist_focuses = ()
+    recipe_line = "Repository recipes: " + "; ".join(recipes)
+    if recipes and not renderable(recipe_line):
+        recipes = ()
+    boundary_line = "Coverage boundaries: " + "; ".join(boundaries)
+    if boundaries and not renderable(boundary_line):
+        boundaries = ()
     reviewed_focuses = tuple(sorted(set((*specialist_focuses, *recipes, *boundaries))))
     review_emphasis = _topic_values(
         context.review_emphasis_topics, forbidden=forbidden, limit=3
@@ -904,15 +935,36 @@ def build_review_handoff(
     thread_severity = _normalized_severity(context.highest_thread_severity)
     thread_status = None
     if thread_count:
-        thread_status = f"{thread_count} unresolved review note(s); highest material severity: {thread_severity}."
+        candidate_thread_status = (
+            f"{thread_count} unresolved review note(s); "
+            f"highest material severity: {thread_severity}."
+        )
+        if renderable(
+            candidate_thread_status,
+            f"Thread status: {candidate_thread_status}",
+        ):
+            thread_status = candidate_thread_status
     theme, theme_label = _aggregate_theme(authoritative, forbidden=forbidden)
+    if theme_label and not renderable(
+        theme_label, f"Aggregate finding theme: {theme_label}"
+    ):
+        theme, theme_label = None, None
     diagnostics = _canonical_request_url(context.diagnostics_url or "")
     diagnostics_url = diagnostics[1] if diagnostics else None
+    if diagnostics_url and not renderable(
+        diagnostics_url, f"Diagnostics: {diagnostics_url}"
+    ):
+        diagnostics_url = None
     coverage_warning = None
     if context.material_coverage_limited:
-        coverage_warning = "Material evidence or session coverage is incomplete."
+        candidate_warning = "Material evidence or session coverage is incomplete."
         if diagnostics_url:
-            coverage_warning += f" Diagnostics: {diagnostics_url}"
+            candidate_warning += f" Diagnostics: {diagnostics_url}"
+        if renderable(
+            candidate_warning,
+            f"Material coverage warning: {candidate_warning}",
+        ):
+            coverage_warning = candidate_warning
     valid_source_notes = {
         note.fingerprint: note
         for item in context.source_access_requests
@@ -921,6 +973,8 @@ def build_review_handoff(
     access_count = len(valid_source_notes)
     access = _canonical_request_url(context.access_request_url or "")
     access_url = access[1] if access else None
+    if access_url and not renderable(access_url):
+        access_url = None
 
     lines = ["## AI Review Handoff"]
     if recommendation:
@@ -953,7 +1007,15 @@ def build_review_handoff(
         access_text = f"{access_count} open"
         if access_url:
             access_text = f"[{access_text}]({access_url})"
-        lines.extend(("", f"**Source access requests:** {access_text}"))
+        if renderable(
+            f"{access_count} open",
+            access_text,
+            f"Source access requests: {access_text}",
+        ):
+            lines.extend(("", f"**Source access requests:** {access_text}"))
+        else:
+            access_count = 0
+            access_url = None
     return ReviewHandoff(
         markdown="\n".join(lines).strip() + "\n",
         recommendation=recommendation,
