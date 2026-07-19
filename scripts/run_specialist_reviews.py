@@ -20,7 +20,7 @@ for entry in (str(SCRIPT_DIR), str(ROOT)):
 
 from redact import mask_secrets  # noqa: E402
 from pr_reviewer.conversation import Conversation, web_tool_schemas  # noqa: E402
-from pr_reviewer.specialist_runtime.policy import load_review_policy  # noqa: E402
+from pr_reviewer.specialist_runtime.policy import ReviewPolicy, load_review_policy  # noqa: E402
 from pr_reviewer.specialist_runtime.web_evidence import SourcePolicy  # noqa: E402
 from pr_reviewer.specialists import (  # noqa: E402
     BUILTIN_LENSES,
@@ -31,7 +31,6 @@ from pr_reviewer.specialists import (  # noqa: E402
     deterministic_focuses,
     dump_json,
     findings_for_review,
-    load_specialist_config,
     normalize_focus,
     normalize_specialist_report,
     policy_notice,
@@ -1201,7 +1200,23 @@ def main() -> int:
     config_path = safe_repo_file(
         os.getenv("SPECIALIST_CONFIG_FILE", ".github/ai-review-specialists.json")
     )
-    config = load_specialist_config(config_path)
+    configuration_degraded = False
+    configuration_warning = ""
+    try:
+        if not Path(config_path).is_file():
+            raise FileNotFoundError(config_path)
+        review_policy = load_review_policy(config_path)
+        source_policy = SourcePolicy.from_review_policy(review_policy)
+    except (OSError, ValueError) as exc:
+        configuration_degraded = True
+        detail = "missing" if isinstance(exc, FileNotFoundError) else "invalid or unreadable"
+        configuration_warning = (
+            f"Specialist policy is {detail}; degraded to an empty policy and disabled web tools"
+        )
+        print(configuration_warning, file=sys.stderr)
+        review_policy = ReviewPolicy.minimal()
+        source_policy = SourcePolicy(())
+    config = review_policy.legacy_projection()
     pr_files = load_json("pr-files.json", [])
     classification = load_json("classification.json", {})
     topology = build_topology(
@@ -1212,10 +1227,6 @@ def main() -> int:
     changed_files = topology["changed_files"]
     config_changed = config_path.replace("\\", "/").lstrip("./") in changed_files
 
-    try:
-        source_policy = SourcePolicy.from_review_policy(load_review_policy(config_path))
-    except (OSError, ValueError):
-        source_policy = SourcePolicy(())
     runner = SequentialModelRunner()
     runner.source_policy = source_policy
     runner.tool_schemas = web_tool_schemas(
@@ -1300,6 +1311,8 @@ def main() -> int:
             "strategy": strategy, "evaluation_status": "failed",
             "fallback_status": "standard_review" if strategy == "specialists" else "publication_gated",
             "configuration": config, "configuration_path": config_path,
+            "configuration_degraded": configuration_degraded,
+            "configuration_warning": configuration_warning,
             "configuration_changed": config_changed, "topology": topology,
             "planner": {"degraded": planner_degraded, "error": planner_error, "diagnostics": planner_diag},
             "schedule": schedule, "passes": pass_diagnostics, "reports": [],
@@ -1317,6 +1330,7 @@ def main() -> int:
             "# Specialist review\n\n"
             f"- Strategy: `{strategy}`\n- Evaluation: `failed`\n"
             f"- Planner: `{'degraded' if planner_degraded else 'complete'}`\n"
+            f"- Configuration: `{'degraded' if configuration_degraded else 'complete'}`\n"
             f"- Specialist passes: 0 succeeded, {failed_initial} failed\n"
             f"- Fallback: `{'standard whole-PR review' if strategy == 'specialists' else 'publication gated'}`\n"
             f"- Model requests: {len(runner.requests)}\n- Duration: {duration}s\n",
@@ -1423,6 +1437,8 @@ def main() -> int:
         "evaluation_status": "complete" if failed == 0 else "incomplete",
         "configuration": config,
         "configuration_path": config_path,
+        "configuration_degraded": configuration_degraded,
+        "configuration_warning": configuration_warning,
         "configuration_changed": config_changed,
         "topology": topology,
         "planner": {"degraded": planner_degraded, "error": planner_error, "diagnostics": planner_diag},
@@ -1450,6 +1466,7 @@ def main() -> int:
         "# Specialist review\n\n"
         f"- Strategy: `{strategy}`\n"
         f"- Planner: `{'degraded' if planner_degraded else 'complete'}`\n"
+        f"- Configuration: `{'degraded' if configuration_degraded else 'complete'}`\n"
         f"- Initial focuses: {', '.join(item['id'] for item in schedule['selected']) or '(none)'}\n"
         f"- Follow-up focuses: {', '.join(item['id'] for item in followup_schedule['selected']) or '(none)'}\n"
         f"- Specialist passes: {succeeded} succeeded, {failed} failed\n"

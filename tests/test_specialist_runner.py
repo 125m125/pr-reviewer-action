@@ -200,6 +200,40 @@ def test_main_runs_dynamic_plan_specialists_two_critic_turns_and_aggregator(monk
     assert EndToEndRunner.last.roles == ["planner", "specialist", "critic", "critic", "aggregator"]
 
 
+def test_main_invalid_current_policy_degrades_without_advertising_web(
+    monkeypatch, tmp_path, capsys,
+):
+    _write_minimal_review_workspace(tmp_path)
+    (tmp_path / ".github").mkdir()
+    (tmp_path / ".github" / "ai-review-specialists.json").write_text(
+        "{invalid json", encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REVIEW_STRATEGY", "specialists_evaluate")
+    monkeypatch.setenv("AI_MODEL", "test-model")
+    monkeypatch.setenv("AI_BASE_URL", "http://unused/v1")
+    monkeypatch.setenv("SEARCH_URL", "https://search.example.com/search")
+    monkeypatch.setattr(runner_module, "SequentialModelRunner", EndToEndRunner)
+    monkeypatch.setattr(runner_module, "tracked_paths", lambda: ["a.py"])
+
+    assert runner_module.main() == 0
+
+    artifact = json.loads(
+        (tmp_path / "specialist-review-artifact.json").read_text(encoding="utf-8")
+    )
+    assert artifact["configuration"] == {
+        "version": 1, "components": [], "recipes": [], "generated_artifacts": [],
+        "exclude": {"paths": [], "components": [], "lenses": [], "recipes": []},
+    }
+    assert artifact["configuration_degraded"] is True
+    assert "invalid" in artifact["configuration_warning"].lower()
+    assert "degraded" in capsys.readouterr().err.lower()
+    assert all(
+        (schema.get("function") or schema).get("name") not in {"web_search", "web_fetch"}
+        for schema in EndToEndRunner.last.tool_schemas
+    )
+
+
 def test_planner_fallback_focuses_only_when_plan_is_degraded():
     topology = {
         "changed_files": ["a.py"],

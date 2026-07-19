@@ -86,6 +86,7 @@ class SearxngSearchProvider:
         max_response_bytes: int = 1024 * 1024,
         max_redirects: int = 3,
         monotonic: Callable[[], float] = time.monotonic,
+        blocking_guard: _BoundedBlockingCallGuard | None = None,
     ) -> None:
         canonical, host = _canonical_search_endpoint(endpoint)
         if request_timeout <= 0 or max_response_bytes <= 0 or max_redirects < 0:
@@ -93,7 +94,10 @@ class SearxngSearchProvider:
         self.endpoint = canonical
         self.host = host
         self.request_timeout = request_timeout
-        self.transport = transport or StdlibHttpTransport(monotonic=monotonic)
+        self.blocking_guard = blocking_guard or _BLOCKING_CALL_GUARD
+        self.transport = transport or StdlibHttpTransport(
+            monotonic=monotonic, blocking_guard=self.blocking_guard,
+        )
         self.resolver = resolver or _default_resolver
         self.max_response_bytes = max_response_bytes
         self.max_redirects = max_redirects
@@ -120,8 +124,10 @@ class SearxngSearchProvider:
         response: HttpResponse | None = None
         for redirect_count in range(self.max_redirects + 1):
             canonical, host = _canonical_search_endpoint(current_url, required_host=self.host)
-            remaining = _remaining(deadline, self.monotonic)
-            addresses = _public_addresses(host, 443, self.resolver, remaining)
+            addresses = _public_addresses(
+                host, 443, self.resolver, deadline, self.monotonic,
+                self.blocking_guard,
+            )
             remaining = _remaining(deadline, self.monotonic)
             response = self.transport.request(HttpRequest(
                 url=canonical,
@@ -517,14 +523,10 @@ def _entropy(value: str) -> float:
 
 
 def _looks_high_entropy(token: str) -> bool:
-    # Requiring mixed case avoids treating ordinary long documentation slugs
-    # or hexadecimal commit IDs as credentials merely because they are long.
-    token_like_alphabet = (
-        bool(re.search(r"[a-z]", token))
-        and bool(re.search(r"[A-Z]", token))
-        and bool(re.search(r"[0-9+/=_-]", token))
-    )
-    return token_like_alphabet and _entropy(token) >= 4.0
+    # Secrets and opaque identifiers are not required to mix character classes:
+    # lowercase base36 tokens, uppercase tokens, and hexadecimal hashes are all
+    # common.  Length, symbol diversity, and measured entropy form the boundary.
+    return len(token) >= 32 and len(set(token)) >= 12 and _entropy(token) >= 3.5
 
 
 def _validated_query(query: str) -> str:
@@ -633,54 +635,113 @@ _METADATA_ADDRESSES = frozenset({
 })
 
 
+class _BoundedBlockingCallGuard:
+    """Run uncancellable blocking calls without permitting thread exhaustion.
+
+    A timed-out worker retains its slot until it actually exits.  New calls fail
+    closed immediately once all slots are occupied instead of creating an
+    unbounded succession of daemon threads.
+    """
+
+    def __init__(self, *, max_outstanding: int = 4) -> None:
+        if max_outstanding <= 0:
+            raise ValueError("blocking-call capacity must be positive")
+        self._max_outstanding = max_outstanding
+        self._slots = threading.BoundedSemaphore(max_outstanding)
+        self._state_lock = threading.Lock()
+        self._outstanding = 0
+
+    @property
+    def outstanding(self) -> int:
+        with self._state_lock:
+            return self._outstanding
+
+    def run(
+        self,
+        operation: Callable[[], object],
+        *,
+        deadline: float,
+        monotonic: Callable[[], float],
+        name: str,
+        on_timeout: Callable[[], None] | None = None,
+    ) -> object:
+        _remaining(deadline, monotonic)
+        if not self._slots.acquire(blocking=False):
+            raise SourceDenied("web blocking-call capacity exhausted")
+        with self._state_lock:
+            self._outstanding += 1
+        outcome: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+        def worker() -> None:
+            try:
+                try:
+                    outcome.put((True, operation()))
+                except BaseException as exc:  # noqa: BLE001 - returned to caller
+                    outcome.put((False, exc))
+            finally:
+                with self._state_lock:
+                    self._outstanding -= 1
+                self._slots.release()
+
+        thread = threading.Thread(
+            target=worker, daemon=True, name=f"secure-web-{name}",
+        )
+        thread.start()
+        thread.join(_remaining(deadline, monotonic))
+        if thread.is_alive():
+            if on_timeout is not None:
+                try:
+                    on_timeout()
+                except Exception:
+                    pass
+            raise SourceDenied(f"{name} exceeded the web operation hard deadline")
+        succeeded, value = outcome.get_nowait()
+        if not succeeded:
+            if isinstance(value, BaseException):
+                raise value
+            raise OSError(f"{name} failed")
+        return value
+
+
+_BLOCKING_CALL_GUARD = _BoundedBlockingCallGuard(max_outstanding=4)
+
+
 def _default_resolver(host: str, port: int, timeout: float | None = None) -> list[str]:
-    def resolve() -> list[str]:
-        resolved = []
-        for item in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
-            address = item[4][0]
-            if address not in resolved:
-                resolved.append(address)
-        return resolved
-
-    if timeout is None:
-        return resolve()
-    outcome: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
-
-    def worker() -> None:
-        try:
-            outcome.put((True, resolve()))
-        except Exception as exc:  # pragma: no cover - platform resolver detail
-            outcome.put((False, exc))
-
-    thread = threading.Thread(target=worker, daemon=True, name="secure-web-dns")
-    thread.start()
-    thread.join(timeout)
-    if thread.is_alive():
-        raise TimeoutError("DNS resolution exceeded the web operation deadline")
-    succeeded, value = outcome.get_nowait()
-    if not succeeded:
-        if isinstance(value, BaseException):
-            raise value
-        raise OSError("DNS resolution failed")
-    return list(value) if isinstance(value, list) else []
+    del timeout  # the shared blocking-call guard owns the deadline
+    resolved = []
+    for item in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+        address = item[4][0]
+        if address not in resolved:
+            resolved.append(address)
+    return resolved
 
 
 def _public_addresses(
     host: str,
     port: int,
     resolver: Callable[..., Sequence[str]],
-    timeout: float | None = None,
+    deadline: float,
+    monotonic: Callable[[], float],
+    blocking_guard: _BoundedBlockingCallGuard,
 ) -> tuple[str, ...]:
     try:
         literal = ipaddress.ip_address(host)
     except ValueError:
-        try:
+        def resolve() -> Sequence[str]:
+            timeout = _remaining(deadline, monotonic)
             try:
                 inspect.signature(resolver).bind(host, port, timeout)
             except (TypeError, ValueError):
-                raw_addresses = resolver(host, port)
-            else:
-                raw_addresses = resolver(host, port, timeout)
+                return resolver(host, port)
+            return resolver(host, port, timeout)
+
+        try:
+            raw_addresses = blocking_guard.run(
+                resolve, deadline=deadline, monotonic=monotonic,
+                name="DNS resolution",
+            )
+        except SourceDenied:
+            raise
         except Exception as exc:
             raise SourceDenied("source address resolution failed") from exc
     else:
@@ -732,15 +793,19 @@ class StdlibHttpTransport:
         *,
         ssl_context: ssl.SSLContext | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        blocking_guard: _BoundedBlockingCallGuard | None = None,
+        connection_factory: Callable[..., object] | None = None,
     ) -> None:
         self._ssl_context = ssl_context or ssl.create_default_context()
         self._monotonic = monotonic
+        self._blocking_guard = blocking_guard or _BLOCKING_CALL_GUARD
+        self._connection_factory = connection_factory or _PinnedHTTPSConnection
 
     def request(self, request: HttpRequest) -> HttpResponse:
         parsed = urlsplit(request.url)
         port = parsed.port or 443
         deadline = request.deadline or (self._monotonic() + request.timeout)
-        connection = _PinnedHTTPSConnection(
+        connection = self._connection_factory(
             parsed.hostname or "", port, request.resolved_ip,
             _remaining(deadline, self._monotonic), self._ssl_context,
         )
@@ -750,19 +815,50 @@ class StdlibHttpTransport:
             connection.sock.settimeout(_remaining(deadline, self._monotonic))
             connection.request("GET", target, headers=dict(request.headers))
             connection.sock.settimeout(_remaining(deadline, self._monotonic))
-            response = connection.getresponse()
-            headers = {key.lower(): value for key, value in response.getheaders()}
+
+            def receive_headers() -> tuple[object, dict[str, str]]:
+                response = connection.getresponse()
+                headers = {
+                    key.lower(): value for key, value in response.getheaders()
+                }
+                return response, headers
+
+            def abort_connection() -> None:
+                sock = getattr(connection, "sock", None)
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except Exception:
+                        pass
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                connection.close()
+
+            response, headers = self._blocking_guard.run(
+                receive_headers,
+                deadline=deadline,
+                monotonic=self._monotonic,
+                name="response headers",
+                on_timeout=abort_connection,
+            )
+            read_one = getattr(response, "read1", None)
+            if not callable(read_one):
+                raise SourceDenied("HTTP response does not support bounded read-one semantics")
             chunks = []
             size = 0
             while size <= request.max_bytes:
                 connection.sock.settimeout(_remaining(deadline, self._monotonic))
-                chunk = response.read(min(16 * 1024, request.max_bytes + 1 - size))
+                chunk = read_one(min(16 * 1024, request.max_bytes + 1 - size))
                 _remaining(deadline, self._monotonic)
                 if not chunk:
                     break
                 chunks.append(chunk)
                 size += len(chunk)
             return HttpResponse(response.status, headers, b"".join(chunks))
+        except SourceDenied:
+            raise
         except (TimeoutError, socket.timeout) as exc:
             raise SourceDenied("web operation hard deadline exceeded") from exc
         finally:
@@ -837,11 +933,15 @@ class SecureFetcher:
         allowed_mime_types: Iterable[str] = _ALLOWED_MIME_TYPES,
         clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
+        blocking_guard: _BoundedBlockingCallGuard | None = None,
     ) -> None:
         if timeout <= 0 or max_bytes <= 0 or max_redirects < 0:
             raise ValueError("secure fetch limits are invalid")
         self.policy = policy
-        self.transport = transport or StdlibHttpTransport(monotonic=monotonic)
+        self.blocking_guard = blocking_guard or _BLOCKING_CALL_GUARD
+        self.transport = transport or StdlibHttpTransport(
+            monotonic=monotonic, blocking_guard=self.blocking_guard,
+        )
         self.resolver = resolver or _default_resolver
         self.evidence_store = evidence_store
         self.timeout = timeout
@@ -875,8 +975,8 @@ class SecureFetcher:
             port = parsed.port or 443
             _remaining(deadline, self.monotonic)
             addresses = _public_addresses(
-                decision.host, port, self.resolver,
-                _remaining(deadline, self.monotonic),
+                decision.host, port, self.resolver, deadline, self.monotonic,
+                self.blocking_guard,
             )
             remaining = _remaining(deadline, self.monotonic)
             request = HttpRequest(

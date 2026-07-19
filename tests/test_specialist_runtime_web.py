@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import random
+import string
+import threading
+import time
 
 import pytest
 
+from pr_reviewer.specialist_runtime import web_evidence as web
 from pr_reviewer.specialist_runtime.policy import SourceRule
 from pr_reviewer.specialist_runtime.evidence import EvidenceStore
 from pr_reviewer.specialist_runtime.web_evidence import (
@@ -16,6 +21,7 @@ from pr_reviewer.specialist_runtime.web_evidence import (
     SecureFetcher,
     SourceDenied,
     SourcePolicy,
+    StdlibHttpTransport,
     discover,
     source_access_request,
 )
@@ -140,6 +146,37 @@ def test_discovery_rejects_credential_or_high_entropy_queries(query):
         discover(query, provider, source_policy())
 
     assert provider.limits == []
+
+
+_RANDOM_BASE36_RANDOM = random.Random(221)
+_RANDOM_BASE36_TOKEN = "".join(
+    _RANDOM_BASE36_RANDOM.choices(string.ascii_lowercase + string.digits, k=64)
+)
+
+
+@pytest.mark.parametrize("token", [
+    pytest.param(_RANDOM_BASE36_TOKEN, id="random-lowercase-base36"),
+    pytest.param("0123456789abcdef" * 4, id="hex"),
+    pytest.param("QWERTYUIOPASDFGHJKLZXCVBNM" * 2, id="uppercase"),
+    pytest.param("aZ9mQ2xK7vP4nR8sT1uW5yB3cD6eF0gH" * 2, id="mixed"),
+])
+def test_entropy_detection_is_independent_of_alphabet_composition(token):
+    with pytest.raises(SourceDenied, match="high-entropy"):
+        discover(f"lookup {token}", FakeSearchProvider([]), source_policy())
+
+    assert source_policy().classify(
+        f"https://docs.example.com/api/{token}"
+    ).approved is False
+
+    denied = discover(
+        "api behavior",
+        FakeSearchProvider([SearchCandidate(
+            "candidate", f"https://evil.example/{token}", "snippet",
+        )]),
+        source_policy(),
+    ).unapproved[0]
+    assert token not in denied.path
+    assert denied.path == "/[REDACTED]"
 
 
 def test_discovery_rejects_overlong_query():
@@ -497,3 +534,144 @@ def test_denied_metadata_strips_authority_query_and_suspicious_path():
     assert all(marker not in serialized for marker in (
         "user", "pass", "q=", "secret", "frag", "hostile title", "hostile snippet",
     ))
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        self.closed = False
+        self.timeouts: list[float] = []
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeouts.append(timeout)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _BlockingHeaderConnection:
+    def __init__(self) -> None:
+        self.sock = _FakeSocket()
+        self.closed = False
+        self.release = threading.Event()
+
+    def connect(self) -> None:
+        return None
+
+    def request(self, *args, **kwargs) -> None:
+        return None
+
+    def getresponse(self):
+        self.release.wait()
+        raise OSError("connection closed")
+
+    def close(self) -> None:
+        self.closed = True
+        self.sock.close()
+        self.release.set()
+
+
+class _SlowDripResponse:
+    status = 200
+
+    def __init__(self) -> None:
+        self.read1_calls = 0
+
+    def getheaders(self):
+        return [("content-type", "text/plain")]
+
+    def read1(self, size: int) -> bytes:
+        self.read1_calls += 1
+        time.sleep(0.025)
+        return b"x"
+
+
+class _ImmediateConnection:
+    def __init__(self, response) -> None:
+        self.sock = _FakeSocket()
+        self.response = response
+        self.closed = False
+
+    def connect(self) -> None:
+        return None
+
+    def request(self, *args, **kwargs) -> None:
+        return None
+
+    def getresponse(self):
+        return self.response
+
+    def close(self) -> None:
+        self.closed = True
+        self.sock.close()
+
+
+def _transport_request(timeout: float) -> HttpRequest:
+    return HttpRequest(
+        url="https://docs.example.com/api", resolved_ip=PUBLIC_IP,
+        timeout=timeout, deadline=time.monotonic() + timeout, max_bytes=1024,
+        headers={},
+    )
+
+
+def test_transport_slow_headers_obey_elapsed_hard_deadline_and_close_socket():
+    connection = _BlockingHeaderConnection()
+    guard = web._BoundedBlockingCallGuard(max_outstanding=2)
+    transport = StdlibHttpTransport(
+        connection_factory=lambda *args: connection,
+        blocking_guard=guard,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(SourceDenied, match="deadline"):
+        transport.request(_transport_request(0.05))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.2
+    assert connection.closed is True
+    assert connection.sock.closed is True
+
+
+def test_transport_slow_drip_body_uses_read_one_and_obeys_elapsed_deadline():
+    response = _SlowDripResponse()
+    connection = _ImmediateConnection(response)
+    guard = web._BoundedBlockingCallGuard(max_outstanding=2)
+    transport = StdlibHttpTransport(
+        connection_factory=lambda *args: connection,
+        blocking_guard=guard,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(SourceDenied, match="deadline"):
+        transport.request(_transport_request(0.06))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.2
+    assert response.read1_calls >= 2
+    assert connection.closed is True
+
+
+def test_two_argument_resolver_timeouts_retain_bounded_slots_and_fail_fast():
+    release = threading.Event()
+    guard = web._BoundedBlockingCallGuard(max_outstanding=2)
+
+    def resolver(host: str, port: int) -> list[str]:
+        release.wait()
+        return [PUBLIC_IP]
+
+    fetcher = SecureFetcher(
+        source_policy(), transport=FakeHttpTransport({}), resolver=resolver,
+        timeout=0.03, blocking_guard=guard,
+    )
+    try:
+        for _ in range(2):
+            with pytest.raises(SourceDenied, match="deadline"):
+                fetcher.fetch("https://docs.example.com/api")
+        assert guard.outstanding == 2
+
+        started = time.monotonic()
+        with pytest.raises(SourceDenied, match="capacity"):
+            fetcher.fetch("https://docs.example.com/api")
+        assert time.monotonic() - started < 0.02
+        assert guard.outstanding == 2
+    finally:
+        release.set()
