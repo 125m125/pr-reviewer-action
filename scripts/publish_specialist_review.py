@@ -110,6 +110,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--notes", required=True)
     parser.add_argument("--diff", required=True)
     parser.add_argument("--files", required=True)
+    parser.add_argument("--changed-files-complete", type=_bool, default=False)
+    parser.add_argument("--diff-complete", type=_bool, default=False)
     parser.add_argument("--policy-result", required=True)
     parser.add_argument("--artifacts")
     parser.add_argument("--repo", required=True)
@@ -145,6 +147,8 @@ def main(argv: list[str] | None = None) -> int:
         notes=notes,
         diff_text=Path(args.diff).read_text(encoding="utf-8", errors="replace"),
         changed_files=changed_files,
+        changed_files_complete=args.changed_files_complete,
+        diff_complete=args.diff_complete,
         policy_result=policy,
         repo=args.repo,
         pr_number=args.pr_number,

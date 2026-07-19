@@ -14,10 +14,10 @@ import os
 import re
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from pr_reviewer.enforcement import RuntimeVerdictPolicyResult
 from pr_reviewer.platform import gh_argv
@@ -29,9 +29,15 @@ from scripts.strip_metadata_markers import strip_reserved_markers
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 _NOTE_MARKER_RE = re.compile(r"<!--\s*ai-pr-review-note:([^\s>]+)\s*-->")
+_NOTE_GENERATION_MARKER_RE = re.compile(
+    r"<!--\s*ai-pr-review-note:([^\s>]+)\s+generation=(\d+)\s*-->"
+)
 _GENERAL_MARKER_RE = re.compile(r"<!--\s*ai-pr-review-general:([^\s>]+)\s*-->")
+_GENERAL_ANSWER_MARKER_RE = re.compile(
+    r"<!--\s*ai-pr-review-general-answer:([^\s>]+):[0-9a-f]{40,64}\s*-->"
+)
 _PUBLISHER_RESOLUTION_RE = re.compile(
-    r"<!--\s*ai-pr-review-resolution:([^\s>]+):publisher\s*-->"
+    r"<!--\s*ai-pr-review-resolution:([^>]+?)(?::g\d+:[0-9a-f]{40,64})?:publisher\s*-->"
 )
 _OWN_MARKER_RE = re.compile(
     r"<!--\s*ai-pr-review-(?:note|general|resolution):[^>]*-->", re.IGNORECASE
@@ -60,6 +66,7 @@ class NormalizedReviewNote:
     severity: str | None
     anchor: NoteAnchor | None
     actionable: bool
+    generation: int = 1
 
 
 @dataclass(frozen=True)
@@ -72,13 +79,22 @@ class PublisherApprovalPolicy:
     effective_scope: str = "full"
     baseline_clean: bool = False
 
+    def __post_init__(self) -> None:
+        for name in ("allow_approve", "approve_forks", "is_fork", "baseline_clean"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name} must be a boolean")
+        if self.effective_scope not in {"full", "incremental"}:
+            raise ValueError("effective_scope must be full or incremental")
+
 
 class ReviewPublishClient(Protocol):
     def update_sticky(self, repo: str, pr_number: int, body: str) -> Mapping[str, Any]: ...
     def query_managed_state(self, repo: str, pr_number: int) -> Mapping[str, Any]: ...
     def reply_thread(self, comment_id: object, body: str) -> Mapping[str, Any]: ...
     def resolve_thread(self, thread_id: str) -> Mapping[str, Any]: ...
-    def create_pending_review(self, pull_request_id: str, head_sha: str) -> Mapping[str, Any]: ...
+    def create_pending_review(
+        self, pull_request_id: str, head_sha: str, body: str
+    ) -> Mapping[str, Any]: ...
     def add_review_thread(self, variables: Mapping[str, Any]) -> Mapping[str, Any]: ...
     def submit_review(self, review_id: str, event: str, body: str) -> Mapping[str, Any]: ...
     def upsert_general_comment(
@@ -118,12 +134,17 @@ def _diff_snapshot(diff_text: str) -> tuple[set[str], dict[str, set[int]]]:
     current: str | None = None
     new_line = 0
     in_hunk = False
+    pending_old_header = False
     for raw in str(diff_text or "").splitlines():
         if raw.startswith("diff --git "):
             current = None
             in_hunk = False
+            pending_old_header = False
             continue
-        if raw.startswith("+++ "):
+        if not in_hunk and raw.startswith("--- "):
+            pending_old_header = True
+            continue
+        if not in_hunk and pending_old_header and raw.startswith("+++ "):
             target = raw[4:].strip()
             if target == "/dev/null":
                 current = None
@@ -132,11 +153,13 @@ def _diff_snapshot(diff_text: str) -> tuple[set[str], dict[str, set[int]]]:
                 current = _safe_repo_path(candidate)
                 if current:
                     paths.add(current)
+            pending_old_header = False
             continue
         match = _HUNK_RE.match(raw)
         if match:
             new_line = int(match.group(1))
             in_hunk = True
+            pending_old_header = False
             continue
         if current is None or not in_hunk or raw.startswith("\\"):
             continue
@@ -164,22 +187,29 @@ def legacy_diff_positions(diff_text: str) -> dict[str, dict[int, int]]:
     new_line = 0
     diff_position = 0
     in_hunk = False
+    pending_old_header = False
     for raw in str(diff_text or "").splitlines():
         if raw.startswith("diff --git "):
             current_path = None
             in_hunk = False
             diff_position = 0
+            pending_old_header = False
             continue
-        if raw.startswith("+++ "):
+        if not in_hunk and raw.startswith("--- "):
+            pending_old_header = True
+            continue
+        if not in_hunk and pending_old_header and raw.startswith("+++ "):
             target = raw[4:].strip()
-            current_path = None if target == "/dev/null" else _safe_repo_path(
+            current_path = None if target == "/dev/null" else (
                 target[2:] if target.startswith("b/") else target
             )
+            pending_old_header = False
             continue
         match = _HUNK_RE.match(raw)
         if match:
             new_line = int(match.group(1))
             in_hunk = True
+            pending_old_header = False
             continue
         if current_path is None or not in_hunk or raw.startswith("\\"):
             continue
@@ -218,9 +248,10 @@ def choose_note_anchor(
 ) -> NoteAnchor | None:
     """Choose LINE, then FILE, using only the current PR diff/files.
 
-    A note's path or line is a hint, never authority.  LINE is limited to an
-    added RIGHT-side line.  FILE requires the path to appear in both supplied
-    PR files (when supplied) and the current diff.
+    A note's path or line is a hint, never authority. LINE is limited to an
+    added RIGHT-side line present in the parsed diff. FILE requires the path in
+    the complete current PR files snapshot, or in the diff only when no files
+    snapshot was supplied.
     """
 
     path = _safe_repo_path(getattr(note, "file", None))
@@ -255,12 +286,20 @@ def _clean_markdown(value: object) -> str:
     return sanitize_markdown(mask_secrets(text)).strip()
 
 
-def _note_marker(fingerprint: str) -> str:
-    return f"<!-- ai-pr-review-note:{fingerprint} -->"
+def _note_marker(fingerprint: str, generation: int = 1) -> str:
+    return f"<!-- ai-pr-review-note:{fingerprint} generation={generation} -->"
 
 
 def _general_marker(fingerprint: str) -> str:
     return f"<!-- ai-pr-review-general:{fingerprint} -->"
+
+
+def _note_generation(note: NormalizedReviewNote, generation: int) -> NormalizedReviewNote:
+    return replace(
+        note,
+        generation=generation,
+        managed_markdown=f"{note.markdown}\n\n{_note_marker(note.fingerprint, generation)}",
+    )
 
 
 def normalize_note(
@@ -328,28 +367,104 @@ def build_review_thread_variables(
     return variables
 
 
-def _valid_artifact_url(value: object) -> bool:
+def _canonical_artifact_url(value: object) -> str | None:
+    raw = str(value or "").strip()
+    if (
+        not raw
+        or len(raw) > 2048
+        or any(character.isspace() or ord(character) < 32 for character in raw)
+        or any(character in raw for character in "\\<>")
+    ):
+        return None
     try:
-        parsed = urlsplit(str(value))
+        parsed = urlsplit(raw)
+        port = parsed.port
     except ValueError:
-        return False
-    return parsed.scheme == "https" and bool(parsed.hostname) and not parsed.username
+        return None
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    try:
+        host = parsed.hostname.encode("idna").decode("ascii").lower()
+        decoded_path = unquote(parsed.path)
+    except (UnicodeError, ValueError):
+        return None
+    if any(
+        character.isspace() or ord(character) < 32 or character in "\\<>"
+        for character in decoded_path
+    ):
+        return None
+    netloc = host + (f":{port}" if port and port != 443 else "")
+    path = quote(decoded_path or "/", safe="/%:@-._~!$&'()*+,;=")
+    return urlunsplit(("https", netloc, path, "", ""))
+
+
+def _valid_artifact_url(value: object) -> bool:
+    return _canonical_artifact_url(value) is not None
+
+
+def _markdown_label(value: object) -> str:
+    label = " ".join(mask_secrets(str(value or "")).split())[:100]
+    label = sanitize_markdown(label)
+    label = re.sub(r"(?i)https?://", lambda match: match.group(0)[:-2] + "\u200b//", label)
+    return label.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def _valid_comment_result(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and isinstance(value.get("id"), int)
+        and not isinstance(value.get("id"), bool)
+        and value["id"] > 0
+        and isinstance(value.get("url"), str)
+        and _valid_artifact_url(value["url"])
+    )
+
+
+def _valid_review_result(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and isinstance(value.get("id"), str)
+        and bool(value["id"])
+        and isinstance(value.get("url"), str)
+        and _valid_artifact_url(value["url"])
+    )
+
+
+def _valid_thread_result(value: object) -> bool:
+    return (
+        _valid_review_result(value)
+        and isinstance(value.get("comment_id"), int)
+        and not isinstance(value.get("comment_id"), bool)
+        and value["comment_id"] > 0
+    )
 
 
 def _handoff_body(
-    handoff: ReviewHandoff, artifact_links: Sequence[tuple[str, str]]
+    handoff: ReviewHandoff,
+    artifact_links: Sequence[tuple[str, str]],
+    review_url: str | None = None,
 ) -> str:
     if not isinstance(handoff, ReviewHandoff):
         raise TypeError("handoff must be a ReviewHandoff")
     body = _clean_markdown(handoff.markdown)
     links = []
     for label, url in artifact_links[:10]:
-        clean_label = " ".join(str(label).split())[:100]
-        clean_url = str(url).strip()[:2048]
-        if clean_label and _valid_artifact_url(clean_url):
-            links.append(f"- [{sanitize_markdown(clean_label)}]({clean_url})")
+        clean_label = _markdown_label(label)
+        clean_url = _canonical_artifact_url(url)
+        if clean_label and clean_url:
+            links.append(f"- [{clean_label}](<{clean_url}>)")
     if links:
         body = body + "\n\n**Retained review artifacts**\n\n" + "\n".join(links)
+    clean_review_url = _canonical_artifact_url(review_url)
+    if clean_review_url:
+        body += f"\n\n[Detailed managed review](<{clean_review_url}>)"
     return "<!-- ai-pr-review-specialist-handoff -->\n" + body.strip()
 
 
@@ -386,15 +501,34 @@ class GitHubReviewPublisher:
         self.max_attempts = max(1, min(int(max_attempts), 3))
         self._errors: list[dict[str, str]] = []
 
-    def _call(self, operation: str, function, *args):
+    def _call(self, operation: str, function, *args, retry_safe: bool = False):
         last: Exception | None = None
-        for _attempt in range(self.max_attempts):
+        attempts = self.max_attempts if retry_safe else 1
+        for _attempt in range(attempts):
             try:
                 return function(*args)
             except Exception as exc:  # publication failures are persisted separately
                 last = exc
         self._errors.append({"operation": operation, "error": mask_secrets(str(last))[:500]})
         return None
+
+    def _checkpoint(
+        self,
+        state: dict[str, Any],
+        operation: str,
+        result: Mapping[str, Any] | None = None,
+    ) -> None:
+        entry: dict[str, Any] = {
+            "sequence": len(state.setdefault("journal", [])) + 1,
+            "operation": operation,
+        }
+        for key in ("id", "url", "comment_id", "thread_id", "fingerprint"):
+            value = (result or {}).get(key)
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                entry[key] = value
+        state["journal"].append(entry)
+        state["publication_errors"] = self._errors
+        self._write_state(state)
 
     def _write_state(self, state: Mapping[str, Any]) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -426,21 +560,53 @@ class GitHubReviewPublisher:
         head_sha: str,
         artifact_links: Sequence[tuple[str, str]] = (),
         approval_policy: PublisherApprovalPolicy = PublisherApprovalPolicy(),
+        changed_files_complete: bool = False,
+        diff_complete: bool = False,
     ) -> dict[str, Any]:
         if mode not in {"comment", "review_comment", "review_verdict"}:
             raise ValueError("unsupported publish mode")
         if not isinstance(policy_result, RuntimeVerdictPolicyResult):
             raise TypeError("policy_result must be a RuntimeVerdictPolicyResult")
+        if policy_result.verdict not in {"approve", "request_changes"}:
+            raise ValueError("policy verdict must be approve or request_changes")
+        if not isinstance(approval_policy, PublisherApprovalPolicy):
+            raise TypeError("approval_policy must be a PublisherApprovalPolicy")
         if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
             raise ValueError("pr_number must be a positive integer")
-        self._errors = []
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo or ""):
+            raise ValueError("repo must be owner/name")
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head_sha or ""):
+            raise ValueError("head_sha must be a canonical 40- or 64-character hex digest")
+        if type(changed_files_complete) is not bool or type(diff_complete) is not bool:
+            raise TypeError("snapshot completeness flags must be boolean")
+        if not isinstance(handoff, ReviewHandoff):
+            raise TypeError("handoff must be a ReviewHandoff")
+        if not isinstance(diff_text, str):
+            raise TypeError("diff_text must be a string")
+        notes_snapshot = tuple(notes)
+        if not all(isinstance(note, ReviewNote) for note in notes_snapshot):
+            raise TypeError("notes must contain only ReviewNote values")
         files_snapshot = tuple(changed_files)
-        normalized = tuple(
-            normalize_note(note, diff_text, files_snapshot)
-            for note in notes
-        )
+        if changed_files_complete and any(
+            not isinstance(path, str) or _safe_repo_path(path) != path
+            for path in files_snapshot
+        ):
+            raise ValueError("complete changed_files must contain safe repository paths")
+        self._errors = []
+        prior_state: Mapping[str, Any] = {}
+        try:
+            loaded_prior = json.loads(self.state_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_prior, Mapping):
+                prior_state = loaded_prior
+        except (OSError, ValueError):
+            pass
         sticky_body = _handoff_body(handoff, artifact_links)
         sticky = self._call("update_sticky", self.client.update_sticky, repo, pr_number, sticky_body)
+        if not _valid_comment_result(sticky):
+            self._errors.append({
+                "operation": "update_sticky",
+                "error": "sticky publication did not return a valid id and URL",
+            })
         state: dict[str, Any] = {
             "version": 1,
             "mode": mode,
@@ -448,22 +614,76 @@ class GitHubReviewPublisher:
             "pr_number": pr_number,
             "head_sha": head_sha,
             "review_completed": True,
+            "changed_files_complete": changed_files_complete,
+            "diff_complete": diff_complete,
             "sticky": dict(sticky or {}),
             "notes": [],
+            "journal": [],
             "publication_errors": self._errors,
         }
+        if not _valid_comment_result(sticky):
+            state["sticky"] = {}
+            self._write_state(state)
+            return state
+        self._checkpoint(state, "update_sticky", sticky)
         if mode == "comment":
             self._write_state(state)
             return state
 
         managed = self._call(
-            "query_managed_state", self.client.query_managed_state, repo, pr_number
-        ) or {}
-        prior_threads = {
-            str(item.get("fingerprint")): item
-            for item in managed.get("threads", ())
-            if isinstance(item, Mapping) and item.get("fingerprint")
-        }
+            "query_managed_state",
+            self.client.query_managed_state,
+            repo,
+            pr_number,
+            retry_safe=True,
+        )
+        if not isinstance(managed, Mapping):
+            prior_notes = prior_state.get("notes")
+            state["notes"] = list(prior_notes) if isinstance(prior_notes, list) else []
+            state["managed_state_complete"] = False
+            state["publication_errors"] = self._errors
+            self._write_state(state)
+            return state
+        state["managed_state_complete"] = True
+        if not changed_files_complete:
+            if managed.get("changed_files_complete") is not True:
+                self._errors.append({
+                    "operation": "changed_files_snapshot",
+                    "error": "complete changed-files snapshot is unavailable",
+                })
+                prior_notes = prior_state.get("notes")
+                state["notes"] = list(prior_notes) if isinstance(prior_notes, list) else []
+                state["publication_errors"] = self._errors
+                self._write_state(state)
+                return state
+            managed_files = managed.get("changed_files")
+            if not isinstance(managed_files, (list, tuple)):
+                self._errors.append({
+                    "operation": "changed_files_snapshot",
+                    "error": "complete changed-files snapshot is invalid",
+                })
+                state["publication_errors"] = self._errors
+                self._write_state(state)
+                return state
+            files_snapshot = tuple(managed_files)
+            state["changed_files_complete"] = True
+        normalized = tuple(
+            normalize_note(note, diff_text, files_snapshot)
+            for note in notes_snapshot
+        )
+        prior_threads: dict[str, Mapping[str, Any]] = {}
+        for item in managed.get("threads", ()):
+            if not isinstance(item, Mapping) or not item.get("fingerprint"):
+                continue
+            fingerprint = str(item["fingerprint"])
+            generation = item.get("generation", 1)
+            previous = prior_threads.get(fingerprint)
+            if (
+                previous is None
+                or isinstance(generation, int)
+                and generation > int(previous.get("generation", 1))
+            ):
+                prior_threads[fingerprint] = item
         prior_general = {
             str(item.get("fingerprint")): item
             for item in managed.get("general_comments", ())
@@ -471,33 +691,142 @@ class GitHubReviewPublisher:
         }
         current = {item.fingerprint: item for item in normalized}
         new_thread_notes: list[NormalizedReviewNote] = []
+        resolution_sources: dict[tuple[str, int], str] = {}
+        answered_general = {
+            str(item) for item in managed.get("general_answered_fingerprints", ())
+        }
+
+        def reconcile_thread_reply(
+            fingerprint: str, generation: int, marker: str, prior: Mapping[str, Any]
+        ) -> Mapping[str, Any] | None:
+            refreshed = self._call(
+                "reconcile_reply_thread",
+                self.client.query_managed_state,
+                repo,
+                pr_number,
+                retry_safe=True,
+            )
+            if not isinstance(refreshed, Mapping):
+                return None
+            for item in refreshed.get("threads", ()):
+                if not isinstance(item, Mapping):
+                    continue
+                if (
+                    item.get("fingerprint") != fingerprint
+                    or int(item.get("generation", 1)) != generation
+                ):
+                    continue
+                for comment in item.get("owned_comments", ()):
+                    if (
+                        isinstance(comment, Mapping)
+                        and marker in str(comment.get("body") or "")
+                        and _valid_comment_result(comment)
+                    ):
+                        return comment
+                if any(
+                    marker in body
+                    for body in item.get("owned_comment_bodies", ())
+                    if isinstance(body, str)
+                ):
+                    comment_id = prior.get("comment_id")
+                    url = prior.get("url")
+                    if (
+                        isinstance(comment_id, int)
+                        and not isinstance(comment_id, bool)
+                        and comment_id > 0
+                        and isinstance(url, str)
+                        and _valid_artifact_url(url)
+                    ):
+                        return {"id": comment_id, "url": url}
+            return None
 
         # Same fingerprints are updated in place; resolved human threads stay resolved.
         for fingerprint, note in current.items():
             prior = prior_threads.get(fingerprint)
             if prior is not None:
+                generation = int(prior.get("generation", 1))
+                owned_bodies = tuple(
+                    item for item in prior.get("owned_comment_bodies", ())
+                    if isinstance(item, str)
+                )
                 if prior.get("is_resolved"):
+                    if prior.get("resolved_by_publisher"):
+                        recurrent = _note_generation(note, generation + 1)
+                        new_thread_notes.append(recurrent)
+                        resolution_sources[(fingerprint, generation + 1)] = "publisher_recurrence"
+                        continue
+                    status_marker = (
+                        f"<!-- ai-pr-review-status:{fingerprint}:g{generation}:"
+                        f"{head_sha}:human-resolved -->"
+                    )
+                    reply = None
+                    if not any(status_marker in body for body in owned_bodies):
+                        reply = self._call(
+                            "reply_thread",
+                            self.client.reply_thread,
+                            prior.get("comment_id"),
+                            "**Re-review status:** Current evidence still references this "
+                            "human-resolved thread; it remains resolved and was not reopened.\n\n"
+                            + status_marker,
+                        )
+                        reconciled_reply = False
+                        if not _valid_comment_result(reply):
+                            reply = reconcile_thread_reply(
+                                fingerprint, generation, status_marker, prior
+                            )
+                            reconciled_reply = _valid_comment_result(reply)
+                        if _valid_comment_result(reply):
+                            self._checkpoint(
+                                state,
+                                "reconcile_reply_human_resolved_thread"
+                                if reconciled_reply
+                                else "reply_human_resolved_thread",
+                                reply,
+                            )
                     state["notes"].append({
                         "fingerprint": fingerprint,
+                        "generation": generation,
                         "id": prior.get("thread_id"),
                         "url": prior.get("url"),
+                        "reply_id": (reply or {}).get("id"),
                         "anchor_type": prior.get("anchor_type") or (
                             note.anchor.subject_type if note.anchor else None
                         ),
                         "resolution": "human_resolved_not_reopened",
-                        "human_resolved": not bool(prior.get("resolved_by_publisher")),
+                        "resolution_source": "human",
+                        "human_resolved": True,
                         "publication_errors": [],
                     })
                     continue
-                reply = self._call(
-                    "reply_thread",
-                    self.client.reply_thread,
-                    prior.get("comment_id"),
-                    "**Re-review status:** This note remains open with current evidence.\n\n"
-                    + note.managed_markdown,
+                status_marker = (
+                    f"<!-- ai-pr-review-status:{fingerprint}:g{generation}:{head_sha}:open -->"
                 )
+                reply = None
+                if not any(status_marker in body for body in owned_bodies):
+                    reply = self._call(
+                        "reply_thread",
+                        self.client.reply_thread,
+                        prior.get("comment_id"),
+                        "**Re-review status:** This note remains open with current evidence.\n\n"
+                        + note.markdown + "\n\n" + status_marker,
+                    )
+                    reconciled_reply = False
+                    if not _valid_comment_result(reply):
+                        reply = reconcile_thread_reply(
+                            fingerprint, generation, status_marker, prior
+                        )
+                        reconciled_reply = _valid_comment_result(reply)
+                    if _valid_comment_result(reply):
+                        self._checkpoint(
+                            state,
+                            "reconcile_reply_open_thread"
+                            if reconciled_reply
+                            else "reply_open_thread",
+                            reply,
+                        )
                 state["notes"].append({
                     "fingerprint": fingerprint,
+                    "generation": generation,
                     "id": prior.get("thread_id"),
                     "url": prior.get("url"),
                     "reply_id": (reply or {}).get("id"),
@@ -505,6 +834,7 @@ class GitHubReviewPublisher:
                         note.anchor.subject_type if note.anchor else None
                     ),
                     "resolution": "open",
+                    "resolution_source": "existing_thread",
                     "human_resolved": False,
                     "publication_errors": [],
                 })
@@ -525,35 +855,132 @@ class GitHubReviewPublisher:
                     prior_comment,
                     body,
                 )
+                if not _valid_comment_result(published):
+                    self._errors.append({
+                        "operation": "upsert_general_comment",
+                        "error": "general comment response is missing a valid id and URL",
+                    })
+                    published = None
+                else:
+                    self._checkpoint(
+                        state,
+                        "upsert_general_comment",
+                        {**dict(published), "fingerprint": fingerprint},
+                    )
                 state["notes"].append({
                     "fingerprint": fingerprint,
                     "id": (published or prior_comment or {}).get("id"),
                     "url": (published or prior_comment or {}).get("url"),
                     "anchor_type": "GENERAL",
-                    "resolution": "open_non_resolvable",
+                    "resolution": (
+                        "open_non_resolvable"
+                        if published is not None or prior_comment is not None
+                        else "publication_failed"
+                    ),
                     "human_resolved": False,
                     "non_resolvable": True,
-                    "publication_errors": [],
+                    "publication_errors": (
+                        [] if published is not None or prior_comment is not None
+                        else ["upsert_general_comment"]
+                    ),
                 })
             else:
                 new_thread_notes.append(note)
+                resolution_sources[(fingerprint, note.generation)] = "new"
 
         # Missing prior fingerprints were fixed/answered by the current policy result.
         for fingerprint, prior in prior_threads.items():
             if fingerprint in current or prior.get("is_resolved"):
                 continue
+            generation = int(prior.get("generation", 1))
+            resolution_marker = (
+                f"<!-- ai-pr-review-resolution:{fingerprint}:g{generation}:"
+                f"{head_sha}:publisher -->"
+            )
             resolution_body = (
                 "**Re-review status:** Fixed or answered in the current review; resolving.\n\n"
-                f"<!-- ai-pr-review-resolution:{fingerprint}:publisher -->"
+                + resolution_marker
             )
-            reply = self._call(
-                "reply_thread", self.client.reply_thread, prior.get("comment_id"), resolution_body
+            owned_bodies = tuple(
+                item for item in prior.get("owned_comment_bodies", ())
+                if isinstance(item, str)
             )
+            reply = None
+            if not any(resolution_marker in body for body in owned_bodies):
+                reply = self._call(
+                    "reply_thread", self.client.reply_thread, prior.get("comment_id"), resolution_body
+                )
+                reconciled_reply = False
+                if not _valid_comment_result(reply):
+                    reply = reconcile_thread_reply(
+                        fingerprint, generation, resolution_marker, prior
+                    )
+                    reconciled_reply = _valid_comment_result(reply)
+                if _valid_comment_result(reply):
+                    self._checkpoint(
+                        state,
+                        "reconcile_reply_resolved_thread"
+                        if reconciled_reply
+                        else "reply_resolved_thread",
+                        reply,
+                    )
             resolved = self._call(
                 "resolve_thread", self.client.resolve_thread, str(prior.get("thread_id") or "")
             )
+            reconciled_resolution = False
+            if not (
+                isinstance(resolved, Mapping)
+                and resolved.get("id") == prior.get("thread_id")
+                and resolved.get("is_resolved") is True
+            ):
+                refreshed = self._call(
+                    "reconcile_resolve_thread",
+                    self.client.query_managed_state,
+                    repo,
+                    pr_number,
+                    retry_safe=True,
+                )
+                if isinstance(refreshed, Mapping):
+                    match = next((
+                        item
+                        for item in refreshed.get("threads", ())
+                        if isinstance(item, Mapping)
+                        and item.get("fingerprint") == fingerprint
+                        and int(item.get("generation", 1)) == generation
+                        and item.get("thread_id") == prior.get("thread_id")
+                        and item.get("is_resolved") is True
+                        and item.get("resolved_by_publisher") is True
+                        and any(
+                            resolution_marker in body
+                            for body in item.get("owned_comment_bodies", ())
+                            if isinstance(body, str)
+                        )
+                    ), None)
+                    if match is not None:
+                        resolved = {
+                            "id": prior.get("thread_id"),
+                            "is_resolved": True,
+                        }
+                        reconciled_resolution = True
+            if not (
+                isinstance(resolved, Mapping)
+                and resolved.get("id") == prior.get("thread_id")
+                and resolved.get("is_resolved") is True
+            ):
+                self._errors.append({
+                    "operation": "resolve_thread",
+                    "error": "resolve mutation did not confirm the managed thread as resolved",
+                })
+                resolved = None
+            else:
+                self._checkpoint(
+                    state,
+                    "reconcile_resolve_thread" if reconciled_resolution else "resolve_thread",
+                    resolved,
+                )
             state["notes"].append({
                 "fingerprint": fingerprint,
+                "generation": generation,
                 "id": prior.get("thread_id"),
                 "url": prior.get("url"),
                 "reply_id": (reply or {}).get("id"),
@@ -561,21 +988,28 @@ class GitHubReviewPublisher:
                 "resolution": "resolved" if resolved is not None else "resolution_failed",
                 "human_resolved": False,
                 "resolved_by_publisher": resolved is not None,
+                "resolution_source": "publisher" if resolved is not None else "publisher_failed",
                 "publication_errors": [],
             })
 
         for fingerprint, prior in prior_general.items():
             if fingerprint in current:
                 continue
-            reply = self._call(
-                "reply_general_comment",
-                self.client.reply_general_comment,
-                repo,
-                pr_number,
-                prior,
-                "**Re-review status:** This request is fixed or answered. "
-                "The original general PR comment is non-resolvable and remains as history.",
-            )
+            reply = None
+            if fingerprint not in answered_general:
+                answer_marker = f"<!-- ai-pr-review-general-answer:{fingerprint}:{head_sha} -->"
+                reply = self._call(
+                    "reply_general_comment",
+                    self.client.reply_general_comment,
+                    repo,
+                    pr_number,
+                    prior,
+                    "**Re-review status:** This request is fixed or answered. "
+                    "The original general PR comment is non-resolvable and remains as history.\n\n"
+                    + answer_marker,
+                )
+                if _valid_comment_result(reply):
+                    self._checkpoint(state, "reply_general_comment", reply)
             state["notes"].append({
                 "fingerprint": fingerprint,
                 "id": prior.get("id"),
@@ -589,29 +1023,153 @@ class GitHubReviewPublisher:
             })
 
         pull_request_id = str(managed.get("pull_request_id") or "")
-        review = self._call(
-            "create_pending_review",
-            self.client.create_pending_review,
-            pull_request_id,
-            head_sha,
-        )
+        review_marker = f"<!-- ai-pr-reviewer-specialist:{head_sha} -->"
+        completed_review = next((
+            item
+            for item in managed.get("reviews", ())
+            if isinstance(item, Mapping)
+            and item.get("state") != "PENDING"
+            and review_marker in str(item.get("body") or "")
+            and _valid_review_result(item)
+        ), None)
+        if completed_review is not None:
+            state["review"] = {
+                "id": completed_review["id"],
+                "url": completed_review["url"],
+                "event": completed_review.get("state"),
+                "safety_reason": "owned specialist review already submitted for this head",
+            }
+            self._checkpoint(state, "resume_submitted_review", completed_review)
+            refreshed = self._call(
+                "refresh_sticky",
+                self.client.update_sticky,
+                repo,
+                pr_number,
+                _handoff_body(handoff, artifact_links, completed_review["url"]),
+            )
+            if _valid_comment_result(refreshed):
+                state["sticky"] = dict(refreshed)
+                self._checkpoint(state, "refresh_sticky", refreshed)
+            elif refreshed is not None:
+                self._errors.append({
+                    "operation": "refresh_sticky",
+                    "error": "sticky refresh did not return a valid id and URL",
+                })
+            state["publication_errors"] = self._errors
+            state["notes"].sort(key=lambda item: str(item.get("fingerprint", "")))
+            self._write_state(state)
+            return state
+        review = next((
+            item
+            for item in managed.get("reviews", ())
+            if isinstance(item, Mapping)
+            and item.get("state") == "PENDING"
+            and review_marker in str(item.get("body") or "")
+        ), None)
+        review_operation = "resume_pending_review" if review is not None else "create_pending_review"
+        if review is None:
+            review = self._call(
+                "create_pending_review",
+                self.client.create_pending_review,
+                pull_request_id,
+                head_sha,
+                review_marker,
+            )
+            if review is not None and not _valid_review_result(review):
+                self._errors.append({
+                    "operation": "create_pending_review",
+                    "error": "pending review response is missing a valid id and URL",
+                })
+                review = None
+        if review is None:
+            reconciled = self._call(
+                "reconcile_pending_review",
+                self.client.query_managed_state,
+                repo,
+                pr_number,
+                retry_safe=True,
+            )
+            if isinstance(reconciled, Mapping):
+                review = next((
+                    item
+                    for item in reconciled.get("reviews", ())
+                    if isinstance(item, Mapping)
+                    and item.get("state") == "PENDING"
+                    and review_marker in str(item.get("body") or "")
+                ), None)
+                if review is not None:
+                    review_operation = "reconcile_create_pending_review"
+        if review is not None and not _valid_review_result(review):
+            self._errors.append({
+                "operation": review_operation,
+                "error": "pending review response is missing a valid id and URL",
+            })
+            review = None
         review_id = str((review or {}).get("id") or "")
         if review_id:
+            self._checkpoint(state, review_operation, review)
             for note in new_thread_notes:
                 variables = build_review_thread_variables(review_id, note)
                 created = self._call(
                     "add_review_thread", self.client.add_review_thread, variables
                 )
+                if created is not None and not _valid_thread_result(created):
+                    self._errors.append({
+                        "operation": "add_review_thread",
+                        "error": "thread response is missing required id, URL, or comment id",
+                    })
+                    created = None
+                if created is None:
+                    reconciled = self._call(
+                        "reconcile_managed_state",
+                        self.client.query_managed_state,
+                        repo,
+                        pr_number,
+                        retry_safe=True,
+                    )
+                    if isinstance(reconciled, Mapping):
+                        match = next((
+                            item
+                            for item in reconciled.get("threads", ())
+                            if isinstance(item, Mapping)
+                            and item.get("fingerprint") == note.fingerprint
+                        ), None)
+                        if match is not None:
+                            created = {
+                                "id": match.get("thread_id"),
+                                "url": match.get("url"),
+                                "comment_id": match.get("comment_id"),
+                            }
+                            if not _valid_thread_result(created):
+                                created = None
                 state["notes"].append({
                     "fingerprint": note.fingerprint,
+                    "generation": note.generation,
                     "id": (created or {}).get("id"),
                     "url": (created or {}).get("url"),
                     "comment_id": (created or {}).get("comment_id"),
                     "anchor_type": note.anchor.subject_type if note.anchor else None,
                     "resolution": "open" if created is not None else "publication_failed",
+                    "resolution_source": resolution_sources.get(
+                        (note.fingerprint, note.generation), "new"
+                    ),
                     "human_resolved": False,
                     "publication_errors": [] if created is not None else ["add_review_thread"],
                 })
+                if created is not None:
+                    operation = (
+                        "reconcile_add_review_thread"
+                        if any(
+                            error.get("operation") == "add_review_thread"
+                            for error in self._errors
+                        )
+                        else "add_review_thread"
+                    )
+                    self._checkpoint(
+                        state,
+                        operation,
+                        {**dict(created), "fingerprint": note.fingerprint},
+                    )
             if mode == "review_comment":
                 event, reason = "COMMENT", "non-verdict specialist review"
             else:
@@ -621,40 +1179,123 @@ class GitHubReviewPublisher:
                 self.client.submit_review,
                 review_id,
                 event,
+                f"<!-- ai-pr-reviewer-specialist:{head_sha} -->\n"
                 "Automated specialist review notes. Detailed findings are in managed threads.",
             )
+            if submitted is not None and not _valid_review_result(submitted):
+                self._errors.append({
+                    "operation": "submit_review",
+                    "error": "submitted review response is missing a valid id and URL",
+                })
+                submitted = None
+            reconciled_submission = False
+            if submitted is None:
+                refreshed = self._call(
+                    "reconcile_submit_review",
+                    self.client.query_managed_state,
+                    repo,
+                    pr_number,
+                    retry_safe=True,
+                )
+                if isinstance(refreshed, Mapping):
+                    submitted = next((
+                        item
+                        for item in refreshed.get("reviews", ())
+                        if isinstance(item, Mapping)
+                        and item.get("state") != "PENDING"
+                        and review_marker in str(item.get("body") or "")
+                        and _valid_review_result(item)
+                    ), None)
+                    reconciled_submission = submitted is not None
             state["review"] = {
                 "id": review_id,
                 "url": (submitted or review or {}).get("url"),
                 "event": event,
                 "safety_reason": reason,
             }
+            if isinstance(submitted, Mapping):
+                self._checkpoint(
+                    state,
+                    "reconcile_submit_review" if reconciled_submission else "submit_review",
+                    submitted,
+                )
+            review_url = (submitted or review or {}).get("url")
+            if isinstance(review_url, str) and _valid_artifact_url(review_url):
+                refreshed = self._call(
+                    "refresh_sticky",
+                    self.client.update_sticky,
+                    repo,
+                    pr_number,
+                    _handoff_body(handoff, artifact_links, review_url),
+                )
+                if _valid_comment_result(refreshed):
+                    state["sticky"] = dict(refreshed)
+                    self._checkpoint(state, "refresh_sticky", refreshed)
+                elif refreshed is not None:
+                    self._errors.append({
+                        "operation": "refresh_sticky",
+                        "error": "sticky refresh did not return a valid id and URL",
+                    })
         state["publication_errors"] = self._errors
         state["notes"].sort(key=lambda item: str(item.get("fingerprint", "")))
         self._write_state(state)
         return state
 
 
-_MANAGED_STATE_QUERY = """
-query ManagedReviewNotes($owner: String!, $name: String!, $number: Int!) {
-  repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) {
-      id
-      reviewThreads(first: 100) {
-        nodes {
-          id isResolved
-          comments(first: 100) { nodes { databaseId url body } }
-        }
-      }
-      comments(first: 100) { nodes { databaseId url body } }
+_MANAGED_IDENTITY_QUERY = """
+query ManagedReviewIdentity($owner: String!, $name: String!, $number: Int!) {
+  viewer { login }
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) { id } }
+}
+""".strip()
+
+_MANAGED_THREADS_QUERY = """
+query ManagedReviewThreads($pullRequestId: ID!, $cursor: String) {
+  node(id: $pullRequestId) { ... on PullRequest {
+    reviewThreads(first: 100, after: $cursor) {
+      nodes { id isResolved }
+      pageInfo { hasNextPage endCursor }
     }
-  }
+  } }
+}
+""".strip()
+
+_MANAGED_THREAD_COMMENTS_QUERY = """
+query ManagedThreadComments($threadId: ID!, $cursor: String) {
+  node(id: $threadId) { ... on PullRequestReviewThread {
+    comments(first: 100, after: $cursor) {
+      nodes { databaseId url body viewerDidAuthor author { login } }
+      pageInfo { hasNextPage endCursor }
+    }
+  } }
+}
+""".strip()
+
+_MANAGED_ISSUE_COMMENTS_QUERY = """
+query ManagedIssueComments($pullRequestId: ID!, $cursor: String) {
+  node(id: $pullRequestId) { ... on PullRequest {
+    comments(first: 100, after: $cursor) {
+      nodes { databaseId url body viewerDidAuthor author { login } }
+      pageInfo { hasNextPage endCursor }
+    }
+  } }
+}
+""".strip()
+
+_MANAGED_REVIEWS_QUERY = """
+query ManagedReviews($pullRequestId: ID!, $cursor: String) {
+  node(id: $pullRequestId) { ... on PullRequest {
+    reviews(first: 100, after: $cursor) {
+      nodes { id url body state viewerDidAuthor author { login } }
+      pageInfo { hasNextPage endCursor }
+    }
+  } }
 }
 """.strip()
 
 _CREATE_REVIEW_MUTATION = """
-mutation CreatePendingReview($pullRequestId: ID!, $commitOID: GitObjectID!) {
-  addPullRequestReview(input: {pullRequestId: $pullRequestId, commitOID: $commitOID}) {
+mutation CreatePendingReview($pullRequestId: ID!, $commitOID: GitObjectID!, $body: String!) {
+  addPullRequestReview(input: {pullRequestId: $pullRequestId, commitOID: $commitOID, body: $body}) {
     pullRequestReview { id url }
   }
 }
@@ -722,7 +1363,14 @@ class GhReviewClient:
                 pass
 
     def _graphql(self, query: str, variables: Mapping[str, Any]) -> dict[str, Any]:
-        return self._input_call(["api", "graphql"], {"query": query, "variables": variables})
+        result = self._input_call(
+            ["api", "graphql"], {"query": query, "variables": variables}
+        )
+        if result.get("errors"):
+            raise RuntimeError("GitHub GraphQL errors: request was not completed")
+        if not isinstance(result.get("data"), dict):
+            raise RuntimeError("GitHub GraphQL response is missing data")
+        return result
 
     @staticmethod
     def _split_repo(repo: str) -> tuple[str, str]:
@@ -731,70 +1379,346 @@ class GhReviewClient:
             raise ValueError("repo must be owner/name")
         return parts[0], parts[1]
 
+    def _api_get(self, endpoint: str) -> Any:
+        completed = subprocess.run(
+            gh_argv(["api", endpoint]),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=self.timeout,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                mask_secrets(completed.stderr.decode("utf-8", errors="replace"))[:500]
+                or "GitHub API query failed"
+            )
+        try:
+            return json.loads(completed.stdout.decode("utf-8", errors="replace"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise RuntimeError("GitHub API query returned invalid JSON") from exc
+
+    def list_changed_files(self, repo: str, pr_number: int) -> tuple[str, ...]:
+        self._split_repo(repo)
+        files: list[str] = []
+        for page in range(1, 101):
+            payload = self._api_get(
+                f"repos/{repo}/pulls/{pr_number}/files?per_page=100&page={page}"
+            )
+            if not isinstance(payload, list) or not all(
+                isinstance(item, Mapping) for item in payload
+            ):
+                raise RuntimeError("changed-files page is not a JSON array of objects")
+            for item in payload:
+                path = _safe_repo_path(item.get("filename"))
+                if path is None:
+                    raise RuntimeError("changed-files response contains an invalid filename")
+                files.append(path)
+            if len(payload) < 100:
+                return tuple(files)
+        raise RuntimeError("changed-files pagination incomplete: page limit exceeded")
+
     def update_sticky(self, repo: str, pr_number: int, body: str) -> Mapping[str, Any]:
         self._split_repo(repo)
-        fd, path = tempfile.mkstemp(prefix="ai-pr-review-handoff-", suffix=".md")
+        existing = self.find_specialist_handoff(repo, pr_number)
+        if existing is None:
+            endpoint = f"repos/{repo}/issues/{pr_number}/comments"
+            method = "POST"
+        else:
+            endpoint = f"repos/{repo}/issues/comments/{existing['id']}"
+            method = "PATCH"
         try:
-            os.chmod(path, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(body)
-                handle.write("\n")
-            helper = self.action_root / "scripts" / "publish_helpers.sh"
-            command = 'source "$1"; platform_comment_sticky "$2" "$3" "$4"'
-            completed = subprocess.run(
-                ["bash", "-c", command, "publish-specialist", str(helper), repo, str(pr_number), path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=self.timeout,
+            return self._api_write(endpoint, method, {"body": body})
+        except Exception:
+            reconciled = self.find_specialist_handoff(
+                repo, pr_number, expected_body=body
             )
-            if completed.returncode != 0:
-                raise RuntimeError(mask_secrets(completed.stderr.decode(errors="replace"))[:500])
-            return {}
-        finally:
-            try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
+            if reconciled is not None:
+                return reconciled
+            raise
+
+    def _api_write(
+        self, endpoint: str, method: str, payload: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        result = self._input_call(["api", endpoint, "--method", method], payload)
+        comment_id = result.get("id")
+        url = result.get("html_url")
+        if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id <= 0:
+            raise RuntimeError("GitHub comment response is missing a valid id")
+        if not isinstance(url, str) or not _valid_artifact_url(url):
+            raise RuntimeError("GitHub comment response is missing a valid URL")
+        return {"id": comment_id, "url": url}
+
+    def find_specialist_handoff(
+        self, repo: str, pr_number: int, expected_body: str | None = None
+    ) -> Mapping[str, Any] | None:
+        matches = []
+        for node, viewer_login in self._owned_issue_comment_nodes(repo, pr_number):
+            body = node.get("body")
+            if (
+                isinstance(body, str)
+                and body.startswith("<!-- ai-pr-review-specialist-handoff -->")
+                and (expected_body is None or body == expected_body)
+                and node.get("viewerDidAuthor") is True
+                and isinstance(node.get("author"), Mapping)
+                and node["author"].get("login") == viewer_login
+            ):
+                comment = self._validated_issue_comment(node, label="sticky comment")
+                matches.append(comment)
+        return max(matches, key=lambda item: item["id"]) if matches else None
+
+    @staticmethod
+    def _validated_issue_comment(
+        node: Mapping[str, Any], *, label: str
+    ) -> Mapping[str, Any]:
+        comment_id, url = node.get("databaseId"), node.get("url")
+        if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id <= 0:
+            raise RuntimeError(f"{label} id is invalid")
+        if not isinstance(url, str) or not _valid_artifact_url(url):
+            raise RuntimeError(f"{label} URL is invalid")
+        return {"id": comment_id, "url": url}
+
+    def _owned_issue_comment_nodes(
+        self, repo: str, pr_number: int
+    ) -> tuple[tuple[Mapping[str, Any], str], ...]:
+        owner, name = self._split_repo(repo)
+        identity = self._graphql(
+            _MANAGED_IDENTITY_QUERY,
+            {"owner": owner, "name": name, "number": pr_number},
+        )["data"]
+        viewer = identity.get("viewer")
+        repository = identity.get("repository")
+        pr = repository.get("pullRequest") if isinstance(repository, Mapping) else None
+        viewer_login = viewer.get("login") if isinstance(viewer, Mapping) else None
+        pull_request_id = pr.get("id") if isinstance(pr, Mapping) else None
+        if not isinstance(viewer_login, str) or not viewer_login:
+            raise RuntimeError("sticky viewer identity is missing")
+        if not isinstance(pull_request_id, str) or not pull_request_id:
+            raise RuntimeError("sticky pull request id is missing")
+        nodes = self._paged_nodes(
+            _MANAGED_ISSUE_COMMENTS_QUERY,
+            {"pullRequestId": pull_request_id},
+            connection_name="comments",
+            label="sticky comments",
+        )
+        return tuple((node, viewer_login) for node in nodes)
+
+    def _find_owned_issue_comment_exact(
+        self, repo: str, pr_number: int, expected_body: str
+    ) -> Mapping[str, Any] | None:
+        matches = []
+        for node, viewer_login in self._owned_issue_comment_nodes(repo, pr_number):
+            author = node.get("author")
+            if (
+                node.get("body") == expected_body
+                and node.get("viewerDidAuthor") is True
+                and isinstance(author, Mapping)
+                and author.get("login") == viewer_login
+            ):
+                matches.append(
+                    self._validated_issue_comment(node, label="managed issue comment")
+                )
+        return max(matches, key=lambda item: item["id"]) if matches else None
+
+    @staticmethod
+    def _connection(value: object, *, label: str) -> tuple[list[Mapping[str, Any]], bool, str | None]:
+        if not isinstance(value, Mapping):
+            raise RuntimeError(f"{label} connection is missing")
+        nodes = value.get("nodes")
+        page_info = value.get("pageInfo")
+        if not isinstance(nodes, list) or not all(isinstance(item, Mapping) for item in nodes):
+            raise RuntimeError(f"{label} nodes are invalid")
+        if not isinstance(page_info, Mapping) or not isinstance(page_info.get("hasNextPage"), bool):
+            raise RuntimeError(f"{label} pageInfo is invalid")
+        cursor = page_info.get("endCursor")
+        if cursor is not None and not isinstance(cursor, str):
+            raise RuntimeError(f"{label} cursor is invalid")
+        if page_info["hasNextPage"] and not cursor:
+            raise RuntimeError(f"{label} incomplete pagination: missing cursor")
+        return nodes, page_info["hasNextPage"], cursor
+
+    def _paged_nodes(
+        self,
+        query: str,
+        variables: Mapping[str, Any],
+        *,
+        connection_name: str,
+        label: str,
+    ) -> list[Mapping[str, Any]]:
+        cursor: str | None = None
+        seen: set[str] = set()
+        result_nodes: list[Mapping[str, Any]] = []
+        for _page in range(100):
+            response = self._graphql(query, {**variables, "cursor": cursor})
+            node = response["data"].get("node")
+            if not isinstance(node, Mapping):
+                raise RuntimeError(f"{label} parent node is missing")
+            nodes, has_next, next_cursor = self._connection(
+                node.get(connection_name), label=label
+            )
+            result_nodes.extend(nodes)
+            if not has_next:
+                return result_nodes
+            if next_cursor in seen:
+                raise RuntimeError(f"{label} incomplete pagination: repeated cursor")
+            seen.add(str(next_cursor))
+            cursor = next_cursor
+        raise RuntimeError(f"{label} incomplete pagination: page limit exceeded")
 
     def query_managed_state(self, repo: str, pr_number: int) -> Mapping[str, Any]:
         owner, name = self._split_repo(repo)
         self._repo_context = (repo, pr_number)
-        result = self._graphql(
-            _MANAGED_STATE_QUERY, {"owner": owner, "name": name, "number": pr_number}
+        identity = self._graphql(
+            _MANAGED_IDENTITY_QUERY,
+            {"owner": owner, "name": name, "number": pr_number},
+        )["data"]
+        viewer = identity.get("viewer")
+        repository = identity.get("repository")
+        pr = repository.get("pullRequest") if isinstance(repository, Mapping) else None
+        viewer_login = viewer.get("login") if isinstance(viewer, Mapping) else None
+        pull_request_id = pr.get("id") if isinstance(pr, Mapping) else None
+        if not isinstance(viewer_login, str) or not viewer_login:
+            raise RuntimeError("managed-state viewer identity is missing")
+        if not isinstance(pull_request_id, str) or not pull_request_id:
+            raise RuntimeError("managed-state pull request id is missing")
+
+        thread_nodes = self._paged_nodes(
+            _MANAGED_THREADS_QUERY,
+            {"pullRequestId": pull_request_id},
+            connection_name="reviewThreads",
+            label="review threads",
         )
-        pr = (((result.get("data") or {}).get("repository") or {}).get("pullRequest") or {})
         threads = []
-        for node in ((pr.get("reviewThreads") or {}).get("nodes") or []):
-            comments = ((node or {}).get("comments") or {}).get("nodes") or []
-            first = comments[0] if comments else {}
-            bodies = [str(item.get("body") or "") for item in comments if isinstance(item, Mapping)]
-            marker = next((_NOTE_MARKER_RE.search(body) for body in bodies if _NOTE_MARKER_RE.search(body)), None)
-            if marker is None:
+        for node in thread_nodes:
+            thread_id = node.get("id")
+            is_resolved = node.get("isResolved")
+            if not isinstance(thread_id, str) or not thread_id or not isinstance(is_resolved, bool):
+                raise RuntimeError("review thread state is invalid")
+            comments = self._paged_nodes(
+                _MANAGED_THREAD_COMMENTS_QUERY,
+                {"threadId": thread_id},
+                connection_name="comments",
+                label=f"review thread {thread_id} comments",
+            )
+            if not comments:
+                raise RuntimeError("review thread has no starter comment")
+            first = comments[0]
+            body = first.get("body")
+            if not isinstance(body, str):
+                raise RuntimeError("review thread starter body is invalid")
+            generation_marker = _NOTE_GENERATION_MARKER_RE.search(body)
+            legacy_marker = _NOTE_MARKER_RE.search(body)
+            marker = generation_marker or legacy_marker
+            if marker is None or first.get("viewerDidAuthor") is not True:
                 continue
+            author = first.get("author")
+            if not isinstance(author, Mapping) or author.get("login") != viewer_login:
+                continue
+            comment_id = first.get("databaseId")
+            url = first.get("url")
+            if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id <= 0:
+                raise RuntimeError("managed review starter id is invalid")
+            if not isinstance(url, str) or not _valid_artifact_url(url):
+                raise RuntimeError("managed review starter URL is invalid")
             fingerprint = marker.group(1)
+            generation = int(generation_marker.group(2)) if generation_marker else 1
+            owned_comments = []
+            for item in comments:
+                author = item.get("author")
+                if not (
+                    isinstance(item.get("body"), str)
+                    and item.get("viewerDidAuthor") is True
+                    and isinstance(author, Mapping)
+                    and author.get("login") == viewer_login
+                ):
+                    continue
+                owned_comments.append({
+                    **self._validated_issue_comment(item, label="managed review comment"),
+                    "body": item["body"],
+                })
+            bodies = [item["body"] for item in owned_comments]
             threads.append({
                 "fingerprint": fingerprint,
-                "thread_id": node.get("id"),
-                "comment_id": first.get("databaseId"),
-                "url": first.get("url"),
-                "is_resolved": bool(node.get("isResolved")),
+                "generation": generation,
+                "thread_id": thread_id,
+                "comment_id": comment_id,
+                "url": url,
+                "is_resolved": is_resolved,
                 "resolved_by_publisher": any(
                     match and match.group(1) == fingerprint
-                    for match in (_PUBLISHER_RESOLUTION_RE.search(body) for body in bodies)
+                    for match in (_PUBLISHER_RESOLUTION_RE.search(item) for item in bodies)
                 ),
+                "owned_comments": tuple(owned_comments),
+                "owned_comment_bodies": tuple(bodies),
             })
+
+        comment_nodes = self._paged_nodes(
+            _MANAGED_ISSUE_COMMENTS_QUERY,
+            {"pullRequestId": pull_request_id},
+            connection_name="comments",
+            label="pull request comments",
+        )
         general = []
-        for node in ((pr.get("comments") or {}).get("nodes") or []):
-            if not isinstance(node, Mapping):
+        general_answered: set[str] = set()
+        for node in comment_nodes:
+            body = node.get("body")
+            answer = _GENERAL_ANSWER_MARKER_RE.search(body) if isinstance(body, str) else None
+            author = node.get("author")
+            owned = (
+                node.get("viewerDidAuthor") is True
+                and isinstance(author, Mapping)
+                and author.get("login") == viewer_login
+            )
+            if answer is not None and owned:
+                general_answered.add(answer.group(1))
+            marker = _GENERAL_MARKER_RE.search(body) if isinstance(body, str) else None
+            if (
+                marker is None
+                or not owned
+            ):
                 continue
-            marker = _GENERAL_MARKER_RE.search(str(node.get("body") or ""))
-            if marker:
-                general.append({
-                    "fingerprint": marker.group(1),
-                    "id": node.get("databaseId"),
-                    "url": node.get("url"),
-                })
-        return {"pull_request_id": pr.get("id"), "threads": threads, "general_comments": general}
+            comment_id = node.get("databaseId")
+            url = node.get("url")
+            if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id <= 0:
+                raise RuntimeError("managed general comment id is invalid")
+            if not isinstance(url, str) or not _valid_artifact_url(url):
+                raise RuntimeError("managed general comment URL is invalid")
+            general.append({
+                "fingerprint": marker.group(1),
+                "id": comment_id,
+                "url": url,
+                "body": body,
+            })
+
+        reviews = self._paged_nodes(
+            _MANAGED_REVIEWS_QUERY,
+            {"pullRequestId": pull_request_id},
+            connection_name="reviews",
+            label="pull request reviews",
+        )
+        owned_reviews = []
+        for node in reviews:
+            if node.get("viewerDidAuthor") is not True:
+                continue
+            author = node.get("author")
+            if not isinstance(author, Mapping) or author.get("login") != viewer_login:
+                continue
+            review_id, url, body, state = (
+                node.get("id"), node.get("url"), node.get("body"), node.get("state")
+            )
+            if not all(isinstance(value, str) and value for value in (review_id, url, body, state)):
+                raise RuntimeError("managed review object is invalid")
+            owned_reviews.append(dict(node))
+
+        changed_files = tuple(self.list_changed_files(repo, pr_number))
+        return {
+            "pull_request_id": pull_request_id,
+            "viewer_login": viewer_login,
+            "threads": threads,
+            "general_comments": general,
+            "general_answered_fingerprints": tuple(sorted(general_answered)),
+            "reviews": owned_reviews,
+            "changed_files": changed_files,
+            "changed_files_complete": True,
+        }
 
     def reply_thread(self, comment_id: object, body: str) -> Mapping[str, Any]:
         if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id <= 0:
@@ -802,36 +1726,54 @@ class GhReviewClient:
         if self._repo_context is None:
             raise RuntimeError("query_managed_state must precede thread replies")
         repo, pr_number = self._repo_context
-        result = self._input_call(
-            ["api", f"repos/{repo}/pulls/{pr_number}/comments", "--method", "POST"],
+        return self._api_write(
+            f"repos/{repo}/pulls/{pr_number}/comments",
+            "POST",
             {"body": body, "in_reply_to": comment_id},
         )
-        return {"id": result.get("id"), "url": result.get("html_url")}
 
     def resolve_thread(self, thread_id: str) -> Mapping[str, Any]:
         result = self._graphql(_RESOLVE_THREAD_MUTATION, {"threadId": thread_id})
-        return (((result.get("data") or {}).get("resolveReviewThread") or {}).get("thread") or {})
+        thread = (((result.get("data") or {}).get("resolveReviewThread") or {}).get("thread") or {})
+        if thread.get("id") != thread_id or thread.get("isResolved") is not True:
+            raise RuntimeError("resolve mutation did not confirm the requested thread")
+        return {"id": thread_id, "is_resolved": True}
 
-    def create_pending_review(self, pull_request_id: str, head_sha: str) -> Mapping[str, Any]:
+    def create_pending_review(
+        self, pull_request_id: str, head_sha: str, body: str
+    ) -> Mapping[str, Any]:
         result = self._graphql(
             _CREATE_REVIEW_MUTATION,
-            {"pullRequestId": pull_request_id, "commitOID": head_sha},
+            {"pullRequestId": pull_request_id, "commitOID": head_sha, "body": body},
         )
-        return (((result.get("data") or {}).get("addPullRequestReview") or {}).get("pullRequestReview") or {})
+        review = (((result.get("data") or {}).get("addPullRequestReview") or {}).get("pullRequestReview") or {})
+        if not _valid_review_result(review):
+            raise RuntimeError("pending review response is missing a valid id and URL")
+        return review
 
     def add_review_thread(self, variables: Mapping[str, Any]) -> Mapping[str, Any]:
         result = self._graphql(_ADD_THREAD_MUTATION, variables)
         thread = (((result.get("data") or {}).get("addPullRequestReviewThread") or {}).get("thread") or {})
         comments = ((thread.get("comments") or {}).get("nodes") or [])
         first = comments[0] if comments else {}
-        return {"id": thread.get("id"), "url": first.get("url"), "comment_id": first.get("databaseId")}
+        created = {
+            "id": thread.get("id"),
+            "url": first.get("url"),
+            "comment_id": first.get("databaseId"),
+        }
+        if not _valid_thread_result(created):
+            raise RuntimeError("review thread response is missing a valid id, URL, or comment id")
+        return created
 
     def submit_review(self, review_id: str, event: str, body: str) -> Mapping[str, Any]:
         result = self._graphql(
             _SUBMIT_REVIEW_MUTATION,
             {"pullRequestReviewId": review_id, "event": event, "body": body},
         )
-        return (((result.get("data") or {}).get("submitPullRequestReview") or {}).get("pullRequestReview") or {})
+        review = (((result.get("data") or {}).get("submitPullRequestReview") or {}).get("pullRequestReview") or {})
+        if not _valid_review_result(review):
+            raise RuntimeError("submitted review response is missing a valid id and URL")
+        return review
 
     def upsert_general_comment(
         self, repo: str, pr_number: int, prior: Mapping[str, Any] | None, body: str
@@ -843,8 +1785,13 @@ class GhReviewClient:
         else:
             endpoint = f"repos/{repo}/issues/{pr_number}/comments"
             method = "POST"
-        result = self._input_call(["api", endpoint, "--method", method], {"body": body})
-        return {"id": result.get("id"), "url": result.get("html_url")}
+        try:
+            return self._api_write(endpoint, method, {"body": body})
+        except Exception:
+            reconciled = self._find_owned_issue_comment_exact(repo, pr_number, body)
+            if reconciled is not None:
+                return reconciled
+            raise
 
     def reply_general_comment(
         self, repo: str, pr_number: int, prior: Mapping[str, Any], body: str
