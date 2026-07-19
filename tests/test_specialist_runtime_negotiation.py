@@ -5,7 +5,12 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from pr_reviewer.specialist_runtime.assignments import Assignment
-from pr_reviewer.specialist_runtime.coverage import CoverageLedger, reconcile_wave
+from pr_reviewer.specialist_runtime.coverage import (
+    CoverageLedger,
+    SessionOwnership,
+    evidence_satisfies_obligation,
+    reconcile_wave,
+)
 from pr_reviewer.specialist_runtime.evidence import EvidenceStore
 from pr_reviewer.specialist_runtime.negotiation import (
     NegotiationError,
@@ -19,6 +24,7 @@ from pr_reviewer.specialist_runtime.types import (
     ObligationStatus,
     SessionCheckpoint,
     SessionState,
+    SpecialistAssignment,
 )
 
 
@@ -73,8 +79,11 @@ def state_for(
     followup_sessions_started: int = 0,
     max_followup_sessions: int = 1,
     new_session_turns_remaining: int = 4,
+    new_session_turn_cap: int = 2,
     new_session_lease_remaining_sec: float = 100.0,
     remaining_deadline_sec: float = 100.0,
+    assignments: tuple[Assignment | SpecialistAssignment, ...] | None = None,
+    session_ownership: tuple[SessionOwnership, ...] | None = None,
 ) -> NegotiationState:
     obligations = (
         obligation("OB1", risk="high"),
@@ -86,8 +95,14 @@ def state_for(
     return NegotiationState(
         obligations=obligations,
         coverage=ledger.snapshot(),
-        assignments=(assignment("S1", ("OB1",)), assignment("S2", ("OB2",))),
+        assignments=assignments or (
+            assignment("A1", ("OB1",)), assignment("A2", ("OB2",)),
+        ),
         checkpoints=(),
+        session_ownership=session_ownership or (
+            SessionOwnership("S1", "A1", primary_obligation_ids=("OB1",)),
+            SessionOwnership("S2", "A2", primary_obligation_ids=("OB2",)),
+        ),
         session_resources=resources or (
             SessionResources("S1", remaining_model_turns=3, lease_remaining_sec=100.0),
             SessionResources("S2", remaining_model_turns=3, lease_remaining_sec=100.0),
@@ -99,6 +114,7 @@ def state_for(
         followup_sessions_started=followup_sessions_started,
         max_followup_sessions=max_followup_sessions,
         new_session_turns_remaining=new_session_turns_remaining,
+        new_session_turn_cap=new_session_turn_cap,
         new_session_lease_remaining_sec=new_session_lease_remaining_sec,
     )
 
@@ -142,6 +158,11 @@ def test_reconcile_wave_uses_evidence_predicates_not_declared_coverage():
         checkpoints=(checkpoint,),
         evidence=store.snapshot(),
         assignments=(assignment("S1", ("OB1", "OB2")),),
+        session_ownership=(SessionOwnership(
+            session_id="S1",
+            assignment_id="S1",
+            primary_obligation_ids=("OB1", "OB2"),
+        ),),
     )
 
     assert result.snapshot.obligation_statuses == (
@@ -150,6 +171,137 @@ def test_reconcile_wave_uses_evidence_predicates_not_declared_coverage():
     )
     assert result.newly_covered_obligation_ids == ("OB1",)
     assert result.uncovered_obligation_ids == ("OB2",)
+
+
+def test_shared_path_with_wrong_evidence_category_does_not_satisfy_obligation():
+    required = obligation("OB1", category="tests", path="shared.py")
+    store = EvidenceStore()
+    implementation = store.add_tool_result(
+        session_id="session-1",
+        tool="read_file",
+        arguments={"path": "shared.py"},
+        result={"status": "ok", "content": "implementation"},
+        category="implementation",
+    )
+
+    assert evidence_satisfies_obligation(implementation, required) is False
+
+
+def test_reconciliation_maps_durable_session_to_specialist_assignment_ownership():
+    required = obligation("OB1")
+    ledger = CoverageLedger((required,))
+    specialist_assignment = SpecialistAssignment(
+        assignment_id="assignment-A",
+        objective="Inspect tests",
+        primary_obligation_ids=("OB1",),
+    )
+    ownership = SessionOwnership(
+        session_id="durable-session-9",
+        assignment_id=specialist_assignment.assignment_id,
+        primary_obligation_ids=specialist_assignment.primary_obligation_ids,
+        independent_obligation_ids=specialist_assignment.independent_obligation_ids,
+    )
+    store = EvidenceStore()
+    evidence = store.add_tool_result(
+        session_id="durable-session-9",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "assert behavior"},
+        category="tests",
+    )
+
+    result = reconcile_wave(
+        ledger,
+        checkpoints=(SessionCheckpoint(
+            session_id="durable-session-9",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(evidence.id,),
+        ),),
+        evidence=store.snapshot(),
+        assignments=(specialist_assignment,),
+        session_ownership=(ownership,),
+    )
+
+    assert result.snapshot.obligation_statuses == (("OB1", ObligationStatus.COVERED),)
+
+
+def test_independent_owner_cannot_satisfy_obligation_with_imported_evidence():
+    required = replace(obligation("OB1"), requires_independent_verification=True)
+    ledger = CoverageLedger((required,))
+    specialist_assignment = SpecialistAssignment(
+        assignment_id="independent-assignment",
+        objective="Independently inspect tests",
+        independent_obligation_ids=("OB1",),
+    )
+    ownership = SessionOwnership(
+        session_id="independent-session",
+        assignment_id=specialist_assignment.assignment_id,
+        independent_obligation_ids=("OB1",),
+    )
+    store = EvidenceStore()
+    imported = store.add_tool_result(
+        session_id="primary-session",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "primary collection"},
+        category="tests",
+    )
+    store.import_into_session("independent-session", imported.id)
+    # SpecialistSession may optimistically attach checkpoint evidence before the
+    # controller's post-wave reconciliation. The controller must remove it.
+    ledger.attach_evidence("OB1", imported.id)
+
+    result = reconcile_wave(
+        ledger,
+        checkpoints=(SessionCheckpoint(
+            session_id="independent-session",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(imported.id,),
+            imported_evidence_ids=(imported.id,),
+        ),),
+        evidence=store.snapshot(),
+        assignments=(specialist_assignment,),
+        session_ownership=(ownership,),
+    )
+
+    assert result.snapshot.obligation_statuses == (("OB1", ObligationStatus.PENDING),)
+
+
+def test_independent_owner_fresh_collection_satisfies_independent_obligation():
+    required = replace(obligation("OB1"), requires_independent_verification=True)
+    ledger = CoverageLedger((required,))
+    specialist_assignment = SpecialistAssignment(
+        assignment_id="independent-assignment",
+        objective="Independently inspect tests",
+        independent_obligation_ids=("OB1",),
+    )
+    ownership = SessionOwnership(
+        session_id="independent-session",
+        assignment_id=specialist_assignment.assignment_id,
+        independent_obligation_ids=("OB1",),
+    )
+    store = EvidenceStore()
+    fresh = store.add_tool_result(
+        session_id="independent-session",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "independent collection"},
+        category="tests",
+    )
+
+    result = reconcile_wave(
+        ledger,
+        checkpoints=(SessionCheckpoint(
+            session_id="independent-session",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(fresh.id,),
+        ),),
+        evidence=store.snapshot(),
+        assignments=(specialist_assignment,),
+        session_ownership=(ownership,),
+    )
+
+    assert result.snapshot.obligation_statuses == (("OB1", ObligationStatus.COVERED),)
 
 
 @pytest.mark.parametrize(
@@ -250,6 +402,117 @@ def test_consult_and_policy_governed_unknown_are_the_other_exact_actions():
     assert unknown.kind == "record_unknown"
     assert unknown.expected_coverage_gain == 1
     assert unknown.resolution_policy == "record_unknown"
+
+
+def test_negotiation_uses_explicit_session_to_specialist_assignment_ownership():
+    specialist_assignment = SpecialistAssignment(
+        assignment_id="assignment-A",
+        objective="Inspect tests",
+        primary_obligation_ids=("OB1",),
+    )
+    state = state_for(
+        current_session_count=1,
+        assignments=(specialist_assignment,),
+        session_ownership=(SessionOwnership(
+            session_id="durable-session-9",
+            assignment_id="assignment-A",
+            primary_obligation_ids=("OB1",),
+        ),),
+        resources=(SessionResources(
+            "durable-session-9", remaining_model_turns=3, lease_remaining_sec=100.0,
+        ),),
+    )
+
+    proposal = validate_negotiation(resume_raw(session_id="durable-session-9"), state)
+
+    assert proposal.actions[0].session_id == "durable-session-9"
+
+
+def test_multiple_actions_cannot_target_same_durable_session_even_when_disjoint():
+    shared_assignment = assignment("A1", ("OB1", "OB2"))
+    state = state_for(
+        current_session_count=1,
+        assignments=(shared_assignment,),
+        session_ownership=(SessionOwnership(
+            session_id="S1",
+            assignment_id="A1",
+            primary_obligation_ids=("OB1", "OB2"),
+        ),),
+        resources=(SessionResources(
+            "S1", remaining_model_turns=4, lease_remaining_sec=100.0,
+        ),),
+    )
+    raw = {"actions": [
+        resume_raw()["actions"][0],
+        resume_raw(
+            obligation_ids=["OB2"], expected_evidence=["implementation"], estimated_turns=1,
+        )["actions"][0],
+    ]}
+
+    with pytest.raises(NegotiationError, match="same durable session"):
+        validate_negotiation(raw, state)
+
+
+def test_new_session_is_bounded_by_controller_owned_per_session_turn_cap():
+    raw = {"actions": [{
+        "kind": "new_session",
+        "obligation_ids": ["OB1"],
+        "expected_evidence": ["tests"],
+        "estimated_turns": 3,
+        "reason": "Collect missing tests evidence.",
+    }]}
+
+    with pytest.raises(NegotiationError, match="per-session turn cap"):
+        validate_negotiation(raw, state_for(new_session_turn_cap=2))
+    raw["actions"][0]["new_session_turn_cap"] = 99
+    with pytest.raises(NegotiationError, match="unsupported fields"):
+        validate_negotiation(raw, state_for(new_session_turn_cap=2))
+
+
+def test_controller_sorting_makes_equivalent_action_orders_identical():
+    resume = resume_raw()["actions"][0]
+    unknown = {
+        "kind": "record_unknown",
+        "obligation_ids": ["OB2"],
+        "expected_evidence": ["implementation"],
+        "estimated_turns": 0,
+        "reason": "The external source is unavailable.",
+    }
+
+    forward = validate_negotiation({"actions": [resume, unknown]}, state_for())
+    reverse = validate_negotiation({"actions": [unknown, resume]}, state_for())
+
+    assert forward == reverse
+    assert tuple(item.obligation_ids for item in forward.actions) == (("OB2",), ("OB1",))
+
+
+@pytest.mark.parametrize("kind", ["new_session", "record_unknown"])
+def test_non_session_actions_reject_session_id_even_when_null(kind):
+    raw = {
+        "kind": kind,
+        "session_id": None,
+        "obligation_ids": ["OB1"],
+        "expected_evidence": ["tests"],
+        "estimated_turns": 0 if kind == "record_unknown" else 1,
+        "reason": "Bounded action.",
+    }
+
+    with pytest.raises(NegotiationError, match="must omit session_id"):
+        validate_negotiation({"actions": [raw]}, state_for())
+
+
+@pytest.mark.parametrize("kind", ["resume", "consult"])
+def test_session_actions_require_session_id_field(kind):
+    raw = {
+        "kind": kind,
+        "obligation_ids": ["OB1"],
+        "expected_evidence": ["tests"],
+        "estimated_turns": 1,
+        "reason": "Bounded action.",
+    }
+
+    with pytest.raises(NegotiationError, match="requires session_id field"):
+        validate_negotiation({"actions": [raw]}, state_for())
 
 
 def test_fallback_resumes_useful_primary_owner_for_highest_risk_gap():

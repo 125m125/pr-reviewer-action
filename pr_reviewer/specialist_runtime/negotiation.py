@@ -8,16 +8,41 @@ from math import isfinite
 from typing import Any
 
 from .assignments import Assignment
-from .coverage import CoverageSnapshot
-from .types import CoverageObligation, ObligationStatus, SessionCheckpoint
+from .coverage import CoverageSnapshot, SessionOwnership
+from .types import (
+    CoverageObligation,
+    ObligationStatus,
+    SessionCheckpoint,
+    SpecialistAssignment,
+)
 
 
 _ACTION_KINDS = frozenset({"resume", "consult", "new_session", "record_unknown"})
+_ACTION_RANK = {"resume": 0, "consult": 1, "new_session": 2, "record_unknown": 3}
 _ACTION_FIELDS = frozenset({
     "kind", "session_id", "obligation_ids", "expected_evidence",
     "estimated_turns", "reason",
 })
 _RISK_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+
+
+def _assignment_id(assignment: Assignment | SpecialistAssignment) -> str:
+    return str(
+        assignment.id if isinstance(assignment, Assignment)
+        else assignment.assignment_id
+    ).strip()
+
+
+def _assignment_ownership(
+    assignment: Assignment | SpecialistAssignment,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    return (
+        tuple(sorted(assignment.primary_obligation_ids)),
+        tuple(sorted(
+            assignment.independent_obligation_ids
+            if isinstance(assignment, SpecialistAssignment) else ()
+        )),
+    )
 
 
 class NegotiationError(ValueError):
@@ -55,8 +80,9 @@ class NegotiationState:
 
     obligations: tuple[CoverageObligation, ...]
     coverage: CoverageSnapshot
-    assignments: tuple[Assignment, ...]
+    assignments: tuple[Assignment | SpecialistAssignment, ...]
     checkpoints: tuple[SessionCheckpoint, ...]
+    session_ownership: tuple[SessionOwnership, ...]
     session_resources: tuple[SessionResources, ...]
     remaining_deadline_sec: float
     seconds_per_turn: float
@@ -65,17 +91,21 @@ class NegotiationState:
     followup_sessions_started: int
     max_followup_sessions: int
     new_session_turns_remaining: int
+    new_session_turn_cap: int
     new_session_lease_remaining_sec: float
 
     def __post_init__(self) -> None:
         obligation_ids = [item.id for item in self.obligations]
-        assignment_ids = [item.id for item in self.assignments]
+        assignment_ids = [_assignment_id(item) for item in self.assignments]
+        ownership_session_ids = [item.session_id for item in self.session_ownership]
         resource_ids = [item.session_id for item in self.session_resources]
         checkpoint_ids = [item.session_id for item in self.checkpoints]
         if len(set(obligation_ids)) != len(obligation_ids):
             raise ValueError("obligation ids must be unique")
         if len(set(assignment_ids)) != len(assignment_ids):
             raise ValueError("assignment ids must be unique")
+        if len(set(ownership_session_ids)) != len(ownership_session_ids):
+            raise ValueError("session ownership ids must be unique")
         if len(set(resource_ids)) != len(resource_ids):
             raise ValueError("session resource ids must be unique")
         if len(set(checkpoint_ids)) != len(checkpoint_ids):
@@ -86,17 +116,32 @@ class NegotiationState:
         unknown_coverage = sorted(set(coverage_ids) - set(obligation_ids))
         if unknown_coverage:
             raise ValueError("coverage contains unknown obligations: " + ", ".join(unknown_coverage))
-        if set(resource_ids) - set(assignment_ids):
-            raise ValueError("session resources must belong to existing assignments")
+        assignment_by_id = {
+            _assignment_id(item): item for item in self.assignments
+        }
+        for ownership in self.session_ownership:
+            assignment = assignment_by_id.get(ownership.assignment_id)
+            if assignment is None:
+                raise ValueError("session ownership must reference an existing assignment")
+            expected_primary, expected_independent = _assignment_ownership(assignment)
+            if tuple(sorted(ownership.primary_obligation_ids)) != expected_primary:
+                raise ValueError("session primary ownership differs from its assignment")
+            if tuple(sorted(ownership.independent_obligation_ids)) != expected_independent:
+                raise ValueError("session independent ownership differs from its assignment")
+        if set(resource_ids) - set(ownership_session_ids):
+            raise ValueError("session resources must belong to durable session ownership")
+        if set(checkpoint_ids) - set(ownership_session_ids):
+            raise ValueError("checkpoints must belong to durable session ownership")
         numeric_counts = (
             self.current_session_count, self.max_sessions,
             self.followup_sessions_started, self.max_followup_sessions,
             self.new_session_turns_remaining,
+            self.new_session_turn_cap,
         )
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in numeric_counts):
             raise ValueError("session counts and remaining turns must be non-negative integers")
-        if self.current_session_count < len(self.assignments):
-            raise ValueError("current_session_count cannot be smaller than the assignment count")
+        if self.current_session_count < len(self.session_ownership):
+            raise ValueError("current_session_count cannot be smaller than durable sessions")
         if self.current_session_count > self.max_sessions:
             raise ValueError("current_session_count cannot exceed max_sessions")
         if self.followup_sessions_started > self.max_followup_sessions:
@@ -232,21 +277,26 @@ def _parse_action(
 
     raw_session_id = raw.get("session_id")
     if kind in {"resume", "consult"}:
-        if not isinstance(raw_session_id, str) or not raw_session_id.strip():
-            errors.append(f"{label} {kind} requires a session_id")
+        if "session_id" not in raw:
+            errors.append(f"{label} {kind} requires session_id field")
+            session_id = None
+        elif not isinstance(raw_session_id, str) or not raw_session_id.strip():
+            errors.append(f"{label} {kind} session_id must be a non-empty string")
             session_id = None
         else:
             session_id = raw_session_id.strip()
     else:
         session_id = None
-        if raw_session_id is not None:
-            errors.append(f"{label} {kind} cannot select an existing session")
+        if "session_id" in raw:
+            errors.append(f"{label} {kind} must omit session_id")
 
-    assignment_by_id = {item.id: item for item in state.assignments}
+    ownership_by_session = {
+        item.session_id: item for item in state.session_ownership
+    }
     if session_id is not None:
-        owner = assignment_by_id.get(session_id)
+        owner = ownership_by_session.get(session_id)
         if owner is None:
-            errors.append(f"{label} session does not own an active assignment")
+            errors.append(f"{label} session has no controller-owned assignment projection")
         elif kind == "resume" and not set(obligation_ids).issubset(owner.primary_obligation_ids):
             errors.append(f"{label} resume session is not the primary owner of all obligations")
         elif kind == "consult" and not set(obligation_ids).issubset(owner.obligation_ids):
@@ -312,7 +362,28 @@ def _validate_feasibility(
         for item in new_session_actions
     ):
         errors.append("new session exceeds its available lease")
+    if any(item.estimated_turns > state.new_session_turn_cap for item in new_session_actions):
+        errors.append("new session exceeds the controller-owned per-session turn cap")
     return errors
+
+
+def _action_order(
+    action: NegotiationAction,
+    obligation_by_id: Mapping[str, CoverageObligation],
+) -> tuple[int, tuple[str, ...], int, str]:
+    risk_rank = min(
+        (
+            _RISK_RANK.get(obligation_by_id[obligation_id].risk_tier, _RISK_RANK["normal"])
+            for obligation_id in action.obligation_ids
+        ),
+        default=_RISK_RANK["normal"],
+    )
+    return (
+        risk_rank,
+        action.obligation_ids,
+        _ACTION_RANK[action.kind],
+        action.session_id or "",
+    )
 
 
 def validate_negotiation(raw: Mapping[str, Any], state: NegotiationState) -> NegotiationProposal:
@@ -337,15 +408,26 @@ def validate_negotiation(raw: Mapping[str, Any], state: NegotiationState) -> Neg
             parsed.append(action)
     actions = tuple(parsed)
     targeted: set[str] = set()
+    targeted_sessions: set[str] = set()
     for action in actions:
         duplicate = sorted(targeted.intersection(action.obligation_ids))
         if duplicate:
             errors.append("proposal repeats obligations across actions: " + ", ".join(duplicate))
         targeted.update(action.obligation_ids)
+        if action.session_id is not None:
+            if action.session_id in targeted_sessions:
+                errors.append(
+                    f"proposal has multiple actions for the same durable session: "
+                    f"{action.session_id}"
+                )
+            targeted_sessions.add(action.session_id)
     errors.extend(_validate_feasibility(actions, state))
     if errors:
         raise NegotiationError(errors)
-    return NegotiationProposal(actions=actions)
+    obligation_by_id = {item.id: item for item in state.obligations}
+    return NegotiationProposal(actions=tuple(sorted(
+        actions, key=lambda action: _action_order(action, obligation_by_id)
+    )))
 
 
 def _fallback_raw(
@@ -387,7 +469,7 @@ def fallback_next_action(state: NegotiationState) -> NegotiationAction:
     obligation = uncovered[0]
 
     primary_owners = sorted(
-        item.id for item in state.assignments
+        item.session_id for item in state.session_ownership
         if obligation.id in item.primary_obligation_ids
     )
     for session_id in primary_owners:

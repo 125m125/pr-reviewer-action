@@ -12,9 +12,16 @@ from typing import Any
 
 from pr_reviewer.specialists import classify_file_roles
 
+from .assignments import Assignment
 from .evidence import EvidenceRecord, EvidenceSnapshot
 from .policy import RecipePolicy, ReviewPolicy
-from .types import CoverageObligation, ObligationStatus, RecipeStatus, SessionCheckpoint
+from .types import (
+    CoverageObligation,
+    ObligationStatus,
+    RecipeStatus,
+    SessionCheckpoint,
+    SpecialistAssignment,
+)
 
 
 def _slug(value: object, fallback: str = "review") -> str:
@@ -70,6 +77,36 @@ class CoverageReconciliation:
     never_covered_obligation_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SessionOwnership:
+    """Controller-owned link between a durable session and its assignment."""
+
+    session_id: str
+    assignment_id: str
+    primary_obligation_ids: tuple[str, ...] = ()
+    independent_obligation_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_id, str) or not self.session_id.strip():
+            raise ValueError("session ownership requires a non-empty session_id")
+        if not isinstance(self.assignment_id, str) or not self.assignment_id.strip():
+            raise ValueError("session ownership requires a non-empty assignment_id")
+        if set(self.primary_obligation_ids).intersection(self.independent_obligation_ids):
+            raise ValueError("primary and independent ownership must be distinct")
+        for field_name in ("primary_obligation_ids", "independent_obligation_ids"):
+            values = getattr(self, field_name)
+            if any(not isinstance(item, str) or not item.strip() for item in values):
+                raise ValueError(f"{field_name} must contain non-empty strings")
+            if len(set(values)) != len(values):
+                raise ValueError(f"{field_name} must not contain duplicates")
+
+    @property
+    def obligation_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(set(self.primary_obligation_ids).union(
+            self.independent_obligation_ids
+        )))
+
+
 def _normalized_path(value: object) -> str:
     path = str(value).strip().replace("\\", "/")
     if not path:
@@ -95,11 +132,12 @@ def evidence_satisfies_obligation(
         source_path = _normalized_path(record.source_path or "")
         if not source_path:
             return False
-        return any(
+        if not any(
             source_path == scope_path or source_path.startswith(scope_path + "/")
             for raw_path in scoped_paths
             if (scope_path := _normalized_path(raw_path))
-        )
+        ):
+            return False
     category = record.category.strip().lower()
     return bool(category) and category in {
         item.strip().lower()
@@ -372,6 +410,33 @@ class CoverageLedger:
         if not self._evidence[obligation_id]:
             self._unresolved.add(obligation_id)
 
+    def replace_reconciled_state(
+        self,
+        evidence_by_obligation: Mapping[str, Iterable[str]],
+        unresolved_obligation_ids: Iterable[str],
+    ) -> None:
+        """Replace optimistic session accounting with controller-validated state."""
+        unresolved_ids = tuple(unresolved_obligation_ids)
+        unknown = sorted(
+            set(evidence_by_obligation).union(unresolved_ids)
+            - set(self._obligations)
+        )
+        if unknown:
+            raise KeyError("unknown coverage obligation: " + ", ".join(unknown))
+        reconciled: dict[str, set[str]] = {
+            obligation_id: set() for obligation_id in self._obligations
+        }
+        for obligation_id, evidence_ids in evidence_by_obligation.items():
+            for evidence_id in evidence_ids:
+                if not str(evidence_id).strip():
+                    raise ValueError("evidence_id must be non-empty")
+                reconciled[obligation_id].add(str(evidence_id))
+        self._evidence = reconciled
+        self._unresolved = {
+            obligation_id for obligation_id in unresolved_ids
+            if not reconciled[obligation_id]
+        }
+
     def obligation_statuses(self) -> dict[str, ObligationStatus]:
         statuses: dict[str, ObligationStatus] = {}
         for obligation_id in sorted(self._obligations):
@@ -414,12 +479,32 @@ class CoverageLedger:
         )
 
 
+def _assignment_id(assignment: Assignment | SpecialistAssignment) -> str:
+    value = (
+        assignment.id if isinstance(assignment, Assignment)
+        else assignment.assignment_id
+    )
+    return str(value).strip()
+
+
+def _assignment_ownership(
+    assignment: Assignment | SpecialistAssignment,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    primary = tuple(sorted(assignment.primary_obligation_ids))
+    independent = tuple(sorted(
+        assignment.independent_obligation_ids
+        if isinstance(assignment, SpecialistAssignment) else ()
+    ))
+    return primary, independent
+
+
 def reconcile_wave(
     ledger: CoverageLedger,
     *,
     checkpoints: Iterable[SessionCheckpoint],
     evidence: EvidenceSnapshot,
-    assignments: Iterable[object],
+    assignments: Iterable[Assignment | SpecialistAssignment],
+    session_ownership: Iterable[SessionOwnership],
 ) -> CoverageReconciliation:
     """Reconcile a wave without trusting specialist-declared coverage states."""
     if not isinstance(ledger, CoverageLedger):
@@ -430,24 +515,44 @@ def reconcile_wave(
     obligation_by_id = {item.id: item for item in ledger.obligations()}
     before = ledger.obligation_statuses()
     records = {record.id: record for record in evidence.records}
-    owned_by_session: dict[str, tuple[str, ...]] = {}
-    for item in assignments:
-        session_id = str(
-            getattr(item, "id", None) or getattr(item, "assignment_id", None) or ""
-        ).strip()
-        if not session_id:
+    reconciled_evidence: dict[str, set[str]] = {
+        obligation_id: set() for obligation_id in obligation_by_id
+    }
+    reconciled_unresolved: set[str] = set()
+    assignment_by_id: dict[str, Assignment | SpecialistAssignment] = {}
+    for assignment in assignments:
+        assignment_id = _assignment_id(assignment)
+        if not assignment_id:
             raise ValueError("assignment must have a non-empty id")
-        if session_id in owned_by_session:
-            raise ValueError(f"duplicate assignment/session id: {session_id}")
-        raw_ids = getattr(item, "obligation_ids", ())
-        owned_by_session[session_id] = tuple(sorted({
-            str(obligation_id).strip()
-            for obligation_id in raw_ids
-            if str(obligation_id).strip() in obligation_by_id
-        }))
+        if assignment_id in assignment_by_id:
+            raise ValueError(f"duplicate assignment id: {assignment_id}")
+        assignment_by_id[assignment_id] = assignment
+
+    owned_by_session: dict[str, SessionOwnership] = {}
+    for ownership in session_ownership:
+        if ownership.session_id in owned_by_session:
+            raise ValueError(f"duplicate durable session id: {ownership.session_id}")
+        assignment = assignment_by_id.get(ownership.assignment_id)
+        if assignment is None:
+            raise ValueError(
+                f"session '{ownership.session_id}' references unknown assignment "
+                f"'{ownership.assignment_id}'"
+            )
+        expected_primary, expected_independent = _assignment_ownership(assignment)
+        if tuple(sorted(ownership.primary_obligation_ids)) != expected_primary:
+            raise ValueError("session primary ownership differs from its assignment")
+        if tuple(sorted(ownership.independent_obligation_ids)) != expected_independent:
+            raise ValueError("session independent ownership differs from its assignment")
+        unknown_ids = sorted(set(ownership.obligation_ids) - set(obligation_by_id))
+        if unknown_ids:
+            raise ValueError("session ownership contains unknown obligations: " + ", ".join(unknown_ids))
+        owned_by_session[ownership.session_id] = ownership
 
     for checkpoint in sorted(tuple(checkpoints), key=lambda item: item.session_id):
-        owned_ids = owned_by_session.get(checkpoint.session_id, ())
+        ownership = owned_by_session.get(checkpoint.session_id)
+        if ownership is None:
+            continue
+        owned_ids = ownership.obligation_ids
         referenced_ids = tuple(sorted(set(
             checkpoint.evidence_ids + checkpoint.imported_evidence_ids
         )))
@@ -455,8 +560,22 @@ def reconcile_wave(
             obligation = obligation_by_id[obligation_id]
             for evidence_id in referenced_ids:
                 record = records.get(evidence_id)
-                if record is not None and evidence_satisfies_obligation(record, obligation):
-                    ledger.attach_evidence(obligation_id, evidence_id)
+                independent_collection = (
+                    obligation_id in ownership.independent_obligation_ids
+                    and record is not None
+                    and record.collector_session_id == checkpoint.session_id
+                    and checkpoint.session_id in record.imported_by
+                    and evidence_id not in checkpoint.imported_evidence_ids
+                )
+                if (
+                    record is not None
+                    and evidence_satisfies_obligation(record, obligation)
+                    and (
+                        not obligation.requires_independent_verification
+                        or independent_collection
+                    )
+                ):
+                    reconciled_evidence[obligation_id].add(evidence_id)
 
         declared_unresolved = set(checkpoint.unknowns)
         declared_unresolved.update(
@@ -465,8 +584,9 @@ def reconcile_wave(
             if status is ObligationStatus.UNRESOLVED
         )
         for obligation_id in sorted(declared_unresolved.intersection(owned_ids)):
-            ledger.mark_unresolved(obligation_id)
+            reconciled_unresolved.add(obligation_id)
 
+    ledger.replace_reconciled_state(reconciled_evidence, reconciled_unresolved)
     snapshot = ledger.snapshot()
     after = dict(snapshot.obligation_statuses)
     newly_covered = tuple(sorted(
