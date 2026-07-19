@@ -17,6 +17,7 @@ from .types import ObligationStatus, RunPhase
 
 
 _PRIORITY_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+_EXPLORATION_PHASES = frozenset({RunPhase.INITIAL, RunPhase.FOLLOWUP})
 _STATUS_RANK = {
     ObligationStatus.COVERED: 3,
     ObligationStatus.UNRESOLVED: 2,
@@ -148,6 +149,8 @@ class SessionScheduler:
         if not self._can_launch(lease):
             return _WorkerDeclined()
         session = self.session_factory(assignment, lease, self.wave_snapshot)
+        if not self._can_launch(lease):
+            return _WorkerDeclined()
         return session.explore()
 
     def run_wave(
@@ -156,6 +159,8 @@ class SessionScheduler:
         phase: RunPhase = RunPhase.INITIAL,
     ) -> WaveResult:
         normalized_phase = RunPhase(phase)
+        if normalized_phase not in _EXPLORATION_PHASES:
+            raise ValueError("scheduler waves require initial or followup phase")
         ordered = tuple(sorted(tuple(assignments), key=_assignment_order))
         ordered_ids = tuple(_assignment_id(item) for item in ordered)
         if len(set(ordered_ids)) != len(ordered_ids):

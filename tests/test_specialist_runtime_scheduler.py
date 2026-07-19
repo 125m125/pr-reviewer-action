@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from threading import Condition, Event, Thread, current_thread
 
+import pytest
+
 from pr_reviewer.specialist_runtime.assignments import Assignment
 from pr_reviewer.specialist_runtime.budget import RunDeadline
 from pr_reviewer.specialist_runtime.coverage import CoverageSnapshot
@@ -414,6 +416,70 @@ def test_worker_declines_session_construction_when_cutoff_crosses_after_submit()
     assert result.not_started == ("S1",)
     assert result.cancelled_assignment_ids == ()
     assert result.in_flight_assignment_ids == ()
+
+
+def test_slow_factory_crossing_cutoff_never_starts_session_exploration():
+    clock = FakeClock(20.0)
+    factory_finished = Event()
+    constructed = []
+    explored = []
+    events = []
+
+    class MustNotExplore(FakeSession):
+        def explore(self):
+            explored.append("S1")
+            return super().explore()
+
+    def factory(item, lease, snapshot):
+        constructed.append(item.id)
+        clock.value = deadline().cutoff_for(RunPhase.INITIAL)
+        factory_finished.set()
+        return MustNotExplore(session_result(
+            item.id, evidence_ids=(),
+            statuses=((f"OB-{item.id}", ObligationStatus.PENDING),),
+        ))
+
+    def sink(kind, payload):
+        events.append((kind, payload.get("assignment_id")))
+        if kind == "session_queued":
+            assert factory_finished.wait(1.0)
+
+    result = SessionScheduler(
+        deadline=deadline(), session_factory=factory, wave_snapshot=empty_snapshot(),
+        concurrency=1, clock=clock, event_sink=sink,
+    ).run_wave((assignment("S1", "critical"),), RunPhase.INITIAL)
+
+    assert constructed == ["S1"]
+    assert explored == []
+    assert result.results == ()
+    assert result.failures == ()
+    assert result.not_started == ("S1",)
+    assert result.cancelled_assignment_ids == ()
+    assert result.in_flight_assignment_ids == ()
+    assert events == [
+        ("wave_started", None),
+        ("session_admitted", "S1"),
+        ("session_queued", "S1"),
+        ("session_not_started", "S1"),
+        ("wave_completed", None),
+    ]
+
+
+@pytest.mark.parametrize("phase", [RunPhase.PLANNING, RunPhase.FINALIZATION])
+def test_scheduler_rejects_non_exploration_wave_phases(phase):
+    factories = []
+    scheduler = SessionScheduler(
+        deadline=deadline(),
+        session_factory=lambda *args: factories.append(args),
+        wave_snapshot=empty_snapshot(),
+        concurrency=1,
+        clock=FakeClock(5.0),
+    )
+
+    with pytest.raises(ValueError, match="initial or followup"):
+        scheduler.run_wave((assignment("S1", "critical"),), phase)
+
+    assert factories == []
 
 
 def test_session_exception_is_a_stable_failure_not_not_started():
