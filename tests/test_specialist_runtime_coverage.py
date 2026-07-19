@@ -1,6 +1,36 @@
+from dataclasses import FrozenInstanceError
+
 import pytest
 
-from pr_reviewer.specialist_runtime.types import CoverageObligation
+from pr_reviewer.specialist_runtime.types import CoverageObligation, ObligationStatus
+
+
+def test_coverage_snapshot_is_sorted_immutable_and_detached():
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger, CoverageSnapshot
+
+    obligations = (
+        CoverageObligation("OB-b", "test", "b.py"),
+        CoverageObligation("OB-a", "test", "a.py"),
+    )
+    ledger = CoverageLedger(obligations)
+    ledger.attach_evidence("OB-b", "E-2")
+    ledger.attach_evidence("OB-b", "E-1")
+
+    snapshot = ledger.snapshot()
+    ledger.attach_evidence("OB-a", "E-later")
+
+    assert isinstance(snapshot, CoverageSnapshot)
+    assert snapshot.obligation_statuses == (
+        ("OB-a", ObligationStatus.PENDING),
+        ("OB-b", ObligationStatus.COVERED),
+    )
+    assert snapshot.recipe_statuses == ()
+    assert snapshot.evidence_by_obligation == (
+        ("OB-a", ()),
+        ("OB-b", ("E-1", "E-2")),
+    )
+    with pytest.raises(FrozenInstanceError):
+        snapshot.evidence_by_obligation = ()
 
 
 def test_coverage_obligation_exposes_legacy_friendly_evidence_aliases():

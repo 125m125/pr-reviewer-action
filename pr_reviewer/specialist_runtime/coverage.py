@@ -48,6 +48,15 @@ class _RecipeAccountingObligation(CoverageObligation):
     recipe_status: RecipeStatus = RecipeStatus.NOT_APPLICABLE
 
 
+@dataclass(frozen=True)
+class CoverageSnapshot:
+    """Detached coverage state fixed at the beginning of a work wave."""
+
+    obligation_statuses: tuple[tuple[str, ObligationStatus], ...]
+    recipe_statuses: tuple[tuple[str, str], ...]
+    evidence_by_obligation: tuple[tuple[str, tuple[str, ...]], ...]
+
+
 def _recipe_accounting_obligation(
     recipe_id: str,
     status: RecipeStatus,
@@ -337,6 +346,17 @@ class CoverageLedger:
             else:
                 statuses[recipe_id] = RecipeStatus.ASSIGNED
         return {recipe_id: status.value for recipe_id, status in sorted(statuses.items())}
+
+    def snapshot(self) -> CoverageSnapshot:
+        """Return a stable immutable view detached from later ledger updates."""
+        return CoverageSnapshot(
+            obligation_statuses=tuple(self.obligation_statuses().items()),
+            recipe_statuses=tuple(self.recipe_statuses().items()),
+            evidence_by_obligation=tuple(
+                (obligation_id, tuple(sorted(self._evidence[obligation_id])))
+                for obligation_id in sorted(self._evidence)
+            ),
+        )
 
 
 def evaluate_coverage(
