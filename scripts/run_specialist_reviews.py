@@ -20,6 +20,7 @@ for entry in (str(SCRIPT_DIR), str(ROOT)):
 
 from redact import mask_secrets  # noqa: E402
 from pr_reviewer.conversation import Conversation, web_tool_schemas  # noqa: E402
+from pr_reviewer.specialist_runtime.model_gateway import OpenAIModelGateway  # noqa: E402
 from pr_reviewer.specialist_runtime.policy import ReviewPolicy, load_review_policy  # noqa: E402
 from pr_reviewer.specialist_runtime.web_evidence import SourcePolicy  # noqa: E402
 from pr_reviewer.specialists import (  # noqa: E402
@@ -285,6 +286,21 @@ class SequentialModelRunner:
         if self.response_format not in {"off", "json_object", "json_schema"}:
             raise ValueError("AI_RESPONSE_FORMAT must be off, json_object, or json_schema")
         self.stream = os.getenv("AI_STREAM", "true").lower() == "true"
+        self._role_models = self._configured_role_models()
+        self.model_gateway = (
+            OpenAIModelGateway(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                default_model=os.environ["AI_MODEL"],
+                role_models=self._role_models,
+                response_format=self.response_format,
+                stream_watchdog=self.stream_watchdog,
+                # Keep the legacy module-level transport seam so its existing
+                # tests and external callers can inject a transport.
+                transport=run_chat_request,
+            )
+            if self.api_format == "openai" else None
+        )
         self.workspace = str(Path.cwd())
         self.current_repo = os.getenv("REPO", "")
         self.allowed_repos = {self.current_repo} if self.current_repo else set()
@@ -303,25 +319,45 @@ class SequentialModelRunner:
     def max_tokens_for_role(self, role: str) -> int:
         return self.planner_max_tokens if role == "planner" else self.max_tokens
 
-    def model(self, role: str) -> str:
+    def _configured_role_models(self) -> dict[str, str]:
         names = {
             "planner": "SPECIALIST_PLANNER_MODEL",
             "specialist": "SPECIALIST_MODEL",
             "critic": "SPECIALIST_CRITIC_MODEL",
             "aggregator": "SPECIALIST_AGGREGATOR_MODEL",
         }
-        configured = os.getenv(names[role], "").strip()
-        if configured:
-            return configured
-        if role == "critic":
-            return os.getenv("SPECIALIST_MODEL", "").strip() or os.environ["AI_MODEL"]
-        return os.environ["AI_MODEL"]
+        configured = {
+            role: os.getenv(name, "").strip() for role, name in names.items()
+        }
+        default = os.environ["AI_MODEL"]
+        return {
+            "planner": configured["planner"] or default,
+            "specialist": configured["specialist"] or default,
+            "critic": configured["critic"] or configured["specialist"] or default,
+            "aggregator": configured["aggregator"] or default,
+        }
+
+    def model(self, role: str) -> str:
+        if self.model_gateway is not None:
+            return self.model_gateway.model_for_role(role)
+        return self._role_models[role]
 
     def _post(
         self, payload: dict[str, Any], role: str,
         *, compact_fallback_payload: dict[str, Any] | None = None,
         stream_watchdog=None,
     ) -> dict[str, Any]:
+        if self.model_gateway is not None:
+            response, diagnostics = self.model_gateway.complete_payload(
+                payload,
+                role,
+                timeout_sec=self.timeout,
+                compact_fallback_payload=compact_fallback_payload,
+                stream_watchdog=stream_watchdog,
+            )
+            self.requests.append(diagnostics)
+            return response
+
         started = time.monotonic()
         structured_fallback = False
         original_error = ""
