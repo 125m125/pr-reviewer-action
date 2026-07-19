@@ -253,12 +253,16 @@ WEB_SEARCH_SCHEMA: dict[str, Any] = {
 
 def web_tool_schemas(search_url: str, source_policy: Any) -> list[dict[str, Any]]:
     """Build the catalogue, advertising discovery only when it can be safe."""
-    schemas = list(TOOL_SCHEMAS)
-    if (
-        str(search_url or "").strip()
-        and source_policy is not None
+    from pr_reviewer.specialist_runtime.web_evidence import SearxngSearchProvider
+
+    has_sources = (
+        source_policy is not None
         and bool(getattr(source_policy, "has_approved_sources", False))
-    ):
+    )
+    schemas = [schema for schema in TOOL_SCHEMAS if schema["name"] != "web_fetch"]
+    if has_sources:
+        schemas.append(next(schema for schema in TOOL_SCHEMAS if schema["name"] == "web_fetch"))
+    if has_sources and SearxngSearchProvider.is_valid_endpoint(str(search_url or "").strip()):
         schemas.append(WEB_SEARCH_SCHEMA)
     return schemas
 

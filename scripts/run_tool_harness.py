@@ -57,6 +57,21 @@ from pr_reviewer.tool_executors import (  # noqa: E402
     web_search,
 )
 from pr_reviewer.specialist_runtime.web_evidence import SourcePolicy  # noqa: E402
+from pr_reviewer.specialist_runtime.policy import load_review_policy  # noqa: E402
+
+
+def load_current_source_policy(workspace_root, config_file):
+    """Load only validated current-worktree source rules; fail closed."""
+    if not str(config_file or "").strip():
+        return SourcePolicy(())
+    root = Path(workspace_root).resolve()
+    try:
+        candidate = (root / str(config_file)).resolve()
+        candidate.relative_to(root)
+        policy = load_review_policy(candidate)
+    except (OSError, ValueError):
+        return SourcePolicy(())
+    return SourcePolicy.from_review_policy(policy)
 
 
 def normalize_repo_name(value):
@@ -555,7 +570,9 @@ def run_native_loop(
     # current source rules give it approved URLs to return.
     search_url = os.getenv("SEARCH_URL", "").strip()
     max_search_results = env_int_bounded("TOOL_MAX_SEARCH_RESULTS", 5, 1, 15)
-    source_policy = SourcePolicy.from_hosts(allowed_hosts)
+    source_policy = load_current_source_policy(
+        workspace_root, os.getenv("SPECIALIST_CONFIG_FILE", "").strip()
+    )
     tool_schemas = web_tool_schemas(search_url, source_policy)
 
     # Read-only MCP tools (#245), allowlisted via TOOL_MCP_SERVERS. Fork-gating
@@ -665,8 +682,8 @@ def run_native_loop(
         f"Review scope: {os.getenv('EFFECTIVE_SCOPE', 'full')}\n"
         f"Allowed repos for gh_api: "
         f"{', '.join(sorted(allowed_gh_api_repos)) if allowed_gh_api_repos else '(none)'}\n"
-        f"Allowed hosts for web_fetch: "
-        f"{', '.join(allowed_hosts) if allowed_hosts else '(none)'}\n"
+        f"Current-policy sources for web_fetch: "
+        f"{', '.join(rule.host for rule in source_policy.rules) if source_policy.rules else '(none)'}\n"
         + ("web_search is available for discovery only; web_fetch an approved "
            "result before relying on it as evidence.\n"
            if search_url and source_policy.has_approved_sources else "")
@@ -1203,8 +1220,9 @@ def main():
     max_requests = env_positive_int("TOOL_MAX_REQUESTS", 4)
     request_timeout = env_positive_int("TOOL_REQUEST_TIMEOUT_SEC", 20)
 
-    allowed_hosts_raw = os.getenv("ALLOWED_SOURCE_HOSTS", "github.com,api.github.com")
-    allowed_hosts = [h.strip() for h in allowed_hosts_raw.split(",") if h.strip()]
+    # Legacy positional executor argument only. Current-head ReviewPolicy.sources
+    # is the sole web authorization authority inside run_native_loop.
+    allowed_hosts = []
 
     workspace_root = os.getcwd()
 

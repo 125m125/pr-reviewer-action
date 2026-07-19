@@ -259,11 +259,7 @@ def web_fetch(
 ):
     """Retrieve typed evidence through the redirect- and DNS-safe boundary."""
     try:
-        if source_policy is None:
-            host = urllib.parse.urlparse(url).hostname or ""
-            if not allowlisted_host(host, allowed_hosts):
-                return {"error": f"Host not allowlisted: {host}"}
-        policy = source_policy or SourcePolicy.from_hosts(allowed_hosts)
+        policy = source_policy or SourcePolicy(())
         fetcher = secure_fetcher or SecureFetcher(
             policy, timeout=request_timeout, evidence_store=evidence_store,
         )
@@ -470,7 +466,7 @@ def execute_tool_request(
             query = args.get("query", "")
             if not query:
                 raise ValueError("Missing 'query' argument")
-            policy = source_policy or SourcePolicy.from_hosts(allowed_hosts)
+            policy = source_policy or SourcePolicy(())
             res = web_search(
                 query,
                 search_url,

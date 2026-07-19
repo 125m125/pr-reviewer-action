@@ -12,6 +12,7 @@ from pr_reviewer.specialist_runtime.web_evidence import (
     HttpRequest,
     HttpResponse,
     SearchCandidate,
+    SearxngSearchProvider,
     SecureFetcher,
     SourceDenied,
     SourcePolicy,
@@ -310,3 +311,189 @@ def test_secure_fetch_caps_redirects():
             source_policy(), transport=transport, resolver=public_resolver,
             max_redirects=1,
         ).fetch("https://docs.example.com/0")
+
+
+@pytest.mark.parametrize("endpoint", [
+    "http://search.example.com/search",
+    "https://user:pass@search.example.com/search",
+    "https://search.example.com:8443/search",
+    "https://search.example.com/search#fragment",
+])
+def test_search_provider_rejects_unsafe_endpoint_syntax(endpoint):
+    with pytest.raises(SourceDenied):
+        SearxngSearchProvider(endpoint, transport=FakeHttpTransport({}), resolver=public_resolver)
+
+
+def test_search_provider_uses_dns_pinned_transport_and_canonical_endpoint():
+    expected = "https://search.example.com/search?q=api+support&format=json"
+    transport = FakeHttpTransport({
+        expected: HttpResponse(200, {"content-type": "application/json"}, b'{"results": []}'),
+    })
+    provider = SearxngSearchProvider(
+        "https://SEARCH.EXAMPLE.COM:443/search",
+        transport=transport,
+        resolver=public_resolver,
+    )
+
+    assert provider.search("api support", limit=5) == ()
+    assert transport.requests[0].url == expected
+    assert transport.requests[0].resolved_ip == PUBLIC_IP
+
+
+def test_search_redirect_cannot_leak_query_to_another_host():
+    source = "https://search.example.com/search?q=secretless+query&format=json"
+    transport = FakeHttpTransport.redirecting(source, "https://evil.example/collect")
+    provider = SearxngSearchProvider(
+        "https://search.example.com/search",
+        transport=transport,
+        resolver=public_resolver,
+    )
+
+    with pytest.raises(SourceDenied, match="redirect"):
+        provider.search("secretless query", limit=5)
+
+    assert len(transport.requests) == 1
+
+
+def test_search_rejects_private_provider_resolution_before_transport():
+    transport = FakeHttpTransport({})
+    provider = SearxngSearchProvider(
+        "https://search.example.com/search",
+        transport=transport,
+        resolver=lambda host, port: ["127.0.0.1"],
+    )
+
+    with pytest.raises(SourceDenied, match="address"):
+        provider.search("api", limit=5)
+
+    assert transport.requests == []
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class SlowDripTransport:
+    def __init__(self, clock: FakeClock, response: HttpResponse) -> None:
+        self.clock = clock
+        self.response = response
+        self.requests: list[HttpRequest] = []
+
+    def request(self, request: HttpRequest) -> HttpResponse:
+        self.requests.append(request)
+        for _ in range(4):
+            self.clock.advance(0.3)
+        return self.response
+
+
+def test_fetch_has_one_hard_deadline_across_slow_body():
+    clock = FakeClock()
+    url = "https://docs.example.com/api"
+    transport = SlowDripTransport(
+        clock, HttpResponse(200, {"content-type": "text/plain"}, b"slow body"),
+    )
+    fetcher = SecureFetcher(
+        source_policy(), transport=transport, resolver=public_resolver,
+        timeout=1.0, monotonic=clock,
+    )
+
+    with pytest.raises(SourceDenied, match="deadline"):
+        fetcher.fetch(url)
+
+    assert transport.requests[0].timeout <= 1.0
+
+
+def test_fetch_passes_remaining_deadline_to_timeout_aware_resolver():
+    clock = FakeClock()
+    url = "https://docs.example.com/api"
+    transport = FakeHttpTransport({
+        url: HttpResponse(200, {"content-type": "text/plain"}, b"ok"),
+    })
+    seen_timeouts = []
+
+    def resolver(host: str, port: int, timeout: float) -> list[str]:
+        seen_timeouts.append(timeout)
+        return [PUBLIC_IP]
+
+    SecureFetcher(
+        source_policy(), transport=transport, resolver=resolver,
+        timeout=2.0, monotonic=clock,
+    ).fetch(url)
+
+    assert seen_timeouts == [pytest.approx(2.0)]
+
+
+def test_search_has_one_hard_deadline_across_slow_body():
+    clock = FakeClock()
+    url = "https://search.example.com/search?q=api&format=json"
+    transport = SlowDripTransport(
+        clock, HttpResponse(200, {"content-type": "application/json"}, b'{"results": []}'),
+    )
+    provider = SearxngSearchProvider(
+        "https://search.example.com/search", transport=transport,
+        resolver=public_resolver, request_timeout=1.0, monotonic=clock,
+    )
+
+    with pytest.raises(SourceDenied, match="deadline"):
+        provider.search("api", limit=5)
+
+
+def test_fetch_sends_exact_canonical_target_that_policy_authorized():
+    canonical = "https://docs.example.com/api/a?view=1"
+    transport = FakeHttpTransport({
+        canonical: HttpResponse(200, {"content-type": "text/plain"}, b"ok"),
+    })
+    fetcher = SecureFetcher(
+        source_policy(), transport=transport, resolver=public_resolver,
+    )
+
+    result = fetcher.fetch(
+        "https://DOCS.EXAMPLE.COM:443/api/%2561?view=%2531"
+    )
+
+    assert transport.requests[0].url == canonical
+    assert result.provenance.final_url == canonical
+
+
+@pytest.mark.parametrize("unsafe_path", [
+    "/api/%2525252e%2525252e/admin",
+    "/api/encoded%25252fdelimiter",
+])
+def test_source_policy_fails_closed_when_canonical_decode_is_not_stable(unsafe_path):
+    decision = source_policy().classify(f"https://docs.example.com{unsafe_path}")
+
+    assert decision.approved is False
+
+
+def test_source_policy_rejects_invalid_percent_encoding():
+    assert source_policy().classify(
+        "https://docs.example.com/api/%ZZ"
+    ).approved is False
+
+
+def test_denied_metadata_strips_authority_query_and_suspicious_path():
+    provider = FakeSearchProvider([SearchCandidate(
+        "hostile title",
+        "https://user:pass@evil.example/ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA?q=secret#frag",
+        "hostile snippet",
+    )])
+
+    discovery = discover("api", provider, source_policy())
+    denied = discovery.unapproved[0]
+    request = source_access_request(denied, "OB-api", "verify behavior")
+    serialized = discovery.to_tool_result()
+
+    assert denied.host == "evil.example"
+    assert denied.path == "/[REDACTED]"
+    assert denied.url == "https://evil.example/[REDACTED]"
+    assert request.candidate_url == denied.url
+    assert all(marker not in serialized for marker in (
+        "user", "pass", "q=", "secret", "frag", "hostile title", "hostile snippet",
+    ))

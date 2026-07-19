@@ -41,6 +41,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import run_tool_harness as rth  # noqa: E402
+from pr_reviewer.specialist_runtime.web_evidence import (  # noqa: E402
+    HttpResponse,
+    SearxngSearchProvider,
+    SourcePolicy,
+)
 
 _REPO = "owner/repo"
 _HOSTS = ["github.com", "docs.siderolabs.com"]
@@ -143,43 +148,39 @@ def test_read_file_masks_secrets_in_allowed_file(tmp_path):
 def test_web_fetch_blocks_unallowlisted_host(tmp_path, url):
     res = _exec("web_fetch", {"url": url}, tmp_path)
     assert res["status"] == "error"
-    assert "not allowlisted" in str(res["result"]).lower()
+    assert "denied" in str(res["result"]).lower()
 
 
 # 5. A hostile web_search query cannot smuggle in a different host: the query is
 #    URL-encoded into the operator-configured search_url, which stays fixed.
 def test_web_search_query_cannot_change_host(tmp_path, monkeypatch):
-    captured = {}
+    class Transport:
+        def __init__(self):
+            self.urls = []
 
-    class _Resp:
-        def __enter__(self):
-            return self
+        def request(self, request):
+            self.urls.append(request.url)
+            return HttpResponse(200, {"content-type": "application/json"}, b'{"results": []}')
 
-        def __exit__(self, *a):
-            return False
-
-        def read(self, size=-1):
-            return b'{"results": []}'
-
-    def fake_urlopen(req, timeout=0):
-        captured["url"] = req.full_url if hasattr(req, "full_url") else req.get_full_url()
-        return _Resp()
-
-    monkeypatch.setattr(rth.urllib.request, "urlopen", fake_urlopen)
+    transport = Transport()
+    provider = SearxngSearchProvider(
+        "https://search.jory.dev/search",
+        transport=transport,
+        resolver=lambda host, port: ["93.184.216.34"],
+    )
 
     hostile_query = "talos matrix&engines=x http://evil.example/?leak=secret"
-    res = _exec(
-        "web_search",
-        {"query": hostile_query},
-        tmp_path,
-        search_url="https://search.jory.dev/search",
+    res = rth.execute_tool_request(
+        "web_search", {"query": hostile_query}, str(tmp_path), {_REPO}, _REPO,
+        _HOSTS, 12000, 5, "https://search.jory.dev/search", 5,
+        source_policy=SourcePolicy.from_hosts(_HOSTS), search_provider=provider,
     )
     assert res["status"] == "ok"
     # The request host stayed the configured one; the hostile text rode inside
     # the URL-encoded q= parameter rather than re-pointing the request.
-    assert captured["url"].startswith("https://search.jory.dev/search?")
-    assert "evil.example" not in rth.urllib.parse.urlparse(captured["url"]).netloc
-    assert "q=talos+matrix%26engines" in captured["url"] or "q=talos%20matrix%26engines" in captured["url"]
+    assert transport.urls[0].startswith("https://search.jory.dev/search?")
+    assert "evil.example" not in rth.urllib.parse.urlparse(transport.urls[0]).netloc
+    assert "q=talos+matrix%26engines" in transport.urls[0]
 
 
 # 6. gh_api is fenced to the repo allowlist, read-only prefixes, and denies the

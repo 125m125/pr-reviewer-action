@@ -19,7 +19,9 @@ for entry in (str(SCRIPT_DIR), str(ROOT)):
         sys.path.insert(0, entry)
 
 from redact import mask_secrets  # noqa: E402
-from pr_reviewer.conversation import Conversation, TOOL_SCHEMAS  # noqa: E402
+from pr_reviewer.conversation import Conversation, web_tool_schemas  # noqa: E402
+from pr_reviewer.specialist_runtime.policy import load_review_policy  # noqa: E402
+from pr_reviewer.specialist_runtime.web_evidence import SourcePolicy  # noqa: E402
 from pr_reviewer.specialists import (  # noqa: E402
     BUILTIN_LENSES,
     build_topology,
@@ -262,7 +264,7 @@ def extract_json(text: str) -> Any:
 
 
 class SequentialModelRunner:
-    def __init__(self) -> None:
+    def __init__(self, *, source_policy: SourcePolicy | None = None) -> None:
         self.base_url = os.environ["AI_BASE_URL"].rstrip("/")
         self.api_format = os.getenv("AI_API_FORMAT", "openai").lower()
         self.api_key = os.getenv("AI_API_KEY", "")
@@ -287,10 +289,13 @@ class SequentialModelRunner:
         self.workspace = str(Path.cwd())
         self.current_repo = os.getenv("REPO", "")
         self.allowed_repos = {self.current_repo} if self.current_repo else set()
-        self.allowed_hosts = [
-            item.strip().lower() for item in os.getenv("ALLOWED_SOURCE_HOSTS", "").split(",")
-            if item.strip()
-        ]
+        # Retained only as the legacy positional executor argument. Web
+        # authorization comes exclusively from self.source_policy.
+        self.allowed_hosts: list[str] = []
+        self.source_policy = source_policy or SourcePolicy(())
+        self.tool_schemas = web_tool_schemas(
+            os.getenv("SEARCH_URL", "").strip(), self.source_policy,
+        )
         self.max_response_bytes = env_int("TOOL_MAX_RESPONSE_BYTES", 12000)
         self.tool_timeout = env_int("TOOL_REQUEST_TIMEOUT_SEC", 20)
         self.requests: list[dict[str, Any]] = []
@@ -412,6 +417,7 @@ class SequentialModelRunner:
             name, args, self.workspace, self.allowed_repos, self.current_repo,
             self.allowed_hosts, self.max_response_bytes, self.tool_timeout,
             os.getenv("SEARCH_URL", ""), env_int("TOOL_MAX_SEARCH_RESULTS", 5),
+            source_policy=self.source_policy,
         )
 
     def _watchdog_recovery_conversation(
@@ -466,7 +472,7 @@ class SequentialModelRunner:
                         "\n[executed evidence clipped to fit the model context]",
                     )
                 )
-        recovery = Conversation(system=system, tool_schemas=list(TOOL_SCHEMAS))
+        recovery = Conversation(system=system, tool_schemas=list(self.tool_schemas))
         recovery.add_user(recovery_user)
         return recovery
 
@@ -496,7 +502,7 @@ class SequentialModelRunner:
     ) -> tuple[Any, dict[str, Any]]:
         model = self.model(role)
         role_max_tokens = self.max_tokens_for_role(role)
-        conversation = Conversation(system=system, tool_schemas=list(TOOL_SCHEMAS))
+        conversation = Conversation(system=system, tool_schemas=list(self.tool_schemas))
         conversation.add_user(user)
         budgets = LoopBudgets(
             max_tool_calls=max_tools,
@@ -1206,7 +1212,15 @@ def main() -> int:
     changed_files = topology["changed_files"]
     config_changed = config_path.replace("\\", "/").lstrip("./") in changed_files
 
+    try:
+        source_policy = SourcePolicy.from_review_policy(load_review_policy(config_path))
+    except (OSError, ValueError):
+        source_policy = SourcePolicy(())
     runner = SequentialModelRunner()
+    runner.source_policy = source_policy
+    runner.tool_schemas = web_tool_schemas(
+        os.getenv("SEARCH_URL", "").strip(), source_policy,
+    )
     runner.generated_artifacts = topology.get("generated_artifacts", [])
     planner_tools = env_int("SPECIALIST_PLANNER_MAX_TOOL_CALLS", 8)
     max_initial = env_int("SPECIALIST_MAX_INITIAL_PASSES", 6)

@@ -11,17 +11,19 @@ import hashlib
 from html.parser import HTMLParser
 import http.client
 import ipaddress
+import inspect
 import json
 import math
 from pathlib import Path
+import queue
 import re
 import socket
 import ssl
 import sys
+import threading
 import time
 from typing import Callable, Iterable, Mapping, Protocol, Sequence
 from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlsplit, urlunsplit
-import urllib.request
 
 from .evidence import EvidenceProvenance, EvidenceStore
 from .policy import ReviewPolicy, SourceRule
@@ -51,6 +53,7 @@ class SourceDecision:
     rule_id: str | None = None
     max_age_hours: int | None = None
     reason: str | None = None
+    canonical_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -78,43 +81,82 @@ class SearxngSearchProvider:
         endpoint: str,
         *,
         request_timeout: float = 20,
-        opener: Callable[..., object] | None = None,
+        transport: HttpTransport | None = None,
+        resolver: Callable[[str, int], Sequence[str]] | None = None,
         max_response_bytes: int = 1024 * 1024,
+        max_redirects: int = 3,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
-        parsed = urlsplit(str(endpoint).strip())
-        if (
-            parsed.scheme.lower() != "https"
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.fragment
-        ):
-            raise SourceDenied("search provider endpoint must be a fixed credential-free HTTPS URL")
-        if request_timeout <= 0 or max_response_bytes <= 0:
+        canonical, host = _canonical_search_endpoint(endpoint)
+        if request_timeout <= 0 or max_response_bytes <= 0 or max_redirects < 0:
             raise ValueError("search provider limits must be positive")
-        self.endpoint = str(endpoint).strip()
+        self.endpoint = canonical
+        self.host = host
         self.request_timeout = request_timeout
-        self.opener = opener or urllib.request.urlopen
+        self.transport = transport or StdlibHttpTransport(monotonic=monotonic)
+        self.resolver = resolver or _default_resolver
         self.max_response_bytes = max_response_bytes
+        self.max_redirects = max_redirects
+        self.monotonic = monotonic
+
+    @classmethod
+    def is_valid_endpoint(cls, endpoint: str) -> bool:
+        try:
+            _canonical_search_endpoint(endpoint)
+        except (SourceDenied, ValueError):
+            return False
+        return True
 
     def search(self, query: str, *, limit: int) -> Sequence[SearchCandidate]:
         if limit <= 0:
             return ()
-        separator = "&" if urlsplit(self.endpoint).query else "?"
-        url = self.endpoint + separator + urlencode({"q": query, "format": "json"})
-        request = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/json",
-                "Accept-Encoding": "identity",
-                "User-Agent": "ai-pr-reviewer/search-discovery",
-            },
-        )
-        with self.opener(request, timeout=self.request_timeout) as response:
-            raw = response.read(self.max_response_bytes + 1)
+        parsed = urlsplit(self.endpoint)
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        query_pairs.extend((("q", query), ("format", "json")))
+        current_url = urlunsplit((
+            "https", self.host, parsed.path or "/", urlencode(query_pairs), "",
+        ))
+        deadline = self.monotonic() + self.request_timeout
+        response: HttpResponse | None = None
+        for redirect_count in range(self.max_redirects + 1):
+            canonical, host = _canonical_search_endpoint(current_url, required_host=self.host)
+            remaining = _remaining(deadline, self.monotonic)
+            addresses = _public_addresses(host, 443, self.resolver, remaining)
+            remaining = _remaining(deadline, self.monotonic)
+            response = self.transport.request(HttpRequest(
+                url=canonical,
+                resolved_ip=addresses[0],
+                timeout=remaining,
+                max_bytes=self.max_response_bytes,
+                deadline=deadline,
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "identity",
+                    "User-Agent": "ai-pr-reviewer/search-discovery",
+                },
+            ))
+            _remaining(deadline, self.monotonic)
+            if response.status not in _REDIRECT_STATUSES:
+                break
+            location = _header(response.headers, "location").strip()
+            if not location or redirect_count >= self.max_redirects:
+                raise SourceDenied("search redirect limit exceeded or omitted Location")
+            target = urljoin(canonical, location)
+            try:
+                current_url, _ = _canonical_search_endpoint(target, required_host=self.host)
+            except SourceDenied as exc:
+                raise SourceDenied(f"search redirect denied: {exc}") from exc
+        if response is None or not 200 <= response.status < 300:
+            raise SourceDenied("search provider returned a non-success response")
+        if _mime_type(response.headers) != "application/json":
+            raise SourceDenied("search provider response MIME type is not JSON")
+        if _header(response.headers, "content-encoding").strip().lower() not in {"", "identity"}:
+            raise SourceDenied("compressed search responses are not accepted")
+        raw = response.body
         if len(raw) > self.max_response_bytes:
             raise SourceDenied("search provider response exceeded maximum size")
         payload = json.loads(raw.decode("utf-8", errors="replace"))
+        _remaining(deadline, self.monotonic)
         if not isinstance(payload, dict):
             raise SourceDenied("search provider returned invalid JSON")
         candidates = []
@@ -138,6 +180,7 @@ class HttpRequest:
     timeout: float
     max_bytes: int
     headers: Mapping[str, str]
+    deadline: float | None = None
 
 
 @dataclass(frozen=True)
@@ -292,33 +335,36 @@ class SourcePolicy:
         except ValueError:
             return SourceDecision(False, "", "", reason="invalid URL")
         host = _normalize_hostname(parsed.hostname)
-        path, path_error = _safe_path(parsed.path)
+        path, path_error = _decode_url_component(parsed.path or "/", component="path")
         if parsed.scheme.lower() != "https":
             return SourceDecision(False, host, path, reason="HTTPS is required")
         if not host:
             return SourceDecision(False, host, path, reason="URL requires a host")
         if parsed.username is not None or parsed.password is not None:
             return SourceDecision(False, host, path, reason="URL credentials are forbidden")
+        if parsed.fragment:
+            return SourceDecision(False, host, path, reason="URL fragments are forbidden")
         if port not in (None, 443):
             return SourceDecision(False, host, path, reason="port is not approved")
         if path_error:
             return SourceDecision(False, host, path, reason=path_error)
-        query_payload = parsed.query
-        try:
-            for _ in range(3):
-                decoded_query = unquote(query_payload, errors="strict")
-                query_payload = decoded_query
-                if "%" not in query_payload:
-                    break
-        except (UnicodeDecodeError, ValueError):
-            return SourceDecision(False, host, path, reason="unsafe URL query encoding")
-        if any(ord(character) < 32 or ord(character) == 127 for character in query_payload):
-            return SourceDecision(False, host, path, reason="unsafe URL query")
+        query_payload, query_error = _decode_url_component(
+            parsed.query, component="query"
+        )
+        if query_error:
+            return SourceDecision(False, host, path, reason=query_error)
         payload = f"{path}?{query_payload}"
-        if mask_secrets(payload) != payload or _CREDENTIAL_QUERY_RE.search(parsed.query):
+        if mask_secrets(payload) != payload or _CREDENTIAL_QUERY_RE.search(query_payload):
             return SourceDecision(False, host, path, reason="unsafe credential-like URL payload")
         if any(_looks_high_entropy(token) for token in _TOKEN_RE.findall(payload)):
             return SourceDecision(False, host, path, reason="unsafe high-entropy URL payload")
+        canonical_url = urlunsplit((
+            "https",
+            host,
+            _encode_path(path),
+            _encode_query(query_payload),
+            "",
+        ))
         for index, rule in enumerate(self.rules):
             host_matches = host == rule.host or (
                 rule.include_subdomains and host.endswith("." + rule.host)
@@ -337,8 +383,9 @@ class SourcePolicy:
                 classification=rule.classification,
                 rule_id=f"source:{index}:{rule.host}",
                 max_age_hours=rule.max_age_hours,
+                canonical_url=canonical_url,
             )
-        return SourceDecision(False, host, path, reason="source is not approved by policy")
+        return SourceDecision(False, host, path, reason="source is not allowlisted by current policy")
 
 
 def _normalize_hostname(host: str | None) -> str:
@@ -350,39 +397,108 @@ def _normalize_hostname(host: str | None) -> str:
         return ""
 
 
-def _safe_path(raw_path: str) -> tuple[str, str | None]:
+_MAX_URL_DECODE_PASSES = 3
+_ENCODED_DELIMITER_RE = re.compile(r"(?i)%(?:2f|5c|3f|23|40)")
+
+
+def _decode_url_component(value: str, *, component: str) -> tuple[str, str | None]:
     try:
-        path = raw_path or "/"
-        for _ in range(3):
-            decoded = unquote(path, errors="strict")
-            path = decoded
-            if "\\" in path or any(ord(character) < 32 or ord(character) == 127 for character in path):
-                return path, "unsafe URL path"
-            if any(segment in {".", ".."} for segment in path.split("/")):
-                return path, "URL path traversal is forbidden"
-            if decoded == path and "%" not in path:
+        current = value
+        for _ in range(_MAX_URL_DECODE_PASSES):
+            if _ENCODED_DELIMITER_RE.search(current):
+                return current, f"encoded URL {component} delimiter is forbidden"
+            decoded = unquote(current, errors="strict")
+            if decoded == current:
                 break
+            current = decoded
     except (UnicodeDecodeError, ValueError):
-        return "/", "invalid URL path encoding"
-    return path if path.startswith("/") else "/" + path, None
+        return "", f"invalid URL {component} encoding"
+    if "%" in current:
+        return current, f"URL {component} encoding did not stabilize"
+    if any(ord(character) < 32 or ord(character) == 127 for character in current):
+        return current, f"unsafe URL {component} control character"
+    if component == "path":
+        if "\\" in current:
+            return current, "unsafe URL path"
+        if any(segment in {".", ".."} for segment in current.split("/")):
+            return current, "URL path traversal is forbidden"
+        current = current if current.startswith("/") else "/" + current
+    return current, None
 
 
-def _safe_discovery_url(url: str) -> str:
-    """Remove credentials, fragments, and secret-like query values."""
+def _safe_path(raw_path: str) -> tuple[str, str | None]:
+    return _decode_url_component(raw_path or "/", component="path")
+
+
+def _encode_path(path: str) -> str:
+    from urllib.parse import quote
+    return quote(path, safe="/-._~")
+
+
+def _encode_query(query: str) -> str:
+    from urllib.parse import quote
+    return quote(query, safe="=&+-._~")
+
+
+def _canonical_search_endpoint(
+    endpoint: str, *, required_host: str | None = None,
+) -> tuple[str, str]:
+    try:
+        parsed = urlsplit(str(endpoint).strip())
+        port = parsed.port
+    except ValueError as exc:
+        raise SourceDenied("search endpoint URL is invalid") from exc
+    host = _normalize_hostname(parsed.hostname)
+    if (
+        parsed.scheme.lower() != "https"
+        or not host
+        or port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+        or bool(parsed.fragment)
+    ):
+        raise SourceDenied(
+            "search endpoint must be credential-free HTTPS on port 443 without a fragment"
+        )
+    if required_host is not None and host != required_host:
+        raise SourceDenied("search endpoint host changed")
+    path, path_error = _decode_url_component(parsed.path or "/", component="path")
+    if path_error:
+        raise SourceDenied(path_error)
+    try:
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True, max_num_fields=50)
+    except ValueError as exc:
+        raise SourceDenied("search endpoint query is invalid") from exc
+    canonical_query = urlencode(query_pairs)
+    return urlunsplit(("https", host, _encode_path(path), canonical_query, "")), host
+
+
+def _remaining(deadline: float, monotonic: Callable[[], float]) -> float:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise SourceDenied("web operation hard deadline exceeded")
+    return remaining
+
+
+def _safe_discovery_url(url: str) -> tuple[str, str, str]:
+    """Return content-free denied metadata: URL, host, and sanitized path."""
     try:
         parsed = urlsplit(str(url).strip())
         host = _normalize_hostname(parsed.hostname)
-        port = parsed.port
     except ValueError:
-        return ""
+        return "", "", "/[REDACTED]"
     if not host:
-        return ""
-    netloc = host + (f":{port}" if port else "")
-    query = urlencode([
-        (mask_secrets(key)[:100], mask_secrets(value)[:300])
-        for key, value in parse_qsl(parsed.query, keep_blank_values=True)[:20]
-    ])
-    return urlunsplit((parsed.scheme.lower(), netloc, parsed.path or "/", query, ""))
+        return "", "", "/[REDACTED]"
+    host = mask_secrets(host)[:253]
+    path, path_error = _decode_url_component(parsed.path or "/", component="path")
+    suspicious = path == "/[REDACTED]" or (
+        bool(path_error)
+        or len(path) > 300
+        or mask_secrets(path) != path
+        or any(_looks_high_entropy(token) for token in _TOKEN_RE.findall(path))
+    )
+    safe_path = "/[REDACTED]" if suspicious else _encode_path(path)[:300]
+    return f"https://{host}{safe_path}", host, safe_path
 
 
 _CREDENTIAL_QUERY_RE = re.compile(
@@ -444,15 +560,14 @@ def discover(
     unapproved: list[SearchCandidate] = []
     suppressed = 0
     for candidate in candidates:
-        safe_url = _safe_discovery_url(candidate.url)
-        decision = source_policy.classify(safe_url)
+        decision = source_policy.classify(candidate.url)
         if decision.approved:
             title, _ = mask_and_truncate(str(candidate.title or ""), 300)
             snippet, _ = mask_and_truncate(str(candidate.snippet or ""), 500)
             normalized = replace(
                 candidate,
                 title=title,
-                url=safe_url,
+                url=decision.canonical_url or "",
                 snippet=snippet,
                 host=decision.host,
                 path=decision.path,
@@ -465,12 +580,13 @@ def discover(
                 suppressed += 1
         else:
             # Never retain provider-controlled content for unapproved sources.
+            safe_url, safe_host, safe_path = _safe_discovery_url(candidate.url)
             unapproved.append(SearchCandidate(
                 title=None,
                 url=safe_url,
                 snippet=None,
-                host=decision.host,
-                path=decision.path,
+                host=safe_host,
+                path=safe_path,
                 denial_reason=decision.reason,
             ))
     return SearchDiscovery(
@@ -487,13 +603,14 @@ def source_access_request(
     purpose: str,
     authority_reason: str = "",
 ) -> SourceAccessRequest:
-    if not candidate.host:
+    safe_url, safe_host, _ = _safe_discovery_url(candidate.url)
+    if not safe_host:
         raise ValueError("source access candidate requires a host")
     if not str(obligation_id).strip() or not str(purpose).strip():
         raise ValueError("source access request requires obligation_id and purpose")
     return SourceAccessRequest(
-        host=candidate.host,
-        candidate_url=candidate.url,
+        host=safe_host,
+        candidate_url=safe_url,
         obligation_id=mask_secrets(str(obligation_id).strip())[:160],
         purpose=mask_secrets(str(purpose).strip())[:1000],
         authority_reason=mask_secrets(str(authority_reason).strip())[:1000],
@@ -516,23 +633,54 @@ _METADATA_ADDRESSES = frozenset({
 })
 
 
-def _default_resolver(host: str, port: int) -> list[str]:
-    addresses = []
-    for item in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
-        address = item[4][0]
-        if address not in addresses:
-            addresses.append(address)
-    return addresses
+def _default_resolver(host: str, port: int, timeout: float | None = None) -> list[str]:
+    def resolve() -> list[str]:
+        resolved = []
+        for item in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+            address = item[4][0]
+            if address not in resolved:
+                resolved.append(address)
+        return resolved
+
+    if timeout is None:
+        return resolve()
+    outcome: queue.Queue[tuple[bool, object]] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            outcome.put((True, resolve()))
+        except Exception as exc:  # pragma: no cover - platform resolver detail
+            outcome.put((False, exc))
+
+    thread = threading.Thread(target=worker, daemon=True, name="secure-web-dns")
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise TimeoutError("DNS resolution exceeded the web operation deadline")
+    succeeded, value = outcome.get_nowait()
+    if not succeeded:
+        if isinstance(value, BaseException):
+            raise value
+        raise OSError("DNS resolution failed")
+    return list(value) if isinstance(value, list) else []
 
 
 def _public_addresses(
-    host: str, port: int, resolver: Callable[[str, int], Sequence[str]],
+    host: str,
+    port: int,
+    resolver: Callable[..., Sequence[str]],
+    timeout: float | None = None,
 ) -> tuple[str, ...]:
     try:
         literal = ipaddress.ip_address(host)
     except ValueError:
         try:
-            raw_addresses = resolver(host, port)
+            try:
+                inspect.signature(resolver).bind(host, port, timeout)
+            except (TypeError, ValueError):
+                raw_addresses = resolver(host, port)
+            else:
+                raw_addresses = resolver(host, port, timeout)
         except Exception as exc:
             raise SourceDenied("source address resolution failed") from exc
     else:
@@ -579,23 +727,44 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 class StdlibHttpTransport:
     """Credential-free HTTPS transport pinned to an approved resolved IP."""
 
-    def __init__(self, *, ssl_context: ssl.SSLContext | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        ssl_context: ssl.SSLContext | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._ssl_context = ssl_context or ssl.create_default_context()
+        self._monotonic = monotonic
 
     def request(self, request: HttpRequest) -> HttpResponse:
         parsed = urlsplit(request.url)
         port = parsed.port or 443
+        deadline = request.deadline or (self._monotonic() + request.timeout)
         connection = _PinnedHTTPSConnection(
             parsed.hostname or "", port, request.resolved_ip,
-            request.timeout, self._ssl_context,
+            _remaining(deadline, self._monotonic), self._ssl_context,
         )
         target = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         try:
+            connection.connect()
+            connection.sock.settimeout(_remaining(deadline, self._monotonic))
             connection.request("GET", target, headers=dict(request.headers))
+            connection.sock.settimeout(_remaining(deadline, self._monotonic))
             response = connection.getresponse()
             headers = {key.lower(): value for key, value in response.getheaders()}
-            body = response.read(request.max_bytes + 1)
-            return HttpResponse(response.status, headers, body)
+            chunks = []
+            size = 0
+            while size <= request.max_bytes:
+                connection.sock.settimeout(_remaining(deadline, self._monotonic))
+                chunk = response.read(min(16 * 1024, request.max_bytes + 1 - size))
+                _remaining(deadline, self._monotonic)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            return HttpResponse(response.status, headers, b"".join(chunks))
+        except (TimeoutError, socket.timeout) as exc:
+            raise SourceDenied("web operation hard deadline exceeded") from exc
         finally:
             connection.close()
 
@@ -667,11 +836,12 @@ class SecureFetcher:
         max_bytes: int = 64 * 1024,
         allowed_mime_types: Iterable[str] = _ALLOWED_MIME_TYPES,
         clock: Callable[[], float] = time.time,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if timeout <= 0 or max_bytes <= 0 or max_redirects < 0:
             raise ValueError("secure fetch limits are invalid")
         self.policy = policy
-        self.transport = transport or StdlibHttpTransport()
+        self.transport = transport or StdlibHttpTransport(monotonic=monotonic)
         self.resolver = resolver or _default_resolver
         self.evidence_store = evidence_store
         self.timeout = timeout
@@ -681,6 +851,7 @@ class SecureFetcher:
             str(item).strip().lower() for item in allowed_mime_types
         )
         self.clock = clock
+        self.monotonic = monotonic
 
     def fetch(
         self,
@@ -691,6 +862,7 @@ class SecureFetcher:
     ) -> FetchedEvidence:
         original_url = str(url).strip()
         current_url = original_url
+        deadline = self.monotonic() + self.timeout
         final_decision: SourceDecision | None = None
         response: HttpResponse | None = None
         for redirect_count in range(self.max_redirects + 1):
@@ -698,14 +870,21 @@ class SecureFetcher:
             if not decision.approved:
                 boundary = "redirect" if redirect_count else "source"
                 raise SourceDenied(f"{boundary} denied: {decision.reason}")
+            current_url = decision.canonical_url or current_url
             parsed = urlsplit(current_url)
             port = parsed.port or 443
-            addresses = _public_addresses(decision.host, port, self.resolver)
+            _remaining(deadline, self.monotonic)
+            addresses = _public_addresses(
+                decision.host, port, self.resolver,
+                _remaining(deadline, self.monotonic),
+            )
+            remaining = _remaining(deadline, self.monotonic)
             request = HttpRequest(
                 url=current_url,
                 resolved_ip=addresses[0],
-                timeout=self.timeout,
+                timeout=remaining,
                 max_bytes=self.max_bytes,
+                deadline=deadline,
                 headers={
                     "Accept": "text/plain, text/html, text/markdown, application/json, application/xml",
                     "Accept-Encoding": "identity",
@@ -718,6 +897,7 @@ class SecureFetcher:
                 raise
             except Exception as exc:
                 raise SourceDenied("secure fetch transport failed") from exc
+            _remaining(deadline, self.monotonic)
             if response.status not in _REDIRECT_STATUSES:
                 final_decision = decision
                 break
@@ -773,6 +953,7 @@ class SecureFetcher:
                 now=provenance.retrieved_at,
             )
             evidence_id = record.id
+        _remaining(deadline, self.monotonic)
         return FetchedEvidence(
             content=bounded,
             content_hash=content_hash,
