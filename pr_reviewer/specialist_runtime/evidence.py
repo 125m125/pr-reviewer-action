@@ -311,6 +311,65 @@ class EvidenceStore:
         self._failed_attempts = 0
         self._refreshes = 0
 
+    @classmethod
+    def from_snapshot(
+        cls,
+        snapshot: EvidenceSnapshot,
+        *,
+        max_content_bytes: int = 64 * 1024,
+    ) -> "EvidenceStore":
+        """Create an isolated mutable store seeded from one immutable snapshot."""
+        if not isinstance(snapshot, EvidenceSnapshot):
+            raise TypeError("snapshot must be an EvidenceSnapshot")
+        store = cls(max_content_bytes=max_content_bytes)
+        for record in snapshot.records:
+            if record.id in store._records:
+                raise ValueError(f"duplicate evidence id in snapshot: {record.id}")
+            store._records[record.id] = record
+            if record.is_usable_for_coverage:
+                store._successful_canonical[record.canonical_key] = record.id
+        store._failed_attempts = sum(
+            1 for record in snapshot.records if not record.is_usable_for_coverage
+        )
+        store._refreshes = sum(":refresh:" in record.id for record in snapshot.records)
+        return store
+
+    def merge_completed_snapshot(self, snapshot: EvidenceSnapshot) -> tuple[str, ...]:
+        """Merge a completed worker snapshot in stable ID order on its owner thread."""
+        if not isinstance(snapshot, EvidenceSnapshot):
+            raise TypeError("snapshot must be an EvidenceSnapshot")
+        changed: list[str] = []
+        for record in sorted(snapshot.records, key=lambda item: item.id):
+            existing = self._records.get(record.id)
+            if existing is not None:
+                if (
+                    existing.canonical_key != record.canonical_key
+                    or existing.content_hash != record.content_hash
+                    or existing.status != record.status
+                ):
+                    raise ValueError(f"conflicting evidence id during merge: {record.id}")
+                imported_by = tuple(sorted(set(existing.imported_by).union(record.imported_by)))
+                if imported_by != existing.imported_by:
+                    self._records[record.id] = replace(existing, imported_by=imported_by)
+                    changed.append(record.id)
+                continue
+            canonical_existing_id = self._successful_canonical.get(record.canonical_key)
+            if record.is_usable_for_coverage and canonical_existing_id is not None:
+                canonical_existing = self._records[canonical_existing_id]
+                imported_by = tuple(sorted(
+                    set(canonical_existing.imported_by).union(record.imported_by)
+                ))
+                self._records[canonical_existing_id] = replace(
+                    canonical_existing, imported_by=imported_by,
+                )
+                changed.append(canonical_existing_id)
+                continue
+            self._records[record.id] = record
+            if record.is_usable_for_coverage:
+                self._successful_canonical[record.canonical_key] = record.id
+            changed.append(record.id)
+        return tuple(sorted(set(changed)))
+
     def add_tool_result(
         self,
         *,

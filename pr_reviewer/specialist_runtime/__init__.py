@@ -1,6 +1,7 @@
 """Continuous specialist-review runtime primitives."""
 
 from .budget import BudgetExceeded, BudgetExhausted, BudgetLedger, RunDeadline, SessionLease
+from .coverage import SessionOwnership, session_ownership_for_assignment
 from .events import RunArtifactProjector, RunEvent
 from .session import SessionResult, SpecialistSession
 from .types import (
@@ -39,9 +40,11 @@ __all__ = [
     "RunEvent",
     "RunPhase",
     "SessionLease",
+    "SessionOwnership",
     "SessionCheckpoint",
     "SessionResult",
     "SessionState",
     "SpecialistAssignment",
     "SpecialistSession",
+    "session_ownership_for_assignment",
 ]

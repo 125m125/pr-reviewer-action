@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from threading import Lock
+from math import isfinite
+import re
+from threading import BoundedSemaphore, Lock, Thread
 from types import MappingProxyType
 from typing import Callable, Mapping
 
@@ -13,13 +15,35 @@ from scripts.redact import mask_secrets
 _MAX_EVENT_STRING = 1000
 _MAX_EVENT_ITEMS = 100
 _SENSITIVE_KEYS = frozenset({
-    "api_key", "authorization", "cookie", "password", "secret", "token",
+    "api_key", "authorization", "cookie", "credential", "password", "secret", "token",
 })
+_INLINE_SECRET = re.compile(
+    r"(?i)(?:api[_-]?key|access[_-]?token|auth(?:orization)?|cookie|credential|"
+    r"password|secret|token)\s*[:=]\s*[^\s,;]+"
+)
+
+
+def _sensitive_key(value: str) -> bool:
+    tokens = tuple(item for item in re.split(r"[^a-z0-9]+", value.lower()) if item)
+    return any(item in _SENSITIVE_KEYS or item in {"auth", "apikey"} for item in tokens)
+
+
+def _safe_masked_string(value: object) -> str:
+    try:
+        return _INLINE_SECRET.sub(
+            "[REDACTED]", mask_secrets(str(value)),
+        )[:_MAX_EVENT_STRING]
+    except BaseException:
+        return "[unserializable]"
 
 
 def _freeze_json(value: object) -> object:
     """Take a deterministic immutable snapshot of JSON-like payload data."""
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        if not isfinite(value):
+            raise ValueError("event payload numbers must be finite")
         return value
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
@@ -45,12 +69,14 @@ def _bounded_json(value: object, *, key: str = "", depth: int = 0) -> object:
     """Redact and bound untrusted event values before they enter the journal."""
     if depth > 8:
         return "[bounded]"
-    if key.strip().lower() in _SENSITIVE_KEYS:
+    if _sensitive_key(key):
         return "[REDACTED]"
-    if value is None or isinstance(value, (bool, int, float)):
+    if value is None or isinstance(value, (bool, int)):
         return value
+    if isinstance(value, float):
+        return value if isfinite(value) else "[invalid-number]"
     if isinstance(value, str):
-        return mask_secrets(value)[:_MAX_EVENT_STRING]
+        return _safe_masked_string(value)
     if hasattr(value, "value") and isinstance(getattr(value, "value"), str):
         return _bounded_json(getattr(value, "value"), key=key, depth=depth + 1)
     if isinstance(value, Mapping):
@@ -58,9 +84,12 @@ def _bounded_json(value: object, *, key: str = "", depth: int = 0) -> object:
             raise TypeError("event payload object keys must be strings")
         result: dict[str, object] = {}
         for raw_key in sorted(value)[:_MAX_EVENT_ITEMS]:
-            result[raw_key] = _bounded_json(
-                value[raw_key], key=raw_key, depth=depth + 1,
-            )
+            try:
+                result[raw_key] = _bounded_json(
+                    value[raw_key], key=raw_key, depth=depth + 1,
+                )
+            except BaseException:
+                result[raw_key] = "[unserializable]"
         return result
     if isinstance(value, (set, frozenset)):
         value = tuple(sorted(value, key=str))
@@ -70,7 +99,7 @@ def _bounded_json(value: object, *, key: str = "", depth: int = 0) -> object:
             _bounded_json(item, depth=depth + 1)
             for item in values[:_MAX_EVENT_ITEMS]
         ]
-    return mask_secrets(str(value))[:_MAX_EVENT_STRING]
+    return _safe_masked_string(value)
 
 
 @dataclass(frozen=True)
@@ -96,11 +125,17 @@ class EventJournal:
     def __init__(
         self,
         external_sink: Callable[[RunEvent], None] | None = None,
+        *,
+        observer_timeout_sec: float = 0.01,
     ) -> None:
+        if not isfinite(observer_timeout_sec) or observer_timeout_sec < 0:
+            raise ValueError("observer_timeout_sec must be finite and non-negative")
         self._events: list[RunEvent] = []
         self._lock = Lock()
         self._external_sink = external_sink
+        self._observer_timeout_sec = float(observer_timeout_sec)
         self._external_errors: list[str] = []
+        self._observer_slots = BoundedSemaphore(4)
 
     def emit(self, kind: str, payload: Mapping[str, object] | None = None) -> RunEvent:
         bounded = _bounded_json(dict(payload or {}))
@@ -114,13 +149,28 @@ class EventJournal:
             )
             self._events.append(event)
         if self._external_sink is not None:
-            try:
-                self._external_sink(event)
-            except Exception as exc:  # noqa: BLE001 - observation cannot abort a run
+            if not self._observer_slots.acquire(blocking=False):
                 with self._lock:
-                    self._external_errors.append(
-                        mask_secrets(f"{type(exc).__name__}: {exc}")[:_MAX_EVENT_STRING]
-                    )
+                    self._external_errors.append("event observer capacity exceeded")
+                return event
+
+            def observe() -> None:
+                try:
+                    self._external_sink(event)
+                except BaseException as exc:  # observation can never abort a run
+                    with self._lock:
+                        self._external_errors.append(
+                            f"{type(exc).__name__}: {_safe_masked_string(exc)}"[
+                                :_MAX_EVENT_STRING
+                            ]
+                        )
+                finally:
+                    self._observer_slots.release()
+
+            observer = Thread(target=observe, name="review-event-observer", daemon=True)
+            observer.start()
+            if self._observer_timeout_sec:
+                observer.join(self._observer_timeout_sec)
         return event
 
     def snapshot(self) -> tuple[RunEvent, ...]:

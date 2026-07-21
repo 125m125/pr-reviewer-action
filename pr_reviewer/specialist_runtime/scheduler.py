@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import dataclass
+from queue import Empty, Queue
+from threading import Lock, Thread
 import time
 from typing import Protocol
 
@@ -47,6 +49,13 @@ class AssignmentResult:
 
     assignment_id: str
     session_result: SessionResult
+    session: ScheduledSession | None = None
+
+
+@dataclass(frozen=True)
+class _CompletedSession:
+    session: ScheduledSession
+    result: SessionResult
 
 
 @dataclass(frozen=True)
@@ -72,6 +81,65 @@ class WaveResult:
 @dataclass(frozen=True)
 class _WorkerDeclined:
     """A submitted worker observed cutoff before constructing its session."""
+
+
+class _DaemonExecutor:
+    """Small bounded executor whose abandoned workers cannot hold process exit."""
+
+    def __init__(self, max_workers: int) -> None:
+        self._queue: Queue[tuple[Future[object], Callable[..., object], tuple[object, ...]] | None] = Queue()
+        self._lock = Lock()
+        self._shutdown = False
+        self._threads = tuple(
+            Thread(
+                target=self._worker,
+                name=f"ThreadPoolExecutor-daemon-{index}",
+                daemon=True,
+            )
+            for index in range(max_workers)
+        )
+        for thread in self._threads:
+            thread.start()
+
+    def submit(self, callback: Callable[..., object], *args: object) -> Future[object]:
+        future: Future[object] = Future()
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("executor is shut down")
+            self._queue.put((future, callback, args))
+        return future
+
+    def _worker(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            future, callback, args = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                result = callback(*args)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+    def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+        with self._lock:
+            self._shutdown = True
+            if cancel_futures:
+                while True:
+                    try:
+                        item = self._queue.get_nowait()
+                    except Empty:
+                        break
+                    if item is not None:
+                        item[0].cancel()
+            for _ in self._threads:
+                self._queue.put(None)
+        if wait:
+            for thread in self._threads:
+                thread.join()
 
 
 def _assignment_id(assignment: object) -> str:
@@ -143,7 +211,7 @@ class SessionScheduler:
 
     def _run_assignment(
         self, assignment: object, lease: SessionLease,
-    ) -> SessionResult | _WorkerDeclined:
+    ) -> _CompletedSession | _WorkerDeclined:
         # Factory construction belongs inside the worker so each worker owns all
         # mutable session state. Only the frozen wave snapshot crosses workers.
         if not self._can_launch(lease):
@@ -151,7 +219,7 @@ class SessionScheduler:
         session = self.session_factory(assignment, lease, self.wave_snapshot)
         if not self._can_launch(lease):
             return _WorkerDeclined()
-        return session.explore()
+        return _CompletedSession(session=session, result=session.explore())
 
     def run_wave(
         self,
@@ -173,14 +241,14 @@ class SessionScheduler:
         })
 
         remaining = deque(ordered)
-        active: dict[Future[SessionResult | _WorkerDeclined], object] = {}
-        completed: dict[str, SessionResult] = {}
+        active: dict[Future[_CompletedSession | _WorkerDeclined], object] = {}
+        completed: dict[str, _CompletedSession] = {}
         failed: dict[str, str] = {}
         declined: set[str] = set()
         cancelled: set[str] = set()
         in_flight: set[str] = set()
 
-        def collect(future: Future[SessionResult | _WorkerDeclined]) -> None:
+        def collect(future: Future[_CompletedSession | _WorkerDeclined]) -> None:
             assignment = active.pop(future)
             assignment_id = _assignment_id(assignment)
             if future.cancelled():
@@ -196,7 +264,7 @@ class SessionScheduler:
             else:
                 completed[assignment_id] = outcome
 
-        executor = ThreadPoolExecutor(max_workers=self.concurrency)
+        executor = _DaemonExecutor(self.concurrency)
         cutoff_reached = False
         try:
             # Admission is stable and may queue more work than the executor can
@@ -258,7 +326,11 @@ class SessionScheduler:
             executor.shutdown(wait=not cutoff_reached, cancel_futures=cutoff_reached)
 
         stable_results = tuple(
-            AssignmentResult(assignment_id, completed[assignment_id])
+            AssignmentResult(
+                assignment_id,
+                completed[assignment_id].result,
+                completed[assignment_id].session,
+            )
             for assignment_id in ordered_ids
             if assignment_id in completed
         )

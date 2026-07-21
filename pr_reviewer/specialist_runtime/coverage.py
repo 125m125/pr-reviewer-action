@@ -516,6 +516,29 @@ def _assignment_ownership(
     )
 
 
+def session_ownership_for_assignment(
+    assignment: Assignment | SpecialistAssignment,
+    obligations: Iterable[CoverageObligation],
+    *,
+    session_id: str,
+) -> SessionOwnership:
+    """Build the canonical durable ownership projection for an assignment."""
+    obligation_items = tuple(obligations)
+    obligation_by_id = {item.id: item for item in obligation_items}
+    if len(obligation_by_id) != len(obligation_items):
+        raise ValueError("obligation ids must be unique")
+    primary, secondary, independent = _assignment_ownership(
+        assignment, obligation_by_id,
+    )
+    return SessionOwnership(
+        session_id=session_id,
+        assignment_id=_assignment_id(assignment),
+        primary_obligation_ids=primary,
+        secondary_obligation_ids=secondary,
+        independent_obligation_ids=independent,
+    )
+
+
 def _validated_wave_start(
     snapshot: CoverageSnapshot,
     obligation_by_id: Mapping[str, CoverageObligation],

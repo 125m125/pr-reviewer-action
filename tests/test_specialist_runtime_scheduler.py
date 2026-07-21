@@ -513,6 +513,28 @@ def test_session_exception_is_a_stable_failure_not_not_started():
     ]
 
 
+def test_scheduler_workers_are_daemonized_for_abandoned_in_flight_work():
+    daemon_flags = []
+
+    result = SessionScheduler(
+        deadline=deadline(),
+        session_factory=lambda item, lease, snapshot: FakeSession(
+            session_result(
+                item.id,
+                evidence_ids=(),
+                statuses=((f"OB-{item.id}", ObligationStatus.COVERED),),
+            ),
+            before_result=lambda: daemon_flags.append(current_thread().daemon),
+        ),
+        wave_snapshot=empty_snapshot(),
+        concurrency=1,
+        clock=FakeClock(20.0),
+    ).run_wave((assignment("S1", "critical"),), RunPhase.INITIAL)
+
+    assert result.failures == ()
+    assert daemon_flags == [True]
+
+
 def test_terminal_event_order_is_risk_id_stable_not_completion_order():
     completion = OrderedCompletion(("S2", "S1"))
     events = []

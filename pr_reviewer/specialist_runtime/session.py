@@ -18,6 +18,7 @@ from .types import (
     BudgetUsage,
     CoverageObligation,
     ObligationStatus,
+    RunPhase,
     SessionCheckpoint,
     SessionState,
     SpecialistAssignment,
@@ -462,6 +463,22 @@ class SpecialistSession:
                 if obligation_id in self._assigned_obligation_ids():
                     self.coverage.mark_unresolved(obligation_id)
         self._current_gaps = self._derive_current_gaps()
+
+    def update_lease(self, lease: SessionLease) -> None:
+        """Advance the same durable session to a controller-issued later lease."""
+        if not isinstance(lease, SessionLease):
+            raise TypeError("lease must be a SessionLease")
+        if self._final_result is not None:
+            raise RuntimeError("a finalized session cannot receive a new lease")
+        phase_rank = {
+            RunPhase.PLANNING: 0,
+            RunPhase.INITIAL: 1,
+            RunPhase.FOLLOWUP: 2,
+            RunPhase.FINALIZATION: 3,
+        }
+        if phase_rank[lease.phase] < phase_rank[self.lease.phase]:
+            raise ValueError("session lease phase cannot move backward")
+        self.lease = lease
 
     def _compact_conversation(self) -> None:
         self.conversation.truncate_oldest_tool_results(2_000)
