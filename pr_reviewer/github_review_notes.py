@@ -39,7 +39,7 @@ _GENERAL_MARKER_RE = re.compile(
     r"\s+content=([0-9a-f]{16}))?\s*-->"
 )
 _GENERAL_ANSWER_MARKER_RE = re.compile(
-    r"<!--\s*ai-pr-review-general-answer:([^\s>]+)"
+    r"<!--\s*ai-pr-review-general-answer:([^\s>]+?)"
     r"(?:\s+generation=(\d+)\s+publication=([0-9a-f]{32})"
     r"\s+content=([0-9a-f]{16})|:[0-9a-f]{40,64})\s*-->"
 )
@@ -1482,11 +1482,11 @@ class GitHubReviewPublisher:
                 prior_generation,
                 prior_content_digest,
             )
-            answer_confirmed = (
-                answer_identity in answered_general_identities
-                if has_bound_publication and has_bound_content
-                else fingerprint in legacy_answered_general
-            )
+            answer_confirmed = answer_identity in answered_general_identities
+            if not answer_confirmed and (
+                not has_bound_publication or not has_bound_content
+            ):
+                answer_confirmed = fingerprint in legacy_answered_general
             if not answer_confirmed:
                 answer_marker = (
                     f"<!-- ai-pr-review-general-answer:{fingerprint} "
@@ -1563,6 +1563,51 @@ class GitHubReviewPublisher:
             )
         ), None)
         if completed_review is not None:
+            if not all_details_confirmed:
+                state["review"] = {
+                    "id": completed_review["id"],
+                    "url": None,
+                    "status": "pending_incomplete",
+                    "expected_event": desired_event,
+                    "safety_reason": "one or more intended details are unconfirmed",
+                }
+                state["publication_errors"] = self._errors
+                state["notes"].sort(
+                    key=lambda item: str(item.get("fingerprint", ""))
+                )
+                self._write_state(state)
+                return state
+            pre_reuse_state = self._call(
+                "pre_submit_head_ref_oid",
+                self.client.query_managed_state,
+                repo,
+                pr_number,
+                retry_safe=True,
+            )
+            if (
+                not isinstance(pre_reuse_state, Mapping)
+                or pre_reuse_state.get("head_ref_oid") != head_sha
+            ):
+                self._errors.append({
+                    "operation": "pre_submit_head_ref_oid",
+                    "error": (
+                        "live pull request head could not be confirmed immediately "
+                        "before completed review reuse"
+                    ),
+                })
+                state["review"] = {
+                    "id": completed_review["id"],
+                    "url": None,
+                    "status": "pending_incomplete",
+                    "expected_event": desired_event,
+                    "safety_reason": "live pull request head changed or was not confirmed",
+                }
+                state["publication_errors"] = self._errors
+                state["notes"].sort(
+                    key=lambda item: str(item.get("fingerprint", ""))
+                )
+                self._write_state(state)
+                return state
             state["review_completed"] = True
             state["review"] = {
                 "id": completed_review["id"],

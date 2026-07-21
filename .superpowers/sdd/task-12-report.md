@@ -99,6 +99,15 @@ pull-request head changes during collection.
     head immediately before COMMENT/APPROVE/REQUEST_CHANGES submission. A failed
     query or changed head leaves the review pending without adding the final
     managed-review link.
+16. **Completed-review reuse and legacy-answer migration.** RED showed an exact
+    completed review could override failed status, resolution, or general-answer
+    reconciliation and could be reused after the head changed mid-reconciliation.
+    GREEN applies the detail-confirmation and immediate live-head gates before
+    terminal review reuse or final sticky linking. RED also showed an unbound
+    general request ignored the exact identity written by its migration answer;
+    GREEN recognizes that publication/generation/content identity on later runs
+    while retaining one-time compatibility with legacy fingerprint markers and
+    parsing the legacy `fingerprint:<sha>` suffix unambiguously.
 
 ## Lifecycle and safety review
 
@@ -149,11 +158,11 @@ pull-request head changes during collection.
 
 ## Verification
 
-- Specialist publication module: **109 passed**.
+- Specialist publication module: **115 passed**.
 - Publisher plus build-comment, sanitation, and resolve-thread host-independent
-  coverage: **211 passed, 12 Windows-only end-to-end cases deselected**.
+  coverage: **217 passed, 12 Windows-only end-to-end cases deselected**.
 - Specialist runtime suite: **331 passed**.
-- Full Python suite with UTF-8 mode: **1506 passed, 21 pre-existing Windows-host
+- Full Python suite with UTF-8 mode: **1512 passed, 21 pre-existing Windows-host
   failures**. The failures are the known Windows mode-bit assertion, evidence
   provider subprocess launch behavior, and extensionless fake-bash resolve
   fixtures; no specialist publication test failed.

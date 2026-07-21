@@ -800,6 +800,36 @@ def test_general_request_and_answer_identity_include_publication_generation_and_
     assert f"content={content_digest}" in answer_body
 
 
+def test_unbound_general_answer_migrates_to_exact_identity_once(tmp_path):
+    general = {
+        "fingerprint": "fp-general-migration",
+        "id": 55,
+        "url": _issue_url(55),
+        "body": "legacy unbound request",
+    }
+    first = _FakeClient({"general_comments": [general]})
+    first_result, first_state = _publish(tmp_path, first, notes=())
+    answer_body = next(
+        call[-1] for call in first.calls if call[0] == "general_reply"
+    )
+    answer_marker = answer_body.split(
+        "<!-- ai-pr-review-general-answer:", 1
+    )[1].split(" -->", 1)[0]
+    content_digest = answer_marker.split("content=", 1)[1]
+    completed = _completed_review_from_submit(first, first_state)
+    second = _FakeClient({
+        "general_comments": [general],
+        "general_answered_identities": (
+            f"fp-general-migration:{first_result['publication_id']}:1:{content_digest}",
+        ),
+        "reviews": [completed],
+    })
+
+    _publish(tmp_path, second, notes=())
+
+    assert not any(call[0] == "general_reply" for call in second.calls)
+
+
 def test_unanchored_requests_use_explicitly_non_resolvable_general_comment(tmp_path):
     client = _FakeClient()
     request = _note(
@@ -1015,6 +1045,134 @@ def test_completed_owned_review_marker_makes_rerun_idempotent(tmp_path):
     assert not any(call[0] in {"pending", "add", "submit"} for call in client.calls)
     assert result["review"]["id"] == completed["id"]
     assert result["sticky"]["url"] == _issue_url(100)
+
+
+def test_completed_review_reuse_is_blocked_by_failed_existing_status_reply(tmp_path):
+    note = _note("fp-completed-status")
+    first = _FakeClient()
+    _first_result, first_state = _publish(tmp_path, first, notes=(note,))
+    completed = _completed_review_from_submit(first, first_state)
+
+    class StatusFailureClient(_FakeClient):
+        def reply_thread(self, comment_id, body):
+            self.calls.append(("reply", comment_id, body))
+            return {}
+
+    second = StatusFailureClient({
+        "threads": [{
+            "fingerprint": note.fingerprint,
+            "generation": 1,
+            "thread_id": "thread-completed-status",
+            "comment_id": 56,
+            "url": _discussion_url(56),
+            "is_resolved": False,
+            "owned_comment_bodies": (),
+        }],
+        "reviews": [completed],
+    })
+
+    result, state = _publish(tmp_path, second, notes=(note,))
+
+    assert result["review_completed"] is False
+    assert state["review"]["status"] == "pending_incomplete"
+    assert len([call for call in second.calls if call[0] == "sticky"]) == 1
+
+
+def test_completed_review_reuse_is_blocked_by_failed_resolution(tmp_path):
+    first = _FakeClient()
+    _first_result, first_state = _publish(tmp_path, first, notes=())
+    completed = _completed_review_from_submit(first, first_state)
+
+    class ResolutionFailureClient(_FakeClient):
+        def resolve_thread(self, thread_id):
+            self.calls.append(("resolve", thread_id))
+            return {}
+
+    second = ResolutionFailureClient({
+        "threads": [{
+            "fingerprint": "fp-completed-fixed",
+            "generation": 1,
+            "thread_id": "thread-completed-fixed",
+            "comment_id": 57,
+            "url": _discussion_url(57),
+            "is_resolved": False,
+            "owned_comment_bodies": (),
+        }],
+        "reviews": [completed],
+    })
+
+    result, state = _publish(tmp_path, second, notes=())
+
+    assert result["review_completed"] is False
+    assert state["review"]["status"] == "pending_incomplete"
+    assert len([call for call in second.calls if call[0] == "sticky"]) == 1
+
+
+def test_completed_review_reuse_is_blocked_by_failed_general_answer(tmp_path):
+    first = _FakeClient()
+    _first_result, first_state = _publish(tmp_path, first, notes=())
+    completed = _completed_review_from_submit(first, first_state)
+
+    class GeneralAnswerFailureClient(_FakeClient):
+        def reply_general_comment(self, repo, pr_number, prior, body):
+            self.calls.append(("general_reply", repo, pr_number, prior, body))
+            return {}
+
+    second = GeneralAnswerFailureClient({
+        "general_comments": [{
+            "fingerprint": "fp-completed-general",
+            "id": 58,
+            "url": _issue_url(58),
+            "body": "unanswered general request",
+        }],
+        "reviews": [completed],
+    })
+
+    result, state = _publish(tmp_path, second, notes=())
+
+    assert result["review_completed"] is False
+    assert state["review"]["status"] == "pending_incomplete"
+    assert len([call for call in second.calls if call[0] == "sticky"]) == 1
+
+
+def test_completed_review_reuse_revalidates_head_after_reconciliation(tmp_path):
+    first = _FakeClient()
+    _first_result, first_state = _publish(tmp_path, first, notes=())
+    completed = _completed_review_from_submit(first, first_state)
+
+    class PushDuringReconciliationClient(_FakeClient):
+        def __init__(self):
+            super().__init__({
+                "general_comments": [{
+                    "fingerprint": "fp-completed-push",
+                    "id": 59,
+                    "url": _issue_url(59),
+                    "body": "unanswered general request",
+                }],
+                "reviews": [completed],
+            })
+            self.query_count = 0
+
+        def query_managed_state(self, repo, pr_number):
+            self.calls.append(("query", repo, pr_number))
+            self.query_count += 1
+            return {
+                **self.managed_state,
+                "head_ref_oid": ("a" if self.query_count == 1 else "b") * 40,
+            }
+
+    second = PushDuringReconciliationClient()
+
+    result, state = _publish(tmp_path, second, notes=())
+
+    assert second.query_count == 2
+    assert result["review_completed"] is False
+    assert state["review"]["status"] == "pending_incomplete"
+    assert any(
+        error["operation"] == "pre_submit_head_ref_oid"
+        for error in state["publication_errors"]
+    )
+    assert len([call for call in second.calls if call[0] == "sticky"]) == 1
 
 
 def _completed_review_from_submit(client, state):
@@ -1982,6 +2140,43 @@ def test_managed_state_paginates_threads_comments_and_thread_comments(monkeypatc
     assert sum("ManagedReviewThreads" in query for query, _ in calls) == 2
     assert sum("ManagedIssueComments" in query for query, _ in calls) == 2
     assert sum("ManagedThreadComments" in query for query, _ in calls) == 3
+
+
+def test_managed_state_legacy_answer_marker_stops_fingerprint_before_sha(
+    monkeypatch, tmp_path
+):
+    client = GhReviewClient(action_root=tmp_path)
+    legacy_sha = "c" * 40
+
+    def fake_graphql(query, _variables):
+        if "ManagedReviewIdentity" in query:
+            return {"data": {"viewer": {"login": "bot"}, "repository": {
+                "pullRequest": {
+                    "id": "PR-node", "changedFiles": 0, "headRefOid": "a" * 40
+                }
+            }}}
+        if "ManagedIssueComments" in query:
+            return {"data": {"node": {"comments": _connection([{
+                "databaseId": 60,
+                "url": _issue_url(60),
+                "body": (
+                    "answered\n<!-- ai-pr-review-general-answer:"
+                    f"fp-legacy-answer:{legacy_sha} -->"
+                ),
+                "viewerDidAuthor": True,
+                "author": {"login": "bot"},
+            }])}}}
+        connection = (
+            "reviewThreads" if "ManagedReviewThreads" in query else "reviews"
+        )
+        return {"data": {"node": {connection: _connection([])}}}
+
+    monkeypatch.setattr(client, "_graphql", fake_graphql)
+    monkeypatch.setattr(client, "list_changed_files", lambda *_args: ())
+
+    state = client.query_managed_state("owner/repo", 17)
+
+    assert state["general_answered_fingerprints"] == ("fp-legacy-answer",)
 
 
 def test_managed_state_rejects_incomplete_cursor_and_copied_starter_marker(monkeypatch, tmp_path):
