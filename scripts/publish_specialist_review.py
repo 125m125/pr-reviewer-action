@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -96,6 +97,52 @@ def _artifacts(value: object) -> tuple[tuple[str, str], ...]:
     )
 
 
+_TRUNCATION_NOTE_RE = re.compile(
+    r"file list truncated to first \d+ of \d+ changed files\Z"
+)
+_PR_FILE_KEYS = {
+    "filename", "status", "additions", "deletions", "changes",
+    "previous_filename", "patch",
+}
+
+
+def _changed_files(
+    value: object, *, complete: bool, expected_count: int | None
+) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ValueError("files JSON must be an array")
+    if complete and expected_count is None:
+        raise ValueError(
+            "changed-files count is required for a complete changed-files snapshot"
+        )
+    paths: list[str] = []
+    saw_truncation_note = False
+    for item in value:
+        if isinstance(item, str):
+            paths.append(item)
+            continue
+        if not isinstance(item, Mapping):
+            raise ValueError("each files entry must be a path or PR-file object")
+        if set(item) == {"note"} and isinstance(item.get("note"), str):
+            if not _TRUNCATION_NOTE_RE.fullmatch(item["note"]):
+                raise ValueError("files metadata note entry is invalid")
+            saw_truncation_note = True
+            continue
+        if not set(item).issubset(_PR_FILE_KEYS) or not isinstance(
+            item.get("filename"), str
+        ):
+            raise ValueError("each files entry must contain a valid filename")
+        paths.append(item["filename"])
+    if complete and saw_truncation_note:
+        raise ValueError("complete changed-files snapshot is marked incomplete")
+    if expected_count is not None:
+        if expected_count < 0:
+            raise ValueError("changed-files count must be non-negative")
+        if complete and len(paths) != expected_count:
+            raise ValueError("complete changed-files count does not match the snapshot")
+    return tuple(paths)
+
+
 def _bool(value: str) -> bool:
     normalized = str(value).strip().lower()
     if normalized not in {"true", "false"}:
@@ -111,6 +158,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--diff", required=True)
     parser.add_argument("--files", required=True)
     parser.add_argument("--changed-files-complete", type=_bool, default=False)
+    parser.add_argument("--changed-files-count", type=int)
     parser.add_argument("--diff-complete", type=_bool, default=False)
     parser.add_argument("--policy-result", required=True)
     parser.add_argument("--artifacts")
@@ -132,9 +180,11 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     handoff = _handoff(_json(args.handoff))
     notes = _notes(_json(args.notes))
-    changed_files = _json(args.files)
-    if not isinstance(changed_files, list):
-        raise ValueError("files JSON must be an array")
+    changed_files = _changed_files(
+        _json(args.files),
+        complete=args.changed_files_complete,
+        expected_count=args.changed_files_count,
+    )
     policy = _policy(_json(args.policy_result))
     artifacts = _artifacts(_json(args.artifacts) if args.artifacts else None)
     client = GhReviewClient(action_root=args.action_root)
