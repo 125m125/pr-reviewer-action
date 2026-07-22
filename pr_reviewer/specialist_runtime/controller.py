@@ -43,6 +43,7 @@ from .budget import BudgetLedger, RunDeadline, SessionLease
 from .callbacks import (
     CALLBACK_POOL,
     CallbackTimedOut,
+    format_callback_error,
     freeze_callback_value,
     mask_runtime_text,
 )
@@ -637,10 +638,7 @@ def _digest(value: object) -> str:
 
 
 def _bounded_error(exc: BaseException) -> str:
-    try:
-        return _mask_runtime_text(f"{type(exc).__name__}: {exc}")[:1000]
-    except BaseException:
-        return f"{type(exc).__name__}: [unprintable error]"
+    return format_callback_error(exc)
 
 
 def _budget_projection(value: BudgetUsage) -> dict[str, object]:
@@ -2217,12 +2215,7 @@ class ReviewController:
         terminal_capture: Mapping[str, object],
         exc: BaseException,
     ) -> ReviewResult:
-        try:
-            error = mask_runtime_text(
-                f"{type(exc).__name__}: {exc}", limit=1000,
-            )
-        except BaseException:
-            error = f"{type(exc).__name__}: [unprintable terminal failure]"
+        error = format_callback_error(exc)
         try:
             obligations = tuple(terminal_capture.get("obligations", ()))
         except BaseException:

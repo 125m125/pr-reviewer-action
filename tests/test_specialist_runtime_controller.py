@@ -1877,6 +1877,70 @@ def test_hostile_validator_cannot_escape_last_resort_terminal_shell(tmp_path):
     assert "private" not in json.dumps(result.artifact)
 
 
+def test_metaclass_hostile_validator_cannot_escape_last_resort_terminal_shell(tmp_path):
+    class HostileExceptionMeta(type):
+        def __getattribute__(cls, name):
+            if name == "__name__":
+                raise KeyboardInterrupt("hostile type name secret=private")
+            return super().__getattribute__(name)
+
+    class HostileTerminalError(BaseException, metaclass=HostileExceptionMeta):
+        def __str__(self):
+            raise KeyboardInterrupt("hostile str secret=private")
+
+        def __repr__(self):
+            raise KeyboardInterrupt("hostile repr secret=private")
+
+    class HostileValidatorController(ReviewController):
+        @staticmethod
+        def _validate_artifact(artifact):
+            del artifact
+            raise HostileTerminalError()
+
+    result = HostileValidatorController(
+        planner=_planner_role,
+        session_factory=_factory,
+        critic=_critic_role,
+        finalizer=_finalizer,
+        clock=lambda: 0.0,
+        artifact_output_root=tmp_path,
+    ).run(_inputs(tmp_path))
+
+    assert isinstance(result, ReviewResult)
+    assert result.artifact["schema_version"] == 2
+    assert result.verdict_source == "controller-terminal-fallback"
+    assert result.publishing_ready is False
+    assert result.artifact_write_error == "BaseException: [unserializable]"
+    assert "private" not in json.dumps(result.artifact)
+
+
+def test_last_resort_formats_metaclass_hostile_exception_without_escaping(tmp_path):
+    class HostileExceptionMeta(type):
+        def __getattribute__(cls, name):
+            if name == "__name__":
+                raise KeyboardInterrupt("hostile terminal type name")
+            return super().__getattribute__(name)
+
+    class HostileTerminalError(BaseException, metaclass=HostileExceptionMeta):
+        def __str__(self):
+            raise KeyboardInterrupt("hostile terminal str")
+
+        def __repr__(self):
+            raise KeyboardInterrupt("hostile terminal repr")
+
+    class BrokenController(ReviewController):
+        def _run_impl(self, inputs, terminal_capture):
+            del inputs, terminal_capture
+            raise HostileTerminalError()
+
+    result = BrokenController(artifact_output_root=tmp_path).run(_inputs(tmp_path))
+
+    assert isinstance(result, ReviewResult)
+    assert result.verdict_source == "controller-terminal-fallback"
+    assert result.publishing_ready is False
+    assert result.artifact_write_error == "BaseException: [unserializable]"
+
+
 def test_hostile_writer_and_observer_never_escape_terminal_result(tmp_path):
     def writer(path, artifact):
         del path, artifact

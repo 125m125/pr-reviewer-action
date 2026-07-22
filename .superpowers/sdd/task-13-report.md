@@ -41,8 +41,9 @@ Implemented only Task 13 of the specialist-session runtime plan.
   Task 14 wiring.
 - The outer terminal shell catches post-identity `BaseException` failures from
   controller execution/projection and returns a frozen, schema-v2, non-publishable
-  human-review result. Hostile callback exceptions are bounded without trusting
-  their `__str__`, `__repr__`, or metaclass-provided type name.
+  human-review result. Both ordinary controller degradation and last-resort
+  projection use the shared callback-error formatter, without trusting exception
+  `__str__`, `__repr__`, or a metaclass-provided type name.
 
 The two unrelated untracked July 12 documents were not edited, staged, or
 committed.
@@ -131,6 +132,13 @@ After the minimal end-to-end orchestration implementation, the test passed.
 - A factory exception whose metaclass raises on `__name__` first escaped the
   scheduler collector and interrupted pytest. It is now isolated as the stable
   diagnostic `BaseException: [unserializable]`, while the sibling result merges.
+- A later terminal-shell regression exposed two duplicated controller formatters:
+  `_bounded_error` retried the hostile type-name access in its own fallback, and
+  `_last_resort_result` repeated the same unsafe fallback. A pathological
+  validator first replaced the original diagnostic with the formatter's
+  `KeyboardInterrupt`, while a direct outer-shell injection escaped completely.
+  Both paths now use `format_callback_error`; each returns a `ReviewResult` with
+  the stable redacted diagnostic `BaseException: [unserializable]`.
 
 ## Failure matrix
 
@@ -226,19 +234,19 @@ replacement, and POSIX replacement is relative to the already-opened root fd.
 Focused controller/scheduler/session:
 
 ```text
-104 passed
+106 passed
 ```
 
 Full specialist runtime:
 
 ```text
-397 passed
+399 passed
 ```
 
 Full Python suite with UTF-8 mode:
 
 ```text
-1578 passed, 21 failed, 2 warnings
+1580 passed, 21 failed, 2 warnings
 ```
 
 The 21 failures exactly match the approved Windows baseline categories: one
