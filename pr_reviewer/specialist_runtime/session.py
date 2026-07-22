@@ -11,10 +11,11 @@ from pr_reviewer.conversation import Conversation
 from pr_reviewer.tool_loop import decode_native_tool_arguments, native_tool_request_key
 
 from .budget import BudgetExhausted, BudgetLedger, SessionLease
-from .callbacks import CALLBACK_POOL, CallbackTimedOut, mask_runtime_text
+from .callbacks import CALLBACK_POOL, CallbackTimedOut, format_callback_error
 from .coverage import CoverageLedger
 from .evidence import EvidenceRecord, EvidenceStore
 from .model_gateway import ModelGateway, ModelTurnRequest, ModelTurnResult
+from .request_attempts import RequestAttemptJournal
 from .types import (
     BudgetUsage,
     CoverageObligation,
@@ -203,6 +204,11 @@ class SpecialistSession:
         self._successful_requests: dict[str, EvidenceRecord] = {}
         self._final_result: SessionResult | None = None
         self._request_events: list[SpecialistRequestEvent] = []
+        self._request_attempt_journal: RequestAttemptJournal | None = None
+        self._request_assignment_id = str(getattr(
+            assignment, "assignment_id", getattr(assignment, "id", ""),
+        ))
+        self._request_turn = 0
         if not self.conversation.events:
             self.conversation.add_user(self._assignment_prompt())
 
@@ -231,6 +237,14 @@ class SpecialistSession:
     def request_events(self) -> tuple[SpecialistRequestEvent, ...]:
         return tuple(self._request_events)
 
+    def bind_request_attempt_journal(
+        self, journal: RequestAttemptJournal, assignment_id: str,
+    ) -> None:
+        if self._request_attempt_journal not in {None, journal}:
+            raise RuntimeError("specialist request journal cannot be rebound")
+        self._request_attempt_journal = journal
+        self._request_assignment_id = str(assignment_id)
+
     def _assigned_obligation_ids(self) -> tuple[str, ...]:
         primary = tuple(getattr(self.assignment, "primary_obligation_ids", ()))
         all_ids = tuple(getattr(self.assignment, "obligation_ids", ()))
@@ -254,8 +268,8 @@ class SpecialistSession:
             else min(self.max_tokens, remaining_output_tokens)
         )
         timeout = self.lease.request_timeout(self.request_timeout_sec)
-        self.budget.reserve_model_turn()
-        request_id = f"{self.session_id}:model:{len(self._request_events) // 2 + 1}"
+        self._request_turn += 1
+        request_id = f"{self.session_id}:model:{self._request_turn}"
         schema_name = (
             "specialist_checkpoint" if schema is _CHECKPOINT_SCHEMA
             else "specialist_final" if schema is _FINAL_SCHEMA else None
@@ -263,7 +277,18 @@ class SpecialistSession:
         self._request_events.append(SpecialistRequestEvent(
             request_id, "started", tools_enabled, schema_name,
         ))
+        if self._request_attempt_journal is not None:
+            self._request_attempt_journal.start(
+                request_id=request_id,
+                session_id=self.session_id,
+                assignment_id=self._request_assignment_id,
+                phase=self.lease.phase.value,
+                turn=self._request_turn,
+                input_tokens=estimated_input_tokens,
+                max_output_tokens=request_max_tokens,
+            )
         try:
+            self.budget.reserve_model_turn()
             request = ModelTurnRequest(
                 role="specialist", conversation=self.conversation,
                 max_tokens=request_max_tokens, response_schema=schema,
@@ -277,15 +302,21 @@ class SpecialistSession:
                 name="specialist-gateway",
             )
         except BaseException as exc:
-            error_text = mask_runtime_text(exc, limit=450)
+            terminal_status = (
+                "timed_out" if isinstance(exc, CallbackTimedOut) else "failed"
+            )
+            if self._request_attempt_journal is not None:
+                self._request_attempt_journal.finish(request_id, terminal_status)
             self._request_events.append(SpecialistRequestEvent(
                 request_id,
-                "timed_out" if isinstance(exc, CallbackTimedOut) else "failed",
+                terminal_status,
                 tools_enabled,
                 schema_name,
-                f"{type(exc).__name__}: {error_text}"[:500],
+                format_callback_error(exc, limit=500),
             ))
             raise
+        if self._request_attempt_journal is not None:
+            self._request_attempt_journal.finish(request_id, "completed")
         self._request_events.append(SpecialistRequestEvent(
             request_id, "completed", tools_enabled, schema_name,
         ))

@@ -12,8 +12,10 @@ import time
 from typing import Protocol
 
 from .budget import RunDeadline, SessionLease
+from .callbacks import format_callback_error
 from .coverage import CoverageSnapshot
 from .evidence import EvidenceSnapshot
+from .request_attempts import RequestAttempt, RequestAttemptJournal
 from .session import SessionResult
 from .types import ObligationStatus, RunPhase
 
@@ -83,6 +85,7 @@ class WaveResult:
     in_flight_assignment_ids: tuple[str, ...]
     evidence_ids: tuple[str, ...]
     coverage_projection: tuple[tuple[str, ObligationStatus], ...]
+    request_attempts: tuple[RequestAttempt, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -195,6 +198,7 @@ class SessionScheduler:
         wave_snapshot: WaveSnapshot,
         concurrency: int = 1,
         event_sink: EventSink | None = None,
+        request_attempt_journal: RequestAttemptJournal | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not isinstance(concurrency, int) or isinstance(concurrency, bool) or concurrency <= 0:
@@ -206,6 +210,7 @@ class SessionScheduler:
         self.wave_snapshot = wave_snapshot
         self.concurrency = concurrency
         self.event_sink = event_sink
+        self.request_attempt_journal = request_attempt_journal
         self.clock = clock
 
     def _emit(self, kind: str, payload: Mapping[str, object]) -> None:
@@ -229,11 +234,9 @@ class SessionScheduler:
         try:
             result = session.explore()
         except BaseException as exc:
-            try:
-                error = f"{type(exc).__name__}: {exc}"
-            except BaseException:
-                error = f"{type(exc).__name__}: [unprintable error]"
-            return _FailedSession(session=session, error=error[:1000])
+            return _FailedSession(
+                session=session, error=format_callback_error(exc),
+            )
         return _CompletedSession(session=session, result=result)
 
     def run_wave(
@@ -249,6 +252,10 @@ class SessionScheduler:
         if len(set(ordered_ids)) != len(ordered_ids):
             raise ValueError("assignment IDs must be unique within a wave")
         lease = self.deadline.lease_for(normalized_phase)
+        attempt_cursor = (
+            self.request_attempt_journal.cursor()
+            if self.request_attempt_journal is not None else 0
+        )
         self._emit("wave_started", {
             "phase": normalized_phase.value,
             "assignment_ids": ordered_ids,
@@ -277,7 +284,7 @@ class SessionScheduler:
             try:
                 outcome = future.result()
             except BaseException as exc:  # isolate every specialist failure
-                failed[assignment_id] = f"{type(exc).__name__}: {exc}"
+                failed[assignment_id] = format_callback_error(exc)
                 return
             if isinstance(outcome, _WorkerDeclined):
                 declined.add(assignment_id)
@@ -348,6 +355,11 @@ class SessionScheduler:
         finally:
             executor.shutdown(wait=not cutoff_reached, cancel_futures=cutoff_reached)
 
+        request_attempts = (
+            self.request_attempt_journal.close_since(attempt_cursor)
+            if self.request_attempt_journal is not None else ()
+        )
+
         stable_results = tuple(
             AssignmentResult(
                 assignment_id,
@@ -415,4 +427,5 @@ class SessionScheduler:
             in_flight_assignment_ids=in_flight_assignment_ids,
             evidence_ids=tuple(sorted(evidence_ids)),
             coverage_projection=tuple(sorted(coverage.items())),
+            request_attempts=request_attempts,
         )

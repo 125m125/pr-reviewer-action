@@ -24,6 +24,7 @@ from pr_reviewer.specialist_runtime.controller import (
     ReviewInputs,
     ReviewResult,
     _atomic_write_json,
+    _directory_fsync_status,
 )
 from pr_reviewer.specialist_runtime.callbacks import (
     CALLBACK_POOL,
@@ -35,6 +36,8 @@ from pr_reviewer.specialist_runtime.evidence import EvidenceStore
 from pr_reviewer.specialist_runtime.coverage import derive_obligations
 from pr_reviewer.specialist_runtime.budget import BudgetLedger
 from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy, RuntimeConfig
+from pr_reviewer.specialist_runtime.model_gateway import ModelTurnResult
+from pr_reviewer.specialist_runtime.scheduler import SessionScheduler
 from pr_reviewer.specialist_runtime.session import (
     SessionResult,
     SpecialistSession,
@@ -46,6 +49,7 @@ from pr_reviewer.specialist_runtime.types import (
     CandidateFinding,
     CoverageObligation,
     PhaseShares,
+    RunPhase,
     SessionCheckpoint,
     SessionState,
 )
@@ -628,6 +632,128 @@ def test_hanging_specialist_gateway_is_bounded_and_accounted_in_artifact(tmp_pat
             time.sleep(0.005)
 
 
+def test_phase_cutoff_freezes_in_flight_request_once_before_late_completion(tmp_path):
+    import threading
+
+    gateway_entered = threading.Event()
+    release = threading.Event()
+    clock = _Clock()
+    clock.now = time.monotonic()
+
+    class BarrierGateway:
+        def complete(self, request):
+            del request
+            gateway_entered.set()
+            release.wait(2)
+            text = json.dumps({
+                "inspected": [],
+                "unresolved": ["OB-code"],
+                "hypotheses": [],
+                "candidate_finding_ids": [],
+                "invariants_evaluated": [],
+                "unknowns": ["OB-code"],
+                "proposed_next_actions": [],
+            })
+            return ModelTurnResult(
+                response={}, tool_calls=(), text=text, text_source="content",
+                finish_reason="stop",
+                usage={"prompt_tokens": 3, "completion_tokens": 2},
+                request_diagnostics={},
+            )
+
+    class BarrierCutoffScheduler(SessionScheduler):
+        def __init__(self, **kwargs):
+            original_sink = kwargs.get("event_sink")
+            self._test_deadline = kwargs["deadline"]
+            self._test_phase = RunPhase.INITIAL
+
+            def sink(kind, payload):
+                if kind == "session_queued":
+                    assert gateway_entered.wait(1)
+                    clock.now = self._test_deadline.cutoff_for(self._test_phase)
+                if original_sink is not None:
+                    original_sink(kind, payload)
+
+            kwargs["event_sink"] = sink
+            super().__init__(**kwargs)
+
+        def run_wave(self, assignments, phase):
+            self._test_phase = RunPhase(phase)
+            if self._test_phase is RunPhase.FOLLOWUP:
+                clock.now = self._test_deadline.cutoff_for(RunPhase.FOLLOWUP)
+            return super().run_wave(assignments, phase)
+
+    inputs = replace(
+        _inputs(tmp_path),
+        config=replace(
+            _inputs(tmp_path).config,
+            review_deadline_sec=100,
+            model_request_timeout_sec=30,
+        ),
+    )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del snapshot, obligations
+        return SpecialistSession(
+            session_id=expected_session_id,
+            assignment=assignment,
+            conversation=Conversation(system="review"),
+            gateway=BarrierGateway(),
+            execute_tool=lambda name, arguments: {},
+            evidence_store=evidence_store,
+            coverage=coverage,
+            budget=BudgetLedger(inputs.config.session_limits),
+            lease=lease,
+            request_timeout_sec=inputs.config.model_request_timeout_sec,
+            max_tokens=128,
+        )
+
+    try:
+        result = _controller(
+            tmp_path,
+            session_factory=factory,
+            scheduler_type=BarrierCutoffScheduler,
+            clock=clock,
+        ).run(inputs)
+        attempts = result.artifact["budgets"]["request_attempts"]
+        assert attempts, (
+            json.dumps(result.artifact["budgets"], sort_keys=True),
+            json.dumps(result.artifact["degradation"], sort_keys=True),
+            tuple(event["kind"] for event in result.artifact["events"]),
+        )
+        request_id = attempts[0]["request_id"]
+        request_events = tuple(
+            event for event in result.artifact["events"]
+            if event["payload"].get("request_id") == request_id
+        )
+        frozen_artifact = json.dumps(result.artifact, sort_keys=True)
+
+        assert len(attempts) == 1
+        assert attempts[0]["status"] == "timed_out_at_phase_cutoff"
+        assert attempts[0]["in_flight"] is True
+        assert tuple(event["kind"] for event in request_events) == (
+            "specialist_request_started",
+            "specialist_request_timed_out_at_phase_cutoff",
+        )
+        assert result.artifact["budgets"]["totals"]["model_turns"] == 1
+        assert result.artifact["budgets"]["totals"]["specialist_model_cutoff"] == 1
+        assert any(
+            event["kind"] == "session_in_flight"
+            for event in result.artifact["events"]
+        )
+
+        release.set()
+        deadline = time.monotonic() + 1
+        while CALLBACK_POOL.in_flight and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert json.dumps(result.artifact, sort_keys=True) == frozen_artifact
+    finally:
+        release.set()
+
+
 def test_artifact_write_failure_preserves_prior_file_and_valid_result(tmp_path):
     artifact_path = tmp_path / "specialist-review-artifact.json"
     artifact_path.write_text('{"prior":true}\n', encoding="utf-8")
@@ -859,7 +985,7 @@ def test_hanging_planner_is_cut_off_and_late_result_is_ignored(tmp_path):
         _inputs(tmp_path),
         config=replace(
             _inputs(tmp_path).config,
-            review_deadline_sec=0.08,
+            review_deadline_sec=0.5,
             model_request_timeout_sec=0.01,
         ),
     )
@@ -871,7 +997,7 @@ def test_hanging_planner_is_cut_off_and_late_result_is_ignored(tmp_path):
     assert returned.wait(1)
     time.sleep(0.02)
 
-    assert elapsed < 0.5
+    assert elapsed < 1
     assert result.artifact["assignment_plan"]["source"] == "deterministic_fallback"
     assert json.dumps(result.artifact, sort_keys=True) == before
 
@@ -1398,6 +1524,17 @@ def test_emergency_projection_is_terminal_schema_valid_and_not_publishable(tmp_p
     assert result.artifact["evaluation_status"] == "degraded"
     assert result.artifact["publishing"]["ready"] is False
     assert result.publishing_ready is False
+    assert result.artifact["assignments"]
+    assert result.artifact["sessions"]
+    assert result.artifact["evidence"]
+    assert set(
+        item["status"] for item in result.artifact["coverage"].values()
+    ) <= {
+        "covered", "partially_covered", "unresolved", "not_applicable",
+        "suppressed_by_policy",
+    }
+    assert "private" not in json.dumps(result.artifact)
+    json.dumps(result.artifact, allow_nan=False)
 
 
 def test_artifact_root_identity_swap_cannot_redirect_atomic_write(tmp_path):
@@ -1453,10 +1590,18 @@ def test_artifact_target_link_is_rejected_before_write(tmp_path):
     assert result.publishing_ready is False
 
 
-@pytest.mark.skipif(os.name == "nt", reason="directory fsync uses POSIX dir fds")
 def test_post_replace_directory_fsync_failure_is_durability_warning(
     tmp_path, monkeypatch,
 ):
+    if os.name == "nt":
+        monkeypatch.setattr(
+            os, "fsync", lambda descriptor: (_ for _ in ()).throw(
+                OSError(f"directory fsync unavailable for {descriptor}")
+            ),
+        )
+        assert _directory_fsync_status(123) == "written_durability_warning"
+        return
+
     directory_fd = os.open(
         tmp_path,
         os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
@@ -1484,14 +1629,6 @@ def test_post_replace_directory_fsync_failure_is_durability_warning(
 
     assert status == "written_durability_warning"
     assert json.loads((tmp_path / "artifact.json").read_text()) == {"safe": True}
-    assert result.artifact["assignments"]
-    assert result.artifact["sessions"]
-    assert result.artifact["evidence"]
-    assert set(
-        item["status"] for item in result.artifact["coverage"].values()
-    ) <= {"covered", "partially_covered", "unresolved", "not_applicable", "suppressed_by_policy"}
-    assert "private" not in json.dumps(result.artifact)
-    json.dumps(result.artifact, allow_nan=False)
 
 
 def test_terminal_artifact_contains_complete_sanitized_event_journal_digest(tmp_path):

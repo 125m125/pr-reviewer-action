@@ -66,6 +66,7 @@ from .negotiation import (
 )
 from .model_gateway import ModelGateway, ModelTurnRequest
 from .policy import ReviewPolicy, RuntimeConfig
+from .request_attempts import RequestAttempt, RequestAttemptJournal
 from .scheduler import SessionScheduler, WaveResult, WaveSnapshot
 from .types import (
     BudgetUsage,
@@ -368,6 +369,9 @@ class _RunState:
     failed_session_budgets: dict[str, BudgetUsage] = field(default_factory=dict)
     quarantined_session_ids: set[str] = field(default_factory=set)
     admitted_specialist_request_events: set[tuple[str, str]] = field(default_factory=set)
+    request_attempt_journal: RequestAttemptJournal | None = None
+    request_attempts: dict[str, RequestAttempt] = field(default_factory=dict)
+    request_attempt_ids_by_session: dict[str, set[str]] = field(default_factory=dict)
     candidates: dict[str, CandidateFinding] = field(default_factory=dict)
     candidate_occurrences: dict[str, CandidateFinding] = field(default_factory=dict)
     collision_dispositions: list[dict[str, object]] = field(default_factory=list)
@@ -643,6 +647,14 @@ def _budget_projection(value: BudgetUsage) -> dict[str, object]:
     return _json_value(value)  # type: ignore[return-value]
 
 
+def _directory_fsync_status(directory_fd: int) -> str:
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        return "written_durability_warning"
+    return "written"
+
+
 def _atomic_write_json(
     path: Path,
     artifact: Mapping[str, object],
@@ -678,11 +690,7 @@ def _atomic_write_json(
                 os.chmod(path.name, 0o600, dir_fd=directory_fd, follow_symlinks=False)
             except (NotImplementedError, OSError, TypeError):
                 pass
-            try:
-                os.fsync(directory_fd)
-            except OSError:
-                return "written_durability_warning"
-            return "written"
+            return _directory_fsync_status(directory_fd)
         except BaseException:
             try:
                 os.unlink(temporary_name, dir_fd=directory_fd)
@@ -720,10 +728,10 @@ def _atomic_write_json(
                 directory = None
             if directory is not None:
                 try:
-                    try:
-                        os.fsync(directory)
-                    except OSError:
-                        durability_warning = True
+                    durability_warning = (
+                        _directory_fsync_status(directory)
+                        == "written_durability_warning"
+                    )
                 finally:
                     os.close(directory)
         return "written_durability_warning" if durability_warning else "written"
@@ -924,6 +932,40 @@ class ReviewController:
                 "response_schema_name": getattr(event, "response_schema_name", None),
                 **({"error": getattr(event, "error", "")} if status == "failed" else {}),
             })
+
+    def _admit_wave_request_attempts(
+        self, state: _RunState, attempts: Iterable[RequestAttempt],
+    ) -> None:
+        for attempt in attempts:
+            state.request_attempts.setdefault(attempt.request_id, attempt)
+            state.request_attempt_ids_by_session.setdefault(
+                attempt.session_id, set(),
+            ).add(attempt.request_id)
+            start_key = (attempt.request_id, "started")
+            payload = {
+                "request_id": attempt.request_id,
+                "session_id": attempt.session_id,
+                "assignment_id": attempt.assignment_id,
+                "phase": attempt.phase,
+                "turn": attempt.turn,
+                "input_tokens": attempt.input_tokens,
+                "max_output_tokens": attempt.max_output_tokens,
+                "started_at": attempt.started_at,
+            }
+            if start_key not in state.admitted_specialist_request_events:
+                state.admitted_specialist_request_events.add(start_key)
+                state.journal.emit("specialist_request_started", payload)
+            terminal_key = (attempt.request_id, attempt.status)
+            if (
+                attempt.status != "started"
+                and terminal_key not in state.admitted_specialist_request_events
+            ):
+                state.admitted_specialist_request_events.add(terminal_key)
+                state.journal.emit(f"specialist_request_{attempt.status}", {
+                    **payload,
+                    "terminal_at": attempt.terminal_at,
+                    "in_flight": attempt.in_flight,
+                })
 
     def _session_hook(
         self,
@@ -1189,6 +1231,9 @@ class ReviewController:
         session_id = str(getattr(session, "session_id", "")).strip()
         if session_id != expected_session_id:
             raise ValueError("session identity differs from controller binding")
+        binder = getattr(session, "bind_request_attempt_journal", None)
+        if callable(binder) and state.request_attempt_journal is not None:
+            binder(state.request_attempt_journal, assignment.id)
         return _IsolatedSessionHandle(
             assignment=assignment,
             session=session,
@@ -1231,9 +1276,11 @@ class ReviewController:
             wave_snapshot=wave_snapshot,
             concurrency=state.inputs.config.concurrency,
             event_sink=lambda kind, payload: state.journal.emit(kind, payload),
+            request_attempt_journal=state.request_attempt_journal,
             clock=self.clock,
         )
         result = scheduler.run_wave(assignment_items, phase)
+        self._admit_wave_request_attempts(state, result.request_attempts)
         assignment_by_id = state.assignments
         for item in result.results:
             if not isinstance(item.session, _IsolatedSessionHandle):
@@ -1822,6 +1869,17 @@ class ReviewController:
         }
         for session_id, usage in state.failed_session_budgets.items():
             session_budgets.setdefault(session_id, _budget_projection(usage))
+        for session_id, request_ids in state.request_attempt_ids_by_session.items():
+            charged_turns = len(request_ids)
+            existing = session_budgets.get(session_id)
+            if existing is None:
+                session_budgets[session_id] = _budget_projection(BudgetUsage(
+                    model_turns=charged_turns,
+                ))
+            elif int(existing.get("model_turns", 0)) < charged_turns:
+                existing = dict(existing)
+                existing["model_turns"] = charged_turns
+                session_budgets[session_id] = existing
         evidence = [
             _evidence_projection(record)
             for record in state.evidence.snapshot().records
@@ -1863,6 +1921,10 @@ class ReviewController:
             "base_sha": state.inputs.base_sha,
             "budgets": {
                 "sessions": session_budgets,
+                "request_attempts": [
+                    _json_value(state.request_attempts[key])
+                    for key in sorted(state.request_attempts)
+                ],
                 "totals": {
                     "model_turns": sum(
                         item["model_turns"] for item in session_budgets.values()
@@ -1914,6 +1976,11 @@ class ReviewController:
                     "specialist_model_timed_out": sum(
                         1 for event in journal_events
                         if event.kind == "specialist_request_timed_out"
+                    ),
+                    "specialist_model_cutoff": sum(
+                        1 for event in journal_events
+                        if event.kind
+                        == "specialist_request_timed_out_at_phase_cutoff"
                     ),
                 },
             },
@@ -2314,7 +2381,13 @@ class ReviewController:
             initialization_error = exc
         deadline = RunDeadline(started_at, inputs.config.review_deadline_sec, inputs.config.phase_shares)
         evidence = EvidenceStore()
-        state = _RunState(inputs=inputs, journal=journal, deadline=deadline, evidence=evidence)
+        state = _RunState(
+            inputs=inputs,
+            journal=journal,
+            deadline=deadline,
+            evidence=evidence,
+            request_attempt_journal=RequestAttemptJournal(self.clock),
+        )
         path: Path | None = None
         path_error: str | None = None
         artifact: dict[str, object] = {}
@@ -2518,6 +2591,13 @@ class ReviewController:
                 state.handoff = self._minimal_handoff(state.verdict, True)
             state.publishing_ready = False
 
+        # Waves close their own request-journal slices at each phase boundary.
+        # This final sweep also accounts for requests launched by finalization
+        # hooks, including callbacks that remain orphaned past their cutoff.
+        self._admit_wave_request_attempts(
+            state, state.request_attempt_journal.close_since(0),
+        )
+
         artifact_identity = _artifact_id(inputs)
         journal.emit("artifact_reference", {
             "artifact_id": artifact_identity,
@@ -2557,6 +2637,17 @@ class ReviewController:
                 session_id: _budget_projection(usage)
                 for session_id, usage in state.failed_session_budgets.items()
             })
+            for session_id, request_ids in state.request_attempt_ids_by_session.items():
+                charged_turns = len(request_ids)
+                existing = emergency_budget_map.get(session_id)
+                if existing is None:
+                    emergency_budget_map[session_id] = _budget_projection(
+                        BudgetUsage(model_turns=charged_turns),
+                    )
+                elif int(existing.get("model_turns", 0)) < charged_turns:
+                    existing = dict(existing)
+                    existing["model_turns"] = charged_turns
+                    emergency_budget_map[session_id] = existing
             emergency_coverage = state.coverage.snapshot()
             emergency_statuses = dict(emergency_coverage.obligation_statuses)
             emergency_evidence = dict(emergency_coverage.evidence_by_obligation)
@@ -2583,6 +2674,10 @@ class ReviewController:
                 "sessions": emergency_sessions,
                 "budgets": {
                     "sessions": emergency_budget_map,
+                    "request_attempts": [
+                        _json_value(state.request_attempts[key])
+                        for key in sorted(state.request_attempts)
+                    ],
                     "totals": {
                         "model_turns": sum(
                             item["model_turns"]

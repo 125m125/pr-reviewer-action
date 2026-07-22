@@ -34,6 +34,15 @@ def mask_runtime_text(value: object, *, limit: int = _MAX_CALLBACK_STRING) -> st
         return "[unserializable]"
 
 
+def format_callback_error(
+    exc: BaseException, *, limit: int = 1000,
+) -> str:
+    """Format even hostile exceptions without invoking unsafe repr fallbacks."""
+    name = getattr(type(exc), "__name__", "BaseException")
+    detail = mask_runtime_text(exc, limit=max(1, limit - len(name) - 2))
+    return f"{name}: {detail}"[:limit]
+
+
 class CallbackTimedOut(TimeoutError):
     """A callback did not return before its caller-owned timeout."""
 

@@ -531,6 +531,39 @@ def test_session_base_exception_is_a_stable_failure_for_reassignment():
     )
 
 
+def test_hostile_factory_baseexception_does_not_block_completed_sibling():
+    class HostileFactoryError(BaseException):
+        def __str__(self):
+            raise KeyboardInterrupt("hostile str")
+
+        def __repr__(self):
+            raise KeyboardInterrupt("hostile repr")
+
+    def factory(item, lease, snapshot):
+        del lease, snapshot
+        if item.id == "S1":
+            raise HostileFactoryError()
+        return FakeSession(session_result(
+            item.id,
+            evidence_ids=("E-S2",),
+            statuses=(("OB-S2", ObligationStatus.COVERED),),
+        ))
+
+    result = SessionScheduler(
+        deadline=deadline(), session_factory=factory,
+        wave_snapshot=empty_snapshot(), concurrency=2, clock=FakeClock(20.0),
+    ).run_wave(
+        (assignment("S1", "critical"), assignment("S2", "normal")),
+        RunPhase.INITIAL,
+    )
+
+    assert tuple(item.assignment_id for item in result.results) == ("S2",)
+    assert tuple((item.assignment_id, item.error) for item in result.failures) == (
+        ("S1", "HostileFactoryError: [unserializable]"),
+    )
+    assert result.evidence_ids == ("E-S2",)
+
+
 def test_scheduler_workers_are_daemonized_for_abandoned_in_flight_work():
     daemon_flags = []
 
