@@ -59,9 +59,16 @@ class _CompletedSession:
 
 
 @dataclass(frozen=True)
+class _FailedSession:
+    session: ScheduledSession
+    error: str
+
+
+@dataclass(frozen=True)
 class WaveFailure:
     assignment_id: str
     error: str
+    session: ScheduledSession | None = None
 
 
 @dataclass(frozen=True)
@@ -211,7 +218,7 @@ class SessionScheduler:
 
     def _run_assignment(
         self, assignment: object, lease: SessionLease,
-    ) -> _CompletedSession | _WorkerDeclined:
+    ) -> _CompletedSession | _FailedSession | _WorkerDeclined:
         # Factory construction belongs inside the worker so each worker owns all
         # mutable session state. Only the frozen wave snapshot crosses workers.
         if not self._can_launch(lease):
@@ -219,7 +226,15 @@ class SessionScheduler:
         session = self.session_factory(assignment, lease, self.wave_snapshot)
         if not self._can_launch(lease):
             return _WorkerDeclined()
-        return _CompletedSession(session=session, result=session.explore())
+        try:
+            result = session.explore()
+        except BaseException as exc:
+            try:
+                error = f"{type(exc).__name__}: {exc}"
+            except BaseException:
+                error = f"{type(exc).__name__}: [unprintable error]"
+            return _FailedSession(session=session, error=error[:1000])
+        return _CompletedSession(session=session, result=result)
 
     def run_wave(
         self,
@@ -241,14 +256,19 @@ class SessionScheduler:
         })
 
         remaining = deque(ordered)
-        active: dict[Future[_CompletedSession | _WorkerDeclined], object] = {}
+        active: dict[
+            Future[_CompletedSession | _FailedSession | _WorkerDeclined], object
+        ] = {}
         completed: dict[str, _CompletedSession] = {}
         failed: dict[str, str] = {}
+        failed_sessions: dict[str, ScheduledSession] = {}
         declined: set[str] = set()
         cancelled: set[str] = set()
         in_flight: set[str] = set()
 
-        def collect(future: Future[_CompletedSession | _WorkerDeclined]) -> None:
+        def collect(
+            future: Future[_CompletedSession | _FailedSession | _WorkerDeclined],
+        ) -> None:
             assignment = active.pop(future)
             assignment_id = _assignment_id(assignment)
             if future.cancelled():
@@ -256,11 +276,14 @@ class SessionScheduler:
                 return
             try:
                 outcome = future.result()
-            except Exception as exc:  # noqa: BLE001 - isolate one specialist failure
+            except BaseException as exc:  # isolate every specialist failure
                 failed[assignment_id] = f"{type(exc).__name__}: {exc}"
                 return
             if isinstance(outcome, _WorkerDeclined):
                 declined.add(assignment_id)
+            elif isinstance(outcome, _FailedSession):
+                failed[assignment_id] = outcome.error
+                failed_sessions[assignment_id] = outcome.session
             else:
                 completed[assignment_id] = outcome
 
@@ -335,7 +358,11 @@ class SessionScheduler:
             if assignment_id in completed
         )
         stable_failures = tuple(
-            WaveFailure(assignment_id, failed[assignment_id])
+            WaveFailure(
+                assignment_id,
+                failed[assignment_id],
+                failed_sessions.get(assignment_id),
+            )
             for assignment_id in ordered_ids
             if assignment_id in failed
         )

@@ -15,20 +15,16 @@ import json
 from math import isfinite
 import os
 from pathlib import Path
-from queue import Empty, Queue
-import re
 import tempfile
-from threading import Thread
 import time
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from pr_reviewer.conversation import Conversation
-from scripts.redact import mask_secrets
-
 from .adjudication import (
     AdjudicatedReview,
     ReviewHandoffContext,
+    ReviewOrientationTopic,
     adjudicate_candidates,
     apply_runtime_verdict_policy,
     build_review_handoff,
@@ -43,6 +39,12 @@ from .assignments import (
     validate_assignment_plan,
 )
 from .budget import BudgetLedger, RunDeadline, SessionLease
+from .callbacks import (
+    CALLBACK_POOL,
+    CallbackTimedOut,
+    freeze_callback_value,
+    mask_runtime_text,
+)
 from .coverage import (
     CoverageLedger,
     CoverageReconciliation,
@@ -51,7 +53,7 @@ from .coverage import (
     reconcile_wave,
     session_ownership_for_assignment,
 )
-from .evidence import EvidenceStore
+from .evidence import EvidenceSnapshot, EvidenceStore
 from .events import EventJournal, RunEvent
 from .negotiation import (
     NegotiationAction,
@@ -79,14 +81,35 @@ from .web_evidence import SourceAccessRequest
 _SCHEMA_VERSION = 2
 _MAX_ARTIFACT_STRING = 16 * 1024
 _MAX_ARTIFACT_ITEMS = 2_000
-_INLINE_SECRET = re.compile(
-    r"(?i)(?:api[_-]?key|access[_-]?token|auth(?:orization)?|cookie|credential|"
-    r"password|secret|token)\s*[:=]\s*[^\s,;]+"
-)
+class _FrozenArtifactDict(dict):
+    """JSON-serializable mapping with an immutable public mutation surface."""
+
+    def _immutable(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise TypeError("review result artifact is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+    __ior__ = _immutable
+
+
+def _freeze_result_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return _FrozenArtifactDict({
+            str(key): _freeze_result_value(item) for key, item in value.items()
+        })
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_result_value(item) for item in value)
+    return value
 
 
 def _mask_runtime_text(value: str) -> str:
-    return _INLINE_SECRET.sub("[REDACTED]", mask_secrets(value))
+    return mask_runtime_text(value)
 
 
 _PHASES = (
@@ -143,6 +166,64 @@ class RoleAdapter(Protocol):
     def complete(self, request: RoleRequest) -> object: ...
 
 
+@dataclass(frozen=True)
+class FinalizerProposal:
+    """Advisory orientation selections; never controller facts or policy."""
+
+    change_topics: tuple[ReviewOrientationTopic, ...] = ()
+    component_ids: tuple[str, ...] = ()
+    specialist_topics: tuple[ReviewOrientationTopic, ...] = ()
+    recipe_ids: tuple[str, ...] = ()
+    coverage_boundary_topics: tuple[ReviewOrientationTopic, ...] = ()
+    review_emphasis_topics: tuple[ReviewOrientationTopic, ...] = ()
+    recommendation: str | None = None
+
+
+@dataclass(frozen=True)
+class EvidenceSeed:
+    """Explicit repository/head binding for intentionally reused evidence."""
+
+    repository: str
+    head_sha: str
+    snapshot: EvidenceSnapshot
+
+    def __post_init__(self) -> None:
+        if not self.repository.strip() or not self.head_sha.strip():
+            raise ValueError("evidence seed repository and head SHA are required")
+
+
+def _finalizer_proposal(value: object) -> FinalizerProposal:
+    if isinstance(value, FinalizerProposal):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("finalizer must return FinalizerProposal")
+
+    def topics(key: str) -> tuple[ReviewOrientationTopic, ...]:
+        raw = value.get(key, ())
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, Iterable):
+            raise TypeError(f"finalizer {key} must be an array")
+        return tuple(ReviewOrientationTopic(str(item)) for item in raw)
+
+    def identifiers(key: str) -> tuple[str, ...]:
+        raw = value.get(key, ())
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, Iterable):
+            raise TypeError(f"finalizer {key} must be an array")
+        return tuple(str(item).strip() for item in raw if str(item).strip())
+
+    recommendation = value.get("recommendation")
+    if recommendation is not None:
+        recommendation = str(recommendation).strip() or None
+    return FinalizerProposal(
+        change_topics=topics("change_topics"),
+        component_ids=identifiers("component_ids"),
+        specialist_topics=topics("specialist_topics"),
+        recipe_ids=identifiers("recipe_ids"),
+        coverage_boundary_topics=topics("coverage_boundary_topics"),
+        review_emphasis_topics=topics("review_emphasis_topics"),
+        recommendation=recommendation,
+    )
+
+
 def _json_object(text: str) -> Mapping[str, object]:
     candidate = str(text or "").strip()
     if candidate.startswith("```"):
@@ -195,7 +276,6 @@ class ReviewInputs:
     config: RuntimeConfig
     changed_files: tuple[str, ...]
     artifact_path: Path | str = Path("specialist-review-artifact.json")
-    artifact_output_root: Path | str = Path(".")
     allow_approve: bool = False
     publishing_mode: str = "review_comment"
     model_verdict: str = "approve"
@@ -225,6 +305,10 @@ class _RunState:
     deadline: RunDeadline
     evidence: EvidenceStore
     phase: str | None = None
+    phase_outcomes: dict[str, str] = field(default_factory=dict)
+    effective_allow_approve: bool = False
+    effective_publishing_mode: str = "review_comment"
+    required_note_count: int = 0
     obligations: tuple[CoverageObligation, ...] = ()
     coverage: CoverageLedger | None = None
     plan: AssignmentPlan = field(default_factory=lambda: AssignmentPlan(()))
@@ -236,7 +320,12 @@ class _RunState:
     assignment_sessions: dict[str, str] = field(default_factory=dict)
     session_generations: dict[str, int] = field(default_factory=dict)
     session_results: dict[tuple[str, str], object] = field(default_factory=dict)
+    failed_session_budgets: dict[str, BudgetUsage] = field(default_factory=dict)
+    quarantined_session_ids: set[str] = field(default_factory=set)
+    admitted_specialist_request_events: set[tuple[str, str]] = field(default_factory=set)
     candidates: dict[str, CandidateFinding] = field(default_factory=dict)
+    candidate_occurrences: dict[str, CandidateFinding] = field(default_factory=dict)
+    collision_dispositions: list[dict[str, object]] = field(default_factory=list)
     source_requests: list[SourceAccessRequest] = field(default_factory=list)
     unknowns: list[dict[str, object]] = field(default_factory=list)
     degradations: list[dict[str, str]] = field(default_factory=list)
@@ -273,6 +362,10 @@ class _IsolatedSessionHandle:
     @property
     def budget(self) -> object:
         return getattr(self.session, "budget", None)
+
+    @property
+    def request_events(self) -> tuple[object, ...]:
+        return tuple(getattr(self.session, "request_events", ()))
 
     def explore(self) -> object:
         result = self.session.explore()
@@ -410,6 +503,36 @@ def _checkpoint_projection(checkpoint: object) -> dict[str, object]:
     }
 
 
+def _evidence_projection(record: object) -> dict[str, object]:
+    provenance = getattr(record, "provenance")
+    return {
+        "evidence_id": getattr(record, "id"),
+        "category": getattr(record, "category"),
+        "collector_session_id": getattr(record, "collector_session_id"),
+        "model_identity": getattr(record, "model_identity"),
+        "tool": getattr(record, "tool"),
+        "source_identity": getattr(record, "source_identity"),
+        "source_path": getattr(record, "source_path"),
+        "provenance": {
+            "head_sha": provenance.head_sha,
+            "policy_hash": provenance.policy_hash,
+            "policy_rule_id": provenance.policy_rule_id,
+            "source_classification": provenance.source_classification,
+            "original_url": provenance.original_url,
+            "final_url": provenance.final_url,
+            "max_age_hours": provenance.max_age_hours,
+        },
+        "status": getattr(record, "status"),
+        "content_hash": getattr(record, "content_hash"),
+        "mime_type": getattr(record, "mime_type"),
+        "truncated": getattr(record, "truncated"),
+        "redacted": getattr(record, "redacted"),
+        "imported_by": list(getattr(record, "imported_by")),
+        "supersedes": list(getattr(record, "supersedes")),
+        "contradicts": list(getattr(record, "contradicts")),
+    }
+
+
 def _artifact_id(inputs: ReviewInputs) -> str:
     return _digest({
         "schema_version": _SCHEMA_VERSION,
@@ -422,10 +545,31 @@ def _artifact_id(inputs: ReviewInputs) -> str:
     })[:32]
 
 
-def _resolve_artifact_path(inputs: ReviewInputs) -> Path:
-    root = Path(inputs.artifact_output_root).resolve(strict=False)
-    requested = Path(inputs.artifact_path)
-    target = requested.resolve(strict=False) if requested.is_absolute() else (root / requested).resolve(strict=False)
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        stat_result = path.lstat()
+    except FileNotFoundError:
+        return False
+    attributes = int(getattr(stat_result, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat_result, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return path.is_symlink() or bool(attributes & reparse_flag)
+
+
+def _resolve_artifact_path(root_value: Path | str, requested_value: Path | str) -> Path:
+    root = Path(root_value).resolve(strict=False)
+    requested = Path(requested_value)
+    if requested.is_absolute() or not requested.parts:
+        raise ValueError("artifact path must be relative to the controller-owned root")
+    if any(part in {"", ".", ".."} for part in requested.parts):
+        raise ValueError("artifact path contains an unsafe segment")
+    if _is_link_or_reparse(root):
+        raise ValueError("artifact output root must not be a link or reparse point")
+    current = root
+    for part in requested.parts[:-1]:
+        current = current / part
+        if _is_link_or_reparse(current):
+            raise ValueError("artifact output path traverses a link or reparse point")
+    target = (root / requested).resolve(strict=False)
     try:
         target.relative_to(root)
     except ValueError as exc:
@@ -433,21 +577,6 @@ def _resolve_artifact_path(inputs: ReviewInputs) -> Path:
     if target == root or not target.name:
         raise ValueError("artifact path must identify a file beneath artifact_output_root")
     return target
-
-
-def _freeze_role_value(value: object) -> object:
-    """Detach mutable caller collections before crossing a timed role boundary."""
-    if isinstance(value, Mapping):
-        if any(not isinstance(key, str) for key in value):
-            raise TypeError("role context keys must be strings")
-        return MappingProxyType({
-            key: _freeze_role_value(value[key]) for key in sorted(value)
-        })
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_role_value(item) for item in value)
-    if isinstance(value, (set, frozenset)):
-        return tuple(_freeze_role_value(item) for item in sorted(value, key=str))
-    return value
 
 
 def _digest(value: object) -> str:
@@ -468,7 +597,7 @@ def _budget_projection(value: BudgetUsage) -> dict[str, object]:
     return _json_value(value)  # type: ignore[return-value]
 
 
-def _atomic_write_json(path: Path, artifact: Mapping[str, object]) -> None:
+def _atomic_write_json(path: Path, artifact: Mapping[str, object]) -> str:
     """Write a private canonical JSON file without exposing a partial target."""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(
@@ -492,6 +621,7 @@ def _atomic_write_json(path: Path, artifact: Mapping[str, object]) -> None:
             os.chmod(path, 0o600)
         except OSError:
             pass
+        durability_warning = False
         if hasattr(os, "O_DIRECTORY"):
             try:
                 directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
@@ -499,9 +629,13 @@ def _atomic_write_json(path: Path, artifact: Mapping[str, object]) -> None:
                 directory = None
             if directory is not None:
                 try:
-                    os.fsync(directory)
+                    try:
+                        os.fsync(directory)
+                    except OSError:
+                        durability_warning = True
                 finally:
                     os.close(directory)
+        return "written_durability_warning" if durability_warning else "written"
     except BaseException:
         try:
             temporary.unlink(missing_ok=True)
@@ -523,15 +657,22 @@ class ReviewController:
         critic: object | None = None,
         finalizer: object | None = None,
         evidence_store: EvidenceStore | None = None,
+        evidence_seed: EvidenceSeed | None = None,
+        evidence_store_factory: Callable[[], EvidenceStore] = EvidenceStore,
+        artifact_output_root: Path | str = Path("."),
         event_sink: Callable[[RunEvent], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
-        artifact_writer: Callable[[Path, Mapping[str, object]], None] = _atomic_write_json,
+        artifact_writer: Callable[[Path, Mapping[str, object]], object] = _atomic_write_json,
         obligation_deriver: Callable[..., tuple[CoverageObligation, ...]] = derive_obligations,
         assignment_validator: Callable[..., AssignmentPlan] = validate_assignment_plan,
         scheduler_type: type[SessionScheduler] = SessionScheduler,
     ) -> None:
         if planner is not None and planner_gateway is not None:
             raise ValueError("provide planner or planner_gateway, not both")
+        if evidence_store is not None and evidence_store.snapshot().records:
+            raise ValueError(
+                "non-empty evidence_store is unbound; provide an EvidenceSeed"
+            )
         self.planner = (
             planner if planner is not None
             else GatewayRoleAdapter(planner_gateway) if planner_gateway is not None
@@ -542,6 +683,9 @@ class ReviewController:
         self.critic = critic
         self.finalizer = finalizer
         self._provided_evidence_store = evidence_store
+        self._evidence_seed = evidence_seed
+        self._evidence_store_factory = evidence_store_factory
+        self.artifact_output_root = Path(artifact_output_root).resolve(strict=False)
         self.event_sink = event_sink
         self.clock = clock
         self.artifact_writer = artifact_writer
@@ -549,18 +693,142 @@ class ReviewController:
         self.assignment_validator = assignment_validator
         self.scheduler_type = scheduler_type
 
-    def _transition(self, state: _RunState, phase: str) -> None:
+    def _transition(
+        self, state: _RunState, phase: str, *, status: str = "complete",
+    ) -> None:
         expected = _LEGAL_TRANSITIONS.get(state.phase)
         if phase != expected:
             raise RuntimeError(f"illegal controller transition {state.phase!r} -> {phase!r}")
         previous = state.phase
         state.phase = phase
-        state.journal.emit("phase_changed", {"phase": phase, "previous_phase": previous})
+        state.phase_outcomes[phase] = status
+        state.journal.emit("phase_changed", {
+            "phase": phase, "previous_phase": previous, "status": status,
+        })
+
+    @staticmethod
+    def _publishing_authority(inputs: ReviewInputs) -> tuple[str, bool]:
+        modes = {"comment": 0, "review_comment": 1, "review_verdict": 2}
+        policy_mode = inputs.policy.publishing.get("mode", "review_verdict")
+        policy_allow = inputs.policy.publishing.get("allow_approve", True)
+        if policy_mode not in modes:
+            raise ValueError("repository publishing policy has an invalid mode")
+        if not isinstance(policy_allow, bool):
+            raise ValueError("repository publishing policy allow_approve must be boolean")
+        mode = min(
+            (policy_mode, inputs.publishing_mode),
+            key=lambda item: modes[item],
+        )
+        return mode, policy_allow and inputs.allow_approve
+
+    @staticmethod
+    def _required_note_count(state: _RunState) -> int:
+        return (
+            len(state.review.accepted)
+            + len(state.review.verification_requests)
+            + len(state.inputs.verification_requests)
+            + len(state.source_requests)
+        )
+
+    @staticmethod
+    def _publication_is_ready(state: _RunState, path: Path | None) -> bool:
+        if path is None or not state.handoff.markdown:
+            return False
+        if state.verdict not in {"approve", "request_changes", "notice"}:
+            return False
+        if state.effective_publishing_mode == "comment":
+            return True
+        return len(state.notes) == state.required_note_count
 
     def _degrade(self, state: _RunState, component: str, reason: str) -> None:
         item = {"component": component, "reason": _mask_runtime_text(reason)[:1000]}
         state.degradations.append(item)
         state.journal.emit("degradation", item)
+
+    def _quarantine_session(
+        self, state: _RunState, session_id: str, reason: str,
+    ) -> None:
+        handle = state.sessions.pop(session_id, None)
+        state.quarantined_session_ids.add(session_id)
+        if isinstance(handle, _IsolatedSessionHandle):
+            if state.assignment_sessions.get(handle.assignment.id) == session_id:
+                state.assignment_sessions.pop(handle.assignment.id, None)
+        state.journal.emit("session_quarantined", {
+            "session_id": session_id,
+            "reason": reason,
+        })
+
+    def _admit_specialist_request_events(
+        self, state: _RunState, source: object,
+    ) -> None:
+        for event in getattr(source, "request_events", ()):
+            request_id = str(getattr(event, "request_id", "")).strip()
+            status = str(getattr(event, "status", "")).strip()
+            key = (request_id, status)
+            if (
+                not request_id
+                or status not in {"started", "completed", "failed"}
+                or key in state.admitted_specialist_request_events
+            ):
+                continue
+            state.admitted_specialist_request_events.add(key)
+            state.journal.emit(f"specialist_request_{status}", {
+                "request_id": request_id,
+                "session_id": getattr(source, "session_id", ""),
+                "tools_enabled": bool(getattr(event, "tools_enabled", False)),
+                "response_schema_name": getattr(event, "response_schema_name", None),
+                **({"error": getattr(event, "error", "")} if status == "failed" else {}),
+            })
+
+    def _session_hook(
+        self,
+        state: _RunState,
+        session_id: str,
+        hook: str,
+        phase: RunPhase,
+        *args: object,
+    ) -> tuple[bool, object | None]:
+        handle = state.sessions.get(session_id)
+        if not isinstance(handle, _IsolatedSessionHandle):
+            return False, None
+        lease = state.deadline.lease_for(phase)
+        timeout = min(
+            float(state.inputs.config.model_request_timeout_sec),
+            lease.remaining(now=self.clock()),
+        )
+        detached_args = tuple(freeze_callback_value(args))
+        state.journal.emit("specialist_hook_started", {
+            "session_id": session_id, "hook": hook, "phase": phase.value,
+        })
+        try:
+            callback = getattr(handle, hook)
+            result = CALLBACK_POOL.run(
+                lambda: callback(*detached_args),
+                timeout_sec=timeout,
+                name=f"session-{hook}",
+            )
+            if lease.remaining(now=self.clock()) <= 0:
+                raise CallbackTimedOut(f"session {hook} completed after phase cutoff")
+        except CallbackTimedOut as exc:
+            reason = _bounded_error(exc)
+            state.journal.emit("specialist_hook_timed_out", {
+                "session_id": session_id, "hook": hook, "error": reason,
+            })
+            self._degrade(state, f"specialist_hook:{session_id}:{hook}", reason)
+            self._quarantine_session(state, session_id, reason)
+            return False, None
+        except BaseException as exc:
+            reason = _bounded_error(exc)
+            state.journal.emit("specialist_hook_failed", {
+                "session_id": session_id, "hook": hook, "error": reason,
+            })
+            self._degrade(state, f"specialist_hook:{session_id}:{hook}", reason)
+            self._quarantine_session(state, session_id, reason)
+            return False, None
+        state.journal.emit("specialist_hook_completed", {
+            "session_id": session_id, "hook": hook,
+        })
+        return True, result
 
     def _model_request(
         self,
@@ -572,93 +840,56 @@ class ReviewController:
         component: object,
         method: str,
         context: Mapping[str, object],
-        legacy_args: tuple[object, ...],
     ) -> object:
-        lease = state.deadline.lease_for(phase)
-
-        def remaining() -> float:
-            return lease.remaining(now=self.clock())
-
-        if remaining() <= 0:
-            raise TimeoutError(f"{role} phase lease expired before request event")
         state.journal.emit("model_request_started", {
             "request_id": request_id,
             "role": role,
             "phase": phase.value,
-            "phase_cutoff": lease.deadline_at,
-            "remaining_deadline_sec": round(remaining(), 6),
         })
-        if remaining() <= 0:
-            raise TimeoutError(f"{role} phase lease expired after request event")
-        timeout = min(float(state.inputs.config.model_request_timeout_sec), remaining())
-        if timeout <= 0:
-            raise TimeoutError(f"{role} phase lease expired before component call")
-        max_tokens = state.inputs.config.session_limits.output_tokens or 4096
-        request = RoleRequest(
-            role=role,
-            request_id=request_id,
-            phase=phase,
-            lease=lease,
-            timeout_sec=timeout,
-            max_tokens=max_tokens,
-            context=_freeze_role_value(context),  # type: ignore[arg-type]
-        )
-        outcome: Queue[tuple[str, object]] = Queue(maxsize=1)
-
-        def invoke() -> None:
-            try:
-                value = self._call_role_component(
-                    component, method, request, legacy_args,
-                )
-            except BaseException as exc:
-                try:
-                    outcome.put_nowait(("error", exc))
-                except Exception:
-                    pass
-            else:
-                try:
-                    outcome.put_nowait(("ok", value))
-                except Exception:
-                    pass
-
-        if remaining() <= 0:
-            raise TimeoutError(f"{role} phase lease expired before component thread")
-        worker = Thread(
-            target=invoke,
-            name=f"review-role-{role}",
-            daemon=True,
-        )
-        worker.start()
         try:
-            status, value = outcome.get(timeout=min(timeout, remaining()))
-        except Empty as exc:
-            timeout_error = TimeoutError(
-                f"{role} request exceeded its phase lease or request timeout"
+            lease = state.deadline.lease_for(phase)
+
+            def remaining() -> float:
+                return lease.remaining(now=self.clock())
+
+            timeout = min(
+                float(state.inputs.config.model_request_timeout_sec), remaining(),
             )
+            frozen_context = freeze_callback_value(context)
+            if not isinstance(frozen_context, Mapping):
+                raise TypeError("role context must freeze to an object")
+            request = RoleRequest(
+                role=role,
+                request_id=request_id,
+                phase=phase,
+                lease=lease,
+                timeout_sec=timeout,
+                max_tokens=state.inputs.config.session_limits.output_tokens or 4096,
+                context=frozen_context,
+            )
+            value = CALLBACK_POOL.run(
+                lambda: self._call_role_component(component, method, request),
+                timeout_sec=timeout,
+                name=f"role-{role}",
+            )
+            if remaining() <= 0:
+                raise CallbackTimedOut(f"{role} result arrived after phase cutoff")
+        except CallbackTimedOut as exc:
+            state.journal.emit("model_request_timed_out", {
+                "request_id": request_id, "role": role, "phase": phase.value,
+                "error": _bounded_error(exc),
+            })
+            raise
+        except BaseException as exc:
             state.journal.emit("model_request_failed", {
                 "request_id": request_id,
                 "role": role,
                 "phase": phase.value,
-                "error": _bounded_error(timeout_error),
+                "error": _bounded_error(exc),
             })
-            raise timeout_error from exc
-        if remaining() <= 0:
-            state.journal.emit("model_request_failed", {
-                "request_id": request_id,
-                "role": role,
-                "phase": phase.value,
-                "error": "late result ignored after phase cutoff",
-            })
-            raise TimeoutError(f"{role} result arrived after its phase cutoff")
-        if status == "error":
-            assert isinstance(value, BaseException)
-            state.journal.emit("model_request_failed", {
-                "request_id": request_id,
-                "role": role,
-                "phase": phase.value,
-                "error": _bounded_error(value),
-            })
-            raise value
+            if isinstance(exc, Exception):
+                raise
+            raise RuntimeError(_bounded_error(exc)) from None
         state.journal.emit("model_request_completed", {
             "request_id": request_id,
             "role": role,
@@ -671,7 +902,6 @@ class ReviewController:
         component: object,
         method: str,
         request: RoleRequest,
-        legacy_args: tuple[object, ...],
     ) -> object:
         target = getattr(component, method, None)
         if target is None:
@@ -680,20 +910,7 @@ class ReviewController:
             target = component
         if not callable(target):
             raise TypeError(f"{method} component is not callable")
-        signature = inspect.signature(target)
-        if any(item.kind is inspect.Parameter.VAR_POSITIONAL for item in signature.parameters.values()):
-            return target(*legacy_args)
-        positional = tuple(
-            item for item in signature.parameters.values()
-            if item.kind in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
-        )
-        if len(positional) == 1 and (
-            positional[0].name in {"request", "role_request"}
-            or positional[0].annotation is RoleRequest
-            or isinstance(component, GatewayRoleAdapter)
-        ):
-            return target(request)
-        return target(*legacy_args[:len(positional)])
+        return target(request)
 
     def _plan(self, state: _RunState) -> AssignmentPlan:
         inputs = state.inputs
@@ -716,7 +933,6 @@ class ReviewController:
                     "pr_metadata": inputs.pr_metadata,
                     "policy": inputs.policy,
                 },
-                legacy_args=(state.obligations, inputs.topology, inputs.config),
             )
             if not isinstance(raw, Mapping):
                 raise AssignmentPlanError("planner result must be an object")
@@ -743,9 +959,6 @@ class ReviewController:
                         "pr_metadata": inputs.pr_metadata,
                         "policy": inputs.policy,
                     },
-                    legacy_args=(
-                        state.obligations, inputs.topology, inputs.config, repair,
-                    ),
                 )
                 if not isinstance(repaired, Mapping):
                     raise AssignmentPlanError("planner repair must be an object")
@@ -800,7 +1013,7 @@ class ReviewController:
             if existing.session_id != expected_session_id:
                 raise ValueError("existing session identity differs from controller binding")
             if existing.lease != lease:
-                existing.update_lease(lease)
+                raise RuntimeError("resumed session lease was not activated by controller")
             return existing
         if self.session_factory is None:
             raise RuntimeError("no specialist session factory configured")
@@ -888,11 +1101,14 @@ class ReviewController:
             state.sessions[expected_session_id] = item.session
             state.assignment_sessions[item.assignment_id] = expected_session_id
             state.session_results[(item.assignment_id, expected_session_id)] = item.session_result
+            self._admit_specialist_request_events(state, item.session_result)
             state.ownership[item.session_result.session_id] = self._ownership(
                 assignment, item.session_result.session_id, state,
             )
-            for candidate in item.session.candidate_findings:
-                state.candidates.setdefault(candidate.candidate_id, candidate)
+            for index, candidate in enumerate(item.session.candidate_findings):
+                state.candidate_occurrences[
+                    f"session:{item.session_result.session_id}:{index}"
+                ] = candidate
             state.journal.emit("session_transition", {
                 "assignment_id": item.assignment_id,
                 "session_id": item.session_result.session_id,
@@ -909,6 +1125,24 @@ class ReviewController:
                 "usage": _budget_projection(usage),
             })
         for failure in result.failures:
+            if isinstance(failure.session, _IsolatedSessionHandle):
+                failed_handle = failure.session
+                self._admit_specialist_request_events(state, failed_handle)
+                failed_usage = getattr(failed_handle.budget, "snapshot", None)
+                if callable(failed_usage):
+                    usage = failed_usage()
+                    if isinstance(usage, BudgetUsage):
+                        state.failed_session_budgets[
+                            failed_handle.session_id
+                        ] = usage
+                        state.journal.emit("budget_changed", {
+                            "session_id": failed_handle.session_id,
+                            "usage": _budget_projection(usage),
+                            "failed": True,
+                        })
+                self._quarantine_session(
+                    state, failed_handle.session_id, failure.error,
+                )
             self._degrade(state, f"specialist:{failure.assignment_id}", failure.error)
             state.journal.emit("recovery", {
                 "component": "specialist", "assignment_id": failure.assignment_id,
@@ -1060,7 +1294,6 @@ class ReviewController:
                         "pr_metadata": state.inputs.pr_metadata,
                         "policy": state.inputs.policy,
                     },
-                    legacy_args=(negotiation_state,),
                 )
                 if not isinstance(raw, Mapping):
                     raise NegotiationError("negotiator result must be an object")
@@ -1106,10 +1339,17 @@ class ReviewController:
                     continue
                 assignment = state.assignments[ownership.assignment_id]
                 session = state.sessions.get(action.session_id)
-                feedback = getattr(session, "apply_coverage_feedback", None)
-                if callable(feedback):
-                    feedback(action.obligation_ids)
-                result.append(assignment)
+                if session is None:
+                    continue
+                succeeded, _ = self._session_hook(
+                    state,
+                    action.session_id,
+                    "apply_coverage_feedback",
+                    RunPhase.FOLLOWUP,
+                    action.obligation_ids,
+                )
+                if succeeded:
+                    result.append(assignment)
                 continue
             selected = tuple(
                 obligation_by_id[item] for item in action.obligation_ids
@@ -1137,8 +1377,32 @@ class ReviewController:
         return tuple(result)
 
     def _collect_candidates(self, state: _RunState) -> tuple[CandidateFinding, ...]:
-        for candidate in state.inputs.candidate_findings:
-            state.candidates.setdefault(candidate.candidate_id, candidate)
+        for index, candidate in enumerate(state.inputs.candidate_findings):
+            state.candidate_occurrences[f"input:{index}"] = candidate
+        grouped: dict[str, list[tuple[str, CandidateFinding]]] = {}
+        for occurrence_ref, candidate in sorted(state.candidate_occurrences.items()):
+            grouped.setdefault(candidate.candidate_id, []).append(
+                (occurrence_ref, candidate)
+            )
+        state.candidates.clear()
+        state.collision_dispositions.clear()
+        for candidate_id in sorted(grouped):
+            occurrences = grouped[candidate_id]
+            if len(occurrences) == 1:
+                state.candidates[candidate_id] = occurrences[0][1]
+                continue
+            for occurrence_ref, candidate in occurrences:
+                disposition = {
+                    "candidate_id": candidate_id,
+                    "occurrence_ref": occurrence_ref,
+                    "action": "reject",
+                    "reason": "duplicate-candidate-id",
+                    "target_id": None,
+                    "collector_session_id": candidate.collector_session_id,
+                    "model_identity": candidate.model_identity,
+                }
+                state.collision_dispositions.append(disposition)
+                state.journal.emit("candidate_disposition", disposition)
         return tuple(state.candidates[key] for key in sorted(state.candidates))
 
     @staticmethod
@@ -1178,13 +1442,6 @@ class ReviewController:
                         "pr_metadata": state.inputs.pr_metadata,
                         "policy": state.inputs.policy,
                     },
-                    legacy_args=(
-                        candidates,
-                        MappingProxyType({
-                            "obligations": obligation_map,
-                            "changed_files": state.inputs.changed_files,
-                        }),
-                    ),
                 )
             except Exception as exc:
                 self._degrade(state, "critic", _bounded_error(exc))
@@ -1224,6 +1481,50 @@ class ReviewController:
         )
 
     @staticmethod
+    def _allowed_orientation_topics(
+        state: _RunState,
+    ) -> frozenset[ReviewOrientationTopic]:
+        values: list[str] = []
+        values.extend(str(item) for item in state.inputs.classification.get("risk_flags", ()))
+        values.extend(str(item) for item in state.inputs.topology.get("file_roles", ()))
+        for assignment in state.assignments.values():
+            values.extend(assignment.lenses)
+        for obligation in state.obligations:
+            values.extend((obligation.origin, obligation.subject, *obligation.required_evidence))
+        values.extend(item.category for item in state.review.accepted)
+        normalized = " ".join(values).lower().replace("-", "_")
+        return frozenset(
+            topic for topic in ReviewOrientationTopic
+            if topic.value in normalized
+        )
+
+    def _apply_finalizer_proposal(
+        self,
+        state: _RunState,
+        base: ReviewHandoffContext,
+        proposal: FinalizerProposal,
+    ) -> ReviewHandoffContext:
+        allowed_topics = self._allowed_orientation_topics(state)
+        allowed_components = set(base.component_ids)
+        allowed_recipes = set(base.recipe_ids)
+
+        def topics(values: Iterable[ReviewOrientationTopic]) -> tuple[ReviewOrientationTopic, ...]:
+            return tuple(sorted(
+                {item for item in values if item in allowed_topics},
+                key=lambda item: item.value,
+            ))
+
+        return replace(
+            base,
+            change_topics=topics(proposal.change_topics),
+            component_ids=tuple(sorted(set(proposal.component_ids) & allowed_components)),
+            specialist_topics=topics(proposal.specialist_topics),
+            recipe_ids=tuple(sorted(set(proposal.recipe_ids) & allowed_recipes)),
+            coverage_boundary_topics=topics(proposal.coverage_boundary_topics),
+            review_emphasis_topics=topics(proposal.review_emphasis_topics),
+        )
+
+    @staticmethod
     def _minimal_handoff(verdict: str, degraded: bool) -> ReviewHandoff:
         recommendation = {
             "request_changes": "Request changes",
@@ -1252,7 +1553,7 @@ class ReviewController:
         policy_result = apply_runtime_verdict_policy(
             model_verdict=state.inputs.model_verdict,
             unresolved=unresolved,
-            allow_approve=state.inputs.allow_approve,
+            allow_approve=state.effective_allow_approve,
             evidence=state.evidence,
             obligations=obligation_map,
             changed_files=state.inputs.changed_files,
@@ -1289,20 +1590,17 @@ class ReviewController:
                         "policy": state.inputs.policy,
                         "pr_metadata": state.inputs.pr_metadata,
                     },
-                    legacy_args=(MappingProxyType({
-                        "review": state.review,
-                        "coverage": state.coverage.snapshot(),
-                        "verdict": state.verdict,
-                        "verdict_source": state.verdict_source,
-                    }),),
                 )
-                if not isinstance(proposed, ReviewHandoffContext):
-                    raise TypeError("finalizer must return ReviewHandoffContext")
-                # The finalizer may exercise the bounded model path, but all
-                # facts rendered into the handoff remain controller-owned.
-                # Accepting model-proposed counts, IDs, verdicts, or coverage
-                # flags here would let presentation overwrite policy state.
-                context = self._handoff_context(state, status)
+                proposal = _finalizer_proposal(proposed)
+                context = self._apply_finalizer_proposal(state, context, proposal)
+                state.journal.emit("finalizer_proposal_applied", {
+                    "recommendation": proposal.recommendation,
+                    "component_ids": context.component_ids,
+                    "recipe_ids": context.recipe_ids,
+                    "review_emphasis_topics": tuple(
+                        item.value for item in context.review_emphasis_topics
+                    ),
+                })
             except Exception as exc:
                 self._degrade(state, "finalizer", _bounded_error(exc))
                 context = self._handoff_context(state, "degraded")
@@ -1322,7 +1620,7 @@ class ReviewController:
             state.handoff = self._minimal_handoff(state.verdict, True)
         try:
             state.notes = build_review_notes(
-                state.review, state.evidence, state.inputs.publishing_mode,
+                state.review, state.evidence, state.effective_publishing_mode,
                 obligations=obligation_map, changed_files=state.inputs.changed_files,
                 verification_requests=state.inputs.verification_requests,
                 source_access_requests=state.source_requests,
@@ -1341,7 +1639,7 @@ class ReviewController:
         return [
             {
                 "phase": phase,
-                "status": "complete" if _PHASES.index(phase) <= _PHASES.index(state.phase or "precheck") else "not_started",
+                "status": state.phase_outcomes.get(phase, "not_started"),
                 "allocated_percent": percentages[phase],
                 "allocated_seconds": round(
                     state.inputs.config.review_deadline_sec * percentages[phase] / 100, 6,
@@ -1374,37 +1672,27 @@ class ReviewController:
                 "budget": _budget_projection(result.budget) if result else _budget_projection(BudgetUsage()),
                 "degraded": bool(result.degraded) if result else True,
             })
-        evidence = []
-        for record in state.evidence.snapshot().records:
-            evidence.append({
-                "evidence_id": record.id,
-                "category": record.category,
-                "collector_session_id": record.collector_session_id,
-                "model_identity": record.model_identity,
-                "tool": record.tool,
-                "source_identity": record.source_identity,
-                "source_path": record.source_path,
-                "provenance": {
-                    "head_sha": record.provenance.head_sha,
-                    "policy_hash": record.provenance.policy_hash,
-                    "policy_rule_id": record.provenance.policy_rule_id,
-                    "source_classification": record.provenance.source_classification,
-                    "original_url": record.provenance.original_url,
-                    "final_url": record.provenance.final_url,
-                    "max_age_hours": record.provenance.max_age_hours,
-                },
-                "status": record.status,
-                "content_hash": record.content_hash,
-                "mime_type": record.mime_type,
-                "truncated": record.truncated,
-                "redacted": record.redacted,
-                "imported_by": list(record.imported_by),
-                "supersedes": list(record.supersedes),
-                "contradicts": list(record.contradicts),
-            })
+        session_budgets = {
+            item["session_id"]: item["budget"] for item in sessions
+        }
+        for session_id, usage in state.failed_session_budgets.items():
+            session_budgets.setdefault(session_id, _budget_projection(usage))
+        evidence = [
+            _evidence_projection(record)
+            for record in state.evidence.snapshot().records
+        ]
+        journal_events = state.journal.snapshot()
+        events = [
+            {
+                "sequence": event.sequence,
+                "kind": event.kind,
+                "payload": _json_value(event.payload),
+            }
+            for event in journal_events
+        ]
         artifacts_events = [
-            {"sequence": event.sequence, "kind": event.kind}
-            for event in state.journal.snapshot()
+            {"sequence": event["sequence"], "kind": event["kind"]}
+            for event in events
         ]
         policy_digest = _digest(state.inputs.policy)
         config_digest = _digest(state.inputs.config)
@@ -1413,7 +1701,7 @@ class ReviewController:
             "accepted_candidates": [_json_value(item) for item in state.review.accepted],
             "candidate_dispositions": [
                 _json_value(item) for item in state.review.dispositions
-            ],
+            ] + list(state.collision_dispositions),
             "artifact_id": run_id,
             "artifact_write": {
                 "status": "ready" if path is not None else "failed",
@@ -1429,16 +1717,54 @@ class ReviewController:
             "assignments": [_json_value(state.assignments[key]) for key in sorted(state.assignments)],
             "base_sha": state.inputs.base_sha,
             "budgets": {
-                "sessions": {
-                    item["session_id"]: item["budget"] for item in sessions
-                },
+                "sessions": session_budgets,
                 "totals": {
-                    "model_turns": sum(item["budget"]["model_turns"] for item in sessions),
-                    "tool_calls": sum(item["budget"]["tool_calls"] for item in sessions),
-                    "recoveries": sum(item["budget"]["recoveries"] for item in sessions),
+                    "model_turns": sum(
+                        item["model_turns"] for item in session_budgets.values()
+                    ),
+                    "tool_calls": sum(
+                        item["tool_calls"] for item in session_budgets.values()
+                    ),
+                    "recoveries": sum(
+                        item["recoveries"] for item in session_budgets.values()
+                    ),
                     "controller_model_requests": sum(
                         1 for event in state.journal.snapshot()
+                        if event.kind == "model_request_started"
+                    ),
+                    "controller_model_completed": sum(
+                        1 for event in journal_events
                         if event.kind == "model_request_completed"
+                    ),
+                    "controller_model_failed": sum(
+                        1 for event in journal_events
+                        if event.kind == "model_request_failed"
+                    ),
+                    "controller_model_timed_out": sum(
+                        1 for event in journal_events
+                        if event.kind == "model_request_timed_out"
+                    ),
+                    "specialist_hook_attempts": sum(
+                        1 for event in journal_events
+                        if event.kind == "specialist_hook_started"
+                    ),
+                    "specialist_hook_failures": sum(
+                        1 for event in journal_events
+                        if event.kind in {
+                            "specialist_hook_failed", "specialist_hook_timed_out",
+                        }
+                    ),
+                    "specialist_model_requests": sum(
+                        1 for event in journal_events
+                        if event.kind == "specialist_request_started"
+                    ),
+                    "specialist_model_completed": sum(
+                        1 for event in journal_events
+                        if event.kind == "specialist_request_completed"
+                    ),
+                    "specialist_model_failed": sum(
+                        1 for event in journal_events
+                        if event.kind == "specialist_request_failed"
                     ),
                 },
             },
@@ -1463,6 +1789,11 @@ class ReviewController:
             "degradation": list(state.degradations),
             "evaluation_status": "degraded" if state.degradations else "complete",
             "event_references": artifacts_events,
+            "events": events,
+            "event_journal": {
+                "count": len(events),
+                "digest": _digest(events),
+            },
             "evidence": evidence,
             "handoff": _json_value(state.handoff),
             "head_sha": state.inputs.head_sha,
@@ -1482,7 +1813,14 @@ class ReviewController:
                 "config_digest": config_digest,
             },
             "pr_number": state.inputs.pr_number,
-            "publishing": {"ready": state.publishing_ready, "status": "not_published"},
+            "publishing": {
+                "ready": state.publishing_ready,
+                "status": "not_published",
+                "mode": state.effective_publishing_mode,
+                "allow_approve": state.effective_allow_approve,
+                "required_note_count": state.required_note_count,
+                "built_note_count": len(state.notes),
+            },
             "recipes": {
                 key: {"status": value} for key, value in sorted(recipe_states.items())
             },
@@ -1536,6 +1874,7 @@ class ReviewController:
             "candidate_dispositions", "candidate_unknowns",
             "verdict", "degradation", "publishing", "event_references",
             "evaluation_status", "artifact_write", "timing",
+            "events", "event_journal",
         }
         missing = sorted(required - set(artifact))
         if missing:
@@ -1568,6 +1907,43 @@ class ReviewController:
             for value in recipes.values()
         ):
             raise ValueError("every recipe requires a terminal status")
+        events = artifact.get("events")
+        event_journal = artifact.get("event_journal")
+        event_references = artifact.get("event_references")
+        if not isinstance(events, (list, tuple)) or any(
+            not isinstance(item, Mapping) for item in events
+        ):
+            raise ValueError("terminal artifact events must be an array of objects")
+        expected_sequences = list(range(1, len(events) + 1))
+        if [item.get("sequence") for item in events] != expected_sequences:
+            raise ValueError("terminal artifact event sequence is not contiguous")
+        if not isinstance(event_journal, Mapping) or (
+            event_journal.get("count") != len(events)
+            or event_journal.get("digest") != _digest(events)
+        ):
+            raise ValueError("terminal artifact event journal digest is inconsistent")
+        if not isinstance(event_references, (list, tuple)) or list(event_references) != [
+            {"sequence": item.get("sequence"), "kind": item.get("kind")}
+            for item in events
+        ]:
+            raise ValueError("terminal artifact event references are inconsistent")
+        publishing = artifact.get("publishing")
+        phases = artifact.get("phases")
+        if not isinstance(publishing, Mapping) or not isinstance(phases, (list, tuple)):
+            raise ValueError("terminal artifact publishing state is invalid")
+        publish_phase_status = next((
+            item.get("status") for item in phases
+            if isinstance(item, Mapping) and item.get("phase") == "publish_ready"
+        ), None)
+        if publishing.get("ready"):
+            if publish_phase_status != "complete":
+                raise ValueError("publishing readiness requires a completed publish phase")
+            if (
+                publishing.get("mode") != "comment"
+                and publishing.get("built_note_count")
+                != publishing.get("required_note_count")
+            ):
+                raise ValueError("detailed publishing readiness requires every note")
         json.dumps(
             artifact,
             sort_keys=True,
@@ -1582,24 +1958,51 @@ class ReviewController:
             next_phase = _LEGAL_TRANSITIONS.get(state.phase)
             if next_phase is None:
                 break
-            self._transition(state, next_phase)
+            status = "degraded" if next_phase == "complete" else "skipped"
+            self._transition(state, next_phase, status=status)
 
     def run(self, inputs: ReviewInputs) -> ReviewResult:
         """Run all legal phases and always return a terminal in-memory result."""
         journal = EventJournal(self.event_sink)
-        started_at = self.clock()
+        initialization_error: BaseException | None = None
+        try:
+            started_at = self.clock()
+            if not isfinite(started_at):
+                raise ValueError("controller clock must return a finite value")
+        except BaseException as exc:
+            started_at = time.monotonic()
+            initialization_error = exc
         deadline = RunDeadline(started_at, inputs.config.review_deadline_sec, inputs.config.phase_shares)
-        evidence = (
-            EvidenceStore.from_snapshot(self._provided_evidence_store.snapshot())
-            if self._provided_evidence_store is not None
-            else EvidenceStore()
-        )
+        evidence = EvidenceStore()
         state = _RunState(inputs=inputs, journal=journal, deadline=deadline, evidence=evidence)
         path: Path | None = None
         path_error: str | None = None
         artifact: dict[str, object] = {}
         write_error: str | None = None
         try:
+            if initialization_error is not None:
+                raise initialization_error
+            if self._evidence_seed is not None:
+                if (
+                    self._evidence_seed.repository != inputs.repository
+                    or self._evidence_seed.head_sha != inputs.head_sha
+                ):
+                    raise ValueError(
+                        "evidence seed binding does not match repository/head"
+                    )
+                state.evidence = EvidenceStore.from_snapshot(
+                    self._evidence_seed.snapshot,
+                )
+            elif self._provided_evidence_store is not None:
+                state.evidence = EvidenceStore.from_snapshot(
+                    self._provided_evidence_store.snapshot(),
+                )
+            else:
+                state.evidence = self._evidence_store_factory()
+                if not isinstance(state.evidence, EvidenceStore):
+                    raise TypeError(
+                        "evidence_store_factory must return EvidenceStore"
+                    )
             journal.emit("run_started", {
                 "repository": inputs.repository,
                 "pr_number": inputs.pr_number,
@@ -1611,8 +2014,14 @@ class ReviewController:
                 raise ValueError("repository and positive PR number are required")
             if inputs.publishing_mode not in {"comment", "review_comment", "review_verdict"}:
                 raise ValueError("invalid publishing mode")
+            (
+                state.effective_publishing_mode,
+                state.effective_allow_approve,
+            ) = self._publishing_authority(inputs)
             try:
-                path = _resolve_artifact_path(inputs)
+                path = _resolve_artifact_path(
+                    self.artifact_output_root, inputs.artifact_path,
+                )
             except BaseException as exc:
                 path_error = _bounded_error(exc)
                 self._degrade(state, "artifact_output_path", path_error)
@@ -1649,14 +2058,10 @@ class ReviewController:
             self._transition(state, "followup")
             followup_lease = state.deadline.lease_for(RunPhase.FOLLOWUP)
             for session_id in sorted(state.sessions):
-                try:
-                    state.sessions[session_id].update_lease(followup_lease)
-                except Exception as exc:
-                    self._degrade(
-                        state,
-                        f"specialist_lease:{session_id}",
-                        _bounded_error(exc),
-                    )
+                self._session_hook(
+                    state, session_id, "update_lease", RunPhase.FOLLOWUP,
+                    followup_lease,
+                )
             actions = self._negotiate(state, reconciliation)
             followups = self._followup_assignments(state, actions)
             followup, followup_snapshot = self._run_wave(
@@ -1682,17 +2087,21 @@ class ReviewController:
                         "absolute deadline reached; specialist finalization used retained checkpoint",
                     )
                     break
-                try:
-                    session.update_lease(state.deadline.lease_for(RunPhase.FINALIZATION))
-                except Exception as exc:
-                    self._degrade(state, f"specialist_lease:{key}", _bounded_error(exc))
+                updated, _ = self._session_hook(
+                    state,
+                    key,
+                    "update_lease",
+                    RunPhase.FINALIZATION,
+                    state.deadline.lease_for(RunPhase.FINALIZATION),
+                )
+                if not updated:
                     continue
-                finalizer = getattr(session, "finalize", None)
-                if not callable(finalizer):
-                    continue
-                try:
-                    result = finalizer()
+                succeeded, result = self._session_hook(
+                    state, key, "finalize", RunPhase.FINALIZATION,
+                )
+                if succeeded and result is not None:
                     state.session_results[(session.assignment.id, result.session_id)] = result
+                    self._admit_specialist_request_events(state, result)
                     journal.emit("session_transition", {
                         "session_id": result.session_id,
                         "state": result.state.value,
@@ -1707,8 +2116,6 @@ class ReviewController:
                             "specialist finalization completed at the absolute deadline",
                         )
                         break
-                except Exception as exc:
-                    self._degrade(state, f"specialist_finalization:{key}", _bounded_error(exc))
             candidates = self._collect_candidates(state)
             self._adjudicate(state, candidates)
             state.source_requests.extend(sorted(
@@ -1725,14 +2132,25 @@ class ReviewController:
                 })
             self._finalize_products(state)
 
-            self._transition(state, "publish_ready")
-            state.publishing_ready = path is not None
+            state.required_note_count = self._required_note_count(state)
+            state.publishing_ready = self._publication_is_ready(state, path)
+            self._transition(
+                state,
+                "publish_ready",
+                status="complete" if state.publishing_ready else "degraded",
+            )
             if state.publishing_ready:
                 journal.emit("publishing_ready", {
                     "handoff": bool(state.handoff.markdown),
                     "note_ids": tuple(item.fingerprint for item in state.notes),
                     "verdict": state.verdict,
                     "verdict_source": state.verdict_source,
+                })
+            else:
+                journal.emit("publishing_blocked", {
+                    "mode": state.effective_publishing_mode,
+                    "required_note_count": state.required_note_count,
+                    "built_note_count": len(state.notes),
                 })
             self._transition(state, "complete")
         except BaseException as exc:  # terminal artifact survives every controlled failure
@@ -1754,8 +2172,37 @@ class ReviewController:
         except BaseException as exc:
             self._degrade(state, "artifact_projection", _bounded_error(exc))
             state.publishing_ready = False
-            # This projection is intentionally small but remains schema-valid and
-            # does not invent findings, evidence, coverage, or a blocking verdict.
+            emergency_results = {
+                result.session_id: result for result in state.session_results.values()
+            }
+            emergency_sessions = [
+                {
+                    "session_id": session_id,
+                    "assignment_id": (
+                        state.ownership[session_id].assignment_id
+                        if session_id in state.ownership else None
+                    ),
+                    "ownership": _json_value(state.ownership[session_id])
+                    if session_id in state.ownership else None,
+                    "state": emergency_results[session_id].state.value,
+                    "checkpoint": _checkpoint_projection(
+                        emergency_results[session_id].checkpoint,
+                    ),
+                    "budget": _budget_projection(emergency_results[session_id].budget),
+                    "degraded": bool(emergency_results[session_id].degraded),
+                }
+                for session_id in sorted(emergency_results)
+            ]
+            emergency_budget_map = {
+                item["session_id"]: item["budget"] for item in emergency_sessions
+            }
+            emergency_budget_map.update({
+                session_id: _budget_projection(usage)
+                for session_id, usage in state.failed_session_budgets.items()
+            })
+            emergency_coverage = state.coverage.snapshot()
+            emergency_statuses = dict(emergency_coverage.obligation_statuses)
+            emergency_evidence = dict(emergency_coverage.evidence_by_obligation)
             artifact = {
                 "schema_version": _SCHEMA_VERSION,
                 "artifact_id": artifact_identity,
@@ -1765,36 +2212,125 @@ class ReviewController:
                 "head_sha": inputs.head_sha,
                 "policy": {"version": inputs.policy.version, "digest": _digest(inputs.policy), "config_digest": _digest(inputs.config)},
                 "phases": self._phase_allocations(state),
-                "assignment_plan": {"source": "deterministic_fallback", "planner_repaired": False, "unassigned_obligation_ids": []},
-                "assignments": [], "sessions": [], "budgets": {"sessions": {}, "totals": {"model_turns": 0, "tool_calls": 0, "recoveries": 0, "controller_model_requests": 0}},
-                "evidence": [],
+                "assignment_plan": {
+                    "source": state.plan_source,
+                    "planner_repaired": state.planner_repaired,
+                    "unassigned_obligation_ids": list(
+                        state.plan.unassigned_obligation_ids,
+                    ),
+                },
+                "assignments": [
+                    _json_value(state.assignments[key])
+                    for key in sorted(state.assignments)
+                ],
+                "sessions": emergency_sessions,
+                "budgets": {
+                    "sessions": emergency_budget_map,
+                    "totals": {
+                        "model_turns": sum(
+                            item["model_turns"]
+                            for item in emergency_budget_map.values()
+                        ),
+                        "tool_calls": sum(
+                            item["tool_calls"]
+                            for item in emergency_budget_map.values()
+                        ),
+                        "recoveries": sum(
+                            item["recoveries"]
+                            for item in emergency_budget_map.values()
+                        ),
+                        "controller_model_requests": sum(
+                            item.kind == "model_request_started"
+                            for item in journal.snapshot()
+                        ),
+                    },
+                },
+                "evidence": [
+                    _evidence_projection(record)
+                    for record in state.evidence.snapshot().records
+                ],
                 "coverage": {
                     item.id: {
-                        "status": "unresolved",
+                        "status": emergency_statuses.get(
+                            item.id, ObligationStatus.UNRESOLVED,
+                        ).value,
                         "mandatory": item.mandatory,
                         "risk_tier": item.risk_tier,
                         "unresolved_policy": item.unresolved_policy,
                         "recipe_id": item.recipe_id,
                         "origin": item.origin,
                         "subject": item.subject,
-                        "explanation": "terminal projection unavailable",
-                        "scope": [],
-                        "satisfaction_predicates": [],
+                        "explanation": item.explanation,
+                        "scope": list(item.scope),
+                        "satisfaction_predicates": list(item.satisfaction_predicates),
                         "requires_independent_verification": item.requires_independent_verification,
                         "required_evidence_categories": list(item.required_evidence_categories),
-                        "evidence_ids": [],
+                        "evidence_ids": list(emergency_evidence.get(item.id, ())),
                     }
                     for item in state.obligations
                 },
-                "recipes": {item.id: {"status": "unresolved"} for item in inputs.policy.recipes},
-                "unknowns": list(state.unknowns), "source_access_requests": [],
-                "accepted_candidates": [], "rejected_candidates": [],
-                "candidate_dispositions": [], "candidate_unknowns": [],
-                "handoff": _json_value(state.handoff), "notes": [],
-                "verdict": {"value": state.verdict, "source": state.verdict_source, "blocking_finding_ids": [], "blocking_obligation_ids": []},
+                "recipes": {
+                    item.id: {
+                        "status": state.coverage.recipe_statuses().get(
+                            item.id, "not_applicable",
+                        ),
+                    }
+                    for item in inputs.policy.recipes
+                },
+                "unknowns": list(state.unknowns),
+                "source_access_requests": [
+                    _json_value(item) for item in state.source_requests
+                ],
+                "accepted_candidates": [
+                    _json_value(item) for item in state.review.accepted
+                ],
+                "rejected_candidates": [
+                    _json_value(item) for item in state.review.rejected
+                ],
+                "candidate_dispositions": [
+                    _json_value(item) for item in state.review.dispositions
+                ] + list(state.collision_dispositions),
+                "candidate_unknowns": [
+                    _json_value(item) for item in state.review.unknowns
+                ],
+                "handoff": _json_value(state.handoff),
+                "notes": [
+                    {
+                        "kind": item.kind.value,
+                        "fingerprint": item.fingerprint,
+                        "related_obligation_ids": list(item.related_obligation_ids),
+                        "evidence_ids": list(item.evidence_ids),
+                    }
+                    for item in state.notes
+                ],
+                "verdict": {
+                    "value": state.verdict,
+                    "source": state.verdict_source,
+                    "blocking_finding_ids": list(state.blocking_finding_ids),
+                    "blocking_obligation_ids": list(state.blocking_obligation_ids),
+                },
                 "degradation": list(state.degradations),
                 "publishing": {"ready": state.publishing_ready, "status": "not_published"},
                 "event_references": [{"sequence": item.sequence, "kind": item.kind} for item in journal.snapshot()],
+                "events": [
+                    {
+                        "sequence": item.sequence,
+                        "kind": item.kind,
+                        "payload": _json_value(item.payload),
+                    }
+                    for item in journal.snapshot()
+                ],
+                "event_journal": {
+                    "count": len(journal.snapshot()),
+                    "digest": _digest([
+                        {
+                            "sequence": item.sequence,
+                            "kind": item.kind,
+                            "payload": _json_value(item.payload),
+                        }
+                        for item in journal.snapshot()
+                    ]),
+                },
                 "evaluation_status": "degraded",
                 "artifact_write": {
                     "status": "ready" if path is not None else "failed",
@@ -1816,7 +2352,19 @@ class ReviewController:
             })
         else:
             try:
-                self.artifact_writer(path, artifact)
+                checked_path = _resolve_artifact_path(
+                    self.artifact_output_root, inputs.artifact_path,
+                )
+                if checked_path != path:
+                    raise ValueError("artifact output path changed before write")
+                write_status = self.artifact_writer(path, artifact)
+                artifact = dict(artifact)
+                artifact["artifact_write"] = {
+                    "status": write_status
+                    if write_status in {"written", "written_durability_warning"}
+                    else "written",
+                    "path": path.name,
+                }
             except BaseException as exc:
                 write_error = _bounded_error(exc)
                 journal.emit("artifact_write_failed", {
@@ -1832,9 +2380,21 @@ class ReviewController:
                 {"sequence": item.sequence, "kind": item.kind}
                 for item in journal.snapshot()
             ]
+            artifact["events"] = [
+                {
+                    "sequence": item.sequence,
+                    "kind": item.kind,
+                    "payload": _json_value(item.payload),
+                }
+                for item in journal.snapshot()
+            ]
+            artifact["event_journal"] = {
+                "count": len(artifact["events"]),
+                "digest": _digest(artifact["events"]),
+            }
             self._validate_artifact(artifact)
         return ReviewResult(
-            artifact=artifact,
+            artifact=_freeze_result_value(artifact),  # type: ignore[arg-type]
             handoff=state.handoff,
             notes=state.notes,
             verdict=state.verdict,

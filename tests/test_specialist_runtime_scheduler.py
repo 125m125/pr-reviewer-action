@@ -513,6 +513,24 @@ def test_session_exception_is_a_stable_failure_not_not_started():
     ]
 
 
+def test_session_base_exception_is_a_stable_failure_for_reassignment():
+    class FatalWorkerSignal(BaseException):
+        pass
+
+    class BrokenSession:
+        def explore(self):
+            raise FatalWorkerSignal("worker interrupted")
+
+    result = SessionScheduler(
+        deadline=deadline(), session_factory=lambda *_: BrokenSession(),
+        wave_snapshot=empty_snapshot(), concurrency=1, clock=FakeClock(20.0),
+    ).run_wave((assignment("S1", "critical"),), RunPhase.INITIAL)
+
+    assert tuple((item.assignment_id, item.error) for item in result.failures) == (
+        ("S1", "FatalWorkerSignal: worker interrupted"),
+    )
+
+
 def test_scheduler_workers_are_daemonized_for_abandoned_in_flight_work():
     daemon_flags = []
 

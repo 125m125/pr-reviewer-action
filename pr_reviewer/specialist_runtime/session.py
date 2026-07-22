@@ -11,6 +11,7 @@ from pr_reviewer.conversation import Conversation
 from pr_reviewer.tool_loop import decode_native_tool_arguments, native_tool_request_key
 
 from .budget import BudgetExhausted, BudgetLedger, SessionLease
+from .callbacks import mask_runtime_text
 from .coverage import CoverageLedger
 from .evidence import EvidenceRecord, EvidenceStore
 from .model_gateway import ModelGateway, ModelTurnRequest, ModelTurnResult
@@ -132,6 +133,17 @@ def _evidence_matches_obligation(
 
 
 @dataclass(frozen=True)
+class SpecialistRequestEvent:
+    """One actual specialist gateway request transition."""
+
+    request_id: str
+    status: str
+    tools_enabled: bool
+    response_schema_name: str | None
+    error: str = ""
+
+
+@dataclass(frozen=True)
 class SessionResult:
     """Detached projection of current or completed specialist state."""
 
@@ -141,6 +153,7 @@ class SessionResult:
     budget: BudgetUsage
     report: Mapping[str, Any] | None = None
     degraded: bool = False
+    request_events: tuple[SpecialistRequestEvent, ...] = ()
 
 
 class SpecialistSession:
@@ -189,6 +202,7 @@ class SpecialistSession:
         self.latest_checkpoint = self._project_checkpoint(())
         self._successful_requests: dict[str, EvidenceRecord] = {}
         self._final_result: SessionResult | None = None
+        self._request_events: list[SpecialistRequestEvent] = []
         if not self.conversation.events:
             self.conversation.add_user(self._assignment_prompt())
 
@@ -212,6 +226,10 @@ class SpecialistSession:
             )),
         }
         return "Immutable specialist assignment:\n" + json.dumps(payload, sort_keys=True)
+
+    @property
+    def request_events(self) -> tuple[SpecialistRequestEvent, ...]:
+        return tuple(self._request_events)
 
     def _assigned_obligation_ids(self) -> tuple[str, ...]:
         primary = tuple(getattr(self.assignment, "primary_obligation_ids", ()))
@@ -237,12 +255,32 @@ class SpecialistSession:
         )
         timeout = self.lease.request_timeout(self.request_timeout_sec)
         self.budget.reserve_model_turn()
-        result = self.gateway.complete(ModelTurnRequest(
-            role="specialist", conversation=self.conversation, max_tokens=request_max_tokens,
-            response_schema=schema, tools_enabled=tools_enabled, timeout_sec=timeout,
-            deadline_at=self.lease.deadline_at, stream=self.stream,
-            response_schema_name=("specialist_checkpoint" if schema is _CHECKPOINT_SCHEMA
-                                  else "specialist_final" if schema is _FINAL_SCHEMA else None),
+        request_id = f"{self.session_id}:model:{len(self._request_events) // 2 + 1}"
+        schema_name = (
+            "specialist_checkpoint" if schema is _CHECKPOINT_SCHEMA
+            else "specialist_final" if schema is _FINAL_SCHEMA else None
+        )
+        self._request_events.append(SpecialistRequestEvent(
+            request_id, "started", tools_enabled, schema_name,
+        ))
+        try:
+            result = self.gateway.complete(ModelTurnRequest(
+                role="specialist", conversation=self.conversation,
+                max_tokens=request_max_tokens, response_schema=schema,
+                tools_enabled=tools_enabled, timeout_sec=timeout,
+                deadline_at=self.lease.deadline_at, stream=self.stream,
+                response_schema_name=schema_name,
+            ))
+        except BaseException as exc:
+            self._request_events.append(SpecialistRequestEvent(
+                request_id, "failed", tools_enabled, schema_name,
+                mask_runtime_text(
+                    f"{type(exc).__name__}: {exc}", limit=500,
+                ),
+            ))
+            raise
+        self._request_events.append(SpecialistRequestEvent(
+            request_id, "completed", tools_enabled, schema_name,
         ))
         self.budget.record_model_usage(
             input_tokens=int(result.usage.get("prompt_tokens", 0) or 0),
@@ -498,6 +536,7 @@ class SpecialistSession:
             session_id=self.session_id, state=self.state,
             checkpoint=self.latest_checkpoint, budget=self.budget.snapshot(),
             report=dict(report) if report is not None else None, degraded=degraded,
+            request_events=tuple(self._request_events),
         )
 
     def conversation_contains_evidence_ids(self, evidence_ids: tuple[str, ...]) -> bool:

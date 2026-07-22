@@ -2,22 +2,41 @@
 
 from dataclasses import dataclass, replace
 
+import hashlib
 import json
 import math
+from pathlib import Path
+import tempfile
 import time
 
-from pr_reviewer.specialist_runtime.adjudication import ReviewHandoffContext
+import pytest
+
+from pr_reviewer.specialist_runtime.adjudication import (
+    ReviewHandoffContext,
+    ReviewOrientationTopic,
+)
 from pr_reviewer.specialist_runtime.controller import (
+    EvidenceSeed,
+    FinalizerProposal,
     RoleRequest,
     ReviewController,
     ReviewInputs,
     ReviewResult,
 )
+from pr_reviewer.specialist_runtime.callbacks import (
+    CALLBACK_POOL,
+    CallbackCapacityExceeded,
+    CallbackTimedOut,
+)
 from pr_reviewer.specialist_runtime.events import EventJournal
 from pr_reviewer.specialist_runtime.evidence import EvidenceStore
 from pr_reviewer.specialist_runtime.coverage import derive_obligations
+from pr_reviewer.specialist_runtime.budget import BudgetLedger
 from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy, RuntimeConfig
-from pr_reviewer.specialist_runtime.session import SessionResult
+from pr_reviewer.specialist_runtime.session import (
+    SessionResult,
+    SpecialistRequestEvent,
+)
 from pr_reviewer.specialist_runtime.types import (
     BudgetLimits,
     BudgetUsage,
@@ -48,6 +67,10 @@ def _policy() -> ReviewPolicy:
 
 
 def _inputs(tmp_path) -> ReviewInputs:
+    relative_artifact = (
+        tmp_path.resolve().relative_to(Path(tempfile.gettempdir()).resolve())
+        / "specialist-review-artifact.json"
+    )
     return ReviewInputs(
         repository="owner/repository",
         pr_number=17,
@@ -68,8 +91,7 @@ def _inputs(tmp_path) -> ReviewInputs:
             session_limits=BudgetLimits(model_turns=8, tool_calls=8, recoveries=1),
         ),
         changed_files=("src/worker.py",),
-        artifact_path=tmp_path / "specialist-review-artifact.json",
-        artifact_output_root=tmp_path,
+        artifact_path=relative_artifact,
         allow_approve=True,
         publishing_mode="review_comment",
     )
@@ -98,6 +120,23 @@ def _planner(obligations, topology, config):
         "priority": priority,
         "overlap_justification": "",
     }]}
+
+
+def _planner_role(request):
+    return _planner(
+        request.context["obligations"],
+        request.context["topology"],
+        request.context["config"],
+    )
+
+
+def _critic_role(request):
+    return {
+        "decisions": [
+            {"candidate_id": item.candidate_id, "action": "keep"}
+            for item in request.context["candidates"]
+        ]
+    }
 
 
 @dataclass
@@ -181,20 +220,15 @@ def test_controller_runs_obligations_assignments_sessions_and_finalizer(tmp_path
         )
 
     controller = ReviewController(
-        planner=_planner,
+        planner=_planner_role,
         session_factory=factory,
-        critic=lambda candidates, state: {
-            "decisions": [
-                {"candidate_id": item.candidate_id, "action": "keep"}
-                for item in candidates
-            ]
-        },
-        finalizer=lambda state: ReviewHandoffContext(
-            recommendation="approve",
-            status="complete",
+        critic=_critic_role,
+        finalizer=lambda request: FinalizerProposal(
+            component_ids=("worker",),
             recipe_ids=("delivery",),
         ),
         clock=lambda: 0.0,
+        artifact_output_root=Path(tempfile.gettempdir()),
     )
 
     result = controller.run(_inputs(tmp_path))
@@ -224,23 +258,19 @@ def _factory(
 
 def _finalizer(state):
     del state
-    return ReviewHandoffContext(
-        recommendation="approve", status="complete", recipe_ids=("delivery",),
+    return FinalizerProposal(
+        component_ids=("worker",), recipe_ids=("delivery",),
     )
 
 
 def _controller(**overrides):
     values = {
-        "planner": _planner,
+        "planner": _planner_role,
         "session_factory": _factory,
-        "critic": lambda candidates, state: {
-            "decisions": [
-                {"candidate_id": item.candidate_id, "action": "keep"}
-                for item in candidates
-            ]
-        },
+        "critic": _critic_role,
         "finalizer": _finalizer,
         "clock": lambda: 0.0,
+        "artifact_output_root": Path(tempfile.gettempdir()),
     }
     values.update(overrides)
     return ReviewController(**values)
@@ -408,6 +438,45 @@ def test_critic_failure_rejects_ambiguous_candidate(tmp_path):
     assert result.verdict != "request_changes" or result.verdict_source != "supported-findings"
 
 
+def test_duplicate_candidate_ids_reject_every_occurrence_without_first_wins(tmp_path):
+    candidates = (
+        CandidateFinding(
+            candidate_id="collision",
+            root_cause_fingerprint="first",
+            claim="First claim",
+            collector_session_id="input:first",
+            model_identity="model-a",
+        ),
+        CandidateFinding(
+            candidate_id="collision",
+            root_cause_fingerprint="second",
+            claim="Second claim",
+            collector_session_id="input:second",
+            model_identity="model-b",
+        ),
+    )
+    critic_inputs = []
+
+    def critic(request):
+        critic_inputs.extend(request.context["candidates"])
+        return {"decisions": []}
+
+    result = _controller(critic=critic).run(replace(
+        _inputs(tmp_path), candidate_findings=candidates,
+    ))
+
+    collisions = [
+        item for item in result.artifact["candidate_dispositions"]
+        if item["candidate_id"] == "collision"
+    ]
+    assert all(item.candidate_id != "collision" for item in critic_inputs)
+    assert len(collisions) == 2
+    assert {item["occurrence_ref"] for item in collisions} == {
+        "input:0", "input:1",
+    }
+    assert all(item["reason"] == "duplicate-candidate-id" for item in collisions)
+
+
 def test_finalizer_failure_builds_deterministic_minimal_sparse_handoff(tmp_path):
     def broken_finalizer(*args):
         raise RuntimeError("finalizer timed out")
@@ -434,8 +503,8 @@ def test_deadline_stops_exploration_and_preserves_finalization_reserve(tmp_path)
     sessions_started = []
     finalizer_calls = []
 
-    def planner(*args):
-        raw = _planner(*args)
+    def planner(request):
+        raw = _planner_role(request)
         clock.now = 90.0
         return raw
 
@@ -460,6 +529,53 @@ def test_deadline_stops_exploration_and_preserves_finalization_reserve(tmp_path)
     )
 
 
+def test_failed_specialist_requests_retain_attempt_budget_without_event_replay(tmp_path):
+    class FailedRequestSession:
+        def __init__(self, assignment, expected_session_id):
+            self.assignment = assignment
+            self.session_id = expected_session_id
+            self.candidate_findings = ()
+            self.budget = BudgetLedger(BudgetLimits(
+                model_turns=8, tool_calls=8, recoveries=1,
+            ))
+            self._events = ()
+
+        @property
+        def request_events(self):
+            return self._events
+
+        def explore(self):
+            self.budget.reserve_model_turn()
+            request_id = f"{self.session_id}:model:1"
+            self._events = (
+                SpecialistRequestEvent(request_id, "started", True, None),
+                SpecialistRequestEvent(
+                    request_id, "failed", True, None, "provider failed",
+                ),
+            )
+            raise RuntimeError("provider failed")
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, evidence_store, coverage, obligations
+        return FailedRequestSession(assignment, expected_session_id)
+
+    result = _controller(session_factory=factory).run(_inputs(tmp_path))
+    totals = result.artifact["budgets"]["totals"]
+
+    assert totals["specialist_model_requests"] == 2
+    assert totals["specialist_model_failed"] == 2
+    assert totals["model_turns"] == 2
+    assert len(result.artifact["budgets"]["sessions"]) == 2
+    assert len({
+        event["payload"]["request_id"]
+        for event in result.artifact["events"]
+        if event["kind"] == "specialist_request_started"
+    }) == 2
+
+
 def test_artifact_write_failure_preserves_prior_file_and_valid_result(tmp_path):
     artifact_path = tmp_path / "specialist-review-artifact.json"
     artifact_path.write_text('{"prior":true}\n', encoding="utf-8")
@@ -468,9 +584,7 @@ def test_artifact_write_failure_preserves_prior_file_and_valid_result(tmp_path):
         del path, artifact
         raise OSError("disk full token=very-secret-value")
 
-    result = _controller(artifact_writer=broken_writer).run(replace(
-        _inputs(tmp_path), artifact_path=artifact_path,
-    ))
+    result = _controller(artifact_writer=broken_writer).run(_inputs(tmp_path))
 
     assert artifact_path.read_text(encoding="utf-8") == '{"prior":true}\n'
     assert result.artifact["artifact_write"]["status"] == "failed"
@@ -548,8 +662,8 @@ def test_semantic_artifact_is_stable_across_completion_order_and_clock_origin(tm
         del args
         return obligations
 
-    def planner(items, topology, config):
-        del topology, config
+    def planner(request):
+        items = request.context["obligations"]
         return {"assignments": [{
             "id": f"session-{item.subject}",
             "title": item.subject,
@@ -587,10 +701,11 @@ def test_semantic_artifact_is_stable_across_completion_order_and_clock_origin(tm
         return ReviewController(
             planner=planner,
             session_factory=factory,
-            critic=lambda candidates, state: {"decisions": []},
+            critic=lambda request: {"decisions": []},
             finalizer=_finalizer,
             clock=lambda: clock_origin,
             obligation_deriver=deriver,
+            artifact_output_root=Path(tempfile.gettempdir()),
         ).run(inputs).artifact
 
     first_dir = tmp_path / "first"
@@ -628,19 +743,20 @@ def test_unexpected_controller_failure_returns_notice_without_fabricated_blocker
         raise RuntimeError("topology unavailable")
 
     result = ReviewController(
-        planner=_planner,
+        planner=_planner_role,
         session_factory=_factory,
-        critic=lambda candidates, state: {"decisions": []},
+        critic=lambda request: {"decisions": []},
         finalizer=_finalizer,
         clock=lambda: 0.0,
         obligation_deriver=broken_deriver,
+        artifact_output_root=Path(tempfile.gettempdir()),
     ).run(_inputs(tmp_path))
 
     assert result.verdict == "notice"
     assert result.publishing_ready is False
     assert "Approve" not in result.handoff.markdown
-    assert result.artifact["accepted_candidates"] == []
-    assert result.artifact["verdict"]["blocking_finding_ids"] == []
+    assert result.artifact["accepted_candidates"] == ()
+    assert result.artifact["verdict"]["blocking_finding_ids"] == ()
 
 
 def test_planner_receives_typed_phase_lease_request(tmp_path):
@@ -805,8 +921,8 @@ def test_in_flight_worker_is_isolated_and_never_finalized_after_wave_return(tmp_
 
     assert finalized.is_set() is False
     assert json.dumps(result.artifact, sort_keys=True) == before
-    assert result.artifact["evidence"] == []
-    assert result.artifact["sessions"] == []
+    assert result.artifact["evidence"] == ()
+    assert result.artifact["sessions"] == ()
 
 
 def test_factory_session_identity_mismatch_fails_closed_without_ghost_state(tmp_path):
@@ -823,8 +939,8 @@ def test_factory_session_identity_mismatch_fails_closed_without_ghost_state(tmp_
 
     result = _controller(session_factory=factory).run(_inputs(tmp_path))
 
-    assert result.artifact["sessions"] == []
-    assert result.artifact["evidence"] == []
+    assert result.artifact["sessions"] == ()
+    assert result.artifact["evidence"] == ()
     assert any(
         "session identity" in item["reason"]
         for item in result.artifact["degradation"]
@@ -863,8 +979,8 @@ def test_session_cannot_forge_evidence_collector_identity(tmp_path):
         config=replace(_inputs(tmp_path).config, max_followup_sessions=0),
     ))
 
-    assert result.artifact["sessions"] == []
-    assert result.artifact["evidence"] == []
+    assert result.artifact["sessions"] == ()
+    assert result.artifact["evidence"] == ()
     assert any(
         "collector identity" in item["reason"]
         for item in result.artifact["degradation"]
@@ -966,6 +1082,94 @@ def test_finalizer_cannot_override_controller_owned_handoff_facts(tmp_path):
     assert result.handoff.coverage_warning
 
 
+def test_finalizer_proposal_selects_only_authorized_orientation(tmp_path):
+    def finalizer(request):
+        assert request.context["pr_metadata"] == {}
+        assert request.context["policy"].version == 2
+        return FinalizerProposal(
+            component_ids=("worker", "invented"),
+            recipe_ids=("delivery", "invented"),
+            review_emphasis_topics=(
+                ReviewOrientationTopic.FAILURE_RECOVERY,
+                ReviewOrientationTopic.SECURITY,
+            ),
+            recommendation="approve",
+        )
+
+    result = _controller(finalizer=finalizer).run(_inputs(tmp_path))
+
+    assert "Component: worker" in result.handoff.markdown
+    assert "invented" not in result.handoff.markdown
+    assert "Failure recovery" in result.handoff.markdown
+    assert "Security" not in result.handoff.markdown
+    assert result.handoff.recommendation in {"Approve", "Request changes"}
+
+
+def test_repository_publishing_policy_prevents_caller_broadening(tmp_path):
+    policy = replace(_policy(), publishing={
+        "mode": "comment",
+        "allow_approve": False,
+    })
+    result = _controller().run(replace(
+        _inputs(tmp_path),
+        policy=policy,
+        publishing_mode="review_verdict",
+        allow_approve=True,
+    ))
+
+    assert result.artifact["publishing"]["mode"] == "comment"
+    assert result.artifact["publishing"]["allow_approve"] is False
+    assert result.verdict == "request_changes"
+    assert result.notes == ()
+
+
+def test_caller_can_narrow_repository_publishing_policy(tmp_path):
+    policy = replace(_policy(), publishing={
+        "mode": "review_verdict",
+        "allow_approve": True,
+    })
+    result = _controller().run(replace(
+        _inputs(tmp_path),
+        policy=policy,
+        publishing_mode="review_comment",
+        allow_approve=True,
+    ))
+
+    assert result.artifact["publishing"]["mode"] == "review_comment"
+    assert result.artifact["publishing"]["allow_approve"] is True
+    assert result.verdict == "approve"
+
+
+def test_detailed_publishing_is_not_ready_when_a_required_note_is_unauthorized(tmp_path):
+    result = _controller().run(replace(
+        _inputs(tmp_path),
+        verification_requests=({"kind": "invalid"},),
+    ))
+
+    assert result.artifact["publishing"]["required_note_count"] > len(result.notes)
+    assert result.publishing_ready is False
+    publish_phase = next(
+        item for item in result.artifact["phases"]
+        if item["phase"] == "publish_ready"
+    )
+    assert publish_phase["status"] == "degraded"
+
+
+def test_comment_mode_is_ready_without_detailed_notes(tmp_path):
+    policy = replace(_policy(), publishing={
+        "mode": "comment", "allow_approve": False,
+    })
+    result = _controller().run(replace(
+        _inputs(tmp_path),
+        policy=policy,
+        publishing_mode="comment",
+        verification_requests=({"kind": "invalid"},),
+    ))
+
+    assert result.notes == ()
+    assert result.publishing_ready is True
+
+
 def test_output_path_must_be_beneath_controller_owned_root(tmp_path):
     outside = tmp_path.parent / "must-not-overwrite.json"
     outside.write_text('{"owner":"user"}\n', encoding="utf-8")
@@ -988,6 +1192,8 @@ def test_event_journal_redacts_sensitive_key_variants_and_nonfinite_numbers():
         "access-token": "value-a",
         "client_secret_value": "value-b",
         "AUTHORIZATION_HEADER": "value-c",
+        "clientSecret": "value-d",
+        "githubToken": "value-e",
         "nan": math.nan,
         "positive_infinity": math.inf,
         "hostile": Hostile(),
@@ -997,6 +1203,8 @@ def test_event_journal_redacts_sensitive_key_variants_and_nonfinite_numbers():
     assert payload["access-token"] == "[REDACTED]"
     assert payload["client_secret_value"] == "[REDACTED]"
     assert payload["AUTHORIZATION_HEADER"] == "[REDACTED]"
+    assert payload["clientSecret"] == "[REDACTED]"
+    assert payload["githubToken"] == "[REDACTED]"
     assert payload["nan"] == "[invalid-number]"
     assert payload["positive_infinity"] == "[invalid-number]"
     assert payload["hostile"] == "[unserializable]"
@@ -1025,6 +1233,58 @@ def test_event_observer_concurrency_is_bounded():
         release.set()
 
 
+def test_event_observer_orphan_cap_is_process_global_across_journals():
+    import threading
+
+    release = threading.Event()
+    entered = []
+
+    def observer(event):
+        entered.append(event.sequence)
+        release.wait(1)
+
+    journals = [EventJournal(observer, observer_timeout_sec=0.01) for _ in range(5)]
+    try:
+        for journal in journals:
+            journal.emit("event", {})
+        assert len(entered) == 4
+        assert any("capacity" in item for item in journals[-1].external_errors())
+    finally:
+        release.set()
+
+
+def test_role_and_session_callback_orphans_share_one_process_global_cap():
+    import threading
+
+    release = threading.Event()
+    entered = []
+
+    def hanging_callback():
+        entered.append(len(entered))
+        release.wait(1)
+
+    try:
+        for index in range(CALLBACK_POOL.capacity):
+            with pytest.raises(CallbackTimedOut):
+                CALLBACK_POOL.run(
+                    hanging_callback,
+                    timeout_sec=0.005,
+                    name=f"mixed-role-session-{index}",
+                )
+        with pytest.raises(CallbackCapacityExceeded):
+            CALLBACK_POOL.run(
+                lambda: None,
+                timeout_sec=0.01,
+                name="later-controller",
+            )
+        assert len(entered) == CALLBACK_POOL.capacity
+    finally:
+        release.set()
+        deadline = time.monotonic() + 1
+        while CALLBACK_POOL.in_flight and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+
 def test_reusing_controller_does_not_reuse_prior_run_evidence(tmp_path):
     shared = EvidenceStore()
     controller = _controller(evidence_store=shared)
@@ -1033,7 +1293,10 @@ def test_reusing_controller_does_not_reuse_prior_run_evidence(tmp_path):
     second = controller.run(replace(
         _inputs(tmp_path),
         head_sha="c" * 40,
-        artifact_path=tmp_path / "second.json",
+        artifact_path=(
+            tmp_path.resolve().relative_to(Path(tempfile.gettempdir()).resolve())
+            / "second.json"
+        ),
     ))
 
     assert len(first.artifact["evidence"]) == len(second.artifact["evidence"])
@@ -1047,16 +1310,12 @@ def test_emergency_projection_is_terminal_schema_valid_and_not_publishable(tmp_p
             raise KeyboardInterrupt("projection interrupted token=private")
 
     controller = BrokenProjectionController(
-        planner=_planner,
+        planner=_planner_role,
         session_factory=_factory,
-        critic=lambda candidates, state: {
-            "decisions": [
-                {"candidate_id": item.candidate_id, "action": "keep"}
-                for item in candidates
-            ],
-        },
+        critic=_critic_role,
         finalizer=_finalizer,
         clock=lambda: 0.0,
+        artifact_output_root=Path(tempfile.gettempdir()),
     )
 
     result = controller.run(_inputs(tmp_path))
@@ -1065,8 +1324,202 @@ def test_emergency_projection_is_terminal_schema_valid_and_not_publishable(tmp_p
     assert result.artifact["evaluation_status"] == "degraded"
     assert result.artifact["publishing"]["ready"] is False
     assert result.publishing_ready is False
+    assert result.artifact["assignments"]
+    assert result.artifact["sessions"]
+    assert result.artifact["evidence"]
     assert set(
         item["status"] for item in result.artifact["coverage"].values()
     ) <= {"covered", "partially_covered", "unresolved", "not_applicable", "suppressed_by_policy"}
     assert "private" not in json.dumps(result.artifact)
     json.dumps(result.artifact, allow_nan=False)
+
+
+def test_terminal_artifact_contains_complete_sanitized_event_journal_digest(tmp_path):
+    result = _controller().run(_inputs(tmp_path))
+    events = result.artifact["events"]
+    encoded = json.dumps(
+        events, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+
+    assert result.artifact["event_journal"] == {
+        "count": len(events),
+        "digest": hashlib.sha256(encoded).hexdigest(),
+    }
+    assert tuple(item["sequence"] for item in events) == tuple(
+        range(1, len(events) + 1)
+    )
+    assert tuple(
+        {"sequence": item["sequence"], "kind": item["kind"]}
+        for item in events
+    ) == result.artifact["event_references"]
+
+
+def test_result_artifact_is_recursively_immutable(tmp_path):
+    result = _controller().run(_inputs(tmp_path))
+
+    with pytest.raises(TypeError, match="immutable"):
+        result.artifact["repository"] = "other/repository"
+    with pytest.raises(TypeError, match="immutable"):
+        result.artifact["publishing"]["ready"] = False
+    assert isinstance(result.artifact["events"], tuple)
+
+
+def test_mismatched_evidence_seed_degrades_to_terminal_result(tmp_path):
+    seed = EvidenceSeed(
+        repository="other/repository",
+        head_sha="c" * 40,
+        snapshot=EvidenceStore().snapshot(),
+    )
+    result = _controller(evidence_seed=seed).run(_inputs(tmp_path))
+
+    assert result.publishing_ready is False
+    assert result.artifact["phases"][-1]["phase"] == "complete"
+    assert any(
+        item["component"] == "controller"
+        for item in result.artifact["degradation"]
+    )
+
+
+def test_clock_failure_is_projected_as_terminal_degradation(tmp_path):
+    def broken_clock():
+        raise KeyboardInterrupt("clock secret=private")
+
+    result = _controller(clock=broken_clock).run(_inputs(tmp_path))
+
+    assert result.publishing_ready is False
+    assert result.artifact["phases"][-1]["status"] == "degraded"
+    assert "private" not in json.dumps(result.artifact)
+
+
+def test_role_callback_receives_only_detached_bounded_role_request(tmp_path):
+    inputs = _inputs(tmp_path)
+    mutable_topology = {
+        **inputs.topology,
+        "changed_files": list(inputs.topology["changed_files"]),
+    }
+    inputs = replace(inputs, topology=mutable_topology)
+    observed = []
+
+    def planner(*args):
+        observed.append(args)
+        mutable_topology["changed_files"].append("src/late.py")
+        request = args[0]
+        assert tuple(request.context["topology"]["changed_files"]) == (
+            "src/worker.py",
+        )
+        return _planner(
+            request.context["obligations"],
+            request.context["topology"],
+            request.context["config"],
+        )
+
+    result = _controller(planner=planner).run(inputs)
+
+    assert result.artifact["assignment_plan"]["source"] == "model_validated"
+    assert len(observed) == 1
+    assert len(observed[0]) == 1
+    assert isinstance(observed[0][0], RoleRequest)
+
+
+@dataclass
+class _HangingHookSession(_ResumeSession):
+    hook: str
+    entered: object
+    release: object
+    finalized: object
+
+    def update_lease(self, lease):
+        if self.hook == "update_lease" and lease.phase.value == "followup":
+            self.entered.set()
+            self.release.wait(2)
+        super().update_lease(lease)
+
+    def apply_coverage_feedback(self, gaps):
+        if self.hook == "feedback":
+            self.entered.set()
+            self.release.wait(2)
+        super().apply_coverage_feedback(gaps)
+
+    def finalize(self):
+        if self.hook == "finalize":
+            self.entered.set()
+            self.release.wait(2)
+        self.finalized.set()
+        return super().finalize()
+
+
+def _run_hanging_hook_case(tmp_path, hook):
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    finalized = threading.Event()
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del snapshot, coverage
+        session = _HangingHookSession(
+            assignment, evidence_store, obligations, expected_session_id,
+            hook, entered, release, finalized,
+        )
+        session.lease = lease
+        return session
+
+    inputs = replace(
+        _inputs(tmp_path),
+        config=replace(
+            _inputs(tmp_path).config,
+            model_request_timeout_sec=0.02,
+            max_followup_sessions=0 if hook == "update_lease" else 1,
+        ),
+    )
+    started = time.monotonic()
+    result = _controller(
+        session_factory=factory,
+        negotiator=lambda request: (_ for _ in ()).throw(RuntimeError("fallback")),
+        clock=time.monotonic,
+    ).run(inputs)
+    elapsed = time.monotonic() - started
+    artifact_before_release = json.dumps(result.artifact, sort_keys=True)
+    release.set()
+    time.sleep(0.04)
+    return result, elapsed, entered, finalized, artifact_before_release
+
+
+def test_hanging_feedback_hook_is_bounded_and_session_is_quarantined(tmp_path):
+    result, elapsed, entered, finalized, before = _run_hanging_hook_case(
+        tmp_path, "feedback",
+    )
+
+    assert entered.is_set()
+    assert elapsed < 0.5
+    assert finalized.is_set() is False
+    assert json.dumps(result.artifact, sort_keys=True) == before
+    assert any(
+        item["component"].startswith("specialist_hook:")
+        for item in result.artifact["degradation"]
+    )
+
+
+def test_hanging_lease_update_hook_is_bounded_and_never_finalized(tmp_path):
+    result, elapsed, entered, finalized, before = _run_hanging_hook_case(
+        tmp_path, "update_lease",
+    )
+
+    assert entered.is_set()
+    assert elapsed < 0.5
+    assert finalized.is_set() is False
+    assert json.dumps(result.artifact, sort_keys=True) == before
+
+
+def test_hanging_finalize_hook_is_bounded_and_retains_checkpoint(tmp_path):
+    result, elapsed, entered, finalized, before = _run_hanging_hook_case(
+        tmp_path, "finalize",
+    )
+
+    assert entered.is_set()
+    assert elapsed < 0.5
+    assert json.dumps(result.artifact, sort_keys=True) == before
+    assert result.artifact["sessions"][0]["state"] == "checkpoint"

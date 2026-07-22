@@ -5,11 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from math import isfinite
 import re
-from threading import BoundedSemaphore, Lock, Thread
+from threading import Lock
 from types import MappingProxyType
 from typing import Callable, Mapping
 
-from scripts.redact import mask_secrets
+from .callbacks import (
+    OBSERVER_POOL,
+    CallbackCapacityExceeded,
+    CallbackTimedOut,
+    mask_runtime_text,
+)
 
 
 _MAX_EVENT_STRING = 1000
@@ -17,24 +22,14 @@ _MAX_EVENT_ITEMS = 100
 _SENSITIVE_KEYS = frozenset({
     "api_key", "authorization", "cookie", "credential", "password", "secret", "token",
 })
-_INLINE_SECRET = re.compile(
-    r"(?i)(?:api[_-]?key|access[_-]?token|auth(?:orization)?|cookie|credential|"
-    r"password|secret|token)\s*[:=]\s*[^\s,;]+"
-)
-
-
 def _sensitive_key(value: str) -> bool:
-    tokens = tuple(item for item in re.split(r"[^a-z0-9]+", value.lower()) if item)
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    tokens = tuple(item for item in re.split(r"[^a-z0-9]+", separated.lower()) if item)
     return any(item in _SENSITIVE_KEYS or item in {"auth", "apikey"} for item in tokens)
 
 
 def _safe_masked_string(value: object) -> str:
-    try:
-        return _INLINE_SECRET.sub(
-            "[REDACTED]", mask_secrets(str(value)),
-        )[:_MAX_EVENT_STRING]
-    except BaseException:
-        return "[unserializable]"
+    return mask_runtime_text(value, limit=_MAX_EVENT_STRING)
 
 
 def _freeze_json(value: object) -> object:
@@ -135,7 +130,6 @@ class EventJournal:
         self._external_sink = external_sink
         self._observer_timeout_sec = float(observer_timeout_sec)
         self._external_errors: list[str] = []
-        self._observer_slots = BoundedSemaphore(4)
 
     def emit(self, kind: str, payload: Mapping[str, object] | None = None) -> RunEvent:
         bounded = _bounded_json(dict(payload or {}))
@@ -149,28 +143,28 @@ class EventJournal:
             )
             self._events.append(event)
         if self._external_sink is not None:
-            if not self._observer_slots.acquire(blocking=False):
+            def record_error(exc: BaseException) -> None:
+                with self._lock:
+                    self._external_errors.append(
+                        f"{type(exc).__name__}: {_safe_masked_string(exc)}"[
+                            :_MAX_EVENT_STRING
+                        ]
+                    )
+
+            try:
+                OBSERVER_POOL.run(
+                    lambda: self._external_sink(event),
+                    timeout_sec=max(self._observer_timeout_sec, 0.000001),
+                    name="event-sink",
+                    on_error=record_error,
+                )
+            except CallbackCapacityExceeded:
                 with self._lock:
                     self._external_errors.append("event observer capacity exceeded")
-                return event
-
-            def observe() -> None:
-                try:
-                    self._external_sink(event)
-                except BaseException as exc:  # observation can never abort a run
-                    with self._lock:
-                        self._external_errors.append(
-                            f"{type(exc).__name__}: {_safe_masked_string(exc)}"[
-                                :_MAX_EVENT_STRING
-                            ]
-                        )
-                finally:
-                    self._observer_slots.release()
-
-            observer = Thread(target=observe, name="review-event-observer", daemon=True)
-            observer.start()
-            if self._observer_timeout_sec:
-                observer.join(self._observer_timeout_sec)
+            except CallbackTimedOut:
+                pass
+            except BaseException:  # recorded by the worker before propagation
+                pass
         return event
 
     def snapshot(self) -> tuple[RunEvent, ...]:

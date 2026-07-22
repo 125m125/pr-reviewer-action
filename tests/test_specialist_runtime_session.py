@@ -154,6 +154,36 @@ def test_model_gateway_exception_still_charges_reserved_turn():
 
     assert session.budget.snapshot().model_turns == 1
     assert len(gateway.requests) == 1
+    assert tuple(item.status for item in session._request_events) == (
+        "started", "failed",
+    )
+    assert session._request_events[0].request_id == session._request_events[1].request_id
+
+
+def test_session_result_reports_each_actual_request_transition_once():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        final_response(),
+    ])
+    session = make_session(gateway)
+
+    checkpoint = session.explore()
+    final = session.finalize()
+    repeated = session.finalize()
+
+    assert tuple(item.status for item in checkpoint.request_events) == (
+        "started", "completed",
+    )
+    assert tuple(item.status for item in final.request_events) == (
+        "started", "completed", "started", "completed",
+    )
+    assert repeated.request_events == final.request_events
+    request_pairs = {}
+    for event in final.request_events:
+        request_pairs.setdefault(event.request_id, []).append(event.status)
+    assert tuple(request_pairs.values()) == (
+        ["started", "completed"], ["started", "completed"],
+    )
 
 
 def test_session_bounds_output_and_rejects_input_before_transport():
