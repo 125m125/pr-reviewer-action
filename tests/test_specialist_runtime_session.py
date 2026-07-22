@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 from dataclasses import dataclass
 
@@ -11,6 +12,7 @@ from pr_reviewer.specialist_runtime.budget import (
     SessionLease,
 )
 from pr_reviewer.specialist_runtime.assignments import Assignment
+from pr_reviewer.specialist_runtime.callbacks import CALLBACK_POOL
 from pr_reviewer.specialist_runtime.coverage import CoverageLedger
 from pr_reviewer.specialist_runtime.evidence import (
     EvidenceRecord,
@@ -111,6 +113,7 @@ def make_session(
     gateway, *, tool_calls=4, model_turns=8, recoveries=1,
     execute_tool=None, lease=None, assignment=None, obligations=None,
     budget_limits=None, max_tokens=1024,
+    request_timeout_sec=30.0,
 ):
     obligations = obligations or (
         CoverageObligation(
@@ -141,7 +144,7 @@ def make_session(
         budget=BudgetLedger(budget_limits or BudgetLimits(
             model_turns=model_turns, tool_calls=tool_calls, recoveries=recoveries,
         )),
-        lease=lease, request_timeout_sec=30.0, max_tokens=max_tokens,
+        lease=lease, request_timeout_sec=request_timeout_sec, max_tokens=max_tokens,
     )
 
 
@@ -184,6 +187,61 @@ def test_session_result_reports_each_actual_request_transition_once():
     assert tuple(request_pairs.values()) == (
         ["started", "completed"], ["started", "completed"],
     )
+
+
+def test_hanging_specialist_gateways_share_global_orphan_cap():
+    release = threading.Event()
+    entered = []
+
+    class HangingGateway:
+        def complete(self, request):
+            del request
+            entered.append(len(entered))
+            release.wait(2)
+            return checkpoint_response(inspected=[], unresolved=[])
+
+    sessions = [
+        make_session(HangingGateway(), request_timeout_sec=0.005)
+        for _ in range(CALLBACK_POOL.capacity + 1)
+    ]
+    try:
+        for session in sessions:
+            with pytest.raises(Exception):
+                session.explore()
+        assert len(entered) == CALLBACK_POOL.capacity
+        assert all(session.budget.snapshot().model_turns == 1 for session in sessions)
+        assert tuple(item.status for item in sessions[0].request_events) == (
+            "started", "timed_out",
+        )
+        assert tuple(item.status for item in sessions[-1].request_events) == (
+            "started", "failed",
+        )
+    finally:
+        release.set()
+        deadline = time.monotonic() + 1
+        while CALLBACK_POOL.in_flight and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+
+def test_hostile_gateway_baseexception_still_gets_one_terminal_event():
+    class HostileError(BaseException):
+        def __str__(self):
+            raise KeyboardInterrupt("hostile error formatter")
+
+    class HostileGateway:
+        def complete(self, request):
+            del request
+            raise HostileError()
+
+    session = make_session(HostileGateway())
+
+    with pytest.raises(HostileError):
+        session.explore()
+
+    assert tuple(item.status for item in session.request_events) == (
+        "started", "failed",
+    )
+    assert session.request_events[-1].error.endswith("[unserializable]")
 
 
 def test_session_bounds_output_and_rejects_input_before_transport():

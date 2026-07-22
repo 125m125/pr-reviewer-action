@@ -5,12 +5,13 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
-import tempfile
 import time
 
 import pytest
 
+from pr_reviewer.conversation import Conversation
 from pr_reviewer.specialist_runtime.adjudication import (
     ReviewHandoffContext,
     ReviewOrientationTopic,
@@ -22,6 +23,7 @@ from pr_reviewer.specialist_runtime.controller import (
     ReviewController,
     ReviewInputs,
     ReviewResult,
+    _atomic_write_json,
 )
 from pr_reviewer.specialist_runtime.callbacks import (
     CALLBACK_POOL,
@@ -35,6 +37,7 @@ from pr_reviewer.specialist_runtime.budget import BudgetLedger
 from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy, RuntimeConfig
 from pr_reviewer.specialist_runtime.session import (
     SessionResult,
+    SpecialistSession,
     SpecialistRequestEvent,
 )
 from pr_reviewer.specialist_runtime.types import (
@@ -67,10 +70,7 @@ def _policy() -> ReviewPolicy:
 
 
 def _inputs(tmp_path) -> ReviewInputs:
-    relative_artifact = (
-        tmp_path.resolve().relative_to(Path(tempfile.gettempdir()).resolve())
-        / "specialist-review-artifact.json"
-    )
+    del tmp_path
     return ReviewInputs(
         repository="owner/repository",
         pr_number=17,
@@ -91,7 +91,7 @@ def _inputs(tmp_path) -> ReviewInputs:
             session_limits=BudgetLimits(model_turns=8, tool_calls=8, recoveries=1),
         ),
         changed_files=("src/worker.py",),
-        artifact_path=relative_artifact,
+        artifact_path="specialist-review-artifact.json",
         allow_approve=True,
         publishing_mode="review_comment",
     )
@@ -228,7 +228,7 @@ def test_controller_runs_obligations_assignments_sessions_and_finalizer(tmp_path
             recipe_ids=("delivery",),
         ),
         clock=lambda: 0.0,
-        artifact_output_root=Path(tempfile.gettempdir()),
+        artifact_output_root=tmp_path,
     )
 
     result = controller.run(_inputs(tmp_path))
@@ -263,14 +263,14 @@ def _finalizer(state):
     )
 
 
-def _controller(**overrides):
+def _controller(tmp_path, **overrides):
     values = {
         "planner": _planner_role,
         "session_factory": _factory,
         "critic": _critic_role,
         "finalizer": _finalizer,
         "clock": lambda: 0.0,
-        "artifact_output_root": Path(tempfile.gettempdir()),
+        "artifact_output_root": tmp_path,
     }
     values.update(overrides)
     return ReviewController(**values)
@@ -280,7 +280,7 @@ def test_planner_failure_uses_deterministic_assignment_plan(tmp_path):
     def broken_planner(*args):
         raise RuntimeError("planner unavailable")
 
-    result = _controller(planner=broken_planner).run(_inputs(tmp_path))
+    result = _controller(tmp_path, planner=broken_planner).run(_inputs(tmp_path))
 
     assert result.artifact["assignments"][0]["id"].startswith("fallback-")
     assert result.artifact["evaluation_status"] == "degraded"
@@ -305,7 +305,7 @@ def test_specialist_failure_gets_one_bounded_followup_reassignment(tmp_path):
             assignment, evidence_store, obligations, expected_session_id,
         )
 
-    result = _controller(session_factory=factory).run(_inputs(tmp_path))
+    result = _controller(tmp_path, session_factory=factory).run(_inputs(tmp_path))
 
     assert len(attempts) == 2
     assert "followup" in attempts[1]
@@ -383,7 +383,7 @@ def test_negotiator_failure_uses_live_budget_fallback_resume(tmp_path):
         assert state.session_resources[0].remaining_model_turns == 7
         raise RuntimeError("negotiator invalid response")
 
-    result = _controller(
+    result = _controller(tmp_path,
         session_factory=factory, negotiator=broken_negotiator,
     ).run(_inputs(tmp_path))
 
@@ -409,7 +409,7 @@ def test_critic_failure_rejects_ambiguous_candidate(tmp_path):
     def broken_critic(*args):
         raise RuntimeError("critic unavailable")
 
-    result = _controller(critic=broken_critic).run(replace(
+    result = _controller(tmp_path, critic=broken_critic).run(replace(
         _inputs(tmp_path), candidate_findings=(ambiguous,),
     ))
 
@@ -461,7 +461,7 @@ def test_duplicate_candidate_ids_reject_every_occurrence_without_first_wins(tmp_
         critic_inputs.extend(request.context["candidates"])
         return {"decisions": []}
 
-    result = _controller(critic=critic).run(replace(
+    result = _controller(tmp_path, critic=critic).run(replace(
         _inputs(tmp_path), candidate_findings=candidates,
     ))
 
@@ -481,7 +481,7 @@ def test_finalizer_failure_builds_deterministic_minimal_sparse_handoff(tmp_path)
     def broken_finalizer(*args):
         raise RuntimeError("finalizer timed out")
 
-    result = _controller(finalizer=broken_finalizer).run(_inputs(tmp_path))
+    result = _controller(tmp_path, finalizer=broken_finalizer).run(_inputs(tmp_path))
 
     assert result.handoff.markdown.startswith("## AI Review Handoff")
     assert "review the complete change" in result.handoff.markdown
@@ -516,7 +516,7 @@ def test_deadline_stops_exploration_and_preserves_finalization_reserve(tmp_path)
         finalizer_calls.append(state)
         return _finalizer(state)
 
-    result = _controller(
+    result = _controller(tmp_path,
         planner=planner, session_factory=factory, finalizer=finalizer, clock=clock,
     ).run(_inputs(tmp_path))
 
@@ -562,7 +562,7 @@ def test_failed_specialist_requests_retain_attempt_budget_without_event_replay(t
         del lease, snapshot, evidence_store, coverage, obligations
         return FailedRequestSession(assignment, expected_session_id)
 
-    result = _controller(session_factory=factory).run(_inputs(tmp_path))
+    result = _controller(tmp_path, session_factory=factory).run(_inputs(tmp_path))
     totals = result.artifact["budgets"]["totals"]
 
     assert totals["specialist_model_requests"] == 2
@@ -576,6 +576,58 @@ def test_failed_specialist_requests_retain_attempt_budget_without_event_replay(t
     }) == 2
 
 
+def test_hanging_specialist_gateway_is_bounded_and_accounted_in_artifact(tmp_path):
+    import threading
+
+    release = threading.Event()
+
+    class HangingGateway:
+        def complete(self, request):
+            del request
+            release.wait(2)
+            raise AssertionError("late gateway result must not be admitted")
+
+    inputs = replace(
+        _inputs(tmp_path),
+        config=replace(_inputs(tmp_path).config, model_request_timeout_sec=0.01),
+    )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del snapshot, obligations
+        return SpecialistSession(
+            session_id=expected_session_id,
+            assignment=assignment,
+            conversation=Conversation(system="review"),
+            gateway=HangingGateway(),
+            execute_tool=lambda name, arguments: {},
+            evidence_store=evidence_store,
+            coverage=coverage,
+            budget=BudgetLedger(inputs.config.session_limits),
+            lease=lease,
+            request_timeout_sec=inputs.config.model_request_timeout_sec,
+            max_tokens=128,
+        )
+
+    try:
+        result = _controller(tmp_path,
+            session_factory=factory, clock=time.monotonic,
+        ).run(inputs)
+        totals = result.artifact["budgets"]["totals"]
+
+        assert totals["specialist_model_requests"] == 2
+        assert totals["specialist_model_timed_out"] == 2
+        assert totals["model_turns"] == 2
+        assert result.publishing_ready is False or result.verdict == "request_changes"
+    finally:
+        release.set()
+        deadline = time.monotonic() + 1
+        while CALLBACK_POOL.in_flight and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+
 def test_artifact_write_failure_preserves_prior_file_and_valid_result(tmp_path):
     artifact_path = tmp_path / "specialist-review-artifact.json"
     artifact_path.write_text('{"prior":true}\n', encoding="utf-8")
@@ -584,7 +636,7 @@ def test_artifact_write_failure_preserves_prior_file_and_valid_result(tmp_path):
         del path, artifact
         raise OSError("disk full token=very-secret-value")
 
-    result = _controller(artifact_writer=broken_writer).run(_inputs(tmp_path))
+    result = _controller(tmp_path, artifact_writer=broken_writer).run(_inputs(tmp_path))
 
     assert artifact_path.read_text(encoding="utf-8") == '{"prior":true}\n'
     assert result.artifact["artifact_write"]["status"] == "failed"
@@ -679,6 +731,7 @@ def test_semantic_artifact_is_stable_across_completion_order_and_clock_origin(tm
         } for item in items]}
 
     def run(directory, delays, clock_origin):
+        directory.mkdir(parents=True, exist_ok=True)
         by_id = {item.id: item for item in obligations}
 
         def factory(assignment, lease, snapshot, evidence_store, coverage, items):
@@ -705,7 +758,7 @@ def test_semantic_artifact_is_stable_across_completion_order_and_clock_origin(tm
             finalizer=_finalizer,
             clock=lambda: clock_origin,
             obligation_deriver=deriver,
-            artifact_output_root=Path(tempfile.gettempdir()),
+            artifact_output_root=tmp_path,
         ).run(inputs).artifact
 
     first_dir = tmp_path / "first"
@@ -729,7 +782,7 @@ def test_controller_retains_and_emits_typed_source_access_requests(tmp_path):
         authority_reason="The current source policy does not allow this host.",
     )
 
-    result = _controller().run(replace(
+    result = _controller(tmp_path, ).run(replace(
         inputs, source_access_requests=(request,),
     ))
 
@@ -749,7 +802,7 @@ def test_unexpected_controller_failure_returns_notice_without_fabricated_blocker
         finalizer=_finalizer,
         clock=lambda: 0.0,
         obligation_deriver=broken_deriver,
-        artifact_output_root=Path(tempfile.gettempdir()),
+        artifact_output_root=tmp_path,
     ).run(_inputs(tmp_path))
 
     assert result.verdict == "notice"
@@ -770,7 +823,7 @@ def test_planner_receives_typed_phase_lease_request(tmp_path):
             request.context["config"],
         )
 
-    result = _controller(planner=planner).run(replace(
+    result = _controller(tmp_path, planner=planner).run(replace(
         _inputs(tmp_path),
         pr_metadata={"title": "Preserve retry intent", "body": "No duplicate work"},
     ))
@@ -811,7 +864,7 @@ def test_hanging_planner_is_cut_off_and_late_result_is_ignored(tmp_path):
         ),
     )
     started = time.monotonic()
-    result = _controller(planner=hanging_planner, clock=time.monotonic).run(inputs)
+    result = _controller(tmp_path, planner=hanging_planner, clock=time.monotonic).run(inputs)
     elapsed = time.monotonic() - started
     before = json.dumps(result.artifact, sort_keys=True)
     release.set()
@@ -911,7 +964,7 @@ def test_in_flight_worker_is_isolated_and_never_finalized_after_wave_return(tmp_
             max_followup_sessions=0,
         ),
     )
-    result = _controller(
+    result = _controller(tmp_path,
         session_factory=factory, clock=time.monotonic,
     ).run(inputs)
     assert started.is_set(), result.artifact["degradation"]
@@ -937,7 +990,7 @@ def test_factory_session_identity_mismatch_fails_closed_without_ghost_state(tmp_
         session.session_id = expected_session_id + "-forged"
         return session
 
-    result = _controller(session_factory=factory).run(_inputs(tmp_path))
+    result = _controller(tmp_path, session_factory=factory).run(_inputs(tmp_path))
 
     assert result.artifact["sessions"] == ()
     assert result.artifact["evidence"] == ()
@@ -972,7 +1025,7 @@ def test_session_cannot_forge_evidence_collector_identity(tmp_path):
             assignment, evidence_store, obligations, expected_session_id,
         )
 
-    result = _controller(
+    result = _controller(tmp_path,
         session_factory=factory,
     ).run(replace(
         _inputs(tmp_path),
@@ -1007,7 +1060,7 @@ def test_resume_replaces_initial_lease_with_actual_followup_lease(tmp_path):
         leases.append(lease)
         return session
 
-    result = _controller(
+    result = _controller(tmp_path,
         session_factory=factory,
         negotiator=lambda state: (_ for _ in ()).throw(RuntimeError("fallback")),
     ).run(_inputs(tmp_path))
@@ -1018,7 +1071,7 @@ def test_resume_replaces_initial_lease_with_actual_followup_lease(tmp_path):
 
 
 def test_artifact_is_schema_v2_strict_json_with_matching_reference(tmp_path):
-    result = _controller().run(_inputs(tmp_path))
+    result = _controller(tmp_path, ).run(_inputs(tmp_path))
 
     assert result.artifact["schema_version"] == 2
     reference = next(
@@ -1048,7 +1101,7 @@ def test_artifact_projection_omits_private_checkpoint_working_state(tmp_path):
             assignment, evidence_store, obligations, expected_session_id,
         )
 
-    result = _controller(session_factory=factory).run(_inputs(tmp_path))
+    result = _controller(tmp_path, session_factory=factory).run(_inputs(tmp_path))
     encoded = json.dumps(result.artifact, sort_keys=True)
 
     assert "private-hypothesis" not in encoded
@@ -1072,7 +1125,7 @@ def test_finalizer_cannot_override_controller_owned_handoff_facts(tmp_path):
             material_coverage_limited=False,
         )
 
-    result = _controller(
+    result = _controller(tmp_path,
         finalizer=malicious_finalizer,
         planner=lambda *args: (_ for _ in ()).throw(RuntimeError("degraded")),
     ).run(_inputs(tmp_path))
@@ -1096,7 +1149,7 @@ def test_finalizer_proposal_selects_only_authorized_orientation(tmp_path):
             recommendation="approve",
         )
 
-    result = _controller(finalizer=finalizer).run(_inputs(tmp_path))
+    result = _controller(tmp_path, finalizer=finalizer).run(_inputs(tmp_path))
 
     assert "Component: worker" in result.handoff.markdown
     assert "invented" not in result.handoff.markdown
@@ -1110,7 +1163,7 @@ def test_repository_publishing_policy_prevents_caller_broadening(tmp_path):
         "mode": "comment",
         "allow_approve": False,
     })
-    result = _controller().run(replace(
+    result = _controller(tmp_path, ).run(replace(
         _inputs(tmp_path),
         policy=policy,
         publishing_mode="review_verdict",
@@ -1123,12 +1176,36 @@ def test_repository_publishing_policy_prevents_caller_broadening(tmp_path):
     assert result.notes == ()
 
 
+def test_missing_repository_publishing_policy_never_grants_approval(tmp_path):
+    result = _controller(tmp_path, ).run(replace(
+        _inputs(tmp_path),
+        policy=replace(_policy(), publishing={}),
+        publishing_mode="review_verdict",
+        allow_approve=True,
+    ))
+
+    assert result.artifact["publishing"]["allow_approve"] is False
+    assert result.verdict == "request_changes"
+
+
+def test_repository_publishing_mode_without_allow_flag_never_grants_approval(tmp_path):
+    result = _controller(tmp_path, ).run(replace(
+        _inputs(tmp_path),
+        policy=replace(_policy(), publishing={"mode": "review_verdict"}),
+        publishing_mode="review_verdict",
+        allow_approve=True,
+    ))
+
+    assert result.artifact["publishing"]["allow_approve"] is False
+    assert result.verdict == "request_changes"
+
+
 def test_caller_can_narrow_repository_publishing_policy(tmp_path):
     policy = replace(_policy(), publishing={
         "mode": "review_verdict",
         "allow_approve": True,
     })
-    result = _controller().run(replace(
+    result = _controller(tmp_path, ).run(replace(
         _inputs(tmp_path),
         policy=policy,
         publishing_mode="review_comment",
@@ -1141,7 +1218,7 @@ def test_caller_can_narrow_repository_publishing_policy(tmp_path):
 
 
 def test_detailed_publishing_is_not_ready_when_a_required_note_is_unauthorized(tmp_path):
-    result = _controller().run(replace(
+    result = _controller(tmp_path, ).run(replace(
         _inputs(tmp_path),
         verification_requests=({"kind": "invalid"},),
     ))
@@ -1159,7 +1236,7 @@ def test_comment_mode_is_ready_without_detailed_notes(tmp_path):
     policy = replace(_policy(), publishing={
         "mode": "comment", "allow_approve": False,
     })
-    result = _controller().run(replace(
+    result = _controller(tmp_path, ).run(replace(
         _inputs(tmp_path),
         policy=policy,
         publishing_mode="comment",
@@ -1175,7 +1252,7 @@ def test_output_path_must_be_beneath_controller_owned_root(tmp_path):
     outside.write_text('{"owner":"user"}\n', encoding="utf-8")
     inputs = replace(_inputs(tmp_path), artifact_path=outside)
 
-    result = _controller().run(inputs)
+    result = _controller(tmp_path, ).run(inputs)
 
     assert outside.read_text(encoding="utf-8") == '{"owner":"user"}\n'
     assert result.artifact_path is None
@@ -1287,16 +1364,13 @@ def test_role_and_session_callback_orphans_share_one_process_global_cap():
 
 def test_reusing_controller_does_not_reuse_prior_run_evidence(tmp_path):
     shared = EvidenceStore()
-    controller = _controller(evidence_store=shared)
+    controller = _controller(tmp_path, evidence_store=shared)
 
     first = controller.run(_inputs(tmp_path))
     second = controller.run(replace(
         _inputs(tmp_path),
         head_sha="c" * 40,
-        artifact_path=(
-            tmp_path.resolve().relative_to(Path(tempfile.gettempdir()).resolve())
-            / "second.json"
-        ),
+        artifact_path="second.json",
     ))
 
     assert len(first.artifact["evidence"]) == len(second.artifact["evidence"])
@@ -1315,7 +1389,7 @@ def test_emergency_projection_is_terminal_schema_valid_and_not_publishable(tmp_p
         critic=_critic_role,
         finalizer=_finalizer,
         clock=lambda: 0.0,
-        artifact_output_root=Path(tempfile.gettempdir()),
+        artifact_output_root=tmp_path,
     )
 
     result = controller.run(_inputs(tmp_path))
@@ -1324,6 +1398,92 @@ def test_emergency_projection_is_terminal_schema_valid_and_not_publishable(tmp_p
     assert result.artifact["evaluation_status"] == "degraded"
     assert result.artifact["publishing"]["ready"] is False
     assert result.publishing_ready is False
+
+
+def test_artifact_root_identity_swap_cannot_redirect_atomic_write(tmp_path):
+    root = tmp_path / "owned-root"
+    moved = tmp_path / "moved-owned-root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+
+    class SwapRootController(ReviewController):
+        swapped = False
+
+        def _artifact(self, state, path):
+            artifact = super()._artifact(state, path)
+            if not self.swapped:
+                os.rename(root, moved)
+                try:
+                    os.symlink(outside, root, target_is_directory=True)
+                except OSError as exc:
+                    os.rename(moved, root)
+                    pytest.skip(f"directory links are unavailable: {exc}")
+                self.swapped = True
+            return artifact
+
+    controller = SwapRootController(
+        planner=_planner_role,
+        session_factory=_factory,
+        critic=_critic_role,
+        finalizer=_finalizer,
+        clock=lambda: 0.0,
+        artifact_output_root=root,
+    )
+    result = controller.run(_inputs(tmp_path))
+
+    assert not (outside / "specialist-review-artifact.json").exists()
+    assert result.artifact_write_error
+    assert result.publishing_ready is False
+
+
+def test_artifact_target_link_is_rejected_before_write(tmp_path):
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"owner":"user"}\n', encoding="utf-8")
+    target = tmp_path / "specialist-review-artifact.json"
+    try:
+        os.symlink(outside, target)
+    except OSError as exc:
+        pytest.skip(f"file links are unavailable: {exc}")
+
+    result = _controller(tmp_path, ).run(_inputs(tmp_path))
+
+    assert outside.read_text(encoding="utf-8") == '{"owner":"user"}\n'
+    assert result.artifact_write_error
+    assert result.publishing_ready is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory fsync uses POSIX dir fds")
+def test_post_replace_directory_fsync_failure_is_durability_warning(
+    tmp_path, monkeypatch,
+):
+    directory_fd = os.open(
+        tmp_path,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    original_fsync = os.fsync
+
+    def selective_fsync(descriptor):
+        if descriptor == directory_fd:
+            raise OSError("directory fsync unavailable")
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", selective_fsync)
+    try:
+        status = _atomic_write_json(
+            tmp_path / "artifact.json",
+            {"safe": True},
+            directory_fd=directory_fd,
+            root_identity=(
+                int(os.fstat(directory_fd).st_dev),
+                int(os.fstat(directory_fd).st_ino),
+            ),
+        )
+    finally:
+        os.close(directory_fd)
+
+    assert status == "written_durability_warning"
+    assert json.loads((tmp_path / "artifact.json").read_text()) == {"safe": True}
     assert result.artifact["assignments"]
     assert result.artifact["sessions"]
     assert result.artifact["evidence"]
@@ -1335,7 +1495,7 @@ def test_emergency_projection_is_terminal_schema_valid_and_not_publishable(tmp_p
 
 
 def test_terminal_artifact_contains_complete_sanitized_event_journal_digest(tmp_path):
-    result = _controller().run(_inputs(tmp_path))
+    result = _controller(tmp_path, ).run(_inputs(tmp_path))
     events = result.artifact["events"]
     encoded = json.dumps(
         events, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
@@ -1355,7 +1515,7 @@ def test_terminal_artifact_contains_complete_sanitized_event_journal_digest(tmp_
 
 
 def test_result_artifact_is_recursively_immutable(tmp_path):
-    result = _controller().run(_inputs(tmp_path))
+    result = _controller(tmp_path, ).run(_inputs(tmp_path))
 
     with pytest.raises(TypeError, match="immutable"):
         result.artifact["repository"] = "other/repository"
@@ -1370,7 +1530,7 @@ def test_mismatched_evidence_seed_degrades_to_terminal_result(tmp_path):
         head_sha="c" * 40,
         snapshot=EvidenceStore().snapshot(),
     )
-    result = _controller(evidence_seed=seed).run(_inputs(tmp_path))
+    result = _controller(tmp_path, evidence_seed=seed).run(_inputs(tmp_path))
 
     assert result.publishing_ready is False
     assert result.artifact["phases"][-1]["phase"] == "complete"
@@ -1384,10 +1544,122 @@ def test_clock_failure_is_projected_as_terminal_degradation(tmp_path):
     def broken_clock():
         raise KeyboardInterrupt("clock secret=private")
 
-    result = _controller(clock=broken_clock).run(_inputs(tmp_path))
+    result = _controller(tmp_path, clock=broken_clock).run(_inputs(tmp_path))
 
     assert result.publishing_ready is False
     assert result.artifact["phases"][-1]["status"] == "degraded"
+    assert "private" not in json.dumps(result.artifact)
+
+
+def test_obligation_derivation_failure_marks_current_phase_and_skips_later(tmp_path):
+    result = _controller(tmp_path,
+        obligation_deriver=lambda *args: (_ for _ in ()).throw(
+            RuntimeError("derivation failed")
+        ),
+    ).run(_inputs(tmp_path))
+    phases = {item["phase"]: item["status"] for item in result.artifact["phases"]}
+
+    assert phases["precheck"] == "complete"
+    assert phases["planning"] == "degraded"
+    assert phases["initial"] == "skipped"
+    assert phases["publish_ready"] == "skipped"
+    assert phases["complete"] == "degraded"
+
+
+def test_scheduler_failure_marks_initial_degraded_and_skips_publish(tmp_path):
+    class BrokenScheduler:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def run_wave(self, assignments, phase):
+            del assignments, phase
+            raise RuntimeError("scheduler failed")
+
+    result = _controller(tmp_path, scheduler_type=BrokenScheduler).run(_inputs(tmp_path))
+    phases = {item["phase"]: item["status"] for item in result.artifact["phases"]}
+
+    assert phases["planning"] == "complete"
+    assert phases["initial"] == "degraded"
+    assert phases["followup"] == "skipped"
+    assert phases["publish_ready"] == "skipped"
+
+
+def test_unexpected_finalization_failure_never_completes_publish_ready(tmp_path):
+    class BrokenFinalizationController(ReviewController):
+        def _finalize_products(self, state):
+            del state
+            raise KeyboardInterrupt("finalization failed")
+
+    result = BrokenFinalizationController(
+        planner=_planner_role,
+        session_factory=_factory,
+        critic=_critic_role,
+        finalizer=_finalizer,
+        clock=lambda: 0.0,
+        artifact_output_root=tmp_path,
+    ).run(_inputs(tmp_path))
+    phases = {item["phase"]: item["status"] for item in result.artifact["phases"]}
+
+    assert phases["followup"] == "complete"
+    assert phases["finalization"] == "degraded"
+    assert phases["publish_ready"] == "skipped"
+    assert result.publishing_ready is False
+
+
+def test_hostile_evidence_snapshot_on_primary_and_emergency_uses_last_resort(tmp_path):
+    class HostileEvidenceStore(EvidenceStore):
+        def snapshot(self):
+            raise KeyboardInterrupt("evidence secret=private")
+
+    result = _controller(tmp_path,
+        evidence_store_factory=HostileEvidenceStore,
+    ).run(_inputs(tmp_path))
+
+    assert result.artifact["schema_version"] == 2
+    assert result.artifact["publishing"]["ready"] is False
+    assert result.artifact["coverage"]
+    assert "private" not in json.dumps(result.artifact)
+
+
+def test_hostile_validator_cannot_escape_last_resort_terminal_shell(tmp_path):
+    class HostileValidatorController(ReviewController):
+        @staticmethod
+        def _validate_artifact(artifact):
+            del artifact
+            raise KeyboardInterrupt("validator secret=private")
+
+    result = HostileValidatorController(
+        planner=_planner_role,
+        session_factory=_factory,
+        critic=_critic_role,
+        finalizer=_finalizer,
+        clock=lambda: 0.0,
+        artifact_output_root=tmp_path,
+    ).run(_inputs(tmp_path))
+
+    assert result.artifact["schema_version"] == 2
+    assert result.verdict_source == "controller-terminal-fallback"
+    assert result.publishing_ready is False
+    assert "private" not in json.dumps(result.artifact)
+
+
+def test_hostile_writer_and_observer_never_escape_terminal_result(tmp_path):
+    def writer(path, artifact):
+        del path, artifact
+        raise KeyboardInterrupt("writer secret=private")
+
+    def observer(event):
+        del event
+        raise KeyboardInterrupt("observer secret=private")
+
+    result = _controller(tmp_path,
+        artifact_writer=writer,
+        event_sink=observer,
+    ).run(_inputs(tmp_path))
+
+    assert result.artifact["schema_version"] == 2
+    assert result.artifact["publishing"]["ready"] is False
+    assert result.artifact_write_error
     assert "private" not in json.dumps(result.artifact)
 
 
@@ -1413,7 +1685,7 @@ def test_role_callback_receives_only_detached_bounded_role_request(tmp_path):
             request.context["config"],
         )
 
-    result = _controller(planner=planner).run(inputs)
+    result = _controller(tmp_path, planner=planner).run(inputs)
 
     assert result.artifact["assignment_plan"]["source"] == "model_validated"
     assert len(observed) == 1
@@ -1476,7 +1748,7 @@ def _run_hanging_hook_case(tmp_path, hook):
         ),
     )
     started = time.monotonic()
-    result = _controller(
+    result = _controller(tmp_path,
         session_factory=factory,
         negotiator=lambda request: (_ for _ in ()).throw(RuntimeError("fallback")),
         clock=time.monotonic,

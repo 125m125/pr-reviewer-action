@@ -15,6 +15,7 @@ import json
 from math import isfinite
 import os
 from pathlib import Path
+import secrets
 import tempfile
 import time
 from types import MappingProxyType
@@ -190,6 +191,50 @@ class EvidenceSeed:
     def __post_init__(self) -> None:
         if not self.repository.strip() or not self.head_sha.strip():
             raise ValueError("evidence seed repository and head SHA are required")
+
+
+@dataclass(frozen=True)
+class _PrimitiveRunIdentity:
+    repository: str
+    pr_number: int
+    base_sha: str
+    head_sha: str
+    artifact_id: str
+    policy_version: int
+
+
+def _primitive_run_identity(inputs: ReviewInputs) -> _PrimitiveRunIdentity:
+    def text_value(value: object, fallback: str) -> str:
+        try:
+            return mask_runtime_text(value, limit=1000) or fallback
+        except BaseException:
+            return fallback
+
+    try:
+        pr_number = int(inputs.pr_number)
+    except BaseException:
+        pr_number = 0
+    try:
+        policy_version = int(inputs.policy.version)
+    except BaseException:
+        policy_version = 0
+    values = {
+        "repository": text_value(inputs.repository, "unknown/unknown"),
+        "pr_number": pr_number,
+        "base_sha": text_value(inputs.base_sha, "unknown"),
+        "head_sha": text_value(inputs.head_sha, "unknown"),
+        "policy_version": policy_version,
+        "schema_version": _SCHEMA_VERSION,
+    }
+    encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+    return _PrimitiveRunIdentity(
+        repository=values["repository"],
+        pr_number=pr_number,
+        base_sha=values["base_sha"],
+        head_sha=values["head_sha"],
+        artifact_id=hashlib.sha256(encoded).hexdigest()[:32],
+        policy_version=policy_version,
+    )
 
 
 def _finalizer_proposal(value: object) -> FinalizerProposal:
@@ -555,27 +600,28 @@ def _is_link_or_reparse(path: Path) -> bool:
     return path.is_symlink() or bool(attributes & reparse_flag)
 
 
+def _path_identity(path: Path) -> tuple[int, int]:
+    result = path.stat(follow_symlinks=False)
+    return int(result.st_dev), int(result.st_ino)
+
+
 def _resolve_artifact_path(root_value: Path | str, requested_value: Path | str) -> Path:
-    root = Path(root_value).resolve(strict=False)
+    root = Path(root_value).absolute()
     requested = Path(requested_value)
-    if requested.is_absolute() or not requested.parts:
-        raise ValueError("artifact path must be relative to the controller-owned root")
-    if any(part in {"", ".", ".."} for part in requested.parts):
-        raise ValueError("artifact path contains an unsafe segment")
+    if (
+        requested.is_absolute()
+        or not requested.name
+        or len(requested.parts) != 1
+        or requested.name in {".", ".."}
+    ):
+        raise ValueError("artifact path must be one safe relative filename")
+    if not root.exists() or not root.is_dir():
+        raise ValueError("controller-owned artifact output root must already exist")
     if _is_link_or_reparse(root):
         raise ValueError("artifact output root must not be a link or reparse point")
-    current = root
-    for part in requested.parts[:-1]:
-        current = current / part
-        if _is_link_or_reparse(current):
-            raise ValueError("artifact output path traverses a link or reparse point")
-    target = (root / requested).resolve(strict=False)
-    try:
-        target.relative_to(root)
-    except ValueError as exc:
-        raise ValueError("artifact path must remain beneath artifact_output_root") from exc
-    if target == root or not target.name:
-        raise ValueError("artifact path must identify a file beneath artifact_output_root")
+    target = root / requested.name
+    if _is_link_or_reparse(target):
+        raise ValueError("artifact target must not be a link or reparse point")
     return target
 
 
@@ -597,12 +643,55 @@ def _budget_projection(value: BudgetUsage) -> dict[str, object]:
     return _json_value(value)  # type: ignore[return-value]
 
 
-def _atomic_write_json(path: Path, artifact: Mapping[str, object]) -> str:
+def _atomic_write_json(
+    path: Path,
+    artifact: Mapping[str, object],
+    *,
+    directory_fd: int | None = None,
+    root_identity: tuple[int, int] | None = None,
+) -> str:
     """Write a private canonical JSON file without exposing a partial target."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(
         artifact, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     ).encode("utf-8") + b"\n"
+    if directory_fd is not None and os.name != "nt":
+        if root_identity is None or _path_identity(path.parent) != root_identity:
+            raise ValueError("artifact output root identity changed before create")
+        temporary_name = f".{path.name}.{secrets.token_hex(12)}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= int(getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(temporary_name, flags, 0o600, dir_fd=directory_fd)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if _path_identity(path.parent) != root_identity:
+                raise ValueError("artifact output root identity changed before replace")
+            os.replace(
+                temporary_name,
+                path.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            try:
+                os.chmod(path.name, 0o600, dir_fd=directory_fd, follow_symlinks=False)
+            except (NotImplementedError, OSError, TypeError):
+                pass
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                return "written_durability_warning"
+            return "written"
+        except BaseException:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except OSError:
+                pass
+            raise
+
+    if root_identity is not None and _path_identity(path.parent) != root_identity:
+        raise ValueError("artifact output root identity changed before create")
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent),
     )
@@ -616,6 +705,8 @@ def _atomic_write_json(path: Path, artifact: Mapping[str, object]) -> str:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        if root_identity is not None and _path_identity(path.parent) != root_identity:
+            raise ValueError("artifact output root identity changed before replace")
         os.replace(temporary, path)
         try:
             os.chmod(path, 0o600)
@@ -685,32 +776,86 @@ class ReviewController:
         self._provided_evidence_store = evidence_store
         self._evidence_seed = evidence_seed
         self._evidence_store_factory = evidence_store_factory
-        self.artifact_output_root = Path(artifact_output_root).resolve(strict=False)
+        self.artifact_output_root = Path(artifact_output_root).absolute()
+        if (
+            not self.artifact_output_root.exists()
+            or not self.artifact_output_root.is_dir()
+            or _is_link_or_reparse(self.artifact_output_root)
+        ):
+            raise ValueError(
+                "artifact_output_root must be an existing non-link directory"
+            )
+        self._artifact_root_identity = _path_identity(self.artifact_output_root)
+        self._artifact_root_fd: int | None = None
+        if os.name != "nt":
+            flags = os.O_RDONLY | int(getattr(os, "O_DIRECTORY", 0))
+            flags |= int(getattr(os, "O_NOFOLLOW", 0))
+            self._artifact_root_fd = os.open(self.artifact_output_root, flags)
+            if (
+                int(os.fstat(self._artifact_root_fd).st_dev),
+                int(os.fstat(self._artifact_root_fd).st_ino),
+            ) != self._artifact_root_identity:
+                os.close(self._artifact_root_fd)
+                self._artifact_root_fd = None
+                raise ValueError("artifact output root identity changed during open")
         self.event_sink = event_sink
         self.clock = clock
         self.artifact_writer = artifact_writer
+        self._uses_atomic_writer = artifact_writer is _atomic_write_json
         self.obligation_deriver = obligation_deriver
         self.assignment_validator = assignment_validator
         self.scheduler_type = scheduler_type
 
-    def _transition(
-        self, state: _RunState, phase: str, *, status: str = "complete",
-    ) -> None:
+    def __del__(self) -> None:
+        descriptor = getattr(self, "_artifact_root_fd", None)
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            self._artifact_root_fd = None
+
+    def _transition(self, state: _RunState, phase: str) -> None:
         expected = _LEGAL_TRANSITIONS.get(state.phase)
         if phase != expected:
             raise RuntimeError(f"illegal controller transition {state.phase!r} -> {phase!r}")
         previous = state.phase
         state.phase = phase
-        state.phase_outcomes[phase] = status
+        state.phase_outcomes[phase] = "running"
         state.journal.emit("phase_changed", {
-            "phase": phase, "previous_phase": previous, "status": status,
+            "phase": phase, "previous_phase": previous, "status": "running",
+        })
+
+    def _complete_phase(
+        self, state: _RunState, *, status: str = "complete",
+    ) -> None:
+        if state.phase is None:
+            raise RuntimeError("cannot complete a phase before it is entered")
+        if status not in {"complete", "degraded"}:
+            raise ValueError("completed phase status must be complete or degraded")
+        state.phase_outcomes[state.phase] = status
+        state.journal.emit("phase_completed", {
+            "phase": state.phase, "status": status,
+        })
+
+    def _skip_phase(self, state: _RunState, phase: str) -> None:
+        expected = _LEGAL_TRANSITIONS.get(state.phase)
+        if phase != expected:
+            raise RuntimeError(
+                f"illegal controller phase skip {state.phase!r} -> {phase!r}"
+            )
+        previous = state.phase
+        state.phase = phase
+        state.phase_outcomes[phase] = "skipped"
+        state.journal.emit("phase_skipped", {
+            "phase": phase, "previous_phase": previous,
         })
 
     @staticmethod
     def _publishing_authority(inputs: ReviewInputs) -> tuple[str, bool]:
         modes = {"comment": 0, "review_comment": 1, "review_verdict": 2}
         policy_mode = inputs.policy.publishing.get("mode", "review_verdict")
-        policy_allow = inputs.policy.publishing.get("allow_approve", True)
+        policy_allow = inputs.policy.publishing.get("allow_approve", False)
         if policy_mode not in modes:
             raise ValueError("repository publishing policy has an invalid mode")
         if not isinstance(policy_allow, bool):
@@ -767,7 +912,7 @@ class ReviewController:
             key = (request_id, status)
             if (
                 not request_id
-                or status not in {"started", "completed", "failed"}
+                or status not in {"started", "completed", "failed", "timed_out"}
                 or key in state.admitted_specialist_request_events
             ):
                 continue
@@ -1766,6 +1911,10 @@ class ReviewController:
                         1 for event in journal_events
                         if event.kind == "specialist_request_failed"
                     ),
+                    "specialist_model_timed_out": sum(
+                        1 for event in journal_events
+                        if event.kind == "specialist_request_timed_out"
+                    ),
                 },
             },
             "coverage": {
@@ -1931,6 +2080,29 @@ class ReviewController:
         phases = artifact.get("phases")
         if not isinstance(publishing, Mapping) or not isinstance(phases, (list, tuple)):
             raise ValueError("terminal artifact publishing state is invalid")
+        phase_statuses = {
+            item.get("phase"): item.get("status")
+            for item in phases if isinstance(item, Mapping)
+        }
+        if set(phase_statuses) != set(_PHASES) or any(
+            status not in {"complete", "degraded", "skipped"}
+            for status in phase_statuses.values()
+        ):
+            raise ValueError("terminal artifact phases require terminal outcomes")
+        event_phase_outcomes: dict[object, object] = {}
+        for event in events:
+            payload = event.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            if event.get("kind") == "phase_completed":
+                event_phase_outcomes[payload.get("phase")] = payload.get("status")
+            elif event.get("kind") == "phase_skipped":
+                event_phase_outcomes[payload.get("phase")] = "skipped"
+        if event_phase_outcomes and any(
+            phase_statuses.get(phase) != status
+            for phase, status in event_phase_outcomes.items()
+        ):
+            raise ValueError("artifact and event phase outcomes are inconsistent")
         publish_phase_status = next((
             item.get("status") for item in phases
             if isinstance(item, Mapping) and item.get("phase") == "publish_ready"
@@ -1954,15 +2126,183 @@ class ReviewController:
 
     def _finish_after_unexpected(self, state: _RunState, exc: BaseException) -> None:
         self._degrade(state, "controller", _bounded_error(exc))
+        if state.phase is not None and state.phase_outcomes.get(state.phase) == "running":
+            self._complete_phase(state, status="degraded")
+        if state.coverage is not None:
+            snapshot = state.coverage.snapshot()
+            statuses = dict(snapshot.obligation_statuses)
+            for obligation in state.obligations:
+                if statuses.get(obligation.id) is ObligationStatus.PENDING:
+                    state.coverage.mark_unresolved(obligation.id)
         while state.phase != "complete":
             next_phase = _LEGAL_TRANSITIONS.get(state.phase)
             if next_phase is None:
                 break
-            status = "degraded" if next_phase == "complete" else "skipped"
-            self._transition(state, next_phase, status=status)
+            if next_phase == "complete":
+                self._transition(state, next_phase)
+                self._complete_phase(state, status="degraded")
+            else:
+                self._skip_phase(state, next_phase)
+
+    @staticmethod
+    def _last_resort_result(
+        identity: _PrimitiveRunIdentity,
+        terminal_capture: Mapping[str, object],
+        exc: BaseException,
+    ) -> ReviewResult:
+        try:
+            error = mask_runtime_text(
+                f"{type(exc).__name__}: {exc}", limit=1000,
+            )
+        except BaseException:
+            error = f"{type(exc).__name__}: [unprintable terminal failure]"
+        try:
+            obligations = tuple(terminal_capture.get("obligations", ()))
+        except BaseException:
+            obligations = ()
+        try:
+            recipes = tuple(terminal_capture.get("recipes", ()))
+        except BaseException:
+            recipes = ()
+        coverage = {
+            str(item[0]): {
+                "status": str(item[1]),
+                "mandatory": bool(item[2]),
+                "risk_tier": "unknown",
+                "unresolved_policy": "report_unknown",
+                "recipe_id": None,
+                "origin": "terminal_capture",
+                "subject": str(item[0]),
+                "explanation": "last-resort terminal projection",
+                "scope": [],
+                "satisfaction_predicates": [],
+                "requires_independent_verification": False,
+                "required_evidence_categories": [],
+                "evidence_ids": [],
+            }
+            for item in obligations
+            if isinstance(item, tuple) and len(item) == 3
+        }
+        recipe_projection = {
+            str(item[0]): {"status": str(item[1])}
+            for item in recipes
+            if isinstance(item, tuple) and len(item) == 2
+        }
+        phases = [
+            {
+                "phase": phase,
+                "status": "degraded" if phase in {"precheck", "complete"} else "skipped",
+                "allocated_percent": 0,
+                "allocated_seconds": 0.0,
+            }
+            for phase in _PHASES
+        ]
+        empty_digest = hashlib.sha256(b"[]").hexdigest()
+        artifact = {
+            "schema_version": _SCHEMA_VERSION,
+            "artifact_id": identity.artifact_id,
+            "repository": identity.repository,
+            "pr_number": identity.pr_number,
+            "base_sha": identity.base_sha,
+            "head_sha": identity.head_sha,
+            "policy": {
+                "version": identity.policy_version,
+                "digest": "0" * 64,
+                "config_digest": "0" * 64,
+            },
+            "phases": phases,
+            "assignment_plan": {
+                "source": "terminal_fallback",
+                "planner_repaired": False,
+                "unassigned_obligation_ids": list(coverage),
+            },
+            "assignments": [],
+            "sessions": [],
+            "budgets": {"sessions": {}, "totals": {
+                "model_turns": 0, "tool_calls": 0, "recoveries": 0,
+                "controller_model_requests": 0,
+            }},
+            "evidence": [],
+            "coverage": coverage,
+            "recipes": recipe_projection,
+            "unknowns": [{
+                "obligation_id": "",
+                "reason": error,
+                "resolution_policy": "human_review",
+            }],
+            "source_access_requests": [],
+            "accepted_candidates": [],
+            "rejected_candidates": [],
+            "candidate_dispositions": [],
+            "candidate_unknowns": [],
+            "handoff": {
+                "markdown": "## AI Review Handoff\n\n**Recommendation:** Human review required\n",
+                "recommendation": "Human review required",
+            },
+            "notes": [],
+            "verdict": {
+                "value": "notice",
+                "source": "controller-terminal-fallback",
+                "blocking_finding_ids": [],
+                "blocking_obligation_ids": [],
+            },
+            "degradation": [{"component": "terminal_safety", "reason": error}],
+            "publishing": {
+                "ready": False,
+                "status": "not_published",
+                "mode": "comment",
+                "allow_approve": False,
+                "required_note_count": 0,
+                "built_note_count": 0,
+            },
+            "event_references": [],
+            "events": [],
+            "event_journal": {"count": 0, "digest": empty_digest},
+            "evaluation_status": "degraded",
+            "artifact_write": {"status": "failed", "error": error},
+            "timing": {
+                "deadline_seconds": 0,
+                "phase_shares": {},
+                "finalization_reserve_seconds": 0,
+            },
+        }
+        try:
+            frozen = _freeze_result_value(artifact)
+            if not isinstance(frozen, Mapping):
+                frozen = artifact
+        except BaseException:
+            frozen = artifact
+        return ReviewResult(
+            artifact=frozen,
+            handoff=ReviewHandoff(
+                markdown=artifact["handoff"]["markdown"],
+                recommendation="Human review required",
+            ),
+            verdict="notice",
+            verdict_source="controller-terminal-fallback",
+            publishing_ready=False,
+            artifact_write_error=error,
+        )
 
     def run(self, inputs: ReviewInputs) -> ReviewResult:
+        """Never let a post-identity runtime failure escape the controller."""
+        identity = _primitive_run_identity(inputs)
+        terminal_capture: dict[str, object] = {"obligations": (), "recipes": ()}
+        try:
+            return self._run_impl(inputs, terminal_capture)
+        except BaseException as exc:
+            return self._last_resort_result(identity, terminal_capture, exc)
+
+    def _run_impl(
+        self, inputs: ReviewInputs, terminal_capture: dict[str, object],
+    ) -> ReviewResult:
         """Run all legal phases and always return a terminal in-memory result."""
+        try:
+            terminal_capture["recipes"] = tuple(
+                (str(recipe.id), "unresolved") for recipe in inputs.policy.recipes
+            )
+        except BaseException:
+            terminal_capture["recipes"] = ()
         journal = EventJournal(self.event_sink)
         initialization_error: BaseException | None = None
         try:
@@ -2025,9 +2365,18 @@ class ReviewController:
             except BaseException as exc:
                 path_error = _bounded_error(exc)
                 self._degrade(state, "artifact_output_path", path_error)
+            self._complete_phase(state)
             self._transition(state, "planning")
             state.obligations = self.obligation_deriver(
                 inputs.topology, inputs.classification, inputs.policy,
+            )
+            terminal_capture["obligations"] = tuple(
+                (
+                    str(item.id),
+                    "unresolved" if item.mandatory else "not_applicable",
+                    bool(item.mandatory),
+                )
+                for item in state.obligations
             )
             state.coverage = CoverageLedger(state.obligations)
             state.plan = self._plan(state)
@@ -2049,12 +2398,14 @@ class ReviewController:
                     "resolution_policy": obligation.unresolved_policy,
                 })
 
+            self._complete_phase(state)
             self._transition(state, "initial")
             initial, initial_snapshot = self._run_wave(
                 state, state.plan.assignments, RunPhase.INITIAL,
             )
             reconciliation = self._reconcile(state, initial, initial_snapshot)
 
+            self._complete_phase(state)
             self._transition(state, "followup")
             followup_lease = state.deadline.lease_for(RunPhase.FOLLOWUP)
             for session_id in sorted(state.sessions):
@@ -2078,6 +2429,7 @@ class ReviewController:
                         "resolution_policy": obligation.unresolved_policy,
                     })
 
+            self._complete_phase(state)
             self._transition(state, "finalization")
             for key in sorted(state.sessions):
                 session = state.sessions[key]
@@ -2132,13 +2484,10 @@ class ReviewController:
                 })
             self._finalize_products(state)
 
+            self._complete_phase(state)
             state.required_note_count = self._required_note_count(state)
             state.publishing_ready = self._publication_is_ready(state, path)
-            self._transition(
-                state,
-                "publish_ready",
-                status="complete" if state.publishing_ready else "degraded",
-            )
+            self._transition(state, "publish_ready")
             if state.publishing_ready:
                 journal.emit("publishing_ready", {
                     "handoff": bool(state.handoff.markdown),
@@ -2152,7 +2501,15 @@ class ReviewController:
                     "required_note_count": state.required_note_count,
                     "built_note_count": len(state.notes),
                 })
+            self._complete_phase(
+                state,
+                status="complete" if state.publishing_ready else "degraded",
+            )
             self._transition(state, "complete")
+            self._complete_phase(
+                state,
+                status="degraded" if state.degradations else "complete",
+            )
         except BaseException as exc:  # terminal artifact survives every controlled failure
             self._finish_after_unexpected(state, exc)
             if state.coverage is None:
@@ -2357,7 +2714,17 @@ class ReviewController:
                 )
                 if checked_path != path:
                     raise ValueError("artifact output path changed before write")
-                write_status = self.artifact_writer(path, artifact)
+                if _path_identity(self.artifact_output_root) != self._artifact_root_identity:
+                    raise ValueError("artifact output root identity changed before write")
+                if self._uses_atomic_writer:
+                    write_status = _atomic_write_json(
+                        path,
+                        artifact,
+                        directory_fd=self._artifact_root_fd,
+                        root_identity=self._artifact_root_identity,
+                    )
+                else:
+                    write_status = self.artifact_writer(path, artifact)
                 artifact = dict(artifact)
                 artifact["artifact_write"] = {
                     "status": write_status

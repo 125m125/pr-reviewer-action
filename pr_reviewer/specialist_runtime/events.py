@@ -202,4 +202,11 @@ class RunArtifactProjector:
                 artifact.update(_clone_json(event.payload))
             elif event.kind == "phase_changed":
                 artifact["phase"] = _clone_json(event.payload.get("phase"))
+                artifact["phase_status"] = "running"
+            elif event.kind == "phase_completed":
+                artifact["phase"] = _clone_json(event.payload.get("phase"))
+                artifact["phase_status"] = _clone_json(event.payload.get("status"))
+            elif event.kind == "phase_skipped":
+                artifact["phase"] = _clone_json(event.payload.get("phase"))
+                artifact["phase_status"] = "skipped"
         return artifact

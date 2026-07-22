@@ -11,7 +11,7 @@ from pr_reviewer.conversation import Conversation
 from pr_reviewer.tool_loop import decode_native_tool_arguments, native_tool_request_key
 
 from .budget import BudgetExhausted, BudgetLedger, SessionLease
-from .callbacks import mask_runtime_text
+from .callbacks import CALLBACK_POOL, CallbackTimedOut, mask_runtime_text
 from .coverage import CoverageLedger
 from .evidence import EvidenceRecord, EvidenceStore
 from .model_gateway import ModelGateway, ModelTurnRequest, ModelTurnResult
@@ -264,19 +264,26 @@ class SpecialistSession:
             request_id, "started", tools_enabled, schema_name,
         ))
         try:
-            result = self.gateway.complete(ModelTurnRequest(
+            request = ModelTurnRequest(
                 role="specialist", conversation=self.conversation,
                 max_tokens=request_max_tokens, response_schema=schema,
                 tools_enabled=tools_enabled, timeout_sec=timeout,
                 deadline_at=self.lease.deadline_at, stream=self.stream,
                 response_schema_name=schema_name,
-            ))
+            )
+            result = CALLBACK_POOL.run(
+                lambda: self.gateway.complete(request),
+                timeout_sec=timeout,
+                name="specialist-gateway",
+            )
         except BaseException as exc:
+            error_text = mask_runtime_text(exc, limit=450)
             self._request_events.append(SpecialistRequestEvent(
-                request_id, "failed", tools_enabled, schema_name,
-                mask_runtime_text(
-                    f"{type(exc).__name__}: {exc}", limit=500,
-                ),
+                request_id,
+                "timed_out" if isinstance(exc, CallbackTimedOut) else "failed",
+                tools_enabled,
+                schema_name,
+                f"{type(exc).__name__}: {error_text}"[:500],
             ))
             raise
         self._request_events.append(SpecialistRequestEvent(
