@@ -20,6 +20,7 @@ from pr_reviewer.specialist_runtime.evidence import (
     canonical_evidence_key,
 )
 from pr_reviewer.specialist_runtime.model_gateway import ModelTurnResult
+from pr_reviewer.specialist_runtime.request_attempts import RequestAttemptJournal
 from pr_reviewer.specialist_runtime.session import SpecialistSession
 from pr_reviewer.specialist_runtime.types import (
     BudgetLimits,
@@ -647,6 +648,28 @@ def test_finalize_falls_back_when_schema_repair_has_no_lifetime_turn_left():
     assert result.report["source"] == "checkpoint-fallback"
     assert result.budget.model_turns == 2
     assert len(gateway.requests) == 2
+
+
+def test_exhausted_finalization_repair_records_no_unadmitted_request_attempt():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+        invalid_response("last-admitted-turn-was-invalid"),
+    ])
+    session = make_session(gateway, model_turns=2)
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
+    session.explore()
+
+    result = session.finalize()
+    recorded = attempts.close_since(0)
+
+    assert result.report["source"] == "checkpoint-fallback"
+    assert result.budget.model_turns == 2
+    assert len(gateway.requests) == 2
+    assert tuple(item.status for item in recorded) == ("completed", "completed")
+    assert tuple(event.status for event in result.request_events) == (
+        "started", "completed", "started", "completed",
+    )
 
 
 def test_initial_finalization_budget_exhaustion_caches_one_fallback():

@@ -268,6 +268,7 @@ class SpecialistSession:
             else min(self.max_tokens, remaining_output_tokens)
         )
         timeout = self.lease.request_timeout(self.request_timeout_sec)
+        self.budget.reserve_model_turn()
         self._request_turn += 1
         request_id = f"{self.session_id}:model:{self._request_turn}"
         schema_name = (
@@ -288,7 +289,6 @@ class SpecialistSession:
                 max_output_tokens=request_max_tokens,
             )
         try:
-            self.budget.reserve_model_turn()
             request = ModelTurnRequest(
                 role="specialist", conversation=self.conversation,
                 max_tokens=request_max_tokens, response_schema=schema,

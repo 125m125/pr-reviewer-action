@@ -38,7 +38,12 @@ def format_callback_error(
     exc: BaseException, *, limit: int = 1000,
 ) -> str:
     """Format even hostile exceptions without invoking unsafe repr fallbacks."""
-    name = getattr(type(exc), "__name__", "BaseException")
+    try:
+        name = getattr(type(exc), "__name__", "BaseException")
+        if type(name) is not str or not name:
+            name = "BaseException"
+    except BaseException:
+        name = "BaseException"
     detail = mask_runtime_text(exc, limit=max(1, limit - len(name) - 2))
     return f"{name}: {detail}"[:limit]
 

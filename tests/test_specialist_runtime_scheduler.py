@@ -532,7 +532,13 @@ def test_session_base_exception_is_a_stable_failure_for_reassignment():
 
 
 def test_hostile_factory_baseexception_does_not_block_completed_sibling():
-    class HostileFactoryError(BaseException):
+    class HostileExceptionMeta(type):
+        def __getattribute__(cls, name):
+            if name == "__name__":
+                raise KeyboardInterrupt("hostile type name")
+            return super().__getattribute__(name)
+
+    class HostileFactoryError(BaseException, metaclass=HostileExceptionMeta):
         def __str__(self):
             raise KeyboardInterrupt("hostile str")
 
@@ -559,7 +565,7 @@ def test_hostile_factory_baseexception_does_not_block_completed_sibling():
 
     assert tuple(item.assignment_id for item in result.results) == ("S2",)
     assert tuple((item.assignment_id, item.error) for item in result.failures) == (
-        ("S1", "HostileFactoryError: [unserializable]"),
+        ("S1", "BaseException: [unserializable]"),
     )
     assert result.evidence_ids == ("E-S2",)
 

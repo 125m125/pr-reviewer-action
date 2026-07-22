@@ -754,6 +754,103 @@ def test_phase_cutoff_freezes_in_flight_request_once_before_late_completion(tmp_
         release.set()
 
 
+def test_exhausted_schema_repair_cannot_inflate_artifact_model_turns(tmp_path):
+    class FinalizationGateway:
+        def __init__(self):
+            self.requests = []
+
+        def complete(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                text = json.dumps({
+                    "inspected": [],
+                    "unresolved": ["OB-code"],
+                    "hypotheses": [],
+                    "candidate_finding_ids": [],
+                    "invariants_evaluated": [],
+                    "unknowns": ["OB-code"],
+                    "proposed_next_actions": [],
+                })
+            else:
+                text = "invalid-final-json"
+            return ModelTurnResult(
+                response={}, tool_calls=(), text=text, text_source="content",
+                finish_reason="stop",
+                usage={"prompt_tokens": 3, "completion_tokens": 2},
+                request_diagnostics={},
+            )
+
+    gateway = FinalizationGateway()
+    inputs = replace(
+        _inputs(tmp_path),
+        config=replace(
+            _inputs(tmp_path).config,
+            max_followup_sessions=0,
+            session_limits=BudgetLimits(
+                model_turns=2, tool_calls=8, recoveries=1,
+            ),
+        ),
+    )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del snapshot, obligations
+        return SpecialistSession(
+            session_id=expected_session_id,
+            assignment=assignment,
+            conversation=Conversation(system="review"),
+            gateway=gateway,
+            execute_tool=lambda name, arguments: {},
+            evidence_store=evidence_store,
+            coverage=coverage,
+            budget=BudgetLedger(inputs.config.session_limits),
+            lease=lease,
+            request_timeout_sec=inputs.config.model_request_timeout_sec,
+            max_tokens=128,
+        )
+
+    def record_unknowns(request):
+        negotiation_state = request.context["negotiation_state"]
+        obligations = tuple(
+            item for item in negotiation_state.obligations if item.mandatory
+        )
+        return {"actions": [{
+            "kind": "record_unknown",
+            "obligation_ids": [item.id for item in obligations],
+            "expected_evidence": sorted({
+                category
+                for item in obligations
+                for category in item.required_evidence_categories
+            }),
+            "estimated_turns": 0,
+            "reason": "retain unresolved coverage for finalization",
+        }]}
+
+    result = _controller(
+        tmp_path,
+        session_factory=factory,
+        negotiator=record_unknowns,
+        clock=time.monotonic,
+    ).run(inputs)
+    session_budgets = result.artifact["budgets"]["sessions"]
+    attempts = result.artifact["budgets"]["request_attempts"]
+
+    assert len(gateway.requests) == 2, result.artifact["degradation"]
+    assert len(attempts) == 2
+    assert all(item["status"] == "completed" for item in attempts)
+    assert max(item["model_turns"] for item in session_budgets.values()) == 2
+    assert all(
+        item["model_turns"] <= inputs.config.session_limits.model_turns
+        for item in session_budgets.values()
+    )
+    assert result.artifact["budgets"]["totals"]["model_turns"] == 2
+    assert result.artifact["budgets"]["totals"]["model_turns"] <= (
+        len(session_budgets) * inputs.config.session_limits.model_turns
+    )
+
+
 def test_artifact_write_failure_preserves_prior_file_and_valid_result(tmp_path):
     artifact_path = tmp_path / "specialist-review-artifact.json"
     artifact_path.write_text('{"prior":true}\n', encoding="utf-8")
