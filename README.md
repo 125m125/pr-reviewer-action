@@ -243,6 +243,10 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_planner_max_context_bytes` | Diff/context bytes supplied to the planner before tool exploration | No | `60000` |
 | `specialist_packet_max_bytes` | Review-corpus bytes supplied to one specialist | No | `90000` |
 
+For an executable version-2 migration, policy example, workflow conversion,
+artifact expectations, and troubleshooting, see the
+[specialist session runtime migration handoff](docs/migrations/specialist-session-runtime.md).
+
 For a large local-model review, keep `model_context_tokens` set to the model's
 actual provider window (for example `262144`) while keeping each specialist's
 conversation bounded. A practical baseline is `ai_stream: "true"`,
@@ -268,50 +272,11 @@ computed maximum specialist tool budget. `specialists_evaluate` writes
 `specialist-review-artifact.json` and exposes its path as `specialist_artifact`,
 but the publish step is unconditionally skipped.
 
-The optional policy file uses this structured version-1 schema:
-
-```json
-{
-  "version": 1,
-  "components": [{
-    "id": "python-worker",
-    "paths": ["worker/**"],
-    "responsibilities": ["background processing"],
-    "related_components": ["contracts"],
-    "contracts": ["event messages"],
-    "invariants": ["delivery remains idempotent"]
-  }],
-  "recipes": [{
-    "id": "worker-delivery",
-    "match": {"component_ids_any": ["python-worker"], "file_roles_any": ["messaging"]},
-    "title": "Worker delivery",
-    "objective": "Trace acknowledgement, retry, and persistence behavior.",
-    "lenses": ["background-work-retry-idempotency"],
-    "seed_paths": ["worker/messaging/**"],
-    "related_paths": ["contracts/**"],
-    "invariants": ["failed work is retried without duplicate effects"],
-    "priority": "high"
-  }],
-  "generated_artifacts": [{
-    "id": "openapi-client",
-    "source_of_truth": ["api/openapi.yaml"],
-    "generator_config": ["pom.xml"],
-    "output_paths": ["target/generated-sources/**"]
-  }],
-  "exclude": {"paths": [], "components": [], "lenses": [], "recipes": []}
-}
-```
-
-Every populated `match` group must match; values inside a group use `any`
-semantics. Exclusions are authoritative for specialist scheduling and are
-disclosed when applied. They do not disable existing classifier, verdict, or
-publication guardrails. Recipes are structured data rendered through an
-action-owned prompt; they cannot provide commands, models, custom budgets, or
-complete prompt replacements.
-Generated-artifact availability is derived from tracked files and actual workspace
-outputs (including ignored build products). When a configured output is absent,
-specialists are directed to its source specification, generator configuration,
-handwritten consumers/implementations, and tests instead of repeating searches.
+`review_policy_file` is a current-branch version-2 policy. The older
+`specialist_config_file` remains a one-release version-1 migration input, but
+version-2 recipes/policy control deterministic obligations and specialist
+selection. See the [migration handoff](docs/migrations/specialist-session-runtime.md)
+for the complete schema, source-rule boundaries, and conversion checklist.
 
 </details>
 
