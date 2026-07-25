@@ -389,12 +389,13 @@ inputs:
     default: "false"
   publish_mode:
     description: >-
-      Publish mode for the review verdict. 'comment' publishes a sticky PR comment (default).
+      Publish mode for the review verdict. When omitted, single reviews use 'comment' and
+      specialist reviews use 'review_comment'. Explicit 'comment' always remains a sticky comment.
       'review_comment' uses GitHub's native PR review API to submit a non-blocking review comment.
       'review_verdict' uses GitHub's native PR review API to submit approve/request_changes.
       Requires permissions: pull-requests: write for review_comment and review_verdict modes.
     required: false
-    default: "comment"
+    default: ""
   allow_approve:
     description: >-
       If true and publish_mode=review_verdict, the model's approve verdict can be submitted as a
@@ -784,7 +785,7 @@ runs:
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
         COMMENT_MARKER: ${{ inputs.comment_marker }}
-        PUBLISH_MODE: ${{ inputs.publish_mode }}
+        PUBLISH_MODE: ${{ inputs.publish_mode != '' && inputs.publish_mode || (inputs.review_strategy == 'single' && 'comment' || 'review_comment') }}
         REVIEW_SCOPE: ${{ inputs.review_scope }}
         SKIP_IF_DIFF_UNCHANGED: ${{ inputs.skip_if_diff_unchanged }}
         FORCE_REVIEW: ${{ inputs.force_review }}
@@ -932,7 +933,7 @@ runs:
         SPECIALIST_MAX_MODEL_TURNS_PER_SESSION: ${{ inputs.specialist_max_model_turns_per_session }}
         SPECIALIST_MAX_TOOL_CALLS_PER_SESSION: ${{ inputs.specialist_max_tool_calls_per_session }}
         SPECIALIST_MAX_RECOVERIES_PER_SESSION: ${{ inputs.specialist_max_recoveries_per_session }}
-        PUBLISH_MODE: ${{ inputs.review_strategy != 'single' && inputs.publish_mode == 'comment' && 'review_comment' || inputs.publish_mode }}
+        PUBLISH_MODE: ${{ inputs.publish_mode != '' && inputs.publish_mode || (inputs.review_strategy == 'single' && 'comment' || 'review_comment') }}
         ALLOW_APPROVE: ${{ inputs.allow_approve }}
         APPROVE_FORKS: ${{ inputs.approve_forks }}
         SPECIALIST_CONFIG_FILE: ${{ inputs.specialist_config_file }}
@@ -1096,7 +1097,7 @@ runs:
       # block makes a duplicate-key manifest error structurally impossible.
       # All per-mode inline `${{ }}` expressions are hoisted into env so the
       # run body is pure bash dispatching on $PUBLISH_MODE.
-      if: inputs.review_strategy == 'single' && steps.precheck.outputs.should_review == 'true' && (inputs.publish_mode == 'review_comment' || inputs.publish_mode == 'review_verdict' || (inputs.publish_mode == 'comment' && inputs.publish_review_comment == 'true'))
+      if: inputs.review_strategy == 'single' && steps.precheck.outputs.should_review == 'true' && (inputs.publish_mode == 'review_comment' || inputs.publish_mode == 'review_verdict' || ((inputs.publish_mode == '' || inputs.publish_mode == 'comment') && inputs.publish_review_comment == 'true'))
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
@@ -1123,7 +1124,7 @@ runs:
         CLEANUP_PREVIOUS_NATIVE_REVIEWS: ${{ inputs.cleanup_previous_native_reviews }}
         ALLOW_APPROVE: ${{ inputs.allow_approve }}
         APPROVE_FORKS: ${{ inputs.approve_forks }}
-        PUBLISH_MODE: ${{ inputs.publish_mode }}
+        PUBLISH_MODE: ${{ inputs.publish_mode != '' && inputs.publish_mode || (inputs.review_strategy == 'single' && 'comment' || 'review_comment') }}
         EFFECTIVE_SCOPE: ${{ steps.precheck.outputs.effective_review_scope || 'full' }}
         BASE_SHA: ${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}
         PREVIOUS_HEAD_SHA: ${{ steps.precheck.outputs.previous_head_sha || '' }}

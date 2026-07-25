@@ -45,6 +45,7 @@ class ModelTurnRequest:
     tokens_param: str = "max_tokens"
     cache_prefix: bool = False
     keep_full_history_on_verdict: bool = True
+    response_format_override: str | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,13 @@ class OpenAIModelGateway:
             raise ValueError("max_tokens must be positive")
         if request.timeout_sec <= 0:
             raise ValueError("timeout_sec must be positive")
+        response_format = (
+            request.response_format_override
+            if request.response_format_override is not None
+            else self.response_format
+        )
+        if response_format not in {"off", "json_object", "json_schema"}:
+            raise ValueError("response_format_override must be off, json_object, or json_schema")
         payload = request.conversation.to_request_payload(
             "openai",
             self.model_for_role(request.role),
@@ -121,7 +129,7 @@ class OpenAIModelGateway:
             temperature=request.temperature,
             verdict_turn=not request.tools_enabled,
             keep_full_history_on_verdict=request.keep_full_history_on_verdict,
-            response_format=self.response_format if not request.tools_enabled else None,
+            response_format=response_format if not request.tools_enabled else None,
             response_schema=request.response_schema,
             response_schema_name=(request.response_schema_name or f"specialist_{request.role}"),
             reasoning_effort=request.reasoning_effort,

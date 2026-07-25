@@ -7,8 +7,15 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 
 from pr_reviewer.specialist_runtime import cli
-from pr_reviewer.specialist_runtime.controller import ReviewResult
-from pr_reviewer.specialist_runtime.types import ReviewHandoff, ReviewNote, ReviewNoteKind
+from pr_reviewer.specialist_runtime.budget import SessionLease
+from pr_reviewer.specialist_runtime.controller import ReviewResult, RoleRequest
+from pr_reviewer.specialist_runtime.model_gateway import ModelTurnRequest
+from pr_reviewer.specialist_runtime.types import (
+    ReviewHandoff,
+    ReviewNote,
+    ReviewNoteKind,
+    RunPhase,
+)
 
 
 def write_review_workspace(root: Path) -> None:
@@ -89,7 +96,13 @@ def test_cli_writes_structured_handoff_notes_artifact_and_compatibility_output(
     assert compatibility == {
         "verdict": "request_changes",
         "review_markdown": "## AI review handoff\n\nReview the complete change.",
-        "findings": [],
+        "findings": [{
+            "severity": "major",
+            "category": "other",
+            "file": "src/app.py",
+            "line": 1,
+            "message": "A detailed note",
+        }],
         "verdict_source": "runtime-policy",
     }
     assert (tmp_path / "review-handoff.md").read_text().startswith("## AI review handoff")
@@ -179,6 +192,106 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
     assert gateway.tokens_param == "max_tokens"
     assert config.tool_response_bytes == 5432
     assert config.tool_request_timeout_sec == 7
+
+
+def _role_request(role: str, phase: RunPhase) -> RoleRequest:
+    return RoleRequest(
+        role=role,
+        request_id=f"{role}:test",
+        phase=phase,
+        lease=SessionLease(phase, 10**20),
+        timeout_sec=30,
+        max_tokens=512,
+        context={},
+    )
+
+
+def _successful_transport(captured):
+    def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
+        captured.append(payload)
+        return {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "{}"},
+            }],
+            "usage": {},
+        }
+
+    return transport
+
+
+def test_default_lm_studio_requests_use_role_and_session_protocols_not_legacy_verdict_prompt(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    monkeypatch.setenv("AI_RESPONSE_FORMAT", "off")
+    config = cli.CliConfig.from_env(workspace=tmp_path)
+    controller = cli.build_controller(config)
+    captured = []
+    gateway = controller.planner.gateway
+    gateway.transport = _successful_transport(captured)
+
+    controller.planner.complete(_role_request("planner", RunPhase.PLANNING))
+
+    from pr_reviewer.specialist_runtime.assignments import Assignment
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger
+    from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+
+    assignment = Assignment(
+        id="a", title="A", objective="Review", obligation_ids=(), recipe_ids=(),
+        lenses=(), seed_paths=(), boundary_paths=(), expected_evidence=(),
+        estimated_turns=1, priority="normal",
+    )
+    session = controller._cli_session_factory(
+        assignment, SessionLease(RunPhase.INITIAL, 10**20), None,
+        EvidenceStore(), CoverageLedger(()), (), "session:test:g0",
+    )
+    gateway.complete(ModelTurnRequest(
+        role="specialist",
+        conversation=session.conversation,
+        max_tokens=512,
+        response_schema=None,
+        tools_enabled=True,
+        timeout_sec=30,
+        stream=False,
+    ))
+
+    planner_payload, specialist_payload = captured
+    planner_system = planner_payload["messages"][0]["content"]
+    specialist_system = specialist_payload["messages"][0]["content"]
+    forbidden = "Return STRICT JSON with keys verdict and review_markdown"
+    assert forbidden not in planner_system
+    assert forbidden not in specialist_system
+    assert "bounded specialist assignment set" in planner_system
+    assert "checkpoint" in specialist_system
+    assert "final" in specialist_system
+    assert "response_format" not in planner_payload
+    assert "response_format" not in specialist_payload
+    assert "tools" not in planner_payload
+    assert specialist_payload["tools"]
+
+
+def test_json_schema_mode_uses_json_object_for_each_controller_role(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    monkeypatch.setenv("AI_RESPONSE_FORMAT", "json_schema")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    captured = []
+    controller.planner.gateway.transport = _successful_transport(captured)
+
+    roles = (
+        ("planner", RunPhase.PLANNING, controller.planner),
+        ("negotiator", RunPhase.FOLLOWUP, controller.negotiator),
+        ("critic", RunPhase.FINALIZATION, controller.critic),
+        ("finalizer", RunPhase.FINALIZATION, controller.finalizer),
+    )
+    for role, phase, adapter in roles:
+        adapter.complete(_role_request(role, phase))
+
+    assert len(captured) == len(roles)
+    for payload in captured:
+        assert payload["response_format"] == {"type": "json_object"}
 
 
 def test_cli_ignores_legacy_source_hosts_and_warns_for_aliases(monkeypatch, tmp_path, capsys):

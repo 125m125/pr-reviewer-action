@@ -234,6 +234,24 @@ def test_specialist_structured_outputs_and_publisher_are_wired():
     assert 'if: inputs.review_strategy == \'single\'' in content
 
 
+def test_publish_mode_omission_and_explicit_comment_have_distinct_specialist_meanings():
+    content = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
+    assert _action_defaults()["publish_mode"] == ""
+    effective = (
+        "${{ inputs.publish_mode != '' && inputs.publish_mode || "
+        "(inputs.review_strategy == 'single' && 'comment' || 'review_comment') }}"
+    )
+    assert content.count(f"PUBLISH_MODE: {effective}") == 3
+    assert (
+        "inputs.review_strategy != 'single' && inputs.publish_mode == 'comment'"
+        not in content
+    )
+    assert (
+        "(inputs.publish_mode == '' || inputs.publish_mode == 'comment') "
+        "&& inputs.publish_review_comment == 'true'"
+    ) in content
+
+
 if __name__ == "__main__":
     test_readme_inputs_in_action()
     test_action_inputs_in_readme()

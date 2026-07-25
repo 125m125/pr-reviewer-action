@@ -288,6 +288,7 @@ class GatewayRoleAdapter:
 
     gateway: ModelGateway
     system_prompt: str = "Return only the requested structured JSON object."
+    response_format_override: str | None = None
 
     def complete(self, request: RoleRequest) -> object:
         conversation = Conversation(system=self.system_prompt)
@@ -307,6 +308,7 @@ class GatewayRoleAdapter:
             deadline_at=request.lease.deadline_at,
             stream=False,
             response_schema_name=f"specialist_{request.role}",
+            response_format_override=self.response_format_override,
         ))
         return _json_object(result.text)
 
