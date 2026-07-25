@@ -32,6 +32,7 @@ SYSTEM_PROMPT_MODE="${SYSTEM_PROMPT_MODE:-replace}"
 # A supplied prompt held for append mode, composed onto the default after
 # fragment assembly (see apply_system_prompt_fragments).
 SYSTEM_PROMPT_ADDENDUM=""
+SYSTEM_PROMPT_IS_DEFAULT=0
 STANDARDS_FILE="${STANDARDS_FILE:-}"
 STANDARDS_FILE_CANDIDATES="${STANDARDS_FILE_CANDIDATES:-AGENTS.md,agents.md,CLAUDE.md,claude.md,.github/ai-review-rules.md,.github/ai-review-rules.txt}"
 CONTEXT_LIMIT_MODE="${CONTEXT_LIMIT_MODE:-normal}"
@@ -499,7 +500,10 @@ apply_system_prompt_fragments() {
   if [[ -n "${SYSTEM_PROMPT_ADDENDUM:-}" ]]; then
     SYSTEM_PROMPT="${SYSTEM_PROMPT}"$'\n\n'"${SYSTEM_PROMPT_ADDENDUM}"
   fi
-  export SYSTEM_PROMPT
+  # The specialist CLI must distinguish this rendered whole-PR default from a
+  # user replacement. Append mode also needs the original addendum so it can
+  # combine it with specialist-neutral guidance instead of this verdict prompt.
+  export SYSTEM_PROMPT SYSTEM_PROMPT_IS_DEFAULT SYSTEM_PROMPT_ADDENDUM
 }
 
 resolve_standards_file

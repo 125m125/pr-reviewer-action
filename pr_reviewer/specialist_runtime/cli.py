@@ -121,15 +121,23 @@ def _safe_repository_path(workspace: Path, value: str, *, label: str) -> Path:
 
 def _read_system_prompt(workspace: Path, env: Mapping[str, str]) -> str:
     default = _REVIEW_GUIDANCE
-    inline = str(env.get("SYSTEM_PROMPT", ""))
+    mode = str(env.get("SYSTEM_PROMPT_MODE", "replace")).strip().lower()
+    shell_rendered_default = str(
+        env.get("SYSTEM_PROMPT_IS_DEFAULT", "0")
+    ).strip() == "1"
+    inline = (
+        str(env.get("SYSTEM_PROMPT_ADDENDUM", ""))
+        if shell_rendered_default and mode == "append"
+        else "" if shell_rendered_default
+        else str(env.get("SYSTEM_PROMPT", ""))
+    )
     file_value = str(env.get("SYSTEM_PROMPT_FILE", "")).strip()
     custom = inline
-    if not custom and file_value:
+    if not shell_rendered_default and not custom and file_value:
         path = _safe_repository_path(workspace, file_value, label="system_prompt_file")
         custom = path.read_text(encoding="utf-8")
     if not custom:
         return default
-    mode = str(env.get("SYSTEM_PROMPT_MODE", "replace")).strip().lower()
     if mode == "append":
         return default.rstrip() + "\n\n" + custom.strip()
     if mode != "replace":

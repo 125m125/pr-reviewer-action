@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import re
+import subprocess
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
@@ -292,6 +295,96 @@ def test_json_schema_mode_uses_json_object_for_each_controller_role(monkeypatch,
     assert len(captured) == len(roles)
     for payload in captured:
         assert payload["response_format"] == {"type": "json_object"}
+
+
+def _shell_prompt_environment(
+    tmp_path: Path, *, inline: str = "", file_name: str = "", mode: str = "replace"
+) -> dict[str, str]:
+    script_dir = Path(__file__).parents[1] / "scripts"
+    config_source = (script_dir / "sections" / "config.sh").read_text(encoding="utf-8")
+    functions = []
+    for name in ("resolve_system_prompt", "apply_system_prompt_fragments"):
+        match = re.search(
+            rf"^{name}\(\) \{{\n(.*?)\n\}}", config_source, re.MULTILINE | re.DOTALL,
+        )
+        assert match is not None
+        functions.append(f"{name}() {{\n{match.group(1)}\n}}\n")
+    function_file = tmp_path / "prompt-functions.sh"
+    function_file.write_text("\n".join(functions), encoding="utf-8")
+    environment = os.environ.copy()
+    environment.update({
+        "ACTION_SCRIPT_DIR": script_dir.as_posix(),
+        "PROMPT_FUNCTION_FILE": function_file.as_posix(),
+        "SYSTEM_PROMPT": inline,
+        "SYSTEM_PROMPT_FILE": file_name,
+        "SYSTEM_PROMPT_MODE": mode,
+        "REVIEW_STRATEGY": "specialists",
+        "REPO": "owner/repo",
+        "PR_NUMBER": "17",
+        "AI_BASE_URL": "http://localhost:1234/v1",
+        "AI_MODEL": "local-model",
+        "GH_TOKEN": "test-token",
+    })
+    script = r'''
+set -euo pipefail
+SCRIPT_DIR="$ACTION_SCRIPT_DIR"
+error() { printf '%s\n' "$*" >&2; }
+source "$PROMPT_FUNCTION_FILE"
+SYSTEM_PROMPT_ADDENDUM=""
+SYSTEM_PROMPT_IS_DEFAULT=0
+resolve_system_prompt
+apply_system_prompt_fragments
+printf '%s\0%s\0%s\0%s\0' \
+  "$SYSTEM_PROMPT" "${SYSTEM_PROMPT_IS_DEFAULT:-0}" \
+  "${SYSTEM_PROMPT_ADDENDUM:-}" "$SYSTEM_PROMPT_MODE"
+'''
+    completed = subprocess.run(
+        ["bash", "-c", script],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    prompt, is_default, addendum, resolved_mode, _ = completed.stdout.split(b"\0")
+    return {
+        **environment,
+        "SYSTEM_PROMPT": prompt.decode(),
+        "SYSTEM_PROMPT_IS_DEFAULT": is_default.decode(),
+        "SYSTEM_PROMPT_ADDENDUM": addendum.decode(),
+        "SYSTEM_PROMPT_MODE": resolved_mode.decode(),
+    }
+
+
+def test_shell_prompt_provenance_gives_specialists_neutral_default_and_custom_semantics(
+    tmp_path
+):
+    default_env = _shell_prompt_environment(tmp_path)
+    assert "Return STRICT JSON with keys verdict" in default_env["SYSTEM_PROMPT"]
+    default_config = cli.CliConfig.from_env(default_env, workspace=tmp_path)
+    assert default_config.system_prompt == cli._REVIEW_GUIDANCE
+
+    custom_file = tmp_path / "review-prompt.txt"
+    custom_file.write_text("FILE CUSTOM PROMPT", encoding="utf-8")
+    cases = (
+        ("INLINE CUSTOM PROMPT", "", "replace", "INLINE CUSTOM PROMPT"),
+        ("", "review-prompt.txt", "replace", "FILE CUSTOM PROMPT"),
+        (
+            "INLINE CUSTOM PROMPT", "", "append",
+            cli._REVIEW_GUIDANCE + "\n\nINLINE CUSTOM PROMPT",
+        ),
+        (
+            "", "review-prompt.txt", "append",
+            cli._REVIEW_GUIDANCE + "\n\nFILE CUSTOM PROMPT",
+        ),
+    )
+    for inline, file_name, mode, expected in cases:
+        resolved = _shell_prompt_environment(
+            tmp_path, inline=inline, file_name=file_name, mode=mode,
+        )
+        config = cli.CliConfig.from_env(resolved, workspace=tmp_path)
+        assert config.system_prompt == expected
+        assert "Return STRICT JSON with keys verdict" not in config.system_prompt
 
 
 def test_cli_ignores_legacy_source_hosts_and_warns_for_aliases(monkeypatch, tmp_path, capsys):
