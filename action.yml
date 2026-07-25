@@ -80,8 +80,44 @@ inputs:
       (publish the validated specialist result).
     required: false
     default: "single"
+  review_policy_file:
+    description: Current-branch version-2 specialist review policy; its source and publishing restrictions are authoritative.
+    required: false
+    default: ".github/ai-review-policy.json"
+  specialist_review_deadline_sec:
+    description: Absolute specialist review deadline in seconds, including finalization and artifact production.
+    required: false
+    default: "7200"
+  specialist_phase_shares:
+    description: JSON percentage allocation for planning, initial investigation, follow-up, and finalization; values must total 100.
+    required: false
+    default: '{"planning":10,"initial":60,"followup":20,"finalization":10}'
+  specialist_concurrency:
+    description: Maximum specialist sessions executed concurrently; start at 1 unless provider capacity is verified.
+    required: false
+    default: "1"
+  specialist_max_sessions:
+    description: Maximum initial specialist sessions for one review run.
+    required: false
+    default: "8"
+  specialist_max_followup_sessions:
+    description: Maximum bounded follow-up specialist sessions for one review run.
+    required: false
+    default: "2"
+  specialist_max_model_turns_per_session:
+    description: Lifetime model-turn limit for one logical specialist session, including resume and recovery.
+    required: false
+    default: "64"
+  specialist_max_tool_calls_per_session:
+    description: Lifetime read-only tool-call limit for one logical specialist session.
+    required: false
+    default: "20"
+  specialist_max_recoveries_per_session:
+    description: Lifetime reconstruction limit for one logical specialist session.
+    required: false
+    default: "1"
   specialist_config_file:
-    description: Optional PR-branch JSON file defining components, specialist recipes, and authoritative exclusions.
+    description: Deprecated one-release alias for review_policy_file using the version-1 specialist schema.
     required: false
     default: ".github/ai-review-specialists.json"
   specialist_planner_max_tool_calls:
@@ -93,19 +129,19 @@ inputs:
     required: false
     default: "2048"
   specialist_max_initial_passes:
-    description: Maximum sequential specialist passes selected for the initial wave.
+    description: Deprecated one-release alias for specialist_max_sessions.
     required: false
     default: "6"
   specialist_max_followup_passes:
-    description: Maximum sequential specialist passes in the critic-requested follow-up wave.
+    description: Deprecated one-release alias for specialist_max_followup_sessions.
     required: false
     default: "2"
   specialist_max_tool_calls_per_pass:
-    description: Maximum read-only tool calls available to each specialist pass.
+    description: Deprecated one-release alias for specialist_max_tool_calls_per_session.
     required: false
     default: "20"
   specialist_tool_mode:
-    description: Specialist evidence mode, native_loop (read-only tools) or packet (preassembled corpus only).
+    description: Specialist evidence mode. native_loop is used; packet is deprecated and emits a migration warning.
     required: false
     default: "native_loop"
   specialist_planner_model:
@@ -717,6 +753,12 @@ outputs:
   specialist_artifact:
     description: Absolute path to the machine-readable specialist evaluation artifact when specialist mode ran
     value: ${{ steps.review.outputs.specialist_artifact }}
+  review_handoff:
+    description: Absolute path to the sparse specialist human-review handoff when specialist mode ran
+    value: ${{ steps.review.outputs.review_handoff }}
+  review_notes:
+    description: Absolute path to normalized detailed specialist review notes when specialist mode ran
+    value: ${{ steps.review.outputs.review_notes }}
 
 runs:
   using: composite
@@ -756,6 +798,15 @@ runs:
         AI_VERDICT_REASONING_EFFORT: ${{ inputs.ai_verdict_reasoning_effort }}
         AI_TOKENS_PARAM: ${{ inputs.ai_tokens_param }}
         REVIEW_STRATEGY: ${{ inputs.review_strategy }}
+        REVIEW_POLICY_FILE: ${{ inputs.review_policy_file }}
+        SPECIALIST_REVIEW_DEADLINE_SEC: ${{ inputs.specialist_review_deadline_sec }}
+        SPECIALIST_PHASE_SHARES: ${{ inputs.specialist_phase_shares }}
+        SPECIALIST_CONCURRENCY: ${{ inputs.specialist_concurrency }}
+        SPECIALIST_MAX_SESSIONS: ${{ inputs.specialist_max_sessions }}
+        SPECIALIST_MAX_FOLLOWUP_SESSIONS: ${{ inputs.specialist_max_followup_sessions }}
+        SPECIALIST_MAX_MODEL_TURNS_PER_SESSION: ${{ inputs.specialist_max_model_turns_per_session }}
+        SPECIALIST_MAX_TOOL_CALLS_PER_SESSION: ${{ inputs.specialist_max_tool_calls_per_session }}
+        SPECIALIST_MAX_RECOVERIES_PER_SESSION: ${{ inputs.specialist_max_recoveries_per_session }}
         SPECIALIST_CONFIG_FILE: ${{ inputs.specialist_config_file }}
         SPECIALIST_PLANNER_MAX_TOOL_CALLS: ${{ inputs.specialist_planner_max_tool_calls }}
         SPECIALIST_PLANNER_MAX_TOKENS: ${{ inputs.specialist_planner_max_tokens }}
@@ -861,6 +912,7 @@ runs:
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
         AI_BASE_URL: ${{ inputs.ai_base_url }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
         AI_API_FORMAT: ${{ inputs.ai_api_format }}
         AI_MODEL: ${{ inputs.ai_model }}
         AI_API_KEY: ${{ inputs.ai_api_key }}
@@ -871,6 +923,18 @@ runs:
         AI_VERDICT_REASONING_EFFORT: ${{ inputs.ai_verdict_reasoning_effort }}
         AI_TOKENS_PARAM: ${{ inputs.ai_tokens_param }}
         REVIEW_STRATEGY: ${{ inputs.review_strategy }}
+        REVIEW_POLICY_FILE: ${{ inputs.review_policy_file }}
+        SPECIALIST_REVIEW_DEADLINE_SEC: ${{ inputs.specialist_review_deadline_sec }}
+        SPECIALIST_PHASE_SHARES: ${{ inputs.specialist_phase_shares }}
+        SPECIALIST_CONCURRENCY: ${{ inputs.specialist_concurrency }}
+        SPECIALIST_MAX_SESSIONS: ${{ inputs.specialist_max_sessions }}
+        SPECIALIST_MAX_FOLLOWUP_SESSIONS: ${{ inputs.specialist_max_followup_sessions }}
+        SPECIALIST_MAX_MODEL_TURNS_PER_SESSION: ${{ inputs.specialist_max_model_turns_per_session }}
+        SPECIALIST_MAX_TOOL_CALLS_PER_SESSION: ${{ inputs.specialist_max_tool_calls_per_session }}
+        SPECIALIST_MAX_RECOVERIES_PER_SESSION: ${{ inputs.specialist_max_recoveries_per_session }}
+        PUBLISH_MODE: ${{ inputs.review_strategy != 'single' && inputs.publish_mode == 'comment' && 'review_comment' || inputs.publish_mode }}
+        ALLOW_APPROVE: ${{ inputs.allow_approve }}
+        APPROVE_FORKS: ${{ inputs.approve_forks }}
         SPECIALIST_CONFIG_FILE: ${{ inputs.specialist_config_file }}
         SPECIALIST_PLANNER_MAX_TOOL_CALLS: ${{ inputs.specialist_planner_max_tool_calls }}
         SPECIALIST_PLANNER_MAX_TOKENS: ${{ inputs.specialist_planner_max_tokens }}
@@ -974,6 +1038,57 @@ runs:
         TOOL_EVIDENCE_MEMORY: ${{ inputs.tool_evidence_memory }}
       run: bash "${{ github.action_path }}/scripts/run_review.sh"
 
+    - name: Publish specialist review
+      if: inputs.review_strategy == 'specialists' && steps.precheck.outputs.should_review == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ inputs.repo || github.repository }}
+        PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
+        EFFECTIVE_SCOPE: ${{ steps.precheck.outputs.effective_review_scope || 'full' }}
+        BASELINE_CLEAN: ${{ steps.precheck.outputs.baseline_clean || 'false' }}
+        IS_FORK_PR: ${{ steps.precheck.outputs.is_fork_pr || 'false' }}
+        APPROVE_FORKS: ${{ inputs.approve_forks }}
+        GITHUB_ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        test -s specialist-review-artifact.json
+        test -s review-handoff.json
+        test -s review-notes.json
+        test -s specialist-policy-result.json
+        test -s specialist-changed-files.json
+        ARTIFACT_HEAD="$(jq -r '.head_sha // empty' specialist-review-artifact.json)"
+        if [[ -z "$ARTIFACT_HEAD" || "$ARTIFACT_HEAD" != "$HEAD_SHA" ]]; then
+          echo "Specialist artifact head does not match the current PR head" >&2
+          exit 1
+        fi
+        if [[ "$(jq -r '.publishing.ready // false' specialist-review-artifact.json)" != "true" ]]; then
+          echo "Specialist artifact is not ready for publication; leaving the structured artifacts for inspection"
+          exit 0
+        fi
+        EFFECTIVE_PUBLISH_MODE="$(jq -r '.publishing.mode // "review_comment"' specialist-review-artifact.json)"
+        EFFECTIVE_ALLOW_APPROVE="$(jq -r '.publishing.allow_approve // false' specialist-review-artifact.json)"
+        CHANGED_FILE_COUNT="$(jq 'length' specialist-changed-files.json)"
+        python3 "${GITHUB_ACTION_PATH}/scripts/publish_specialist_review.py" \
+          --mode "$EFFECTIVE_PUBLISH_MODE" \
+          --handoff review-handoff.json \
+          --notes review-notes.json \
+          --diff pr.diff \
+          --files specialist-changed-files.json \
+          --changed-files-complete true \
+          --changed-files-count "$CHANGED_FILE_COUNT" \
+          --diff-complete false \
+          --policy-result specialist-policy-result.json \
+          --repo "$REPO" \
+          --pr-number "$PR_NUMBER" \
+          --head-sha "$HEAD_SHA" \
+          --allow-approve "$EFFECTIVE_ALLOW_APPROVE" \
+          --approve-forks "$APPROVE_FORKS" \
+          --is-fork "$IS_FORK_PR" \
+          --effective-scope "$EFFECTIVE_SCOPE" \
+          --baseline-clean "$BASELINE_CLEAN"
+
     - name: Publish review
       # Single dispatcher for all three publish modes. One superset env block
       # (harmless unused keys per mode) replaces the three near-duplicate
@@ -981,7 +1096,7 @@ runs:
       # block makes a duplicate-key manifest error structurally impossible.
       # All per-mode inline `${{ }}` expressions are hoisted into env so the
       # run body is pure bash dispatching on $PUBLISH_MODE.
-      if: steps.precheck.outputs.should_review == 'true' && inputs.review_strategy != 'specialists_evaluate' && (inputs.publish_mode == 'review_comment' || inputs.publish_mode == 'review_verdict' || (inputs.publish_mode == 'comment' && inputs.publish_review_comment == 'true'))
+      if: inputs.review_strategy == 'single' && steps.precheck.outputs.should_review == 'true' && (inputs.publish_mode == 'review_comment' || inputs.publish_mode == 'review_verdict' || (inputs.publish_mode == 'comment' && inputs.publish_review_comment == 'true'))
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}

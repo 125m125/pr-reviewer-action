@@ -88,6 +88,20 @@ REVIEW_SCOPE="${REVIEW_SCOPE:-auto}"
 EFFECTIVE_SCOPE="${EFFECTIVE_SCOPE:-full}"
 PREVIOUS_HEAD_SHA="${PREVIOUS_HEAD_SHA:-}"
 REVIEW_STRATEGY="${REVIEW_STRATEGY:-single}"
+REVIEW_POLICY_FILE="${REVIEW_POLICY_FILE:-.github/ai-review-policy.json}"
+SPECIALIST_REVIEW_DEADLINE_SEC="${SPECIALIST_REVIEW_DEADLINE_SEC:-7200}"
+SPECIALIST_PHASE_SHARES="${SPECIALIST_PHASE_SHARES:-}"
+if [[ -z "$SPECIALIST_PHASE_SHARES" ]]; then
+  SPECIALIST_PHASE_SHARES='{"planning":10,"initial":60,"followup":20,"finalization":10}'
+fi
+SPECIALIST_CONCURRENCY="${SPECIALIST_CONCURRENCY:-1}"
+SPECIALIST_MAX_SESSIONS="${SPECIALIST_MAX_SESSIONS:-8}"
+SPECIALIST_MAX_FOLLOWUP_SESSIONS="${SPECIALIST_MAX_FOLLOWUP_SESSIONS:-2}"
+SPECIALIST_MAX_MODEL_TURNS_PER_SESSION="${SPECIALIST_MAX_MODEL_TURNS_PER_SESSION:-64}"
+SPECIALIST_MAX_TOOL_CALLS_PER_SESSION="${SPECIALIST_MAX_TOOL_CALLS_PER_SESSION:-20}"
+SPECIALIST_MAX_RECOVERIES_PER_SESSION="${SPECIALIST_MAX_RECOVERIES_PER_SESSION:-1}"
+# One-release aliases retained for migration diagnostics. The Python adapter
+# resolves an explicitly changed alias when its replacement is still default.
 SPECIALIST_CONFIG_FILE="${SPECIALIST_CONFIG_FILE:-.github/ai-review-specialists.json}"
 SPECIALIST_PLANNER_MAX_TOOL_CALLS="${SPECIALIST_PLANNER_MAX_TOOL_CALLS:-2}"
 SPECIALIST_PLANNER_MAX_TOKENS="${SPECIALIST_PLANNER_MAX_TOKENS:-2048}"
@@ -290,6 +304,9 @@ case "$(printf '%s' "$SPECIALIST_TOOL_MODE" | tr '[:upper:]' '[:lower:]')" in
 esac
 
 for _specialist_budget_name in \
+  SPECIALIST_REVIEW_DEADLINE_SEC SPECIALIST_CONCURRENCY SPECIALIST_MAX_SESSIONS \
+  SPECIALIST_MAX_FOLLOWUP_SESSIONS SPECIALIST_MAX_MODEL_TURNS_PER_SESSION \
+  SPECIALIST_MAX_TOOL_CALLS_PER_SESSION SPECIALIST_MAX_RECOVERIES_PER_SESSION \
   SPECIALIST_PLANNER_MAX_TOOL_CALLS SPECIALIST_PLANNER_MAX_TOKENS \
   SPECIALIST_MAX_INITIAL_PASSES \
   SPECIALIST_MAX_FOLLOWUP_PASSES SPECIALIST_MAX_TOOL_CALLS_PER_PASS \
@@ -303,6 +320,23 @@ for _specialist_budget_name in \
   fi
 done
 unset _specialist_budget_name _specialist_budget_value
+
+if [[ "$REVIEW_STRATEGY" != "single" ]]; then
+  if ! SPECIALIST_PHASE_SHARES="$SPECIALIST_PHASE_SHARES" python3 - <<'PY'
+import json, os
+value = json.loads(os.environ["SPECIALIST_PHASE_SHARES"])
+if set(value) != {"planning", "initial", "followup", "finalization"}:
+    raise SystemExit(1)
+if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in value.values()):
+    raise SystemExit(1)
+if sum(value.values()) != 100 or value["finalization"] <= 0:
+    raise SystemExit(1)
+PY
+  then
+    error "Invalid SPECIALIST_PHASE_SHARES; expected JSON percentages totaling 100 with a finalization reserve"
+    exit 1
+  fi
+fi
 
 if [[ ! "$SPECIALIST_TEMPERATURE" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]]; then
   error "Invalid SPECIALIST_TEMPERATURE '$SPECIALIST_TEMPERATURE'; expected a non-negative number"

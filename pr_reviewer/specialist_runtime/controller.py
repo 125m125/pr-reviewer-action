@@ -330,6 +330,8 @@ class ReviewInputs:
     source_access_requests: tuple[SourceAccessRequest, ...] = ()
     verification_requests: tuple[Mapping[str, Any], ...] = ()
     pr_metadata: Mapping[str, Any] = field(default_factory=dict)
+    configuration_warnings: tuple[str, ...] = ()
+    adapter_configuration: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1896,7 +1898,10 @@ class ReviewController:
             for event in events
         ]
         policy_digest = _digest(state.inputs.policy)
-        config_digest = _digest(state.inputs.config)
+        config_digest = _digest({
+            "runtime": state.inputs.config,
+            "adapter": state.inputs.adapter_configuration,
+        })
         run_id = _artifact_id(state.inputs)
         artifact: dict[str, object] = {
             "accepted_candidates": [_json_value(item) for item in state.review.accepted],
@@ -1999,6 +2004,10 @@ class ReviewController:
                     "evidence_ids": list(evidence_by_obligation.get(item.id, ())),
                 }
                 for item in state.obligations
+            },
+            "configuration": {
+                "runtime": _json_value(state.inputs.config),
+                "adapter": _json_value(state.inputs.adapter_configuration),
             },
             "degradation": list(state.degradations),
             "evaluation_status": "degraded" if state.degradations else "complete",
@@ -2424,6 +2433,8 @@ class ReviewController:
                 state.effective_publishing_mode,
                 state.effective_allow_approve,
             ) = self._publishing_authority(inputs)
+            for warning in inputs.configuration_warnings:
+                self._degrade(state, "configuration", warning)
             try:
                 path = _resolve_artifact_path(
                     self.artifact_output_root, inputs.artifact_path,

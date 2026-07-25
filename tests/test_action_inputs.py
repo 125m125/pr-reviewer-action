@@ -11,7 +11,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 def parse_action_inputs():
     """Parse declared input names from action.yml."""
     action_yml = _REPO_ROOT / "action.yml"
-    content = action_yml.read_text()
+    content = action_yml.read_text(encoding="utf-8")
 
     inputs = set()
     in_inputs_section = False
@@ -39,7 +39,7 @@ def parse_readme_inputs():
     is scanned.
     """
     readme = _REPO_ROOT / "README.md"
-    content = readme.read_text()
+    content = readme.read_text(encoding="utf-8")
 
     inputs = set()
     in_table = False
@@ -143,7 +143,7 @@ def test_action_yml_has_no_duplicate_env_keys():
     to load for every consumer. The action's own validate CI never caught it
     because nothing checked the manifest for duplicate keys.
     """
-    content = (_REPO_ROOT / "action.yml").read_text()
+    content = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
     duplicates = find_duplicate_block_keys(content)
     assert not duplicates, (
         "action.yml has duplicate keys in an env:/with: block (GitHub's runner "
@@ -161,7 +161,7 @@ def test_comment_marker_input_exists():
 
 
 def test_reasoning_inputs_declared_and_wired():
-    content = (_REPO_ROOT / "action.yml").read_text()
+    content = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
     inputs = parse_action_inputs()
     assert {"ai_reasoning_effort", "ai_verdict_reasoning_effort"} <= inputs
     assert "AI_REASONING_EFFORT: ${{ inputs.ai_reasoning_effort }}" in content
@@ -169,7 +169,7 @@ def test_reasoning_inputs_declared_and_wired():
 
 
 def test_synthesis_inputs_declared_and_wired():
-    content = (_REPO_ROOT / "action.yml").read_text()
+    content = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
     inputs = parse_action_inputs()
     assert {"tool_synthesis_timeout_sec", "tool_synthesis_max_tokens"} <= inputs
     assert "TOOL_SYNTHESIS_TIMEOUT_SEC: ${{ inputs.tool_synthesis_timeout_sec }}" in content
@@ -177,7 +177,7 @@ def test_synthesis_inputs_declared_and_wired():
 
 
 def test_specialist_watchdog_inputs_are_declared_and_wired():
-    content = (_REPO_ROOT / "action.yml").read_text()
+    content = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
     inputs = parse_action_inputs()
     expected = {
         "specialist_stream_watchdog",
@@ -189,6 +189,49 @@ def test_specialist_watchdog_inputs_are_declared_and_wired():
     for name in expected:
         env_name = name.upper()
         assert f"{env_name}: ${{{{ inputs.{name} }}}}" in content
+
+
+def _action_defaults() -> dict[str, str]:
+    content = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
+    defaults: dict[str, str] = {}
+    current = None
+    for line in content.splitlines():
+        match = re.match(r"^  (\w+):\s*$", line)
+        if match:
+            current = match.group(1)
+        default = re.match(r'^    default:\s*"?(.*?)"?\s*$', line)
+        if current and default:
+            defaults[current] = default.group(1).strip("'\"")
+    return defaults
+
+
+def test_specialist_session_runtime_inputs_have_exact_defaults_and_wiring():
+    expected = {
+        "review_policy_file": ".github/ai-review-policy.json",
+        "specialist_review_deadline_sec": "7200",
+        "specialist_phase_shares": '{"planning":10,"initial":60,"followup":20,"finalization":10}',
+        "specialist_concurrency": "1",
+        "specialist_max_sessions": "8",
+        "specialist_max_followup_sessions": "2",
+        "specialist_max_model_turns_per_session": "64",
+        "specialist_max_tool_calls_per_session": "20",
+        "specialist_max_recoveries_per_session": "1",
+    }
+    content = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
+    assert expected.items() <= _action_defaults().items()
+    for name in expected:
+        assert f"{name.upper()}: ${{{{ inputs.{name} }}}}" in content
+
+
+def test_specialist_structured_outputs_and_publisher_are_wired():
+    content = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
+    assert "review_handoff:" in content
+    assert "review_notes:" in content
+    assert "specialist_artifact:" in content
+    assert 'if: inputs.review_strategy == \'specialists\'' in content
+    assert 'python3 "${GITHUB_ACTION_PATH}/scripts/publish_specialist_review.py"' in content
+    assert "--changed-files-complete true" in content
+    assert 'if: inputs.review_strategy == \'single\'' in content
 
 
 if __name__ == "__main__":

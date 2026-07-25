@@ -70,6 +70,9 @@ check "platform_pr_diff" \
 check "platform_pr_files" \
   "$(run_seam github "" 'platform_pr_files o/r 7')" \
   "gh api repos/o/r/pulls/7/files?per_page=100"
+check "platform_pr_files_all paginates and slurps" \
+  "$(run_seam github "" 'platform_pr_files_all o/r 7')" \
+  "gh api --paginate --slurp repos/o/r/pulls/7/files?per_page=100 --jq add // []"
 check "platform_issue_get" \
   "$(run_seam github "" 'platform_issue_get o/r 9')" \
   "gh api repos/o/r/issues/9"
@@ -135,6 +138,8 @@ RESULT="$(run_seam forgejo "" '_forgejo_py(){ echo "forgejo $*"; }; platform_com
 check "forgejo compare uses backend cli" "$RESULT" "forgejo compare o/r aaa...bbb"
 RESULT="$(run_seam forgejo "" '_forgejo_py(){ echo "forgejo $*"; }; platform_pr_reviews o/r 7' "https://forgejo.example.com")"
 check "forgejo pr reviews uses backend cli" "$RESULT" "forgejo list-pr-reviews o/r 7"
+RESULT="$(run_seam forgejo "" '_forgejo_py(){ echo "forgejo $*"; }; platform_pr_files_all o/r 7' "https://forgejo.example.com")"
+check "forgejo complete PR files uses backend cli" "$RESULT" "forgejo list-pr-files o/r 7"
 RESULT="$(run_seam forgejo "" '_forgejo_py(){ echo "forgejo $*"; }; platform_review_create_json o/r 7 req.json' "https://forgejo.example.com")"
 check "forgejo create review uses backend cli" "$RESULT" "forgejo create-review-json o/r 7 req.json"
 RESULT="$(run_seam forgejo "" '_forgejo_py(){ echo "forgejo $*"; }; platform_review_native o/r 7 APPROVE body.md' "https://forgejo.example.com")"

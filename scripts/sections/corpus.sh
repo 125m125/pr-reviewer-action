@@ -199,6 +199,19 @@ case "$REVIEW_STRATEGY" in specialists|specialists_evaluate) SPECIALIST_PIPELINE
 if [[ "$SPECIALIST_PIPELINE_ENABLED" == "true" ]]; then
   section_timer_start "specialist-review"
   log "Running generic specialist review strategy: $REVIEW_STRATEGY"
+  # Sourced defaults are shell variables, while the CLI boundary intentionally
+  # reads only an explicit environment. Export the normalized runtime contract
+  # so standalone/smoke invocations behave exactly like the composite action.
+  export REVIEW_STRATEGY REVIEW_POLICY_FILE SPECIALIST_REVIEW_DEADLINE_SEC
+  export SPECIALIST_PHASE_SHARES SPECIALIST_CONCURRENCY SPECIALIST_MAX_SESSIONS
+  export SPECIALIST_MAX_FOLLOWUP_SESSIONS SPECIALIST_MAX_MODEL_TURNS_PER_SESSION
+  export SPECIALIST_MAX_TOOL_CALLS_PER_SESSION SPECIALIST_MAX_RECOVERIES_PER_SESSION
+  export SPECIALIST_CONFIG_FILE SPECIALIST_MAX_INITIAL_PASSES
+  export SPECIALIST_MAX_FOLLOWUP_PASSES SPECIALIST_MAX_TOOL_CALLS_PER_PASS
+  export SPECIALIST_TOOL_MODE SPECIALIST_PASS_TIMEOUT_SEC SPECIALIST_MAX_TOKENS
+  export SPECIALIST_RECOVERY_MAX_TOKENS
+  export SPECIALIST_MAX_CONVERSATION_TOKENS SPECIALIST_TEMPERATURE
+  export SPECIALIST_STREAM_WATCHDOG SPECIALIST_PLANNER_MAX_TOKENS
   if ! IS_FORK_PR="$IS_FORK_PR" python3 "$SCRIPT_DIR/run_specialist_reviews.py"; then
     error "Specialist review pipeline failed"
     exit 1

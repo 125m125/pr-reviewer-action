@@ -133,6 +133,18 @@ platform_pr_files() {
   fi
 }
 
+platform_pr_files_all() {
+  # $1=repo $2=pr_number -> one JSON array containing every changed file.
+  # Specialist publication needs a complete snapshot; the ordinary corpus
+  # remains on the bounded first page returned by platform_pr_files.
+  if _platform_is_forgejo; then
+    _forgejo_py list-pr-files "$1" "$2"
+  else
+    gh api --paginate --slurp "repos/$1/pulls/$2/files?per_page=100" \
+      --jq 'add // []'
+  fi
+}
+
 platform_issue_get() {
   # $1=repo $2=issue_number → issue object on stdout
   if _platform_is_forgejo; then

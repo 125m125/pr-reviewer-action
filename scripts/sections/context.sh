@@ -42,6 +42,16 @@ jq -c --argjson total "${TOTAL_CHANGED_FILES:-0}" \
   '[.[] | {filename,status,additions,deletions,changes,previous_filename}]
    + (if $total > 100 then [{note: "file list truncated to first 100 of \($total) changed files"}] else [] end)' \
   pr-files.raw.json > pr-files.json
+
+# Review threads require every changed path even though the model corpus stays
+# bounded. Bind this separately collected snapshot to a post-pagination head.
+if [[ "$REVIEW_STRATEGY" != "single" ]]; then
+  platform_pr_files_all "$REPO" "$PR_NUMBER" > pr-files-complete.raw.json
+  jq -c '[.[] | {filename,status,additions,deletions,changes,previous_filename}]' \
+    pr-files-complete.raw.json > pr-files-complete.json
+  platform_pr_get "$REPO" "$PR_NUMBER" --jq '.head.sha // .headRefOid // empty' \
+    > pr-files-head.txt
+fi
 truncate_clean pr-files.json pr-files.truncated.json "$MAX_FILES" '…[file list truncated]'
 
 jq -r '.body // ""' pr.json > pr-body.txt

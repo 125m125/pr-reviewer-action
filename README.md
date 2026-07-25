@@ -213,13 +213,22 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `review_strategy` | `single` preserves the existing path; `specialists_evaluate` runs the complete specialist pipeline without publishing; `specialists` publishes its validated result | No | `single` |
-| `specialist_config_file` | Optional PR-branch JSON file defining component hints, structured recipes, and authoritative exclusions. A changed policy file is disclosed in the review | No | `.github/ai-review-specialists.json` |
+| `review_policy_file` | Current-branch version-2 specialist policy; source and publishing restrictions are authoritative | No | `.github/ai-review-policy.json` |
+| `specialist_review_deadline_sec` | Absolute specialist run deadline including finalization and artifact production | No | `7200` |
+| `specialist_phase_shares` | JSON percentage allocation for planning, initial, follow-up, and finalization; must total 100 | No | `{"planning":10,"initial":60,"followup":20,"finalization":10}` |
+| `specialist_concurrency` | Maximum concurrent specialist sessions | No | `1` |
+| `specialist_max_sessions` | Maximum initial specialist sessions | No | `8` |
+| `specialist_max_followup_sessions` | Maximum bounded follow-up specialist sessions | No | `2` |
+| `specialist_max_model_turns_per_session` | Lifetime model-turn limit for one logical specialist session | No | `64` |
+| `specialist_max_tool_calls_per_session` | Lifetime read-only tool-call limit for one logical specialist session | No | `20` |
+| `specialist_max_recoveries_per_session` | Lifetime reconstruction limit for one logical specialist session | No | `1` |
+| `specialist_config_file` | Deprecated one-release alias for a version-1 policy; migrate to `review_policy_file` | No | `.github/ai-review-specialists.json` |
 | `specialist_planner_max_tool_calls` | Maximum read-only calls available to the bounded topology/diff planning scout | No | `2` |
 | `specialist_planner_max_tokens` | Completion-token ceiling for the bounded planning scout | No | `2048` |
-| `specialist_max_initial_passes` | Maximum sequential specialist passes in the initial wave | No | `6` |
-| `specialist_max_followup_passes` | Maximum sequential passes in the critic's single follow-up wave | No | `2` |
-| `specialist_max_tool_calls_per_pass` | Maximum read-only calls available to each specialist pass | No | `20` |
-| `specialist_tool_mode` | `native_loop` lets each specialist explore with read-only tools; `packet` uses only its bounded preassembled corpus | No | `native_loop` |
+| `specialist_max_initial_passes` | Deprecated one-release alias for `specialist_max_sessions` | No | `6` |
+| `specialist_max_followup_passes` | Deprecated one-release alias for `specialist_max_followup_sessions` | No | `2` |
+| `specialist_max_tool_calls_per_pass` | Deprecated one-release alias for `specialist_max_tool_calls_per_session` | No | `20` |
+| `specialist_tool_mode` | `native_loop` uses durable read-only specialist sessions; `packet` is deprecated | No | `native_loop` |
 | `specialist_planner_model` | Planning/scout model; empty inherits `ai_model` | No | `""` |
 | `specialist_model` | Specialist model; empty inherits `ai_model` | No | `""` |
 | `specialist_critic_model` | Critic model; empty inherits `specialist_model`, then `ai_model` | No | `""` |

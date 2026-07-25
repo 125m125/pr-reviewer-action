@@ -60,3 +60,13 @@ def test_action_run_blocks_are_valid_bash_syntax() -> None:
                 check=False,
             )
         assert result.returncode == 0, f"{name} has invalid bash syntax:\n{result.stderr}"
+
+
+def test_specialist_and_single_publish_steps_are_separate_and_guarded() -> None:
+    action = (ROOT / "action.yml").read_text(encoding="utf-8")
+    assert "- name: Publish specialist review" in action
+    assert "- name: Publish review" in action
+    assert "inputs.review_strategy == 'specialists'" in action
+    assert "inputs.review_strategy == 'single'" in action
+    assert "'.publishing.ready // false'" in action
+    assert "--diff-complete false" in action
