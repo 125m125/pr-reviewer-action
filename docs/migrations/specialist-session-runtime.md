@@ -80,6 +80,30 @@ older static `comment` default into a specialist workflow: omission means
 `review_comment` for `specialists` and `specialists_evaluate`; writing
 `publish_mode: comment` deliberately requests the sticky-comment behavior.
 
+## Version-1 to version-2 mapping
+
+Translate the existing `.github/ai-review-specialists.json` into
+`.github/ai-review-policy.json` rather than deleting it before the first v2
+evaluation. The v1 file remains a compatibility migration input, but the
+validated current-head v2 policy is authoritative for obligations, specialist
+selection, sources, and publishing.
+
+| Version-1 field | Version-2 field | Translation |
+|---|---|---|
+| `version: 1` | `version: 2` | Change the version and add v2-only sections as needed. |
+| `components` | `components` | Copy each component's `id`, `paths`, responsibilities, relationships, contracts, and invariants. IDs are normalized to slugs; paths must remain repository-relative. |
+| `recipes` | `recipes` | Copy recipe IDs, title, objective, `match`, lenses, paths, invariants, expected evidence, and priority. Add `execution`: use `coverage` for normal obligation coverage, `dedicated` for a focused separate examination, or `independent` for a separate corroborating examination. |
+| `match` | `match` | Preserve `paths_any`, `component_ids_any`, `risk_flags_any`, and `file_roles_any`. Every populated match group must match; values within a group use `any` semantics. Do not turn separate match groups into alternatives. |
+| `exclude` | `exclude` | Copy `paths`, `components`, `lenses`, and `recipes`. Exclusions remain authoritative for scheduling and are disclosed; they do not disable classifier, verdict, or publication guardrails. |
+| `generated_artifacts` | `generated_artifacts` | Copy each artifact's `id`, `source_of_truth`, `generator_config`, and `output_paths`. If an output is absent, review the source specification, generator config, handwritten consumers, and tests instead of assuming generated output is evidence. |
+
+Then add the v2-only sections deliberately: `coverage_rules` for deterministic
+risk/obligation requirements, `sources` for narrow official-documentation
+allowlists, `verdict_policy` for verdict restrictions, and `publishing` for
+policy-level narrowing. Recipes are structured review data: they do not grant
+commands, arbitrary web hosts, custom models, custom budgets, or full prompt
+replacement.
+
 ## Repository file checklist
 
 Create or review these files in the consuming repository before enabling
@@ -304,7 +328,7 @@ re-review label is applied.
 
 | Surface | Expected behavior |
 |---|---|
-| PR handoff | A sparse managed comment/native review with the recommendation, change topics, selected coverage boundary, and the outcome—not a repeated list of every finding. |
+| `review-handoff.md` and PR handoff | A sparse managed comment/native review with the recommendation, change topics, selected coverage boundary, and the outcome—not a repeated list of every finding. `review-handoff.json` is the structured handoff companion. |
 | `review-notes.json` | Detailed, resolvable notes including evidence/access requests and normalized findings; use it to investigate or anchor comments. |
 | `specialist-review-artifact.json` | Machine-readable schema-versioned run artifact bound to the PR head SHA, with policy validation/result, event/budget accounting, coverage, degradations, and publication readiness. |
 | Action outputs | `review_handoff`, `review_notes`, and `specialist_artifact` expose the respective files when specialist mode runs. |
