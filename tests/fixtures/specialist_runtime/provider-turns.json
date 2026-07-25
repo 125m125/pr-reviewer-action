@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "api_format": "openai-chat-completions",
+  "scenarios": {
+    "multilingual": {
+      "planner": [
+        {
+          "kind": "json",
+          "value": {
+            "assignments": [
+              {
+                "id": "too-broad",
+                "title": "Broad pass",
+                "objective": "Review everything",
+                "obligation_ids": [],
+                "lenses": ["general"],
+                "seed_paths": [],
+                "boundary_paths": [],
+                "expected_evidence": [],
+                "estimated_turns": 1,
+                "priority": "normal",
+                "overlap_justification": ""
+              }
+            ]
+          }
+        },
+        {
+          "kind": "assignment_from_obligations",
+          "id": "cross-stack-contract-audit",
+          "title": "Cross-stack contract audit",
+          "objective": "Trace the changed API and event contract through every producer, consumer, migration, deployment artifact, and test.",
+          "lenses": ["contract", "delivery", "migration"]
+        }
+      ],
+      "specialist": [
+        {"kind": "cover_assignment"},
+        {"kind": "checkpoint"},
+        {
+          "kind": "final",
+          "summary": "The assigned cross-stack behavior was checked against retained evidence.",
+          "recommendation": "request_changes"
+        }
+      ],
+      "critic": [{"kind": "raise", "message": "recorded critic failure"}],
+      "finalizer": [{"kind": "sparse_handoff"}]
+    },
+    "no_progress_resume": {
+      "sequence": [
+        {"kind": "tool", "path": "src/a.py"},
+        {"kind": "duplicate_tool", "path": "src/a.py"},
+        {"kind": "duplicate_tool", "path": "src/a.py"},
+        {"kind": "checkpoint"},
+        {"kind": "resume_same_session", "path": "tests/test_a.py"}
+      ]
+    },
+    "reconstruction": {
+      "sequence": [
+        {"kind": "tool", "path": "src/a.py"},
+        {"kind": "checkpoint"},
+        {"kind": "recover", "reason": "repetitive-transcript"}
+      ]
+    },
+    "planner_repair": {
+      "sequence": [
+        {"kind": "invalid_plan"},
+        {"kind": "valid_repair"},
+        {"kind": "no_second_repair"}
+      ]
+    },
+    "failed_critic": {
+      "sequence": [
+        {"kind": "raise", "message": "recorded critic failure"},
+        {"kind": "conservative_fallback"}
+      ]
+    },
+    "deadline_cutoff": {
+      "deadline_sec": 20,
+      "phase_shares": {
+        "planning": 10,
+        "initial": 60,
+        "followup": 20,
+        "finalization": 10
+      },
+      "sequence": [
+        {"kind": "advance_to_exploration_cutoff"},
+        {"kind": "retain_finalization_reserve"}
+      ]
+    },
+    "completion_inversion": {
+      "orders": [["assignment-b", "assignment-a"], ["assignment-a", "assignment-b"]]
+    },
+    "note_anchor_race": {
+      "orders": [["file-candidate", "line-candidate"], ["line-candidate", "file-candidate"]]
+    }
+  }
+}

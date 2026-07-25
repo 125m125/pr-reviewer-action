@@ -93,6 +93,12 @@
       }
     }
   ],
+  "offline_specialist_replays": [
+    {
+      "id": "multilingual-specialist-runtime",
+      "fixture": "../tests/fixtures/specialist_runtime/multilingual-pr"
+    }
+  ],
   "metadata": {
     "created_at": "2026-06-12T00:00:00Z",
     "updated_at": "2026-06-19T00:00:00Z",

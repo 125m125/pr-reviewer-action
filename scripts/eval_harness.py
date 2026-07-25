@@ -27,7 +27,19 @@ import tempfile
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+
+from pr_reviewer.specialist_runtime.replay import (
+    EXPECTED_FIELDS,
+    budget_history,
+    replay_fixture,
+    validated_strings,
+)
+from pr_reviewer.specialist_runtime.types import ReviewNote
 
 
 # ---------------------------------------------------------------------------
@@ -124,11 +136,22 @@ class BenchmarkResult:
 class BenchmarkCorpus:
     """The full benchmark corpus with known-good findings."""
     prs: list[dict[str, Any]] = field(default_factory=list)
+    offline_specialist_replays: list[dict[str, Any]] = field(default_factory=list)
+    source_path: Path | None = None
 
     @classmethod
     def from_file(cls, path: Path) -> BenchmarkCorpus:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return cls(prs=data.get("benchmark_corpus", []))
+        replays = data.get("offline_specialist_replays", [])
+        if not isinstance(replays, list) or any(
+            not isinstance(item, dict) for item in replays
+        ):
+            raise ValueError("offline_specialist_replays must be an array of objects")
+        return cls(
+            prs=data.get("benchmark_corpus", []),
+            offline_specialist_replays=replays,
+            source_path=path.resolve(),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +259,291 @@ def compute_precision_recall(
         "total_found": len(found_findings),
         "total_known": len(known_findings),
     }
+
+
+# ---------------------------------------------------------------------------
+# Offline specialist-runtime acceptance evaluation
+# ---------------------------------------------------------------------------
+
+_TERMINAL_OBLIGATION_STATUSES = {
+    "covered", "partially_covered", "unresolved", "not_applicable",
+    "suppressed_by_policy",
+}
+
+
+def _note_anchor_types(notes: Sequence[ReviewNote]) -> dict[str, int]:
+    counts = {"line": 0, "file": 0, "general": 0}
+    for note in notes:
+        if note.file and note.line is not None:
+            counts["line"] += 1
+        elif note.file:
+            counts["file"] += 1
+        else:
+            counts["general"] += 1
+    return counts
+
+
+def _budget_usage_decreased(previous: object, current: object) -> bool:
+    fields = (
+        "model_turns", "tool_calls", "recoveries",
+        "input_tokens", "output_tokens",
+    )
+    if isinstance(previous, Mapping) and isinstance(current, Mapping):
+        return any(
+            int(current.get(field, 0)) < int(previous.get(field, 0))
+            for field in fields
+        )
+    return int(current) < int(previous)
+
+
+def evaluate_specialist_replay(
+    artifact: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    *,
+    notes: Sequence[ReviewNote] = (),
+    observed: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Grade a real schema-v2 artifact against strict offline acceptance gates."""
+    missing_expected = sorted(EXPECTED_FIELDS - set(expected))
+    if missing_expected:
+        raise ValueError(
+            "specialist expectations missing fields: " + ", ".join(missing_expected)
+        )
+    observed = dict(observed or {})
+    coverage = artifact.get("coverage")
+    coverage = coverage if isinstance(coverage, Mapping) else {}
+    mandatory_ids = validated_strings(
+        expected["mandatory_obligation_ids"],
+        "expected mandatory_obligation_ids",
+    )
+    expected_ids = validated_strings(
+        expected["obligation_ids"], "expected obligation_ids",
+    )
+    missing = sorted(set(expected_ids) - set(coverage))
+    unexpected = sorted(set(coverage) - set(expected_ids))
+    missing_mandatory = sorted(set(mandatory_ids) - set(coverage))
+    invalid_statuses = sorted(
+        obligation_id for obligation_id in mandatory_ids
+        if obligation_id in coverage and (
+            not isinstance(coverage[obligation_id], Mapping)
+            or coverage[obligation_id].get("status")
+            not in _TERMINAL_OBLIGATION_STATUSES
+        )
+    )
+    recipes = artifact.get("recipes")
+    recipes = recipes if isinstance(recipes, Mapping) else {}
+    expected_recipes = expected["recipe_statuses"]
+    recipe_mismatches = sorted(
+        recipe_id for recipe_id, status in expected_recipes.items()
+        if not isinstance(recipes.get(recipe_id), Mapping)
+        or recipes[recipe_id].get("status") != status
+    )
+    unsupported = tuple(
+        str(item) for item in observed.get("unsupported_public_claims", ())
+        if str(item).strip()
+    )
+    unsafe_fetch_attempts = int(observed.get("unsafe_fetch_attempts", 0))
+    elapsed = float(observed.get("elapsed_simulated_sec", 0.0))
+    history = observed.get("budget_history")
+    if not isinstance(history, Mapping):
+        history = budget_history(artifact)
+    reset_sessions = sorted(
+        str(session_id)
+        for session_id, values in history.items()
+        if isinstance(values, Sequence)
+        and not isinstance(values, (str, bytes))
+        and any(
+            _budget_usage_decreased(previous, current)
+            for previous, current in zip(values, values[1:])
+        )
+    )
+    accepted = tuple(
+        item for item in artifact.get("accepted_candidates", ())
+        if isinstance(item, Mapping)
+    )
+    accepted_ids = {
+        str(item.get("candidate_id", "")) for item in accepted
+        if str(item.get("candidate_id", "")).strip()
+    }
+    expected_finding_ids = set(expected["finding_ids"])
+    missing_findings = sorted(expected_finding_ids - accepted_ids)
+    artifact_unknown_ids = {
+        str(item.get("obligation_id") or item.get("candidate_id") or "")
+        for key in ("unknowns", "candidate_unknowns")
+        for item in artifact.get(key, ())
+        if isinstance(item, Mapping)
+        and str(item.get("obligation_id") or item.get("candidate_id") or "").strip()
+    }
+    unexpected_unknowns = sorted(
+        artifact_unknown_ids - set(expected["acceptable_unknowns"])
+    )
+    retained_evidence_ids = {
+        str(item.get("evidence_id", ""))
+        for item in artifact.get("evidence", ())
+        if isinstance(item, Mapping)
+        and str(item.get("evidence_id", "")).strip()
+    }
+    referenced_evidence_ids = {
+        str(evidence_id)
+        for item in accepted
+        for field in ("supporting_evidence_ids", "contradicting_evidence_ids")
+        for evidence_id in item.get(field, ())
+    }
+    referenced_evidence_ids.update(
+        evidence_id for note in notes for evidence_id in note.evidence_ids
+    )
+    missing_evidence_ids = sorted(
+        referenced_evidence_ids - retained_evidence_ids
+    )
+    head_mismatch = bool(
+        expected.get("head_sha")
+        and artifact.get("head_sha") != expected["head_sha"]
+    )
+    totals = artifact.get("budgets", {}).get("totals", {})
+    if not isinstance(totals, Mapping):
+        totals = {}
+    budget_exceeded = (
+        int(totals.get("specialist_model_requests", 0))
+        > int(expected["max_model_turns"])
+        or int(totals.get("tool_calls", 0)) > int(expected["max_tool_calls"])
+        or int(totals.get("recoveries", 0)) > int(expected["max_recoveries"])
+    )
+    failure_gates: list[str] = []
+    if artifact.get("schema_version") != 2:
+        failure_gates.append("artifact_schema")
+    if missing_mandatory or invalid_statuses:
+        failure_gates.append("missing_mandatory_status")
+    if missing or unexpected:
+        failure_gates.append("obligation_accounting")
+    if recipe_mismatches:
+        failure_gates.append("recipe_status")
+    if unsupported:
+        failure_gates.append("unsupported_public_claim")
+    if unsafe_fetch_attempts:
+        failure_gates.append("unsafe_fetch")
+    if reset_sessions:
+        failure_gates.append("budget_reset")
+    if elapsed > float(expected["deadline_sec"]):
+        failure_gates.append("deadline_violation")
+    if budget_exceeded:
+        failure_gates.append("budget_exceeded")
+    if missing_findings:
+        failure_gates.append("missing_expected_finding")
+    if unexpected_unknowns:
+        failure_gates.append("unexpected_unknown")
+    if missing_evidence_ids:
+        failure_gates.append("missing_evidence")
+    if head_mismatch:
+        failure_gates.append("head_mismatch")
+    phases = artifact.get("phases")
+    phases = phases if isinstance(phases, Sequence) else ()
+    return {
+        "passed": not failure_gates,
+        "failure_gates": failure_gates,
+        "obligation_accounting": {
+            "expected": len(expected_ids),
+            "observed": len(coverage),
+            "missing": missing,
+            "unexpected": unexpected,
+            "statuses": {
+                key: value.get("status")
+                for key, value in sorted(coverage.items())
+                if isinstance(value, Mapping)
+            },
+        },
+        "recipe_status": {
+            key: value.get("status")
+            for key, value in sorted(recipes.items())
+            if isinstance(value, Mapping)
+        },
+        "unsupported_claims": list(unsupported),
+        "candidates": {
+            "accepted": len(accepted),
+            "rejected": len(artifact.get("rejected_candidates", ())),
+            "expected_ids": sorted(expected_finding_ids),
+            "missing_expected_ids": missing_findings,
+        },
+        "unknowns": {
+            "observed_ids": sorted(artifact_unknown_ids),
+            "unexpected_ids": unexpected_unknowns,
+        },
+        "evidence": {
+            "retained": len(retained_evidence_ids),
+            "referenced": len(referenced_evidence_ids),
+            "missing_ids": missing_evidence_ids,
+            "head_matches": not head_mismatch,
+        },
+        "review_note_anchor_types": _note_anchor_types(notes),
+        "sources": {
+            "denials": int(observed.get("source_denials", 0)),
+            "requests": len(artifact.get("source_access_requests", ()))
+            + int(observed.get("source_access_requests", 0)),
+            "unsafe_fetch_attempts": unsafe_fetch_attempts,
+        },
+        "runtime": {
+            "model_turns": int(totals.get("specialist_model_requests", 0)),
+            "controller_model_turns": int(
+                totals.get("controller_model_requests", 0)
+            ),
+            "tool_calls": int(totals.get("tool_calls", 0)),
+            "recoveries": int(totals.get("recoveries", 0)),
+            "budget_reset_sessions": reset_sessions,
+            "elapsed_simulated_sec": elapsed,
+            "deadline_sec": expected["deadline_sec"],
+        },
+        "phase_timing": [dict(item) for item in phases if isinstance(item, Mapping)],
+        "finalization_reserve_seconds": artifact.get("timing", {}).get(
+            "finalization_reserve_seconds", 0,
+        ),
+    }
+
+
+def run_offline_specialist_replays(
+    corpus: BenchmarkCorpus,
+) -> list[dict[str, Any]]:
+    """Execute repository-recorded specialist fixtures without external I/O."""
+    if not corpus.offline_specialist_replays:
+        return []
+    if corpus.source_path is None:
+        raise ValueError("offline specialist corpus requires a source path")
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in corpus.offline_specialist_replays:
+        if set(entry) != {"id", "fixture"}:
+            raise ValueError(
+                "offline specialist entry must contain exactly id and fixture"
+            )
+        replay_id = str(entry["id"]).strip()
+        fixture_value = str(entry["fixture"]).strip()
+        if not replay_id or not fixture_value:
+            raise ValueError("offline specialist id and fixture must be non-empty")
+        if replay_id in seen:
+            raise ValueError(f"duplicate offline specialist replay id: {replay_id}")
+        seen.add(replay_id)
+        fixture_path = (corpus.source_path.parent / fixture_value).resolve()
+        replay = replay_fixture(fixture_path)
+        metrics = evaluate_specialist_replay(
+            replay.artifact,
+            replay.expected,
+            notes=replay.notes,
+            observed=replay.observed,
+        )
+        results.append({
+            "id": replay_id,
+            "fixture": fixture_value,
+            "passed": metrics["passed"],
+            "failure_gates": metrics["failure_gates"],
+            "metrics": metrics,
+            "artifact": {
+                "schema_version": replay.artifact["schema_version"],
+                "artifact_id": replay.artifact["artifact_id"],
+                "repository": replay.artifact["repository"],
+                "head_sha": replay.artifact["head_sha"],
+                "evaluation_status": replay.artifact["evaluation_status"],
+            },
+            "adversarial_cases": replay.failures,
+        })
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -706,6 +1014,14 @@ def build_parser() -> argparse.ArgumentParser:
             "is noise at the fast tier's reliability (Tau2 ~68%%)."
         ),
     )
+    parser.add_argument(
+        "--offline-specialist-only",
+        action="store_true",
+        help=(
+            "Run only recorded specialist-runtime fixtures declared by the corpus; "
+            "no repository clone, network, or model endpoint is used"
+        ),
+    )
     return parser
 
 
@@ -719,9 +1035,22 @@ def main() -> int:
         return 1
 
     corpus = BenchmarkCorpus.from_file(args.corpus)
-    if not corpus.prs:
+    if not corpus.prs and not corpus.offline_specialist_replays:
         print("Error: corpus is empty", file=sys.stderr)
         return 1
+    if args.offline_specialist_only and not corpus.offline_specialist_replays:
+        print(
+            "Error: corpus has no offline specialist replays",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        offline_replays = run_offline_specialist_replays(corpus)
+    except (OSError, ValueError) as exc:
+        print(f"Error: offline specialist replay failed: {exc}", file=sys.stderr)
+        return 2
+    offline_passed = all(item["passed"] for item in offline_replays)
 
     # Limit PRs if requested
     prs = corpus.prs[:args.max_prs] if args.max_prs else corpus.prs
@@ -736,15 +1065,46 @@ def main() -> int:
     print(f"Loaded {len(corpus.prs)} PRs from corpus, running {len(prs)}...", file=sys.stderr)
     print(f"Modes: {args.modes}", file=sys.stderr)
     print(f"Model: {args.model or '(not set)'}", file=sys.stderr)
+    if offline_replays:
+        print(
+            f"Offline specialist replays: {len(offline_replays)} "
+            f"({'PASS' if offline_passed else 'FAIL'})",
+            file=sys.stderr,
+        )
 
     runs_per_mode = max(1, args.runs_per_mode)
 
     if args.dry_run:
+        for replay in corpus.offline_specialist_replays:
+            print(f"  Would replay offline: {replay['id']} [{replay['fixture']}]")
+        if args.offline_specialist_only:
+            return 0
         for pr in prs:
             for mode in args.modes:
                 suffix = f" x{runs_per_mode}" if runs_per_mode > 1 else ""
                 print(f"  Would run: {pr['repo_full_name']}#{pr['number']} [{mode}]{suffix}")
         return 0
+
+    if args.offline_specialist_only:
+        report = {
+            "metadata": {
+                "generated_at": datetime.datetime.now(
+                    datetime.timezone.utc,
+                ).isoformat(),
+                "harness_version": "0.2.0",
+                "corpus_source": str(args.corpus),
+                "network_used": False,
+            },
+            "offline_specialist_replays": offline_replays,
+        }
+        output_text = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(output_text, encoding="utf-8")
+            print(f"\nReport written to {args.output}", file=sys.stderr)
+        else:
+            print(output_text)
+        return 0 if offline_passed else 2
 
     # Execute reviews
     results: list[BenchmarkResult] = []
@@ -783,6 +1143,7 @@ def main() -> int:
     # Generate report
     report = generate_report(results, corpus)
     report["metadata"]["corpus_source"] = str(args.corpus)
+    report["offline_specialist_replays"] = offline_replays
 
     output_text = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
 
@@ -793,7 +1154,7 @@ def main() -> int:
     else:
         print(output_text)
 
-    return 0
+    return 0 if offline_passed else 2
 
 
 if __name__ == "__main__":

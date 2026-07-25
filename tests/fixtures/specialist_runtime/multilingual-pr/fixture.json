@@ -1,0 +1,213 @@
+{
+  "schema_version": 1,
+  "id": "multilingual-specialist-runtime",
+  "provider_scenario": "multilingual",
+  "policy_file": "review-policy-v1.json",
+  "policy_input_version": 1,
+  "repository": "example/multilingual-service",
+  "pr_number": 418,
+  "base_sha": "1111111111111111111111111111111111111111",
+  "head_sha": "2222222222222222222222222222222222222222",
+  "classification": {
+    "risk_flags": ["schema_changes"]
+  },
+  "runtime": {
+    "deadline_sec": 300,
+    "request_timeout_sec": 5,
+    "concurrency": 1,
+    "max_sessions": 2,
+    "max_followup_sessions": 1,
+    "model_turns": 12,
+    "tool_calls": 64,
+    "recoveries": 1,
+    "phase_shares": {
+      "planning": 10,
+      "initial": 60,
+      "followup": 20,
+      "finalization": 10
+    }
+  },
+  "topology": {
+    "changed_files": [
+      "src/main/java/example/api/OrderController.java",
+      "web/src/order-client.ts",
+      "workers/messaging/order_worker.py",
+      "contracts/order-event.schema.json",
+      "db/migrations/V42__order_status.sql",
+      "deploy/k8s/order-worker.yaml",
+      "tests/java/OrderControllerTest.java",
+      "web/tests/order-client.spec.ts",
+      "tests/python/test_order_worker.py"
+    ],
+    "file_roles": [
+      "implementation",
+      "messaging",
+      "schema-contract",
+      "migration",
+      "persistence",
+      "deployment",
+      "test"
+    ],
+    "available_role_paths": {
+      "test": [
+        "tests/java/OrderControllerTest.java",
+        "web/tests/order-client.spec.ts",
+        "tests/python/test_order_worker.py"
+      ]
+    },
+    "components": [
+      {
+        "id": "java-api",
+        "changed_files": [
+          "src/main/java/example/api/OrderController.java",
+          "tests/java/OrderControllerTest.java"
+        ],
+        "file_roles": ["implementation", "test"]
+      },
+      {
+        "id": "typescript-consumer",
+        "changed_files": [
+          "web/src/order-client.ts",
+          "web/tests/order-client.spec.ts"
+        ],
+        "file_roles": ["implementation", "test"]
+      },
+      {
+        "id": "python-messaging",
+        "changed_files": [
+          "workers/messaging/order_worker.py",
+          "tests/python/test_order_worker.py"
+        ],
+        "file_roles": ["implementation", "messaging", "test"]
+      },
+      {
+        "id": "order-contract",
+        "changed_files": ["contracts/order-event.schema.json"],
+        "file_roles": ["schema-contract"]
+      },
+      {
+        "id": "order-store",
+        "changed_files": ["db/migrations/V42__order_status.sql"],
+        "file_roles": ["migration", "persistence"]
+      },
+      {
+        "id": "order-deployment",
+        "changed_files": ["deploy/k8s/order-worker.yaml"],
+        "file_roles": ["deployment"]
+      }
+    ],
+    "relationships": [
+      {"source": "java-api", "target": "order-contract"},
+      {"source": "order-contract", "target": "typescript-consumer"},
+      {"source": "order-contract", "target": "python-messaging"},
+      {"source": "python-messaging", "target": "order-store"},
+      {"source": "order-store", "target": "order-deployment"}
+    ],
+    "generated_artifacts": [
+      {
+        "id": "order-worker-deployment",
+        "source_of_truth": ["deploy/k8s/order-worker.yaml"],
+        "output_paths": ["deploy/k8s/order-worker.yaml"]
+      }
+    ]
+  },
+  "representative_changes": [
+    {"path": "src/main/java/example/api/OrderController.java", "language": "Java", "role": "api"},
+    {"path": "web/src/order-client.ts", "language": "TypeScript", "role": "consumer"},
+    {"path": "workers/messaging/order_worker.py", "language": "Python", "role": "messaging"},
+    {"path": "contracts/order-event.schema.json", "language": "JSON", "role": "schema"},
+    {"path": "db/migrations/V42__order_status.sql", "language": "SQL", "role": "migration"},
+    {"path": "deploy/k8s/order-worker.yaml", "language": "YAML", "role": "deployment"},
+    {"path": "tests/java/OrderControllerTest.java", "language": "Java", "role": "test"},
+    {"path": "web/tests/order-client.spec.ts", "language": "TypeScript", "role": "test"},
+    {"path": "tests/python/test_order_worker.py", "language": "Python", "role": "test"}
+  ],
+  "finding": {
+    "id": "candidate-schema-enum",
+    "claim": "The TypeScript consumer does not handle the new CANCELLED status.",
+    "affected_location": "web/src/order-client.ts:7",
+    "causal_chain": "The schema and Java producer add CANCELLED while the TypeScript exhaustive switch retains only CREATED and SHIPPED.",
+    "severity": "major",
+    "category": "correctness",
+    "evidence_path": "web/src/order-client.ts",
+    "evidence_category": "implementation",
+    "obligation_subject": "web/src/order-client.ts",
+    "user_visible_consequence": "Cancelled orders render as an unknown state.",
+    "manual_validation": "Run the TypeScript consumer test with a CANCELLED event."
+  },
+  "expected": {
+    "deadline_sec": 300,
+    "obligation_ids": [
+      "obligation:recipe:cross-language-contract:interaction:edec5ab1904a",
+      "obligation:recipe:deployment-rollout:deployment-artifact:7bb554316399",
+      "obligation:risk-rule:schema-changes:risk-assessment:4aa7fd38013b",
+      "obligation:topology:contracts-order-event-schema-json:consumer:53c8f5e2d566",
+      "obligation:topology:contracts-order-event-schema-json:implementation:b57372513732",
+      "obligation:topology:contracts-order-event-schema-json:producer:42ca4db59e94",
+      "obligation:topology:db-migrations-v42-order-status-sql:implementation:e3d595e0465a",
+      "obligation:topology:deploy-k8s-order-worker-yaml:implementation:7e0204a9458c",
+      "obligation:topology:java-api-to-order-contract:interaction:7da5b698b788",
+      "obligation:topology:order-contract-to-python-messaging:interaction:a35939cab811",
+      "obligation:topology:order-contract-to-typescript-consumer:interaction:048d17c9fff3",
+      "obligation:topology:order-deployment:deployment-artifact:4fd33e41198c",
+      "obligation:topology:order-store-to-order-deployment:interaction:c4942a5fb641",
+      "obligation:topology:order-store:migration:80066a2fbb3a",
+      "obligation:topology:order-store:persistence:f6c6d8fba857",
+      "obligation:topology:order-worker-deployment:deployment-artifact:4128fc6ad77b",
+      "obligation:topology:python-messaging-to-order-store:interaction:3e26931b6dcb",
+      "obligation:topology:python-messaging:consumer:ec89c6c37935",
+      "obligation:topology:python-messaging:delivery:fb5b398a39da",
+      "obligation:topology:python-messaging:producer:bca10ac5d93f",
+      "obligation:topology:relevant-tests:tests:6c17d8d1bc72",
+      "obligation:topology:src-main-java-example-api-ordercontroller-java:implementation:d577a16b2edb",
+      "obligation:topology:tests-java-ordercontrollertest-java:implementation:38c9abf890dd",
+      "obligation:topology:tests-python-test-order-worker-py:implementation:da089070551e",
+      "obligation:topology:web-src-order-client-ts:implementation:90781ad84511",
+      "obligation:topology:web-tests-order-client-spec-ts:implementation:2d10e0a0cbe6",
+      "obligation:topology:workers-messaging-order-worker-py:implementation:e1e64f7eccf7"
+    ],
+    "mandatory_obligation_ids": [
+      "obligation:recipe:cross-language-contract:interaction:edec5ab1904a",
+      "obligation:recipe:deployment-rollout:deployment-artifact:7bb554316399",
+      "obligation:risk-rule:schema-changes:risk-assessment:4aa7fd38013b",
+      "obligation:topology:contracts-order-event-schema-json:consumer:53c8f5e2d566",
+      "obligation:topology:contracts-order-event-schema-json:implementation:b57372513732",
+      "obligation:topology:contracts-order-event-schema-json:producer:42ca4db59e94",
+      "obligation:topology:db-migrations-v42-order-status-sql:implementation:e3d595e0465a",
+      "obligation:topology:deploy-k8s-order-worker-yaml:implementation:7e0204a9458c",
+      "obligation:topology:java-api-to-order-contract:interaction:7da5b698b788",
+      "obligation:topology:order-contract-to-python-messaging:interaction:a35939cab811",
+      "obligation:topology:order-contract-to-typescript-consumer:interaction:048d17c9fff3",
+      "obligation:topology:order-deployment:deployment-artifact:4fd33e41198c",
+      "obligation:topology:order-store-to-order-deployment:interaction:c4942a5fb641",
+      "obligation:topology:order-store:migration:80066a2fbb3a",
+      "obligation:topology:order-store:persistence:f6c6d8fba857",
+      "obligation:topology:order-worker-deployment:deployment-artifact:4128fc6ad77b",
+      "obligation:topology:python-messaging-to-order-store:interaction:3e26931b6dcb",
+      "obligation:topology:python-messaging:consumer:ec89c6c37935",
+      "obligation:topology:python-messaging:delivery:fb5b398a39da",
+      "obligation:topology:python-messaging:producer:bca10ac5d93f",
+      "obligation:topology:relevant-tests:tests:6c17d8d1bc72",
+      "obligation:topology:src-main-java-example-api-ordercontroller-java:implementation:d577a16b2edb",
+      "obligation:topology:tests-java-ordercontrollertest-java:implementation:38c9abf890dd",
+      "obligation:topology:tests-python-test-order-worker-py:implementation:da089070551e",
+      "obligation:topology:web-src-order-client-ts:implementation:90781ad84511",
+      "obligation:topology:web-tests-order-client-spec-ts:implementation:2d10e0a0cbe6",
+      "obligation:topology:workers-messaging-order-worker-py:implementation:e1e64f7eccf7"
+    ],
+    "recipe_statuses": {
+      "cross-language-contract": "covered",
+      "deployment-rollout": "covered"
+    },
+    "finding_ids": ["candidate-schema-enum"],
+    "acceptable_unknowns": [],
+    "max_model_turns": 12,
+    "max_tool_calls": 64,
+    "max_recoveries": 1,
+    "forbidden_public_text": [
+      "candidate-schema-enum",
+      "evidence:",
+      "src/main/java"
+    ]
+  }
+}
