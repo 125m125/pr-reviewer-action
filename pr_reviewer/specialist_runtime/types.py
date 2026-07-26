@@ -130,8 +130,12 @@ class CandidateFinding:
 class ReviewHandoff:
     markdown: str = ""
     recommendation: str = ""
+    status: str = ""
     change_map: tuple[str, ...] = ()
     reviewed_focuses: tuple[str, ...] = ()
+    specialist_focuses: tuple[str, ...] = ()
+    recipe_focuses: tuple[str, ...] = ()
+    coverage_boundaries: tuple[str, ...] = ()
     thread_status: str | None = None
     finding_theme: str | None = None
     review_emphasis: tuple[str, ...] = ()

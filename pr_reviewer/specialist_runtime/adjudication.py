@@ -120,6 +120,17 @@ _TOPIC_LABELS = {
 }
 
 
+def review_orientation_label(value: object) -> str | None:
+    """Return the production sparse-handoff label for a typed topic value."""
+    try:
+        topic = value if isinstance(value, ReviewOrientationTopic) else ReviewOrientationTopic(
+            _unicode(value).strip().casefold()
+        )
+    except ValueError:
+        return None
+    return _TOPIC_LABELS[topic]
+
+
 @dataclass(frozen=True)
 class ReviewHandoffContext:
     recommendation: str = ""
@@ -824,6 +835,69 @@ def _aggregate_theme(
     return topic.value, label
 
 
+def render_review_handoff(handoff: ReviewHandoff) -> str:
+    """Render the complete sparse handoff from its structured projection."""
+    if not isinstance(handoff, ReviewHandoff):
+        raise TypeError("handoff must be a ReviewHandoff")
+    reviewed = tuple(sorted(set((
+        *handoff.specialist_focuses,
+        *handoff.recipe_focuses,
+        *handoff.coverage_boundaries,
+    ))))
+    if tuple(handoff.reviewed_focuses) != reviewed:
+        raise ValueError("reviewed_focuses must equal the structured focus projection")
+    theme_label = review_orientation_label(handoff.finding_theme)
+    if handoff.finding_theme and theme_label is None:
+        raise ValueError("finding_theme must be a review orientation topic")
+
+    lines = ["## AI Review Handoff"]
+    if handoff.recommendation:
+        lines.extend(("", f"**Recommendation:** {handoff.recommendation}"))
+    if handoff.status:
+        lines.extend(("", f"**Status:** {handoff.status}"))
+    if handoff.change_map:
+        lines.extend(("", "### Change map", "", *[
+            f"- {item}" for item in handoff.change_map
+        ]))
+    if handoff.reviewed_focuses:
+        lines.extend(("", "### AI focus and coverage", ""))
+        if handoff.specialist_focuses:
+            lines.append(
+                "- Specialist focus: " + "; ".join(handoff.specialist_focuses)
+            )
+        if handoff.recipe_focuses:
+            lines.append(
+                "- Repository recipes: " + "; ".join(handoff.recipe_focuses)
+            )
+        if handoff.coverage_boundaries:
+            lines.append(
+                "- Coverage boundaries: " + "; ".join(handoff.coverage_boundaries)
+            )
+    if handoff.thread_status:
+        lines.extend(("", f"**Thread status:** {handoff.thread_status}"))
+    if theme_label:
+        lines.extend(("", f"**Aggregate finding theme:** {theme_label}"))
+    if handoff.review_emphasis:
+        lines.extend(("", "### Human review focus", "", *[
+            f"- {item}" for item in handoff.review_emphasis
+        ]))
+    lines.extend((
+        "",
+        "These focus suggestions do not reduce responsibility to review the complete change.",
+    ))
+    if handoff.coverage_warning:
+        lines.extend((
+            "",
+            f"**Material coverage warning:** {handoff.coverage_warning}",
+        ))
+    if handoff.access_request_count:
+        access_text = f"{handoff.access_request_count} open"
+        if handoff.access_request_url:
+            access_text = f"[{access_text}]({handoff.access_request_url})"
+        lines.extend(("", f"**Source access requests:** {access_text}"))
+    return "\n".join(lines).strip() + "\n"
+
+
 def build_review_handoff(
     context: ReviewHandoffContext,
     *,
@@ -965,62 +1039,35 @@ def build_review_handoff(
             f"Material coverage warning: {candidate_warning}",
         ):
             coverage_warning = candidate_warning
-    valid_source_notes = {
-        note.fingerprint: note
-        for item in context.source_access_requests
-        if (note := _source_note(item, obligations=obligation_map)) is not None
-    }
+    valid_source_notes = build_source_access_request_notes(
+        context.source_access_requests,
+        obligations=obligation_map,
+    )
     access_count = len(valid_source_notes)
     access = _canonical_request_url(context.access_request_url or "")
     access_url = access[1] if access else None
     if access_url and not renderable(access_url):
         access_url = None
 
-    lines = ["## AI Review Handoff"]
-    if recommendation:
-        lines.extend(("", f"**Recommendation:** {recommendation}"))
-    if status:
-        lines.extend(("", f"**Status:** {status}"))
-    if change_map:
-        lines.extend(("", "### Change map", "", *[f"- {item}" for item in change_map]))
-    if reviewed_focuses:
-        lines.extend(("", "### AI focus and coverage", ""))
-        if specialist_focuses:
-            lines.append("- Specialist focus: " + "; ".join(specialist_focuses))
-        if recipes:
-            lines.append("- Repository recipes: " + "; ".join(recipes))
-        if boundaries:
-            lines.append("- Coverage boundaries: " + "; ".join(boundaries))
-    if thread_status:
-        lines.extend(("", f"**Thread status:** {thread_status}"))
-    if theme_label:
-        lines.extend(("", f"**Aggregate finding theme:** {theme_label}"))
-    if review_emphasis:
-        lines.extend(("", "### Human review focus", "", *[f"- {item}" for item in review_emphasis]))
-    lines.extend((
-        "",
-        "These focus suggestions do not reduce responsibility to review the complete change.",
-    ))
-    if coverage_warning:
-        lines.extend(("", f"**Material coverage warning:** {coverage_warning}"))
     if access_count:
         access_text = f"{access_count} open"
         if access_url:
             access_text = f"[{access_text}]({access_url})"
-        if renderable(
+        if not renderable(
             f"{access_count} open",
             access_text,
             f"Source access requests: {access_text}",
         ):
-            lines.extend(("", f"**Source access requests:** {access_text}"))
-        else:
             access_count = 0
             access_url = None
-    return ReviewHandoff(
-        markdown="\n".join(lines).strip() + "\n",
+    projection = ReviewHandoff(
         recommendation=recommendation,
+        status=status,
         change_map=change_map,
         reviewed_focuses=reviewed_focuses,
+        specialist_focuses=specialist_focuses,
+        recipe_focuses=recipes,
+        coverage_boundaries=boundaries,
         thread_status=thread_status,
         finding_theme=theme,
         review_emphasis=review_emphasis,
@@ -1028,6 +1075,7 @@ def build_review_handoff(
         access_request_count=access_count,
         access_request_url=access_url,
     )
+    return replace(projection, markdown=render_review_handoff(projection))
 
 
 def _quoted(value: object, *, limit: int = _NOTE_VALUE_LIMIT) -> str:
@@ -1234,6 +1282,20 @@ def _source_note(
         related_obligation_ids=(request.obligation_id,),
         evidence_ids=(),
     )
+
+
+def build_source_access_request_notes(
+    values: Iterable[object],
+    *,
+    obligations: Mapping[str, CoverageObligation],
+) -> tuple[ReviewNote, ...]:
+    """Project valid source requests using the production authorization rules."""
+    notes = {
+        note.fingerprint: note
+        for value in values
+        if (note := _source_note(value, obligations=obligations)) is not None
+    }
+    return tuple(notes[key] for key in sorted(notes))
 
 
 def _finding_note(finding: AcceptedFinding) -> ReviewNote:

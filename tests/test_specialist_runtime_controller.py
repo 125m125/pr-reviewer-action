@@ -1379,6 +1379,17 @@ def test_finalizer_proposal_selects_only_authorized_orientation(tmp_path):
     assert "Failure recovery" in result.handoff.markdown
     assert "Security" not in result.handoff.markdown
     assert result.handoff.recommendation in {"Approve", "Request changes"}
+    assert result.handoff.review_emphasis == ("Failure recovery",)
+    assert result.artifact["handoff"]["status"] == "AI review complete"
+    assert result.artifact["handoff"]["recipe_focuses"] == (
+        "Repository recipe: delivery",
+    )
+    event = next(
+        item for item in result.artifact["events"]
+        if item["kind"] == "finalizer_proposal_applied"
+    )
+    assert event["payload"]["coverage_boundary_topics"] == ()
+    assert event["payload"]["review_emphasis_topics"] == ("failure_recovery",)
 
 
 def test_repository_publishing_policy_prevents_caller_broadening(tmp_path):

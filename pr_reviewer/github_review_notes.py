@@ -677,8 +677,12 @@ def _publication_id(
         "handoff": {
             "markdown": _clean_markdown(handoff.markdown),
             "recommendation": str(handoff.recommendation or ""),
+            "status": str(handoff.status or ""),
             "change_map": list(handoff.change_map),
             "reviewed_focuses": list(handoff.reviewed_focuses),
+            "specialist_focuses": list(handoff.specialist_focuses),
+            "recipe_focuses": list(handoff.recipe_focuses),
+            "coverage_boundaries": list(handoff.coverage_boundaries),
             "thread_status": handoff.thread_status,
             "finding_theme": handoff.finding_theme,
             "review_emphasis": list(handoff.review_emphasis),

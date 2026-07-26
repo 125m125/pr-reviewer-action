@@ -1734,7 +1734,11 @@ class ReviewController:
             f"**Status:** {status}\n\n"
             "These focus suggestions do not reduce responsibility to review the complete change.\n"
         )
-        return ReviewHandoff(markdown=markdown, recommendation=recommendation)
+        return ReviewHandoff(
+            markdown=markdown,
+            recommendation=recommendation,
+            status=status,
+        )
 
     def _finalize_products(self, state: _RunState) -> None:
         assert state.coverage is not None
@@ -1789,8 +1793,17 @@ class ReviewController:
                 context = self._apply_finalizer_proposal(state, context, proposal)
                 state.journal.emit("finalizer_proposal_applied", {
                     "recommendation": proposal.recommendation,
+                    "change_topics": tuple(
+                        item.value for item in context.change_topics
+                    ),
                     "component_ids": context.component_ids,
+                    "specialist_topics": tuple(
+                        item.value for item in context.specialist_topics
+                    ),
                     "recipe_ids": context.recipe_ids,
+                    "coverage_boundary_topics": tuple(
+                        item.value for item in context.coverage_boundary_topics
+                    ),
                     "review_emphasis_topics": tuple(
                         item.value for item in context.review_emphasis_topics
                     ),
@@ -2309,6 +2322,18 @@ class ReviewController:
             "handoff": {
                 "markdown": "## AI Review Handoff\n\n**Recommendation:** Human review required\n",
                 "recommendation": "Human review required",
+                "status": "",
+                "change_map": [],
+                "reviewed_focuses": [],
+                "specialist_focuses": [],
+                "recipe_focuses": [],
+                "coverage_boundaries": [],
+                "thread_status": None,
+                "finding_theme": None,
+                "review_emphasis": [],
+                "coverage_warning": None,
+                "access_request_count": 0,
+                "access_request_url": None,
             },
             "notes": [],
             "verdict": {

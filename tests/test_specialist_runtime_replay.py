@@ -284,6 +284,128 @@ def test_eval_ignores_caller_supplied_unsupported_claim_flags():
     assert "unsupported_public_claim" not in metrics["failure_gates"]
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "source_request_value",
+        "source_request_count",
+        "aggregate_theme_value",
+        "aggregate_theme_count",
+        "thread_status",
+        "coverage_warning",
+        "change_map",
+        "review_emphasis",
+        "specialist_focus",
+        "recipe_focus",
+        "coverage_boundary",
+    ],
+)
+def test_eval_rejects_forged_structured_handoff_lines(mutation):
+    replay = replay_fixture(FIXTURES / "multilingual-pr")
+    artifact = deepcopy(replay.artifact)
+    handoff = artifact["handoff"]
+    novel = "NOVEL-UNSUPPORTED-PUBLIC-CLAIM"
+
+    if mutation == "source_request_value":
+        handoff["access_request_count"] = 1
+        handoff["markdown"] += f"\n**Source access requests:** {novel}\n"
+    elif mutation == "source_request_count":
+        handoff["access_request_count"] = 1
+        handoff["markdown"] += "\n**Source access requests:** 1 open\n"
+    elif mutation == "aggregate_theme_value":
+        handoff["finding_theme"] = "database"
+        handoff["markdown"] += f"\n**Aggregate finding theme:** {novel}\n"
+    elif mutation == "aggregate_theme_count":
+        handoff["finding_theme"] = "database"
+        handoff["markdown"] += (
+            "\n**Aggregate finding theme:** Database and persistence\n"
+        )
+    elif mutation == "thread_status":
+        original = f"**Thread status:** {handoff['thread_status']}"
+        handoff["thread_status"] = novel
+        handoff["markdown"] = handoff["markdown"].replace(
+            original, f"**Thread status:** {novel}",
+        )
+    elif mutation == "coverage_warning":
+        original = f"**Material coverage warning:** {handoff['coverage_warning']}"
+        handoff["coverage_warning"] = novel
+        handoff["markdown"] = handoff["markdown"].replace(
+            original, f"**Material coverage warning:** {novel}",
+        )
+    elif mutation == "change_map":
+        handoff["change_map"].append(novel)
+        handoff["markdown"] = handoff["markdown"].replace(
+            "### Change map\n\n", f"### Change map\n\n- {novel}\n",
+        )
+    elif mutation == "review_emphasis":
+        handoff["review_emphasis"].append(novel)
+        handoff["markdown"] = handoff["markdown"].replace(
+            "These focus suggestions",
+            f"### Human review focus\n\n- {novel}\n\nThese focus suggestions",
+        )
+    elif mutation == "specialist_focus":
+        handoff["reviewed_focuses"].append(novel)
+        handoff["specialist_focuses"].append(novel)
+        handoff["markdown"] = handoff["markdown"].replace(
+            "### AI focus and coverage\n\n",
+            f"### AI focus and coverage\n\n- Specialist focus: {novel}\n",
+        )
+    elif mutation == "recipe_focus":
+        recipe = f"Repository recipe: {novel.casefold()}"
+        original = "- Repository recipes: " + "; ".join(handoff["recipe_focuses"])
+        handoff["reviewed_focuses"].append(recipe)
+        handoff["recipe_focuses"].append(recipe)
+        replacement = "- Repository recipes: " + "; ".join(
+            sorted(handoff["recipe_focuses"])
+        )
+        handoff["markdown"] = handoff["markdown"].replace(original, replacement)
+    else:
+        handoff["reviewed_focuses"].append(novel)
+        handoff["coverage_boundaries"].append(novel)
+        handoff["markdown"] = handoff["markdown"].replace(
+            "### AI focus and coverage\n\n",
+            f"### AI focus and coverage\n\n- Coverage boundaries: {novel}\n",
+        )
+
+    metrics = evaluate_specialist_replay(
+        artifact,
+        replay.expected,
+        notes=replay.notes,
+        observed=replay.observed,
+        adversarial_cases=replay.failures,
+    )
+
+    assert "unsupported_public_claim" in metrics["failure_gates"]
+
+
+def test_eval_accepts_source_request_count_derived_from_authoritative_requests():
+    replay = replay_fixture(FIXTURES / "multilingual-pr")
+    artifact = deepcopy(replay.artifact)
+    obligation_id = replay.expected["mandatory_obligation_ids"][0]
+    artifact["source_access_requests"] = [{
+        "host": "docs.example.org",
+        "candidate_url": "https://docs.example.org/reference/runtime",
+        "obligation_id": obligation_id,
+        "purpose": "Confirm the documented runtime contract.",
+        "authority_reason": "Repository policy requires human authorization.",
+    }]
+    artifact["handoff"]["access_request_count"] = 1
+    artifact["handoff"]["markdown"] = (
+        artifact["handoff"]["markdown"].rstrip()
+        + "\n\n**Source access requests:** 1 open\n"
+    )
+
+    metrics = evaluate_specialist_replay(
+        artifact,
+        replay.expected,
+        notes=replay.notes,
+        observed=replay.observed,
+        adversarial_cases=replay.failures,
+    )
+
+    assert "unsupported_public_claim" not in metrics["failure_gates"]
+
+
 def test_false_adversarial_predicate_is_a_mandatory_gate():
     replay = replay_fixture(FIXTURES / "multilingual-pr")
     adversarial = deepcopy(replay.failures)

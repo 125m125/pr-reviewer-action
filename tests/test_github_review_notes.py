@@ -1911,7 +1911,20 @@ def test_specialist_publish_cli_loads_only_typed_final_artifacts(tmp_path, monke
     from scripts import publish_specialist_review as cli
 
     inputs = {
-        "handoff.json": {"markdown": "Sparse handoff", "recommendation": "approve"},
+        "handoff.json": {
+            "markdown": "Sparse handoff",
+            "recommendation": "Approve",
+            "status": "AI review complete",
+            "change_map": ["Component: worker"],
+            "reviewed_focuses": [
+                "Failure recovery",
+                "Repository recipe: delivery",
+            ],
+            "specialist_focuses": [],
+            "recipe_focuses": ["Repository recipe: delivery"],
+            "coverage_boundaries": ["Failure recovery"],
+            "review_emphasis": ["Failure recovery"],
+        },
         "notes.json": [{
             "kind": "finding",
             "fingerprint": "fp-cli",
@@ -1958,7 +1971,12 @@ def test_specialist_publish_cli_loads_only_typed_final_artifacts(tmp_path, monke
         "--state", str(tmp_path / "state.json"),
         "--action-root", str(tmp_path),
     ]) == 0
-    assert isinstance(captured["publish"]["handoff"], ReviewHandoff)
+    handoff = captured["publish"]["handoff"]
+    assert isinstance(handoff, ReviewHandoff)
+    assert handoff.status == "AI review complete"
+    assert handoff.specialist_focuses == ()
+    assert handoff.recipe_focuses == ("Repository recipe: delivery",)
+    assert handoff.coverage_boundaries == ("Failure recovery",)
     assert isinstance(captured["publish"]["notes"][0], ReviewNote)
     assert isinstance(captured["publish"]["policy_result"], RuntimeVerdictPolicyResult)
     assert captured["publish"]["changed_files"] == ("a.py",)

@@ -351,3 +351,95 @@ parser rather than duplicating those responsibilities in replay code.
 
 `git diff --check` is clean. No dependency or network access was added. The two
 pre-existing untracked July 12 documents remain untouched and unstaged.
+
+# Review round 2 fixes (2026-07-26)
+
+The remaining handoff-authorization gap is closed. Sparse handoff markdown is
+now rendered by one production projection and the evaluator independently
+reconstructs that projection from authoritative artifact state.
+
+## Root cause and correction
+
+`_unsupported_handoff_lines` previously accepted aggregate-theme and
+source-request lines by prefix. It also treated the handoff's own
+`thread_status`, `coverage_warning`, change-map, focus, and emphasis fields as
+authorization for their rendered text. An attacker could therefore mutate both
+a structured field and its markdown line and make unsupported content appear
+self-consistent.
+
+The correction separates authority from rendering:
+
+- `render_review_handoff` is now the single production renderer for the entire
+  sparse handoff.
+- `ReviewHandoff` retains the structured status and the three focus partitions
+  (specialist, recipe, and coverage-boundary) instead of only their flattened
+  union. The publishing parser and payload projection preserve these fields.
+- The controller records every filtered finalizer focus field in its event
+  journal. The evaluator derives change-map/focus/emphasis values from that
+  controller event rather than from handoff markdown.
+- Recommendation and status come from the artifact verdict/evaluation state.
+  Thread count and highest severity come from accepted findings. Aggregate
+  theme is permitted only for at least two accepted findings with the same
+  recognized production orientation category. Material-warning text comes
+  from degradation state.
+- Source-request count is reconstructed with
+  `build_source_access_request_notes`, which uses the same production
+  obligation, URL, host, and deduplication validation as handoff/note
+  construction. The handoff field cannot manufacture a count.
+- Every structured field is compared to the reconstructed projection, then the
+  complete normalized markdown is compared to the production render. There
+  are no prefix-authorized public lines.
+
+Sparse summary semantics are unchanged: detailed claims and evidence remain in
+typed findings/notes rather than the handoff.
+
+## TDD evidence
+
+RED:
+
+```text
+.\.venv\Scripts\python.exe -m pytest tests\test_specialist_runtime_replay.py -k forged_structured_handoff_lines -q
+6 failed, 26 deselected in 0.96s
+```
+
+All initial mutations passed through without a failure gate: forged
+source-request value, forged source-request count, forged aggregate-theme
+value, aggregate theme with only one finding, forged thread status, and forged
+material-warning text.
+
+The mutation matrix was then extended to cover the remaining structured lines:
+change map, human-review emphasis, specialist focus, repository recipe focus,
+and coverage-boundary focus. A positive control adds one valid source request
+for a real obligation and proves the derived count remains accepted.
+
+GREEN:
+
+```text
+.\.venv\Scripts\python.exe -m pytest tests\test_specialist_runtime_replay.py -k "forged_structured_handoff_lines or source_request_count_derived" -q
+12 passed, 26 deselected in 1.70s
+
+.\.venv\Scripts\python.exe -m pytest tests\test_specialist_runtime_replay.py tests\test_eval_harness.py -q
+86 passed in 4.77s
+
+.\.venv\Scripts\python.exe -m pytest tests\test_specialist_runtime_replay.py tests\test_native_loop_exfil_redteam.py tests\test_specialist_runtime_web.py -q
+138 passed in 5.10s
+
+.\.venv\Scripts\python.exe -X utf8 -m pytest tests -k specialist_runtime -q
+449 passed, 1184 deselected in 7.65s
+
+.\.venv\Scripts\python.exe -m pytest tests\test_github_review_notes.py -q
+115 passed in 1.03s
+
+.\.venv\Scripts\python.exe -m pytest tests\test_specialist_runtime_controller.py tests\test_specialist_runtime_cli.py -q
+71 passed in 2.17s
+```
+
+Offline corpus:
+
+```text
+.\.venv\Scripts\python.exe scripts\eval_harness.py --corpus evals\corpus-agentic.json --offline-specialist-only --output <workspace-report>
+Offline specialist replays: 2 (PASS)
+```
+
+`git diff --check` is clean. No dependencies or network access were added. The
+two pre-existing untracked July 12 documents remain untouched and unstaged.

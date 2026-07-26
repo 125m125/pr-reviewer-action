@@ -42,8 +42,12 @@ def _handoff(value: object) -> ReviewHandoff:
     return ReviewHandoff(
         markdown=str(value.get("markdown") or ""),
         recommendation=str(value.get("recommendation") or ""),
+        status=str(value.get("status") or ""),
         change_map=tuple(value.get("change_map") or ()),
         reviewed_focuses=tuple(value.get("reviewed_focuses") or ()),
+        specialist_focuses=tuple(value.get("specialist_focuses") or ()),
+        recipe_focuses=tuple(value.get("recipe_focuses") or ()),
+        coverage_boundaries=tuple(value.get("coverage_boundaries") or ()),
         thread_status=value.get("thread_status"),
         finding_theme=value.get("finding_theme"),
         review_emphasis=tuple(value.get("review_emphasis") or ()),
