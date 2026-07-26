@@ -8,6 +8,7 @@ metrics and CLI exit policy remain in ``scripts.eval_harness``.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -16,20 +17,23 @@ import threading
 import time
 from typing import Any, Mapping, Sequence
 
-from pr_reviewer.conversation import Conversation
+from pr_reviewer.conversation import Conversation, TOOL_SCHEMAS
 
 from .adjudication import AdjudicatedReview, build_review_notes
 from .budget import BudgetLedger, SessionLease
-from .controller import FinalizerProposal, ReviewController, ReviewInputs
+from .controller import GatewayRoleAdapter, ReviewController, ReviewInputs
 from .coverage import CoverageLedger, derive_obligations
-from .evidence import EvidenceStore, canonical_evidence_key
-from .model_gateway import ModelTurnResult
+from .evidence import EvidenceStore
+from .model_gateway import (
+    ModelTurnRequest,
+    ModelTurnResult,
+    OpenAIModelGateway,
+)
 from .policy import RuntimeConfig, SourceRule, load_review_policy
 from .replay_adversarial import run_failure_injections
 from .session import SpecialistSession
 from .types import (
     BudgetLimits,
-    CandidateFinding,
     CoverageObligation,
     PhaseShares,
     ReviewNote,
@@ -50,7 +54,7 @@ _FIXTURE_FIELDS = {
     "schema_version", "id", "provider_scenario", "policy_file",
     "policy_input_version", "repository", "pr_number", "base_sha", "head_sha",
     "classification", "runtime", "topology", "representative_changes",
-    "finding", "expected",
+    "expected",
 }
 EXPECTED_FIELDS = {
     "deadline_sec", "obligation_ids", "mandatory_obligation_ids",
@@ -208,9 +212,29 @@ def _load_fixture(
     scenario = turns["scenarios"].get(fixture["provider_scenario"])
     if not isinstance(scenario, dict):
         raise ValueError("fixture provider_scenario is not recorded")
-    for role in ("planner", "specialist", "critic", "finalizer"):
-        if not isinstance(scenario.get(role), list) or not scenario[role]:
-            raise ValueError(f"recorded scenario missing {role} turns")
+    order = scenario.get("request_order")
+    responses = scenario.get("responses")
+    if (
+        not isinstance(order, list)
+        or not order
+        or any(not isinstance(item, str) or not item for item in order)
+        or len(set(order)) != len(order)
+        or not isinstance(responses, dict)
+        or set(responses) != set(order)
+    ):
+        raise ValueError(
+            "recorded scenario must contain an exact request_order/responses pair"
+        )
+    for turn_id, turn in responses.items():
+        if (
+            not isinstance(turn, dict)
+            or set(turn) != {"expect", "response"}
+            or not isinstance(turn["expect"], dict)
+            or not isinstance(turn["response"], dict)
+        ):
+            raise ValueError(
+                f"recorded provider turn has an invalid shape: {turn_id}"
+            )
     missing_failures = sorted(_FAILURE_SCENARIOS - set(turns["scenarios"]))
     if missing_failures:
         raise ValueError(
@@ -253,201 +277,93 @@ def _runtime(raw: Mapping[str, Any]) -> RuntimeConfig:
     )
 
 
-def _tool_spec(
-    obligation: CoverageObligation,
-) -> tuple[str, dict[str, str]]:
-    path = next(iter(obligation.seed_hints or obligation.scope), "")
-    category = next(iter(obligation.required_evidence_categories), "")
-    if not path or not category:
-        raise ValueError(
-            f"replay obligation lacks deterministic evidence: {obligation.id}"
-        )
-    return "read_file", {
-        "path": path,
-        "evidence_category": category,
-        "obligation_id": obligation.id,
-    }
+class _RecordedProvider:
+    """Validate recorded request order and parse real OpenAI response bodies."""
 
-
-def _turn(
-    *,
-    text: str = "",
-    tool_calls: Sequence[Mapping[str, Any]] = (),
-    finish_reason: str = "stop",
-) -> ModelTurnResult:
-    return ModelTurnResult(
-        response={},
-        tool_calls=tuple(dict(item) for item in tool_calls),
-        text=text,
-        text_source="content" if text else "none",
-        finish_reason=finish_reason,
-        usage={"prompt_tokens": 3, "completion_tokens": 2},
-        request_diagnostics={},
-    )
-
-
-def _checkpoint_text(inspected: list[str]) -> str:
-    return json.dumps({
-        "inspected": inspected,
-        "unresolved": [],
-        "hypotheses": [],
-        "candidate_finding_ids": [],
-        "invariants_evaluated": [],
-        "unknowns": [],
-        "proposed_next_actions": [],
-    }, sort_keys=True)
-
-
-class _SpecialistGateway:
     def __init__(
         self,
-        assignment: object,
-        obligations: Sequence[CoverageObligation],
-        turns: Sequence[Mapping[str, Any]],
+        scenario: Mapping[str, Any],
         clock: _ReplayClock,
     ) -> None:
-        assigned = set(getattr(assignment, "obligation_ids", ()))
-        self.obligations = tuple(item for item in obligations if item.id in assigned)
-        self.turns = tuple(turns)
+        self.order = tuple(str(item) for item in scenario["request_order"])
+        self.responses = dict(scenario["responses"])
         self.clock = clock
         self.index = 0
-
-    def complete(self, request: object) -> ModelTurnResult:
-        del request
-        if self.index >= len(self.turns):
-            raise AssertionError("recorded specialist provider turns were exhausted")
-        turn = self.turns[self.index]
-        self.index += 1
-        self.clock.advance()
-        kind = turn.get("kind")
-        if kind == "cover_assignment":
-            calls = []
-            for index, obligation in enumerate(self.obligations, start=1):
-                name, arguments = _tool_spec(obligation)
-                calls.append({
-                    "id": f"call-{index}",
-                    "name": name,
-                    "arguments": json.dumps(arguments, sort_keys=True),
-                })
-            return _turn(tool_calls=calls, finish_reason="tool_calls")
-        if kind == "checkpoint":
-            inspected = sorted({
-                _tool_spec(item)[1]["path"] for item in self.obligations
-            })
-            return _turn(text=_checkpoint_text(inspected))
-        if kind == "final":
-            return _turn(text=json.dumps({
-                "summary": str(turn.get("summary") or "Replay complete."),
-                "recommendation": str(turn.get("recommendation") or "approve"),
-                "candidate_finding_ids": [],
-                "evidence_ids": [],
-                "unknowns": [],
-            }, sort_keys=True))
-        raise AssertionError(f"unsupported recorded specialist turn: {kind}")
-
-
-class _Planner:
-    def __init__(
-        self, turns: Sequence[Mapping[str, Any]], clock: _ReplayClock,
-    ) -> None:
-        self.turns = tuple(turns)
-        self.clock = clock
-        self.calls: list[str] = []
-
-    def plan(self, request: object) -> Mapping[str, Any]:
-        del request
-        self.calls.append("plan")
-        self.clock.advance()
-        turn = self.turns[0]
-        if turn.get("kind") != "json" or not isinstance(turn.get("value"), dict):
-            raise ValueError("first recorded planner turn must be a JSON value")
-        return turn["value"]
-
-    def repair(self, request: object) -> Mapping[str, Any]:
-        self.calls.append("repair")
-        self.clock.advance()
-        if len(self.turns) != 2:
-            raise ValueError("recorded planner must contain exactly one repair turn")
-        turn = self.turns[1]
-        if turn.get("kind") != "assignment_from_obligations":
-            raise ValueError("planner repair turn must create a bounded assignment")
-        obligations = tuple(
-            item for item in getattr(request, "context")["obligations"]
-            if item.mandatory and item.required_evidence_categories
+        self.request_log: list[str] = []
+        self._active: Mapping[str, Any] | None = None
+        self.gateway = OpenAIModelGateway(
+            base_url="https://recorded.invalid/v1",
+            api_key="recorded-offline",
+            default_model="recorded-specialist",
+            api_format="openai",
+            response_format="json_schema",
+            stream_watchdog=False,
+            transport=self._transport,
         )
-        ranks = {"critical": 0, "high": 1, "normal": 2, "low": 3}
-        priority = min(
-            (item.risk_tier for item in obligations),
-            key=lambda value: ranks.get(value, 2),
-            default="normal",
-        )
-        paths = sorted({
-            path for item in obligations for path in (*item.scope, *item.seed_hints)
-        })
-        return {"assignments": [{
-            "id": turn["id"],
-            "title": turn["title"],
-            "objective": turn["objective"],
-            "obligation_ids": [item.id for item in obligations],
-            "lenses": list(turn["lenses"]),
-            "seed_paths": paths,
-            "boundary_paths": [],
-            "expected_evidence": sorted({
-                category
-                for item in obligations
-                for category in item.required_evidence_categories
-            }),
-            "estimated_turns": 3,
-            "priority": priority,
-            "overlap_justification": "",
-        }]}
 
-
-class _Critic:
-    def __init__(
-        self, turns: Sequence[Mapping[str, Any]], clock: _ReplayClock,
-    ) -> None:
-        self.turn = turns[0]
-        self.clock = clock
-
-    def adjudicate(self, request: object) -> Mapping[str, Any]:
-        self.clock.advance()
-        if self.turn.get("kind") == "raise":
-            raise RuntimeError(
-                str(self.turn.get("message") or "recorded critic failure")
+    def complete(self, request: ModelTurnRequest) -> ModelTurnResult:
+        if self.index >= len(self.order):
+            raise AssertionError("recorded provider requests were exhausted")
+        turn_id = self.order[self.index]
+        turn = self.responses[turn_id]
+        expected = turn["expect"]
+        if set(expected) != {
+            "role", "tools_enabled", "response_schema_name",
+        }:
+            raise AssertionError(
+                f"recorded request expectation has wrong schema: {turn_id}"
             )
-        return {"decisions": [
-            {"candidate_id": item.candidate_id, "action": "keep"}
-            for item in getattr(request, "context")["candidates"]
-        ]}
-
-
-class _Finalizer:
-    def __init__(
-        self,
-        turns: Sequence[Mapping[str, Any]],
-        clock: _ReplayClock,
-        fixture: Mapping[str, Any],
-    ) -> None:
-        self.turn = turns[0]
-        self.clock = clock
-        self.fixture = fixture
-
-    def finalize(self, request: object) -> FinalizerProposal:
-        del request
+        actual = {
+            "role": request.role,
+            "tools_enabled": request.tools_enabled,
+            "response_schema_name": request.response_schema_name,
+        }
+        if actual != expected:
+            raise AssertionError(
+                f"recorded request mismatch for {turn_id}: "
+                f"expected {expected!r}, got {actual!r}"
+            )
+        self.index += 1
+        self.request_log.append(turn_id)
+        self._active = turn
         self.clock.advance()
-        if self.turn.get("kind") != "sparse_handoff":
-            raise ValueError("recorded finalizer turn must be sparse_handoff")
-        return FinalizerProposal(
-            component_ids=tuple(
-                str(item["id"])
-                for item in self.fixture["topology"]["components"]
-                if isinstance(item, dict) and item.get("id")
-            ),
-            recipe_ids=tuple(sorted(
-                self.fixture["expected"]["recipe_statuses"],
-            )),
-        )
+        try:
+            return self.gateway.complete(request)
+        finally:
+            self._active = None
+
+    def _transport(
+        self,
+        base_url: str,
+        api_format: str,
+        payload: dict[str, Any],
+        api_key: str,
+        timeout: float,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del api_key, timeout, kwargs
+        if self._active is None:
+            raise AssertionError("recorded transport called without an active turn")
+        expected = self._active["expect"]
+        if base_url != "https://recorded.invalid/v1" or api_format != "openai":
+            raise AssertionError("recorded transport boundary changed")
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise AssertionError("recorded request must contain OpenAI messages")
+        has_tools = bool(payload.get("tools"))
+        if has_tools != bool(expected["tools_enabled"]):
+            raise AssertionError("recorded request tools shape changed")
+        has_response_format = "response_format" in payload
+        if has_response_format == bool(expected["tools_enabled"]):
+            raise AssertionError("recorded structured-output request shape changed")
+        return deepcopy(self._active["response"])
+
+    def assert_complete(self) -> None:
+        if self.index != len(self.order):
+            remaining = self.order[self.index:]
+            raise AssertionError(
+                f"recorded request turns were not consumed: {remaining!r}"
+            )
 
 
 def _executor(
@@ -481,46 +397,6 @@ def _executor(
         return result
 
     return execute
-
-
-def _candidate(
-    fixture: Mapping[str, Any],
-    root: Path,
-    obligations: Sequence[CoverageObligation],
-) -> CandidateFinding:
-    raw = fixture["finding"]
-    obligation = next((
-        item for item in obligations
-        if item.subject == raw["obligation_subject"]
-        and raw["evidence_category"] in item.required_evidence_categories
-    ), None)
-    if obligation is None:
-        raise ValueError("fixture finding does not resolve to an obligation")
-    _, arguments = _tool_spec(obligation)
-    result = {
-        "tool": "read_file",
-        "status": "ok",
-        "result": {
-            "content": (root / arguments["path"]).read_text(encoding="utf-8"),
-        },
-    }
-    evidence_id = canonical_evidence_key("read_file", arguments, result)
-    return CandidateFinding(
-        candidate_id=raw["id"],
-        root_cause_fingerprint="root:" + raw["id"],
-        claim=raw["claim"],
-        affected_location=raw["affected_location"],
-        causal_chain=raw["causal_chain"],
-        severity=raw["severity"],
-        category=raw["category"],
-        supporting_evidence_ids=(evidence_id,),
-        related_obligation_ids=(obligation.id,),
-        collector_session_id="fixture-input",
-        model_identity="recorded-specialist",
-        confidence_rationale="The retained producer/consumer evidence is direct.",
-        user_visible_consequence=raw["user_visible_consequence"],
-        manual_validation=raw["manual_validation"],
-    )
 
 
 def budget_history(
@@ -565,9 +441,12 @@ def replay_fixture(fixture_dir: Path | str) -> SpecialistReplayResult:
         )
     scenario = turns["scenarios"][fixture["provider_scenario"]]
     clock = _ReplayClock()
-    planner = _Planner(scenario["planner"], clock)
+    provider = _RecordedProvider(scenario, clock)
+    role_adapter = GatewayRoleAdapter(provider)
     runtime = _runtime(fixture["runtime"])
-    candidate = _candidate(fixture, root, obligations)
+    read_file_schema = next(
+        item for item in TOOL_SCHEMAS if item.get("name") == "read_file"
+    )
 
     def session_factory(
         assignment: object,
@@ -582,10 +461,11 @@ def replay_fixture(fixture_dir: Path | str) -> SpecialistReplayResult:
         return SpecialistSession(
             session_id=session_id,
             assignment=assignment,
-            conversation=Conversation(system="Recorded specialist replay."),
-            gateway=_SpecialistGateway(
-                assignment, session_obligations, scenario["specialist"], clock,
+            conversation=Conversation(
+                system="Recorded specialist replay.",
+                tool_schemas=[read_file_schema],
             ),
+            gateway=provider,
             execute_tool=_executor(root, evidence, session_id, clock),
             evidence_store=evidence,
             coverage=coverage,
@@ -598,10 +478,10 @@ def replay_fixture(fixture_dir: Path | str) -> SpecialistReplayResult:
 
     with tempfile.TemporaryDirectory(prefix="specialist-replay-") as temp_dir:
         controller = ReviewController(
-            planner=planner,
+            planner=role_adapter,
             session_factory=session_factory,
-            critic=_Critic(scenario["critic"], clock),
-            finalizer=_Finalizer(scenario["finalizer"], clock, fixture),
+            critic=role_adapter,
+            finalizer=role_adapter,
             clock=clock,
             artifact_output_root=Path(temp_dir),
         )
@@ -619,10 +499,10 @@ def replay_fixture(fixture_dir: Path | str) -> SpecialistReplayResult:
             allow_approve=True,
             publishing_mode="review_comment",
             model_verdict="approve",
-            candidate_findings=(candidate,),
             pr_metadata={"title": "Recorded multilingual PR replay"},
             adapter_configuration={"provider": "recorded-offline"},
         ))
+    provider.assert_complete()
     artifact = json.loads(json.dumps(result.artifact, ensure_ascii=False))
     handoff = str(artifact.get("handoff", {}).get("markdown", ""))
     unsupported = tuple(
@@ -631,10 +511,6 @@ def replay_fixture(fixture_dir: Path | str) -> SpecialistReplayResult:
     )
     expected = {**expected_file, "head_sha": fixture["head_sha"]}
     observed = {
-        "unsupported_public_claims": unsupported,
-        "unsafe_fetch_attempts": 0,
-        "source_denials": 0,
-        "source_access_requests": 0,
         "elapsed_simulated_sec": round(clock.elapsed, 6),
         "budget_history": budget_history(artifact),
     }
@@ -645,7 +521,12 @@ def replay_fixture(fixture_dir: Path | str) -> SpecialistReplayResult:
         notes=result.notes,
         observed=observed,
         failures=run_failure_injections(
-            artifact, planner.calls, turns["scenarios"],
+            artifact,
+            tuple(
+                "repair" if item == "planner-repair" else item
+                for item in provider.request_log
+            ),
+            turns["scenarios"],
         ),
         unsupported_published_claims=unsupported,
         elapsed_simulated_sec=clock.elapsed,
@@ -658,13 +539,19 @@ def replay_web_policy_fixture(fixture_dir: Path | str) -> dict[str, Any]:
     fixture = _json_file(root / "fixture.json", "web replay fixture")
     required = {
         "schema_version", "id", "approved_source", "unapproved_source",
-        "redirect_escape", "source_rule", "source_access",
+        "redirect_escape", "source_rule", "source_access", "expected",
     }
     missing = sorted(required - set(fixture))
     if missing:
         raise ValueError("web fixture missing required fields: " + ", ".join(missing))
     if fixture["schema_version"] != 1:
         raise ValueError("web replay fixture schema_version must be 1")
+    expected = fixture["expected"]
+    if not isinstance(expected, dict) or set(expected) != {
+        "approved_fetches", "source_denials", "source_access_requests",
+        "unsafe_fetch_attempts", "forbidden_public_text",
+    }:
+        raise ValueError("web replay expected values have an invalid schema")
     rule = fixture["source_rule"]
     policy = SourcePolicy((
         SourceRule(
@@ -749,6 +636,7 @@ def replay_web_policy_fixture(fixture_dir: Path | str) -> dict[str, Any]:
         source_access_requests=(request,),
     )[0]
     return {
+        "expected": deepcopy(expected),
         "approved_fetches": [fetched.provenance.final_url],
         "approved_evidence": fetched.as_dict(),
         "unapproved": discovery.as_dict()["unapproved"],

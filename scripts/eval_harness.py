@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import html
 import json
 import os
 import re
@@ -37,6 +38,7 @@ from pr_reviewer.specialist_runtime.replay import (
     EXPECTED_FIELDS,
     budget_history,
     replay_fixture,
+    replay_web_policy_fixture,
     validated_strings,
 )
 from pr_reviewer.specialist_runtime.types import ReviewNote
@@ -296,12 +298,293 @@ def _budget_usage_decreased(previous: object, current: object) -> bool:
     return int(current) < int(previous)
 
 
+def _retained_evidence(
+    artifact: Mapping[str, Any],
+) -> dict[str, Mapping[str, Any]]:
+    return {
+        str(item["evidence_id"]): item
+        for item in artifact.get("evidence", ())
+        if isinstance(item, Mapping)
+        and isinstance(item.get("evidence_id"), str)
+        and item["evidence_id"]
+    }
+
+
+def _citation_is_authorized(
+    citation: object,
+    records: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    if not isinstance(citation, Mapping):
+        return False
+    evidence_id = str(citation.get("evidence_id") or "")
+    record = records.get(evidence_id)
+    if record is None or str(record.get("status") or "").lower() != "ok":
+        return False
+    provenance = record.get("provenance")
+    provenance = provenance if isinstance(provenance, Mapping) else {}
+    allowed_sources = {
+        str(value)
+        for value in (
+            provenance.get("final_url"),
+            provenance.get("original_url"),
+            record.get("source_identity"),
+            record.get("source_path"),
+        )
+        if value
+    }
+    if record.get("source_path"):
+        allowed_sources.add("path:" + str(record["source_path"]))
+    return (
+        citation.get("category") == record.get("category")
+        and citation.get("tool") == record.get("tool")
+        and citation.get("content_hash") == record.get("content_hash")
+        and str(citation.get("source") or "") in allowed_sources
+    )
+
+
+def _accepted_claim_is_authorized(
+    finding: Mapping[str, Any],
+    artifact: Mapping[str, Any],
+    records: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    supporting_ids = tuple(
+        str(item) for item in finding.get("supporting_evidence_ids", ())
+        if str(item)
+    )
+    citations = tuple(finding.get("supporting_citations", ()))
+    citation_ids = tuple(
+        str(item.get("evidence_id") or "")
+        for item in citations if isinstance(item, Mapping)
+    )
+    obligation_ids = tuple(
+        str(item) for item in finding.get("related_obligation_ids", ())
+        if str(item)
+    )
+    required_text = (
+        "candidate_id", "claim", "affected_file", "causal_chain",
+        "user_visible_consequence", "manual_validation",
+    )
+    return bool(
+        all(str(finding.get(key) or "").strip() for key in required_text)
+        and supporting_ids
+        and set(supporting_ids) == set(citation_ids)
+        and all(_citation_is_authorized(item, records) for item in citations)
+        and obligation_ids
+        and all(item in artifact.get("coverage", {}) for item in obligation_ids)
+        and str(finding.get("collector_session_id") or "").strip()
+    )
+
+
+def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
+    handoff = artifact.get("handoff")
+    if not isinstance(handoff, Mapping):
+        return ["handoff is not an object"]
+    markdown = str(handoff.get("markdown") or "")
+    verdict_labels = {
+        "approve": "Approve",
+        "request_changes": "Request changes",
+        "notice": "Human review required",
+    }
+    status_labels = {
+        "complete": "AI review complete",
+        "degraded": "AI review completed with material coverage limits",
+    }
+    verdict = artifact.get("verdict")
+    verdict_value = (
+        str(verdict.get("value") or "")
+        if isinstance(verdict, Mapping)
+        else str(verdict or "")
+    )
+    fixed = {
+        "## AI Review Handoff",
+        "### Change map",
+        "### AI focus and coverage",
+        "### Human review focus",
+        "These focus suggestions do not reduce responsibility to review the complete change.",
+        f"**Recommendation:** {verdict_labels.get(verdict_value, '')}",
+        f"**Status:** {status_labels.get(str(artifact.get('evaluation_status')), '')}",
+    }
+    change_map = {str(item) for item in handoff.get("change_map", ())}
+    focuses = {str(item) for item in handoff.get("reviewed_focuses", ())}
+    emphasis = {str(item) for item in handoff.get("review_emphasis", ())}
+    thread = str(handoff.get("thread_status") or "")
+    warning = str(handoff.get("coverage_warning") or "")
+    theme = str(handoff.get("finding_theme") or "")
+    access_count = int(handoff.get("access_request_count") or 0)
+    unsupported: list[str] = []
+    for raw_line in markdown.splitlines():
+        line = raw_line.strip()
+        if not line or line in fixed:
+            continue
+        if line.startswith("- ") and line[2:] in change_map.union(emphasis):
+            continue
+        if any(
+            line == prefix + "; ".join(sorted(values))
+            for prefix, values in (
+                ("- Specialist focus: ", {
+                    item for item in focuses
+                    if not item.startswith("Repository recipe:")
+                }),
+                ("- Repository recipes: ", {
+                    item for item in focuses
+                    if item.startswith("Repository recipe:")
+                }),
+                ("- Coverage boundaries: ", {
+                    item for item in focuses
+                    if not item.startswith("Repository recipe:")
+                }),
+            )
+            if values
+        ):
+            continue
+        if thread and line == f"**Thread status:** {thread}":
+            continue
+        if warning and line == f"**Material coverage warning:** {warning}":
+            continue
+        if theme and line.startswith("**Aggregate finding theme:** "):
+            continue
+        if access_count and line.startswith("**Source access requests:** "):
+            continue
+        unsupported.append(line)
+    return unsupported
+
+
+def _quoted_note(value: object, *, limit: int = 1000) -> str:
+    single_line = " ".join(str(value or "").split())[:limit]
+    return "<code>" + html.escape(single_line, quote=True) + "</code>"
+
+
+def _expected_finding_note(finding: Mapping[str, Any]) -> str:
+    def citation_lines(values: object) -> list[str]:
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            return []
+        return [
+            "- ID " + _quoted_note(item.get("evidence_id"), limit=160)
+            + "; category " + _quoted_note(item.get("category"), limit=100)
+            + "; tool " + _quoted_note(item.get("tool"), limit=100)
+            + "; source " + _quoted_note(item.get("source"))
+            + "; content hash " + _quoted_note(item.get("content_hash"), limit=80)
+            for item in values if isinstance(item, Mapping)
+        ]
+
+    consequences = tuple(finding.get("user_visible_consequences", ())) or (
+        finding.get("user_visible_consequence", ""),
+    )
+    validations = tuple(finding.get("manual_validations", ())) or (
+        finding.get("manual_validation", ""),
+    )
+    supporting = citation_lines(finding.get("supporting_citations", ()))
+    contradicting = citation_lines(finding.get("contradicting_citations", ()))
+    markdown = (
+        f"### {str(finding.get('severity') or 'info').title()} finding\n\n"
+        "**Claim:** " + _quoted_note(finding.get("claim"))
+        + "\n\n**User-visible consequence:**\n"
+        + "\n".join("- " + _quoted_note(item) for item in consequences)
+        + "\n\n**Causal chain:** " + _quoted_note(finding.get("causal_chain"))
+        + "\n\n**Supporting evidence provenance / citations:**\n"
+        + "\n".join(supporting)
+    )
+    if contradicting:
+        markdown += (
+            "\n\n**Contradicting evidence provenance / citations:**\n"
+            + "\n".join(contradicting)
+        )
+    return (
+        markdown
+        + "\n\n**Suggested validation:**\n"
+        + "\n".join("- " + _quoted_note(item) for item in validations)
+    )
+
+
+def _unsupported_public_claims(
+    artifact: Mapping[str, Any],
+    notes: Sequence[ReviewNote],
+) -> tuple[str, ...]:
+    records = _retained_evidence(artifact)
+    accepted = tuple(
+        item for item in artifact.get("accepted_candidates", ())
+        if isinstance(item, Mapping)
+    )
+    unsupported = _unsupported_handoff_lines(artifact)
+    accepted_by_fingerprint = {
+        str(item.get("root_cause_fingerprint") or ""): item
+        for item in accepted
+    }
+    projected_notes = {
+        (
+            str(item.get("kind") or ""),
+            str(item.get("fingerprint") or ""),
+        ): item
+        for item in artifact.get("notes", ())
+        if isinstance(item, Mapping)
+    }
+    for finding in accepted:
+        if not _accepted_claim_is_authorized(finding, artifact, records):
+            unsupported.append(str(finding.get("claim") or finding))
+    for note in notes:
+        projection = projected_notes.get((note.kind.value, note.fingerprint))
+        expected_projection = {
+            "kind": note.kind.value,
+            "fingerprint": note.fingerprint,
+            "related_obligation_ids": list(note.related_obligation_ids),
+            "evidence_ids": list(note.evidence_ids),
+        }
+        if projection != expected_projection:
+            unsupported.append(note.markdown)
+            continue
+        finding = accepted_by_fingerprint.get(note.fingerprint)
+        if note.kind.value == "finding" and (
+            finding is None or note.markdown != _expected_finding_note(finding)
+        ):
+            unsupported.append(note.markdown)
+    return tuple(dict.fromkeys(item for item in unsupported if item))
+
+
+_ADVERSARIAL_PREDICATES = {
+    "no_progress_resume.same_session": True,
+    "no_progress_resume.budget_reset": False,
+    "reconstruction.reason": "repetitive-transcript",
+    "reconstruction.recoveries": 1,
+    "reconstruction.checkpoint_retained": True,
+    "planner_repair.repair_requests": 1,
+    "planner_repair.source": "model_repaired_validated",
+    "failed_critic.terminal": True,
+    "failed_critic.fallback": "conservative",
+    "deadline_cutoff.deadline_violation": False,
+    "deadline_cutoff.finalization_reserved": True,
+    "deadline_cutoff.cutoff_enforced": True,
+    "deadline_cutoff.terminal": True,
+    "completion_inversion.coverage_stable": True,
+    "completion_inversion.evidence_stable": True,
+    "completion_inversion.orders_enforced": True,
+    "completion_inversion.terminal": True,
+    "completion_inversion.controller_runs": 2,
+    "note_anchor_race.stable": True,
+}
+
+
+def _failed_adversarial_predicates(
+    cases: Mapping[str, Mapping[str, Any]] | None,
+) -> list[str]:
+    if not isinstance(cases, Mapping):
+        return ["adversarial_cases.missing"]
+    failed = []
+    for path, expected in _ADVERSARIAL_PREDICATES.items():
+        scenario, predicate = path.split(".", 1)
+        value = cases.get(scenario)
+        actual = value.get(predicate) if isinstance(value, Mapping) else None
+        if actual != expected:
+            failed.append(path)
+    return failed
+
+
 def evaluate_specialist_replay(
     artifact: Mapping[str, Any],
     expected: Mapping[str, Any],
     *,
     notes: Sequence[ReviewNote] = (),
     observed: Mapping[str, Any] | None = None,
+    adversarial_cases: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Grade a real schema-v2 artifact against strict offline acceptance gates."""
     missing_expected = sorted(EXPECTED_FIELDS - set(expected))
@@ -338,10 +621,8 @@ def evaluate_specialist_replay(
         if not isinstance(recipes.get(recipe_id), Mapping)
         or recipes[recipe_id].get("status") != status
     )
-    unsupported = tuple(
-        str(item) for item in observed.get("unsupported_public_claims", ())
-        if str(item).strip()
-    )
+    unsupported = _unsupported_public_claims(artifact, notes)
+    failed_adversarial = _failed_adversarial_predicates(adversarial_cases)
     unsafe_fetch_attempts = int(observed.get("unsafe_fetch_attempts", 0))
     elapsed = float(observed.get("elapsed_simulated_sec", 0.0))
     history = observed.get("budget_history")
@@ -435,6 +716,8 @@ def evaluate_specialist_replay(
         failure_gates.append("missing_evidence")
     if head_mismatch:
         failure_gates.append("head_mismatch")
+    if failed_adversarial:
+        failure_gates.append("adversarial_failure")
     phases = artifact.get("phases")
     phases = phases if isinstance(phases, Sequence) else ()
     return {
@@ -457,6 +740,9 @@ def evaluate_specialist_replay(
             if isinstance(value, Mapping)
         },
         "unsupported_claims": list(unsupported),
+        "adversarial": {
+            "failed": failed_adversarial,
+        },
         "candidates": {
             "accepted": len(accepted),
             "rejected": len(artifact.get("rejected_candidates", ())),
@@ -498,6 +784,57 @@ def evaluate_specialist_replay(
     }
 
 
+def evaluate_web_policy_replay(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Grade measured source-policy behavior; fixture expectations are comparisons."""
+    expected = result.get("expected")
+    if not isinstance(expected, Mapping):
+        raise ValueError("web replay result lacks expected comparisons")
+    approved = list(result.get("approved_fetches", ()))
+    denials = int(result.get("source_denials", 0))
+    requests = int(result.get("source_access_requests", 0))
+    unsafe = int(result.get("unsafe_fetch_attempts", 0))
+    public_result = {
+        key: value for key, value in result.items() if key != "expected"
+    }
+    public_text = json.dumps(public_result, sort_keys=True)
+    leaked = [
+        str(marker)
+        for marker in expected.get("forbidden_public_text", ())
+        if str(marker) and str(marker) in public_text
+    ]
+    mismatches = []
+    if approved != list(expected.get("approved_fetches", ())):
+        mismatches.append("approved_fetches")
+    if denials != int(expected.get("source_denials", -1)):
+        mismatches.append("source_denials")
+    if requests != int(expected.get("source_access_requests", -1)):
+        mismatches.append("source_access_requests")
+    if unsafe != int(expected.get("unsafe_fetch_attempts", -1)):
+        mismatches.append("unsafe_fetch_attempts")
+    note = result.get("request_note")
+    if not isinstance(note, Mapping) or note.get("kind") != "source_access_request":
+        mismatches.append("source_access_request_note")
+    gates = []
+    if unsafe:
+        gates.append("unsafe_fetch")
+    if leaked:
+        gates.append("unsupported_public_claim")
+    if mismatches:
+        gates.append("web_source_policy")
+    return {
+        "passed": not gates,
+        "failure_gates": gates,
+        "sources": {
+            "approved_fetches": len(approved),
+            "denials": denials,
+            "requests": requests,
+            "unsafe_fetch_attempts": unsafe,
+        },
+        "mismatches": mismatches,
+        "unsupported_claims": leaked,
+    }
+
+
 def run_offline_specialist_replays(
     corpus: BenchmarkCorpus,
 ) -> list[dict[str, Any]]:
@@ -509,27 +846,42 @@ def run_offline_specialist_replays(
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
     for entry in corpus.offline_specialist_replays:
-        if set(entry) != {"id", "fixture"}:
+        if set(entry) != {"id", "kind", "fixture"}:
             raise ValueError(
-                "offline specialist entry must contain exactly id and fixture"
+                "offline specialist entry must contain exactly id, kind, and fixture"
             )
         replay_id = str(entry["id"]).strip()
+        replay_kind = str(entry["kind"]).strip()
         fixture_value = str(entry["fixture"]).strip()
-        if not replay_id or not fixture_value:
-            raise ValueError("offline specialist id and fixture must be non-empty")
+        if not replay_id or replay_kind not in {"runtime", "web_policy"} or not fixture_value:
+            raise ValueError("offline specialist id, kind, and fixture are invalid")
         if replay_id in seen:
             raise ValueError(f"duplicate offline specialist replay id: {replay_id}")
         seen.add(replay_id)
         fixture_path = (corpus.source_path.parent / fixture_value).resolve()
+        if replay_kind == "web_policy":
+            web = replay_web_policy_fixture(fixture_path)
+            metrics = evaluate_web_policy_replay(web)
+            results.append({
+                "id": replay_id,
+                "kind": replay_kind,
+                "fixture": fixture_value,
+                "passed": metrics["passed"],
+                "failure_gates": metrics["failure_gates"],
+                "metrics": metrics,
+            })
+            continue
         replay = replay_fixture(fixture_path)
         metrics = evaluate_specialist_replay(
             replay.artifact,
             replay.expected,
             notes=replay.notes,
             observed=replay.observed,
+            adversarial_cases=replay.failures,
         )
         results.append({
             "id": replay_id,
+            "kind": replay_kind,
             "fixture": fixture_value,
             "passed": metrics["passed"],
             "failure_gates": metrics["failure_gates"],

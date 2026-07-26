@@ -122,19 +122,6 @@
     {"path": "web/tests/order-client.spec.ts", "language": "TypeScript", "role": "test"},
     {"path": "tests/python/test_order_worker.py", "language": "Python", "role": "test"}
   ],
-  "finding": {
-    "id": "candidate-schema-enum",
-    "claim": "The TypeScript consumer does not handle the new CANCELLED status.",
-    "affected_location": "web/src/order-client.ts:7",
-    "causal_chain": "The schema and Java producer add CANCELLED while the TypeScript exhaustive switch retains only CREATED and SHIPPED.",
-    "severity": "major",
-    "category": "correctness",
-    "evidence_path": "web/src/order-client.ts",
-    "evidence_category": "implementation",
-    "obligation_subject": "web/src/order-client.ts",
-    "user_visible_consequence": "Cancelled orders render as an unknown state.",
-    "manual_validation": "Run the TypeScript consumer test with a CANCELLED event."
-  },
   "expected": {
     "deadline_sec": 300,
     "obligation_ids": [

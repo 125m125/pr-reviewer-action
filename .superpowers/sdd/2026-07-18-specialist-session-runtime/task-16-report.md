@@ -170,3 +170,184 @@ were not read, modified, staged, or removed:
 - `docs/superpowers/specs/2026-07-12-large-review-reliability-design.md`
 
 No dependencies or network access were added.
+
+# Review round 1 fixes (2026-07-26)
+
+All six review findings were resolved. The replay now treats fixture
+expectations only as private comparisons and obtains observations through the
+same public controller, session, gateway, parser, evidence, and publishing
+boundaries used by the runtime.
+
+## Finding disposition
+
+### Candidate provenance and adjudication
+
+- Removed the fixture-created `CandidateFinding` and the
+  `ReviewInputs.candidate_findings` injection path from the replay.
+- Extended the public `SpecialistSession` checkpoint schema to carry complete
+  candidate objects. The session admits a candidate only when its ID was
+  declared by the same checkpoint, its supporting evidence is retained, all
+  cited evidence belongs to the assigned obligation set, and the candidate has
+  non-empty related obligations and review detail.
+- Collector identity is stamped by the live session and model identity is
+  derived from retained evidence. The controller remains the sole adjudicator.
+- A corrupt recorded checkpoint/final turn that omits the candidate now
+  produces no accepted candidates and trips `missing_expected_finding`.
+- A direct session test proves that a forged candidate with unretained evidence
+  is discarded while the evidence-backed candidate is collected.
+
+### Public-claim authorization
+
+- The evaluator no longer trusts `observed.unsupported_public_claims`.
+- It derives unsupported claims independently from all three public surfaces:
+  controller handoff markdown, review notes, and accepted findings.
+- Accepted findings are checked against retained evidence IDs, citation
+  category/tool/hash/source provenance, assigned obligations, and collector
+  identity. Handoff and note text must match the deterministic controller
+  projections of those structured records.
+- Separate mutations inject a novel claim into each public surface and each
+  mutation activates the mandatory `unsupported_public_claim` gate. A caller
+  supplied flag is deliberately ignored.
+
+### Real completion inversion and deadline cutoff
+
+- Both completion-order cases execute a full public `ReviewController` with two
+  public `SpecialistSession` instances. A `threading.Event` controls the
+  checkpoint release order; there are no timing sleeps or wall-clock races.
+- The two controller artifacts are compared for coverage and retained-evidence
+  equality, both requested completion orders must be observed, both runs must
+  be terminal, and all recorded gateway turns must be consumed.
+- The deadline case executes another full controller/session run using a
+  thread-safe fake monotonic clock. The first provider turn advances exactly to
+  the initial cutoff. The run finishes at 14/20 simulated seconds, preserves a
+  two-second finalization reserve, consumes both recorded turns, and reaches a
+  terminal state without crossing the deadline.
+
+### Mandatory adversarial gates and CLI behavior
+
+- Every adversarial predicate is now enumerated and mandatory: same-session
+  resume, no budget reset, checkpoint reconstruction, planner repair source,
+  conservative critic fallback, deadline cutoff/reserve/terminal state,
+  completion coverage/evidence/order/terminal state, and stable note anchors.
+- A false or missing predicate adds `adversarial_failure`; the offline CLI
+  returns exit code 2.
+- An in-process CLI mutation test flips a measured completion predicate and
+  proves the non-zero exit and report gate.
+
+### Web policy registration
+
+- Registered `web-source-policy` as a second typed offline corpus entry.
+- Its replay measures one allowlisted fetch, two denials, one source-access
+  request, and zero unsafe transport attempts through the public discovery and
+  fetch-policy functions.
+- The evaluator compares those measurements to private expectations, rejects
+  unsafe attempts and leaked discovery/redirect text, and exposes the measured
+  web metrics in the offline report.
+- A CLI mutation changes the measured unsafe-attempt count to one and proves
+  exit code 2 with the `unsafe_fetch` gate.
+
+### Recorded provider boundary
+
+- Replaced provider behavior macros with explicit OpenAI-compatible
+  `choices[].message` response bodies, including tool calls, structured JSON
+  turns, and the critic error body.
+- `_RecordedProvider` and the adversarial `_RecordedGateway` use the production
+  `OpenAIModelGateway` parser boundary. They validate request role, tool
+  enablement, response-schema name, OpenAI message/tool/structured-output
+  payload shape, exact request order, and complete turn consumption.
+- Planner assignments, specialist tool calls, checkpoints, candidates, critic
+  failure, and finalizer output are all explicit recorded data. Corrupt request
+  expectations and corrupt turn bodies now fail replay.
+- Removed the multilingual fixture's detailed expected finding body; private
+  expectations retain only finding IDs and acceptance counts.
+
+## Expected-versus-observed audit
+
+- Expectations: obligation IDs, recipe IDs, mandatory IDs, expected finding
+  IDs, acceptable unknown IDs, deadline, head SHA, and web comparison counts.
+- Observations: controller artifact, session-collected candidates, retained
+  evidence, public notes/handoff, gateway request log, controller timing and
+  budget state, adversarial controller outputs, and measured web transport
+  requests.
+- Removed synthetic runtime observations for unsupported claims and zero-valued
+  web metrics. Runtime source metrics default to empty because that fixture has
+  no web activity; the registered web fixture supplies the measured values.
+
+## TDD evidence for the fix round
+
+RED:
+
+```text
+python -m pytest tests/test_specialist_runtime_replay.py -q
+11 failed, 12 passed
+```
+
+The failures reproduced the missing real completion/deadline observations,
+provider macros, candidate-input injection, caller-controlled unsupported
+claims, non-mandatory adversarial predicates, and absent web corpus entry.
+
+```text
+python -m pytest tests/test_specialist_runtime_session.py::test_checkpoint_collects_only_evidence_backed_candidate_objects -q
+1 failed
+```
+
+The forged candidate remained visible in the checkpoint and the session
+collected no candidate objects before the public session hook was added.
+
+GREEN:
+
+```text
+.\.venv\Scripts\python.exe -m pytest tests/test_specialist_runtime_replay.py -q
+26 passed in 3.09s
+
+.\.venv\Scripts\python.exe -m pytest tests/test_specialist_runtime_replay.py tests/test_native_loop_exfil_redteam.py tests/test_specialist_runtime_web.py -q
+126 passed in 3.46s
+
+.\.venv\Scripts\python.exe -m pytest tests/test_eval_harness.py tests/test_specialist_runtime_controller.py tests/test_specialist_runtime_session.py tests/test_specialist_runtime_state.py -q
+153 passed in 2.04s
+
+.\.venv\Scripts\python.exe -X utf8 -m pytest tests -k specialist_runtime -q
+437 passed, 1184 deselected in 5.90s
+```
+
+Offline CLI:
+
+```text
+.\.venv\Scripts\python.exe scripts\eval_harness.py --corpus evals\corpus-agentic.json --offline-specialist-only --output <workspace-report>
+Offline specialist replays: 2 (PASS)
+```
+
+Measured report highlights: runtime 27/27 obligations covered, one accepted
+evidence-backed finding, no unsupported claims, no failed adversarial
+predicates; web 1 approved fetch, 2 denials, 1 source-access request, 0 unsafe
+attempts, and no leaked text.
+
+Fresh full Windows baseline:
+
+```text
+.\.venv\Scripts\python.exe -X utf8 -m pytest tests -q
+21 failed, 1600 passed, 2 warnings in 18.37s
+```
+
+The same platform-only baseline remains: one POSIX mode assertion, twelve
+Bash/Windows evidence-provider execution failures, and eight fake-`gh`
+finding-thread failures. No specialist-runtime test failed.
+
+## Module responsibility audit
+
+- `replay.py` (658 lines): fixture validation, recorded main provider adapter,
+  runtime replay orchestration, and measured web-policy replay.
+- `replay_adversarial.py` (656 lines): explicit recorded failure providers plus
+  real public session/controller adversarial executions.
+- `session.py` (852 lines): public specialist lifecycle, now including
+  evidence-backed checkpoint candidate collection.
+- `eval_harness.py` (1513 lines): offline corpus dispatch and independent
+  acceptance/security/adversarial/web evaluation.
+
+The split keeps provider transport/parsing in the existing gateway and model
+parser rather than duplicating those responsibilities in replay code.
+
+## Final hygiene
+
+`git diff --check` is clean. No dependency or network access was added. The two
+pre-existing untracked July 12 documents remain untouched and unstaged.

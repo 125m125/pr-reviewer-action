@@ -25,5 +25,15 @@
     "obligation_id": "obligation:web-reference",
     "purpose": "Confirm the vendor behavior not available from an approved source.",
     "authority_reason": "Repository policy must be expanded by a maintainer."
+  },
+  "expected": {
+    "approved_fetches": ["https://docs.example.org/reference/runtime"],
+    "source_denials": 2,
+    "source_access_requests": 1,
+    "unsafe_fetch_attempts": 0,
+    "forbidden_public_text": [
+      "UNAPPROVED-SNIPPET-MUST-STAY-HIDDEN",
+      "REDIRECT-ESCAPE-BODY-MUST-STAY-HIDDEN"
+    ]
   }
 }

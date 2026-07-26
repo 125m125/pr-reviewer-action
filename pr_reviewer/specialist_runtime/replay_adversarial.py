@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
+from pathlib import Path
+import tempfile
+import threading
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-from pr_reviewer.conversation import Conversation
+from pr_reviewer.conversation import Conversation, TOOL_SCHEMAS
 
 from .adjudication import adjudicate_candidates, build_review_notes
-from .budget import BudgetLedger, RunDeadline, SessionLease
+from .budget import BudgetLedger, SessionLease
+from .controller import GatewayRoleAdapter, ReviewController, ReviewInputs
 from .coverage import CoverageLedger
 from .evidence import EvidenceStore
-from .model_gateway import ModelTurnResult
+from .model_gateway import ModelTurnRequest, ModelTurnResult, OpenAIModelGateway
+from .policy import ReviewPolicy, RuntimeConfig
 from .session import SpecialistSession
 from .types import (
     BudgetLimits,
@@ -25,86 +31,146 @@ from .types import (
 )
 
 
-def _turn(
-    *,
-    text: str = "",
-    tool_calls: Sequence[Mapping[str, Any]] = (),
-    finish_reason: str = "stop",
-) -> ModelTurnResult:
-    return ModelTurnResult(
-        response={},
-        tool_calls=tuple(dict(item) for item in tool_calls),
-        text=text,
-        text_source="content" if text else "none",
-        finish_reason=finish_reason,
-        usage={"prompt_tokens": 3, "completion_tokens": 2},
-        request_diagnostics={},
-    )
+_READ_FILE_SCHEMA = next(
+    item for item in TOOL_SCHEMAS if item.get("name") == "read_file"
+)
 
 
-def _checkpoint_text(inspected: list[str], unresolved: list[str]) -> str:
-    return json.dumps({
-        "inspected": inspected,
-        "unresolved": unresolved,
-        "hypotheses": [],
-        "candidate_finding_ids": [],
-        "invariants_evaluated": [],
-        "unknowns": unresolved,
-        "proposed_next_actions": [],
-    }, sort_keys=True)
+class _ReplayClock:
+    def __init__(self) -> None:
+        self.started_at = time.monotonic()
+        self._now = self.started_at
+        self._lock = threading.Lock()
+
+    def __call__(self) -> float:
+        with self._lock:
+            return self._now
+
+    def advance_to(self, value: float) -> None:
+        with self._lock:
+            self._now = max(self._now, float(value))
+
+    @property
+    def elapsed(self) -> float:
+        return self() - self.started_at
 
 
-def _tool_turn(call_id: str, path: str) -> ModelTurnResult:
-    return _turn(
-        tool_calls=({
-            "id": call_id,
-            "name": "read_file",
-            "arguments": json.dumps({"path": path}, sort_keys=True),
-        },),
-        finish_reason="tool_calls",
-    )
+class _RecordedGateway:
+    """Parse explicit OpenAI bodies while validating the public request contract."""
+
+    def __init__(
+        self,
+        turns: Sequence[Mapping[str, Any]],
+        *,
+        before: Callable[[int, ModelTurnRequest], None] | None = None,
+        after: Callable[[int, ModelTurnResult], None] | None = None,
+    ) -> None:
+        self.turns = tuple(turns)
+        self.before = before
+        self.after = after
+        self.index = 0
+        self._active: Mapping[str, Any] | None = None
+        self.gateway = OpenAIModelGateway(
+            base_url="https://recorded.invalid/v1",
+            api_key="recorded-offline",
+            default_model="recorded-adversarial",
+            api_format="openai",
+            response_format="json_schema",
+            stream_watchdog=False,
+            transport=self._transport,
+        )
+
+    def complete(self, request: ModelTurnRequest) -> ModelTurnResult:
+        if self.index >= len(self.turns):
+            raise AssertionError("adversarial recorded responses were exhausted")
+        turn_index = self.index
+        turn = self.turns[turn_index]
+        expected = turn.get("expect")
+        if not isinstance(expected, Mapping) or set(expected) != {
+            "role", "tools_enabled", "response_schema_name",
+        }:
+            raise AssertionError("adversarial request expectation has wrong schema")
+        actual = {
+            "role": request.role,
+            "tools_enabled": request.tools_enabled,
+            "response_schema_name": request.response_schema_name,
+        }
+        if dict(expected) != actual:
+            raise AssertionError(
+                f"adversarial recorded request mismatch: "
+                f"expected {dict(expected)!r}, got {actual!r}"
+            )
+        if self.before is not None:
+            self.before(turn_index, request)
+        self.index += 1
+        self._active = turn
+        try:
+            result = self.gateway.complete(request)
+        finally:
+            self._active = None
+        if self.after is not None:
+            self.after(turn_index, result)
+        return result
+
+    def _transport(
+        self,
+        base_url: str,
+        api_format: str,
+        payload: dict[str, Any],
+        api_key: str,
+        timeout: float,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del api_key, timeout, kwargs
+        if (
+            self._active is None
+            or base_url != "https://recorded.invalid/v1"
+            or api_format != "openai"
+        ):
+            raise AssertionError("adversarial transport boundary changed")
+        expected = self._active["expect"]
+        if not isinstance(payload.get("messages"), list) or not payload["messages"]:
+            raise AssertionError("adversarial OpenAI request lacks messages")
+        if bool(payload.get("tools")) != bool(expected["tools_enabled"]):
+            raise AssertionError("adversarial OpenAI tools shape changed")
+        if ("response_format" in payload) == bool(expected["tools_enabled"]):
+            raise AssertionError("adversarial structured-output shape changed")
+        response = self._active.get("response")
+        if not isinstance(response, Mapping):
+            raise AssertionError("adversarial response is not an OpenAI object")
+        return deepcopy(dict(response))
+
+    def assert_complete(self) -> None:
+        if self.index != len(self.turns):
+            raise AssertionError(
+                f"adversarial responses not consumed: "
+                f"{len(self.turns) - self.index}"
+            )
 
 
 def _session(
-    responses: Sequence[ModelTurnResult],
+    turns: Sequence[Mapping[str, Any]],
     obligations: Sequence[CoverageObligation],
     assignment: SpecialistAssignment,
 ) -> SpecialistSession:
     evidence = EvidenceStore()
-
-    class Gateway:
-        def __init__(self) -> None:
-            self.responses = list(responses)
-
-        def complete(self, request: object) -> ModelTurnResult:
-            del request
-            if not self.responses:
-                raise AssertionError("failure-injection provider turns exhausted")
-            return self.responses.pop(0)
+    gateway = _RecordedGateway(turns)
 
     def execute(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        result = {
+        return {
             "tool": name,
             "status": "ok",
             "result": {"content": f"contents:{arguments.get('path', '')}"},
         }
-        evidence.add_tool_result(
-            session_id="failure-session",
-            tool=name,
-            arguments=arguments,
-            result=result,
-            category=(
-                "tests" if "test" in str(arguments.get("path", ""))
-                else "implementation"
-            ),
-        )
-        return result
 
-    return SpecialistSession(
+    session = SpecialistSession(
         session_id="failure-session",
         assignment=assignment,
-        conversation=Conversation(system="Recorded failure replay."),
-        gateway=Gateway(),
+        conversation=Conversation(
+            system="Recorded failure replay.",
+            tool_schemas=[_READ_FILE_SCHEMA],
+        ),
+        gateway=gateway,
         execute_tool=execute,
         evidence_store=evidence,
         coverage=CoverageLedger(obligations),
@@ -114,40 +180,292 @@ def _session(
         max_tokens=512,
         max_no_progress_streak=2,
     )
+    session._recorded_gateway = gateway  # type: ignore[attr-defined]
+    return session
 
 
-def _completion_projection(
-    orders: object,
-) -> tuple[tuple[tuple[str, str], ...], ...]:
-    expected = [
-        ["assignment-b", "assignment-a"],
-        ["assignment-a", "assignment-b"],
-    ]
-    if orders != expected:
-        raise ValueError("completion_inversion orders are invalid")
-    stores: dict[str, EvidenceStore] = {}
-    for session_id, path, content in (
-        ("assignment-a", "src/a.py", "a"),
-        ("assignment-b", "src/b.py", "b"),
-    ):
-        store = EvidenceStore()
-        store.add_tool_result(
-            session_id=session_id,
-            tool="read_file",
-            arguments={"path": path},
-            result={"status": "ok", "content": content},
-            category="implementation",
+class _CompletionOrder:
+    """Release the second assignment only after the first checkpoint completes."""
+
+    def __init__(self, order: Sequence[str]) -> None:
+        if len(order) != 2 or len(set(order)) != 2:
+            raise ValueError("completion order must contain two unique assignments")
+        self.order = tuple(order)
+        self.first_checkpoint = threading.Event()
+        self.actual: list[str] = []
+        self._lock = threading.Lock()
+
+    def before(
+        self, assignment_id: str, index: int, request: ModelTurnRequest,
+    ) -> None:
+        del request
+        if index == 0 and assignment_id != self.order[0]:
+            if not self.first_checkpoint.wait(timeout=5):
+                raise AssertionError("first recorded completion never checkpointed")
+
+    def after(
+        self, assignment_id: str, index: int, result: ModelTurnResult,
+    ) -> None:
+        del result
+        if index != 1:
+            return
+        with self._lock:
+            self.actual.append(assignment_id)
+        if assignment_id == self.order[0]:
+            self.first_checkpoint.set()
+
+
+def _controller_topology() -> dict[str, Any]:
+    return {
+        "changed_files": ["src/a.py", "src/b.py"],
+        "file_roles": ["implementation"],
+        "components": [
+            {
+                "id": "a",
+                "changed_files": ["src/a.py"],
+                "file_roles": ["implementation"],
+            },
+            {
+                "id": "b",
+                "changed_files": ["src/b.py"],
+                "file_roles": ["implementation"],
+            },
+        ],
+        "relationships": [],
+        "available_role_paths": {},
+    }
+
+
+def _completion_controller_run(
+    raw: Mapping[str, Any],
+    order: Sequence[str],
+) -> dict[str, Any]:
+    coordinator = _CompletionOrder(order)
+    planner_gateway = _RecordedGateway((raw["planner_response"],))
+    session_gateways: dict[str, _RecordedGateway] = {}
+
+    def session_factory(
+        assignment: object,
+        lease: SessionLease,
+        snapshot: object,
+        evidence: EvidenceStore,
+        coverage: CoverageLedger,
+        obligations: Sequence[CoverageObligation],
+        session_id: str,
+    ) -> SpecialistSession:
+        del snapshot, obligations
+        assignment_id = str(getattr(assignment, "id"))
+        gateway = _RecordedGateway(
+            raw["session_responses"][assignment_id],
+            before=lambda index, request: coordinator.before(
+                assignment_id, index, request,
+            ),
+            after=lambda index, result: coordinator.after(
+                assignment_id, index, result,
+            ),
         )
-        stores[session_id] = store
-    projections = []
-    for order in expected:
-        merged = EvidenceStore()
-        for assignment_id in order:
-            merged.merge_completed_snapshot(stores[assignment_id].snapshot())
-        projections.append(tuple(
-            (item.id, item.content_hash) for item in merged.snapshot().records
+        session_gateways[assignment_id] = gateway
+
+        def execute(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            result = {
+                "tool": name,
+                "status": "ok",
+                "result": {
+                    "content": f"{assignment_id}:{arguments.get('path', '')}",
+                },
+            }
+            evidence.add_tool_result(
+                session_id=session_id,
+                tool=name,
+                arguments=arguments,
+                result=result,
+                category=str(
+                    arguments.get("evidence_category") or "tool-result"
+                ),
+                model_identity="recorded-adversarial",
+            )
+            return result
+
+        return SpecialistSession(
+            session_id=session_id,
+            assignment=assignment,
+            conversation=Conversation(
+                system="Recorded completion-order replay.",
+                tool_schemas=[_READ_FILE_SCHEMA],
+            ),
+            gateway=gateway,
+            execute_tool=execute,
+            evidence_store=evidence,
+            coverage=coverage,
+            budget=BudgetLedger(BudgetLimits(8, 8, 1)),
+            lease=lease,
+            request_timeout_sec=5,
+            max_tokens=512,
+        )
+
+    config = RuntimeConfig(
+        review_deadline_sec=60,
+        model_request_timeout_sec=5,
+        phase_shares=PhaseShares(),
+        concurrency=2,
+        max_sessions=2,
+        max_followup_sessions=1,
+        session_limits=BudgetLimits(8, 8, 1),
+    )
+    topology = _controller_topology()
+    with tempfile.TemporaryDirectory(prefix="completion-inversion-") as temp_dir:
+        controller = ReviewController(
+            planner=GatewayRoleAdapter(planner_gateway),
+            session_factory=session_factory,
+            artifact_output_root=Path(temp_dir),
+        )
+        result = controller.run(ReviewInputs(
+            repository="example/completion-inversion",
+            pr_number=1,
+            base_sha="1" * 40,
+            head_sha="2" * 40,
+            topology=topology,
+            classification={},
+            policy=ReviewPolicy.minimal(),
+            config=config,
+            changed_files=tuple(topology["changed_files"]),
+            artifact_path="artifact.json",
+            publishing_mode="comment",
+            pr_metadata={"title": "Completion inversion"},
         ))
-    return tuple(projections)
+    planner_gateway.assert_complete()
+    gateway_consumption = {
+        assignment_id: (gateway.index, len(gateway.turns))
+        for assignment_id, gateway in session_gateways.items()
+    }
+    for gateway in session_gateways.values():
+        gateway.assert_complete()
+    return {
+        "target_order": list(order),
+        "actual_order": list(coordinator.actual),
+        "coverage": {
+            key: {
+                "status": value["status"],
+                "evidence_ids": list(value["evidence_ids"]),
+            }
+            for key, value in sorted(result.artifact["coverage"].items())
+        },
+        "evidence": [
+            {
+                key: item.get(key)
+                for key in (
+                    "evidence_id", "content_hash", "source_path",
+                    "category", "status",
+                )
+            }
+            for item in result.artifact["evidence"]
+        ],
+        "terminal": result.artifact["evaluation_status"] in {
+            "complete", "degraded",
+        },
+        "gateway_consumption": gateway_consumption,
+    }
+
+
+def _deadline_controller_run(raw: Mapping[str, Any]) -> dict[str, Any]:
+    clock = _ReplayClock()
+    shares = PhaseShares(**raw["phase_shares"])
+    deadline_sec = int(raw["deadline_sec"])
+    initial_cutoff = (
+        clock.started_at
+        + deadline_sec * (shares.planning + shares.initial) / 100
+    )
+    gateway = _RecordedGateway(
+        raw["responses"],
+        before=lambda index, request: (
+            clock.advance_to(initial_cutoff) if index == 0 else None
+        ),
+    )
+    topology = {
+        "changed_files": ["src/a.py"],
+        "file_roles": ["implementation"],
+        "components": [{
+            "id": "a",
+            "changed_files": ["src/a.py"],
+            "file_roles": ["implementation"],
+        }],
+        "relationships": [],
+        "available_role_paths": {},
+    }
+
+    def session_factory(
+        assignment: object,
+        lease: SessionLease,
+        snapshot: object,
+        evidence: EvidenceStore,
+        coverage: CoverageLedger,
+        obligations: Sequence[CoverageObligation],
+        session_id: str,
+    ) -> SpecialistSession:
+        del snapshot, obligations
+        return SpecialistSession(
+            session_id=session_id,
+            assignment=assignment,
+            conversation=Conversation(
+                system="Recorded deadline replay.",
+                tool_schemas=[_READ_FILE_SCHEMA],
+            ),
+            gateway=gateway,
+            execute_tool=lambda name, arguments: {
+                "tool": name, "status": "ok", "result": {"content": ""},
+            },
+            evidence_store=evidence,
+            coverage=coverage,
+            budget=BudgetLedger(BudgetLimits(4, 2, 1)),
+            lease=lease,
+            request_timeout_sec=5,
+            max_tokens=512,
+        )
+
+    config = RuntimeConfig(
+        review_deadline_sec=deadline_sec,
+        model_request_timeout_sec=5,
+        phase_shares=shares,
+        concurrency=1,
+        max_sessions=1,
+        max_followup_sessions=1,
+        session_limits=BudgetLimits(4, 2, 1),
+    )
+    with tempfile.TemporaryDirectory(prefix="deadline-cutoff-") as temp_dir:
+        controller = ReviewController(
+            session_factory=session_factory,
+            clock=clock,
+            artifact_output_root=Path(temp_dir),
+        )
+        result = controller.run(ReviewInputs(
+            repository="example/deadline-cutoff",
+            pr_number=2,
+            base_sha="1" * 40,
+            head_sha="2" * 40,
+            topology=topology,
+            classification={},
+            policy=ReviewPolicy.minimal(),
+            config=config,
+            changed_files=("src/a.py",),
+            artifact_path="artifact.json",
+            publishing_mode="comment",
+            pr_metadata={"title": "Deadline cutoff"},
+        ))
+    timing = result.artifact["timing"]
+    expected_reserve = deadline_sec * shares.finalization / 100
+    return {
+        "deadline_violation": clock.elapsed > deadline_sec,
+        "finalization_reserved": (
+            timing["finalization_reserve_seconds"] == expected_reserve
+        ),
+        "cutoff_enforced": clock.elapsed == initial_cutoff - clock.started_at,
+        "terminal": result.artifact["evaluation_status"] in {
+            "complete", "degraded",
+        },
+        "elapsed_simulated_sec": clock.elapsed,
+        "deadline_sec": deadline_sec,
+        "provider_turns_consumed": gateway.index,
+    }
 
 
 def _anchor_notes(
@@ -222,13 +540,13 @@ def run_failure_injections(
     planner_calls: Sequence[str],
     scenarios: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Mapping[str, Any]]:
-    """Run recorded failure sequences against public runtime components."""
-    no_progress_turns = scenarios["no_progress_resume"].get("sequence")
-    reconstruction_turns = scenarios["reconstruction"].get("sequence")
-    if not isinstance(no_progress_turns, list) or len(no_progress_turns) != 5:
-        raise ValueError("no_progress_resume must record exactly five transitions")
-    if not isinstance(reconstruction_turns, list) or len(reconstruction_turns) != 3:
-        raise ValueError("reconstruction must record exactly three transitions")
+    """Run recorded failures through public sessions and controllers."""
+    no_progress_turns = scenarios["no_progress_resume"].get("responses")
+    reconstruction_turns = scenarios["reconstruction"].get("responses")
+    if not isinstance(no_progress_turns, list) or len(no_progress_turns) != 6:
+        raise ValueError("no_progress_resume must record six OpenAI responses")
+    if not isinstance(reconstruction_turns, list) or len(reconstruction_turns) != 2:
+        raise ValueError("reconstruction must record two OpenAI responses")
 
     code = CoverageObligation(
         obligation_id="OB-code",
@@ -250,39 +568,43 @@ def run_failure_injections(
         primary_obligation_ids=("OB-code", "OB-tests"),
         seed_paths=("src/a.py", "tests/test_a.py"),
     )
-    no_progress = _session([
-        _tool_turn("call-a", no_progress_turns[0]["path"]),
-        _tool_turn("call-a-duplicate-1", no_progress_turns[1]["path"]),
-        _tool_turn("call-a-duplicate-2", no_progress_turns[2]["path"]),
-        _turn(text=_checkpoint_text(["src/a.py"], ["OB-tests"])),
-        _tool_turn("call-tests", no_progress_turns[4]["path"]),
-        _turn(text=_checkpoint_text(["src/a.py", "tests/test_a.py"], [])),
-    ], (code, tests), assignment)
+    no_progress = _session(no_progress_turns, (code, tests), assignment)
     first = no_progress.explore()
     conversation_identity = id(no_progress.conversation)
     no_progress.apply_coverage_feedback(["OB-tests"])
     second = no_progress.explore()
+    no_progress._recorded_gateway.assert_complete()  # type: ignore[attr-defined]
 
-    reconstruction = _session([
-        _tool_turn("call-reconstruct", reconstruction_turns[0]["path"]),
-        _turn(text=_checkpoint_text(["src/a.py"], ["OB-tests"])),
-    ], (code, tests), assignment)
+    reconstruction = _session(
+        reconstruction_turns, (code, tests), assignment,
+    )
     reconstruction.explore()
     checkpoint = reconstruction.latest_checkpoint
-    reconstruction.recover(str(reconstruction_turns[2].get("reason")))
+    reconstruction.recover(
+        str(scenarios["reconstruction"].get("recovery_reason")),
+    )
+    reconstruction._recorded_gateway.assert_complete()  # type: ignore[attr-defined]
     recovery_usage = reconstruction.budget.snapshot()
 
-    deadline_raw = scenarios["deadline_cutoff"]
-    deadline = RunDeadline(
-        0.0,
-        float(deadline_raw["deadline_sec"]),
-        PhaseShares(**deadline_raw["phase_shares"]),
+    completion_raw = scenarios["completion_inversion"]
+    orders = completion_raw.get("orders")
+    if not isinstance(orders, list) or len(orders) != 2:
+        raise ValueError("completion_inversion must record two completion orders")
+    completion_runs = [
+        _completion_controller_run(completion_raw, order)
+        for order in orders
+    ]
+    coverage_stable = (
+        completion_runs[0]["coverage"] == completion_runs[1]["coverage"]
     )
-    exploration_cutoff = deadline.cutoff_for(RunPhase.FOLLOWUP)
-    reserve = deadline.cutoff_for(RunPhase.FINALIZATION) - exploration_cutoff
-    completion = _completion_projection(
-        scenarios["completion_inversion"].get("orders"),
+    evidence_stable = (
+        completion_runs[0]["evidence"] == completion_runs[1]["evidence"]
     )
+    orders_enforced = all(
+        item["target_order"] == item["actual_order"]
+        for item in completion_runs
+    )
+    deadline = _deadline_controller_run(scenarios["deadline_cutoff"])
     notes_one, notes_two = _anchor_notes(
         scenarios["note_anchor_race"].get("orders"),
     )
@@ -310,17 +632,19 @@ def run_failure_injections(
             "source": artifact["assignment_plan"]["source"],
         },
         "failed_critic": {
-            "terminal": artifact.get("evaluation_status") in {"complete", "degraded"},
+            "terminal": artifact.get("evaluation_status") in {
+                "complete", "degraded",
+            },
             "fallback": "conservative" if critic_degraded else "not_observed",
         },
-        "deadline_cutoff": {
-            "deadline_violation": exploration_cutoff > deadline.deadline_sec,
-            "finalization_reserved": reserve == (
-                deadline.deadline_sec * deadline.phase_shares.finalization / 100
-            ),
-        },
+        "deadline_cutoff": deadline,
         "completion_inversion": {
-            "stable_projection": completion[0] == completion[1],
+            "stable_projection": coverage_stable and evidence_stable,
+            "coverage_stable": coverage_stable,
+            "evidence_stable": evidence_stable,
+            "orders_enforced": orders_enforced,
+            "controller_runs": len(completion_runs),
+            "terminal": all(item["terminal"] for item in completion_runs),
         },
         "note_anchor_race": {
             "stable": note_projection(notes_one) == note_projection(notes_two),

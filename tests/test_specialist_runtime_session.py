@@ -447,6 +447,65 @@ def test_checkpoint_attaches_only_successful_retained_evidence_ids():
     assert dict(result.checkpoint.obligation_statuses)["OB-code"].value == "pending"
 
 
+def test_checkpoint_collects_only_evidence_backed_candidate_objects():
+    executor_result = {
+        "tool": "read_file",
+        "status": "ok",
+        "result": {"content": "contents:a.py"},
+    }
+    evidence_id = canonical_evidence_key(
+        "read_file", {"path": "a.py"}, executor_result,
+    )
+    checkpoint = checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])
+    raw = json.loads(checkpoint.text)
+    raw["candidate_finding_ids"] = ["candidate-code", "candidate-forged"]
+    raw["candidate_findings"] = [
+        {
+            "candidate_id": "candidate-code",
+            "root_cause_fingerprint": "root:candidate-code",
+            "claim": "The changed branch skips the cancellation state.",
+            "affected_location": "a.py:4",
+            "causal_chain": "The new state reaches a switch without a matching arm.",
+            "severity": "major",
+            "category": "correctness",
+            "supporting_evidence_ids": [evidence_id],
+            "related_obligation_ids": ["OB-code"],
+            "confidence_rationale": "Direct retained file evidence.",
+            "user_visible_consequence": "Cancelled work is shown as active.",
+            "manual_validation": "Run the cancellation-state test.",
+        },
+        {
+            "candidate_id": "candidate-forged",
+            "root_cause_fingerprint": "root:candidate-forged",
+            "claim": "A claim without retained evidence.",
+            "affected_location": "a.py:5",
+            "causal_chain": "Unsupported.",
+            "supporting_evidence_ids": ["evidence:not-retained"],
+            "related_obligation_ids": ["OB-code"],
+        },
+    ]
+    checkpoint = ModelTurnResult(**{
+        **checkpoint.__dict__,
+        "text": json.dumps(raw),
+    })
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        checkpoint,
+    ])
+    session = make_session(gateway)
+
+    result = session.explore()
+
+    assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
+    assert tuple(item.candidate_id for item in session.candidate_findings) == (
+        "candidate-code",
+    )
+    candidate = session.candidate_findings[0]
+    assert candidate.supporting_evidence_ids == (evidence_id,)
+    assert candidate.related_obligation_ids == ("OB-code",)
+    assert candidate.collector_session_id == "S1"
+
+
 def test_tool_result_enters_conversation_only_after_evidence_redaction():
     secret = "supersecretvalue"
 

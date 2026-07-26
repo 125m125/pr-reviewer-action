@@ -18,6 +18,7 @@ from .model_gateway import ModelGateway, ModelTurnRequest, ModelTurnResult
 from .request_attempts import RequestAttemptJournal
 from .types import (
     BudgetUsage,
+    CandidateFinding,
     CoverageObligation,
     ObligationStatus,
     RunPhase,
@@ -38,6 +39,40 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
         "unresolved": {"type": "array", "items": {"type": "string"}},
         "hypotheses": {"type": "array", "items": {"type": "string"}},
         "candidate_finding_ids": {"type": "array", "items": {"type": "string"}},
+        "candidate_findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "candidate_id": {"type": "string"},
+                    "root_cause_fingerprint": {"type": "string"},
+                    "claim": {"type": "string"},
+                    "affected_location": {"type": "string"},
+                    "causal_chain": {"type": "string"},
+                    "severity": {"type": "string"},
+                    "category": {"type": "string"},
+                    "supporting_evidence_ids": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "contradicting_evidence_ids": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "related_obligation_ids": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "confidence_rationale": {"type": "string"},
+                    "user_visible_consequence": {"type": "string"},
+                    "manual_validation": {"type": "string"},
+                },
+                "required": [
+                    "candidate_id", "claim", "affected_location",
+                    "causal_chain", "supporting_evidence_ids",
+                    "related_obligation_ids", "user_visible_consequence",
+                    "manual_validation",
+                ],
+                "additionalProperties": False,
+            },
+        },
         "invariants_evaluated": {"type": "array", "items": {"type": "string"}},
         "unknowns": {"type": "array", "items": {"type": "string"}},
         "proposed_next_actions": {"type": "array", "items": {"type": "string"}},
@@ -201,6 +236,7 @@ class SpecialistSession:
         self.state = SessionState.CREATED
         self._current_gaps = self._assigned_obligation_ids()
         self.latest_checkpoint = self._project_checkpoint(())
+        self.candidate_findings: tuple[CandidateFinding, ...] = ()
         self._successful_requests: dict[str, EvidenceRecord] = {}
         self._final_result: SessionResult | None = None
         self._request_events: list[SpecialistRequestEvent] = []
@@ -475,6 +511,27 @@ class SpecialistSession:
                     self.coverage.attach_evidence(obligation_id, evidence_id)
         for obligation_id in assigned.intersection(unresolved):
             self.coverage.mark_unresolved(obligation_id)
+        declared_candidate_ids = set(_strings(raw.get("candidate_finding_ids")))
+        candidates: dict[str, CandidateFinding] = {
+            item.candidate_id: item for item in self.candidate_findings
+        }
+        raw_candidates = raw.get("candidate_findings")
+        if isinstance(raw_candidates, list):
+            for value in raw_candidates:
+                candidate = self._candidate_from_checkpoint(
+                    value,
+                    retained=retained,
+                    assigned=assigned,
+                )
+                if (
+                    candidate is not None
+                    and candidate.candidate_id in declared_candidate_ids
+                    and candidate.candidate_id not in candidates
+                ):
+                    candidates[candidate.candidate_id] = candidate
+        self.candidate_findings = tuple(
+            candidates[key] for key in sorted(candidates)
+        )
         self._current_gaps = self._derive_current_gaps()
         evidence_ids = list(dict.fromkeys(evidence_ids))
         return SessionCheckpoint(
@@ -482,11 +539,81 @@ class SpecialistSession:
             state=SessionState.CHECKPOINT,
             evidence_ids=tuple(evidence_ids),
             hypotheses=_strings(raw.get("hypotheses")),
-            candidate_finding_ids=_strings(raw.get("candidate_finding_ids")),
+            candidate_finding_ids=tuple(
+                item.candidate_id for item in self.candidate_findings
+            ),
             obligation_statuses=tuple(sorted(self.coverage.obligation_statuses().items())),
             invariants_evaluated=_strings(raw.get("invariants_evaluated")),
             unknowns=self._current_gaps,
             proposed_next_actions=self._current_gaps,
+        )
+
+    def _candidate_from_checkpoint(
+        self,
+        value: object,
+        *,
+        retained: Mapping[str, EvidenceRecord],
+        assigned: set[str],
+    ) -> CandidateFinding | None:
+        if not isinstance(value, Mapping):
+            return None
+        allowed = {
+            "candidate_id", "root_cause_fingerprint", "claim",
+            "affected_location", "causal_chain", "severity", "category",
+            "supporting_evidence_ids", "contradicting_evidence_ids",
+            "related_obligation_ids", "confidence_rationale",
+            "user_visible_consequence", "manual_validation",
+        }
+        if set(value) - allowed:
+            return None
+        candidate_id = str(value.get("candidate_id") or "").strip()
+        claim = str(value.get("claim") or "").strip()
+        affected_location = str(value.get("affected_location") or "").strip()
+        causal_chain = str(value.get("causal_chain") or "").strip()
+        consequence = str(value.get("user_visible_consequence") or "").strip()
+        validation = str(value.get("manual_validation") or "").strip()
+        if not all((
+            candidate_id, claim, affected_location, causal_chain,
+            consequence, validation,
+        )):
+            return None
+        supporting = _strings(value.get("supporting_evidence_ids"))
+        contradicting = _strings(value.get("contradicting_evidence_ids"))
+        obligations = _strings(value.get("related_obligation_ids"))
+        if (
+            not supporting
+            or any(item not in retained for item in (*supporting, *contradicting))
+            or not obligations
+            or any(item not in assigned for item in obligations)
+        ):
+            return None
+        model_identities = {
+            retained[item].model_identity
+            for item in supporting
+            if retained[item].model_identity
+        }
+        return CandidateFinding(
+            candidate_id=candidate_id,
+            root_cause_fingerprint=str(
+                value.get("root_cause_fingerprint") or ""
+            ).strip(),
+            claim=claim,
+            affected_location=affected_location,
+            causal_chain=causal_chain,
+            severity=str(value.get("severity") or "info").strip(),
+            category=str(value.get("category") or "").strip(),
+            supporting_evidence_ids=supporting,
+            contradicting_evidence_ids=contradicting,
+            related_obligation_ids=obligations,
+            collector_session_id=self.session_id,
+            model_identity=(
+                next(iter(model_identities)) if len(model_identities) == 1 else ""
+            ),
+            confidence_rationale=str(
+                value.get("confidence_rationale") or ""
+            ).strip(),
+            user_visible_consequence=consequence,
+            manual_validation=validation,
         )
 
     def _derive_current_gaps(self) -> tuple[str, ...]:

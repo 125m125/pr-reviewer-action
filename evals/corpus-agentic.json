@@ -96,7 +96,13 @@
   "offline_specialist_replays": [
     {
       "id": "multilingual-specialist-runtime",
+      "kind": "runtime",
       "fixture": "../tests/fixtures/specialist_runtime/multilingual-pr"
+    },
+    {
+      "id": "web-source-policy",
+      "kind": "web_policy",
+      "fixture": "../tests/fixtures/specialist_runtime/web-policy-pr"
     }
   ],
   "metadata": {
