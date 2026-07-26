@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from pr_reviewer.conversation import Conversation
@@ -8,9 +10,9 @@ from pr_reviewer.specialist_runtime.model_gateway import (
 from pr_reviewer.transport import ModelRequestError
 
 
-def conversation():
+def conversation(user: str = "user"):
     value = Conversation(system="system")
-    value.add_user("user")
+    value.add_user(user)
     return value
 
 
@@ -44,30 +46,76 @@ def test_role_model_override_and_deadline_bound_timeout():
     assert result.usage == {"prompt_tokens": 3, "completion_tokens": 2}
 
 
-def test_diagnostics_distinguish_configured_and_per_request_response_formats():
+def test_override_payload_and_diagnostics_use_per_request_response_format():
+    payloads = []
+
+    def transport(*args, **_kwargs):
+        payloads.append(args[2])
+        return stop_response("{}")
+
     gateway = OpenAIModelGateway(
         base_url="http://model/v1",
         api_key="",
         default_model="main",
         response_format="json_schema",
-        transport=lambda *_args, **_kwargs: stop_response("{}"),
+        transport=transport,
     )
 
     result = gateway.complete(ModelTurnRequest(
         role="planner",
-        conversation=conversation(),
+        conversation=conversation("REQUEST-SENTINEL"),
         max_tokens=512,
-        response_schema={"type": "object"},
+        response_schema={
+            "type": "object",
+            "properties": {"value": {"const": "SCHEMA-SENTINEL"}},
+        },
         tools_enabled=False,
         timeout_sec=20,
         stream=False,
         response_format_override="json_object",
     ))
 
+    assert payloads[0]["response_format"] == {"type": "json_object"}
     assert result.request_diagnostics["response_format_configured"] == "json_schema"
     assert result.request_diagnostics["response_format_requested"] == "json_object"
     assert result.request_diagnostics["response_format_effective"] == "json_object"
     assert result.request_diagnostics["response_format"] == "json_object"
+    serialized = json.dumps(result.request_diagnostics)
+    assert "REQUEST-SENTINEL" not in serialized
+    assert "SCHEMA-SENTINEL" not in serialized
+
+
+def test_tool_enabled_payload_omits_format_but_diagnostics_keep_requested_format():
+    payloads = []
+
+    def transport(*args, **_kwargs):
+        payloads.append(args[2])
+        return stop_response("{}")
+
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1",
+        api_key="",
+        default_model="main",
+        response_format="json_schema",
+        transport=transport,
+    )
+
+    result = gateway.complete(ModelTurnRequest(
+        role="specialist",
+        conversation=conversation("REQUEST-SENTINEL"),
+        max_tokens=512,
+        response_schema=None,
+        tools_enabled=True,
+        timeout_sec=20,
+        stream=False,
+    ))
+
+    assert "response_format" not in payloads[0]
+    assert result.request_diagnostics["response_format_configured"] == "json_schema"
+    assert result.request_diagnostics["response_format_requested"] == "json_schema"
+    assert result.request_diagnostics["response_format_effective"] == "off"
+    assert result.request_diagnostics["response_format"] == "off"
+    assert "REQUEST-SENTINEL" not in json.dumps(result.request_diagnostics)
 
 
 def test_gateway_rejects_non_openai_format_before_transport():
@@ -153,9 +201,11 @@ def test_structured_retry_uses_the_same_decreasing_logical_deadline(monkeypatch)
         "pr_reviewer.specialist_runtime.model_gateway.time.monotonic", lambda: next(clock),
     )
     timeouts = []
+    payloads = []
 
     def transport(*args, **_kwargs):
         timeouts.append(args[4])
+        payloads.append(args[2])
         if len(timeouts) == 1:
             raise ModelRequestError("unsupported response format", status=400)
         return stop_response("{}")
@@ -164,11 +214,28 @@ def test_structured_retry_uses_the_same_decreasing_logical_deadline(monkeypatch)
         base_url="http://model/v1", api_key="", default_model="main", transport=transport,
     )
     result = gateway.complete(ModelTurnRequest(
-        role="planner", conversation=conversation(), max_tokens=512,
-        response_schema={"type": "object"}, tools_enabled=False, timeout_sec=20, stream=False,
+        role="planner", conversation=conversation("REQUEST-SENTINEL"), max_tokens=512,
+        response_schema={
+            "type": "object",
+            "properties": {"value": {"const": "SCHEMA-SENTINEL"}},
+        },
+        tools_enabled=False, timeout_sec=20, stream=False,
     ))
 
     assert timeouts == [19.0, 16.0]
+    assert payloads[0]["response_format"]["type"] == "json_schema"
+    assert "response_format" not in payloads[1]
+    assert result.request_diagnostics["response_format_configured"] == "json_schema"
+    assert result.request_diagnostics["response_format_requested"] == "json_schema"
+    assert result.request_diagnostics["response_format_effective"] == "off"
+    assert result.request_diagnostics["response_format"] == "off"
+    assert result.request_diagnostics["structured_output_fallback"] is True
+    assert "unsupported response format" in result.request_diagnostics[
+        "structured_output_error"
+    ]
+    serialized = json.dumps(result.request_diagnostics)
+    assert "REQUEST-SENTINEL" not in serialized
+    assert "SCHEMA-SENTINEL" not in serialized
     assert result.request_diagnostics["duration_sec"] <= 20
 
 
