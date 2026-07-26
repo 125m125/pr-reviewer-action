@@ -443,3 +443,89 @@ Offline specialist replays: 2 (PASS)
 
 `git diff --check` is clean. No dependencies or network access were added. The
 two pre-existing untracked July 12 documents remain untouched and unstaged.
+
+# Review round 3 fixes (2026-07-26)
+
+The round-2 false-positive regression is fixed. The evaluator no longer
+reimplements production component, recipe, or topic projection rules.
+
+## Root cause and correction
+
+Round 2 centralized markdown rendering but still manually rebuilt structured
+focus values in `eval_harness.py`. That copy omitted the production
+normalization, forbidden-detail filtering, six-item component/recipe/topic
+caps, three-item emphasis cap, and combined-line safety checks. Consequently,
+an authoritative event with more than six values produced a valid capped
+handoff in the controller but a different uncapped expectation in the
+evaluator.
+
+`project_review_handoff` is now the single production projection boundary. It
+owns:
+
+- recommendation/status normalization;
+- forbidden-detail extraction and URL canonicalization;
+- component and recipe normalization, validation, sorting, deduplication, and
+  six-item caps;
+- topic label selection, forbidden-label filtering, six-item focus caps, and
+  the three-item human-emphasis cap;
+- thread/theme/material-warning/source-request structured projection; and
+- final sparse markdown rendering.
+
+`build_review_handoff` performs controller-only evidence/finding revalidation,
+then delegates to that projection. The evaluator independently reconstructs
+the authoritative `ReviewHandoffContext`, finding categories, available detail
+roots, source requests, and obligation identities from the artifact, then
+calls the same projection and compares every observed structured field and the
+complete normalized markdown. It does not trust observed handoff fields and no
+longer contains `Component:`/`Repository recipe:` formatting or projection
+caps.
+
+## TDD evidence
+
+RED:
+
+```text
+.\.venv\Scripts\python.exe -m pytest tests\test_specialist_runtime_replay.py::test_eval_accepts_production_capped_normalized_and_filtered_handoff -q
+1 failed in 0.13s
+```
+
+The test supplies authoritative state containing eight padded/mixed-case
+components, eight recipes, eight topics, and source-request detail that forbids
+one component ID and two topic labels. Production correctly filters,
+normalizes, and caps the handoff; the duplicated evaluator projection rejected
+it with seven inconsistent-field/markdown diagnostics.
+
+GREEN:
+
+```text
+.\.venv\Scripts\python.exe -m pytest tests\test_specialist_runtime_replay.py::test_eval_accepts_production_capped_normalized_and_filtered_handoff -q
+1 passed in 0.10s
+
+.\.venv\Scripts\python.exe -m pytest tests\test_specialist_runtime_replay.py -k "production_capped_normalized or forged_structured_handoff_lines or source_request_count_derived" -q
+13 passed, 26 deselected in 1.73s
+
+.\.venv\Scripts\python.exe -m pytest tests\test_specialist_runtime_replay.py tests\test_eval_harness.py -q
+87 passed in 4.63s
+
+.\.venv\Scripts\python.exe -m pytest tests\test_specialist_runtime_adjudication.py tests\test_specialist_runtime_adjudication_adversarial.py -q
+80 passed in 0.15s
+
+.\.venv\Scripts\python.exe -m pytest tests\test_specialist_runtime_controller.py tests\test_specialist_runtime_cli.py -q
+71 passed in 2.07s
+
+.\.venv\Scripts\python.exe -m pytest tests\test_github_review_notes.py -q
+115 passed in 0.69s
+
+.\.venv\Scripts\python.exe -m pytest tests\test_specialist_runtime_replay.py tests\test_native_loop_exfil_redteam.py tests\test_specialist_runtime_web.py -q
+139 passed in 4.98s
+```
+
+Offline corpus:
+
+```text
+.\.venv\Scripts\python.exe scripts\eval_harness.py --corpus evals\corpus-agentic.json --offline-specialist-only --output <workspace-report>
+Offline specialist replays: 2 (PASS)
+```
+
+`git diff --check` is clean. No dependencies or network access were added. The
+two pre-existing untracked July 12 documents remain untouched and unstaged.

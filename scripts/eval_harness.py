@@ -26,7 +26,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass, field, asdict, replace
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -42,13 +42,12 @@ from pr_reviewer.specialist_runtime.replay import (
     validated_strings,
 )
 from pr_reviewer.specialist_runtime.adjudication import (
-    build_source_access_request_notes,
-    render_review_handoff,
-    review_orientation_label,
+    ReviewHandoffContext,
+    ReviewOrientationTopic,
+    project_review_handoff,
 )
 from pr_reviewer.specialist_runtime.types import (
     CoverageObligation,
-    ReviewHandoff,
     ReviewNote,
 )
 
@@ -392,16 +391,6 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
         item for item in artifact.get("accepted_candidates", ())
         if isinstance(item, Mapping)
     )
-    verdict_labels = {
-        "approve": "Approve",
-        "request_changes": "Request changes",
-        "notice": "Human review required",
-    }
-    status_labels = {
-        "complete": "AI review complete",
-        "degraded": "AI review completed with material coverage limits",
-        "incomplete": "AI review incomplete",
-    }
     verdict = artifact.get("verdict")
     verdict_value = str(
         verdict.get("value") if isinstance(verdict, Mapping) else verdict or ""
@@ -414,60 +403,28 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
             if isinstance(payload, Mapping):
                 proposal = payload
 
-    invalid_topics: list[str] = []
+    invalid_projection_values: list[str] = []
 
-    def topic_labels(key: str) -> tuple[str, ...]:
-        labels = []
-        values = proposal.get(key, ())
-        if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
-            for value in values:
-                label = review_orientation_label(value)
-                if label is None:
-                    invalid_topics.append(str(value))
-                else:
-                    labels.append(label)
-        return tuple(sorted(set(labels)))
+    def values(key: str) -> tuple[object, ...]:
+        raw = proposal.get(key, ())
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+            return tuple(raw)
+        invalid_projection_values.append(key)
+        return ()
 
-    change_topics = topic_labels("change_topics")
-    specialist_focuses = topic_labels("specialist_topics")
-    coverage_boundaries = topic_labels("coverage_boundary_topics")
-    review_emphasis = topic_labels("review_emphasis_topics")
-    components = tuple(sorted({
-        f"Component: {str(value)}"
-        for value in proposal.get("component_ids", ())
-        if str(value).strip()
-    }))
-    recipe_focuses = tuple(sorted({
-        f"Repository recipe: {str(value)}"
-        for value in proposal.get("recipe_ids", ())
-        if str(value).strip()
-    }))
-    change_map = tuple(sorted({*change_topics, *components}))
-    reviewed_focuses = tuple(sorted({
-        *specialist_focuses,
-        *recipe_focuses,
-        *coverage_boundaries,
-    }))
+    def topics(key: str) -> tuple[ReviewOrientationTopic, ...]:
+        result = []
+        for value in values(key):
+            try:
+                result.append(ReviewOrientationTopic(str(value)))
+            except ValueError:
+                invalid_projection_values.append(f"{key}:{value}")
+        return tuple(result)
 
     severity_rank = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
-    thread_status = None
-    if accepted:
-        highest = max(
-            (str(item.get("severity") or "info") for item in accepted),
-            key=lambda value: severity_rank.get(value, 0),
-        )
-        thread_status = (
-            f"{len(accepted)} unresolved review note(s); "
-            f"highest material severity: {highest}."
-        )
-
-    finding_theme = None
     finding_categories = tuple(
-        str(item.get("category") or "").strip().casefold() for item in accepted
+        str(item.get("category") or "") for item in accepted
     )
-    if len(finding_categories) >= 2 and len(set(finding_categories)) == 1:
-        if review_orientation_label(finding_categories[0]) is not None:
-            finding_theme = finding_categories[0]
 
     coverage = artifact.get("coverage")
     obligations = {
@@ -486,29 +443,37 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
         source_requests, (str, bytes)
     ):
         source_requests = ()
-    access_count = len(build_source_access_request_notes(
-        source_requests,
-        obligations=obligations,
-    ))
-    expected = ReviewHandoff(
-        recommendation=verdict_labels.get(verdict_value, ""),
-        status=status_labels.get(str(artifact.get("evaluation_status")), ""),
-        change_map=change_map,
-        reviewed_focuses=reviewed_focuses,
-        specialist_focuses=specialist_focuses,
-        recipe_focuses=recipe_focuses,
-        coverage_boundaries=coverage_boundaries,
-        thread_status=thread_status,
-        finding_theme=finding_theme,
-        review_emphasis=review_emphasis,
-        coverage_warning=(
-            "Material evidence or session coverage is incomplete."
-            if artifact.get("degradation") else None
+    context = ReviewHandoffContext(
+        recommendation=verdict_value,
+        status=str(artifact.get("evaluation_status") or ""),
+        change_topics=topics("change_topics"),
+        component_ids=values("component_ids"),
+        specialist_topics=topics("specialist_topics"),
+        recipe_ids=values("recipe_ids"),
+        coverage_boundary_topics=topics("coverage_boundary_topics"),
+        unresolved_thread_count=len(accepted),
+        highest_thread_severity=(
+            max(
+                (str(item.get("severity") or "info") for item in accepted),
+                key=lambda value: severity_rank.get(value, 0),
+            )
+            if accepted else None
         ),
-        access_request_count=access_count,
-        access_request_url=None,
+        review_emphasis_topics=topics("review_emphasis_topics"),
+        material_coverage_limited=bool(artifact.get("degradation")),
+        source_access_requests=tuple(source_requests),
     )
-    expected = replace(expected, markdown=render_review_handoff(expected))
+    expected = project_review_handoff(
+        context,
+        finding_categories=finding_categories,
+        forbidden_detail_roots=(
+            accepted,
+            artifact.get("candidate_unknowns", ()),
+            source_requests,
+            artifact.get("evidence", ()),
+        ),
+        obligations=obligations,
+    )
 
     structured_fields = (
         "recommendation",
@@ -534,7 +499,8 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
         "review_emphasis",
     }
     unsupported = [
-        f"handoff has invalid focus topic: {value}" for value in invalid_topics
+        f"handoff has invalid projection value: {value}"
+        for value in invalid_projection_values
     ]
     for name in structured_fields:
         observed = handoff.get(name)

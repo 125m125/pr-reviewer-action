@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import shutil
@@ -13,6 +13,13 @@ import sys
 import pytest
 
 import scripts.eval_harness as eval_harness_module
+from pr_reviewer.specialist_runtime.adjudication import (
+    AdjudicatedReview,
+    ReviewHandoffContext,
+    ReviewOrientationTopic,
+    build_review_handoff,
+)
+from pr_reviewer.specialist_runtime.evidence import EvidenceStore
 from scripts.eval_harness import (
     BenchmarkCorpus,
     evaluate_specialist_replay,
@@ -21,6 +28,7 @@ from pr_reviewer.specialist_runtime.replay import (
     replay_fixture,
     replay_web_policy_fixture,
 )
+from pr_reviewer.specialist_runtime.web_evidence import SourceAccessRequest
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -404,6 +412,99 @@ def test_eval_accepts_source_request_count_derived_from_authoritative_requests()
     )
 
     assert "unsupported_public_claim" not in metrics["failure_gates"]
+
+
+def test_eval_accepts_production_capped_normalized_and_filtered_handoff():
+    source_request = SourceAccessRequest(
+        host="docs.example.org",
+        candidate_url="https://docs.example.org/reference/runtime",
+        obligation_id="missing-obligation",
+        purpose="Security-sensitive behavior",
+        authority_reason="Deployment and runtime configuration",
+    )
+    topics = (
+        ReviewOrientationTopic.DATABASE,
+        ReviewOrientationTopic.AUTHORIZATION,
+        ReviewOrientationTopic.CACHING,
+        ReviewOrientationTopic.CONCURRENCY,
+        ReviewOrientationTopic.API_CONTRACTS,
+        ReviewOrientationTopic.FAILURE_RECOVERY,
+        ReviewOrientationTopic.DEPLOYMENT,
+        ReviewOrientationTopic.SECURITY,
+    )
+    context = ReviewHandoffContext(
+        recommendation="approve",
+        status="complete",
+        change_topics=topics,
+        component_ids=(
+            "  ZETA  ",
+            "alpha",
+            "bravo",
+            "charlie",
+            "delta",
+            "echo",
+            "foxtrot",
+            "docs.example.org",
+        ),
+        specialist_topics=topics,
+        recipe_ids=(
+            "  RECIPE-Z  ",
+            "recipe-a",
+            "recipe-b",
+            "recipe-c",
+            "recipe-d",
+            "recipe-e",
+            "recipe-f",
+            "docs.example.org",
+        ),
+        coverage_boundary_topics=topics,
+        review_emphasis_topics=topics,
+        source_access_requests=(source_request,),
+    )
+    handoff = build_review_handoff(
+        context,
+        review=AdjudicatedReview(),
+        evidence=EvidenceStore(),
+        obligations={},
+        changed_files=(),
+    )
+    artifact = {
+        "accepted_candidates": [],
+        "coverage": {},
+        "degradation": [],
+        "evaluation_status": "complete",
+        "events": [{
+            "kind": "finalizer_proposal_applied",
+            "payload": {
+                "change_topics": [item.value for item in context.change_topics],
+                "component_ids": list(context.component_ids),
+                "specialist_topics": [
+                    item.value for item in context.specialist_topics
+                ],
+                "recipe_ids": list(context.recipe_ids),
+                "coverage_boundary_topics": [
+                    item.value for item in context.coverage_boundary_topics
+                ],
+                "review_emphasis_topics": [
+                    item.value for item in context.review_emphasis_topics
+                ],
+            },
+        }],
+        "handoff": asdict(handoff),
+        "source_access_requests": [asdict(source_request)],
+        "verdict": {"value": "approve"},
+    }
+
+    assert len(handoff.change_map) == 12
+    assert handoff.recipe_focuses == (
+        "Repository recipe: recipe-a",
+        "Repository recipe: recipe-b",
+        "Repository recipe: recipe-c",
+        "Repository recipe: recipe-d",
+        "Repository recipe: recipe-e",
+        "Repository recipe: recipe-f",
+    )
+    assert eval_harness_module._unsupported_handoff_lines(artifact) == []
 
 
 def test_false_adversarial_predicate_is_a_mandatory_gate():

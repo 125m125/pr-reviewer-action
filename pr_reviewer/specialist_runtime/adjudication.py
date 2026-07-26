@@ -818,13 +818,13 @@ def _category_topic(value: str) -> ReviewOrientationTopic | None:
         return None
 
 
-def _aggregate_theme(
-    findings: Iterable[AcceptedFinding],
+def _aggregate_theme_categories(
+    categories: Iterable[str],
     *,
     forbidden: frozenset[str],
 ) -> tuple[str | None, str | None]:
-    values = tuple(findings)
-    topics = tuple(_category_topic(item.category) for item in values)
+    values = tuple(categories)
+    topics = tuple(_category_topic(item) for item in values)
     material = {item for item in topics if item is not None}
     if len(values) < 2 or len(material) != 1 or any(item is None for item in topics):
         return None, None
@@ -898,24 +898,17 @@ def render_review_handoff(handoff: ReviewHandoff) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def build_review_handoff(
+def project_review_handoff(
     context: ReviewHandoffContext,
     *,
-    review: AdjudicatedReview | None,
-    evidence: EvidenceStore | EvidenceSnapshot,
+    finding_categories: Iterable[str],
+    forbidden_detail_roots: Iterable[object],
     obligations: Mapping[str, CoverageObligation],
-    changed_files: Iterable[str],
 ) -> ReviewHandoff:
-    """Build orientation exclusively from typed controller context."""
+    """Project and render a sparse handoff from authoritative structured state."""
     if not isinstance(context, ReviewHandoffContext):
         raise TypeError("context must be a ReviewHandoffContext")
-    obligation_map, _ = _controller_state(obligations, changed_files)
-    authoritative, _ = _revalidated_findings(
-        review.accepted if isinstance(review, AdjudicatedReview) else (),
-        evidence=evidence,
-        obligations=obligation_map,
-        changed_files=changed_files,
-    )
+    obligation_map = dict(obligations)
     recommendation_map = {
         "approve": "Approve",
         "request_changes": "Request changes",
@@ -928,19 +921,7 @@ def build_review_handoff(
     }
     recommendation = recommendation_map.get(_unicode(context.recommendation).strip().lower(), "")
     status = status_map.get(_unicode(context.status).strip().lower(), "")
-    snapshot = _snapshot(evidence)
-    detail_roots: list[object] = []
-    if isinstance(review, AdjudicatedReview):
-        detail_roots.extend((
-            review.accepted,
-            review.unknowns,
-            review.verification_requests,
-        ))
-    detail_roots.extend((
-        context.source_access_requests,
-        snapshot.records,
-    ))
-    detail_values = _detail_scalars(tuple(detail_roots))
+    detail_values = _detail_scalars(tuple(forbidden_detail_roots))
     forbidden_values = {
         value for item in detail_values if (value := _exact_detail(item))
     }
@@ -1018,7 +999,10 @@ def build_review_handoff(
             f"Thread status: {candidate_thread_status}",
         ):
             thread_status = candidate_thread_status
-    theme, theme_label = _aggregate_theme(authoritative, forbidden=forbidden)
+    theme, theme_label = _aggregate_theme_categories(
+        finding_categories,
+        forbidden=forbidden,
+    )
     if theme_label and not renderable(
         theme_label, f"Aggregate finding theme: {theme_label}"
     ):
@@ -1076,6 +1060,44 @@ def build_review_handoff(
         access_request_url=access_url,
     )
     return replace(projection, markdown=render_review_handoff(projection))
+
+
+def build_review_handoff(
+    context: ReviewHandoffContext,
+    *,
+    review: AdjudicatedReview | None,
+    evidence: EvidenceStore | EvidenceSnapshot,
+    obligations: Mapping[str, CoverageObligation],
+    changed_files: Iterable[str],
+) -> ReviewHandoff:
+    """Build orientation exclusively from typed controller context."""
+    if not isinstance(context, ReviewHandoffContext):
+        raise TypeError("context must be a ReviewHandoffContext")
+    obligation_map, _ = _controller_state(obligations, changed_files)
+    authoritative, _ = _revalidated_findings(
+        review.accepted if isinstance(review, AdjudicatedReview) else (),
+        evidence=evidence,
+        obligations=obligation_map,
+        changed_files=changed_files,
+    )
+    snapshot = _snapshot(evidence)
+    detail_roots: list[object] = []
+    if isinstance(review, AdjudicatedReview):
+        detail_roots.extend((
+            review.accepted,
+            review.unknowns,
+            review.verification_requests,
+        ))
+    detail_roots.extend((
+        context.source_access_requests,
+        snapshot.records,
+    ))
+    return project_review_handoff(
+        context,
+        finding_categories=(item.category for item in authoritative),
+        forbidden_detail_roots=detail_roots,
+        obligations=obligation_map,
+    )
 
 
 def _quoted(value: object, *, limit: int = _NOTE_VALUE_LIMIT) -> str:
