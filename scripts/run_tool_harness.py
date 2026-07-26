@@ -554,7 +554,7 @@ def run_native_loop(
         web_tool_schemas,
     )
     from pr_reviewer.tool_loop import (  # noqa: PLC0415
-        adaptive_loop_budgets,
+        LoopBudgets,
         drive_tool_loop,
         extract_intermediate_turn,
         extract_tool_calls,
@@ -611,16 +611,10 @@ def run_native_loop(
     synthesis_timeout = env_positive_int("TOOL_SYNTHESIS_TIMEOUT_SEC", 60)
     synthesis_max_tokens = env_positive_int("TOOL_SYNTHESIS_MAX_TOKENS", 2048)
     synthesis_reserve = min(synthesis_timeout, max(1, wall_clock // 2))
-    # Right-size the loop to PR risk (#197 §2): the fast route only fires on
-    # low-risk PRs, so they get a shallow loop; risk-flagged / smart-routed PRs
-    # get full depth. REVIEW_ROUTE is exported by run_review.sh; standalone runs
-    # default to legacy (full depth).
-    budgets = adaptive_loop_budgets(
-        max_rounds,
-        max_requests,
-        max(0.001, wall_clock - synthesis_reserve),
-        review_route=os.getenv("REVIEW_ROUTE", "legacy"),
-        risk_flag_count=_classification_risk_flag_count(),
+    budgets = LoopBudgets(
+        max_tool_calls=max_requests,
+        max_rounds=max_rounds,
+        wall_clock_sec=max(0.001, wall_clock - synthesis_reserve),
     )
     verdict_max_tokens = env_positive_int("AI_MAX_TOKENS", 8192)
     model_context_tokens = env_positive_int(
@@ -670,7 +664,7 @@ def run_native_loop(
     print(
         "Native-loop budget:\n"
         f"  tool calls: configured={max_requests}, effective={budgets.max_tool_calls}\n"
-        f"  planning turns: configured={max_rounds} rounds, effective={budgets.max_rounds} turns\n"
+        f"  planning turns: configured={max_rounds}, effective={budgets.max_rounds}\n"
         f"  total wall clock: configured={wall_clock}s, effective={wall_clock}s "
         f"(synthesis timeout configured={synthesis_timeout}s, "
         f"effective reserve={synthesis_reserve}s)",

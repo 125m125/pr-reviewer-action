@@ -21,6 +21,37 @@ from pr_reviewer.specialist_runtime.types import (
 )
 
 
+def runtime_source_paths() -> tuple[Path, ...]:
+    root = Path(__file__).resolve().parent.parent
+    return (
+        root / "pr_reviewer" / "specialists.py",
+        root / "pr_reviewer" / "tool_loop.py",
+        root / "scripts" / "build_review_comments.py",
+        root / "scripts" / "resolve_finding_threads.py",
+        root / "scripts" / "publish_helpers.sh",
+        root / "scripts" / "run_specialist_reviews.py",
+    )
+
+
+def test_removed_specialist_architecture_is_not_present():
+    sources = "\n".join(
+        path.read_text(encoding="utf-8") for path in runtime_source_paths()
+    )
+    for forbidden in (
+        "class SequentialModelRunner",
+        "def run_focus(",
+        "max_rounds=max(4, max_tools * 2 + 2)",
+        "initial_fallback_focuses(",
+        "def schedule_focuses(",
+        "def normalize_specialist_report(",
+        "def legacy_diff_positions(",
+        "def extract_marker_fingerprint(",
+        "publish_specialist_review() {",
+        "rounds = max_rounds * 2",
+    ):
+        assert forbidden not in sources
+
+
 def write_review_workspace(root: Path) -> None:
     (root / "pr.json").write_text(json.dumps({
         "number": 17,

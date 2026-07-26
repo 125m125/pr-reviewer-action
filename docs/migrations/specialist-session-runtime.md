@@ -69,7 +69,7 @@ replay and provider capacity have been demonstrated.
 | `specialist_stream_watchdog` | retained | `true` | `true` | Stops repeated streamed blocks and permits one compact recovery. |
 | `specialist_max_truncation_continuations` | retained | `2` | `2` | Bounds continuation requests after an output reaches its cap. |
 | `specialist_planner_max_context_bytes` | retained | `60000` | `60000` | Limits context given to the planning scout before tool exploration. |
-| `specialist_packet_max_bytes` | retained | `90000` | `90000` | Limits the compact corpus sent to a specialist. |
+| `specialist_packet_max_bytes` | retained | `90000` | `90000` | One-release packet migration setting; durable sessions ignore it. |
 | `publish_review_comment` | retained | `false` | `"true"` when publishing | Enables managed publication for the selected publish mode. |
 | `publish_mode` | changed |  | `review_comment` | The empty default is an omission sentinel: `single` resolves to `comment`; specialist strategies resolve to `review_comment`. An explicit `comment` remains authoritative and stays a sticky comment. |
 | `inline_findings` | retained | `false` | Keep `false` until line-anchor noise is acceptable | Detailed notes remain the primary evidence surface. |

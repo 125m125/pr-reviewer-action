@@ -29,7 +29,7 @@ for _path in (str(_SCRIPTS_DIR), str(_ACTION_ROOT)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from pr_reviewer.github_review_notes import legacy_diff_positions as diff_positions  # noqa: E402
+from pr_reviewer.github_review_notes import diff_positions  # noqa: E402
 from redact import mask_secrets  # noqa: E402
 from sanitize_review_markdown import sanitize_markdown  # noqa: E402
 

@@ -157,7 +157,7 @@ inputs:
     required: false
     default: ""
   specialist_aggregator_model:
-    description: Optional final candidate-ranking model; empty inherits ai_model.
+    description: Optional finalizer model; empty inherits ai_model.
     required: false
     default: ""
   specialist_pass_timeout_sec:
@@ -165,7 +165,7 @@ inputs:
     required: false
     default: "600"
   specialist_max_tokens:
-    description: Maximum completion tokens for specialist, critic, and aggregator turns.
+    description: Maximum completion tokens for specialist, critic, and finalizer turns.
     required: false
     default: "4096"
   specialist_recovery_max_tokens:
@@ -193,7 +193,7 @@ inputs:
     required: false
     default: "60000"
   specialist_packet_max_bytes:
-    description: Maximum review-corpus bytes supplied to one specialist pass.
+    description: Retained migration setting for deprecated packet mode; durable sessions ignore it.
     required: false
     default: "90000"
   ai_fallback_base_url:
@@ -526,9 +526,8 @@ inputs:
     default: "4"
   tool_max_rounds:
     description: >-
-      Round budget for tool_mode=native_loop, where a round is a single model turn:
-      the legacy mapping allows exactly twice this value to leave room for
-      one-call-per-turn chains and repair turns. Ignored when tool_mode=off.
+      Maximum planning turns for tool_mode=native_loop. Tool-only turns use the
+      independent request budget. Ignored when tool_mode=off.
     required: false
     default: "3"
   tool_max_consecutive_no_progress_rounds:

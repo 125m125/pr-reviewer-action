@@ -147,11 +147,6 @@ def resolved_fingerprints(carried: list, findings) -> set:
     }
 
 
-def extract_marker_fingerprint(body):
-    """Compatibility wrapper around the specialist managed-marker parser."""
-    return extract_managed_fingerprint(body, FINDING_MARKER_PREFIX)
-
-
 def match_threads(thread_nodes) -> dict:
     """Map fingerprint -> thread info for unresolved marker-bearing threads.
 
@@ -168,7 +163,9 @@ def match_threads(thread_nodes) -> dict:
             continue
         first_nodes = (node.get("first") or {}).get("nodes") or []
         first = first_nodes[0] if first_nodes and isinstance(first_nodes[0], dict) else {}
-        fingerprint = extract_marker_fingerprint(first.get("body"))
+        fingerprint = extract_managed_fingerprint(
+            first.get("body"), FINDING_MARKER_PREFIX
+        )
         if not fingerprint or fingerprint in matched:
             continue
         last_nodes = (node.get("last") or {}).get("nodes") or []

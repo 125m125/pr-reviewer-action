@@ -241,7 +241,7 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_stream_watchdog` | Interrupt streamed specialist output after repeated paragraphs/blocks and recover once from compact evidence | No | `true` |
 | `specialist_max_truncation_continuations` | Maximum continuation turns after a specialist response reaches the completion-token limit | No | `2` |
 | `specialist_planner_max_context_bytes` | Diff/context bytes supplied to the planner before tool exploration | No | `60000` |
-| `specialist_packet_max_bytes` | Review-corpus bytes supplied to one specialist | No | `90000` |
+| `specialist_packet_max_bytes` | Retained migration setting for the deprecated packet input; durable sessions ignore it | No | `90000` |
 
 For an executable version-2 migration, policy example, workflow conversion,
 artifact expectations, and troubleshooting, see the
@@ -255,20 +255,18 @@ conversation bounded. A practical baseline is `ai_stream: "true"`,
 repeated paragraphs or blocks, discards the polluted partial turn, and performs
 one compact recovery request instead of continuing the same transcript.
 
-Specialist mode derives a generic component topology from manifests, paths,
-file roles, contracts, and deterministic risk flags. A bounded planning call may
-inspect the repository and returns a strict list of free-form focuses. The runner
-merges overlapping plan/recipe/fallback ownership, then selects passes by marginal
-component, relationship, lens, invariant, risk, and repository-recipe coverage.
-Each pass receives the full compact coworker roster plus a provisional coverage
-ledger from earlier passes. A critic may request one bounded follow-up wave only
-for omitted coverage, contradictions, or specifically missing evidence. Only evidence-backed, in-scope candidates
-survive deterministic validation; the final model can rank candidate IDs but
-cannot add findings.
+Specialist mode derives a generic component topology and deterministic review
+obligations from manifests, paths, file roles, contracts, recipes, and risk
+flags. A bounded planner assigns those obligations to durable specialist
+sessions. Sessions gather read-only evidence, checkpoint their progress, and
+finish on the same logical conversation; the coverage ledger and scheduler
+decide whether a bounded follow-up is justified. Deterministic adjudication
+accepts only evidence-backed, in-scope notes, and the finalizer produces the
+sparse human handoff without reopening findings or starting gap conversations.
 
-The configured pass and tool limits are literal ceilings. The job summary reports
-selected and omitted focuses, applied exclusions, model requests, runtime, and the
-computed maximum specialist tool budget. `specialists_evaluate` writes
+The configured session, turn, tool, recovery, and deadline limits are literal
+ceilings. The job summary reports assignment coverage, model requests, runtime,
+and budget accounting. `specialists_evaluate` writes
 `specialist-review-artifact.json` and exposes its path as `specialist_artifact`,
 but the publish step is unconditionally skipped.
 
@@ -393,7 +391,7 @@ for the complete schema, source-rule boundaries, and conversion checklist.
 |-------|-------------|----------|---------|
 | `tool_mode` | Tool harness mode: `off` or `native_loop` (the `plan_execute_*` planner modes were removed in 2.0) | No | `off` |
 | `tool_max_requests` | Maximum tool requests executed in one harness run (total across the loop) | No | `4` |
-| `tool_max_rounds` | Configured round budget for `tool_mode=native_loop`; the legacy mapping permits exactly twice this many planning turns, with no hidden cap | No | `3` |
+| `tool_max_rounds` | Exact planning-turn budget for `tool_mode=native_loop`; tool-only turns use the independent request budget | No | `3` |
 | `tool_max_consecutive_no_progress_rounds` | Advanced safety bound: stop exploration after this many consecutive duplicate, malformed, failed, or exhausted-budget rounds and synthesize from existing evidence | No | `2` |
 | `tool_max_repeated_call_sets` | Advanced safety bound: stop when the same duplicate-only canonical call set recurs this many times | No | `3` |
 | `tool_loop_wall_clock_sec` | Total wall-clock ceiling for native exploration plus terminal synthesis | No | `120` |
@@ -655,7 +653,7 @@ Evidence providers are **disabled by default on cross-repository pull requests**
     tool_min_successful_requests: "1"
 ```
 
-In `native_loop` mode the reviewing model uses its provider's native tool-calling API (OpenAI `tool_calls` / Anthropic `tool_use`). The tool schemas are sent with the request and the model holds the conversation: it issues a call, sees the result appended as a real tool-result turn, and decides the next call from what came back — so a chain like "read the machineconfig → extract the platform version → fetch that version's published compatibility matrix" is expressed natively, with each hop conditioned on the previous one's content rather than guessed up front. Each request receives an ephemeral note with the remaining call/turn/no-progress allowance. Successful duplicate calls replay the original bounded result without re-execution or budget charge. `tool_max_requests` is the exact execution cap; the legacy rounds mapping permits exactly `2 × tool_max_rounds` planning turns without a hidden maximum. Positive configured values are never clamped or raised automatically. `tool_loop_wall_clock_sec` covers exploration plus a reserved terminal synthesis phase (`tool_synthesis_timeout_sec`, `tool_synthesis_max_tokens`). The effective synthesis reserve is the smaller of the configured synthesis timeout and half the total wall clock, leaving time for both phases; configured and effective values are logged and shown in the step summary. Reaching a call, turn, no-progress, repetition, or exploration-time limit stops tool execution and triggers one tools-disabled, reasoning-enabled evidence synthesis turn before the strict verdict turn. Length-truncated analysis is retained as bounded internal synthesis input instead of restarting with a doubled output budget. Malformed, duplicate, and over-budget calls receive synthetic results but do not count as executions.
+In `native_loop` mode the reviewing model uses its provider's native tool-calling API (OpenAI `tool_calls` / Anthropic `tool_use`). The tool schemas are sent with the request and the model holds the conversation: it issues a call, sees the result appended as a real tool-result turn, and decides the next call from what came back — so a chain like "read the machineconfig → extract the platform version → fetch that version's published compatibility matrix" is expressed natively, with each hop conditioned on the previous one's content rather than guessed up front. Each request receives an ephemeral note with the remaining call/turn/no-progress allowance. Successful duplicate calls replay the original bounded result without re-execution or budget charge. `tool_max_requests` is the exact execution cap and `tool_max_rounds` is the exact planning-turn cap; tool-only turns use the request budget and do not consume planning turns. Positive configured values are never clamped or raised automatically. `tool_loop_wall_clock_sec` covers exploration plus a reserved terminal synthesis phase (`tool_synthesis_timeout_sec`, `tool_synthesis_max_tokens`). The effective synthesis reserve is the smaller of the configured synthesis timeout and half the total wall clock, leaving time for both phases; configured and effective values are logged and shown in the step summary. Reaching a call, turn, no-progress, repetition, or exploration-time limit stops tool execution and triggers one tools-disabled, reasoning-enabled evidence synthesis turn before the strict verdict turn. Length-truncated analysis is retained as bounded internal synthesis input instead of restarting with a doubled output budget. Malformed, duplicate, and over-budget calls receive synthetic results but do not count as executions.
 
 For intermediate OpenAI turns only, blank `content` falls back internally to nonblank `reasoning_content`, allowing servers such as LM Studio/Qwen to carry analysis into the next tool turn. Ordinary `content` always wins; Anthropic is unchanged; and final verdict parsing never consumes `reasoning_content`. Fallback reasoning is not copied into review markdown, logs, or action outputs. Streamed reasoning deltas are reassembled with the same boundary.
 

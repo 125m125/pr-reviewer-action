@@ -17,13 +17,6 @@ sanitize_review_markdown() {
   python3 "${GITHUB_ACTION_PATH}/scripts/sanitize_review_markdown.py" "$output_file"
 }
 
-# Compatibility entry point for the specialist publisher. Task 13 wires the
-# controller's final artifact paths; legacy single-review publish arms remain
-# in action.yml until Task 17 removes them.
-publish_specialist_review() {
-  python3 "${GITHUB_ACTION_PATH}/scripts/publish_specialist_review.py" "$@"
-}
-
 # Resolve cleanup flag based on input value and publish mode.
 # Args: $1 = CLEANUP_PREVIOUS_NATIVE_REVIEWS input, $2 = PUBLISH_MODE
 # Outputs: "true" or "false" to stdout

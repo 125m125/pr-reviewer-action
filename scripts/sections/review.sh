@@ -234,7 +234,7 @@ if [ "$PRIMARY_OK" -eq 1 ]; then
   if [[ "$REVIEW_STRATEGY" == "single" ]]; then
     ANALYSIS_ENGINE="$(annotate_analysis_engine "$AI_MODEL@$AI_BASE_URL ($AI_API_FORMAT)" primary)"
   else
-    ANALYSIS_ENGINE="specialists@$AI_BASE_URL ($AI_API_FORMAT; sequential hybrid plan)"
+    ANALYSIS_ENGINE="specialists@$AI_BASE_URL ($AI_API_FORMAT; durable session runtime)"
   fi
   echo "Primary model succeeded"
 else

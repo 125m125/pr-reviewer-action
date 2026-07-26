@@ -47,8 +47,8 @@ check_contains "smart failure publishes the primary review" "$SRC" "publishing t
 check_contains "route becomes escalated on success" "$SRC" 'REVIEW_ROUTE="escalated"'
 check "escalation_reason output emitted" "$(grep -c '^echo "escalation_reason=' "$RUN_REVIEW")" "1"
 # Escalation must be decided before the enforcement wrapper runs.
-ESC_LINE="$(grep -n '^maybe_escalate_review$' "$RUN_REVIEW" | cut -d: -f1)"
-ENF_LINE="$(grep -n '^apply_all_enforcement_wrapper ' "$RUN_REVIEW" | cut -d: -f1)"
+ESC_LINE="$(grep -n '^[[:space:]]*maybe_escalate_review$' "$RUN_REVIEW" | cut -d: -f1)"
+ENF_LINE="$(grep -n '^[[:space:]]*apply_all_enforcement_wrapper ' "$RUN_REVIEW" | cut -d: -f1)"
 if [[ -n "$ESC_LINE" && -n "$ENF_LINE" && "$ESC_LINE" -lt "$ENF_LINE" ]]; then
   echo "  PASS: escalation runs before enforcement/validation"
   PASS=$((PASS + 1))

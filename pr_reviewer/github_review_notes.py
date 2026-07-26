@@ -184,13 +184,12 @@ def _diff_snapshot(diff_text: str) -> tuple[set[str], dict[str, set[int]]]:
     return paths, added
 
 
-def legacy_diff_positions(diff_text: str) -> dict[str, dict[int, int]]:
-    """Compatibility map for the legacy inline-comment payload builder.
+def diff_positions(diff_text: str) -> dict[str, dict[int, int]]:
+    """Map commentable RIGHT-side lines to diff positions by changed path.
 
-    The specialist publisher uses :func:`choose_note_anchor` and therefore
-    only accepts actually changed RIGHT-side lines.  Existing single-review
-    callers historically allow context lines too; this isolated adapter keeps
-    that behavior until Task 17 removes those callers.
+    The single-review publisher uses these positions for both GitHub line
+    comments and Forgejo's ``new_position`` payload. Specialist review notes
+    use :func:`choose_note_anchor`.
     """
 
     positions_by_path: dict[str, dict[int, int]] = {}
@@ -2569,6 +2568,6 @@ __all__ = [
     "build_review_thread_variables",
     "choose_note_anchor",
     "extract_managed_fingerprint",
-    "legacy_diff_positions",
+    "diff_positions",
     "normalize_note",
 ]

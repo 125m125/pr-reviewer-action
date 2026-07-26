@@ -16,7 +16,6 @@ from pr_reviewer.tool_loop import (
     STOP_STREAM_WATCHDOG,
     STOP_WALL_CLOCK,
     LoopBudgets,
-    adaptive_loop_budgets,
     detect_textual_tool_intent,
     drive_tool_loop,
     effective_intermediate_text,
@@ -33,33 +32,6 @@ src/parent.ts
 </parameter>
 </function>
 </tool_call>"""
-
-
-class TestAdaptiveLoopBudgets:
-    """Loop depth is route-independent: exactly 2× configured rounds
-    plus the configured tool-call budget, on every route. The route selects the
-    MODEL, never the tool budget — the primary model is fully capable and is no
-    longer shallow-capped (the loop self-limits when the model stops calling
-    tools)."""
-
-    def test_headroom_doubles_rounds_without_hidden_cap(self):
-        b = adaptive_loop_budgets(3, 4, 120.0)
-        assert b.max_rounds == 6  # 3 * 2
-        assert b.max_tool_calls == 4
-        assert adaptive_loop_budgets(6, 4, 120.0).max_rounds == 12
-
-    def test_primary_route_is_not_shallowed(self):
-        # Was capped to 2 rounds / 3 calls; now gets the full configured budget.
-        b = adaptive_loop_budgets(3, 8, 120.0, review_route="primary", risk_flag_count=0)
-        assert b.max_rounds == 6
-        assert b.max_tool_calls == 8
-
-    def test_every_route_gets_the_same_budget(self):
-        # incl. the deprecated "fast" value and risk_flag_count (now ignored).
-        for route in ("primary", "smart", "legacy", "fast", "", None):
-            b = adaptive_loop_budgets(3, 8, 120.0, review_route=route, risk_flag_count=0)
-            assert b.max_rounds == 6, route
-            assert b.max_tool_calls == 8, route
 
 
 def openai_tool_call_response(calls, content=None):

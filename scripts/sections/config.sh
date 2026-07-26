@@ -296,6 +296,8 @@ case "$(printf '%s' "$REVIEW_STRATEGY" | tr '[:upper:]' '[:lower:]')" in
     exit 1 ;;
 esac
 
+# ``packet`` is accepted only so the Python CLI can emit its one-release
+# migration warning. No runtime branch consumes it.
 case "$(printf '%s' "$SPECIALIST_TOOL_MODE" | tr '[:upper:]' '[:lower:]')" in
   native_loop|packet)
     SPECIALIST_TOOL_MODE="$(printf '%s' "$SPECIALIST_TOOL_MODE" | tr '[:upper:]' '[:lower:]')" ;;

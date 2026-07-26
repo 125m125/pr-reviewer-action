@@ -2041,23 +2041,8 @@ def test_cli_pr_file_objects_reach_real_publisher_as_complete_paths(tmp_path, mo
     assert state["changed_files_complete"] is True
 
 
-def test_legacy_publish_scripts_delegate_shared_diff_and_marker_primitives():
-    from pr_reviewer.github_review_notes import (
-        extract_managed_fingerprint,
-        legacy_diff_positions,
-    )
-    from scripts import build_review_comments, resolve_finding_threads
-
-    assert build_review_comments.diff_positions is legacy_diff_positions
-    body = "x <!-- ai-pr-review-finding:legacy-fp -->"
-    assert resolve_finding_threads.extract_marker_fingerprint(body) == "legacy-fp"
-    assert extract_managed_fingerprint(
-        body, build_review_comments.FINDING_MARKER_PREFIX
-    ) == "legacy-fp"
-
-
-def test_legacy_diff_adapter_preserves_linux_backslash_filename():
-    from pr_reviewer.github_review_notes import legacy_diff_positions
+def test_diff_positions_preserves_linux_backslash_filename():
+    from pr_reviewer.github_review_notes import diff_positions
 
     diff = """\
 diff --git "a/dir\\name.py" "b/dir\\name.py"
@@ -2067,15 +2052,7 @@ diff --git "a/dir\\name.py" "b/dir\\name.py"
 -old
 +new
 """
-    assert legacy_diff_positions(diff) == {"dir\\name.py": {1: 2}}
-
-
-def test_publish_helper_exposes_specialist_compatibility_wrapper():
-    helper = (
-        Path(__file__).resolve().parent.parent / "scripts" / "publish_helpers.sh"
-    ).read_text(encoding="utf-8")
-    assert "publish_specialist_review()" in helper
-    assert "scripts/publish_specialist_review.py" in helper
+    assert diff_positions(diff) == {"dir\\name.py": {1: 2}}
 
 
 def _connection(nodes=(), *, has_next=False, cursor=None):

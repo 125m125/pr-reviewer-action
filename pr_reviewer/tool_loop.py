@@ -99,40 +99,6 @@ class LoopBudgets:
     max_truncation_continuations: int = 1
 
 
-def adaptive_loop_budgets(
-    max_rounds: int,
-    max_tool_calls: int,
-    wall_clock_sec: float,
-    *,
-    review_route: str = "primary",
-    risk_flag_count: int = 0,
-) -> "LoopBudgets":
-    """Apply the documented legacy mapping of two planning turns per round.
-
-    Positive configured call and time limits are used exactly, with no hidden
-    cap or route-dependent reduction.
-
-    The budget is the SAME on every route — the route selects the MODEL, never
-    the tool budget. An earlier version shallow-capped the primary route (then
-    misnamed "fast") on low-risk PRs to "save budget on a trivial diff", but the
-    loop already self-limits (it stops as soon as the model stops calling
-    tools), so the cap never saved cost on trivial PRs — it only starved the
-    PRs that genuinely need a multi-hop chain (e.g. reading a deployed version,
-    then verifying it against a host platform's compatibility matrix). The
-    primary model is fully capable; don't ration its evidence-gathering.
-    ``review_route``/``risk_flag_count`` are retained for signature stability
-    and possible future heuristics.
-    """
-    if max_rounds <= 0 or max_tool_calls <= 0 or wall_clock_sec <= 0:
-        raise ValueError("native-loop budgets must be positive")
-    rounds = max_rounds * 2
-    return LoopBudgets(
-        max_tool_calls=max_tool_calls,
-        max_rounds=rounds,
-        wall_clock_sec=float(wall_clock_sec),
-    )
-
-
 @dataclass
 class ExecutedCall:
     tool: str
