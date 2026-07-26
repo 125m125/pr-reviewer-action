@@ -245,3 +245,79 @@ All completed with exit code 0 and no output.
   untracked:
   - `docs/superpowers/plans/2026-07-12-stream-loop-watchdog.md`
   - `docs/superpowers/specs/2026-07-12-large-review-reliability-design.md`
+
+## Review fix round 1/5: exact TOOL_MAX_ROUNDS wiring coverage
+
+The first important review finding correctly identified that Task 17's
+dead-pattern guard would not catch a future cap, offset, or different
+multiplication expression. Existing parsing coverage also exercised only
+`TOOL_MAX_REQUESTS`, not the real `TOOL_MAX_ROUNDS` path into
+`LoopBudgets.max_rounds`.
+
+Added focused wiring coverage in `tests/test_run_native_loop_wiring.py`:
+
+- generalized the existing `drive_tool_loop` capture helper so it retains the
+  real keyword arguments supplied by `run_native_loop`;
+- parameterized exact positive values at the lower validation boundary (`1`),
+  a representative configured value (`7`), and a large uncapped value
+  (`4096`);
+- asserted all three independent observables:
+  `budgets.max_rounds`, `budget.rounds_configured`, and
+  `budget.planning_turns_effective`;
+- exercised the real configuration path's zero boundary and asserted it is
+  rejected before the driver runs;
+- left all no-progress and repeated-call-set tests unchanged.
+
+### RED
+
+After adding the test, a deliberate local mutation changed the production
+assignment to `max_rounds=max_rounds * 2`. This mutation was used only to prove
+the new test detects the regression and was immediately reverted.
+
+Command:
+
+```text
+.\.venv\Scripts\python.exe -m pytest \
+  tests/test_run_native_loop_wiring.py::test_tool_max_rounds_reaches_loop_budgets_unchanged \
+  tests/test_run_native_loop_wiring.py::test_tool_max_rounds_zero_is_rejected_before_driver -v
+```
+
+Result:
+
+```text
+3 failed, 1 passed
+configured 1: expected 1, got 2
+configured 7: expected 7, got 14
+configured 4096: expected 4096, got 8192
+zero boundary: passed (rejected before driver)
+```
+
+### GREEN
+
+With the direct `max_rounds=max_rounds` assignment restored, the same command
+reported:
+
+```text
+4 passed in 0.13s
+```
+
+Native-loop, wiring, action-input, and action-shell focused suite:
+
+```text
+pytest tests/test_native_tool_loop.py tests/test_run_native_loop_wiring.py \
+  tests/test_tool_max_requests.py tests/test_action_inputs.py \
+  tests/test_action_shell_syntax.py -q
+95 passed in 2.30s
+```
+
+Focused shell wiring:
+
+```text
+bash tests/test_tool_loop_wiring.sh
+15 passed, 0 failed
+```
+
+The fix adds test coverage only; production behavior remains the verified
+direct mapping from `TOOL_MAX_ROUNDS` to `LoopBudgets.max_rounds`. The deferred
+minor `classification.sh` comment was not touched. Both untracked July 12
+documents remain preserved.

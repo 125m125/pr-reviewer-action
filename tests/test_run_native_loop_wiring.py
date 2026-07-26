@@ -375,16 +375,20 @@ def test_native_loop_accepts_useful_no_tool_completion(monkeypatch, tmp_path):
     assert result["synthesis"]["ran"] is False
 
 
-def _capture_summarize_fn(monkeypatch, tmp_path, *, enabled):
-    """Run run_native_loop with drive_tool_loop stubbed to capture the
-    summarize_fn kwarg, so we can assert the result-summarization wiring
-    without forcing a real 24k-token conversation overflow."""
+def _capture_drive_kwargs(
+    monkeypatch,
+    tmp_path,
+    *,
+    summarize_enabled: bool = False,
+    tool_max_rounds: str | None = None,
+):
+    """Capture the real run_native_loop configuration passed to its driver."""
     import pr_reviewer.tool_loop as tl
 
     captured = {}
 
     def fake_drive(conversation, post_fn, execute_fn, **kwargs):
-        captured["summarize_fn"] = kwargs.get("summarize_fn")
+        captured.update(kwargs)
         out = tl.LoopOutcome()
         out.degraded = True
         out.stop_reason = "no-tool-calls"
@@ -393,10 +397,12 @@ def _capture_summarize_fn(monkeypatch, tmp_path, *, enabled):
     monkeypatch.setattr(tl, "drive_tool_loop", fake_drive)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("EFFECTIVE_SCOPE", "full")
-    if enabled:
+    if summarize_enabled:
         monkeypatch.setenv("TOOL_LOOP_SUMMARIZE", "true")
     else:
         monkeypatch.delenv("TOOL_LOOP_SUMMARIZE", raising=False)
+    if tool_max_rounds is not None:
+        monkeypatch.setenv("TOOL_MAX_ROUNDS", tool_max_rounds)
     result = {
         "mode": "plan_execute_once",
         "planned_request_count": 0,
@@ -410,17 +416,41 @@ def _capture_summarize_fn(monkeypatch, tmp_path, *, enabled):
         12000, 15, 4, 45, 400, result,
     )
     assert handled is False  # the stub degraded
-    return captured["summarize_fn"]
+    captured["result"] = result
+    return captured
+
+
+@pytest.mark.parametrize("configured", ("1", "7", "4096"))
+def test_tool_max_rounds_reaches_loop_budgets_unchanged(
+    monkeypatch, tmp_path, configured
+):
+    captured = _capture_drive_kwargs(
+        monkeypatch, tmp_path, tool_max_rounds=configured
+    )
+
+    budgets = captured["budgets"]
+    assert budgets.max_rounds == int(configured)
+    assert captured["result"]["budget"]["rounds_configured"] == int(configured)
+    assert captured["result"]["budget"]["planning_turns_effective"] == int(
+        configured
+    )
+
+
+def test_tool_max_rounds_zero_is_rejected_before_driver(monkeypatch, tmp_path):
+    with pytest.raises(ValueError, match="TOOL_MAX_ROUNDS must be a positive integer"):
+        _capture_drive_kwargs(monkeypatch, tmp_path, tool_max_rounds="0")
 
 
 def test_summarize_fn_wired_when_enabled(monkeypatch, tmp_path):
-    summarize_fn = _capture_summarize_fn(monkeypatch, tmp_path, enabled=True)
-    assert callable(summarize_fn)
+    captured = _capture_drive_kwargs(
+        monkeypatch, tmp_path, summarize_enabled=True
+    )
+    assert callable(captured["summarize_fn"])
 
 
 def test_summarize_fn_absent_by_default(monkeypatch, tmp_path):
-    summarize_fn = _capture_summarize_fn(monkeypatch, tmp_path, enabled=False)
-    assert summarize_fn is None
+    captured = _capture_drive_kwargs(monkeypatch, tmp_path)
+    assert captured["summarize_fn"] is None
 
 
 def _openai_text_with_usage(text, *, prompt, completion, cached=0):
