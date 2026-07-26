@@ -141,6 +141,7 @@ class OpenAIModelGateway:
             request.role,
             timeout_sec=request.timeout_sec,
             deadline_at=request.deadline_at,
+            requested_response_format=response_format,
             stream_watchdog=(StreamWatchdog("openai") if request.stream and self.stream_watchdog else None),
         )
         calls, text, text_source, finish_reason = extract_intermediate_turn(response, "openai")
@@ -164,6 +165,7 @@ class OpenAIModelGateway:
         *,
         timeout_sec: float,
         deadline_at: float | None = None,
+        requested_response_format: str | None = None,
         compact_fallback_payload: dict[str, Any] | None = None,
         stream_watchdog: StreamWatchdog | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -244,12 +246,23 @@ class OpenAIModelGateway:
                 response = unstructured_retry()
 
         usage = response.get("usage") if isinstance(response, dict) else {}
+        payload_format = payload.get("response_format")
+        payload_format_name = (
+            str(payload_format.get("type"))
+            if isinstance(payload_format, Mapping)
+            else "off"
+        )
+        requested_format = requested_response_format or payload_format_name
+        effective_format = "off" if structured_fallback else payload_format_name
         diagnostics = {
             "role": role,
             "model": payload.get("model"),
             "duration_sec": round(time.monotonic() - started, 3),
             "usage": usage if isinstance(usage, dict) else {},
-            "response_format": self.response_format if "response_format" in payload else "off",
+            "response_format": effective_format,
+            "response_format_configured": self.response_format,
+            "response_format_requested": requested_format,
+            "response_format_effective": effective_format,
             "structured_output_fallback": structured_fallback,
             "structured_output_error": original_error if structured_fallback else "",
         }

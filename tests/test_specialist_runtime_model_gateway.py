@@ -44,6 +44,32 @@ def test_role_model_override_and_deadline_bound_timeout():
     assert result.usage == {"prompt_tokens": 3, "completion_tokens": 2}
 
 
+def test_diagnostics_distinguish_configured_and_per_request_response_formats():
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1",
+        api_key="",
+        default_model="main",
+        response_format="json_schema",
+        transport=lambda *_args, **_kwargs: stop_response("{}"),
+    )
+
+    result = gateway.complete(ModelTurnRequest(
+        role="planner",
+        conversation=conversation(),
+        max_tokens=512,
+        response_schema={"type": "object"},
+        tools_enabled=False,
+        timeout_sec=20,
+        stream=False,
+        response_format_override="json_object",
+    ))
+
+    assert result.request_diagnostics["response_format_configured"] == "json_schema"
+    assert result.request_diagnostics["response_format_requested"] == "json_object"
+    assert result.request_diagnostics["response_format_effective"] == "json_object"
+    assert result.request_diagnostics["response_format"] == "json_object"
+
+
 def test_gateway_rejects_non_openai_format_before_transport():
     called = False
 
