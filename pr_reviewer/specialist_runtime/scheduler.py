@@ -234,6 +234,37 @@ class SessionScheduler:
         try:
             result = session.explore()
         except BaseException as exc:
+            message = format_callback_error(exc).lower()
+            recovery_reason = None
+            for markers, reason in (
+                (
+                    ("invalid provider history", "invalid message history",
+                     "tool call history"),
+                    "invalid-provider-history",
+                ),
+                (
+                    ("transport incompat", "unsupported transport",
+                     "sse protocol"),
+                    "transport-incompatibility",
+                ),
+                (("repetitive transcript", "no progress"), "repetitive-transcript"),
+                (("context pressure", "context limit"), "context-pressure"),
+                (("polluted transcript",), "polluted-transcript"),
+            ):
+                if any(marker in message for marker in markers):
+                    recovery_reason = reason
+                    break
+            recover = getattr(session, "recover", None)
+            if recovery_reason is not None and callable(recover):
+                try:
+                    recover(recovery_reason)
+                    result = session.explore()
+                except BaseException as recovery_exc:
+                    return _FailedSession(
+                        session=session,
+                        error=format_callback_error(recovery_exc),
+                    )
+                return _CompletedSession(session=session, result=result)
             return _FailedSession(
                 session=session, error=format_callback_error(exc),
             )

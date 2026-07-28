@@ -57,7 +57,10 @@ def derive_runtime_verdict(
             str(item).strip().lower() for item in configured if str(item).strip()
         }.intersection({"blocker", "major"})
     else:
-        blocking_severities = set()
+        # A malformed repository policy must not silently disable the secure
+        # default.  The validated v2 parser rejects this earlier; this guard
+        # protects direct/internal callers as well.
+        blocking_severities = {"blocker", "major"}
 
     blocking_findings = tuple(sorted(
         str(finding_id).strip()

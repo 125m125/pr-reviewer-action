@@ -212,7 +212,7 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
-| `review_strategy` | `single` preserves the existing path; `specialists_evaluate` runs the complete specialist pipeline without publishing; `specialists` publishes its validated result | No | `single` |
+| `review_strategy` | `single` preserves the existing path; `specialists_evaluate` runs without publishing; `specialists` enables publication only when `publish_review_comment` is also `true` | No | `single` |
 | `review_policy_file` | Current-branch version-2 specialist policy; source and publishing restrictions are authoritative | No | `.github/ai-review-policy.json` |
 | `specialist_review_deadline_sec` | Absolute specialist run deadline including finalization and artifact production | No | `7200` |
 | `specialist_phase_shares` | JSON percentage allocation for planning, initial, follow-up, and finalization; must total 100 | No | `{"planning":10,"initial":60,"followup":20,"finalization":10}` |
@@ -223,7 +223,7 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_max_tool_calls_per_session` | Lifetime read-only tool-call limit for one logical specialist session | No | `20` |
 | `specialist_max_recoveries_per_session` | Lifetime reconstruction limit for one logical specialist session | No | `1` |
 | `specialist_config_file` | Deprecated one-release alias for a version-1 policy; migrate to `review_policy_file` | No | `.github/ai-review-specialists.json` |
-| `specialist_planner_max_tool_calls` | Maximum read-only calls available to the bounded topology/diff planning scout | No | `2` |
+| `specialist_planner_max_tool_calls` | Deprecated no-op; the planner role does not expose tools. Use `specialist_max_tool_calls_per_session` | No | `2` |
 | `specialist_planner_max_tokens` | Completion-token ceiling for the bounded planning scout | No | `2048` |
 | `specialist_max_initial_passes` | Deprecated one-release alias for `specialist_max_sessions` | No | `6` |
 | `specialist_max_followup_passes` | Deprecated one-release alias for `specialist_max_followup_sessions` | No | `2` |
@@ -235,13 +235,13 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_aggregator_model` | Candidate-ranking model; empty inherits `ai_model` | No | `""` |
 | `specialist_pass_timeout_sec` | Per-model-request timeout for specialist strategies | No | `600` |
 | `specialist_max_tokens` | Completion-token ceiling for specialist, critic, and aggregator turns | No | `4096` |
-| `specialist_recovery_max_tokens` | Completion-token ceiling for the one compact recovery after a repetition watchdog stop | No | `2048` |
+| `specialist_recovery_max_tokens` | Completion-token ceiling for the first reconstructed specialist turn after bounded recovery | No | `2048` |
 | `specialist_max_conversation_tokens` | Approximate transcript ceiling for one specialist conversation; independent of `model_context_tokens` | No | `96000` |
 | `specialist_temperature` | Sampling temperature for streamed specialist exploration turns; keep `0.0` for deterministic behavior or experiment with a modest value | No | `0.0` |
 | `specialist_stream_watchdog` | Interrupt streamed specialist output after repeated paragraphs/blocks and recover once from compact evidence | No | `true` |
-| `specialist_max_truncation_continuations` | Maximum continuation turns after a specialist response reaches the completion-token limit | No | `2` |
+| `specialist_max_truncation_continuations` | Deprecated no-op; durable sessions checkpoint instead of issuing truncation-continuation turns | No | `2` |
 | `specialist_planner_max_context_bytes` | Diff/context bytes supplied to the planner before tool exploration | No | `60000` |
-| `specialist_packet_max_bytes` | Retained migration setting for the deprecated packet input; durable sessions ignore it | No | `90000` |
+| `specialist_packet_max_bytes` | Deprecated no-op; durable sessions do not build packet-mode specialist inputs | No | `90000` |
 
 For an executable version-2 migration, policy example, workflow conversion,
 artifact expectations, and troubleshooting, see the

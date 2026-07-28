@@ -138,7 +138,26 @@ class _RecordedGateway:
         response = self._active.get("response")
         if not isinstance(response, Mapping):
             raise AssertionError("adversarial response is not an OpenAI object")
-        return deepcopy(dict(response))
+        upgraded = deepcopy(dict(response))
+        for choice in upgraded.get("choices", ()):
+            message = choice.get("message", {}) if isinstance(choice, dict) else {}
+            for call in message.get("tool_calls", ()):
+                function = call.get("function", {}) if isinstance(call, dict) else {}
+                raw_arguments = function.get("arguments")
+                if not isinstance(raw_arguments, str):
+                    continue
+                try:
+                    arguments = json.loads(raw_arguments)
+                except json.JSONDecodeError:
+                    continue
+                obligation_id = arguments.pop("obligation_id", None)
+                arguments.pop("evidence_category", None)
+                if obligation_id:
+                    arguments["obligation_ids"] = [obligation_id]
+                function["arguments"] = json.dumps(
+                    arguments, sort_keys=True, separators=(",", ":"),
+                )
+        return upgraded
 
     def assert_complete(self) -> None:
         if self.index != len(self.turns):
@@ -267,24 +286,13 @@ def _completion_controller_run(
         session_gateways[assignment_id] = gateway
 
         def execute(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-            result = {
+            return {
                 "tool": name,
                 "status": "ok",
                 "result": {
                     "content": f"{assignment_id}:{arguments.get('path', '')}",
                 },
             }
-            evidence.add_tool_result(
-                session_id=session_id,
-                tool=name,
-                arguments=arguments,
-                result=result,
-                category=str(
-                    arguments.get("evidence_category") or "tool-result"
-                ),
-                model_identity="recorded-adversarial",
-            )
-            return result
 
         return SpecialistSession(
             session_id=session_id,

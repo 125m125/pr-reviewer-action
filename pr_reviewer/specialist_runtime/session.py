@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import inspect
+import time
 from dataclasses import asdict, dataclass
 from pathlib import PurePosixPath
 from typing import Any, Callable, Mapping
@@ -26,9 +28,14 @@ from .types import (
     SessionState,
     SpecialistAssignment,
 )
+from .web_evidence import (
+    SearchCandidate,
+    SourceAccessRequest,
+    source_access_request,
+)
 
 
-ToolExecutor = Callable[[str, dict[str, Any]], dict[str, Any]]
+ToolExecutor = Callable[..., dict[str, Any]]
 
 _CHECKPOINT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -155,11 +162,12 @@ def _evidence_matches_obligation(
         source_path = _normalized_path(record.source_path or "")
         if not source_path:
             return False
-        return any(
+        if not any(
             source_path == scope_path or source_path.startswith(scope_path + "/")
             for raw_path in scoped_paths
             if (scope_path := _normalized_path(raw_path))
-        )
+        ):
+            return False
     category = record.category.strip().lower()
     return bool(category) and category in {
         item.strip().lower()
@@ -212,11 +220,18 @@ class SpecialistSession:
         stream: bool = False,
         max_no_progress_streak: int = 2,
         max_context_tokens: int = 24_000,
+        recovery_max_tokens: int | None = None,
         recovery_evidence_bytes: int = 8_000,
+        clock: Callable[[], float] = time.monotonic,
+        wire_safety_tokens: int = 256,
     ) -> None:
         if not session_id.strip():
             raise ValueError("session_id must not be empty")
-        if request_timeout_sec <= 0 or max_tokens <= 0:
+        if (
+            request_timeout_sec <= 0
+            or max_tokens <= 0
+            or (recovery_max_tokens is not None and recovery_max_tokens <= 0)
+        ):
             raise ValueError("request timeout and max tokens must be positive")
         self.session_id = session_id
         self.assignment = assignment
@@ -232,12 +247,22 @@ class SpecialistSession:
         self.stream = stream
         self.max_no_progress_streak = max_no_progress_streak
         self.max_context_tokens = max_context_tokens
+        self.recovery_max_tokens = min(
+            max_tokens,
+            max_tokens if recovery_max_tokens is None else recovery_max_tokens,
+        )
         self.recovery_evidence_bytes = recovery_evidence_bytes
+        self.clock = clock
+        self.wire_safety_tokens = max(0, int(wire_safety_tokens))
         self.state = SessionState.CREATED
         self._current_gaps = self._assigned_obligation_ids()
         self.latest_checkpoint = self._project_checkpoint(())
         self.candidate_findings: tuple[CandidateFinding, ...] = ()
+        self.source_access_requests: tuple[SourceAccessRequest, ...] = ()
         self._successful_requests: dict[str, EvidenceRecord] = {}
+        self._successful_collections: dict[str, str] = {}
+        self._tool_lease_exhausted = False
+        self._recovery_turn_pending = False
         self._final_result: SessionResult | None = None
         self._request_events: list[SpecialistRequestEvent] = []
         self._request_attempt_journal: RequestAttemptJournal | None = None
@@ -247,6 +272,27 @@ class SpecialistSession:
         self._request_turn = 0
         if not self.conversation.events:
             self.conversation.add_user(self._assignment_prompt())
+        self._advertise_obligation_associations()
+
+    def _advertise_obligation_associations(self) -> None:
+        """Add controller-owned association metadata only to specialist schemas."""
+        schemas = json.loads(json.dumps(self.conversation.tool_schemas))
+        for schema in schemas:
+            parameters = schema.get("parameters")
+            if not isinstance(parameters, dict):
+                continue
+            properties = parameters.get("properties")
+            if not isinstance(properties, dict):
+                continue
+            properties["obligation_ids"] = {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional assigned obligation IDs this collection is meant "
+                    "to support. Evidence categories are derived by the runtime."
+                ),
+            }
+        self.conversation.tool_schemas = schemas
 
     def _assignment_prompt(self) -> str:
         lenses = getattr(self.assignment, "analytical_lens", "")
@@ -298,12 +344,36 @@ class SpecialistSession:
         remaining_output_tokens = self.budget.remaining_output_tokens()
         if remaining_output_tokens is not None and remaining_output_tokens <= 0:
             raise BudgetExhausted("output token limit exhausted")
-        request_max_tokens = (
-            self.max_tokens
-            if remaining_output_tokens is None
-            else min(self.max_tokens, remaining_output_tokens)
+        configured_max_tokens = (
+            self.recovery_max_tokens
+            if self._recovery_turn_pending
+            else self.max_tokens
         )
-        timeout = self.lease.request_timeout(self.request_timeout_sec)
+        request_max_tokens = (
+            configured_max_tokens
+            if remaining_output_tokens is None
+            else min(configured_max_tokens, remaining_output_tokens)
+        )
+        if (
+            estimated_input_tokens
+            + request_max_tokens
+            + self.wire_safety_tokens
+            > self.max_context_tokens
+        ):
+            self._compact_conversation()
+            estimated_input_tokens = self.conversation.approx_tokens()
+            if (
+                estimated_input_tokens
+                + request_max_tokens
+                + self.wire_safety_tokens
+                > self.max_context_tokens
+            ):
+                raise BudgetExhausted(
+                    "model context limit cannot admit input and requested output"
+                )
+        timeout = self.lease.request_timeout(
+            self.request_timeout_sec, now=self.clock(),
+        )
         self.budget.reserve_model_turn()
         self._request_turn += 1
         request_id = f"{self.session_id}:model:{self._request_turn}"
@@ -360,20 +430,28 @@ class SpecialistSession:
             input_tokens=int(result.usage.get("prompt_tokens", 0) or 0),
             output_tokens=int(result.usage.get("completion_tokens", 0) or 0),
         )
+        self._recovery_turn_pending = False
         return result
 
     def explore(self) -> SessionResult:
         """Explore until the specialist emits or is forced to a checkpoint."""
         if self._final_result is not None:
             return self._final_result
-        self.lease.request_timeout(self.request_timeout_sec)
+        self.lease.request_timeout(
+            self.request_timeout_sec, now=self.clock(),
+        )
         self.state = SessionState.EXPLORING
         while True:
             if self.conversation.approx_tokens() > self.max_context_tokens:
                 self._compact_conversation()
                 if self.conversation.approx_tokens() > self.max_context_tokens:
                     return self.request_checkpoint("context-pressure")
-            turn = self._request(tools_enabled=True, schema=None)
+            try:
+                turn = self._request(tools_enabled=True, schema=None)
+            except BudgetExhausted as exc:
+                if "model context limit" not in str(exc):
+                    raise
+                return self.request_checkpoint("context-pressure")
             if turn.text:
                 self.conversation.add_assistant_text(turn.text)
             if not turn.tool_calls:
@@ -385,6 +463,8 @@ class SpecialistSession:
                 return self._snapshot()
             self.conversation.add_assistant_tool_calls(turn.tool_calls)
             progressed = self._execute_calls(turn.tool_calls)
+            if self._tool_lease_exhausted:
+                return self.request_checkpoint("tool-lease-expired")
             if progressed:
                 self.budget.reset_no_progress_streak("new retained evidence")
             else:
@@ -403,9 +483,53 @@ class SpecialistSession:
                 self.budget.record_tool_rejection("invalid tool arguments")
                 self.conversation.add_tool_result(call_id, {"error": str(exc)}, is_error=True)
                 continue
+            if "evidence_category" in arguments or "obligation_id" in arguments:
+                self.budget.record_tool_rejection(
+                    "model-supplied evidence authority is forbidden"
+                )
+                self.conversation.add_tool_result(
+                    call_id,
+                    {"error": "evidence categories are runtime-derived"},
+                    is_error=True,
+                )
+                continue
+            raw_obligation_ids = arguments.pop("obligation_ids", ())
+            if raw_obligation_ids in (None, ()):
+                requested_obligation_ids: tuple[str, ...] = ()
+            elif (
+                isinstance(raw_obligation_ids, list)
+                and all(
+                    isinstance(item, str) and item.strip()
+                    for item in raw_obligation_ids
+                )
+            ):
+                requested_obligation_ids = tuple(dict.fromkeys(
+                    item.strip() for item in raw_obligation_ids
+                ))
+            else:
+                self.budget.record_tool_rejection("invalid obligation_ids")
+                self.conversation.add_tool_result(
+                    call_id, {"error": "obligation_ids must be an array of strings"},
+                    is_error=True,
+                )
+                continue
+            if set(requested_obligation_ids) - set(
+                self._assigned_obligation_ids()
+            ):
+                self.budget.record_tool_rejection("unassigned obligation_ids")
+                self.conversation.add_tool_result(
+                    call_id, {"error": "obligation_ids contain an unassigned id"},
+                    is_error=True,
+                )
+                continue
             key = native_tool_request_key(name, arguments)
             prior = self._successful_requests.get(key)
             if prior is not None:
+                collection_id = self._successful_collections.get(key)
+                if collection_id:
+                    self._associate_collection(
+                        collection_id, prior, requested_obligation_ids,
+                    )
                 self.budget.record_tool_rejection("duplicate tool request")
                 self.conversation.add_tool_result(
                     call_id,
@@ -421,14 +545,48 @@ class SpecialistSession:
                 )
                 continue
             try:
-                result = self.execute_tool(name, arguments)
+                timeout = self.lease.request_timeout(
+                    self.request_timeout_sec, now=self.clock(),
+                )
+            except TimeoutError:
+                self.budget.record_tool_rejection("session lease expired")
+                self.conversation.add_tool_result(
+                    call_id, {"error": "session lease expired"}, is_error=True,
+                )
+                self._tool_lease_exhausted = True
+                break
+            try:
+                signature = inspect.signature(self.execute_tool)
+                supports_deadline = all(
+                    parameter in signature.parameters
+                    or any(
+                        item.kind is inspect.Parameter.VAR_KEYWORD
+                        for item in signature.parameters.values()
+                    )
+                    for parameter in ("timeout_sec", "deadline_at")
+                )
+                if supports_deadline:
+                    result = self.execute_tool(
+                        name,
+                        arguments,
+                        timeout_sec=timeout,
+                        deadline_at=self.lease.deadline_at,
+                    )
+                else:
+                    result = self.execute_tool(name, arguments)
             except Exception as exc:  # noqa: BLE001 - executor failures become tool results
                 result = {"tool": name, "status": "error", "error": str(exc)}
             if not isinstance(result, dict):
                 result = {"tool": name, "status": "error", "error": "invalid executor result"}
             is_error = str(result.get("status", "")).lower() not in {"ok", "success", "completed"}
-            record = self.evidence_store.add_tool_result(
+            self._record_source_access_requests(
+                name, result, requested_obligation_ids,
+            )
+            record, collection = self.evidence_store.add_tool_result_with_collection(
                 session_id=self.session_id, tool=name, arguments=arguments, result=result,
+            )
+            self._associate_collection(
+                collection.id, record, requested_obligation_ids,
             )
             self.conversation.add_tool_result(
                 call_id,
@@ -441,8 +599,129 @@ class SpecialistSession:
             )
             if record.is_usable_for_coverage:
                 self._successful_requests[key] = record
+                self._successful_collections[key] = collection.id
                 progressed = True
+            if self.clock() >= self.lease.deadline_at:
+                self._tool_lease_exhausted = True
+                break
         return progressed
+
+    def _record_source_access_requests(
+        self,
+        tool_name: str,
+        result: Mapping[str, Any],
+        requested_obligation_ids: tuple[str, ...],
+    ) -> None:
+        if tool_name != "web_search" or str(
+            result.get("status", "")
+        ).lower() not in {"ok", "success", "completed"}:
+            return
+        payload = result.get("result")
+        if not isinstance(payload, Mapping):
+            return
+        unapproved = payload.get("unapproved")
+        if not isinstance(unapproved, list):
+            return
+        obligation_ids = requested_obligation_ids or self._current_gaps
+        retained = {
+            (
+                item.obligation_id,
+                item.host,
+                item.candidate_url,
+                item.purpose,
+            ): item
+            for item in self.source_access_requests
+        }
+        for raw in unapproved:
+            if not isinstance(raw, Mapping):
+                continue
+            candidate = SearchCandidate(
+                title=None,
+                snippet=None,
+                url=str(raw.get("url") or ""),
+                host=str(raw.get("host") or ""),
+                path=str(raw.get("path") or ""),
+                denial_reason=str(raw.get("denial_reason") or ""),
+            )
+            for obligation_id in obligation_ids:
+                try:
+                    request = source_access_request(
+                        candidate,
+                        obligation_id,
+                        "Retrieve the discovered source to verify the assigned "
+                        "review obligation.",
+                        candidate.denial_reason or "source policy did not approve it",
+                    )
+                except ValueError:
+                    continue
+                retained[(
+                    request.obligation_id,
+                    request.host,
+                    request.candidate_url,
+                    request.purpose,
+                )] = request
+        self.source_access_requests = tuple(
+            retained[key] for key in sorted(retained)
+        )
+
+    def _associate_collection(
+        self,
+        collection_id: str,
+        record: EvidenceRecord,
+        requested_obligation_ids: tuple[str, ...],
+    ) -> None:
+        if not record.is_usable_for_coverage:
+            return
+        candidates = requested_obligation_ids
+        if not candidates:
+            candidates = tuple(
+                obligation_id for obligation_id in self._assigned_obligation_ids()
+                if self.coverage.obligation(obligation_id).scope
+            )
+        for obligation_id in candidates:
+            obligation = self.coverage.obligation(obligation_id)
+            if not obligation.required_evidence_categories:
+                continue
+            scoped = tuple(dict.fromkeys(
+                (*obligation.scope, *obligation.seed_hints)
+            ))
+            if scoped:
+                source_path = _normalized_path(record.source_path or "")
+                if not source_path or not any(
+                    source_path == path or source_path.startswith(path + "/")
+                    for raw_path in scoped
+                    if (path := _normalized_path(raw_path))
+                ):
+                    continue
+            elif not requested_obligation_ids:
+                continue
+            self.evidence_store.associate_collection(
+                collection_id,
+                obligation_id=obligation_id,
+                categories=obligation.required_evidence_categories,
+            )
+
+    def _record_matches_obligation(
+        self, record: EvidenceRecord, obligation: CoverageObligation,
+    ) -> bool:
+        snapshot = self.evidence_store.snapshot()
+        if snapshot.associations_for(record.id, obligation.id):
+            return any(
+                _evidence_matches_obligation(
+                    EvidenceRecord(
+                        **{
+                            **record.__dict__,
+                            "category": category,
+                        }
+                    ),
+                    obligation,
+                )
+                for _collection, association in snapshot.associations_for(
+                    record.id, obligation.id,
+                )
+                for category in association.categories
+            )
+        return _evidence_matches_obligation(record, obligation)
 
     def request_checkpoint(self, reason: str = "controller-request") -> SessionResult:
         """Request a structured checkpoint; never force a final report."""
@@ -498,7 +777,7 @@ class SpecialistSession:
                 for evidence_id in _strings(ids):
                     record = retained.get(evidence_id)
                     obligation = self.coverage.obligation(obligation_id)
-                    if record is not None and _evidence_matches_obligation(record, obligation):
+                    if record is not None and self._record_matches_obligation(record, obligation):
                         self.coverage.attach_evidence(obligation_id, evidence_id)
                         evidence_ids.append(evidence_id)
         # The compact `inspected` checkpoint form associates retained inspected
@@ -507,7 +786,7 @@ class SpecialistSession:
             obligation = self.coverage.obligation(obligation_id)
             for evidence_id in evidence_ids:
                 record = retained[evidence_id]
-                if _evidence_matches_obligation(record, obligation):
+                if self._record_matches_obligation(record, obligation):
                     self.coverage.attach_evidence(obligation_id, evidence_id)
         for obligation_id in assigned.intersection(unresolved):
             self.coverage.mark_unresolved(obligation_id)
@@ -715,7 +994,9 @@ class SpecialistSession:
             raise ValueError(f"not a recorded recovery reason: {reason}")
         if self._final_result is not None:
             return self._final_result
-        self.lease.request_timeout(self.request_timeout_sec)
+        self.lease.request_timeout(
+            self.request_timeout_sec, now=self.clock(),
+        )
         self.budget.record_recovery(normalized)
         self.state = SessionState.RECOVERY
 
@@ -748,6 +1029,9 @@ class SpecialistSession:
             "latest_checkpoint": asdict(self.latest_checkpoint),
             "evidence": evidence,
             "current_gaps": list(self._current_gaps),
+            "source_access_requests": [
+                item.as_dict() for item in self.source_access_requests
+            ],
             "deduplication_request_keys": sorted(self._successful_requests),
             "remaining_lifetime_budget": {
                 "model_turns": self.budget.remaining_model_turns(),
@@ -764,6 +1048,7 @@ class SpecialistSession:
             )
         )
         self.conversation = rebuilt
+        self._recovery_turn_pending = True
         self.state = SessionState.EXPLORING
         return self._snapshot()
 
@@ -772,7 +1057,9 @@ class SpecialistSession:
         if self._final_result is not None:
             return self._final_result
         try:
-            self.lease.request_timeout(self.request_timeout_sec)
+            self.lease.request_timeout(
+                self.request_timeout_sec, now=self.clock(),
+            )
             self.state = SessionState.FINALIZING
             self.conversation.add_user(
                 "Finalize this specialist assessment once from the latest checkpoint and "

@@ -5,7 +5,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections.abc import Iterable, Mapping
 from pathlib import PurePosixPath
 from typing import Any
@@ -150,6 +150,29 @@ def evidence_satisfies_obligation(
     }
 
 
+def _associated_collections_satisfying(
+    evidence: EvidenceSnapshot,
+    record: EvidenceRecord,
+    obligation: CoverageObligation,
+    *,
+    session_id: str | None = None,
+) -> tuple[str, ...]:
+    satisfying: list[str] = []
+    for collection, association in evidence.associations_for(
+        record.id, obligation.id,
+    ):
+        if session_id is not None and collection.session_id != session_id:
+            continue
+        if any(
+            evidence_satisfies_obligation(
+                replace(record, category=category), obligation,
+            )
+            for category in association.categories
+        ):
+            satisfying.append(collection.id)
+    return tuple(satisfying)
+
+
 def _recipe_accounting_obligation(
     recipe_id: str,
     status: RecipeStatus,
@@ -179,6 +202,7 @@ def _add_obligation(
     recipe_id: str | None = None,
     recipe_execution: str | None = None,
     requires_independent_verification: bool = False,
+    unresolved_policy: str = "record_unknown",
     required_evidence_categories: tuple[str, ...] | None = None,
     mandatory: bool = True,
     scope: Iterable[str] = (),
@@ -196,6 +220,7 @@ def _add_obligation(
         satisfaction_predicates=("recorded_evidence",),
         risk_tier=risk_tier,
         requires_independent_verification=requires_independent_verification,
+        unresolved_policy=unresolved_policy,
         scope=tuple(scope),
         seed_hints=tuple(seed_hints),
         explanation=explanation,
@@ -225,6 +250,39 @@ def _recipe_matches(recipe: RecipePolicy, topology: Mapping[str, Any], risk_flag
     return all(checks[key](wanted) for key, wanted in match.items() if key in checks)
 
 
+def _rule_matches(
+    rule: Mapping[str, Any],
+    topology: Mapping[str, Any],
+    risk_flags: set[str],
+) -> bool:
+    changed_files = _paths(topology.get("changed_files"))
+    component_ids = {
+        _slug(component.get("id"))
+        for component in topology.get("components", [])
+        if isinstance(component, Mapping) and component.get("id")
+    }
+    roles = set(_strings(topology.get("file_roles")))
+    checks = {
+        "paths_any": lambda wanted: any(
+            fnmatch.fnmatchcase(path, pattern)
+            for path in changed_files for pattern in wanted
+        ),
+        "component_ids_any": lambda wanted: bool(
+            component_ids.intersection(_slug(item) for item in wanted)
+        ),
+        "risk_flags_any": lambda wanted: bool(risk_flags.intersection(wanted)),
+        "file_roles_any": lambda wanted: bool(roles.intersection(wanted)),
+    }
+    populated = False
+    for key, check in checks.items():
+        if key not in rule:
+            continue
+        populated = True
+        if not check(rule[key]):
+            return False
+    return populated
+
+
 def derive_obligations(
     topology: Mapping[str, Any],
     classification: Mapping[str, Any] | None,
@@ -232,18 +290,47 @@ def derive_obligations(
 ) -> tuple[CoverageObligation, ...]:
     """Return deterministic mandatory obligations and recipe lifecycle decisions."""
     classification = classification or {}
-    changed_files = _paths(topology.get("changed_files"))
+    excluded_paths = tuple(policy.exclude.get("paths", ()))
+
+    def included(path: str) -> bool:
+        return not any(
+            fnmatch.fnmatchcase(path, pattern) for pattern in excluded_paths
+        )
+
+    changed_files = tuple(
+        path for path in _paths(topology.get("changed_files")) if included(path)
+    )
     changed_roles = {
         role for path in changed_files for role in classify_file_roles(path)
     }
     roles = set(_strings(topology.get("file_roles"))) | changed_roles
     risk_flags = set(_strings(topology.get("risk_flags"))) | set(_strings(classification.get("risk_flags")))
+    excluded_components = {
+        _slug(item) for item in policy.exclude.get("components", ())
+    }
     components = tuple(
         sorted(
-            (component for component in topology.get("components", []) if isinstance(component, Mapping)),
+            (
+                {
+                    **component,
+                    "changed_files": tuple(
+                        path for path in _paths(component.get("changed_files"))
+                        if included(path)
+                    ),
+                }
+                for component in topology.get("components", [])
+                if isinstance(component, Mapping)
+                and _slug(component.get("id")) not in excluded_components
+            ),
             key=lambda component: _slug(component.get("id")),
         )
     )
+    effective_topology = {
+        **topology,
+        "changed_files": changed_files,
+        "components": components,
+        "file_roles": sorted(roles),
+    }
     obligations: dict[str, CoverageObligation] = {}
 
     for path in changed_files:
@@ -319,6 +406,7 @@ def derive_obligations(
         _add_obligation(
             obligations, origin="risk-rule", subject=flag, evidence_category="risk-assessment",
             risk_tier="high" if flag.startswith("linked_priority") else "critical",
+            unresolved_policy="block_when_unresolved",
             scope=changed_files, seed_hints=changed_files,
             explanation=f"Verify the deterministic risk flag: {flag}.",
         )
@@ -339,23 +427,61 @@ def derive_obligations(
             )
 
     recipe_states: dict[str, RecipeStatus] = {}
-    excluded_recipes = {_slug(recipe_id) for recipe_id in policy.exclude.get("recipes", ())}
+    excluded_recipes = {
+        _slug(recipe_id) for recipe_id in policy.exclude.get("recipes", ())
+    }
+    excluded_lenses = {
+        _slug(lens) for lens in policy.exclude.get("lenses", ())
+    }
+    forced_recipes: dict[str, tuple[str, str]] = {}
+    risk_rank = {"low": 0, "normal": 1, "high": 2, "critical": 3}
+    for rule in policy.coverage_rules:
+        if not _rule_matches(rule, effective_topology, risk_flags):
+            continue
+        for recipe_id in rule.get("required_recipe_ids", ()):
+            current = forced_recipes.get(str(recipe_id))
+            candidate = (
+                str(rule.get("risk_tier", "high")),
+                str(rule.get("unresolved_policy", "block_when_unresolved")),
+            )
+            if current is None or risk_rank[candidate[0]] > risk_rank[current[0]]:
+                forced_recipes[str(recipe_id)] = candidate
     for recipe in sorted(policy.recipes, key=lambda item: item.id):
-        if _slug(recipe.id) in excluded_recipes:
+        if (
+            _slug(recipe.id) in excluded_recipes
+            or excluded_lenses.intersection(_slug(item) for item in recipe.lenses)
+            or set(recipe.match.get("component_ids_any", ())).intersection(
+                excluded_components
+            )
+        ):
             recipe_states[recipe.id] = RecipeStatus.SUPPRESSED_BY_POLICY
             continue
-        recipe_topology = {**topology, "file_roles": sorted(roles)}
-        if not _recipe_matches(recipe, recipe_topology, risk_flags):
+        if (
+            recipe.id not in forced_recipes
+            and not _recipe_matches(recipe, effective_topology, risk_flags)
+        ):
             recipe_states[recipe.id] = RecipeStatus.NOT_APPLICABLE
             continue
         recipe_states[recipe.id] = RecipeStatus.ASSIGNED
         categories = recipe.expected_evidence or ("review",)
+        forced = forced_recipes.get(recipe.id)
+        risk_tier = forced[0] if forced else recipe.priority
+        unresolved_policy = (
+            forced[1]
+            if forced
+            else (
+                "block_when_unresolved"
+                if recipe.priority in {"critical", "high"}
+                else "record_unknown"
+            )
+        )
         for category in categories:
             _add_obligation(
                 obligations, origin="recipe", subject=recipe.id, evidence_category=category,
-                risk_tier=recipe.priority, recipe_id=recipe.id,
+                risk_tier=risk_tier, recipe_id=recipe.id,
                 recipe_execution=recipe.execution,
                 requires_independent_verification=recipe.execution == "independent",
+                unresolved_policy=unresolved_policy,
                 scope=changed_files, seed_hints=recipe.seed_paths or changed_files,
                 explanation=f"Repository recipe '{recipe.id}' requires {category} evidence.",
             )
@@ -542,7 +668,7 @@ def session_ownership_for_assignment(
 def _validated_wave_start(
     snapshot: CoverageSnapshot,
     obligation_by_id: Mapping[str, CoverageObligation],
-    records: Mapping[str, EvidenceRecord],
+    evidence: EvidenceSnapshot,
 ) -> tuple[
     dict[str, ObligationStatus],
     dict[str, set[str]],
@@ -550,6 +676,7 @@ def _validated_wave_start(
 ]:
     if not isinstance(snapshot, CoverageSnapshot):
         raise TypeError("wave_start_coverage must be a CoverageSnapshot")
+    records = {record.id: record for record in evidence.records}
     status_ids = [obligation_id for obligation_id, _ in snapshot.obligation_statuses]
     evidence_ids = [obligation_id for obligation_id, _ in snapshot.evidence_by_obligation]
     if len(set(status_ids)) != len(status_ids):
@@ -571,7 +698,12 @@ def _validated_wave_start(
             record = records.get(evidence_id)
             if record is None:
                 raise ValueError(f"wave-start coverage references unknown evidence: {evidence_id}")
-            if not evidence_satisfies_obligation(record, obligation):
+            if not (
+                _associated_collections_satisfying(
+                    evidence, record, obligation,
+                )
+                or evidence_satisfies_obligation(record, obligation)
+            ):
                 raise ValueError(
                     f"wave-start evidence does not satisfy obligation '{obligation_id}'"
                 )
@@ -616,7 +748,7 @@ def reconcile_wave(
     obligation_by_id = {item.id: item for item in ledger.obligations()}
     records = {record.id: record for record in evidence.records}
     before, reconciled_evidence, reconciled_unresolved = _validated_wave_start(
-        wave_start_coverage, obligation_by_id, records
+        wave_start_coverage, obligation_by_id, evidence
     )
     assignment_by_id: dict[str, Assignment | SpecialistAssignment] = {}
     for assignment in assignments:
@@ -665,16 +797,34 @@ def reconcile_wave(
             obligation = obligation_by_id[obligation_id]
             for evidence_id in referenced_ids:
                 record = records.get(evidence_id)
+                associated = (
+                    ()
+                    if record is None
+                    else _associated_collections_satisfying(
+                        evidence,
+                        record,
+                        obligation,
+                        session_id=checkpoint.session_id,
+                    )
+                )
                 independent_collection = (
                     obligation_id in ownership.independent_obligation_ids
                     and record is not None
-                    and record.collector_session_id == checkpoint.session_id
-                    and checkpoint.session_id in record.imported_by
-                    and evidence_id not in checkpoint.imported_evidence_ids
+                    and (
+                        bool(associated)
+                        or (
+                            record.collector_session_id == checkpoint.session_id
+                            and checkpoint.session_id in record.imported_by
+                            and evidence_id not in checkpoint.imported_evidence_ids
+                        )
+                    )
                 )
                 if (
                     record is not None
-                    and evidence_satisfies_obligation(record, obligation)
+                    and (
+                        bool(associated)
+                        or evidence_satisfies_obligation(record, obligation)
+                    )
                     and (
                         not obligation.requires_independent_verification
                         or independent_collection

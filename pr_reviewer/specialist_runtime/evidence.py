@@ -282,10 +282,32 @@ class EvidenceRecord:
 
 
 @dataclass(frozen=True)
+class EvidenceCollection:
+    """One actual executor invocation, even when its content is deduplicated."""
+
+    id: str
+    evidence_id: str
+    session_id: str
+    tool: str
+    arguments: str
+
+
+@dataclass(frozen=True)
+class EvidenceAssociation:
+    """Controller-derived typed coverage authority for one collection."""
+
+    collection_id: str
+    obligation_id: str
+    categories: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class EvidenceSnapshot:
     """A detached evidence view fixed at the beginning of a work wave."""
 
     records: tuple[EvidenceRecord, ...]
+    collections: tuple[EvidenceCollection, ...] = ()
+    associations: tuple[EvidenceAssociation, ...] = ()
 
     @property
     def evidence_ids(self) -> tuple[str, ...]:
@@ -298,6 +320,29 @@ class EvidenceSnapshot:
         normalized = _normalized_path(path)
         return tuple(record for record in self.records if record.source_path == normalized)
 
+    def collections_for(
+        self, evidence_id: str, *, session_id: str | None = None,
+    ) -> tuple[EvidenceCollection, ...]:
+        return tuple(
+            item for item in self.collections
+            if item.evidence_id == evidence_id
+            and (session_id is None or item.session_id == session_id)
+        )
+
+    def associations_for(
+        self, evidence_id: str, obligation_id: str,
+    ) -> tuple[tuple[EvidenceCollection, EvidenceAssociation], ...]:
+        collections = {
+            item.id: item for item in self.collections
+            if item.evidence_id == evidence_id
+        }
+        return tuple(
+            (collections[item.collection_id], item)
+            for item in self.associations
+            if item.obligation_id == obligation_id
+            and item.collection_id in collections
+        )
+
 
 class EvidenceStore:
     """Mutable canonical store which creates immutable snapshots on demand."""
@@ -307,6 +352,9 @@ class EvidenceStore:
             raise ValueError("max_content_bytes must be positive")
         self._max_content_bytes = max_content_bytes
         self._records: dict[str, EvidenceRecord] = {}
+        self._collections: dict[str, EvidenceCollection] = {}
+        self._associations: dict[tuple[str, str], EvidenceAssociation] = {}
+        self._collection_attempts: dict[str, int] = {}
         self._successful_canonical: dict[str, str] = {}
         self._failed_attempts = 0
         self._refreshes = 0
@@ -328,6 +376,33 @@ class EvidenceStore:
             store._records[record.id] = record
             if record.is_usable_for_coverage:
                 store._successful_canonical[record.canonical_key] = record.id
+        for collection in snapshot.collections:
+            if collection.id in store._collections:
+                raise ValueError(
+                    f"duplicate evidence collection id in snapshot: {collection.id}"
+                )
+            if collection.evidence_id not in store._records:
+                raise ValueError("evidence collection references unknown record")
+            store._collections[collection.id] = collection
+            identity = _canonical_json({
+                "session_id": collection.session_id,
+                "tool": collection.tool,
+                "arguments": json.loads(collection.arguments),
+            })
+            try:
+                ordinal = int(collection.id.rsplit(":", 1)[1])
+            except (ValueError, IndexError):
+                ordinal = 1
+            store._collection_attempts[identity] = max(
+                store._collection_attempts.get(identity, 0), ordinal,
+            )
+        for association in snapshot.associations:
+            if association.collection_id not in store._collections:
+                raise ValueError("evidence association references unknown collection")
+            key = (association.collection_id, association.obligation_id)
+            if key in store._associations:
+                raise ValueError("duplicate evidence association in snapshot")
+            store._associations[key] = association
         store._failed_attempts = sum(
             1 for record in snapshot.records if not record.is_usable_for_coverage
         )
@@ -339,6 +414,7 @@ class EvidenceStore:
         if not isinstance(snapshot, EvidenceSnapshot):
             raise TypeError("snapshot must be an EvidenceSnapshot")
         changed: list[str] = []
+        evidence_id_map: dict[str, str] = {}
         for record in sorted(snapshot.records, key=lambda item: item.id):
             existing = self._records.get(record.id)
             if existing is not None:
@@ -352,6 +428,7 @@ class EvidenceStore:
                 if imported_by != existing.imported_by:
                     self._records[record.id] = replace(existing, imported_by=imported_by)
                     changed.append(record.id)
+                evidence_id_map[record.id] = existing.id
                 continue
             canonical_existing_id = self._successful_canonical.get(record.canonical_key)
             if record.is_usable_for_coverage and canonical_existing_id is not None:
@@ -363,11 +440,35 @@ class EvidenceStore:
                     canonical_existing, imported_by=imported_by,
                 )
                 changed.append(canonical_existing_id)
+                evidence_id_map[record.id] = canonical_existing_id
                 continue
             self._records[record.id] = record
             if record.is_usable_for_coverage:
                 self._successful_canonical[record.canonical_key] = record.id
             changed.append(record.id)
+            evidence_id_map[record.id] = record.id
+        for collection in sorted(snapshot.collections, key=lambda item: item.id):
+            mapped = replace(
+                collection,
+                evidence_id=evidence_id_map.get(
+                    collection.evidence_id, collection.evidence_id,
+                ),
+            )
+            existing = self._collections.get(mapped.id)
+            if existing is not None and existing != mapped:
+                raise ValueError(
+                    f"conflicting evidence collection id during merge: {mapped.id}"
+                )
+            self._collections[mapped.id] = mapped
+        for association in sorted(
+            snapshot.associations,
+            key=lambda item: (item.collection_id, item.obligation_id),
+        ):
+            key = (association.collection_id, association.obligation_id)
+            existing = self._associations.get(key)
+            if existing is not None and existing != association:
+                raise ValueError("conflicting evidence association during merge")
+            self._associations[key] = association
         return tuple(sorted(set(changed)))
 
     def add_tool_result(
@@ -386,7 +487,7 @@ class EvidenceStore:
         contradicts: tuple[str, ...] | list[str] = (),
         now: float | None = None,
     ) -> EvidenceRecord:
-        return self.add(
+        record, _collection = self.add_tool_result_with_collection(
             session_id=session_id,
             tool=tool,
             arguments=arguments,
@@ -400,8 +501,48 @@ class EvidenceStore:
             contradicts=contradicts,
             now=now,
         )
+        return record
 
-    def add(
+    def add_tool_result_with_collection(
+        self,
+        *,
+        session_id: str,
+        tool: str,
+        arguments: Mapping[str, Any],
+        result: Mapping[str, Any],
+        category: str = "tool-result",
+        model_identity: str = "",
+        source: str | None = None,
+        mime_type: str | None = None,
+        provenance: EvidenceProvenance | None = None,
+        supersedes: tuple[str, ...] | list[str] = (),
+        contradicts: tuple[str, ...] | list[str] = (),
+        now: float | None = None,
+    ) -> tuple[EvidenceRecord, EvidenceCollection]:
+        record = self._add_record(
+            session_id=session_id,
+            tool=tool,
+            arguments=arguments,
+            result=result,
+            category=category,
+            model_identity=model_identity,
+            source=source,
+            mime_type=mime_type,
+            provenance=provenance,
+            supersedes=supersedes,
+            contradicts=contradicts,
+            now=now,
+        )
+        collection = self._record_collection(
+            record, session_id=session_id, tool=tool, arguments=arguments,
+        )
+        return record, collection
+
+    def add(self, **kwargs: Any) -> EvidenceRecord:
+        """Compatibility entry point; every call is an actual collection."""
+        return self.add_tool_result(**kwargs)
+
+    def _add_record(
         self,
         *,
         session_id: str,
@@ -487,6 +628,62 @@ class EvidenceStore:
             self._successful_canonical[canonical_key] = record.id
         return record
 
+    def _record_collection(
+        self,
+        record: EvidenceRecord,
+        *,
+        session_id: str,
+        tool: str,
+        arguments: Mapping[str, Any],
+    ) -> EvidenceCollection:
+        identity = _canonical_json({
+            "session_id": session_id,
+            "tool": tool,
+            "arguments": arguments,
+        })
+        ordinal = self._collection_attempts.get(identity, 0) + 1
+        self._collection_attempts[identity] = ordinal
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        collection = EvidenceCollection(
+            id=f"collection:{digest}:{ordinal}",
+            evidence_id=record.id,
+            session_id=str(session_id).strip(),
+            tool=str(tool).strip(),
+            arguments=_canonical_json(arguments),
+        )
+        self._collections[collection.id] = collection
+        return collection
+
+    def associate_collection(
+        self,
+        collection_id: str,
+        *,
+        obligation_id: str,
+        categories: tuple[str, ...] | list[str],
+    ) -> EvidenceAssociation:
+        collection = self._collections.get(str(collection_id))
+        if collection is None:
+            raise ValueError("evidence association references unknown collection")
+        record = self._records[collection.evidence_id]
+        if not record.is_usable_for_coverage:
+            raise ValueError("failed evidence collection cannot satisfy coverage")
+        normalized = tuple(sorted({
+            str(item).strip().lower() for item in categories
+            if str(item).strip()
+        }))
+        if not str(obligation_id).strip() or not normalized:
+            raise ValueError(
+                "evidence association requires an obligation and categories"
+            )
+        key = (collection.id, str(obligation_id))
+        association = EvidenceAssociation(
+            collection_id=collection.id,
+            obligation_id=str(obligation_id),
+            categories=normalized,
+        )
+        self._associations[key] = association
+        return association
+
     @staticmethod
     def _is_fresh(record: EvidenceRecord, now: float) -> bool:
         provenance = record.provenance
@@ -538,4 +735,13 @@ class EvidenceStore:
 
     def snapshot(self) -> EvidenceSnapshot:
         """Freeze the store's current records for a later wave's stable view."""
-        return EvidenceSnapshot(tuple(self._records[key] for key in sorted(self._records)))
+        return EvidenceSnapshot(
+            tuple(self._records[key] for key in sorted(self._records)),
+            tuple(
+                self._collections[key] for key in sorted(self._collections)
+            ),
+            tuple(
+                self._associations[key]
+                for key in sorted(self._associations)
+            ),
+        )

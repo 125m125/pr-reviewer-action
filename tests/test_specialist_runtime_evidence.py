@@ -33,6 +33,27 @@ def test_duplicate_success_reuses_evidence_without_claiming_independence():
     assert second.is_usable_for_coverage is True
 
 
+def test_duplicate_success_retains_distinct_collection_events():
+    store = EvidenceStore()
+
+    first, first_collection = store.add_tool_result_with_collection(
+        session_id="S1", tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "result": {"content": "same"}},
+    )
+    second, second_collection = store.add_tool_result_with_collection(
+        session_id="S2", tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "result": {"content": "same"}},
+    )
+
+    assert first.id == second.id
+    assert first_collection.id != second_collection.id
+    assert first_collection.session_id == "S1"
+    assert second_collection.session_id == "S2"
+    assert {
+        item.id for item in store.snapshot().collections
+    } == {first_collection.id, second_collection.id}
+
+
 def test_canonical_key_normalizes_request_identity_and_redacts_before_hashing():
     first = canonical_evidence_key(
         "read_file",

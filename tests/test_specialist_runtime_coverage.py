@@ -1,4 +1,5 @@
 from dataclasses import FrozenInstanceError
+import json
 
 import pytest
 
@@ -249,3 +250,119 @@ def test_public_coverage_obligation_has_no_lifecycle_field():
     assert obligation.required_evidence == obligation.required_evidence_categories
     assert "recipe_status" not in CoverageObligation.__dataclass_fields__
     assert not hasattr(obligation, "recipe_status")
+
+
+def test_documented_v2_rule_forces_recipe_and_blocks_unresolved_high_risk(tmp_path):
+    from pr_reviewer.specialist_runtime.adjudication import (
+        AdjudicatedReview,
+        apply_runtime_verdict_policy,
+    )
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+    from pr_reviewer.specialist_runtime.policy import load_review_policy
+
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps({
+        "version": 2,
+        "components": [{"id": "api", "paths": ["services/api/**"]}],
+        "recipes": [{
+            "id": "api-coverage",
+            "title": "API compatibility",
+            "objective": "Trace authorization and compatibility.",
+            "execution": "coverage",
+            "match": {"component_ids_any": ["api"]},
+            "expected_evidence": ["implementation", "tests"],
+            "priority": "high",
+        }],
+        "coverage_rules": [{
+            "id": "auth-risk",
+            "risk_flags_any": ["auth_changes"],
+            "required_recipe_ids": ["api-coverage"],
+        }],
+        "exclude": {
+            "paths": ["vendor/**"], "components": [], "lenses": [], "recipes": [],
+        },
+        "verdict_policy": {
+            "blocker_requires_request_changes": True,
+            "require_evidence_for_findings": True,
+        },
+        "publishing": {
+            "allowed_modes": ["review_comment"], "allow_approve": False,
+        },
+    }), encoding="utf-8")
+    policy = load_review_policy(policy_path)
+    topology = {
+        "changed_files": ["services/api/auth.py", "vendor/copied.py"],
+        "file_roles": ["implementation"],
+        "components": [{
+            "id": "api",
+            "file_roles": ["implementation"],
+            "changed_files": ["services/api/auth.py", "vendor/copied.py"],
+        }],
+    }
+
+    obligations = derive_obligations(
+        topology, {"risk_flags": ["auth_changes"]}, policy,
+    )
+    recipe_obligations = tuple(
+        item for item in obligations if item.recipe_id == "api-coverage"
+    )
+
+    assert recipe_obligations
+    assert all(item.risk_tier == "high" for item in recipe_obligations)
+    assert all(
+        item.unresolved_policy == "block_when_unresolved"
+        for item in recipe_obligations
+    )
+    assert not any(
+        item.subject == "vendor/copied.py" and item.origin == "topology"
+        for item in obligations
+    )
+
+    result = apply_runtime_verdict_policy(
+        model_verdict="approve",
+        review=AdjudicatedReview(),
+        unresolved=recipe_obligations,
+        allow_approve=True,
+        evidence=EvidenceStore(),
+        obligations={item.id: item for item in obligations},
+        changed_files=tuple(topology["changed_files"]),
+        policy=policy.verdict_policy,
+    )
+
+    assert result.verdict == "request_changes"
+    assert result.source == "incomplete-high-risk-coverage"
+    assert set(result.blocking_obligation_ids) == {
+        item.id for item in recipe_obligations
+    }
+
+
+def test_component_and_lens_exclusions_are_materialized_as_recipe_suppression():
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger, derive_obligations
+    from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy
+
+    policy = ReviewPolicy(
+        recipes=(
+            RecipePolicy(
+                id="worker-check", title="Worker", objective="Trace worker",
+                match={"component_ids_any": ("worker",)},
+                lenses=("retry",), expected_evidence=("implementation",),
+            ),
+        ),
+        exclude={
+            "paths": (), "components": ("worker",),
+            "lenses": ("retry",), "recipes": (),
+        },
+    )
+    obligations = derive_obligations({
+        "changed_files": ["worker/main.py"],
+        "file_roles": ["implementation"],
+        "components": [{
+            "id": "worker", "changed_files": ["worker/main.py"],
+            "file_roles": ["implementation"],
+        }],
+    }, {}, policy)
+
+    assert CoverageLedger(obligations).recipe_statuses() == {
+        "worker-check": "suppressed_by_policy",
+    }

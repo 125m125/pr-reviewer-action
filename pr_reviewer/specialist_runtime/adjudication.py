@@ -348,6 +348,7 @@ def _authorize(
     value: AcceptedFinding | CandidateFinding,
     *,
     records: Mapping[str, EvidenceRecord],
+    evidence_snapshot: EvidenceSnapshot,
     obligations: Mapping[str, CoverageObligation],
     changed_files: tuple[str, ...],
 ) -> tuple[AcceptedFinding | None, str]:
@@ -395,10 +396,24 @@ def _authorize(
     if len(usable_support) != len(supporting_records):
         return None, "unusable-retained-evidence"
     related = tuple(obligations[item] for item in candidate.related_obligation_ids)
+    def satisfies(record: EvidenceRecord, obligation: CoverageObligation) -> bool:
+        associations = evidence_snapshot.associations_for(
+            record.id, obligation.id,
+        )
+        if associations:
+            return any(
+                evidence_satisfies_obligation(
+                    replace(record, category=category), obligation,
+                )
+                for _collection, association in associations
+                for category in association.categories
+            )
+        return evidence_satisfies_obligation(record, obligation)
+
     satisfying = tuple(sorted(
         (
             record for record in usable_support
-            if any(evidence_satisfies_obligation(record, obligation) for obligation in related)
+            if any(satisfies(record, obligation) for obligation in related)
         ),
         key=lambda item: item.id,
     ))
@@ -518,7 +533,8 @@ def adjudicate_candidates(
 ) -> AdjudicatedReview:
     """Adjudicate candidates against immutable controller-owned authority."""
     obligation_map, changed = _controller_state(obligations, changed_files)
-    records = {record.id: record for record in _snapshot(evidence).records}
+    evidence_snapshot = _snapshot(evidence)
+    records = {record.id: record for record in evidence_snapshot.records}
     candidate_by_id: dict[str, CandidateFinding] = {}
     duplicate_ids: set[str] = set()
     for value in candidates:
@@ -583,7 +599,11 @@ def adjudicate_candidates(
             )
             continue
         authorized, reason = _authorize(
-            candidate, records=records, obligations=obligation_map, changed_files=changed
+            candidate,
+            records=records,
+            evidence_snapshot=evidence_snapshot,
+            obligations=obligation_map,
+            changed_files=changed,
         )
         if authorized is None:
             verification[candidate_id] = CandidateVerificationRequest(candidate, reason)
@@ -657,7 +677,8 @@ def _revalidated_findings(
     changed_files: Iterable[str],
 ) -> tuple[tuple[AcceptedFinding, ...], tuple[CandidateVerificationRequest, ...]]:
     obligation_map, changed = _controller_state(obligations, changed_files)
-    records = {record.id: record for record in _snapshot(evidence).records}
+    evidence_snapshot = _snapshot(evidence)
+    records = {record.id: record for record in evidence_snapshot.records}
     accepted: list[AcceptedFinding] = []
     verification: list[CandidateVerificationRequest] = []
     for value in values:
@@ -665,7 +686,11 @@ def _revalidated_findings(
         if candidate is None:
             continue
         authorized, reason = _authorize(
-            value, records=records, obligations=obligation_map, changed_files=changed
+            value,
+            records=records,
+            evidence_snapshot=evidence_snapshot,
+            obligations=obligation_map,
+            changed_files=changed,
         )
         if authorized is None:
             verification.append(CandidateVerificationRequest(_normalized_candidate(candidate), reason))

@@ -310,6 +310,52 @@ def test_independent_owner_fresh_collection_satisfies_independent_obligation():
     assert result.snapshot.obligation_statuses == (("OB1", ObligationStatus.COVERED),)
 
 
+def test_independent_owner_identical_fresh_read_is_not_collapsed_to_import():
+    required = replace(obligation("OB1"), requires_independent_verification=True)
+    ledger = CoverageLedger((required,))
+    assignment_value = SpecialistAssignment(
+        assignment_id="independent-assignment",
+        objective="Independently inspect tests",
+        independent_obligation_ids=("OB1",),
+    )
+    ownership = SessionOwnership(
+        session_id="independent-session",
+        assignment_id=assignment_value.assignment_id,
+        independent_obligation_ids=("OB1",),
+    )
+    store = EvidenceStore()
+    store.add_tool_result(
+        session_id="primary-session", tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "identical"}, category="tests",
+    )
+    record, collection = store.add_tool_result_with_collection(
+        session_id="independent-session", tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "identical"}, category="tests",
+    )
+    store.associate_collection(
+        collection.id, obligation_id="OB1", categories=("tests",),
+    )
+
+    result = reconcile_wave(
+        ledger,
+        wave_start_coverage=ledger.snapshot(),
+        checkpoints=(SessionCheckpoint(
+            session_id="independent-session",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(record.id,),
+        ),),
+        evidence=store.snapshot(),
+        assignments=(assignment_value,),
+        session_ownership=(ownership,),
+    )
+
+    assert result.snapshot.obligation_statuses == (
+        ("OB1", ObligationStatus.COVERED),
+    )
+
+
 def test_wave_start_baseline_retains_prior_coverage_and_counts_current_gain():
     obligations = (
         obligation("OB1"),

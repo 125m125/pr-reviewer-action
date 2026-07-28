@@ -1058,7 +1058,9 @@ def test_only_supported_blocking_severities_can_block(configured: object):
 @pytest.mark.parametrize("configured", [42, {"major": True}, [None], object()])
 def test_malformed_severity_configuration_fails_closed_without_crashing(configured: object):
     store, evidence_id = _store()
-    review = _adjudicate((_candidate(evidence_ids=(evidence_id,)),), store)
+    review = _adjudicate((
+        _candidate(evidence_ids=(evidence_id,), severity="major"),
+    ), store)
 
     result = apply_runtime_verdict_policy(
         model_verdict="approve",
@@ -1071,8 +1073,8 @@ def test_malformed_severity_configuration_fails_closed_without_crashing(configur
         policy={"blocking_severities": configured},
     )
 
-    assert result.verdict == "approve"
-    assert result.blocking_finding_ids == ()
+    assert result.verdict == "request_changes"
+    assert result.blocking_finding_ids
 
 
 @pytest.mark.parametrize(

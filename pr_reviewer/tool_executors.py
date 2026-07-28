@@ -256,6 +256,7 @@ def web_fetch(
     evidence_store=None,
     session_id="tool-harness",
     model_identity="",
+    deadline_at=None,
 ):
     """Retrieve typed evidence through the redirect- and DNS-safe boundary."""
     try:
@@ -264,7 +265,10 @@ def web_fetch(
             policy, timeout=request_timeout, evidence_store=evidence_store,
         )
         return fetcher.fetch(
-            url, session_id=session_id, model_identity=model_identity,
+            url,
+            session_id=session_id,
+            model_identity=model_identity,
+            deadline_at=deadline_at,
         ).as_dict()
     except Exception as exc:
         return {"error": str(exc)}
@@ -361,6 +365,7 @@ def execute_tool_request(
     session_id="tool-harness",
     model_identity="",
     search_scan_limit=25,
+    deadline_at=None,
 ):
     """Execute a single tool request and return the result dict.
 
@@ -417,9 +422,21 @@ def execute_tool_request(
             if res.get("error"):
                 raise ValueError(res["error"])
             matches = res.get("matches", [])
-            text = "\n".join(matches)
-            text, _ = mask_and_truncate(text, max_response_bytes)
-            tool_result["result"] = {"matches": matches[:60]}
+            text = mask_secrets("\n".join(matches))
+            encoded = text.encode("utf-8", errors="replace")
+            if len(encoded) > max_response_bytes:
+                marker = b"\n[truncated]"
+                if max_response_bytes <= len(marker):
+                    encoded = marker[:max_response_bytes]
+                else:
+                    encoded = (
+                        encoded[:max_response_bytes - len(marker)].decode(
+                            "utf-8", errors="ignore"
+                        ).encode("utf-8")
+                        + marker
+                    )
+                text = encoded.decode("utf-8", errors="replace")
+            tool_result["result"] = {"matches": text.splitlines()}
 
         elif tool_name == "gh_api":
             endpoint = args.get("endpoint", "")
@@ -450,6 +467,7 @@ def execute_tool_request(
                 evidence_store=evidence_store,
                 session_id=session_id,
                 model_identity=model_identity,
+                deadline_at=deadline_at,
             )
             if res.get("error"):
                 raise ValueError(res["error"])

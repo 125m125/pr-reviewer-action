@@ -1015,10 +1015,13 @@ class SecureFetcher:
         *,
         session_id: str = "web-fetch",
         model_identity: str = "",
+        deadline_at: float | None = None,
     ) -> FetchedEvidence:
         original_url = str(url).strip()
         current_url = original_url
         deadline = self.monotonic() + self.timeout
+        if deadline_at is not None:
+            deadline = min(deadline, float(deadline_at))
         final_decision: SourceDecision | None = None
         response: HttpResponse | None = None
         for redirect_count in range(self.max_redirects + 1):

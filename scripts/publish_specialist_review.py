@@ -154,6 +154,15 @@ def _bool(value: str) -> bool:
     return normalized == "true"
 
 
+def _fork_state(value: str) -> bool | None:
+    normalized = str(value).strip().lower()
+    if normalized in {"", "unknown"}:
+        return None
+    if normalized not in {"true", "false"}:
+        raise argparse.ArgumentTypeError("expected true, false, or unknown")
+    return normalized == "true"
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True, choices=("comment", "review_comment", "review_verdict"))
@@ -174,7 +183,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--allow-approve", type=_bool, default=False)
     parser.add_argument("--approve-forks", type=_bool, default=False)
-    parser.add_argument("--is-fork", type=_bool, default=False)
+    parser.add_argument("--is-fork", type=_fork_state, default=None)
     parser.add_argument("--effective-scope", choices=("full", "incremental"), default="full")
     parser.add_argument("--baseline-clean", type=_bool, default=False)
     return parser
@@ -195,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
     publisher = GitHubReviewPublisher(
         client, state_path=args.state, max_attempts=args.max_attempts
     )
-    publisher.publish(
+    state = publisher.publish(
         mode=args.mode,
         handoff=handoff,
         notes=notes,
@@ -216,6 +225,15 @@ def main(argv: list[str] | None = None) -> int:
             baseline_clean=args.baseline_clean,
         ),
     )
+    if (
+        state.get("review_completed") is not True
+        or bool(state.get("publication_errors"))
+    ):
+        print(
+            "Specialist review publication was not fully confirmed",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

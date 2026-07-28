@@ -580,6 +580,59 @@ def test_failed_specialist_requests_retain_attempt_budget_without_event_replay(t
     }) == 2
 
 
+def test_recoverable_provider_history_failure_reuses_same_session_and_budget(
+    tmp_path,
+):
+    factory_calls = []
+    recoveries = []
+
+    class RecoverableSession(_SuccessfulSession):
+        def __post_init__(self):
+            super().__post_init__()
+            self.failed_once = False
+            self.budget = BudgetLedger(BudgetLimits(8, 8, 1))
+
+        def explore(self):
+            if not self.failed_once:
+                self.failed_once = True
+                self.budget.reserve_model_turn()
+                raise RuntimeError("invalid provider history")
+            return super().explore()
+
+        def recover(self, reason):
+            recoveries.append((self.session_id, reason, id(self)))
+            self.budget.record_recovery(reason)
+            return SessionResult(
+                session_id=self.session_id,
+                state=SessionState.EXPLORING,
+                checkpoint=SessionCheckpoint(
+                    session_id=self.session_id,
+                    state=SessionState.EXPLORING,
+                ),
+                budget=self.budget.snapshot(),
+            )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        session = RecoverableSession(
+            assignment, evidence_store, tuple(obligations), expected_session_id,
+        )
+        factory_calls.append((expected_session_id, id(session)))
+        return session
+
+    result = _controller(tmp_path, session_factory=factory).run(_inputs(tmp_path))
+
+    assert len(factory_calls) == 1
+    assert recoveries == [(
+        factory_calls[0][0], "invalid-provider-history", factory_calls[0][1],
+    )]
+    assert len(result.artifact["sessions"]) == 1
+    assert result.artifact["sessions"][0]["session_id"] == factory_calls[0][0]
+
+
 def test_hanging_specialist_gateway_is_bounded_and_accounted_in_artifact(tmp_path):
     import threading
 
@@ -1394,7 +1447,7 @@ def test_finalizer_proposal_selects_only_authorized_orientation(tmp_path):
 
 def test_repository_publishing_policy_prevents_caller_broadening(tmp_path):
     policy = replace(_policy(), publishing={
-        "mode": "comment",
+        "allowed_modes": ("comment",),
         "allow_approve": False,
     })
     result = _controller(tmp_path, ).run(replace(
@@ -1425,7 +1478,9 @@ def test_missing_repository_publishing_policy_never_grants_approval(tmp_path):
 def test_repository_publishing_mode_without_allow_flag_never_grants_approval(tmp_path):
     result = _controller(tmp_path, ).run(replace(
         _inputs(tmp_path),
-        policy=replace(_policy(), publishing={"mode": "review_verdict"}),
+        policy=replace(
+            _policy(), publishing={"allowed_modes": ("review_verdict",)},
+        ),
         publishing_mode="review_verdict",
         allow_approve=True,
     ))
@@ -1436,7 +1491,7 @@ def test_repository_publishing_mode_without_allow_flag_never_grants_approval(tmp
 
 def test_caller_can_narrow_repository_publishing_policy(tmp_path):
     policy = replace(_policy(), publishing={
-        "mode": "review_verdict",
+        "allowed_modes": ("review_verdict",),
         "allow_approve": True,
     })
     result = _controller(tmp_path, ).run(replace(
@@ -1468,7 +1523,7 @@ def test_detailed_publishing_is_not_ready_when_a_required_note_is_unauthorized(t
 
 def test_comment_mode_is_ready_without_detailed_notes(tmp_path):
     policy = replace(_policy(), publishing={
-        "mode": "comment", "allow_approve": False,
+        "allowed_modes": ("comment",), "allow_approve": False,
     })
     result = _controller(tmp_path, ).run(replace(
         _inputs(tmp_path),
@@ -1479,6 +1534,30 @@ def test_comment_mode_is_ready_without_detailed_notes(tmp_path):
 
     assert result.notes == ()
     assert result.publishing_ready is True
+
+
+def test_documented_allowed_modes_intersects_with_caller_mode(tmp_path):
+    policy = replace(_policy(), publishing={
+        "allowed_modes": ("review_comment",),
+        "allow_approve": False,
+    })
+
+    broadened = _controller(tmp_path).run(replace(
+        _inputs(tmp_path),
+        policy=policy,
+        publishing_mode="review_verdict",
+        allow_approve=True,
+    ))
+    narrowed = _controller(tmp_path).run(replace(
+        _inputs(tmp_path),
+        policy=policy,
+        publishing_mode="comment",
+        allow_approve=True,
+    ))
+
+    assert broadened.artifact["publishing"]["mode"] == "review_comment"
+    assert broadened.artifact["publishing"]["allow_approve"] is False
+    assert narrowed.artifact["publishing"]["mode"] == "comment"
 
 
 def test_output_path_must_be_beneath_controller_owned_root(tmp_path):

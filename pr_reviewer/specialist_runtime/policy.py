@@ -24,6 +24,38 @@ _MATCH_KEYS = frozenset({
     "paths_any", "component_ids_any", "risk_flags_any", "file_roles_any",
 })
 _EXECUTION_MODES = frozenset({"coverage", "dedicated", "independent"})
+_COMPONENT_KEYS = frozenset({
+    "id", "paths", "responsibilities", "related_components", "contracts",
+    "invariants",
+})
+_RECIPE_KEYS = frozenset({
+    "id", "title", "objective", "execution", "match", "lenses",
+    "seed_paths", "related_paths", "invariants", "expected_evidence",
+    "priority", "source",
+})
+_SOURCE_KEYS = frozenset({
+    "host", "include_subdomains", "path_prefixes", "classification",
+    "max_age_hours", "schemes",
+})
+_ARTIFACT_KEYS = frozenset({
+    "id", "source_of_truth", "generator_config", "output_paths",
+})
+_COVERAGE_RULE_KEYS = frozenset({
+    "id", *_MATCH_KEYS, "required_recipe_ids", "risk_tier",
+    "unresolved_policy",
+})
+_VERDICT_POLICY_KEYS = frozenset({
+    "blocker_requires_request_changes", "require_evidence_for_findings",
+    "blocking_severities", "request_changes_severities", "high_risk_tiers",
+})
+_PUBLISHING_KEYS = frozenset({"allowed_modes", "allow_approve"})
+_PUBLISHING_MODES = ("comment", "review_comment", "review_verdict")
+_BLOCKING_SEVERITIES = frozenset({"blocker", "major"})
+_RISK_TIERS = frozenset({"critical", "high", "normal", "low"})
+_BLOCKING_RISK_TIERS = frozenset({"critical", "high"})
+_UNRESOLVED_POLICIES = frozenset({
+    "record_unknown", "block_when_unresolved",
+})
 _HOST_RE = re.compile(
     r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
 )
@@ -176,6 +208,18 @@ class ReviewPolicy:
 
 
 @dataclass(frozen=True)
+class PolicyAuthorization:
+    """The validated policy selected after base/head authorization checks."""
+
+    policy: ReviewPolicy
+    changed: bool
+    authorized: bool
+    changed_sections: tuple[str, ...] = ()
+    base_hash: str = ""
+    head_hash: str = ""
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     review_deadline_sec: int = 7200
     model_request_timeout_sec: int = 300
@@ -270,6 +314,11 @@ def migrate_v1_policy(data: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _component_policy(raw: Mapping[str, Any]) -> Mapping[str, Any]:
+    unknown = set(raw) - _COMPONENT_KEYS
+    if unknown:
+        raise ValueError(
+            "component contains unknown keys: " + ", ".join(sorted(unknown))
+        )
     if not raw.get("id"):
         raise ValueError("every specialist component requires an id")
     return MappingProxyType({
@@ -285,6 +334,11 @@ def _component_policy(raw: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _recipe_policy(raw: Mapping[str, Any]) -> RecipePolicy:
+    unknown = set(raw) - _RECIPE_KEYS
+    if unknown:
+        raise ValueError(
+            "recipe contains unknown keys: " + ", ".join(sorted(unknown))
+        )
     if not raw.get("id"):
         raise ValueError("every specialist recipe requires an id")
     match = _mapping(raw.get("match"), field_name="recipe match")
@@ -322,6 +376,11 @@ def _recipe_policy(raw: Mapping[str, Any]) -> RecipePolicy:
 
 
 def _source_rule(raw: Mapping[str, Any]) -> SourceRule:
+    unknown = set(raw) - _SOURCE_KEYS
+    if unknown:
+        raise ValueError(
+            "source rule contains unknown keys: " + ", ".join(sorted(unknown))
+        )
     host = raw.get("host")
     if not isinstance(host, str) or host != host.lower() or not _HOST_RE.fullmatch(host):
         raise ValueError("source rule requires a concrete lowercase host")
@@ -337,6 +396,11 @@ def _source_rule(raw: Mapping[str, Any]) -> SourceRule:
     include_subdomains = raw.get("include_subdomains", False)
     if not isinstance(include_subdomains, bool):
         raise ValueError("source rule include_subdomains must be boolean")
+    if include_subdomains:
+        raise ValueError(
+            "source rule include_subdomains is unsupported until registrable-domain "
+            "validation is available"
+        )
     path_prefixes = []
     for prefix in _strings(raw.get("path_prefixes", []), field_name="source rule path_prefixes"):
         if not prefix.startswith("/") or "/../" in f"{prefix}/" or "://" in prefix:
@@ -359,6 +423,12 @@ def _source_rule(raw: Mapping[str, Any]) -> SourceRule:
 
 
 def _generated_artifact(raw: Mapping[str, Any]) -> Mapping[str, Any]:
+    unknown = set(raw) - _ARTIFACT_KEYS
+    if unknown:
+        raise ValueError(
+            "generated artifact contains unknown keys: "
+            + ", ".join(sorted(unknown))
+        )
     if not raw.get("id"):
         raise ValueError("every generated artifact requires an id")
     return MappingProxyType({
@@ -382,6 +452,119 @@ def _exclude(raw: Any) -> Mapping[str, tuple[str, ...]]:
     })
 
 
+def _coverage_rule(
+    raw: Mapping[str, Any], *, recipe_ids: frozenset[str],
+) -> Mapping[str, Any]:
+    unknown = set(raw) - _COVERAGE_RULE_KEYS
+    if unknown:
+        raise ValueError(
+            "coverage rule contains unknown keys: " + ", ".join(sorted(unknown))
+        )
+    if not raw.get("id"):
+        raise ValueError("every coverage rule requires an id")
+    normalized: dict[str, Any] = {"id": _slug(raw["id"])}
+    for key in _MATCH_KEYS:
+        if key not in raw:
+            continue
+        values = _strings(raw[key], field_name=f"coverage rule {key}")
+        if key == "paths_any":
+            values = _repository_paths(
+                list(values), field_name=f"coverage rule {key}",
+            )
+        elif key == "component_ids_any":
+            values = tuple(_slug(item) for item in values)
+        normalized[key] = values
+    required_recipe_ids = tuple(
+        _slug(item) for item in _strings(
+            raw.get("required_recipe_ids", []),
+            field_name="coverage rule required_recipe_ids",
+        )
+    )
+    unknown_recipes = sorted(set(required_recipe_ids) - recipe_ids)
+    if unknown_recipes:
+        raise ValueError(
+            "coverage rule references unknown recipes: "
+            + ", ".join(unknown_recipes)
+        )
+    if not required_recipe_ids:
+        raise ValueError("coverage rule requires at least one required_recipe_id")
+    normalized["required_recipe_ids"] = required_recipe_ids
+    risk_tier = str(raw.get("risk_tier", "high")).strip().lower()
+    if risk_tier not in _RISK_TIERS:
+        raise ValueError("coverage rule risk_tier is invalid")
+    unresolved_policy = str(
+        raw.get("unresolved_policy", "block_when_unresolved")
+    ).strip().lower()
+    if unresolved_policy not in _UNRESOLVED_POLICIES:
+        raise ValueError("coverage rule unresolved_policy is invalid")
+    normalized["risk_tier"] = risk_tier
+    normalized["unresolved_policy"] = unresolved_policy
+    return MappingProxyType(normalized)
+
+
+def _verdict_policy(raw: Any) -> Mapping[str, Any]:
+    data = _mapping(raw, field_name="verdict_policy")
+    unknown = set(data) - _VERDICT_POLICY_KEYS
+    if unknown:
+        raise ValueError(
+            "verdict_policy contains unknown keys: " + ", ".join(sorted(unknown))
+        )
+    normalized: dict[str, Any] = {}
+    for key in (
+        "blocker_requires_request_changes", "require_evidence_for_findings",
+    ):
+        value = data.get(key, True)
+        if not isinstance(value, bool):
+            raise ValueError(f"verdict_policy {key} must be boolean")
+        if value is not True:
+            raise ValueError(
+                f"verdict_policy {key} must remain true in this runtime"
+            )
+        normalized[key] = value
+    blocking_value = data.get(
+        "blocking_severities",
+        data.get("request_changes_severities", ["blocker", "major"]),
+    )
+    blocking = _strings(
+        blocking_value, field_name="verdict_policy blocking_severities",
+    )
+    if not blocking or any(item not in _BLOCKING_SEVERITIES for item in blocking):
+        raise ValueError("verdict_policy blocking_severities is invalid")
+    high_risk = _strings(
+        data.get("high_risk_tiers", ["critical", "high"]),
+        field_name="verdict_policy high_risk_tiers",
+    )
+    if not high_risk or any(item not in _BLOCKING_RISK_TIERS for item in high_risk):
+        raise ValueError("verdict_policy high_risk_tiers is invalid")
+    normalized["blocking_severities"] = blocking
+    normalized["high_risk_tiers"] = high_risk
+    return MappingProxyType(normalized)
+
+
+def _publishing(raw: Any) -> Mapping[str, Any]:
+    data = _mapping(raw, field_name="publishing")
+    unknown = set(data) - _PUBLISHING_KEYS
+    if unknown:
+        raise ValueError(
+            "publishing contains unknown keys: " + ", ".join(sorted(unknown))
+        )
+    allowed_modes = _strings(
+        data.get("allowed_modes", ["review_verdict"]),
+        field_name="publishing allowed_modes",
+    )
+    if not allowed_modes or any(
+        item not in _PUBLISHING_MODES for item in allowed_modes
+    ):
+        raise ValueError("publishing allowed_modes is invalid")
+    allow_approve = data.get("allow_approve", False)
+    if not isinstance(allow_approve, bool):
+        raise ValueError("publishing allow_approve must be boolean")
+    return MappingProxyType({
+        "allowed_modes": allowed_modes,
+        "allow_approve": allow_approve,
+    })
+
+
 def _parse_v2_policy(data: Mapping[str, Any]) -> ReviewPolicy:
     if data.get("version") != 2:
         raise ValueError("review policy must be a JSON object with version 1 or 2")
@@ -390,17 +573,149 @@ def _parse_v2_policy(data: Mapping[str, Any]) -> ReviewPolicy:
         raise ValueError(f"policy contains unknown top-level keys: {', '.join(sorted(unknown))}")
     if not (set(data) - {"version"}):
         raise ValueError("review policy must define at least one configuration section")
+    components = tuple(
+        _component_policy(item)
+        for item in _entries(data.get("components"), field_name="components")
+    )
+    recipes = tuple(
+        _recipe_policy(item)
+        for item in _entries(data.get("recipes"), field_name="recipes")
+    )
+    recipe_ids = frozenset(recipe.id for recipe in recipes)
+    if len(recipe_ids) != len(recipes):
+        raise ValueError("recipe ids must be unique")
     return ReviewPolicy(
-        components=tuple(_component_policy(item) for item in _entries(data.get("components"), field_name="components")),
-        recipes=tuple(_recipe_policy(item) for item in _entries(data.get("recipes"), field_name="recipes")),
-        coverage_rules=tuple(_freeze(item) for item in _entries(data.get("coverage_rules"), field_name="coverage_rules")),
+        components=components,
+        recipes=recipes,
+        coverage_rules=tuple(
+            _coverage_rule(item, recipe_ids=recipe_ids)
+            for item in _entries(
+                data.get("coverage_rules"), field_name="coverage_rules",
+            )
+        ),
         sources=tuple(_source_rule(item) for item in _entries(data.get("sources"), field_name="sources")),
         generated_artifacts=tuple(
             _generated_artifact(item) for item in _entries(data.get("generated_artifacts"), field_name="generated_artifacts")
         ),
-        verdict_policy=_freeze(_mapping(data.get("verdict_policy"), field_name="verdict_policy")),
-        publishing=_freeze(_mapping(data.get("publishing"), field_name="publishing")),
+        verdict_policy=_verdict_policy(data.get("verdict_policy")),
+        publishing=_publishing(data.get("publishing")),
         exclude=_exclude(data.get("exclude")),
+    )
+
+
+def _policy_sections(policy: ReviewPolicy) -> dict[str, object]:
+    return {
+        "components": policy.components,
+        "recipes": policy.recipes,
+        "coverage_rules": policy.coverage_rules,
+        "sources": policy.sources,
+        "generated_artifacts": policy.generated_artifacts,
+        "verdict_policy": policy.verdict_policy,
+        "publishing": policy.publishing,
+        "exclude": policy.exclude,
+    }
+
+
+def _unique_structured(values: tuple[Any, ...]) -> tuple[Any, ...]:
+    retained: list[Any] = []
+    seen: set[str] = set()
+    for value in values:
+        identity = json.dumps(
+            _thaw(value), sort_keys=True, separators=(",", ":"), default=str,
+        )
+        if identity not in seen:
+            retained.append(value)
+            seen.add(identity)
+    return tuple(retained)
+
+
+def authorize_policy_change(
+    *,
+    base_policy: ReviewPolicy,
+    head_policy: ReviewPolicy,
+    authorized: bool,
+    base_hash: str = "",
+    head_hash: str = "",
+) -> PolicyAuthorization:
+    """Use head policy only when authorized; otherwise choose a non-widening policy."""
+    base_sections = _policy_sections(base_policy)
+    head_sections = _policy_sections(head_policy)
+    changed_sections = tuple(
+        key for key in base_sections if base_sections[key] != head_sections[key]
+    )
+    if not changed_sections:
+        selected = head_policy
+    elif authorized:
+        selected = head_policy
+    else:
+        base_recipes = {item.id: item for item in base_policy.recipes}
+        head_recipes = {item.id: item for item in head_policy.recipes}
+        recipes = tuple(
+            (
+                base_recipes[recipe_id]
+                if recipe_id in base_recipes
+                else head_recipes[recipe_id]
+            )
+            for recipe_id in sorted(set(base_recipes).union(head_recipes))
+        )
+        base_sources = set(base_policy.sources)
+        sources = tuple(
+            item for item in head_policy.sources if item in base_sources
+        )
+        base_allowed = set(
+            base_policy.publishing.get("allowed_modes", ("review_verdict",))
+        )
+        head_allowed = set(
+            head_policy.publishing.get("allowed_modes", ("review_verdict",))
+        )
+        mode_rank = {mode: index for index, mode in enumerate(_PUBLISHING_MODES)}
+        base_cap = max(
+            (mode_rank[item] for item in base_allowed),
+            default=0,
+        )
+        head_cap = max(
+            (mode_rank[item] for item in head_allowed),
+            default=0,
+        )
+        allowed_modes = (_PUBLISHING_MODES[min(base_cap, head_cap)],)
+        selected = ReviewPolicy(
+            # Component paths/IDs affect recipe applicability.  Keeping the
+            # base component map prevents an automatic head-policy edit from
+            # making a base recipe silently stop matching.
+            components=base_policy.components,
+            recipes=recipes,
+            coverage_rules=_unique_structured(
+                (*base_policy.coverage_rules, *head_policy.coverage_rules)
+            ),
+            sources=sources,
+            generated_artifacts=_unique_structured(
+                (*base_policy.generated_artifacts,
+                 *head_policy.generated_artifacts)
+            ),
+            verdict_policy=base_policy.verdict_policy,
+            publishing=MappingProxyType({
+                "allowed_modes": allowed_modes,
+                "allow_approve": bool(
+                    base_policy.publishing.get("allow_approve", False)
+                    and head_policy.publishing.get("allow_approve", False)
+                ),
+            }),
+            exclude=MappingProxyType({
+                key: tuple(sorted(
+                    set(base_policy.exclude.get(key, ())).intersection(
+                        head_policy.exclude.get(key, ())
+                    )
+                ))
+                for key in ("paths", "components", "lenses", "recipes")
+            }),
+        )
+    return PolicyAuthorization(
+        policy=selected,
+        changed=bool(changed_sections),
+        authorized=bool(authorized),
+        changed_sections=changed_sections,
+        base_hash=str(base_hash),
+        head_hash=str(head_hash),
     )
 
 
@@ -415,6 +730,11 @@ def load_review_policy(path: str | Path, legacy_path: str | Path | None = None) 
         data = json.loads(candidate.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"review policy is not valid JSON: {candidate}") from exc
+    return parse_review_policy(data)
+
+
+def parse_review_policy(data: object) -> ReviewPolicy:
+    """Parse an already-loaded policy value through the same strict schema."""
     if not isinstance(data, dict):
         raise ValueError("review policy must be a JSON object")
     if data.get("version") == 1:

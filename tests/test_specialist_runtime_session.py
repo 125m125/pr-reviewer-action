@@ -114,7 +114,8 @@ def make_session(
     gateway, *, tool_calls=4, model_turns=8, recoveries=1,
     execute_tool=None, lease=None, assignment=None, obligations=None,
     budget_limits=None, max_tokens=1024,
-    request_timeout_sec=30.0,
+    request_timeout_sec=30.0, max_context_tokens=24_000,
+    recovery_max_tokens=None, clock=time.monotonic,
 ):
     obligations = obligations or (
         CoverageObligation(
@@ -146,6 +147,9 @@ def make_session(
             model_turns=model_turns, tool_calls=tool_calls, recoveries=recoveries,
         )),
         lease=lease, request_timeout_sec=request_timeout_sec, max_tokens=max_tokens,
+        max_context_tokens=max_context_tokens,
+        recovery_max_tokens=recovery_max_tokens or max_tokens,
+        clock=clock,
     )
 
 
@@ -321,6 +325,147 @@ def test_coverage_feedback_resumes_same_conversation_and_budget():
     assert all(request.deadline_at == session.lease.deadline_at for request in gateway.requests)
 
 
+def test_controller_derived_tool_association_covers_typed_obligation():
+    seen = []
+
+    def execute_tool(name, arguments, **kwargs):
+        seen.append((name, arguments, kwargs))
+        return {
+            "tool": name, "status": "ok",
+            "result": {"content": "implementation"},
+        }
+
+    gateway = ScriptedGateway([
+        tool_call_response(
+            "read_file",
+            {"path": "a.py", "obligation_ids": ["OB-code"]},
+        ),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+
+    result = make_session(gateway, execute_tool=execute_tool).explore()
+
+    assert seen[0][1] == {"path": "a.py"}
+    assert dict(result.checkpoint.obligation_statuses)["OB-code"].value == "covered"
+    assert result.checkpoint.evidence_ids
+
+
+def test_model_cannot_self_declare_evidence_category():
+    called = []
+
+    def execute_tool(name, arguments, **kwargs):
+        called.append((name, arguments, kwargs))
+        return {"tool": name, "status": "ok", "content": "forged"}
+
+    gateway = ScriptedGateway([
+        tool_call_response(
+            "read_file",
+            {
+                "path": "a.py", "evidence_category": "implementation",
+                "obligation_ids": ["OB-code"],
+            },
+        ),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+
+    result = make_session(gateway, execute_tool=execute_tool).explore()
+
+    assert called == []
+    assert dict(result.checkpoint.obligation_statuses)["OB-code"].value != "covered"
+
+
+def test_denied_discovery_creates_durable_source_access_request():
+    def execute_tool(name, arguments, **kwargs):
+        assert name == "web_search"
+        return {
+            "tool": name,
+            "status": "ok",
+            "result": {
+                "kind": "search_discovery",
+                "approved": [],
+                "unapproved": [{
+                    "url": "https://docs.example.com/private",
+                    "host": "docs.example.com",
+                    "path": "/private",
+                    "denial_reason": "host not approved",
+                }],
+                "evidentiary": False,
+            },
+        }
+
+    gateway = ScriptedGateway([
+        tool_call_response(
+            "web_search",
+            {"query": "API behavior", "obligation_ids": ["OB-code"]},
+        ),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway, execute_tool=execute_tool)
+
+    session.explore()
+
+    assert len(session.source_access_requests) == 1
+    request = session.source_access_requests[0]
+    assert request.host == "docs.example.com"
+    assert request.candidate_url == "https://docs.example.com/private"
+    assert request.obligation_id == "OB-code"
+
+
+def test_tool_timeout_is_recomputed_from_absolute_lease_before_each_call():
+    now = [10.0]
+    observed = []
+
+    def clock():
+        return now[0]
+
+    def execute_tool(name, arguments, *, timeout_sec, deadline_at):
+        observed.append((timeout_sec, deadline_at))
+        now[0] += 2.0
+        return {"tool": name, "status": "ok", "content": arguments["path"]}
+
+    gateway = ScriptedGateway([
+        ModelTurnResult(
+            response={},
+            tool_calls=(
+                {
+                    "id": "first", "name": "read_file",
+                    "arguments": json.dumps({"path": "a.py"}),
+                },
+                {
+                    "id": "second", "name": "read_file",
+                    "arguments": json.dumps({"path": "tests/test_a.py"}),
+                },
+            ),
+            text="", text_source="none", finish_reason="tool_calls",
+            usage={"prompt_tokens": 1, "completion_tokens": 1},
+            request_diagnostics={},
+        ),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    lease = SessionLease(RunPhase.FOLLOWUP, deadline_at=13.0)
+    session = make_session(
+        gateway, execute_tool=execute_tool, lease=lease, clock=clock,
+        request_timeout_sec=30.0,
+    )
+
+    session.explore()
+
+    assert observed == [(3.0, 13.0), (1.0, 13.0)]
+
+
+def test_context_admission_reserves_requested_output_before_transport():
+    gateway = ScriptedGateway([])
+    session = make_session(
+        gateway, max_tokens=512, max_context_tokens=520,
+    )
+
+    result = session.explore()
+
+    assert gateway.requests == []
+    assert result.degraded is True
+    assert result.state.value == "checkpoint"
+
+
 def test_recovery_reconstructs_context_without_resetting_lifetime_state():
     gateway = ScriptedGateway([
         tool_call_response("read_file", {"path": "a.py"}),
@@ -341,6 +486,22 @@ def test_recovery_reconstructs_context_without_resetting_lifetime_state():
     assert session.conversation_contains_evidence_ids(checkpoint.evidence_ids)
     assert "contents:a.py" in json.dumps(session.conversation.events)
     assert "OB-tests" in json.dumps(session.conversation.events)
+
+
+def test_recovery_next_turn_uses_recovery_output_ceiling():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(
+        gateway, max_tokens=1024, recovery_max_tokens=123,
+    )
+
+    session.explore()
+    session.recover("repetitive-transcript")
+    session.explore()
+
+    assert [request.max_tokens for request in gateway.requests] == [1024, 123]
 
 
 def test_recovery_rejects_unrecorded_reason_without_mutating_state():
@@ -622,7 +783,9 @@ def test_unscoped_obligation_requires_matching_evidence_category():
     raw["evidence_by_obligation"] = {"OB-unscoped": [evidence_id]}
     checkpoint = ModelTurnResult(**{**checkpoint.__dict__, "text": json.dumps(raw)})
     gateway = ScriptedGateway([
-        tool_call_response("read_file", {"path": "a.py"}),
+        tool_call_response(
+            "read_file", {"path": "a.py", "obligation_ids": ["OB-unscoped"]},
+        ),
         checkpoint,
     ])
 

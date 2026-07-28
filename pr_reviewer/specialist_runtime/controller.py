@@ -421,6 +421,15 @@ class _IsolatedSessionHandle:
     def request_events(self) -> tuple[object, ...]:
         return tuple(getattr(self.session, "request_events", ()))
 
+    @property
+    def source_access_requests(self) -> tuple[SourceAccessRequest, ...]:
+        return tuple(
+            item for item in getattr(
+                self.session, "source_access_requests", (),
+            )
+            if isinstance(item, SourceAccessRequest)
+        )
+
     def explore(self) -> object:
         result = self.session.explore()
         self._validate_result(result)
@@ -435,6 +444,15 @@ class _IsolatedSessionHandle:
         if not callable(callback):
             raise TypeError("resumed session must support apply_coverage_feedback")
         callback(tuple(gaps))
+
+    def recover(self, reason: str) -> object:
+        callback = getattr(self.session, "recover", None)
+        if not callable(callback):
+            raise TypeError("failed session does not support reconstruction")
+        result = callback(reason)
+        self._validate_result(result)
+        self.latest_result = result
+        return result
 
     def update_lease(self, lease: SessionLease) -> None:
         callback = getattr(self.session, "update_lease", None)
@@ -864,12 +882,21 @@ class ReviewController:
     @staticmethod
     def _publishing_authority(inputs: ReviewInputs) -> tuple[str, bool]:
         modes = {"comment": 0, "review_comment": 1, "review_verdict": 2}
-        policy_mode = inputs.policy.publishing.get("mode", "review_verdict")
+        allowed_modes = inputs.policy.publishing.get(
+            "allowed_modes", ("review_verdict",),
+        )
         policy_allow = inputs.policy.publishing.get("allow_approve", False)
-        if policy_mode not in modes:
-            raise ValueError("repository publishing policy has an invalid mode")
+        if (
+            not isinstance(allowed_modes, (list, tuple))
+            or not allowed_modes
+            or any(mode not in modes for mode in allowed_modes)
+        ):
+            raise ValueError(
+                "repository publishing policy has invalid allowed_modes"
+            )
         if not isinstance(policy_allow, bool):
             raise ValueError("repository publishing policy allow_approve must be boolean")
+        policy_mode = max(allowed_modes, key=lambda item: modes[item])
         mode = min(
             (policy_mode, inputs.publishing_mode),
             key=lambda item: modes[item],
@@ -1303,6 +1330,7 @@ class ReviewController:
                 state.candidate_occurrences[
                     f"session:{item.session_result.session_id}:{index}"
                 ] = candidate
+            state.source_requests.extend(item.session.source_access_requests)
             state.journal.emit("session_transition", {
                 "assignment_id": item.assignment_id,
                 "session_id": item.session_result.session_id,
@@ -2049,6 +2077,11 @@ class ReviewController:
                 "version": state.inputs.policy.version,
                 "digest": policy_digest,
                 "config_digest": config_digest,
+                "authorization": _json_value(
+                    state.inputs.pr_metadata.get(
+                        "policy_authorization", {},
+                    )
+                ),
             },
             "pr_number": state.inputs.pr_number,
             "publishing": {
@@ -2574,12 +2607,22 @@ class ReviewController:
                         break
             candidates = self._collect_candidates(state)
             self._adjudicate(state, candidates)
-            state.source_requests.extend(sorted(
-                inputs.source_access_requests,
+            state.source_requests.extend(inputs.source_access_requests)
+            state.source_requests = list({
+                (
+                    item.obligation_id,
+                    item.host,
+                    item.candidate_url,
+                    item.purpose,
+                    item.authority_reason,
+                ): item
+                for item in state.source_requests
+            }.values())
+            state.source_requests.sort(
                 key=lambda item: (
                     item.obligation_id, item.host, item.candidate_url, item.purpose,
                 ),
-            ))
+            )
             for request in state.source_requests:
                 journal.emit("source_access_request", {
                     "fingerprint": _digest(request.as_dict())[:32],

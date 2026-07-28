@@ -86,20 +86,23 @@ class PublisherApprovalPolicy:
 
     allow_approve: bool = False
     approve_forks: bool = False
-    is_fork: bool = False
+    is_fork: bool | None = None
     effective_scope: str = "full"
     baseline_clean: bool = False
 
     def __post_init__(self) -> None:
-        for name in ("allow_approve", "approve_forks", "is_fork", "baseline_clean"):
+        for name in ("allow_approve", "approve_forks", "baseline_clean"):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be a boolean")
+        if self.is_fork is not None and type(self.is_fork) is not bool:
+            raise TypeError("is_fork must be a boolean or unknown")
         if self.effective_scope not in {"full", "incremental"}:
             raise ValueError("effective_scope must be full or incremental")
 
 
 class ReviewPublishClient(Protocol):
     def update_sticky(self, repo: str, pr_number: int, body: str) -> Mapping[str, Any]: ...
+    def query_pr_identity(self, repo: str, pr_number: int) -> Mapping[str, Any]: ...
     def query_managed_state(self, repo: str, pr_number: int) -> Mapping[str, Any]: ...
     def reply_thread(self, comment_id: object, body: str) -> Mapping[str, Any]: ...
     def resolve_thread(self, thread_id: str) -> Mapping[str, Any]: ...
@@ -615,6 +618,8 @@ def _native_event(
         return "REQUEST_CHANGES", "native approval disabled"
     if approval.effective_scope == "incremental" and not approval.baseline_clean:
         return "REQUEST_CHANGES", "incremental approval lacks a clean baseline"
+    if approval.is_fork is None:
+        return "REQUEST_CHANGES", "pull request fork identity is unknown"
     if approval.is_fork and not approval.approve_forks:
         return "REQUEST_CHANGES", "fork approval disabled"
     return "APPROVE", "approval safety policy passed"
@@ -898,7 +903,7 @@ class GitHubReviewPublisher:
             "publication_id": publication_id,
             "expected_event": desired_event,
             "expected_review_state": expected_review_state,
-            "review_completed": mode == "comment",
+            "review_completed": False,
             "changed_files_complete": changed_files_complete,
             "diff_complete": diff_complete,
             "sticky": (
@@ -916,13 +921,83 @@ class GitHubReviewPublisher:
             "publication_errors": self._errors,
         }
         managed: Mapping[str, Any] | None = None
+        identity_method = getattr(self.client, "query_pr_identity", None)
+        used_managed_identity_fallback = not callable(identity_method)
+        identity_operation = "live_identity"
+        if not callable(identity_method):
+            identity_method = self.client.query_managed_state
+            identity_operation = "query_managed_state"
+        identity_error_count = len(self._errors)
+        live_identity = self._call(
+            identity_operation,
+            identity_method,
+            repo,
+            pr_number,
+            retry_safe=True,
+        )
+        if (
+            not isinstance(live_identity, Mapping)
+            or live_identity.get("head_ref_oid") != head_sha
+        ):
+            if len(self._errors) == identity_error_count:
+                self._errors.append({
+                    "operation": "live_identity",
+                    "error": (
+                        "live pull request identity is unavailable or its head "
+                        "does not match the requested publication head"
+                    ),
+                })
+            if mode != "comment":
+                state["managed_state_complete"] = False
+            state["publication_errors"] = self._errors
+            self._write_state(state)
+            return state
+        if desired_event == "APPROVE":
+            repository_name = live_identity.get("repository_full_name")
+            base_name = live_identity.get("base_repository_full_name")
+            head_name = live_identity.get("head_repository_full_name")
+            if (
+                repository_name != repo
+                or base_name != repo
+                or not isinstance(head_name, str)
+                or not head_name
+            ):
+                self._errors.append({
+                    "operation": "live_repository_identity",
+                    "error": (
+                        "live base/head repository identities are unavailable "
+                        "or do not match the requested repository"
+                    ),
+                })
+                state["publication_errors"] = self._errors
+                self._write_state(state)
+                return state
+            live_is_fork = head_name != base_name
+            if approval_policy.is_fork is None or (
+                approval_policy.is_fork != live_is_fork
+            ):
+                self._errors.append({
+                    "operation": "live_repository_identity",
+                    "error": (
+                        "precheck fork identity does not match the live pull "
+                        "request repository identity"
+                    ),
+                })
+                state["publication_errors"] = self._errors
+                self._write_state(state)
+                return state
         if mode != "comment":
-            queried = self._call(
-                "query_managed_state",
-                self.client.query_managed_state,
-                repo,
-                pr_number,
-                retry_safe=True,
+            queried = (
+                live_identity
+                if used_managed_identity_fallback
+                and "pull_request_id" in live_identity
+                else self._call(
+                    "query_managed_state",
+                    self.client.query_managed_state,
+                    repo,
+                    pr_number,
+                    retry_safe=True,
+                )
             )
             if not isinstance(queried, Mapping):
                 state["notes"] = (
@@ -1007,6 +1082,7 @@ class GitHubReviewPublisher:
         state["sticky"] = dict(sticky)
         self._checkpoint(state, "update_sticky", sticky)
         if mode == "comment":
+            state["review_completed"] = True
             self._write_state(state)
             return state
 
@@ -1901,7 +1977,12 @@ _MANAGED_IDENTITY_QUERY = """
 query ManagedReviewIdentity($owner: String!, $name: String!, $number: Int!) {
   viewer { login }
   repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) { id changedFiles headRefOid }
+    nameWithOwner
+    pullRequest(number: $number) {
+      id changedFiles headRefOid
+      baseRepository { nameWithOwner }
+      headRepository { nameWithOwner }
+    }
   }
 }
 """.strip()
@@ -2227,6 +2308,58 @@ class GhReviewClient:
             cursor = next_cursor
         raise RuntimeError(f"{label} incomplete pagination: page limit exceeded")
 
+    def query_pr_identity(self, repo: str, pr_number: int) -> Mapping[str, Any]:
+        owner, name = self._split_repo(repo)
+        data = self._graphql(
+            _MANAGED_IDENTITY_QUERY,
+            {"owner": owner, "name": name, "number": pr_number},
+        )["data"]
+        repository = data.get("repository")
+        pr = (
+            repository.get("pullRequest")
+            if isinstance(repository, Mapping)
+            else None
+        )
+        base_repository = (
+            pr.get("baseRepository") if isinstance(pr, Mapping) else None
+        )
+        head_repository = (
+            pr.get("headRepository") if isinstance(pr, Mapping) else None
+        )
+        result = {
+            "head_ref_oid": (
+                pr.get("headRefOid") if isinstance(pr, Mapping) else None
+            ),
+            "repository_full_name": (
+                repository.get("nameWithOwner")
+                if isinstance(repository, Mapping)
+                else None
+            ),
+            "base_repository_full_name": (
+                base_repository.get("nameWithOwner")
+                if isinstance(base_repository, Mapping)
+                else None
+            ),
+            "head_repository_full_name": (
+                head_repository.get("nameWithOwner")
+                if isinstance(head_repository, Mapping)
+                else None
+            ),
+        }
+        if (
+            result["repository_full_name"] != repo
+            or result["base_repository_full_name"] != repo
+            or not isinstance(result["head_repository_full_name"], str)
+            or not result["head_repository_full_name"]
+            or not isinstance(result["head_ref_oid"], str)
+            or not re.fullmatch(
+                r"(?:[0-9a-f]{40}|[0-9a-f]{64})",
+                result["head_ref_oid"],
+            )
+        ):
+            raise RuntimeError("live pull request repository identity is invalid")
+        return result
+
     def query_managed_state(self, repo: str, pr_number: int) -> Mapping[str, Any]:
         owner, name = self._split_repo(repo)
         self._repo_context = (repo, pr_number)
@@ -2241,6 +2374,17 @@ class GhReviewClient:
         pull_request_id = pr.get("id") if isinstance(pr, Mapping) else None
         changed_files_count = pr.get("changedFiles") if isinstance(pr, Mapping) else None
         head_ref_oid = pr.get("headRefOid") if isinstance(pr, Mapping) else None
+        repository_full_name = (
+            repository.get("nameWithOwner")
+            if isinstance(repository, Mapping)
+            else None
+        )
+        base_repository = (
+            pr.get("baseRepository") if isinstance(pr, Mapping) else None
+        )
+        head_repository = (
+            pr.get("headRepository") if isinstance(pr, Mapping) else None
+        )
         if not isinstance(viewer_login, str) or not viewer_login:
             raise RuntimeError("managed-state viewer identity is missing")
         if not isinstance(pull_request_id, str) or not pull_request_id:
@@ -2463,6 +2607,17 @@ class GhReviewClient:
             "changed_files_complete": True,
             "changed_files_count": changed_files_count,
             "head_ref_oid": head_ref_oid,
+            "repository_full_name": repository_full_name,
+            "base_repository_full_name": (
+                base_repository.get("nameWithOwner")
+                if isinstance(base_repository, Mapping)
+                else None
+            ),
+            "head_repository_full_name": (
+                head_repository.get("nameWithOwner")
+                if isinstance(head_repository, Mapping)
+                else None
+            ),
         }
 
     def reply_thread(self, comment_id: object, body: str) -> Mapping[str, Any]:

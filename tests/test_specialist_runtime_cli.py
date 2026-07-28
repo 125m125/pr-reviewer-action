@@ -202,6 +202,10 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
     monkeypatch.setenv("SPECIALIST_PASS_TIMEOUT_SEC", "41")
     monkeypatch.setenv("SPECIALIST_MAX_TOKENS", "1234")
     monkeypatch.setenv("SPECIALIST_RECOVERY_MAX_TOKENS", "456")
+    monkeypatch.setenv("SPECIALIST_PLANNER_MAX_CONTEXT_BYTES", "6543")
+    monkeypatch.setenv("SPECIALIST_PLANNER_MAX_TOOL_CALLS", "7")
+    monkeypatch.setenv("SPECIALIST_MAX_TRUNCATION_CONTINUATIONS", "3")
+    monkeypatch.setenv("SPECIALIST_PACKET_MAX_BYTES", "87654")
     monkeypatch.setenv("MODEL_CONTEXT_TOKENS", "32000")
     monkeypatch.setenv("SPECIALIST_TEMPERATURE", "0.2")
     monkeypatch.setenv("SPECIALIST_STREAM_WATCHDOG", "false")
@@ -221,11 +225,60 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
     assert config.request_timeout_sec == 41
     assert config.max_tokens == 1234
     assert config.recovery_max_tokens == 456
+    assert config.planner_max_context_bytes == 6543
     assert config.model_context_tokens == 32000
     assert config.temperature == 0.2
     assert gateway.tokens_param == "max_tokens"
     assert config.tool_response_bytes == 5432
     assert config.tool_request_timeout_sec == 7
+    assert {
+        "SPECIALIST_PLANNER_MAX_TOOL_CALLS",
+        "SPECIALIST_MAX_TRUNCATION_CONTINUATIONS",
+        "SPECIALIST_PACKET_MAX_BYTES",
+    }.issubset(config.deprecation_warnings)
+
+    from pr_reviewer.specialist_runtime.assignments import Assignment
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger
+    from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+
+    session = controller._cli_session_factory(
+        Assignment(
+            id="a", title="A", objective="Review", obligation_ids=(),
+            recipe_ids=(), lenses=(), seed_paths=(), boundary_paths=(),
+            expected_evidence=(), estimated_turns=1, priority="normal",
+        ),
+        SessionLease(RunPhase.INITIAL, 10**20),
+        None,
+        EvidenceStore(),
+        CoverageLedger(()),
+        (),
+        "session:test:g0",
+    )
+    assert session.recovery_max_tokens == 456
+
+
+def test_planner_context_byte_limit_stops_oversized_request_before_transport(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    monkeypatch.setenv("SPECIALIST_PLANNER_MAX_CONTEXT_BYTES", "64")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    captured = []
+    controller.planner.gateway.transport = _successful_transport(captured)
+
+    with pytest.raises(ValueError, match="planner context"):
+        controller.planner.complete(RoleRequest(
+            role="planner",
+            request_id="planner:oversized",
+            phase=RunPhase.PLANNING,
+            lease=SessionLease(RunPhase.PLANNING, 10**20),
+            timeout_sec=30,
+            max_tokens=512,
+            context={"diff_context": "x" * 500},
+        ))
+
+    assert captured == []
 
 
 def _role_request(role: str, phase: RunPhase) -> RoleRequest:
@@ -260,6 +313,7 @@ def test_default_lm_studio_requests_use_role_and_session_protocols_not_legacy_ve
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
     monkeypatch.setenv("AI_MODEL", "local-model")
     monkeypatch.setenv("AI_RESPONSE_FORMAT", "off")
+    monkeypatch.setenv("IS_FORK_PR", "false")
     config = cli.CliConfig.from_env(workspace=tmp_path)
     controller = cli.build_controller(config)
     captured = []
@@ -446,6 +500,127 @@ def test_invalid_current_policy_is_an_authoritative_controller_degradation(monke
     assert "locked minimal policy" in workspace.inputs.configuration_warnings[0]
 
 
+def test_automatic_policy_change_uses_base_head_non_widening_policy(
+    monkeypatch, tmp_path,
+):
+    write_review_workspace(tmp_path)
+    policy = tmp_path / ".github" / "ai-review-policy.json"
+    policy.parent.mkdir()
+    policy.write_text(json.dumps({
+        "version": 2,
+        "publishing": {
+            "allowed_modes": ["review_verdict"], "allow_approve": True,
+        },
+    }), encoding="utf-8")
+    base_policy = json.dumps({
+        "version": 2,
+        "publishing": {
+            "allowed_modes": ["comment"], "allow_approve": False,
+        },
+    }).encode()
+
+    class Result:
+        returncode = 0
+        stdout = base_policy
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REPO", "owner/repo")
+    monkeypatch.setattr(cli, "_git_changed_files", lambda *_: ("src/app.py",))
+    monkeypatch.setattr(cli, "_tracked_paths", lambda *_: ())
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: Result())
+
+    workspace = cli.load_workspace(cli.CliConfig.from_env())
+
+    assert workspace.inputs.policy.publishing["allowed_modes"] == ("comment",)
+    assert workspace.inputs.policy.publishing["allow_approve"] is False
+    authorization = workspace.inputs.pr_metadata["policy_authorization"]
+    assert authorization["changed"] is True
+    assert authorization["authorized"] is False
+    assert "non-widening" in " ".join(workspace.inputs.configuration_warnings)
+
+
+def test_manual_rereview_authorizes_validated_head_policy(monkeypatch, tmp_path):
+    write_review_workspace(tmp_path)
+    policy = tmp_path / ".github" / "ai-review-policy.json"
+    policy.parent.mkdir()
+    policy.write_text(json.dumps({
+        "version": 2,
+        "publishing": {
+            "allowed_modes": ["review_comment"], "allow_approve": False,
+        },
+    }), encoding="utf-8")
+    base_policy = json.dumps({
+        "version": 2,
+        "publishing": {
+            "allowed_modes": ["comment"], "allow_approve": False,
+        },
+    }).encode()
+
+    class Result:
+        returncode = 0
+        stdout = base_policy
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REPO", "owner/repo")
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setattr(cli, "_git_changed_files", lambda *_: ("src/app.py",))
+    monkeypatch.setattr(cli, "_tracked_paths", lambda *_: ())
+    monkeypatch.setattr(cli.subprocess, "run", lambda *args, **kwargs: Result())
+
+    workspace = cli.load_workspace(cli.CliConfig.from_env())
+
+    assert workspace.inputs.policy.publishing["allowed_modes"] == (
+        "review_comment",
+    )
+    assert workspace.inputs.pr_metadata["policy_authorization"]["authorized"] is True
+
+
+def test_deleting_v2_policy_cannot_switch_automatic_run_to_legacy_authority(
+    monkeypatch, tmp_path,
+):
+    write_review_workspace(tmp_path)
+    legacy = tmp_path / ".github" / "ai-review-specialists.json"
+    legacy.parent.mkdir()
+    legacy.write_text(json.dumps({
+        "version": 1,
+        "recipes": [{
+            "id": "legacy", "objective": "Legacy review",
+        }],
+    }), encoding="utf-8")
+    base_v2 = json.dumps({
+        "version": 2,
+        "publishing": {
+            "allowed_modes": ["comment"], "allow_approve": False,
+        },
+    }).encode()
+    base_legacy = legacy.read_bytes()
+
+    class Result:
+        def __init__(self, returncode, stdout=b""):
+            self.returncode = returncode
+            self.stdout = stdout
+
+    def git_run(arguments, **_kwargs):
+        revision_path = arguments[-1]
+        if revision_path.endswith(".github/ai-review-policy.json"):
+            return Result(0, base_v2)
+        if revision_path.endswith(".github/ai-review-specialists.json"):
+            return Result(0, base_legacy)
+        raise AssertionError(arguments)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REPO", "owner/repo")
+    monkeypatch.setattr(cli, "_git_changed_files", lambda *_: ("src/app.py",))
+    monkeypatch.setattr(cli, "_tracked_paths", lambda *_: ())
+    monkeypatch.setattr(cli.subprocess, "run", git_run)
+
+    workspace = cli.load_workspace(cli.CliConfig.from_env())
+
+    assert workspace.inputs.policy.publishing["allowed_modes"] == ("comment",)
+    assert workspace.inputs.pr_metadata["policy_authorization"]["changed"] is True
+    assert "non-widening" in " ".join(workspace.inputs.configuration_warnings)
+
+
 def test_fork_sessions_do_not_advertise_tools_without_explicit_opt_in(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_BASE_URL", "http://model.invalid/v1")
     monkeypatch.setenv("AI_MODEL", "model")
@@ -470,4 +645,36 @@ def test_fork_sessions_do_not_advertise_tools_without_explicit_opt_in(monkeypatc
         assignment, SessionLease(RunPhase.INITIAL, 10**20), None,
         EvidenceStore(), CoverageLedger(()), (), "session:test:g0",
     )
+    assert session.conversation.tool_schemas == []
+
+
+@pytest.mark.parametrize("fork_state", ["unknown", ""])
+def test_unknown_fork_identity_disables_specialist_tools(
+    monkeypatch, tmp_path, fork_state,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://model.invalid/v1")
+    monkeypatch.setenv("AI_MODEL", "model")
+    if fork_state:
+        monkeypatch.setenv("IS_FORK_PR", fork_state)
+    else:
+        monkeypatch.delenv("IS_FORK_PR", raising=False)
+    monkeypatch.setenv("TOOL_ENABLE_FOR_FORKS", "true")
+    config = cli.CliConfig.from_env(workspace=tmp_path)
+    controller = cli.build_controller(config)
+    factory = controller._cli_session_factory
+    factory.source_policy = cli.SourcePolicy(())
+    from pr_reviewer.specialist_runtime.assignments import Assignment
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger
+    from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+
+    assignment = Assignment(
+        id="a", title="A", objective="Review", obligation_ids=(),
+        recipe_ids=(), lenses=(), seed_paths=(), boundary_paths=(),
+        expected_evidence=(), estimated_turns=1, priority="normal",
+    )
+    session = factory(
+        assignment, SessionLease(RunPhase.INITIAL, 10**20), None,
+        EvidenceStore(), CoverageLedger(()), (), "session:test:g0",
+    )
+
     assert session.conversation.tool_schemas == []

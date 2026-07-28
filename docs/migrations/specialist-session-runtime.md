@@ -37,7 +37,7 @@ replay and provider capacity have been demonstrated.
 <!-- specialist-runtime-input-table -->
 | Input | Lifecycle | Default | Large multilingual recommendation | Why |
 |---|---|---|---|---|
-| `review_strategy` | added | `single` | Begin with `specialists_evaluate`, then use `specialists` | Evaluate without publishing before enabling the handoff. |
+| `review_strategy` | added | `single` | Begin with `specialists_evaluate`, then use `specialists` with `publish_review_comment: "true"` | Evaluate without publishing before enabling the handoff; the strategy alone never publishes. |
 | `review_policy_file` | added | `.github/ai-review-policy.json` | Keep the default and commit a version-2 policy | The validated current-head policy selects work and limits sources/publishing. |
 | `specialist_review_deadline_sec` | added | `7200` | `7200` initially; raise only after measured runs need it | This is the absolute run deadline, including finalization and artifact production. |
 | `specialist_phase_shares` | added | `{"planning":10,"initial":60,"followup":20,"finalization":10}` | Keep the default before tuning from artifacts | The four percentages must total 100 and prevent one phase consuming the run. |
@@ -52,7 +52,7 @@ replay and provider capacity have been demonstrated.
 | `specialist_max_followup_passes` | deprecated | `2` | Replace with `specialist_max_followup_sessions: "2"` | Legacy alias, not the version-2 follow-up limit. |
 | `specialist_max_tool_calls_per_pass` | deprecated | `20` | Replace with `specialist_max_tool_calls_per_session: "20"` | Legacy alias; the new limit is lifetime-per-session. |
 | `specialist_tool_mode` | retained | `native_loop` | `native_loop` | Uses durable read-only specialist sessions; `packet` is deprecated. |
-| `specialist_planner_max_tool_calls` | retained | `2` | `2` | Keeps the topology/diff planning scout bounded. |
+| `specialist_planner_max_tool_calls` | deprecated | `2` | Remove it; use `specialist_max_tool_calls_per_session` for evidence gathering | The planner role does not expose tools, so this compatibility input is a no-op and warns when customized. |
 | `specialist_planner_max_tokens` | retained | `2048` | `2048` | Keeps the planning scout concise before specialist work begins. |
 | `specialist_planner_model` | retained |  | Leave blank to inherit `ai_model` initially | A separate planner model is an optional capacity/quality tuning point. |
 | `specialist_model` | retained |  | Leave blank to inherit `ai_model` initially | A separate worker model is optional after the baseline is stable. |
@@ -60,16 +60,16 @@ replay and provider capacity have been demonstrated.
 | `specialist_aggregator_model` | retained |  | Leave blank to inherit `ai_model` | Candidate ranking is bounded; tune only from artifacts. |
 | `specialist_pass_timeout_sec` | retained | `600` | `600` | Bounds an individual model request within the global deadline. |
 | `specialist_max_tokens` | retained | `4096` | `4096` | Bounds specialist, critic, and aggregation output. |
-| `specialist_recovery_max_tokens` | retained | `2048` | `2048` | Bounds the compact recovery after a repetition watchdog stop. |
+| `specialist_recovery_max_tokens` | retained | `2048` | `2048` | Bounds the first reconstructed specialist model turn after a recovery. |
 | `specialist_max_conversation_tokens` | retained | `96000` | `96000` | Bounds each session transcript separately from model context. |
 | `specialist_temperature` | retained | `0.0` | `0.0` | Keeps exploration deterministic while replay behavior is established. |
 | `model_context_tokens` | retained |  | Set the provider's actual window, for example `262144` | Derives corpus/diff budgets from the real context window; blank uses the action's context-limit mode. |
 | `system_prompt_file` | retained |  | `.github/ai-review-prompt.md` | Stores repository conventions alongside the code being reviewed. |
 | `system_prompt_mode` | changed | `replace` | `append` | Preserves the action-owned specialist protocol and appends repository conventions. |
 | `specialist_stream_watchdog` | retained | `true` | `true` | Stops repeated streamed blocks and permits one compact recovery. |
-| `specialist_max_truncation_continuations` | retained | `2` | `2` | Bounds continuation requests after an output reaches its cap. |
+| `specialist_max_truncation_continuations` | deprecated | `2` | Remove it | Durable sessions do not issue truncation-continuation turns; they checkpoint and preserve bounded unknowns instead. |
 | `specialist_planner_max_context_bytes` | retained | `60000` | `60000` | Limits context given to the planning scout before tool exploration. |
-| `specialist_packet_max_bytes` | retained | `90000` | `90000` | One-release packet migration setting; durable sessions ignore it. |
+| `specialist_packet_max_bytes` | deprecated | `90000` | Remove it | Packet mode has been removed; durable sessions ignore this compatibility input and warn when it is customized. |
 | `publish_review_comment` | retained | `false` | `"true"` when publishing | Enables managed publication for the selected publish mode. |
 | `publish_mode` | changed |  | `review_comment` | The empty default is an omission sentinel: `single` resolves to `comment`; specialist strategies resolve to `review_comment`. An explicit `comment` remains authoritative and stays a sticky comment. |
 | `inline_findings` | retained | `false` | Keep `false` until line-anchor noise is acceptable | Detailed notes remain the primary evidence surface. |

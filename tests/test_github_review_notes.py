@@ -140,6 +140,9 @@ class _FakeClient:
         self.managed_state = {
             "pull_request_id": "PR-node",
             "head_ref_oid": "a" * 40,
+            "repository_full_name": "owner/repo",
+            "base_repository_full_name": "owner/repo",
+            "head_repository_full_name": "owner/repo",
             "changed_files": ("a.py", "b.py"),
             "changed_files_complete": True,
             "threads": [],
@@ -156,6 +159,16 @@ class _FakeClient:
     def query_managed_state(self, repo, pr_number):
         self.calls.append(("query", repo, pr_number))
         return self.managed_state
+
+    def query_pr_identity(self, repo, pr_number):
+        del repo, pr_number
+        return {
+            key: self.managed_state[key]
+            for key in (
+                "head_ref_oid", "repository_full_name",
+                "base_repository_full_name", "head_repository_full_name",
+            )
+        }
 
     def reply_thread(self, comment_id, body):
         self.calls.append(("reply", comment_id, body))
@@ -234,6 +247,37 @@ def test_comment_mode_only_updates_sparse_handoff_and_artifacts(tmp_path):
     assert "https://example/artifact" in client.calls[0][3]
     assert "SECRET DETAIL" not in client.calls[0][3]
     assert result["mode"] == state["mode"] == "comment"
+    assert result["review_completed"] is True
+
+
+def test_comment_mode_live_head_mismatch_stops_before_sticky_mutation(tmp_path):
+    class StaleIdentityClient(_FakeClient):
+        def query_pr_identity(self, repo, pr_number):
+            self.calls.append(("identity", repo, pr_number))
+            return {
+                **super().query_pr_identity(repo, pr_number),
+                "head_ref_oid": "b" * 40,
+            }
+
+    client = StaleIdentityClient()
+    result, _state = _publish(tmp_path, client, mode="comment")
+
+    assert [call[0] for call in client.calls] == ["identity"]
+    assert result["review_completed"] is False
+    assert result["publication_errors"][0]["operation"] == "live_identity"
+
+
+def test_comment_sticky_failure_never_reports_review_completed(tmp_path):
+    class StickyFailureClient(_FakeClient):
+        def update_sticky(self, repo, pr_number, body):
+            self.calls.append(("sticky", repo, pr_number, body))
+            return {}
+
+    result, _state = _publish(
+        tmp_path, StickyFailureClient(), mode="comment",
+    )
+
+    assert result["review_completed"] is False
 
 
 def test_artifact_links_reject_credentials_queries_fragments_and_markdown_injection(tmp_path):
@@ -1635,7 +1679,9 @@ def test_final_sticky_refresh_has_one_aggregate_review_link_and_no_note_detail(t
         (
             "review_verdict",
             "approve",
-            PublisherApprovalPolicy(allow_approve=True, baseline_clean=True),
+            PublisherApprovalPolicy(
+                allow_approve=True, is_fork=False, baseline_clean=True,
+            ),
             "APPROVE",
         ),
         ("review_verdict", "request_changes", PublisherApprovalPolicy(), "REQUEST_CHANGES"),
@@ -1949,7 +1995,11 @@ def test_specialist_publish_cli_loads_only_typed_final_artifacts(tmp_path, monke
 
         def publish(self, **kwargs):
             captured["publish"] = kwargs
-            return {"mode": kwargs["mode"]}
+            return {
+                "mode": kwargs["mode"],
+                "review_completed": True,
+                "publication_errors": [],
+            }
 
     monkeypatch.setattr(cli, "GhReviewClient", lambda **_kwargs: object())
     monkeypatch.setattr(cli, "GitHubReviewPublisher", FakePublisher)
@@ -1984,6 +2034,50 @@ def test_specialist_publish_cli_loads_only_typed_final_artifacts(tmp_path, monke
     assert captured["publish"]["diff_complete"] is False
     assert "transcript" not in captured["publish"]
     assert "evidence_store" not in captured["publish"]
+
+
+def test_specialist_publish_cli_exits_nonzero_on_partial_publication(
+    tmp_path, monkeypatch,
+):
+    from scripts import publish_specialist_review as cli
+
+    for name, value in {
+        "handoff.json": {"markdown": "Sparse handoff"},
+        "notes.json": [],
+        "files.json": [{"filename": "a.py"}],
+        "policy.json": {"verdict": "approve", "source": "policy"},
+    }.items():
+        (tmp_path / name).write_text(json.dumps(value), encoding="utf-8")
+    (tmp_path / "pr.diff").write_text(DIFF, encoding="utf-8")
+
+    class PartialPublisher:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def publish(self, **_kwargs):
+            return {
+                "review_completed": False,
+                "publication_errors": [{
+                    "operation": "update_sticky", "error": "denied",
+                }],
+            }
+
+    monkeypatch.setattr(cli, "GhReviewClient", lambda **_kwargs: object())
+    monkeypatch.setattr(cli, "GitHubReviewPublisher", PartialPublisher)
+
+    assert cli.main([
+        "--mode", "comment",
+        "--handoff", str(tmp_path / "handoff.json"),
+        "--notes", str(tmp_path / "notes.json"),
+        "--diff", str(tmp_path / "pr.diff"),
+        "--files", str(tmp_path / "files.json"),
+        "--changed-files-complete", "true",
+        "--changed-files-count", "1",
+        "--policy-result", str(tmp_path / "policy.json"),
+        "--repo", "owner/repo",
+        "--pr-number", "17",
+        "--head-sha", "a" * 40,
+    ]) == 1
 
 
 def test_cli_file_normalization_handles_pr_file_objects_and_explicit_note_entries():
@@ -2354,9 +2448,9 @@ def test_live_head_mismatch_fails_before_any_publication_mutation(tmp_path):
 
     result, _state = _publish(tmp_path, client, notes=())
 
-    assert [call[0] for call in client.calls] == ["query"]
+    assert client.calls == []
     assert result["managed_state_complete"] is False
-    assert any(error["operation"] == "head_ref_oid" for error in result["publication_errors"])
+    assert any(error["operation"] == "live_identity" for error in result["publication_errors"])
 
 
 def test_discovery_failure_preserves_only_matching_publication_journal_and_notes(tmp_path):
@@ -2529,6 +2623,26 @@ def test_push_during_detail_mutations_keeps_review_pending(
 def test_approval_policy_rejects_truthy_non_booleans(field):
     with pytest.raises((TypeError, ValueError), match="boolean"):
         PublisherApprovalPolicy(**{field: "true"})
+
+
+def test_unknown_fork_identity_cannot_produce_native_approval(tmp_path):
+    client = _FakeClient()
+    result, _state = _publish(
+        tmp_path,
+        client,
+        mode="review_verdict",
+        approval=PublisherApprovalPolicy(
+            allow_approve=True,
+            approve_forks=True,
+            is_fork=None,
+            effective_scope="full",
+            baseline_clean=True,
+        ),
+    )
+
+    submit = next(call for call in client.calls if call[0] == "submit")
+    assert submit[2] == "REQUEST_CHANGES"
+    assert result["review"]["event"] == "REQUEST_CHANGES"
 
 
 @pytest.mark.parametrize("repo,head_sha", [

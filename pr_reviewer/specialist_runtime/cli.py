@@ -25,7 +25,14 @@ from pr_reviewer.tool_executors import execute_tool_request
 from .budget import BudgetLedger
 from .controller import GatewayRoleAdapter, ReviewController, ReviewInputs, ReviewResult
 from .model_gateway import ModelTurnRequest, OpenAIModelGateway
-from .policy import ReviewPolicy, RuntimeConfig, load_review_policy
+from .policy import (
+    PolicyAuthorization,
+    ReviewPolicy,
+    RuntimeConfig,
+    authorize_policy_change,
+    load_review_policy,
+    parse_review_policy,
+)
 from .session import SpecialistSession
 from .types import ReviewHandoff, ReviewNote, ReviewNoteKind
 from .web_evidence import SecureFetcher, SearxngSearchProvider, SourcePolicy
@@ -164,6 +171,7 @@ class CliConfig:
     max_tokens: int
     recovery_max_tokens: int
     planner_max_tokens: int
+    planner_max_context_bytes: int
     model_context_tokens: int
     temperature: float
     stream: bool
@@ -210,6 +218,13 @@ class CliConfig:
             warnings.append("ALLOWED_SOURCE_HOSTS")
         if source.get("SPECIALIST_TOOL_MODE", "native_loop").strip().lower() == "packet":
             warnings.append("SPECIALIST_TOOL_MODE=packet")
+        for name, default in (
+            ("SPECIALIST_PLANNER_MAX_TOOL_CALLS", "2"),
+            ("SPECIALIST_MAX_TRUNCATION_CONTINUATIONS", "2"),
+            ("SPECIALIST_PACKET_MAX_BYTES", "90000"),
+        ):
+            if name in source and str(source.get(name, "")).strip() != default:
+                warnings.append(name)
 
         api_format = source.get("AI_API_FORMAT", "openai").strip().lower()
         if api_format != "openai":
@@ -259,6 +274,9 @@ class CliConfig:
             max_tokens=_positive_int(source, "SPECIALIST_MAX_TOKENS", 4096),
             recovery_max_tokens=_positive_int(source, "SPECIALIST_RECOVERY_MAX_TOKENS", 2048),
             planner_max_tokens=_positive_int(source, "SPECIALIST_PLANNER_MAX_TOKENS", 2048),
+            planner_max_context_bytes=_positive_int(
+                source, "SPECIALIST_PLANNER_MAX_CONTEXT_BYTES", 60_000,
+            ),
             model_context_tokens=context_tokens,
             temperature=_nonnegative_float(source, "SPECIALIST_TEMPERATURE", 0.0),
             stream=_bool(source, "AI_STREAM", True),
@@ -307,11 +325,25 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
     def __init__(
         self, gateway, system_prompt: str, max_tokens: int,
         response_format_override: str | None = None,
+        max_context_bytes: int | None = None,
     ):
         super().__init__(gateway, system_prompt, response_format_override)
         self.max_tokens = max_tokens
+        self.max_context_bytes = max_context_bytes
 
     def complete(self, request):
+        if self.max_context_bytes is not None:
+            context_bytes = len(json.dumps(
+                _json_value(request.context),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8"))
+            if context_bytes > self.max_context_bytes:
+                raise ValueError(
+                    f"{request.role} context exceeds configured byte limit "
+                    f"({context_bytes}>{self.max_context_bytes})"
+                )
         return super().complete(replace(request, max_tokens=min(request.max_tokens, self.max_tokens)))
 
 
@@ -367,6 +399,86 @@ def _policy(config: CliConfig) -> tuple[ReviewPolicy, bool, str]:
         return ReviewPolicy.minimal(), True, warning
 
 
+def _manual_policy_authorization(config: CliConfig) -> bool:
+    event_name = config.environment.get("GITHUB_EVENT_NAME", "").strip()
+    if event_name == "workflow_dispatch":
+        return True
+    event_path = config.environment.get("GITHUB_EVENT_PATH", "").strip()
+    if event_name != "pull_request" or not event_path:
+        return False
+    try:
+        event = json.loads(Path(event_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return bool(
+        isinstance(event, Mapping)
+        and event.get("action") == "labeled"
+        and isinstance(event.get("label"), Mapping)
+        and event["label"].get("name")
+        == config.environment.get("REREVIEW_LABEL", "ai-review")
+    )
+
+
+def _authorized_policy(
+    config: CliConfig,
+    *,
+    base_sha: str,
+) -> tuple[PolicyAuthorization, bool, tuple[str, ...]]:
+    head, degraded, warning = _policy(config)
+    warnings = [warning] if warning else []
+    head_selected_path = (
+        config.policy_path
+        if config.policy_path.is_file() or not config.legacy_policy_path.is_file()
+        else config.legacy_policy_path
+    )
+    base = ReviewPolicy.minimal()
+    base_bytes = b"<missing>"
+    for candidate in (config.policy_path, config.legacy_policy_path):
+        result = subprocess.run(
+            [
+                "git", "show",
+                f"{base_sha}:{candidate.relative_to(config.workspace).as_posix()}",
+            ],
+            cwd=config.workspace,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            continue
+        base_bytes = result.stdout
+        try:
+            base = parse_review_policy(
+                json.loads(base_bytes.decode("utf-8")),
+            )
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+            warnings.append(
+                "base review policy is invalid; using locked minimal base "
+                f"policy: {exc}"
+            )
+            degraded = True
+        break
+    head_bytes = (
+        head_selected_path.read_bytes()
+        if head_selected_path.is_file()
+        else b"<missing>"
+    )
+    decision = authorize_policy_change(
+        base_policy=base,
+        head_policy=head,
+        authorized=_manual_policy_authorization(config),
+        base_hash=hashlib.sha256(base_bytes).hexdigest(),
+        head_hash=hashlib.sha256(head_bytes).hexdigest(),
+    )
+    if decision.changed and not decision.authorized:
+        warnings.append(
+            "automatic run detected a review-policy change; applied the "
+            "non-widening base/head intersection pending an authorized manual "
+            "re-review"
+        )
+        degraded = True
+    return decision, degraded, tuple(warnings)
+
+
 def load_workspace(config: CliConfig) -> ReviewWorkspace:
     root = config.workspace
     pr = _load_json(root / "pr.json", expected=dict)
@@ -404,7 +516,11 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
         for item in pr_files if isinstance(item, Mapping) and item.get("filename")
     }
     complete_pr_files = [raw_by_path.get(path, {"filename": path}) for path in changed_files]
-    policy, degraded, warning = _policy(config)
+    policy_decision, degraded, policy_warnings = _authorized_policy(
+        config, base_sha=base_sha,
+    )
+    policy = policy_decision.policy
+    warning = "; ".join(policy_warnings)
     topology = build_topology(
         complete_pr_files, classification, _tracked_paths(root), policy.legacy_projection(),
     )
@@ -434,8 +550,15 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
             "corpus_path": "review-corpus.truncated.md",
             "standards_path": "standards-context.md",
             **({"policy_warning": warning} if warning else {}),
+            "policy_authorization": {
+                "changed": policy_decision.changed,
+                "authorized": policy_decision.authorized,
+                "changed_sections": list(policy_decision.changed_sections),
+                "base_hash": policy_decision.base_hash,
+                "head_hash": policy_decision.head_hash,
+            },
         },
-        configuration_warnings=(warning,) if warning else (),
+        configuration_warnings=policy_warnings,
         adapter_configuration={
             "endpoint": endpoint_identity,
             "role_models": dict(config.role_models),
@@ -445,6 +568,7 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
             "request_timeout_sec": config.request_timeout_sec,
             "max_tokens": config.max_tokens,
             "planner_max_tokens": config.planner_max_tokens,
+            "planner_max_context_bytes": config.planner_max_context_bytes,
             "recovery_max_tokens": config.recovery_max_tokens,
             "model_context_tokens": config.model_context_tokens,
             "temperature": config.temperature,
@@ -481,7 +605,7 @@ def build_controller(config: CliConfig) -> ReviewController:
     role_response_format = "json_object" if config.response_format == "json_schema" else None
     planner = _BoundedRoleAdapter(
         gateway, _role_prompt(config.system_prompt, "planner"), config.planner_max_tokens,
-        role_response_format,
+        role_response_format, max_context_bytes=config.planner_max_context_bytes,
     )
     negotiator = _BoundedRoleAdapter(
         gateway, _role_prompt(config.system_prompt, "negotiator"), config.max_tokens,
@@ -499,45 +623,72 @@ def build_controller(config: CliConfig) -> ReviewController:
     def session_factory(assignment, lease, snapshot, evidence, coverage, obligations, session_id):
         del snapshot, obligations
         policy = getattr(session_factory, "source_policy", SourcePolicy(()))
-        tools_allowed = not (
-            config.environment.get("IS_FORK_PR", "false").strip().lower() == "true"
-            and config.environment.get("TOOL_ENABLE_FOR_FORKS", "false").strip().lower()
-            != "true"
+        fork_state = config.environment.get(
+            "IS_FORK_PR", "unknown",
+        ).strip().lower()
+        tools_allowed = (
+            fork_state == "false"
+            or (
+                fork_state == "true"
+                and config.environment.get(
+                    "TOOL_ENABLE_FOR_FORKS", "false",
+                ).strip().lower() == "true"
+            )
         )
         tools = web_tool_schemas(config.search_url, policy) if tools_allowed else []
         conversation = Conversation(
             system=config.system_prompt.rstrip() + "\n\n" + _SPECIALIST_SYSTEM,
             tool_schemas=tools,
         )
-        search_provider = (
-            SearxngSearchProvider(
-                config.search_url,
-                request_timeout=config.tool_request_timeout_sec,
-                max_response_bytes=max(config.tool_response_bytes, 64 * 1024),
+        def execute(
+            name: str,
+            arguments: dict[str, Any],
+            *,
+            timeout_sec: float | None = None,
+            deadline_at: float | None = None,
+        ) -> dict[str, Any]:
+            effective_timeout = max(
+                0.001,
+                min(
+                    float(config.tool_request_timeout_sec),
+                    float(timeout_sec)
+                    if timeout_sec is not None
+                    else float(config.tool_request_timeout_sec),
+                ),
             )
-            if tools and any(item.get("name") == "web_search" for item in tools)
-            else None
-        )
-        fetcher = SecureFetcher(
-            policy, evidence_store=evidence, timeout=config.tool_request_timeout_sec,
-            max_bytes=config.tool_response_bytes,
-        )
-
-        def execute(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             allowed_repos = tuple(dict.fromkeys(
                 item.strip() for item in (
                     config.environment.get("REPO", ""),
                     *config.environment.get("TOOL_ALLOWED_GH_API_REPOS", "").split(","),
                 ) if item.strip()
             ))
+            bounded_fetcher = SecureFetcher(
+                policy,
+                evidence_store=evidence,
+                timeout=effective_timeout,
+                max_bytes=config.tool_response_bytes,
+            )
+            bounded_search = (
+                SearxngSearchProvider(
+                    config.search_url,
+                    request_timeout=effective_timeout,
+                    max_response_bytes=max(
+                        config.tool_response_bytes, 64 * 1024,
+                    ),
+                )
+                if tools
+                and any(item.get("name") == "web_search" for item in tools)
+                else None
+            )
             return execute_tool_request(
                 name, arguments, str(config.workspace), allowed_repos,
                 config.environment.get("REPO", ""), tuple(rule.host for rule in policy.rules),
-                config.tool_response_bytes, config.tool_request_timeout_sec,
+                config.tool_response_bytes, effective_timeout,
                 config.search_url, config.max_search_results,
-                source_policy=policy, search_provider=search_provider,
-                secure_fetcher=fetcher, evidence_store=evidence,
+                source_policy=policy, search_provider=bounded_search,
+                secure_fetcher=bounded_fetcher, evidence_store=evidence,
                 session_id=session_id, model_identity=config.role_models["specialist"],
+                deadline_at=deadline_at,
             )
 
         return SpecialistSession(
@@ -554,6 +705,10 @@ def build_controller(config: CliConfig) -> ReviewController:
             max_tokens=config.max_tokens,
             stream=config.stream,
             max_context_tokens=config.model_context_tokens,
+            recovery_max_tokens=config.recovery_max_tokens,
+            recovery_evidence_bytes=max(
+                1_000, config.recovery_max_tokens * 4,
+            ),
         )
 
     # The current-head policy is attached after workspace loading in main.

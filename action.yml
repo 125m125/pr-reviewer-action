@@ -121,7 +121,7 @@ inputs:
     required: false
     default: ".github/ai-review-specialists.json"
   specialist_planner_max_tool_calls:
-    description: Maximum read-only tool calls available to the specialist planning scout.
+    description: Deprecated no-op retained for one release; the planner role exposes no tools. Use specialist_max_tool_calls_per_session for specialist evidence collection.
     required: false
     default: "2"
   specialist_planner_max_tokens:
@@ -169,7 +169,7 @@ inputs:
     required: false
     default: "4096"
   specialist_recovery_max_tokens:
-    description: Maximum completion tokens for one compact recovery after a specialist repetition watchdog stop.
+    description: Maximum completion tokens for the first reconstructed specialist turn after a bounded recovery.
     required: false
     default: "2048"
   specialist_max_conversation_tokens:
@@ -185,7 +185,7 @@ inputs:
     required: false
     default: "true"
   specialist_max_truncation_continuations:
-    description: Maximum continuation turns after a specialist response reaches the completion-token limit.
+    description: Deprecated no-op retained for one release; durable sessions checkpoint instead of issuing truncation-continuation turns.
     required: false
     default: "2"
   specialist_planner_max_context_bytes:
@@ -193,7 +193,7 @@ inputs:
     required: false
     default: "60000"
   specialist_packet_max_bytes:
-    description: Retained migration setting for deprecated packet mode; durable sessions ignore it.
+    description: Deprecated no-op retained for one release; durable sessions do not build packet-mode specialist inputs.
     required: false
     default: "90000"
   ai_fallback_base_url:
@@ -1039,7 +1039,7 @@ runs:
       run: bash "${{ github.action_path }}/scripts/run_review.sh"
 
     - name: Publish specialist review
-      if: inputs.review_strategy == 'specialists' && steps.precheck.outputs.should_review == 'true'
+      if: inputs.review_strategy == 'specialists' && steps.precheck.outputs.should_review == 'true' && inputs.publish_review_comment == 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
@@ -1048,8 +1048,9 @@ runs:
         HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
         EFFECTIVE_SCOPE: ${{ steps.precheck.outputs.effective_review_scope || 'full' }}
         BASELINE_CLEAN: ${{ steps.precheck.outputs.baseline_clean || 'false' }}
-        IS_FORK_PR: ${{ steps.precheck.outputs.is_fork_pr || 'false' }}
+        IS_FORK_PR: ${{ steps.precheck.outputs.is_fork_pr || 'unknown' }}
         APPROVE_FORKS: ${{ inputs.approve_forks }}
+        CLEANUP_PREVIOUS_NATIVE_REVIEWS: ${{ inputs.cleanup_previous_native_reviews }}
         GITHUB_ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
@@ -1070,6 +1071,14 @@ runs:
         EFFECTIVE_PUBLISH_MODE="$(jq -r '.publishing.mode // "review_comment"' specialist-review-artifact.json)"
         EFFECTIVE_ALLOW_APPROVE="$(jq -r '.publishing.allow_approve // false' specialist-review-artifact.json)"
         CHANGED_FILE_COUNT="$(jq 'length' specialist-changed-files.json)"
+        source "${GITHUB_ACTION_PATH}/scripts/publish_helpers.sh"
+        LIVE_HEAD_SHA="$(platform_pr_get "$REPO" "$PR_NUMBER" --jq '.head.sha // empty' 2>/dev/null || true)"
+        if [[ -z "$LIVE_HEAD_SHA" || "$LIVE_HEAD_SHA" != "$HEAD_SHA" ]]; then
+          echo "Live pull request head does not match the specialist artifact head" >&2
+          exit 1
+        fi
+        CLEANUP_NATIVE_REVIEWS="$(resolve_cleanup_flag "${CLEANUP_PREVIOUS_NATIVE_REVIEWS:-auto}" "$EFFECTIVE_PUBLISH_MODE")"
+        cleanup_native_reviews "$CLEANUP_NATIVE_REVIEWS"
         python3 "${GITHUB_ACTION_PATH}/scripts/publish_specialist_review.py" \
           --mode "$EFFECTIVE_PUBLISH_MODE" \
           --handoff review-handoff.json \

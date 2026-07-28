@@ -82,6 +82,23 @@ def test_documented_runtime_inputs_exist_with_matching_defaults():
             assert action[name] == row["default"]
 
 
+def test_inert_legacy_limits_are_explicitly_deprecated_while_live_limits_remain_retained():
+    table = parse_migration_input_table()
+
+    assert table["specialist_planner_max_context_bytes"]["status"] == "retained"
+    assert table["specialist_recovery_max_tokens"]["status"] == "retained"
+    for name in (
+        "specialist_planner_max_tool_calls",
+        "specialist_max_truncation_continuations",
+        "specialist_packet_max_bytes",
+    ):
+        assert table[name]["status"] == "deprecated"
+
+    text = MIGRATION.read_text(encoding="utf-8").lower()
+    assert "planner role does not expose tools" in text
+    assert "durable sessions do not issue truncation-continuation turns" in text
+
+
 def test_documented_v2_policy_parses_with_real_policy_api_and_is_source_safe(tmp_path):
     policy_path = tmp_path / "ai-review-policy.json"
     policy_path.write_text(json.dumps(documented_v2_policy()), encoding="utf-8")

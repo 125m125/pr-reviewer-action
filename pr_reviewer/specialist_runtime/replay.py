@@ -356,7 +356,30 @@ class _RecordedProvider:
         has_response_format = "response_format" in payload
         if has_response_format == bool(expected["tools_enabled"]):
             raise AssertionError("recorded structured-output request shape changed")
-        return deepcopy(self._active["response"])
+        response = deepcopy(self._active["response"])
+        # Older captured fixtures carried category authority in model-owned
+        # arguments.  Replay upgrades that wire shape to the production
+        # contract: the model may name assigned obligations, while the
+        # runtime derives categories from those obligations.
+        for choice in response.get("choices", ()):
+            message = choice.get("message", {}) if isinstance(choice, dict) else {}
+            for call in message.get("tool_calls", ()):
+                function = call.get("function", {}) if isinstance(call, dict) else {}
+                raw_arguments = function.get("arguments")
+                if not isinstance(raw_arguments, str):
+                    continue
+                try:
+                    arguments = json.loads(raw_arguments)
+                except json.JSONDecodeError:
+                    continue
+                obligation_id = arguments.pop("obligation_id", None)
+                arguments.pop("evidence_category", None)
+                if obligation_id:
+                    arguments["obligation_ids"] = [obligation_id]
+                function["arguments"] = json.dumps(
+                    arguments, sort_keys=True, separators=(",", ":"),
+                )
+        return response
 
     def assert_complete(self) -> None:
         if self.index != len(self.order):
@@ -372,7 +395,14 @@ def _executor(
     session_id: str,
     clock: _ReplayClock,
 ):
-    def execute(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def execute(
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        timeout_sec: float | None = None,
+        deadline_at: float | None = None,
+    ) -> dict[str, Any]:
+        _ = (evidence, session_id, timeout_sec, deadline_at)
         clock.advance(0.1)
         path = (root / Path(str(arguments.get("path", "")))).resolve()
         try:
@@ -386,14 +416,6 @@ def _executor(
             "status": "ok",
             "result": {"content": path.read_text(encoding="utf-8")},
         }
-        evidence.add_tool_result(
-            session_id=session_id,
-            tool=name,
-            arguments=arguments,
-            result=result,
-            category=str(arguments.get("evidence_category") or "tool-result"),
-            model_identity="recorded-specialist",
-        )
         return result
 
     return execute
@@ -474,6 +496,7 @@ def replay_fixture(fixture_dir: Path | str) -> SpecialistReplayResult:
             request_timeout_sec=runtime.model_request_timeout_sec,
             max_tokens=1024,
             max_context_tokens=24_000,
+            clock=clock,
         )
 
     with tempfile.TemporaryDirectory(prefix="specialist-replay-") as temp_dir:
