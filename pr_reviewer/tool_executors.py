@@ -13,7 +13,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 
 # mask_secrets lives in scripts/redact.py; ensure scripts/ is importable.
@@ -450,27 +450,55 @@ def execute_tool_request(
             offset = max(_opt_int(args.get("offset")) or 1, 1)
             limit = max(1, min(_opt_int(args.get("limit")) or 400, 400))
             diff_args = [
-                "git", "diff", "--no-ext-diff", "--no-color",
+                "git", "--literal-pathspecs", "diff", "--no-ext-diff", "--no-color",
                 "--find-renames", f"--unified={context_lines}",
                 f"{base_sha}...{head_sha}", "--", normalized_path,
             ]
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 diff_args,
                 cwd=workspace_root,
-                capture_output=True,
-                text=True,
-                timeout=request_timeout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
             )
-            if completed.returncode != 0:
+            if process.stdout is None:
+                process.kill()
+                raise ValueError("git diff did not provide a readable output stream")
+            capture_limit = max_response_bytes + 1
+            with ThreadPoolExecutor(max_workers=1) as reader:
+                future = reader.submit(process.stdout.read, capture_limit)
+                try:
+                    raw_output = future.result(timeout=request_timeout)
+                except FutureTimeoutError:
+                    process.kill()
+                    raise ValueError(
+                        f"git diff timed out after {request_timeout}s"
+                    )
+            capture_truncated = len(raw_output) > max_response_bytes
+            if capture_truncated:
+                process.kill()
+            return_code = process.wait(timeout=request_timeout)
+            output = raw_output.decode("utf-8", errors="replace")
+            if return_code != 0 and not capture_truncated:
                 raise ValueError(
-                    f"git diff failed: {mask_secrets((completed.stderr or '').strip())}"
+                    f"git diff failed: {mask_secrets(output.strip())}"
                 )
-            lines = (completed.stdout or "").splitlines(keepends=True)
+            lines = output.splitlines(keepends=True)
             start = offset - 1
             window = "".join(lines[start:start + limit])
-            patch, _ = mask_and_truncate(
-                mask_secrets(window), max_response_bytes
-            )
+            masked_patch = mask_secrets(window)
+            encoded_patch = masked_patch.encode("utf-8", errors="replace")
+            if len(encoded_patch) > max_response_bytes:
+                marker = b"\n[truncated]"
+                if max_response_bytes <= len(marker):
+                    encoded_patch = marker[:max_response_bytes]
+                else:
+                    encoded_patch = (
+                        encoded_patch[:max_response_bytes - len(marker)].decode(
+                            "utf-8", errors="ignore"
+                        ).encode("utf-8")
+                        + marker
+                    )
+            patch = encoded_patch.decode("utf-8", errors="replace")
             tool_result["result"] = {
                 "path": normalized_path,
                 "patch": patch,

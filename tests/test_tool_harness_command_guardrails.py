@@ -1,3 +1,4 @@
+import io
 import subprocess
 from pathlib import Path
 
@@ -102,19 +103,26 @@ def test_read_pr_diff_uses_bounded_file_scoped_merge_base_argv(
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "app.py").write_text("head\n", encoding="utf-8")
 
-    def fake_run(args, cwd, capture_output, text, timeout):
-        seen["args"] = args
-        return subprocess.CompletedProcess(
-            args,
-            0,
-            stdout=(
-                "diff --git a/src/app.py b/src/app.py\n"
-                "@@ -1 +1 @@\n-old\n+new\n"
-            ),
-            stderr="",
-        )
+    class FakeProcess:
+        def __init__(self, args, cwd, stdout, stderr):
+            seen["args"] = args
+            self.stdout = io.BytesIO(
+                b"diff --git a/src/app.py b/src/app.py\n"
+                b"@@ -1 +1 @@\n-old\n+new\n"
+            )
+            self.returncode = 0
 
-    monkeypatch.setattr(tool_executors.subprocess, "run", fake_run)
+        def wait(self, timeout):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    def fake_popen(args, cwd, stdout, stderr):
+        seen["args"] = args
+        return FakeProcess(args, cwd, stdout, stderr)
+
+    monkeypatch.setattr(tool_executors.subprocess, "Popen", fake_popen)
 
     result = tool_executors.execute_tool_request(
         "read_pr_diff",
@@ -141,6 +149,7 @@ def test_read_pr_diff_uses_bounded_file_scoped_merge_base_argv(
     assert result["result"]["range"]["offset"] == 1
     assert seen["args"] == [
         "git",
+        "--literal-pathspecs",
         "diff",
         "--no-ext-diff",
         "--no-color",
@@ -150,3 +159,93 @@ def test_read_pr_diff_uses_bounded_file_scoped_merge_base_argv(
         "--",
         "src/app.py",
     ]
+
+
+def test_read_pr_diff_treats_magic_looking_assigned_filename_literally(
+    monkeypatch, tmp_path,
+):
+    magic_path = ":(top)**"
+    base_sha = "1" * 40
+    head_sha = "2" * 40
+
+    class FakeProcess:
+        def __init__(self, args):
+            literal = args[:2] == ["git", "--literal-pathspecs"]
+            patch = (
+                b"diff --git a/:(top)** b/:(top)**\n-head\n+head magic\n"
+                if literal
+                else b"diff --git a/outside.txt b/outside.txt\n"
+                b"+SHOULD-NOT-BE-EXPOSED\n"
+            )
+            self.stdout = io.BytesIO(patch)
+            self.returncode = 0
+
+        def wait(self, timeout):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(
+        tool_executors.subprocess, "Popen",
+        lambda args, **kwargs: FakeProcess(args),
+    )
+
+    result = tool_executors.execute_tool_request(
+        "read_pr_diff", {"path": magic_path}, str(tmp_path),
+        set(), "", (), 12000, 15,
+        base_sha=base_sha, head_sha=head_sha,
+        allowed_diff_paths=(magic_path,),
+    )
+
+    assert result["status"] == "ok"
+    assert "head magic" in result["result"]["patch"]
+    assert "SHOULD-NOT-BE-EXPOSED" not in result["result"]["patch"]
+    assert "outside.txt" not in result["result"]["patch"]
+
+
+def test_read_pr_diff_bounds_capture_before_large_single_line_is_materialized(
+    monkeypatch, tmp_path,
+):
+    base_sha = "1" * 40
+    head_sha = "2" * 40
+    path = "large.min.js"
+    (tmp_path / path).write_text("head\n", encoding="utf-8")
+    observed = {}
+
+    class BoundedStream(io.BytesIO):
+        def read(self, size=-1):
+            observed["read_size"] = size
+            assert 0 < size <= 12001
+            return super().read(size)
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = BoundedStream(b"+" + b"x" * (5 * 1024 * 1024))
+            self.returncode = None
+            self.killed = False
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout):
+            self.returncode = 0 if self.returncode is None else self.returncode
+            return self.returncode
+
+    process = FakeProcess()
+    monkeypatch.setattr(
+        tool_executors.subprocess, "Popen",
+        lambda *args, **kwargs: process,
+    )
+    result = tool_executors.execute_tool_request(
+        "read_pr_diff", {"path": path}, str(tmp_path),
+        set(), "", (), 12000, 15,
+        base_sha=base_sha, head_sha=head_sha,
+        allowed_diff_paths=(path,),
+    )
+
+    assert result["status"] == "ok"
+    assert observed["read_size"] == 12001
+    assert process.killed is True
+    assert len(result["result"]["patch"].encode("utf-8")) <= 12000

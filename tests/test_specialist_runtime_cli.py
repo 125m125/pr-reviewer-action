@@ -404,7 +404,7 @@ def test_controller_rejects_symbolic_or_malformed_diff_revisions(
 
 def test_git_changed_files_uses_merge_base_when_target_branch_advances(tmp_path):
     subprocess.run(
-        ["git", "init", "-q"], cwd=tmp_path, check=True,
+        ["git", "init", "-q", "-b", "target"], cwd=tmp_path, check=True,
         capture_output=True, text=True,
     )
     subprocess.run(
@@ -442,7 +442,7 @@ def test_git_changed_files_uses_merge_base_when_target_branch_advances(tmp_path)
         capture_output=True, text=True,
     ).stdout.strip()
     subprocess.run(
-        ["git", "checkout", "-q", "master"], cwd=tmp_path, check=True,
+        ["git", "checkout", "-q", "target"], cwd=tmp_path, check=True,
         capture_output=True, text=True,
     )
     (tmp_path / "target-only.txt").write_text("advanced\n", encoding="utf-8")
