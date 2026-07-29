@@ -616,6 +616,95 @@ def _successful_transport(captured):
     return transport
 
 
+def test_planner_continues_truncated_reasoning_then_forces_json_response(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    monkeypatch.setenv("AI_RESPONSE_FORMAT", "json_schema")
+    monkeypatch.setenv("AI_REASONING_EFFORT", "high")
+    monkeypatch.setenv("SPECIALIST_PLANNER_MAX_TOKENS", "8192")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    payloads = []
+    responses = iter((
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"role": "assistant", "reasoning_content": "first reasoning"},
+            }],
+            "usage": {},
+        },
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"role": "assistant", "reasoning_content": "second reasoning"},
+            }],
+            "usage": {},
+        },
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": '{"assignments":[]}'},
+            }],
+            "usage": {},
+        },
+    ))
+
+    def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
+        payloads.append(payload)
+        return next(responses)
+
+    controller.planner.gateway.transport = transport
+
+    assert controller.planner.complete(_role_request("planner", RunPhase.PLANNING)) == {
+        "assignments": [],
+    }
+
+    assert len(payloads) == 3
+    assert payloads[0]["max_tokens"] == 8192
+    assert payloads[1]["max_tokens"] == 8192
+    assert all(
+        payload["response_format"] == {"type": "json_object"}
+        for payload in payloads
+    )
+    assert any(
+        message == {"role": "assistant", "content": "first reasoning"}
+        for message in payloads[1]["messages"]
+    )
+    assert any(
+        message == {"role": "assistant", "content": "first reasoning"}
+        for message in payloads[2]["messages"]
+    )
+    assert any(
+        message == {"role": "assistant", "content": "second reasoning"}
+        for message in payloads[2]["messages"]
+    )
+    assert payloads[2]["reasoning_effort"] == "none"
+    assert payloads[2]["response_format"] == {"type": "json_object"}
+
+
+def test_planner_uses_its_configured_output_limit_over_session_limit(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    monkeypatch.setenv("SPECIALIST_MAX_TOKENS", "4096")
+    monkeypatch.setenv("SPECIALIST_PLANNER_MAX_TOKENS", "8192")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    captured = []
+    controller.planner.gateway.transport = _successful_transport(captured)
+
+    controller.planner.complete(RoleRequest(
+        role="planner",
+        request_id="planner:session-limit",
+        phase=RunPhase.PLANNING,
+        lease=SessionLease(RunPhase.PLANNING, 10**20),
+        timeout_sec=30,
+        max_tokens=4096,
+        context={},
+    ))
+
+    assert captured[0]["max_tokens"] == 8192
+
+
 def test_default_lm_studio_requests_use_role_and_session_protocols_not_legacy_verdict_prompt(
     monkeypatch, tmp_path
 ):

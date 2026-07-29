@@ -30,7 +30,13 @@ from pr_reviewer.tool_executors import execute_tool_request
 
 from .budget import BudgetLedger
 from .adjudication import ReviewOrientationTopic
-from .controller import GatewayRoleAdapter, ReviewController, ReviewInputs, ReviewResult
+from .controller import (
+    GatewayRoleAdapter,
+    ReviewController,
+    ReviewInputs,
+    ReviewResult,
+    _json_object,
+)
 from .model_gateway import ModelTurnRequest, OpenAIModelGateway
 from .policy import (
     PolicyAuthorization,
@@ -366,11 +372,52 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
                     f"{request.role} context exceeds configured byte limit "
                     f"({context_bytes}>{self.max_context_bytes})"
                 )
-        return super().complete(replace(
+        bounded_request = replace(
             request,
             context=context,
-            max_tokens=min(request.max_tokens, self.max_tokens),
+            max_tokens=(
+                self.max_tokens
+                if request.role == "planner"
+                else min(request.max_tokens, self.max_tokens)
+            ),
+        )
+        if request.role != "planner":
+            return super().complete(bounded_request)
+
+        conversation = Conversation(system=self.system_prompt)
+        conversation.add_user(json.dumps(
+            _json_value(bounded_request.context),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
         ))
+        for attempt in range(3):
+            finalization = attempt == 2
+            result = self.gateway.complete(ModelTurnRequest(
+                role=bounded_request.role,
+                conversation=conversation,
+                max_tokens=bounded_request.max_tokens,
+                response_schema=None,
+                tools_enabled=False,
+                timeout_sec=bounded_request.timeout_sec,
+                deadline_at=bounded_request.lease.deadline_at,
+                stream=False,
+                response_schema_name="specialist_planner",
+                response_format_override=self.response_format_override,
+                reasoning_effort="none" if finalization else None,
+                ephemeral_user_note=(
+                    "Return only the required JSON object."
+                    if finalization else None
+                ),
+            ))
+            try:
+                return _json_object(result.text)
+            except (TypeError, ValueError):
+                if attempt == 2 or result.finish_reason != "length" or not result.text:
+                    raise
+                conversation.add_assistant_text(result.text)
+
+        raise AssertionError("planner continuation loop exhausted")
 
 
 def _load_json(path: Path, *, expected: type) -> Any:
