@@ -546,6 +546,34 @@ def _contradicts_stable_github_line_semantics(candidate: CandidateFinding) -> bo
     return False
 
 
+def _record_verification_or_platform_rejection(
+    candidate: CandidateFinding,
+    reason: str,
+    *,
+    verification: dict[str, CandidateVerificationRequest],
+    rejected: dict[str, CandidateDisposition],
+    dispositions: dict[str, CandidateDisposition],
+    target_id: str | None = None,
+) -> None:
+    candidate_id = candidate.candidate_id
+    if _contradicts_stable_github_line_semantics(candidate):
+        disposition = CandidateDisposition(
+            candidate_id,
+            "reject",
+            "deterministic-platform-contradiction",
+        )
+        rejected[candidate_id] = disposition
+        dispositions[candidate_id] = disposition
+        return
+    verification[candidate_id] = CandidateVerificationRequest(candidate, reason)
+    dispositions[candidate_id] = CandidateDisposition(
+        candidate_id,
+        "request_verification",
+        reason,
+        target_id,
+    )
+
+
 def _merge_findings(group: Iterable[AcceptedFinding], representative_id: str) -> AcceptedFinding:
     values = tuple(sorted(group, key=lambda item: item.candidate_id))
     representative = next(item for item in values if item.candidate_id == representative_id)
@@ -666,20 +694,12 @@ def adjudicate_candidates(
             )
             continue
         if action == "request_verification":
-            if _contradicts_stable_github_line_semantics(candidate):
-                disposition = CandidateDisposition(
-                    candidate_id,
-                    "reject",
-                    "deterministic-platform-contradiction",
-                )
-                rejected[candidate_id] = disposition
-                dispositions[candidate_id] = disposition
-                continue
-            verification[candidate_id] = CandidateVerificationRequest(
-                candidate, "critic-requested-verification"
-            )
-            dispositions[candidate_id] = CandidateDisposition(
-                candidate_id, action, "critic-requested-verification"
+            _record_verification_or_platform_rejection(
+                candidate,
+                "critic-requested-verification",
+                verification=verification,
+                rejected=rejected,
+                dispositions=dispositions,
             )
             continue
         authorized, reason = _authorize(
@@ -690,9 +710,12 @@ def adjudicate_candidates(
             changed_files=changed,
         )
         if authorized is None:
-            verification[candidate_id] = CandidateVerificationRequest(candidate, reason)
-            dispositions[candidate_id] = CandidateDisposition(
-                candidate_id, "request_verification", reason
+            _record_verification_or_platform_rejection(
+                candidate,
+                reason,
+                verification=verification,
+                rejected=rejected,
+                dispositions=dispositions,
             )
             continue
         if action == "merge":
@@ -714,12 +737,13 @@ def adjudicate_candidates(
         target = accepted.get(target_id)
         if target is None:
             for source in sources:
-                verification[source.candidate_id] = CandidateVerificationRequest(
-                    candidate_by_id[source.candidate_id], "merge-target-not-authoritative"
-                )
-                dispositions[source.candidate_id] = CandidateDisposition(
-                    source.candidate_id, "request_verification",
-                    "merge-target-not-authoritative", target_id,
+                _record_verification_or_platform_rejection(
+                    candidate_by_id[source.candidate_id],
+                    "merge-target-not-authoritative",
+                    verification=verification,
+                    rejected=rejected,
+                    dispositions=dispositions,
+                    target_id=target_id,
                 )
             continue
         accepted[target_id] = _merge_findings((target, *sources), target_id)
@@ -1270,6 +1294,8 @@ def _verification_note(
     changed_files: tuple[str, ...],
 ) -> ReviewNote | None:
     candidate = _normalized_candidate(request.candidate)
+    if _contradicts_stable_github_line_semantics(candidate):
+        return None
     if not _identity_text(candidate.claim):
         return None
     obligation_ids = tuple(

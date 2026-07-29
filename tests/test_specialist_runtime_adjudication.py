@@ -198,6 +198,69 @@ def test_critic_cannot_request_verification_that_github_review_lines_may_be_zero
     assert review.rejected[0].reason == "deterministic-platform-contradiction"
 
 
+def test_authorization_failure_cannot_publish_zero_based_github_line_hypothesis():
+    candidate = _candidate(
+        claim="GitHub review comment lines might be zero-based",
+        location="src/store.py:0",
+        causal_chain="GitHub may accept line 0 for a review comment location.",
+        consequence="A valid inline review comment could be discarded.",
+        manual_validation="Check whether the GitHub review API accepts line 0.",
+    )
+
+    review = _adjudicate(
+        (candidate,),
+        {candidate.candidate_id: "keep"},
+        EvidenceStore(),
+    )
+
+    assert review.verification_requests == ()
+    assert review.rejected[0].reason == "deterministic-platform-contradiction"
+
+
+def test_raw_candidate_verification_cannot_publish_zero_based_github_line_hypothesis():
+    candidate = _candidate(
+        claim="GitHub review comment lines might be zero-based",
+        location="src/store.py:0",
+        causal_chain="GitHub may accept line 0 for a review comment location.",
+        manual_validation="Check whether the GitHub review API accepts line 0.",
+    )
+    review = AdjudicatedReview(verification_requests=(candidate,))
+
+    notes = build_review_notes(
+        review,
+        EvidenceStore(),
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert notes == ()
+
+
+def test_defensive_revalidation_cannot_publish_zero_based_github_line_hypothesis():
+    store, evidence_id = _store()
+    candidate = _candidate(
+        claim="GitHub review comment lines might be zero-based",
+        causal_chain="GitHub may accept line 0 for a review comment location.",
+        evidence_ids=(evidence_id,),
+        manual_validation="Check whether the GitHub review API accepts line 0.",
+    )
+    accepted = _adjudicate(
+        (candidate,),
+        {candidate.candidate_id: "keep"},
+        store,
+    ).accepted[0]
+    review = AdjudicatedReview(accepted=(replace(accepted, line=0),))
+
+    notes = build_review_notes(
+        review,
+        store,
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert notes == ()
+
+
 def test_critic_preserves_genuine_github_diff_side_location_ambiguity():
     candidate = _candidate(
         claim="The requested line exists on both sides of the GitHub diff",
