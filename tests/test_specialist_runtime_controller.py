@@ -436,6 +436,45 @@ def test_negotiator_failure_uses_live_budget_fallback_resume(tmp_path):
     assert "negotiator invalid response" not in result.handoff.markdown
 
 
+def test_degraded_session_is_promoted_once_across_initial_followup_and_finalization(
+    tmp_path,
+):
+    class DegradedResumeSession(_ResumeSession):
+        def explore(self):
+            return replace(super().explore(), degraded=True)
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return DegradedResumeSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    def broken_negotiator(_state):
+        raise RuntimeError("negotiator unavailable")
+
+    result = _controller(
+        tmp_path,
+        session_factory=factory,
+        negotiator=broken_negotiator,
+    ).run(_inputs(tmp_path))
+
+    specialist_degradations = tuple(
+        item for item in result.artifact["degradation"]
+        if item["component"].startswith("specialist:")
+    )
+    assert result.artifact["evaluation_status"] == "degraded"
+    assert specialist_degradations == ({
+        "component": "specialist:worker-flow",
+        "reason": "specialist completed with degraded retained state",
+    },)
+    assert result.handoff.status == "AI review completed with material coverage limits"
+    assert result.handoff.coverage_warning.count("specialist") == 1
+    assert "worker-flow" not in result.handoff.markdown
+
+
 def test_critic_failure_rejects_ambiguous_candidate(tmp_path):
     ambiguous = CandidateFinding(
         candidate_id="ambiguous",
@@ -938,6 +977,102 @@ def test_exhausted_schema_repair_cannot_inflate_artifact_model_turns(tmp_path):
     assert result.artifact["budgets"]["totals"]["model_turns"] <= (
         len(session_budgets) * inputs.config.session_limits.model_turns
     )
+
+
+def test_repeated_dangling_final_references_promote_top_level_specialist_degradation(
+    tmp_path,
+):
+    class DanglingFinalGateway:
+        def __init__(self):
+            self.requests = []
+
+        def complete(self, request):
+            self.requests.append(request)
+            request_number = len(self.requests)
+            if request_number == 1:
+                call = {
+                    "id": "read-worker",
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "src/worker.py"}),
+                }
+                return ModelTurnResult(
+                    response={}, tool_calls=(call,), text="", text_source="none",
+                    finish_reason="tool_calls",
+                    usage={"prompt_tokens": 3, "completion_tokens": 2},
+                    request_diagnostics={},
+                )
+            if request_number == 2:
+                text = json.dumps({
+                    "inspected": ["src/worker.py"],
+                    "unresolved": [],
+                    "hypotheses": [],
+                    "candidate_finding_ids": [],
+                    "invariants_evaluated": [],
+                    "unknowns": [],
+                    "proposed_next_actions": [],
+                })
+            else:
+                text = json.dumps({
+                    "summary": "candidate-forged-private-detail",
+                    "recommendation": "approve",
+                    "candidate_finding_ids": ["candidate-forged-private-detail"],
+                    "evidence_ids": [],
+                    "unknowns": [],
+                })
+            return ModelTurnResult(
+                response={}, tool_calls=(), text=text, text_source="content",
+                finish_reason="stop",
+                usage={"prompt_tokens": 3, "completion_tokens": 2},
+                request_diagnostics={},
+            )
+
+    gateway = DanglingFinalGateway()
+    inputs = replace(
+        _inputs(tmp_path),
+        config=replace(
+            _inputs(tmp_path).config,
+            session_limits=BudgetLimits(
+                model_turns=4, tool_calls=8, recoveries=1,
+            ),
+        ),
+    )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del snapshot, obligations
+        return SpecialistSession(
+            session_id=expected_session_id,
+            assignment=assignment,
+            conversation=Conversation(system="review"),
+            gateway=gateway,
+            execute_tool=lambda name, arguments: {
+                "tool": name,
+                "status": "ok",
+                "result": {"content": "def process(): pass"},
+            },
+            evidence_store=evidence_store,
+            coverage=coverage,
+            budget=BudgetLedger(inputs.config.session_limits),
+            lease=lease,
+            request_timeout_sec=inputs.config.model_request_timeout_sec,
+            max_tokens=128,
+            clock=lambda: 0.0,
+        )
+
+    result = _controller(tmp_path, session_factory=factory).run(inputs)
+
+    assert len(gateway.requests) == 4
+    assert result.artifact["evaluation_status"] == "degraded"
+    assert tuple(result.artifact["degradation"]) == ({
+        "component": "specialist:worker-flow",
+        "reason": "specialist completed with degraded retained state",
+    },)
+    assert result.artifact["sessions"][0]["degraded"] is True
+    assert result.handoff.status == "AI review completed with material coverage limits"
+    assert "Affected stages: specialist." in result.handoff.markdown
+    assert "candidate-forged-private-detail" not in result.handoff.markdown
 
 
 def test_artifact_write_failure_preserves_prior_file_and_valid_result(tmp_path):

@@ -927,6 +927,23 @@ class ReviewController:
         state.degradations.append(item)
         state.journal.emit("degradation", item)
 
+    def _promote_degraded_session_result(
+        self,
+        state: _RunState,
+        assignment_id: str,
+        result: object,
+    ) -> None:
+        if not bool(getattr(result, "degraded", False)):
+            return
+        component = f"specialist:{assignment_id}"
+        if any(item.get("component") == component for item in state.degradations):
+            return
+        self._degrade(
+            state,
+            component,
+            "specialist completed with degraded retained state",
+        )
+
     def _quarantine_session(
         self, state: _RunState, session_id: str, reason: str,
     ) -> None:
@@ -1322,6 +1339,9 @@ class ReviewController:
             state.sessions[expected_session_id] = item.session
             state.assignment_sessions[item.assignment_id] = expected_session_id
             state.session_results[(item.assignment_id, expected_session_id)] = item.session_result
+            self._promote_degraded_session_result(
+                state, item.assignment_id, item.session_result,
+            )
             self._admit_specialist_request_events(state, item.session_result)
             state.ownership[item.session_result.session_id] = self._ownership(
                 assignment, item.session_result.session_id, state,
@@ -2599,6 +2619,9 @@ class ReviewController:
                 )
                 if succeeded and result is not None:
                     state.session_results[(session.assignment.id, result.session_id)] = result
+                    self._promote_degraded_session_result(
+                        state, session.assignment.id, result,
+                    )
                     self._admit_specialist_request_events(state, result)
                     journal.emit("session_transition", {
                         "session_id": result.session_id,
