@@ -1906,6 +1906,10 @@ class ReviewController:
                 "checkpoint": _checkpoint_projection(result.checkpoint) if result else None,
                 "budget": _budget_projection(result.budget) if result else _budget_projection(BudgetUsage()),
                 "degraded": bool(result.degraded) if result else True,
+                "finalization_diagnostics": (
+                    _json_value(getattr(result, "finalization_diagnostics", ()))
+                    if result else []
+                ),
             })
         session_budgets = {
             item["session_id"]: item["budget"] for item in sessions
@@ -2701,6 +2705,11 @@ class ReviewController:
                     ),
                     "budget": _budget_projection(emergency_results[session_id].budget),
                     "degraded": bool(emergency_results[session_id].degraded),
+                    "finalization_diagnostics": _json_value(getattr(
+                        emergency_results[session_id],
+                        "finalization_diagnostics",
+                        (),
+                    )),
                 }
                 for session_id in sorted(emergency_results)
             ]

@@ -89,11 +89,13 @@ class ScriptedGateway:
         return response
 
 
-def final_response(summary="reviewed", recommendation="approve"):
+def final_response(
+    summary="reviewed", recommendation="approve", candidate_finding_ids=None,
+):
     text = json.dumps({
         "summary": summary,
         "recommendation": recommendation,
-        "candidate_finding_ids": [],
+        "candidate_finding_ids": candidate_finding_ids or [],
         "evidence_ids": [],
         "unknowns": [],
     })
@@ -894,6 +896,89 @@ def test_finalize_falls_back_to_structured_checkpoint_after_one_repair():
     assert result.degraded is True
     assert result.report["source"] == "checkpoint-fallback"
     assert result.report["unknowns"] == ["OB-code", "OB-tests"]
+
+
+def _session_with_retained_candidate(final_responses):
+    executor_result = {
+        "tool": "read_file",
+        "status": "ok",
+        "result": {"content": "contents:a.py"},
+    }
+    evidence_id = canonical_evidence_key(
+        "read_file", {"path": "a.py"}, executor_result,
+    )
+    checkpoint = checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])
+    raw = json.loads(checkpoint.text)
+    raw["candidate_finding_ids"] = ["candidate-code"]
+    raw["candidate_findings"] = [{
+        "candidate_id": "candidate-code",
+        "root_cause_fingerprint": "root:candidate-code",
+        "claim": "The changed branch skips the cancellation state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The new state reaches a switch without a matching arm.",
+        "severity": "major",
+        "category": "correctness",
+        "supporting_evidence_ids": [evidence_id],
+        "related_obligation_ids": ["OB-code"],
+        "confidence_rationale": "Direct retained file evidence.",
+        "user_visible_consequence": "Cancelled work is shown as active.",
+        "manual_validation": "Run the cancellation-state test.",
+    }]
+    checkpoint = ModelTurnResult(**{
+        **checkpoint.__dict__,
+        "text": json.dumps(raw),
+    })
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        checkpoint,
+        *final_responses,
+    ])
+    session = make_session(gateway)
+    session.explore()
+    return session, gateway
+
+
+def test_finalization_repairs_dangling_candidate_references_without_dropping_valid_ids():
+    session, gateway = _session_with_retained_candidate([
+        final_response(candidate_finding_ids=["candidate-code", "candidate-forged"]),
+        final_response(summary="repaired", candidate_finding_ids=["candidate-code"]),
+    ])
+
+    result = session.finalize()
+
+    assert result.degraded is False
+    assert result.report["summary"] == "repaired"
+    assert result.report["candidate_finding_ids"] == ["candidate-code"]
+    assert result.finalization_diagnostics == ({
+        "code": "invalid_candidate_finding_references",
+        "attempt": "initial",
+        "candidate_finding_ids": ("candidate-forged",),
+        "omitted_count": 0,
+    },)
+    assert gateway.requests[3].messages_contain("candidate-forged")
+    assert gateway.requests[3].messages_contain("latest checkpoint")
+
+
+def test_repeated_dangling_candidate_references_degrade_with_bounded_diagnostics():
+    forged_ids = [f"candidate-forged-{index}" for index in range(25)]
+    session, _gateway = _session_with_retained_candidate([
+        final_response(candidate_finding_ids=["candidate-code", *forged_ids]),
+        final_response(candidate_finding_ids=forged_ids),
+    ])
+
+    result = session.finalize()
+
+    assert result.degraded is True
+    assert result.report["source"] == "checkpoint-fallback"
+    assert result.report["candidate_finding_ids"] == ["candidate-code"]
+    assert tuple(
+        item["attempt"] for item in result.finalization_diagnostics
+    ) == ("initial", "repair")
+    assert all(
+        len(item["candidate_finding_ids"]) == 20
+        and item["omitted_count"] == 5
+        for item in result.finalization_diagnostics
+    )
 
 
 def test_finalize_falls_back_when_schema_repair_has_no_lifetime_turn_left():

@@ -250,6 +250,38 @@ def test_controller_runs_obligations_assignments_sessions_and_finalizer(tmp_path
     ]
 
 
+def test_session_finalization_diagnostics_are_artifact_only(tmp_path):
+    diagnostic = {
+        "code": "invalid_candidate_finding_references",
+        "attempt": "initial",
+        "candidate_finding_ids": ("candidate-forged",),
+        "omitted_count": 0,
+    }
+
+    class DiagnosedSession(_SuccessfulSession):
+        def finalize(self):
+            return replace(
+                super().finalize(),
+                finalization_diagnostics=(diagnostic,),
+            )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return DiagnosedSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    result = _controller(tmp_path, session_factory=factory).run(_inputs(tmp_path))
+
+    assert result.artifact["sessions"][0]["finalization_diagnostics"] == ({
+        **diagnostic,
+    },)
+    assert "candidate-forged" not in result.handoff.markdown
+
+
 def _factory(
     assignment, lease, snapshot, evidence_store, coverage, obligations,
     expected_session_id,

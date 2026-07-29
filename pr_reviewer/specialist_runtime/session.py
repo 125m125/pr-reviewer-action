@@ -108,6 +108,8 @@ _RECOVERY_REASONS = frozenset({
     "invalid-provider-history",
     "transport-incompatibility",
 })
+_MAX_FINALIZATION_DIAGNOSTIC_IDS = 20
+_MAX_FINALIZATION_DIAGNOSTIC_ID_CHARS = 256
 
 
 def _strings(value: object) -> tuple[str, ...]:
@@ -198,6 +200,7 @@ class SessionResult:
     report: Mapping[str, Any] | None = None
     degraded: bool = False
     request_events: tuple[SpecialistRequestEvent, ...] = ()
+    finalization_diagnostics: tuple[Mapping[str, object], ...] = ()
 
 
 class SpecialistSession:
@@ -265,6 +268,7 @@ class SpecialistSession:
         self._recovery_turn_pending = False
         self._final_result: SessionResult | None = None
         self._request_events: list[SpecialistRequestEvent] = []
+        self._finalization_diagnostics: list[dict[str, object]] = []
         self._request_attempt_journal: RequestAttemptJournal | None = None
         self._request_assignment_id = str(getattr(
             assignment, "assignment_id", getattr(assignment, "id", ""),
@@ -990,6 +994,9 @@ class SpecialistSession:
             checkpoint=self.latest_checkpoint, budget=self.budget.snapshot(),
             report=dict(report) if report is not None else None, degraded=degraded,
             request_events=tuple(self._request_events),
+            finalization_diagnostics=tuple(
+                dict(item) for item in self._finalization_diagnostics
+            ),
         )
 
     def conversation_contains_evidence_ids(self, evidence_ids: tuple[str, ...]) -> bool:
@@ -1077,16 +1084,32 @@ class SpecialistSession:
             turn = self._request(tools_enabled=False, schema=_FINAL_SCHEMA)
             if turn.text:
                 self.conversation.add_assistant_text(turn.text)
-            report = self._final_report_from_text(turn.text)
+            report, invalid_references = self._final_report_from_text(turn.text)
             if report is None:
-                self.conversation.add_user(
+                repair_instruction = (
                     "Schema repair: return exactly one final JSON object with non-empty "
                     "summary and recommendation fields. Tools remain disabled."
                 )
+                if invalid_references:
+                    diagnostic = self._record_invalid_final_references(
+                        "initial", invalid_references,
+                    )
+                    repair_instruction = (
+                        "Schema repair: candidate_finding_ids are references only. "
+                        "Remove these invalid references that are not defined in the "
+                        "latest checkpoint: "
+                        + json.dumps(list(diagnostic["candidate_finding_ids"]))
+                        + ". Return exactly one final JSON object; tools remain disabled."
+                    )
+                self.conversation.add_user(repair_instruction)
                 repair = self._request(tools_enabled=False, schema=_FINAL_SCHEMA)
                 if repair.text:
                     self.conversation.add_assistant_text(repair.text)
-                report = self._final_report_from_text(repair.text)
+                report, invalid_references = self._final_report_from_text(repair.text)
+                if invalid_references:
+                    self._record_invalid_final_references(
+                        "repair", invalid_references,
+                    )
         except Exception:  # noqa: BLE001 - provider/admission failure degrades once
             return self._cache_checkpoint_fallback()
         if report is None:
@@ -1102,34 +1125,55 @@ class SpecialistSession:
         )
         return self._final_result
 
-    def _final_report_from_text(self, text: str) -> dict[str, Any] | None:
+    def _final_report_from_text(
+        self, text: str,
+    ) -> tuple[dict[str, Any] | None, tuple[str, ...]]:
         raw = _json_object(text)
         if raw is None:
-            return None
+            return None, ()
         summary = raw.get("summary")
         recommendation = raw.get("recommendation")
         if not isinstance(summary, str) or not summary.strip():
-            return None
+            return None, ()
         if not isinstance(recommendation, str) or not recommendation.strip():
-            return None
+            return None, ()
         retained = {
             record.id for record in self.evidence_store.snapshot().records
             if record.is_usable_for_coverage
         }
         checkpoint_findings = set(self.latest_checkpoint.candidate_finding_ids)
+        declared_findings = _strings(raw.get("candidate_finding_ids"))
+        invalid_references = tuple(
+            item for item in declared_findings if item not in checkpoint_findings
+        )
+        if invalid_references:
+            return None, invalid_references
         return {
             "summary": summary.strip(),
             "recommendation": recommendation.strip(),
-            "candidate_finding_ids": [
-                item for item in _strings(raw.get("candidate_finding_ids"))
-                if item in checkpoint_findings
-            ],
+            "candidate_finding_ids": list(declared_findings),
             "evidence_ids": [
                 item for item in _strings(raw.get("evidence_ids")) if item in retained
             ],
             "unknowns": list(_strings(raw.get("unknowns"))),
             "source": "model-finalization",
+        }, ()
+
+    def _record_invalid_final_references(
+        self, attempt: str, invalid_references: tuple[str, ...],
+    ) -> dict[str, object]:
+        retained = tuple(
+            item[:_MAX_FINALIZATION_DIAGNOSTIC_ID_CHARS]
+            for item in invalid_references[:_MAX_FINALIZATION_DIAGNOSTIC_IDS]
+        )
+        diagnostic: dict[str, object] = {
+            "code": "invalid_candidate_finding_references",
+            "attempt": attempt,
+            "candidate_finding_ids": retained,
+            "omitted_count": max(0, len(invalid_references) - len(retained)),
         }
+        self._finalization_diagnostics.append(diagnostic)
+        return diagnostic
 
     def _checkpoint_fallback_report(self) -> dict[str, Any]:
         checkpoint = self.latest_checkpoint
