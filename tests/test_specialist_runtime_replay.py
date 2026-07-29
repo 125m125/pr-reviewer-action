@@ -204,6 +204,8 @@ def test_recorded_candidate_is_collected_by_session_not_review_inputs(tmp_path):
     final_payload = json.loads(final["content"])
     final_payload["candidate_finding_ids"] = []
     final["content"] = json.dumps(final_payload, sort_keys=True)
+    provider["scenarios"]["multilingual"]["request_order"].remove("critic")
+    provider["scenarios"]["multilingual"]["responses"].pop("critic")
     provider_path.write_text(json.dumps(provider), encoding="utf-8")
 
     replay = replay_fixture(copied / "multilingual-pr")

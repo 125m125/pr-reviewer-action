@@ -248,8 +248,20 @@ def _finalizer_proposal(value: object) -> FinalizerProposal:
     def topics(key: str) -> tuple[ReviewOrientationTopic, ...]:
         raw = value.get(key, ())
         if isinstance(raw, (str, bytes)) or not isinstance(raw, Iterable):
-            raise TypeError(f"finalizer {key} must be an array")
-        return tuple(ReviewOrientationTopic(str(item)) for item in raw)
+            return ()
+        selected: list[ReviewOrientationTopic] = []
+        for item in raw:
+            try:
+                topic = (
+                    item
+                    if isinstance(item, ReviewOrientationTopic)
+                    else ReviewOrientationTopic(str(item).strip().casefold())
+                )
+            except ValueError:
+                continue
+            if topic not in selected:
+                selected.append(topic)
+        return tuple(selected)
 
     def identifiers(key: str) -> tuple[str, ...]:
         raw = value.get(key, ())
@@ -269,6 +281,49 @@ def _finalizer_proposal(value: object) -> FinalizerProposal:
         review_emphasis_topics=topics("review_emphasis_topics"),
         recommendation=recommendation,
     )
+
+
+_VALID_CRITIC_ACTIONS = frozenset({
+    "keep", "reject", "merge", "request_verification", "downgrade_unknown",
+})
+
+
+def _validated_critic_result(
+    value: object,
+    candidates: Iterable[CandidateFinding],
+) -> object:
+    candidate_ids = tuple(item.candidate_id for item in candidates)
+    allowed_ids = set(candidate_ids)
+    rows: object = value
+    if isinstance(value, Mapping):
+        rows = value.get("actions", value.get("decisions"))
+    if (
+        isinstance(rows, (str, bytes))
+        or not isinstance(rows, Iterable)
+    ):
+        raise ValueError("critic actions must be an array")
+    admitted: list[Mapping[str, object]] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ValueError("critic actions must contain objects")
+        candidate_id = str(row.get("candidate_id") or "").strip()
+        action = str(row.get("action") or "").strip().lower()
+        target_id = str(row.get("target_id") or "").strip()
+        if candidate_id not in allowed_ids or candidate_id in seen:
+            raise ValueError("critic candidate coverage is invalid")
+        if action not in _VALID_CRITIC_ACTIONS:
+            raise ValueError("critic action is invalid")
+        if action == "merge":
+            if target_id not in allowed_ids or target_id == candidate_id:
+                raise ValueError("critic merge target is invalid")
+        elif target_id:
+            raise ValueError("critic target_id is only valid for merge")
+        seen.add(candidate_id)
+        admitted.append(row)
+    if seen != allowed_ids:
+        raise ValueError("critic omitted candidate decisions")
+    return {"actions": admitted}
 
 
 def _json_object(text: str) -> Mapping[str, object]:
@@ -1664,6 +1719,9 @@ class ReviewController:
 
     def _adjudicate(self, state: _RunState, candidates: tuple[CandidateFinding, ...]) -> None:
         obligation_map = {item.id: item for item in state.obligations}
+        if not candidates:
+            state.review = AdjudicatedReview()
+            return
         critic_result: object
         if self.critic is None:
             self._degrade(state, "critic", "deterministic conservative critic fallback")
@@ -1684,6 +1742,9 @@ class ReviewController:
                         "pr_metadata": state.inputs.pr_metadata,
                         "policy": state.inputs.policy,
                     },
+                )
+                critic_result = _validated_critic_result(
+                    critic_result, candidates,
                 )
             except Exception as exc:
                 self._degrade(state, "critic", _bounded_error(exc))

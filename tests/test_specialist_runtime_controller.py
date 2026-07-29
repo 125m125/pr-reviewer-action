@@ -517,6 +517,93 @@ def test_critic_failure_rejects_ambiguous_candidate(tmp_path):
     assert result.verdict != "request_changes" or result.verdict_source != "supported-findings"
 
 
+def test_empty_candidate_set_skips_critic_without_degradation(tmp_path):
+    critic_calls = []
+
+    class NoCandidateSession(_SuccessfulSession):
+        def explore(self):
+            result = super().explore()
+            self.candidate_findings = ()
+            return replace(
+                result,
+                checkpoint=replace(
+                    result.checkpoint,
+                    candidate_finding_ids=(),
+                ),
+            )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return NoCandidateSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    def critic(request):
+        critic_calls.append(request)
+        return {"actions": [{"action": "request_verification"}]}
+
+    result = _controller(
+        tmp_path,
+        session_factory=factory,
+        critic=critic,
+    ).run(_inputs(tmp_path))
+
+    assert critic_calls == []
+    assert result.artifact["accepted_candidates"] == ()
+    assert not any(
+        item["component"] == "critic"
+        for item in result.artifact["degradation"]
+    )
+
+
+@pytest.mark.parametrize(
+    "critic_result",
+    (
+        {"actions": [{"action": "keep"}]},
+        {"actions": []},
+        {"actions": [
+            {"candidate_id": "candidate-delivery", "action": "keep"},
+            {"candidate_id": "candidate-delivery", "action": "reject"},
+        ]},
+        {"actions": [{"candidate_id": "invented", "action": "keep"}]},
+        {"actions": [{
+            "candidate_id": "candidate-delivery",
+            "action": "invented",
+        }]},
+        {"actions": [{
+            "candidate_id": "candidate-delivery",
+            "action": "keep",
+            "target_id": "candidate-delivery",
+        }]},
+        {"actions": [{
+            "candidate_id": "candidate-delivery",
+            "action": "merge",
+        }]},
+    ),
+)
+def test_malformed_critic_result_uses_evidence_gated_conservative_fallback(
+    tmp_path, critic_result,
+):
+    result = _controller(
+        tmp_path,
+        critic=lambda _request: critic_result,
+    ).run(_inputs(tmp_path))
+
+    assert [
+        item["candidate_id"]
+        for item in result.artifact["accepted_candidates"]
+    ] == ["candidate-delivery"]
+    critic_degradations = [
+        item for item in result.artifact["degradation"]
+        if item["component"] == "critic"
+    ]
+    assert len(critic_degradations) == 1
+    assert "private" not in critic_degradations[0]["reason"]
+
+
 def test_duplicate_candidate_ids_reject_every_occurrence_without_first_wins(tmp_path):
     candidates = (
         CandidateFinding(
@@ -1614,6 +1701,32 @@ def test_finalizer_proposal_selects_only_authorized_orientation(tmp_path):
     )
     assert event["payload"]["coverage_boundary_topics"] == ()
     assert event["payload"]["review_emphasis_topics"] == ("failure_recovery",)
+
+
+def test_finalizer_filters_invalid_topics_without_discarding_valid_selection(
+    tmp_path,
+):
+    def finalizer(_request):
+        return {
+            "component_ids": ["worker"],
+            "recipe_ids": ["delivery"],
+            "change_topics": "wrong-container",
+            "review_emphasis_topics": [
+                "failure_recovery",
+                "invented-private-topic",
+                "FAILURE_RECOVERY",
+            ],
+        }
+
+    result = _controller(tmp_path, finalizer=finalizer).run(_inputs(tmp_path))
+
+    assert result.handoff.review_emphasis == ("Failure recovery",)
+    assert "Component: worker" in result.handoff.markdown
+    assert "invented-private-topic" not in result.handoff.markdown
+    assert not any(
+        item["component"] == "finalizer"
+        for item in result.artifact["degradation"]
+    )
 
 
 def test_repository_publishing_policy_prevents_caller_broadening(tmp_path):
