@@ -152,8 +152,8 @@ class _FakeClient:
         if managed_state is not None:
             self.managed_state.update(managed_state)
 
-    def update_sticky(self, repo, pr_number, body):
-        self.calls.append(("sticky", repo, pr_number, body))
+    def update_sticky(self, repo, pr_number, body, known_comment_id=None):
+        self.calls.append(("sticky", repo, pr_number, body, known_comment_id))
         return {"id": 100, "url": _issue_url(100)}
 
     def query_managed_state(self, repo, pr_number):
@@ -1526,6 +1526,37 @@ def test_sticky_post_timeout_reconciles_exact_owned_body_without_retry(monkeypat
     assert finds == [None, body]
 
 
+def test_sticky_refresh_patches_known_comment_when_comment_list_is_stale(monkeypatch, tmp_path):
+    client = GhReviewClient(action_root=tmp_path)
+    initial_body = "<!-- ai-pr-review-specialist-handoff -->\nInitial handoff"
+    refreshed_body = "<!-- ai-pr-review-specialist-handoff -->\nReview link"
+    finds = []
+    writes = []
+
+    def find(_repo, _pr_number, expected_body=None):
+        finds.append(expected_body)
+        return None
+
+    def write(endpoint, method, payload):
+        writes.append((endpoint, method, payload))
+        return {"id": 74, "url": _issue_url(74)}
+
+    monkeypatch.setattr(client, "find_specialist_handoff", find)
+    monkeypatch.setattr(client, "_api_write", write)
+
+    created = client.update_sticky("owner/repo", 17, initial_body)
+    refreshed = client.update_sticky(
+        "owner/repo", 17, refreshed_body, known_comment_id=created["id"]
+    )
+
+    assert refreshed == {"id": 74, "url": _issue_url(74)}
+    assert finds == [None]
+    assert writes == [
+        ("repos/owner/repo/issues/17/comments", "POST", {"body": initial_body}),
+        ("repos/owner/repo/issues/comments/74", "PATCH", {"body": refreshed_body}),
+    ]
+
+
 def test_general_comment_post_timeout_reconciles_exact_owned_body_without_retry(
     monkeypatch, tmp_path
 ):
@@ -1670,6 +1701,19 @@ def test_final_sticky_refresh_has_one_aggregate_review_link_and_no_note_detail(t
     assert "PRIVATE NOTE DETAIL" not in sticky_calls[-1][3]
     assert sticky_calls[-1][3].count(_review_url(151)) == 1
     assert "Detailed managed review" in sticky_calls[-1][3]
+
+
+def test_final_sticky_refresh_uses_initial_comment_id_when_list_is_stale(tmp_path):
+    class StaleListClient(_FakeClient):
+        def update_sticky(self, repo, pr_number, body, known_comment_id=None):
+            self.calls.append(("sticky", repo, pr_number, body, known_comment_id))
+            return {"id": 100, "url": _issue_url(100)}
+
+    client = StaleListClient()
+    _publish(tmp_path, client, notes=())
+    sticky_calls = [call for call in client.calls if call[0] == "sticky"]
+
+    assert [call[4] for call in sticky_calls] == [None, 100]
 
 
 @pytest.mark.parametrize(

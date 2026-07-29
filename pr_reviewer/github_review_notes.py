@@ -101,7 +101,13 @@ class PublisherApprovalPolicy:
 
 
 class ReviewPublishClient(Protocol):
-    def update_sticky(self, repo: str, pr_number: int, body: str) -> Mapping[str, Any]: ...
+    def update_sticky(
+        self,
+        repo: str,
+        pr_number: int,
+        body: str,
+        known_comment_id: int | None = None,
+    ) -> Mapping[str, Any]: ...
     def query_pr_identity(self, repo: str, pr_number: int) -> Mapping[str, Any]: ...
     def query_managed_state(self, repo: str, pr_number: int) -> Mapping[str, Any]: ...
     def reply_thread(self, comment_id: object, body: str) -> Mapping[str, Any]: ...
@@ -1701,6 +1707,7 @@ class GitHubReviewPublisher:
                 repo,
                 pr_number,
                 _handoff_body(handoff, artifact_links, completed_review["url"]),
+                sticky["id"],
             )
             if _valid_comment_result(refreshed):
                 state["sticky"] = dict(refreshed)
@@ -1958,6 +1965,7 @@ class GitHubReviewPublisher:
                     repo,
                     pr_number,
                     _handoff_body(handoff, artifact_links, review_url),
+                    sticky["id"],
                 )
                 if _valid_comment_result(refreshed):
                     state["sticky"] = dict(refreshed)
@@ -2161,14 +2169,30 @@ class GhReviewClient:
                 return tuple(files)
         raise RuntimeError("changed-files pagination incomplete: page limit exceeded")
 
-    def update_sticky(self, repo: str, pr_number: int, body: str) -> Mapping[str, Any]:
+    def update_sticky(
+        self,
+        repo: str,
+        pr_number: int,
+        body: str,
+        known_comment_id: int | None = None,
+    ) -> Mapping[str, Any]:
         self._split_repo(repo)
-        existing = self.find_specialist_handoff(repo, pr_number)
-        if existing is None:
+        if known_comment_id is None:
+            existing = self.find_specialist_handoff(repo, pr_number)
+            comment_id = existing["id"] if existing is not None else None
+        else:
+            if (
+                not isinstance(known_comment_id, int)
+                or isinstance(known_comment_id, bool)
+                or known_comment_id <= 0
+            ):
+                raise ValueError("known sticky comment id must be a positive integer")
+            comment_id = known_comment_id
+        if comment_id is None:
             endpoint = f"repos/{repo}/issues/{pr_number}/comments"
             method = "POST"
         else:
-            endpoint = f"repos/{repo}/issues/comments/{existing['id']}"
+            endpoint = f"repos/{repo}/issues/comments/{comment_id}"
             method = "PATCH"
         try:
             return self._api_write(endpoint, method, {"body": body})
