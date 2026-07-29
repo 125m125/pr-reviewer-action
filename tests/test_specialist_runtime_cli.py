@@ -11,8 +11,10 @@ import pytest
 
 from pr_reviewer.specialist_runtime import cli
 from pr_reviewer.specialist_runtime.budget import SessionLease
+from pr_reviewer.specialist_runtime.callbacks import freeze_callback_value
 from pr_reviewer.specialist_runtime.controller import ReviewResult, RoleRequest
 from pr_reviewer.specialist_runtime.model_gateway import ModelTurnRequest
+from pr_reviewer.specialist_runtime.policy import ReviewPolicy
 from pr_reviewer.specialist_runtime.types import (
     ReviewHandoff,
     ReviewNote,
@@ -279,6 +281,31 @@ def test_planner_context_byte_limit_stops_oversized_request_before_transport(
         ))
 
     assert captured == []
+
+
+def test_planner_serializes_frozen_policy_context_without_mappingproxy_copy(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    captured = []
+    controller.planner.gateway.transport = _successful_transport(captured)
+    frozen_context = freeze_callback_value({"policy": ReviewPolicy.minimal()})
+
+    controller.planner.complete(RoleRequest(
+        role="planner",
+        request_id="planner:frozen-policy",
+        phase=RunPhase.PLANNING,
+        lease=SessionLease(RunPhase.PLANNING, 10**20),
+        timeout_sec=30,
+        max_tokens=512,
+        context=frozen_context,
+    ))
+
+    assert captured
+    message = captured[0]["messages"][-1]["content"]
+    assert json.loads(message)["policy"]["version"] == 2
 
 
 def _role_request(role: str, phase: RunPhase) -> RoleRequest:

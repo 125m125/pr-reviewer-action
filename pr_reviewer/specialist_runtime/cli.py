@@ -7,7 +7,7 @@ adapters, and writes the narrow publication/compatibility artifacts.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 import json
 import os
@@ -728,12 +728,15 @@ def build_controller(config: CliConfig) -> ReviewController:
 def _json_value(value: object) -> object:
     if isinstance(value, Enum):
         return value.value
-    if is_dataclass(value):
-        return _json_value(asdict(value))
     if isinstance(value, Mapping):
         return {str(key): _json_value(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
         return [_json_value(item) for item in value]
+    if is_dataclass(value):
+        return {
+            item.name: _json_value(getattr(value, item.name))
+            for item in fields(value)
+        }
     return value
 
 

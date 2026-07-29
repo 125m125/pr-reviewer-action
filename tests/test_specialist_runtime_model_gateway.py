@@ -46,6 +46,26 @@ def test_role_model_override_and_deadline_bound_timeout():
     assert result.usage == {"prompt_tokens": 3, "completion_tokens": 2}
 
 
+def test_gateway_forwards_ephemeral_user_note_only_to_wire_payload():
+    calls = []
+    value = conversation("persistent request")
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1", api_key="secret", default_model="main",
+        transport=lambda *args, **kwargs: calls.append((args, kwargs)) or stop_response("{}"),
+    )
+
+    gateway.complete(ModelTurnRequest(
+        role="specialist", conversation=value, max_tokens=512,
+        response_schema=None, tools_enabled=True, timeout_sec=20, stream=False,
+        ephemeral_user_note="transient budget status",
+    ))
+
+    assert calls[0][0][2]["messages"][-1] == {
+        "role": "user", "content": "transient budget status",
+    }
+    assert "transient budget status" not in json.dumps(value.events)
+
+
 def test_override_payload_and_diagnostics_use_per_request_response_format():
     payloads = []
 

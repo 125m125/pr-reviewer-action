@@ -46,6 +46,7 @@ class ModelTurnRequest:
     cache_prefix: bool = False
     keep_full_history_on_verdict: bool = True
     response_format_override: str | None = None
+    ephemeral_user_note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +134,7 @@ class OpenAIModelGateway:
             response_schema=request.response_schema,
             response_schema_name=(request.response_schema_name or f"specialist_{request.role}"),
             reasoning_effort=request.reasoning_effort,
+            ephemeral_user_note=request.ephemeral_user_note,
             tokens_param=request.tokens_param,
             cache_prefix=request.cache_prefix,
         )

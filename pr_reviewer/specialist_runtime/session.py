@@ -374,6 +374,14 @@ class SpecialistSession:
         timeout = self.lease.request_timeout(
             self.request_timeout_sec, now=self.clock(),
         )
+        exploration_budget_note = None
+        if tools_enabled:
+            exploration_budget_note = (
+                "Exploration budget before this turn: "
+                f"{self.budget.remaining_model_turns()} model turns and "
+                f"{self.budget.remaining_tool_calls()} tool calls remain. "
+                "Prioritize unresolved correctness risks. Do not repeat completed checks."
+            )
         self.budget.reserve_model_turn()
         self._request_turn += 1
         request_id = f"{self.session_id}:model:{self._request_turn}"
@@ -401,6 +409,7 @@ class SpecialistSession:
                 tools_enabled=tools_enabled, timeout_sec=timeout,
                 deadline_at=self.lease.deadline_at, stream=self.stream,
                 response_schema_name=schema_name,
+                ephemeral_user_note=exploration_budget_note,
             )
             result = CALLBACK_POOL.run(
                 lambda: self.gateway.complete(request),

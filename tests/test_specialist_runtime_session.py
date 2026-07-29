@@ -63,6 +63,7 @@ class RecordedRequest:
     tools_enabled: bool
     deadline_at: float | None
     max_tokens: int
+    ephemeral_user_note: str | None
 
     def messages_contain(self, value):
         return value in self.messages
@@ -79,6 +80,7 @@ class ScriptedGateway:
             tools_enabled=request.tools_enabled,
             deadline_at=request.deadline_at,
             max_tokens=request.max_tokens,
+            ephemeral_user_note=request.ephemeral_user_note,
         ))
         assert self.responses, "model called more times than scripted"
         response = self.responses.pop(0)
@@ -192,6 +194,45 @@ def test_session_result_reports_each_actual_request_transition_once():
     assert tuple(request_pairs.values()) == (
         ["started", "completed"], ["started", "completed"],
     )
+
+
+def test_exploration_budget_note_is_ephemeral_and_updates_per_turn():
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        checkpoint_response(inspected=["a.py"], unresolved=[]),
+    ])
+    session = make_session(gateway, model_turns=4, tool_calls=4)
+
+    session.explore()
+
+    first, second = gateway.requests
+    assert first.ephemeral_user_note == (
+        "Exploration budget before this turn: 4 model turns and 4 tool calls remain. "
+        "Prioritize unresolved correctness risks. Do not repeat completed checks."
+    )
+    assert second.ephemeral_user_note == (
+        "Exploration budget before this turn: 3 model turns and 3 tool calls remain. "
+        "Prioritize unresolved correctness risks. Do not repeat completed checks."
+    )
+    assert "Exploration budget before this turn" not in json.dumps(session.conversation.events)
+
+
+def test_invalid_exploration_stop_forces_checkpoint_before_later_finalization():
+    gateway = ScriptedGateway([
+        invalid_response("plain-text conclusion"),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+        final_response(),
+    ])
+    session = make_session(gateway)
+
+    checkpoint = session.explore()
+    final = session.finalize()
+
+    assert checkpoint.state.value == "checkpoint"
+    assert final.state.value == "complete"
+    assert [request.tools_enabled for request in gateway.requests] == [True, False, False]
+    assert gateway.requests[1].messages_contain("Checkpoint requested (not a final report)")
+    assert gateway.requests[2].messages_contain("Finalize this specialist assessment once")
 
 
 def test_hanging_specialist_gateways_share_global_orphan_cap():
