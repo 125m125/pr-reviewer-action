@@ -9,7 +9,140 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Iterable, Mapping
+
+
+@dataclass(frozen=True)
+class RuntimeVerdictPolicyResult:
+    """Deterministic specialist-runtime verdict and its policy provenance."""
+
+    verdict: str
+    source: str
+    blocking_finding_ids: tuple[str, ...] = ()
+    blocking_obligation_ids: tuple[str, ...] = ()
+    unknown_obligation_ids: tuple[str, ...] = ()
+
+
+def _field(value: object, name: str, default: Any = None) -> Any:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def derive_runtime_verdict(
+    *,
+    model_verdict: str,
+    supported_findings: Mapping[str, str],
+    unresolved: Iterable[object],
+    allow_approve: bool,
+    policy: Mapping[str, Any] | None = None,
+) -> RuntimeVerdictPolicyResult:
+    """Apply evidence-backed severity and unresolved-coverage policy.
+
+    This pure specialist-runtime helper deliberately does not replace the
+    existing file-based enforcement functions or GitHub approval guardrails.
+    """
+    settings = dict(policy or {})
+    configured = settings.get(
+        "blocking_severities", settings.get("request_changes_severities")
+    )
+    if configured is None:
+        blocking_severities = {"blocker", "major"}
+    elif isinstance(configured, (list, tuple, set, frozenset)) and all(
+        isinstance(item, str) for item in configured
+    ):
+        blocking_severities = {
+            str(item).strip().lower() for item in configured if str(item).strip()
+        }.intersection({"blocker", "major"})
+    else:
+        # A malformed repository policy must not silently disable the secure
+        # default.  The validated v2 parser rejects this earlier; this guard
+        # protects direct/internal callers as well.
+        blocking_severities = {"blocker", "major"}
+
+    blocking_findings = tuple(sorted(
+        str(finding_id).strip()
+        for finding_id, severity in supported_findings.items()
+        if str(finding_id).strip()
+        and str(severity).strip().lower() in blocking_severities
+    ))
+
+    unresolved_items = tuple(unresolved)
+    blocking_obligations: list[str] = []
+    unknown_obligations: list[str] = []
+    supported_high_risk_tiers = {"critical", "high"}
+    configured_high_risk_tiers = settings.get("high_risk_tiers")
+    if configured_high_risk_tiers is None:
+        high_risk_tiers = supported_high_risk_tiers
+    elif isinstance(
+        configured_high_risk_tiers, (list, tuple, set, frozenset)
+    ) and all(isinstance(item, str) for item in configured_high_risk_tiers):
+        normalized_high_risk_tiers = {
+            item.strip().lower()
+            for item in configured_high_risk_tiers
+            if item.strip()
+        }
+        if (
+            not normalized_high_risk_tiers
+            or not normalized_high_risk_tiers.issubset(supported_high_risk_tiers)
+        ):
+            high_risk_tiers = supported_high_risk_tiers
+        else:
+            high_risk_tiers = normalized_high_risk_tiers
+    else:
+        high_risk_tiers = supported_high_risk_tiers
+    blocking_policies = {
+        "block", "blocking", "request_changes", "block_when_unresolved",
+    }
+    for obligation in unresolved_items:
+        obligation_id = str(
+            _field(obligation, "obligation_id", _field(obligation, "id", ""))
+        ).strip()
+        if not obligation_id:
+            continue
+        mandatory = bool(_field(obligation, "mandatory", True))
+        risk_tier = str(_field(obligation, "risk_tier", "normal")).strip().lower()
+        unresolved_policy = str(
+            _field(obligation, "unresolved_policy", "record_unknown")
+        ).strip().lower()
+        explicitly_blocking = bool(_field(obligation, "block_when_unresolved", False))
+        if (
+            mandatory
+            and risk_tier in high_risk_tiers
+            and (explicitly_blocking or unresolved_policy in blocking_policies)
+        ):
+            blocking_obligations.append(obligation_id)
+        else:
+            unknown_obligations.append(obligation_id)
+
+    if blocking_obligations:
+        return RuntimeVerdictPolicyResult(
+            verdict="request_changes",
+            source="incomplete-high-risk-coverage",
+            blocking_finding_ids=blocking_findings,
+            blocking_obligation_ids=tuple(sorted(set(blocking_obligations))),
+            unknown_obligation_ids=tuple(sorted(set(unknown_obligations))),
+        )
+    if blocking_findings:
+        return RuntimeVerdictPolicyResult(
+            verdict="request_changes",
+            source="supported-findings",
+            blocking_finding_ids=blocking_findings,
+            unknown_obligation_ids=tuple(sorted(set(unknown_obligations))),
+        )
+    if not allow_approve:
+        return RuntimeVerdictPolicyResult(
+            verdict="request_changes",
+            source="approval-disabled",
+            unknown_obligation_ids=tuple(sorted(set(unknown_obligations))),
+        )
+    return RuntimeVerdictPolicyResult(
+        verdict="approve",
+        source="model" if str(model_verdict).strip().lower() == "approve" else "policy",
+        unknown_obligation_ids=tuple(sorted(set(unknown_obligations))),
+    )
 
 
 def apply_evidence_blocker_enforcement(

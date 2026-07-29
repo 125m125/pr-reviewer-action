@@ -212,27 +212,40 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
-| `review_strategy` | `single` preserves the existing path; `specialists_evaluate` runs the complete specialist pipeline without publishing; `specialists` publishes its validated result | No | `single` |
-| `specialist_config_file` | Optional PR-branch JSON file defining component hints, structured recipes, and authoritative exclusions. A changed policy file is disclosed in the review | No | `.github/ai-review-specialists.json` |
-| `specialist_planner_max_tool_calls` | Maximum read-only calls available to the bounded topology/diff planning scout | No | `2` |
+| `review_strategy` | `single` preserves the existing path; `specialists_evaluate` runs without publishing; `specialists` enables publication only when `publish_review_comment` is also `true` | No | `single` |
+| `review_policy_file` | Current-branch version-2 specialist policy; source and publishing restrictions are authoritative | No | `.github/ai-review-policy.json` |
+| `specialist_review_deadline_sec` | Absolute specialist run deadline including finalization and artifact production | No | `7200` |
+| `specialist_phase_shares` | JSON percentage allocation for planning, initial, follow-up, and finalization; must total 100 | No | `{"planning":10,"initial":60,"followup":20,"finalization":10}` |
+| `specialist_concurrency` | Maximum concurrent specialist sessions | No | `1` |
+| `specialist_max_sessions` | Maximum initial specialist sessions | No | `8` |
+| `specialist_max_followup_sessions` | Maximum bounded follow-up specialist sessions | No | `2` |
+| `specialist_max_model_turns_per_session` | Lifetime model-turn limit for one logical specialist session | No | `64` |
+| `specialist_max_tool_calls_per_session` | Lifetime read-only tool-call limit for one logical specialist session | No | `20` |
+| `specialist_max_recoveries_per_session` | Lifetime reconstruction limit for one logical specialist session | No | `1` |
+| `specialist_config_file` | Deprecated one-release alias for a version-1 policy; migrate to `review_policy_file` | No | `.github/ai-review-specialists.json` |
+| `specialist_planner_max_tool_calls` | Deprecated no-op; the planner role does not expose tools. Use `specialist_max_tool_calls_per_session` | No | `2` |
 | `specialist_planner_max_tokens` | Completion-token ceiling for the bounded planning scout | No | `2048` |
-| `specialist_max_initial_passes` | Maximum sequential specialist passes in the initial wave | No | `6` |
-| `specialist_max_followup_passes` | Maximum sequential passes in the critic's single follow-up wave | No | `2` |
-| `specialist_max_tool_calls_per_pass` | Maximum read-only calls available to each specialist pass | No | `20` |
-| `specialist_tool_mode` | `native_loop` lets each specialist explore with read-only tools; `packet` uses only its bounded preassembled corpus | No | `native_loop` |
+| `specialist_max_initial_passes` | Deprecated one-release alias for `specialist_max_sessions` | No | `6` |
+| `specialist_max_followup_passes` | Deprecated one-release alias for `specialist_max_followup_sessions` | No | `2` |
+| `specialist_max_tool_calls_per_pass` | Deprecated one-release alias for `specialist_max_tool_calls_per_session` | No | `20` |
+| `specialist_tool_mode` | `native_loop` uses durable read-only specialist sessions; `packet` is deprecated | No | `native_loop` |
 | `specialist_planner_model` | Planning/scout model; empty inherits `ai_model` | No | `""` |
 | `specialist_model` | Specialist model; empty inherits `ai_model` | No | `""` |
 | `specialist_critic_model` | Critic model; empty inherits `specialist_model`, then `ai_model` | No | `""` |
 | `specialist_aggregator_model` | Candidate-ranking model; empty inherits `ai_model` | No | `""` |
 | `specialist_pass_timeout_sec` | Per-model-request timeout for specialist strategies | No | `600` |
 | `specialist_max_tokens` | Completion-token ceiling for specialist, critic, and aggregator turns | No | `4096` |
-| `specialist_recovery_max_tokens` | Completion-token ceiling for the one compact recovery after a repetition watchdog stop | No | `2048` |
+| `specialist_recovery_max_tokens` | Completion-token ceiling for the first reconstructed specialist turn after bounded recovery | No | `2048` |
 | `specialist_max_conversation_tokens` | Approximate transcript ceiling for one specialist conversation; independent of `model_context_tokens` | No | `96000` |
 | `specialist_temperature` | Sampling temperature for streamed specialist exploration turns; keep `0.0` for deterministic behavior or experiment with a modest value | No | `0.0` |
 | `specialist_stream_watchdog` | Interrupt streamed specialist output after repeated paragraphs/blocks and recover once from compact evidence | No | `true` |
-| `specialist_max_truncation_continuations` | Maximum continuation turns after a specialist response reaches the completion-token limit | No | `2` |
+| `specialist_max_truncation_continuations` | Deprecated no-op; durable sessions checkpoint instead of issuing truncation-continuation turns | No | `2` |
 | `specialist_planner_max_context_bytes` | Diff/context bytes supplied to the planner before tool exploration | No | `60000` |
-| `specialist_packet_max_bytes` | Review-corpus bytes supplied to one specialist | No | `90000` |
+| `specialist_packet_max_bytes` | Deprecated no-op; durable sessions do not build packet-mode specialist inputs | No | `90000` |
+
+For an executable version-2 migration, policy example, workflow conversion,
+artifact expectations, and troubleshooting, see the
+[specialist session runtime migration handoff](docs/migrations/specialist-session-runtime.md).
 
 For a large local-model review, keep `model_context_tokens` set to the model's
 actual provider window (for example `262144`) while keeping each specialist's
@@ -242,67 +255,26 @@ conversation bounded. A practical baseline is `ai_stream: "true"`,
 repeated paragraphs or blocks, discards the polluted partial turn, and performs
 one compact recovery request instead of continuing the same transcript.
 
-Specialist mode derives a generic component topology from manifests, paths,
-file roles, contracts, and deterministic risk flags. A bounded planning call may
-inspect the repository and returns a strict list of free-form focuses. The runner
-merges overlapping plan/recipe/fallback ownership, then selects passes by marginal
-component, relationship, lens, invariant, risk, and repository-recipe coverage.
-Each pass receives the full compact coworker roster plus a provisional coverage
-ledger from earlier passes. A critic may request one bounded follow-up wave only
-for omitted coverage, contradictions, or specifically missing evidence. Only evidence-backed, in-scope candidates
-survive deterministic validation; the final model can rank candidate IDs but
-cannot add findings.
+Specialist mode derives a generic component topology and deterministic review
+obligations from manifests, paths, file roles, contracts, recipes, and risk
+flags. A bounded planner assigns those obligations to durable specialist
+sessions. Sessions gather read-only evidence, checkpoint their progress, and
+finish on the same logical conversation; the coverage ledger and scheduler
+decide whether a bounded follow-up is justified. Deterministic adjudication
+accepts only evidence-backed, in-scope notes, and the finalizer produces the
+sparse human handoff without reopening findings or starting gap conversations.
 
-The configured pass and tool limits are literal ceilings. The job summary reports
-selected and omitted focuses, applied exclusions, model requests, runtime, and the
-computed maximum specialist tool budget. `specialists_evaluate` writes
+The configured session, turn, tool, recovery, and deadline limits are literal
+ceilings. The job summary reports assignment coverage, model requests, runtime,
+and budget accounting. `specialists_evaluate` writes
 `specialist-review-artifact.json` and exposes its path as `specialist_artifact`,
 but the publish step is unconditionally skipped.
 
-The optional policy file uses this structured version-1 schema:
-
-```json
-{
-  "version": 1,
-  "components": [{
-    "id": "python-worker",
-    "paths": ["worker/**"],
-    "responsibilities": ["background processing"],
-    "related_components": ["contracts"],
-    "contracts": ["event messages"],
-    "invariants": ["delivery remains idempotent"]
-  }],
-  "recipes": [{
-    "id": "worker-delivery",
-    "match": {"component_ids_any": ["python-worker"], "file_roles_any": ["messaging"]},
-    "title": "Worker delivery",
-    "objective": "Trace acknowledgement, retry, and persistence behavior.",
-    "lenses": ["background-work-retry-idempotency"],
-    "seed_paths": ["worker/messaging/**"],
-    "related_paths": ["contracts/**"],
-    "invariants": ["failed work is retried without duplicate effects"],
-    "priority": "high"
-  }],
-  "generated_artifacts": [{
-    "id": "openapi-client",
-    "source_of_truth": ["api/openapi.yaml"],
-    "generator_config": ["pom.xml"],
-    "output_paths": ["target/generated-sources/**"]
-  }],
-  "exclude": {"paths": [], "components": [], "lenses": [], "recipes": []}
-}
-```
-
-Every populated `match` group must match; values inside a group use `any`
-semantics. Exclusions are authoritative for specialist scheduling and are
-disclosed when applied. They do not disable existing classifier, verdict, or
-publication guardrails. Recipes are structured data rendered through an
-action-owned prompt; they cannot provide commands, models, custom budgets, or
-complete prompt replacements.
-Generated-artifact availability is derived from tracked files and actual workspace
-outputs (including ignored build products). When a configured output is absent,
-specialists are directed to its source specification, generator configuration,
-handwritten consumers/implementations, and tests instead of repeating searches.
+`review_policy_file` is a current-branch version-2 policy. The older
+`specialist_config_file` remains a one-release version-1 migration input, but
+version-2 recipes/policy control deterministic obligations and specialist
+selection. See the [migration handoff](docs/migrations/specialist-session-runtime.md)
+for the complete schema, source-rule boundaries, and conversion checklist.
 
 </details>
 
@@ -364,7 +336,7 @@ handwritten consumers/implementations, and tests instead of repeating searches.
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `publish_review_comment` | Publish or update a managed PR comment | No | `false` |
-| `publish_mode` | Publish mode for the review verdict: `comment` (sticky PR comment, default), `review_comment` (non-blocking native PR review comment), `review_verdict` (native approve/request_changes). Requires `pull-requests: write` for review_comment and review_verdict | No | `comment` |
+| `publish_mode` | Publish mode for the review verdict. When omitted, `single` uses `comment` and specialist reviews use `review_comment`; explicit `comment` always remains a sticky PR comment. `review_comment` submits a non-blocking native review and `review_verdict` submits approve/request_changes. Native modes require `pull-requests: write` | No | `""` |
 | `allow_approve` | If true and publish_mode=review_verdict, the model's approve verdict can be submitted as a native approval. Defaults to false — approval is blocked unless explicitly enabled. WARNING: native approvals can affect branch protection rules and automerge pipelines. | No | `false` |
 | `approve_forks` | If true and publish_mode=review_verdict with allow_approve=true, native approvals are also allowed for cross-repository (fork) PRs. Defaults to false — fork PRs are blocked from approval even when allow_approve is set. | No | `false` |
 | `cleanup_previous_native_reviews` | Mark previous managed native PR reviews as outdated/superseded before publishing a new native review. Accepted values: `auto` (default, enables cleanup for review_comment and review_verdict modes), `true`, or `false`. Cleanup only targets reviews created by this action carrying the managed marker. Dismissal of old approval/request-changes reviews is attempted when permissions allow but is secondary to visual cleanup. | No | `auto` |
@@ -419,7 +391,7 @@ handwritten consumers/implementations, and tests instead of repeating searches.
 |-------|-------------|----------|---------|
 | `tool_mode` | Tool harness mode: `off` or `native_loop` (the `plan_execute_*` planner modes were removed in 2.0) | No | `off` |
 | `tool_max_requests` | Maximum tool requests executed in one harness run (total across the loop) | No | `4` |
-| `tool_max_rounds` | Configured round budget for `tool_mode=native_loop`; the legacy mapping permits exactly twice this many planning turns, with no hidden cap | No | `3` |
+| `tool_max_rounds` | Exact planning-turn budget for `tool_mode=native_loop`; tool-only turns use the independent request budget | No | `3` |
 | `tool_max_consecutive_no_progress_rounds` | Advanced safety bound: stop exploration after this many consecutive duplicate, malformed, failed, or exhausted-budget rounds and synthesize from existing evidence | No | `2` |
 | `tool_max_repeated_call_sets` | Advanced safety bound: stop when the same duplicate-only canonical call set recurs this many times | No | `3` |
 | `tool_loop_wall_clock_sec` | Total wall-clock ceiling for native exploration plus terminal synthesis | No | `120` |
@@ -681,7 +653,7 @@ Evidence providers are **disabled by default on cross-repository pull requests**
     tool_min_successful_requests: "1"
 ```
 
-In `native_loop` mode the reviewing model uses its provider's native tool-calling API (OpenAI `tool_calls` / Anthropic `tool_use`). The tool schemas are sent with the request and the model holds the conversation: it issues a call, sees the result appended as a real tool-result turn, and decides the next call from what came back — so a chain like "read the machineconfig → extract the platform version → fetch that version's published compatibility matrix" is expressed natively, with each hop conditioned on the previous one's content rather than guessed up front. Each request receives an ephemeral note with the remaining call/turn/no-progress allowance. Successful duplicate calls replay the original bounded result without re-execution or budget charge. `tool_max_requests` is the exact execution cap; the legacy rounds mapping permits exactly `2 × tool_max_rounds` planning turns without a hidden maximum. Positive configured values are never clamped or raised automatically. `tool_loop_wall_clock_sec` covers exploration plus a reserved terminal synthesis phase (`tool_synthesis_timeout_sec`, `tool_synthesis_max_tokens`). The effective synthesis reserve is the smaller of the configured synthesis timeout and half the total wall clock, leaving time for both phases; configured and effective values are logged and shown in the step summary. Reaching a call, turn, no-progress, repetition, or exploration-time limit stops tool execution and triggers one tools-disabled, reasoning-enabled evidence synthesis turn before the strict verdict turn. Length-truncated analysis is retained as bounded internal synthesis input instead of restarting with a doubled output budget. Malformed, duplicate, and over-budget calls receive synthetic results but do not count as executions.
+In `native_loop` mode the reviewing model uses its provider's native tool-calling API (OpenAI `tool_calls` / Anthropic `tool_use`). The tool schemas are sent with the request and the model holds the conversation: it issues a call, sees the result appended as a real tool-result turn, and decides the next call from what came back — so a chain like "read the machineconfig → extract the platform version → fetch that version's published compatibility matrix" is expressed natively, with each hop conditioned on the previous one's content rather than guessed up front. Each request receives an ephemeral note with the remaining call/turn/no-progress allowance. Successful duplicate calls replay the original bounded result without re-execution or budget charge. `tool_max_requests` is the exact execution cap and `tool_max_rounds` is the exact planning-turn cap; tool-only turns use the request budget and do not consume planning turns. Positive configured values are never clamped or raised automatically. `tool_loop_wall_clock_sec` covers exploration plus a reserved terminal synthesis phase (`tool_synthesis_timeout_sec`, `tool_synthesis_max_tokens`). The effective synthesis reserve is the smaller of the configured synthesis timeout and half the total wall clock, leaving time for both phases; configured and effective values are logged and shown in the step summary. Reaching a call, turn, no-progress, repetition, or exploration-time limit stops tool execution and triggers one tools-disabled, reasoning-enabled evidence synthesis turn before the strict verdict turn. Length-truncated analysis is retained as bounded internal synthesis input instead of restarting with a doubled output budget. Malformed, duplicate, and over-budget calls receive synthetic results but do not count as executions.
 
 For intermediate OpenAI turns only, blank `content` falls back internally to nonblank `reasoning_content`, allowing servers such as LM Studio/Qwen to carry analysis into the next tool turn. Ordinary `content` always wins; Anthropic is unchanged; and final verdict parsing never consumes `reasoning_content`. Fallback reasoning is not copied into review markdown, logs, or action outputs. Streamed reasoning deltas are reassembled with the same boundary.
 

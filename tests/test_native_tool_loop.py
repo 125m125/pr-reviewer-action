@@ -16,7 +16,6 @@ from pr_reviewer.tool_loop import (
     STOP_STREAM_WATCHDOG,
     STOP_WALL_CLOCK,
     LoopBudgets,
-    adaptive_loop_budgets,
     detect_textual_tool_intent,
     drive_tool_loop,
     effective_intermediate_text,
@@ -33,33 +32,6 @@ src/parent.ts
 </parameter>
 </function>
 </tool_call>"""
-
-
-class TestAdaptiveLoopBudgets:
-    """Loop depth is route-independent: exactly 2× configured rounds
-    plus the configured tool-call budget, on every route. The route selects the
-    MODEL, never the tool budget — the primary model is fully capable and is no
-    longer shallow-capped (the loop self-limits when the model stops calling
-    tools)."""
-
-    def test_headroom_doubles_rounds_without_hidden_cap(self):
-        b = adaptive_loop_budgets(3, 4, 120.0)
-        assert b.max_rounds == 6  # 3 * 2
-        assert b.max_tool_calls == 4
-        assert adaptive_loop_budgets(6, 4, 120.0).max_rounds == 12
-
-    def test_primary_route_is_not_shallowed(self):
-        # Was capped to 2 rounds / 3 calls; now gets the full configured budget.
-        b = adaptive_loop_budgets(3, 8, 120.0, review_route="primary", risk_flag_count=0)
-        assert b.max_rounds == 6
-        assert b.max_tool_calls == 8
-
-    def test_every_route_gets_the_same_budget(self):
-        # incl. the deprecated "fast" value and risk_flag_count (now ignored).
-        for route in ("primary", "smart", "legacy", "fast", "", None):
-            b = adaptive_loop_budgets(3, 8, 120.0, review_route=route, risk_flag_count=0)
-            assert b.max_rounds == 6, route
-            assert b.max_tool_calls == 8, route
 
 
 def openai_tool_call_response(calls, content=None):
@@ -157,6 +129,71 @@ def test_extract_anthropic_tool_use_blocks():
     assert calls[0]["name"] == "read_file"
     assert json.loads(calls[0]["arguments"]) == {"path": "a.txt"}
     assert text == "I will read the file. "
+
+
+def test_extract_openai_rejects_blank_and_duplicate_normalized_call_ids():
+    response = openai_tool_call_response([
+        ("  ", "read_file", '{}'),
+        (" dup ", " read_file ", '{"path":"a.py"}'),
+        ("dup", "git_grep", '{"pattern":"x"}'),
+        ("named", "   ", '{}'),
+    ])
+
+    calls, _ = extract_tool_calls(response, "openai")
+
+    assert calls == [{
+        "id": "dup", "name": "read_file", "arguments": '{"path":"a.py"}',
+    }]
+
+
+def test_extract_anthropic_rejects_blank_and_duplicate_normalized_call_ids():
+    response = {
+        "stop_reason": "tool_use",
+        "content": [
+            {"type": "tool_use", "id": "  ", "name": "read_file", "input": {}},
+            {"type": "tool_use", "id": " dup ", "name": " read_file ",
+             "input": {"path": "a.py"}},
+            {"type": "tool_use", "id": "dup", "name": "git_grep",
+             "input": {"pattern": "x"}},
+            {"type": "tool_use", "id": "named", "name": "   ", "input": {}},
+        ],
+    }
+
+    calls, _ = extract_tool_calls(response, "anthropic")
+
+    assert len(calls) == 1
+    assert calls[0]["id"] == "dup"
+    assert calls[0]["name"] == "read_file"
+    assert json.loads(calls[0]["arguments"]) == {"path": "a.py"}
+
+
+def test_malformed_provider_calls_keep_assistant_and_tool_results_paired():
+    conversation = fresh_conversation()
+    response = openai_tool_call_response([
+        (" dup ", " read_file ", '{"path":"a.py"}'),
+        ("dup", "git_grep", '{"pattern":"x"}'),
+        (" ", "read_file", '{"path":"orphan.py"}'),
+    ])
+    execute, log = recording_execute()
+
+    drive_tool_loop(
+        conversation,
+        scripted_post([response, openai_text_response("done")]),
+        execute,
+        api_format="openai",
+        model="m",
+    )
+
+    assistant_ids = [
+        call["id"]
+        for event in conversation.events if event["kind"] == "assistant_tool_calls"
+        for call in event["calls"]
+    ]
+    result_ids = [
+        event["call_id"] for event in conversation.events if event["kind"] == "tool_result"
+    ]
+    assert assistant_ids == result_ids == ["dup"]
+    assert log == [("read_file", {"path": "a.py"})]
 
 
 def test_extract_malformed_response_is_empty():

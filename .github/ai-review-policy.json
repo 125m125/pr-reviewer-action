@@ -1,0 +1,632 @@
+{
+  "version": 2,
+  "components": [
+    {
+      "id": "orchestration",
+      "paths": [
+        "action.yml",
+        "scripts/run_review.sh",
+        "scripts/sections/**",
+        "scripts/check_review_needed.sh",
+        "scripts/wait_for_ci.sh",
+        ".github/workflows/**"
+      ],
+      "responsibilities": [
+        "GitHub Action inputs, environment wiring, review lifecycle, and failure handling"
+      ],
+      "related_components": [
+        "specialist-runtime",
+        "model-transport",
+        "publishing"
+      ],
+      "contracts": [
+        "Existing inputs retain compatible defaults and documented behavior",
+        "The requested review strategy reaches the matching runtime and publishing path"
+      ],
+      "invariants": [
+        "Secrets are not written to logs, command arguments, artifacts, or model-visible context",
+        "A failed or incomplete analysis cannot be presented as a successful review"
+      ]
+    },
+    {
+      "id": "specialist-runtime",
+      "paths": [
+        "pr_reviewer/specialist_runtime/**",
+        "pr_reviewer/specialists.py",
+        "scripts/run_specialist_reviews.py"
+      ],
+      "responsibilities": [
+        "Policy validation, deterministic coverage, durable specialist sessions, budgets, recovery, and adjudication"
+      ],
+      "related_components": [
+        "orchestration",
+        "model-transport",
+        "publishing",
+        "verification-documentation"
+      ],
+      "contracts": [
+        "Version-2 policy selects bounded work without granting tools, hosts, models, or budgets",
+        "Artifacts account for selected, completed, omitted, degraded, and unresolved obligations"
+      ],
+      "invariants": [
+        "Session lifetime limits survive recovery and cannot reset through a new conversation",
+        "High-risk unresolved coverage cannot silently become approval-ready",
+        "Untrusted current-branch policy changes cannot widen web or publishing authority"
+      ]
+    },
+    {
+      "id": "model-transport",
+      "paths": [
+        "pr_reviewer/conversation.py",
+        "pr_reviewer/transport.py",
+        "pr_reviewer/tool_loop.py",
+        "pr_reviewer/tool_executors.py",
+        "pr_reviewer/sse_reassembler.py",
+        "pr_reviewer/stream_watchdog.py",
+        "pr_reviewer/mcp_client.py",
+        "scripts/model_call.sh",
+        "scripts/run_tool_harness.py"
+      ],
+      "responsibilities": [
+        "OpenAI-compatible and Anthropic-compatible requests, streaming, structured responses, and read-only evidence tools"
+      ],
+      "related_components": [
+        "orchestration",
+        "specialist-runtime"
+      ],
+      "contracts": [
+        "Both supported API formats preserve their required message and tool-call ordering",
+        "Streaming and non-streaming responses normalize to equivalent complete model results",
+        "Model-provided values cannot escape repository, command-catalog, repository-API, or web-source boundaries"
+      ],
+      "invariants": [
+        "API keys never appear in process arguments or retained evidence",
+        "Tool execution remains read-only and policy constrained",
+        "Retries, watchdog recovery, and context compaction remain bounded"
+      ]
+    },
+    {
+      "id": "publishing",
+      "paths": [
+        "scripts/publish_helpers.sh",
+        "scripts/publish_specialist_review.py",
+        "scripts/build_review_comments.py",
+        "scripts/resolve_finding_threads.py",
+        "scripts/sanitize_review_markdown.py",
+        "scripts/strip_metadata_markers.py",
+        "pr_reviewer/github_review_notes.py",
+        "pr_reviewer/enforcement.py",
+        "pr_reviewer/carry_forward.py",
+        "pr_reviewer/metadata.py"
+      ],
+      "responsibilities": [
+        "Verdict enforcement, concise human handoff, inline findings, managed metadata, and re-review cleanup"
+      ],
+      "related_components": [
+        "orchestration",
+        "specialist-runtime"
+      ],
+      "contracts": [
+        "The handoff summarizes scope and review focus while detailed evidence remains in resolvable notes",
+        "Published findings are sanitized, deduplicated, and anchored only to valid diff lines"
+      ],
+      "invariants": [
+        "This repository policy cannot publish approvals or native verdict reviews",
+        "Open carried-forward blocking findings continue to prevent a positive recommendation",
+        "Upstream references and reserved metadata cannot create notification spam or corrupt managed state"
+      ]
+    },
+    {
+      "id": "verification-documentation",
+      "paths": [
+        "tests/**",
+        "docs/**",
+        "README.md",
+        "AGENTS.md",
+        ".github/ai-review-rules.md",
+        ".github/ai-review-policy.json",
+        ".github/ai-review-prompt.md"
+      ],
+      "responsibilities": [
+        "Regression coverage, migration guidance, public configuration documentation, and repository review policy"
+      ],
+      "related_components": [
+        "orchestration",
+        "specialist-runtime",
+        "model-transport",
+        "publishing"
+      ],
+      "contracts": [
+        "Documented defaults and examples match action.yml and runtime validation",
+        "Tests cover behavior rather than only implementation shape"
+      ],
+      "invariants": [
+        "Migration guidance does not recommend deprecated or ineffective inputs",
+        "Security and compatibility claims have executable or directly inspectable evidence"
+      ]
+    }
+  ],
+  "recipes": [
+    {
+      "id": "action-interface-compatibility",
+      "title": "Action interface and orchestration compatibility",
+      "objective": "Trace changed inputs, defaults, environment propagation, strategy routing, timeouts, and failure states through action.yml and the shell orchestration.",
+      "execution": "coverage",
+      "match": {
+        "component_ids_any": [
+          "orchestration"
+        ]
+      },
+      "lenses": [
+        "backward-compatibility",
+        "failure-handling",
+        "secret-handling"
+      ],
+      "seed_paths": [
+        "action.yml",
+        "scripts/sections/config.sh",
+        "scripts/sections/review.sh"
+      ],
+      "related_paths": [
+        "README.md",
+        "tests/test_action_inputs.py",
+        "tests/test_action_shell_syntax.py"
+      ],
+      "invariants": [
+        "Existing callers keep compatible behavior unless a breaking change is explicit",
+        "Every public input reaches the intended runtime setting and validation",
+        "Failure and degraded states cannot fall through to misleading publication"
+      ],
+      "expected_evidence": [
+        "Changed action input and its consuming environment or runtime path",
+        "Focused input, shell, routing, or failure-path tests"
+      ],
+      "priority": "high"
+    },
+    {
+      "id": "durable-session-safety",
+      "title": "Durable specialist session safety",
+      "objective": "Examine session continuity, policy authorization, coverage accounting, deadlines, lifetime budgets, recovery, and final adjudication as one state machine.",
+      "execution": "dedicated",
+      "match": {
+        "component_ids_any": [
+          "specialist-runtime"
+        ]
+      },
+      "lenses": [
+        "state-machine",
+        "budget-accounting",
+        "policy-authorization",
+        "degraded-outcomes"
+      ],
+      "seed_paths": [
+        "pr_reviewer/specialist_runtime/controller.py",
+        "pr_reviewer/specialist_runtime/session.py",
+        "pr_reviewer/specialist_runtime/policy.py"
+      ],
+      "related_paths": [
+        "pr_reviewer/specialist_runtime/budget.py",
+        "pr_reviewer/specialist_runtime/coverage.py",
+        "pr_reviewer/specialist_runtime/adjudication.py",
+        "tests/test_specialist_runtime_state.py",
+        "tests/test_specialist_runtime_policy.py"
+      ],
+      "invariants": [
+        "A logical session cannot regain turns, tools, recovery, or time by reconstructing context",
+        "Every required obligation has an auditable terminal status",
+        "Unauthorized head policy changes can only preserve or narrow authority and safety"
+      ],
+      "expected_evidence": [
+        "Relevant state transitions and persisted counters",
+        "Boundary tests for exhaustion, recovery, authorization, and unresolved coverage"
+      ],
+      "priority": "critical"
+    },
+    {
+      "id": "model-api-compatibility",
+      "title": "Model API and stream compatibility",
+      "objective": "Trace request construction and response assembly for both supported provider formats, including native tools, structured verdict turns, streaming deltas, retries, and cancellation.",
+      "execution": "coverage",
+      "match": {
+        "component_ids_any": [
+          "model-transport"
+        ]
+      },
+      "lenses": [
+        "openai-compatibility",
+        "anthropic-compatibility",
+        "streaming",
+        "tool-protocol"
+      ],
+      "seed_paths": [
+        "pr_reviewer/conversation.py",
+        "pr_reviewer/transport.py",
+        "pr_reviewer/tool_loop.py"
+      ],
+      "related_paths": [
+        "pr_reviewer/sse_reassembler.py",
+        "scripts/model_call.sh",
+        "tests/test_conversation.py",
+        "tests/test_sse_reassembler.py",
+        "tests/test_transport_stream_watchdog.py"
+      ],
+      "invariants": [
+        "Provider-specific tool-call and tool-result ordering remains valid",
+        "Stream reassembly preserves complete arguments and finish reasons",
+        "A retry cannot duplicate unsafe work or exceed the enclosing session budget"
+      ],
+      "expected_evidence": [
+        "Wire-format comparison for each affected API format",
+        "Streaming and non-streaming tests for the affected response shape"
+      ],
+      "priority": "high"
+    },
+    {
+      "id": "tool-and-secret-boundaries",
+      "title": "Tool, network, and secret boundaries",
+      "objective": "Independently challenge path resolution, command catalogues, GitHub repository scoping, web allowlisting, redaction, and API-key handling for realistic exfiltration or mutation paths.",
+      "execution": "independent",
+      "match": {
+        "paths_any": [
+          "pr_reviewer/tool_executors.py",
+          "pr_reviewer/specialist_runtime/web_evidence.py",
+          "pr_reviewer/transport.py",
+          "scripts/run_tool_harness.py",
+          "scripts/redact.py",
+          "scripts/model_call.sh"
+        ]
+      },
+      "lenses": [
+        "trust-boundary",
+        "path-traversal",
+        "network-scope",
+        "secret-exposure",
+        "read-only-enforcement"
+      ],
+      "seed_paths": [
+        "pr_reviewer/tool_executors.py",
+        "pr_reviewer/specialist_runtime/web_evidence.py",
+        "scripts/redact.py"
+      ],
+      "related_paths": [
+        "tests/test_native_loop_exfil_redteam.py",
+        "tests/test_tool_harness_command_guardrails.py",
+        "tests/test_specialist_runtime_web.py",
+        "tests/test_api_key_argv.py"
+      ],
+      "invariants": [
+        "Model-controlled text is never executed as shell",
+        "Filesystem and repository API access cannot escape the configured scope",
+        "Only policy-authorized HTTPS documentation URLs can be fetched",
+        "Secrets are redacted before evidence reaches models, logs, or artifacts"
+      ],
+      "expected_evidence": [
+        "Concrete guard and normalization path for every changed boundary",
+        "Adversarial test covering the plausible bypass"
+      ],
+      "priority": "critical"
+    },
+    {
+      "id": "publishing-hygiene",
+      "title": "Publishing and human-handoff hygiene",
+      "objective": "Verify verdict enforcement, managed review lifecycle, inline anchoring, sanitization, carry-forward behavior, and the separation between concise handoff and detailed notes.",
+      "execution": "dedicated",
+      "match": {
+        "component_ids_any": [
+          "publishing"
+        ]
+      },
+      "lenses": [
+        "verdict-safety",
+        "github-review-api",
+        "finding-lifecycle",
+        "notification-hygiene"
+      ],
+      "seed_paths": [
+        "scripts/publish_helpers.sh",
+        "scripts/publish_specialist_review.py",
+        "pr_reviewer/enforcement.py"
+      ],
+      "related_paths": [
+        "scripts/build_review_comments.py",
+        "scripts/resolve_finding_threads.py",
+        "pr_reviewer/carry_forward.py",
+        "tests/test_verdict_safety.sh",
+        "tests/test_resolve_finding_threads.py"
+      ],
+      "invariants": [
+        "Policy and workflow keep publication non-approving",
+        "Detailed claims and evidence are not duplicated into the handoff summary",
+        "Invalid anchors or cleanup failures cannot discard the underlying review"
+      ],
+      "expected_evidence": [
+        "Resulting GitHub review event and fallback behavior",
+        "Tests for carried findings, anchors, sanitization, and managed cleanup"
+      ],
+      "priority": "high"
+    },
+    {
+      "id": "contract-verification",
+      "title": "Tests and documentation contract verification",
+      "objective": "Check that behavioral changes have focused regression coverage and that documented inputs, defaults, migration advice, and examples match executable behavior.",
+      "execution": "coverage",
+      "match": {
+        "component_ids_any": [
+          "verification-documentation"
+        ]
+      },
+      "lenses": [
+        "regression-coverage",
+        "documentation-accuracy",
+        "migration-safety"
+      ],
+      "seed_paths": [
+        "tests/**",
+        "README.md",
+        "docs/migrations/**"
+      ],
+      "related_paths": [
+        "action.yml",
+        "pr_reviewer/specialist_runtime/policy.py",
+        "scripts/sections/config.sh"
+      ],
+      "invariants": [
+        "Tests exercise observable outcomes and meaningful boundaries",
+        "Documented defaults and lifecycle labels match action.yml",
+        "Migration examples do not restore deprecated pass-based behavior"
+      ],
+      "expected_evidence": [
+        "Focused test that fails without the behavior under review",
+        "Direct comparison between documentation and source-of-truth defaults"
+      ],
+      "priority": "normal"
+    }
+  ],
+  "coverage_rules": [
+    {
+      "id": "orchestration-contract",
+      "paths_any": [
+        "action.yml",
+        "scripts/run_review.sh",
+        "scripts/sections/**"
+      ],
+      "required_recipe_ids": [
+        "action-interface-compatibility"
+      ],
+      "risk_tier": "high",
+      "unresolved_policy": "block_when_unresolved"
+    },
+    {
+      "id": "specialist-runtime-contract",
+      "paths_any": [
+        "pr_reviewer/specialist_runtime/**",
+        "scripts/run_specialist_reviews.py"
+      ],
+      "required_recipe_ids": [
+        "durable-session-safety"
+      ],
+      "risk_tier": "critical",
+      "unresolved_policy": "block_when_unresolved"
+    },
+    {
+      "id": "model-transport-contract",
+      "paths_any": [
+        "pr_reviewer/conversation.py",
+        "pr_reviewer/transport.py",
+        "pr_reviewer/tool_loop.py",
+        "pr_reviewer/sse_reassembler.py",
+        "scripts/model_call.sh"
+      ],
+      "required_recipe_ids": [
+        "model-api-compatibility"
+      ],
+      "risk_tier": "high",
+      "unresolved_policy": "block_when_unresolved"
+    },
+    {
+      "id": "tool-security-contract",
+      "paths_any": [
+        "pr_reviewer/tool_executors.py",
+        "pr_reviewer/specialist_runtime/web_evidence.py",
+        "scripts/run_tool_harness.py",
+        "scripts/redact.py"
+      ],
+      "required_recipe_ids": [
+        "tool-and-secret-boundaries"
+      ],
+      "risk_tier": "critical",
+      "unresolved_policy": "block_when_unresolved"
+    },
+    {
+      "id": "publishing-contract",
+      "paths_any": [
+        "scripts/publish_helpers.sh",
+        "scripts/publish_specialist_review.py",
+        "scripts/build_review_comments.py",
+        "scripts/resolve_finding_threads.py",
+        "scripts/sanitize_review_markdown.py",
+        "pr_reviewer/github_review_notes.py",
+        "pr_reviewer/enforcement.py",
+        "pr_reviewer/carry_forward.py"
+      ],
+      "required_recipe_ids": [
+        "publishing-hygiene"
+      ],
+      "risk_tier": "high",
+      "unresolved_policy": "block_when_unresolved"
+    }
+  ],
+  "sources": [
+    {
+      "host": "docs.github.com",
+      "include_subdomains": false,
+      "path_prefixes": [
+        "/en/actions",
+        "/en/rest",
+        "/en/graphql"
+      ],
+      "classification": "official-github-documentation",
+      "max_age_hours": 720,
+      "schemes": [
+        "https"
+      ]
+    },
+    {
+      "host": "cli.github.com",
+      "include_subdomains": false,
+      "path_prefixes": [
+        "/manual"
+      ],
+      "classification": "official-github-cli-documentation",
+      "max_age_hours": 720,
+      "schemes": [
+        "https"
+      ]
+    },
+    {
+      "host": "platform.openai.com",
+      "include_subdomains": false,
+      "path_prefixes": [
+        "/docs"
+      ],
+      "classification": "official-openai-api-documentation",
+      "max_age_hours": 168,
+      "schemes": [
+        "https"
+      ]
+    },
+    {
+      "host": "developers.openai.com",
+      "include_subdomains": false,
+      "path_prefixes": [
+        "/api/docs"
+      ],
+      "classification": "official-openai-developer-documentation",
+      "max_age_hours": 168,
+      "schemes": [
+        "https"
+      ]
+    },
+    {
+      "host": "docs.anthropic.com",
+      "include_subdomains": false,
+      "path_prefixes": [
+        "/en/api"
+      ],
+      "classification": "official-anthropic-api-documentation",
+      "max_age_hours": 168,
+      "schemes": [
+        "https"
+      ]
+    },
+    {
+      "host": "platform.claude.com",
+      "include_subdomains": false,
+      "path_prefixes": [
+        "/docs"
+      ],
+      "classification": "official-claude-platform-documentation",
+      "max_age_hours": 168,
+      "schemes": [
+        "https"
+      ]
+    },
+    {
+      "host": "lmstudio.ai",
+      "include_subdomains": false,
+      "path_prefixes": [
+        "/docs"
+      ],
+      "classification": "official-lm-studio-documentation",
+      "max_age_hours": 168,
+      "schemes": [
+        "https"
+      ]
+    },
+    {
+      "host": "docs.python.org",
+      "include_subdomains": false,
+      "path_prefixes": [
+        "/3"
+      ],
+      "classification": "official-python-documentation",
+      "max_age_hours": 720,
+      "schemes": [
+        "https"
+      ]
+    },
+    {
+      "host": "www.gnu.org",
+      "include_subdomains": false,
+      "path_prefixes": [
+        "/software/bash/manual"
+      ],
+      "classification": "official-bash-documentation",
+      "max_age_hours": 720,
+      "schemes": [
+        "https"
+      ]
+    },
+    {
+      "host": "curl.se",
+      "include_subdomains": false,
+      "path_prefixes": [
+        "/docs"
+      ],
+      "classification": "official-curl-documentation",
+      "max_age_hours": 720,
+      "schemes": [
+        "https"
+      ]
+    },
+    {
+      "host": "git-scm.com",
+      "include_subdomains": false,
+      "path_prefixes": [
+        "/docs"
+      ],
+      "classification": "official-git-documentation",
+      "max_age_hours": 720,
+      "schemes": [
+        "https"
+      ]
+    },
+    {
+      "host": "jqlang.org",
+      "include_subdomains": false,
+      "path_prefixes": [
+        "/manual"
+      ],
+      "classification": "official-jq-documentation",
+      "max_age_hours": 720,
+      "schemes": [
+        "https"
+      ]
+    }
+  ],
+  "generated_artifacts": [],
+  "verdict_policy": {
+    "blocker_requires_request_changes": true,
+    "require_evidence_for_findings": true,
+    "blocking_severities": [
+      "blocker",
+      "major"
+    ],
+    "high_risk_tiers": [
+      "critical",
+      "high"
+    ]
+  },
+  "publishing": {
+    "allowed_modes": [
+      "review_comment"
+    ],
+    "allow_approve": false
+  },
+  "exclude": {
+    "paths": [],
+    "components": [],
+    "lenses": [],
+    "recipes": []
+  }
+}

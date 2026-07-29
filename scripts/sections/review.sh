@@ -90,9 +90,9 @@ PRIMARY_OK=0
 # call. A parse failure (degraded/oversized/garbled verdict) falls through to
 # the standard corpus review below, so this only ever adds capability.
 NATIVE_VERDICT_USED=0
-SPECIALIST_EVALUATION_STATUS="$(jq -r '.evaluation_status // "unknown"' specialist-review-artifact.json 2>/dev/null || echo unknown)"
+SPECIALIST_EVALUATION_STATUS="$(jq -r '.evaluation_status // "unknown"' specialist-run-status.json 2>/dev/null || jq -r '.evaluation_status // "unknown"' specialist-review-artifact.json 2>/dev/null || echo unknown)"
 if [[ "$REVIEW_STRATEGY" != "single" ]] && [ -s specialist-ai-output.json ] \
-  && [[ "$SPECIALIST_EVALUATION_STATUS" == "complete" || "$SPECIALIST_EVALUATION_STATUS" == "incomplete" ]]; then
+  && [[ "$SPECIALIST_EVALUATION_STATUS" == "complete" || "$SPECIALIST_EVALUATION_STATUS" == "degraded" ]]; then
   log "Using validated specialist review output; skipping the standard whole-PR model call"
   cp specialist-ai-output.json ai-output.json
   PRIMARY_OK=1
@@ -234,7 +234,7 @@ if [ "$PRIMARY_OK" -eq 1 ]; then
   if [[ "$REVIEW_STRATEGY" == "single" ]]; then
     ANALYSIS_ENGINE="$(annotate_analysis_engine "$AI_MODEL@$AI_BASE_URL ($AI_API_FORMAT)" primary)"
   else
-    ANALYSIS_ENGINE="specialists@$AI_BASE_URL ($AI_API_FORMAT; sequential hybrid plan)"
+    ANALYSIS_ENGINE="specialists@$AI_BASE_URL ($AI_API_FORMAT; durable session runtime)"
   fi
   echo "Primary model succeeded"
 else
@@ -362,7 +362,9 @@ This is an ESCALATED review: a preliminary review was judged insufficient (${ESC
     log "Smart model failed after escalation; publishing the primary review"
   fi
 }
-maybe_escalate_review
+if [[ "$REVIEW_STRATEGY" == "single" ]]; then
+  maybe_escalate_review
+fi
 
 EVIDENCE_BLOCKER_ENABLED="false"
 if [[ "$(printf '%s' "$EVIDENCE_BLOCKER_ENFORCEMENT" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
@@ -376,7 +378,9 @@ if [[ "$REVIEW_STRATEGY" == "single" ]] && \
   TOOL_FAILURE_ENABLED="true"
 fi
 
-apply_all_enforcement_wrapper "$EVIDENCE_BLOCKER_ENABLED" "$TOOL_FAILURE_ENABLED" "$TOOL_MIN_SUCCESSFUL_REQUESTS" "$VERDICT_POLICY" "$VALIDATE_REQUIRED_CHECKS" "$REQUIRED_CHECK_VALIDATION_MODE" "$CARRY_FORWARD_ACTIVE"
+if [[ "$REVIEW_STRATEGY" == "single" ]]; then
+  apply_all_enforcement_wrapper "$EVIDENCE_BLOCKER_ENABLED" "$TOOL_FAILURE_ENABLED" "$TOOL_MIN_SUCCESSFUL_REQUESTS" "$VERDICT_POLICY" "$VALIDATE_REQUIRED_CHECKS" "$REQUIRED_CHECK_VALIDATION_MODE" "$CARRY_FORWARD_ACTIVE"
+fi
 
 echo "analysis_engine=$ANALYSIS_ENGINE" >> "$OUTPUT_FILE"
 echo "verdict=$(jq -r '.verdict' ai-output.json)" >> "$OUTPUT_FILE"
@@ -387,8 +391,12 @@ echo "escalation_reason=${ESCALATION_REASONS:-}" >> "$OUTPUT_FILE"
 echo "review_strategy=$REVIEW_STRATEGY" >> "$OUTPUT_FILE"
 if [[ "$REVIEW_STRATEGY" != "single" && -f specialist-review-artifact.json ]]; then
   echo "specialist_artifact=$(pwd)/specialist-review-artifact.json" >> "$OUTPUT_FILE"
+  echo "review_handoff=$(pwd)/review-handoff.md" >> "$OUTPUT_FILE"
+  echo "review_notes=$(pwd)/review-notes.json" >> "$OUTPUT_FILE"
 else
   echo "specialist_artifact=" >> "$OUTPUT_FILE"
+  echo "review_handoff=" >> "$OUTPUT_FILE"
+  echo "review_notes=" >> "$OUTPUT_FILE"
 fi
 
 # Use a random heredoc delimiter so model-controlled review text (which can be

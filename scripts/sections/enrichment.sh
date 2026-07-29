@@ -6,6 +6,15 @@
 section_timer_start "enrichment"
 log "Gathering linked sources..."
 : > linked-sources.md
+# Specialist sessions may discover and fetch external content only through the
+# version-2 current-head source policy. The legacy corpus enrichment uses the
+# single-review host list, so it must not make requests or expose snippets on
+# the specialist path.
+if [[ "$REVIEW_STRATEGY" != "single" ]]; then
+  echo "External sources are discovered inside specialist sessions under the current review policy." > linked-sources.md
+  section_timer_end
+  return 0
+fi
 if [ -s urls.txt ]; then
   ENRICHMENT_START_TS=$(date +%s)
   TARGET_VERSION="$(jq -r '.title' pr.json | sed -n 's/.*→ *v\?\([0-9][0-9.]*\).*/\1/p' | head -n1)"

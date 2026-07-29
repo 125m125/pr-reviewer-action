@@ -3,78 +3,173 @@ name: AI PR Review
 on:
   pull_request:
     branches: ["main"]
-    # `labeled` enables the one-click re-review: add the `ai-review` label to
-    # force a fresh review (only write/triage can label — self-authorizing).
-    types: [opened, reopened, synchronize, ready_for_review, labeled]
-  workflow_dispatch:
+    # Reviews are requested explicitly by a maintainer adding `ai-review`.
+    types: [labeled]
 
 concurrency:
-  # `labeled` events get their own group so an auto-applied label can't cancel
-  # the in-flight opened/synchronize review (see README → Forcing a re-review).
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && format('-label-{0}', github.run_id) || '' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 permissions:
   contents: read
+  packages: read
   pull-requests: write
 
 jobs:
-  review:
-    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+  runner:
+    name: Prepare review runner
+    if: >-
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'ai-review' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on:
+      - self-hosted
+      - linux
+      - lm-studio
+    outputs:
+      uid: ${{ steps.info.outputs.uid }}
+      gid: ${{ steps.info.outputs.gid }}
+      actions_dir: ${{ steps.info.outputs.actions_dir }}
     steps:
-      - name: Checkout repository
+      - name: Read runner paths and identity
+        id: info
+        run: |
+          actions_dir="$(dirname "$RUNNER_TEMP")/_actions"
+          {
+            echo "uid=$(id -u)"
+            echo "gid=$(id -g)"
+            echo "actions_dir=$actions_dir"
+          } >> "$GITHUB_OUTPUT"
+
+  review:
+    name: Review with LM Studio
+    needs:
+      - runner
+    # Add the lm-studio label to a Linux Docker runner that can reach LM Studio.
+    # Review tools live in the job container, not on the host.
+    runs-on:
+      - self-hosted
+      - linux
+      - lm-studio
+    # A full specialist review runs several focused passes sequentially on one
+    # local model. Leave enough room for cold model loading and one follow-up wave.
+    timeout-minutes: 150
+    container:
+      # Keep the minimal public runtime immutable because it receives the
+      # review token and LM Studio credential.
+      image: ghcr.io/125m125/moviehrdb-ai-review@sha256:03c863c7fc7a81416da98dbfb9778ad632476a483baaf9371ff8485ce2d29ef0
+      # Do not add privileged mode or mount the Docker socket here.
+      # Rancher Desktop/WSL leaves github.action_path as the host-side path.
+      # Expose only the action cache at that same path so composite actions can
+      # find their scripts; keep the alias read-only.
+      options: >-
+        --user ${{ needs.runner.outputs.uid }}:${{ needs.runner.outputs.gid }}
+        --volume ${{ needs.runner.outputs.actions_dir }}:${{ needs.runner.outputs.actions_dir }}:ro
+        --cap-drop=ALL
+        --security-opt=no-new-privileges
+        --pids-limit=256
+
+    steps:
+      - name: Checkout pull request
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Generate bot token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      - name: Review pull request
+        # Fork of pr-reviewer-action v2.0.0 with generic, model-planned specialist
+        # reviews and LM Studio reasoning-channel compatibility; pinned for safety.
+        uses: 125m125/pr-reviewer-action@e1a3f548d54945158c9a9bff8aa960a3b31b891d
         with:
-          client-id: ${{ secrets.BOT_CLIENT_ID }}
-          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Review PR with reusable AI reviewer
-        if: github.event_name == 'pull_request'
-        id: review
-        uses: misospace/pr-reviewer-action@7e25f7d0d8651e936f3158477b0a364f27ed7383 # v2.0.0
-        with:
-          github_token: ${{ steps.app-token.outputs.token }}
-          ai_primary_retries: "3"
-          ai_primary_retry_delay_sec: "15"
-          ai_base_url: ${{ vars.LITELLM_URL }}
-          ai_api_format: ${{ vars.PRIMARY_FORMAT }}
-          ai_model: ${{ vars.PRIMARY_MODEL }}
-          ai_api_key: ${{ secrets.LITELLM_API_KEY }}
-          ai_response_format: json_object
-          ai_fallback_base_url: ${{ vars.LITELLM_URL }}
-          ai_fallback_api_format: ${{ vars.FALLBACK_FORMAT }}
-          ai_fallback_model: ${{ vars.FALLBACK_MODEL }}
-          ai_fallback_api_key: ${{ secrets.LITELLM_API_KEY }}
-          ai_max_tokens: "32768"
-          review_routing_mode: auto
-          ai_smart_base_url: ${{ vars.LITELLM_URL }}
-          ai_smart_api_format: ${{ vars.SMART_FORMAT }}
-          ai_smart_model: ${{ vars.SMART_MODEL }}
-          ai_smart_api_key: ${{ secrets.LITELLM_API_KEY }}
-          context_limit_mode: normal
-          ci_status_check: "true"
-          ci_timeout_sec: "600"
-          tool_mode: native_loop
-          tool_max_rounds: "2"
-          tool_max_requests: "4"
-          tool_loop_wall_clock_sec: "300"
-          tool_planning_timeout_sec: "300"
-          tool_planning_max_context_bytes: "15000"
-          tool_planning_max_tokens: "16000"
+          ai_base_url: ${{ vars.LM_STUDIO_BASE_URL }}
+          # Intermediate calls preserve LM Studio reasoning_content when normal
+          # content is blank. Public review text is rendered only from validated
+          # candidates; raw reasoning is never published.
+          ai_api_format: openai
+          ai_api_key: ${{ secrets.LM_STUDIO_API_KEY }}
+          ai_model: qwen/qwen3.6-35b-a3b
+          ai_response_format: json_schema
+          ai_reasoning_effort: ""
+          ai_verdict_reasoning_effort: none
+          ai_stream: "true"
+          ai_max_tokens: "8192"
+          model_context_tokens: "262144"
+          ai_request_timeout_sec: "1200"
+          standards_file: .github/ai-review-rules.md
+          system_prompt_file: .github/ai-review-prompt.md
+          system_prompt_mode: append
+          # Reviews are manually requested, so re-evaluate the whole PR rather
+          # than trusting an earlier automated clean baseline and reviewing
+          # only the latest delta.
+          review_scope: full
+
+          # Let a bounded scout derive free-form focuses from the diff and the
+          # repository topology below, then run each specialist sequentially.
+          review_strategy: specialists
+          review_policy_file: .github/ai-review-policy.json
+          specialist_tool_mode: native_loop
+
+          specialist_review_deadline_sec: "7200"
+          specialist_phase_shares: '{"planning":10,"initial":60,"followup":20,"finalization":10}'
+          specialist_concurrency: "1"
+          specialist_max_sessions: "8"
+          specialist_max_followup_sessions: "2"
+          specialist_max_model_turns_per_session: "64"
+          specialist_max_tool_calls_per_session: "20"
+          specialist_max_recoveries_per_session: "1"
+
+          specialist_planner_max_tokens: "8192"
+          specialist_planner_max_context_bytes: "400000"
+
+          specialist_pass_timeout_sec: "1200"
+          specialist_max_tokens: "8192"
+          # Keep the larger project-specific budgets; the new watchdog still
+          # interrupts repetitive streamed output before it consumes them.
+          specialist_recovery_max_tokens: "4096"
+          specialist_max_conversation_tokens: "200000"
+          specialist_temperature: "0.6"
+          specialist_stream_watchdog: "true"
+
+          # Specialist calls reuse the existing read-only executor restrictions.
           tool_max_response_bytes: "12000"
-          tool_allowed_gh_api_repos: misospace/pr-reviewer-action
-          tool_request_timeout_sec: "15"
+          tool_request_timeout_sec: "20"
+          tool_max_consecutive_no_progress_rounds: "2"
+          tool_max_repeated_call_sets: "3"
           tool_enable_for_forks: "false"
-          on_model_failure: notice
+          # Configure this repository variable with a trusted SearXNG-compatible
+          # endpoint. An empty value leaves web_search unavailable; fetched
+          # results remain constrained by the current-branch policy allowlist.
+          search_url: ${{ vars.AI_REVIEW_SEARCH_URL }}
+          tool_max_search_results: "5"
+
+          # Publish a short sticky summary and attach supported findings to the
+          # changed lines as a non-blocking native review.
+          publish_mode: review_comment
+          publish_review_comment: "true"
           inline_findings: "true"
-          verdict_policy: findings_severity_gated
-          publish_mode: review_verdict
-          allow_approve: "true"
+          inline_findings_max: "20"
+          allow_approve: "false"
+
+          # The action removes this label after a review, allowing it to be
+          # applied again later to request a fresh review.
+          rereview_label: ai-review
+
+      - name: Upload structured review diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ai-pr-review-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
+          path: |
+            specialist-review-artifact.json
+            review-handoff.json
+            review-notes.json
+            specialist-policy-result.json
+            specialist-run-status.json
+            specialist-changed-files.json
+            specialist-review-summary.md
+          if-no-files-found: warn
+          retention-days: 14
