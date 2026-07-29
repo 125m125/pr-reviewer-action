@@ -1699,6 +1699,11 @@ class ReviewController:
                 key=lambda value: {"info": 0, "minor": 1, "major": 2, "blocker": 3}.get(value, 0),
             ),
             material_coverage_limited=bool(state.degradations),
+            degraded_stages=tuple(
+                str(item.get("component", ""))
+                for item in state.degradations
+                if str(item.get("component", "")).strip()
+            ),
             source_access_requests=tuple(state.source_requests),
         )
 

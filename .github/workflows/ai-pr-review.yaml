@@ -157,3 +157,19 @@ jobs:
           # The action removes this label after a review, allowing it to be
           # applied again later to request a fresh review.
           rereview_label: ai-review
+
+      - name: Upload structured review diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ai-pr-review-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
+          path: |
+            specialist-review-artifact.json
+            review-handoff.json
+            review-notes.json
+            specialist-policy-result.json
+            specialist-run-status.json
+            specialist-changed-files.json
+            specialist-review-summary.md
+          if-no-files-found: warn
+          retention-days: 14

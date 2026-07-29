@@ -87,6 +87,20 @@ class ScriptedController:
         artifact = {
             "schema_version": 2,
             "evaluation_status": "degraded",
+            "assignment_plan": {
+                "source": "deterministic_fallback",
+                "planner_repaired": False,
+            },
+            "degradation": [
+                {
+                    "component": "planner",
+                    "reason": "invalid | plan\n### injected heading",
+                },
+                {
+                    "component": "negotiator",
+                    "reason": "fallback after <timeout>",
+                },
+            ],
             "publishing": {"ready": True, "mode": "review_comment", "allow_approve": False},
             "verdict": {"value": "request_changes", "source": "runtime-policy"},
         }
@@ -158,6 +172,11 @@ def test_cli_writes_structured_handoff_notes_artifact_and_compatibility_output(
     assert snapshot == ["src/app.py"]
     assert controller.inputs.head_sha == "h" * 40
     assert controller.inputs.changed_files == ("src/app.py",)
+    summary = (tmp_path / "specialist-review-summary.md").read_text()
+    assert "- Assignment plan: `deterministic_fallback` (repaired: `false`)" in summary
+    assert "| planner | invalid \\| plan ### injected heading |" in summary
+    assert "| negotiator | fallback after &lt;timeout&gt; |" in summary
+    assert "\n### injected heading" not in summary
 
 
 def test_cli_rejects_incomplete_or_wrong_current_head_snapshot(monkeypatch, tmp_path):

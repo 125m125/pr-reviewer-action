@@ -144,6 +144,7 @@ class ReviewHandoffContext:
     highest_thread_severity: str | None = None
     review_emphasis_topics: tuple[ReviewOrientationTopic, ...] = ()
     material_coverage_limited: bool = False
+    degraded_stages: tuple[str, ...] = ()
     diagnostics_url: str | None = None
     source_access_requests: tuple[SourceAccessRequest, ...] = ()
     access_request_url: str | None = None
@@ -1041,6 +1042,15 @@ def project_review_handoff(
     coverage_warning = None
     if context.material_coverage_limited:
         candidate_warning = "Material evidence or session coverage is incomplete."
+        degraded_stages = _structured_ids(
+            context.degraded_stages,
+            forbidden=forbidden,
+            limit=6,
+        )
+        if degraded_stages:
+            candidate_warning += (
+                " Affected stages: " + ", ".join(degraded_stages) + "."
+            )
         if diagnostics_url:
             candidate_warning += f" Diagnostics: {diagnostics_url}"
         if renderable(

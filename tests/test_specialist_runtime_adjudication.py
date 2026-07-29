@@ -288,6 +288,27 @@ def test_handoff_is_sparse_and_uses_only_genuine_structured_theme():
     assert "Source access requests" not in handoff.markdown
 
 
+def test_handoff_compactly_names_distinct_degraded_stages_without_details():
+    handoff = build_review_handoff(
+        ReviewHandoffContext(
+            status="degraded",
+            material_coverage_limited=True,
+            degraded_stages=("planner", "negotiator", "planner"),
+        ),
+        review=AdjudicatedReview(),
+        evidence=EvidenceStore(),
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert handoff.coverage_warning == (
+        "Material evidence or session coverage is incomplete. "
+        "Affected stages: negotiator, planner."
+    )
+    assert handoff.markdown.count("planner") == 1
+    assert "exception" not in handoff.markdown.lower()
+
+
 def test_disparate_or_generic_findings_do_not_get_artificial_theme():
     store, evidence_id = _store()
     disparate = (

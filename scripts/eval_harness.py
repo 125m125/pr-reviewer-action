@@ -443,6 +443,11 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
         source_requests, (str, bytes)
     ):
         source_requests = ()
+    degradations = artifact.get("degradation", ())
+    if not isinstance(degradations, Sequence) or isinstance(
+        degradations, (str, bytes)
+    ):
+        degradations = ()
     context = ReviewHandoffContext(
         recommendation=verdict_value,
         status=str(artifact.get("evaluation_status") or ""),
@@ -461,6 +466,12 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
         ),
         review_emphasis_topics=topics("review_emphasis_topics"),
         material_coverage_limited=bool(artifact.get("degradation")),
+        degraded_stages=tuple(
+            str(item.get("component", ""))
+            for item in degradations
+            if isinstance(item, Mapping)
+            and str(item.get("component", "")).strip()
+        ),
         source_access_requests=tuple(source_requests),
     )
     expected = project_review_handoff(

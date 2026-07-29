@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
+import html
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -766,6 +767,16 @@ def _write_json(path: Path, value: object) -> None:
     )
 
 
+def _summary_cell(value: object, *, limit: int = 240) -> str:
+    text = " ".join(str(value or "").split())[:limit]
+    return (
+        html.escape(text)
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("`", "\\`")
+    )
+
+
 def emit_deprecation_warnings(config: CliConfig) -> None:
     for name in config.deprecation_warnings:
         replacement = {
@@ -840,12 +851,51 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
         "policy_degraded": workspace.policy_degraded,
         "policy_warning": workspace.policy_warning,
     })
+    assignment_plan = (
+        artifact.get("assignment_plan", {})
+        if isinstance(artifact, Mapping)
+        else {}
+    )
+    if not isinstance(assignment_plan, Mapping):
+        assignment_plan = {}
+    plan_source = _summary_cell(
+        assignment_plan.get("source", "unknown"),
+        limit=80,
+    )
+    planner_repaired = str(
+        bool(assignment_plan.get("planner_repaired", False))
+    ).lower()
+    degradations = tuple(
+        item for item in artifact.get("degradation", ())
+        if isinstance(item, Mapping)
+    ) if isinstance(artifact, Mapping) else ()
+    summary_lines = [
+        "# Specialist review",
+        "",
+        f"- Evaluation: `{artifact.get('evaluation_status', 'degraded')}`",
+        f"- Verdict: `{result.verdict}` (`{result.verdict_source}`)",
+        f"- Review notes: {len(notes)}",
+        f"- Publishing ready: `{str(result.publishing_ready).lower()}`",
+        f"- Assignment plan: `{plan_source}` (repaired: `{planner_repaired}`)",
+    ]
+    if degradations:
+        summary_lines.extend((
+            "",
+            "## Degradation diagnostics",
+            "",
+            "| Component | Reason |",
+            "| --- | --- |",
+        ))
+        summary_lines.extend(
+            "| "
+            + _summary_cell(item.get("component", "unknown"), limit=80)
+            + " | "
+            + _summary_cell(item.get("reason", "unspecified"))
+            + " |"
+            for item in degradations
+        )
     (root / "specialist-review-summary.md").write_text(
-        "# Specialist review\n\n"
-        f"- Evaluation: `{artifact.get('evaluation_status', 'degraded')}`\n"
-        f"- Verdict: `{result.verdict}` (`{result.verdict_source}`)\n"
-        f"- Review notes: {len(notes)}\n"
-        f"- Publishing ready: `{str(result.publishing_ready).lower()}`\n",
+        "\n".join(summary_lines) + "\n",
         encoding="utf-8",
     )
 

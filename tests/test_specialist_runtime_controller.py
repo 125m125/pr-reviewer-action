@@ -323,6 +323,8 @@ def test_planner_failure_uses_deterministic_assignment_plan(tmp_path):
     assert any(
         item["component"] == "planner" for item in result.artifact["degradation"]
     )
+    assert "planner" in result.handoff.coverage_warning
+    assert "planner unavailable" not in result.handoff.markdown
     assert result.publishing_ready is True
 
 
@@ -430,6 +432,8 @@ def test_negotiator_failure_uses_live_budget_fallback_resume(tmp_path):
         event.kind == "negotiation_action" and event.payload["kind"] == "resume"
         for event in result.events
     )
+    assert "negotiator" in result.handoff.coverage_warning
+    assert "negotiator invalid response" not in result.handoff.markdown
 
 
 def test_critic_failure_rejects_ambiguous_candidate(tmp_path):
