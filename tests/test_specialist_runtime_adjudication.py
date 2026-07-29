@@ -297,7 +297,7 @@ def test_handoff_compactly_names_distinct_degraded_stages_without_details():
                 "planner",
                 "negotiator",
                 "planner",
-                "specialist:private-assignment-id",
+                "specialist_hook:private-session-id:private-hook-id",
             ),
         ),
         review=AdjudicatedReview(),
@@ -311,7 +311,8 @@ def test_handoff_compactly_names_distinct_degraded_stages_without_details():
         "Affected stages: negotiator, planner, specialist."
     )
     assert handoff.markdown.count("planner") == 1
-    assert "private-assignment-id" not in handoff.markdown
+    assert "private-session-id" not in handoff.markdown
+    assert "private-hook-id" not in handoff.markdown
     assert "exception" not in handoff.markdown.lower()
 
 

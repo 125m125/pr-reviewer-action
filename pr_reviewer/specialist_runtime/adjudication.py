@@ -1046,7 +1046,9 @@ def project_review_handoff(
             tuple(
                 "specialist"
                 if isinstance(value, str)
-                and value.strip().casefold().startswith("specialist:")
+                and value.strip().casefold().startswith(
+                    ("specialist:", "specialist_hook:")
+                )
                 else value
                 for value in context.degraded_stages
             ),
