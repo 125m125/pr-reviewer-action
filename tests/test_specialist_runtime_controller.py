@@ -252,6 +252,50 @@ def test_controller_runs_obligations_assignments_sessions_and_finalizer(tmp_path
     ]
 
 
+@pytest.mark.parametrize(
+    ("excluded_recipes", "expected_status"),
+    [
+        ((), "not_applicable"),
+        (("messaging",), "suppressed_by_policy"),
+    ],
+)
+def test_artifact_projects_recipe_accounting_status(
+    tmp_path,
+    excluded_recipes,
+    expected_status,
+):
+    recipe = RecipePolicy(
+        id="messaging",
+        title="Messaging",
+        objective="Review messaging behavior",
+        match={"file_roles_any": ("messaging",)},
+        expected_evidence=("tests",),
+    )
+    inputs = replace(
+        _inputs(tmp_path),
+        policy=ReviewPolicy(
+            recipes=(recipe,),
+            exclude={
+                "paths": (),
+                "components": (),
+                "lenses": (),
+                "recipes": excluded_recipes,
+            },
+        ),
+    )
+
+    result = _controller(tmp_path).run(inputs)
+
+    recipe_accounting = [
+        item for item in result.artifact["coverage"].values()
+        if item["origin"] == "recipe-accounting"
+    ]
+    assert [item["status"] for item in recipe_accounting] == [expected_status]
+    assert result.notes
+    assert result.artifact["notes"]
+    assert result.publishing_ready is True
+
+
 def test_session_finalization_diagnostics_are_artifact_only(tmp_path):
     diagnostic = {
         "code": "invalid_candidate_finding_references",
@@ -330,7 +374,7 @@ def test_planner_failure_uses_deterministic_assignment_plan(tmp_path):
     assert result.publishing_ready is True
 
 
-def test_truncated_planner_final_json_does_not_trigger_a_fourth_provider_request(
+def test_invalid_planner_final_json_uses_reserved_fourth_repair_request(
     monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
@@ -351,6 +395,13 @@ def test_truncated_planner_final_json_does_not_trigger_a_fourth_provider_request
             "choices": [{
                 "finish_reason": "length",
                 "message": {"role": "assistant", "reasoning_content": "second reasoning"},
+            }],
+            "usage": {},
+        },
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": '{"assignments":[]}'},
             }],
             "usage": {},
         },
@@ -383,12 +434,83 @@ def test_truncated_planner_final_json_does_not_trigger_a_fourth_provider_request
 
     plan = controller._plan(state)
 
-    assert len(payloads) == 3
+    assert len(payloads) == 4
+    assert payloads[3]["reasoning_effort"] == "none"
     assert state.plan_source == "deterministic_fallback"
     assert plan.assignments[0].id.startswith("fallback-")
 
 
-def test_invalid_second_planner_continuation_cannot_start_a_fourth_request(
+def test_planner_reserves_one_request_for_semantic_repair_after_two_continuations(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    monkeypatch.setenv("AI_REASONING_EFFORT", "high")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    now = time.monotonic()
+    controller.clock = lambda: now
+    payloads = []
+    inputs = _inputs(tmp_path)
+    state = _RunState(
+        inputs=inputs,
+        journal=EventJournal(),
+        deadline=RunDeadline(
+            now, inputs.config.review_deadline_sec, inputs.config.phase_shares,
+        ),
+        evidence=EvidenceStore(),
+        obligations=derive_obligations(
+            inputs.topology, inputs.classification, inputs.policy,
+        ),
+    )
+    valid_repair = _planner(state.obligations, inputs.topology, inputs.config)
+    responses = iter((
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"role": "assistant", "reasoning_content": "first reasoning"},
+            }],
+            "usage": {},
+        },
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"role": "assistant", "reasoning_content": "second reasoning"},
+            }],
+            "usage": {},
+        },
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": '{"assignments":[]}'},
+            }],
+            "usage": {},
+        },
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": json.dumps(valid_repair)},
+            }],
+            "usage": {},
+        },
+    ))
+
+    def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
+        payloads.append(payload)
+        return next(responses)
+
+    controller.planner.gateway.transport = transport
+
+    plan = controller._plan(state)
+
+    assert len(payloads) == 4
+    assert payloads[2]["reasoning_effort"] == "none"
+    assert payloads[3]["reasoning_effort"] == "none"
+    assert state.plan_source == "model_repaired_validated"
+    assert state.planner_repaired is True
+    assert plan.assignments[0].id == "worker-flow"
+
+
+def test_invalid_repair_continuation_cannot_exceed_four_request_budget(
     monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
@@ -420,6 +542,13 @@ def test_invalid_second_planner_continuation_cannot_start_a_fourth_request(
             }],
             "usage": {},
         },
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"role": "assistant", "reasoning_content": "more repair reasoning"},
+            }],
+            "usage": {},
+        },
     ))
 
     def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
@@ -442,8 +571,9 @@ def test_invalid_second_planner_continuation_cannot_start_a_fourth_request(
 
     plan = controller._plan(state)
 
-    assert len(payloads) == 3
+    assert len(payloads) == 4
     assert payloads[2]["reasoning_effort"] == "none"
+    assert payloads[3]["reasoning_effort"] == "none"
     assert payloads[2]["messages"][-1] == {
         "role": "user", "content": "Return only the required JSON object.",
     }

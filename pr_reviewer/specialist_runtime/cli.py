@@ -397,7 +397,7 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
         for attempt in range(3):
             budget = bounded_request.planner_request_budget
             finalization = (
-                budget.remaining == 1
+                budget.remaining <= 2
                 if budget is not None
                 else attempt == 2
             )

@@ -198,7 +198,7 @@ class ControllerPhase(str, Enum):
 class PlannerRequestBudget:
     """Controller-owned cap for all provider requests in one planning attempt."""
 
-    remaining: int = 3
+    remaining: int = 4
 
     def consume(self) -> None:
         if self.remaining <= 0:
@@ -2152,6 +2152,14 @@ class ReviewController:
         recipe_states = state.coverage.recipe_statuses()
         for recipe in state.inputs.policy.recipes:
             recipe_states.setdefault(recipe.id, "not_applicable")
+
+        def projected_status(item: CoverageObligation) -> str:
+            if item.id in statuses:
+                return statuses[item.id].value
+            if item.origin == "recipe-accounting" and item.recipe_id:
+                return ObligationStatus(recipe_states[item.recipe_id]).value
+            return statuses[item.id].value
+
         unique_sessions: dict[str, object] = {}
         for result in state.session_results.values():
             unique_sessions[result.session_id] = result
@@ -2297,7 +2305,7 @@ class ReviewController:
             },
             "coverage": {
                 item.id: {
-                    "status": statuses[item.id].value,
+                    "status": projected_status(item),
                     "mandatory": item.mandatory,
                     "risk_tier": item.risk_tier,
                     "unresolved_policy": item.unresolved_policy,
