@@ -159,6 +159,41 @@ def read_file(path, workspace_root, offset=None, limit=None):
         "range": {"offset": start + 1, "lines": len(lines[start:end]), "total_lines": len(lines)},
     }
 
+def _read_bounded_line_window(stream, offset, limit, max_bytes):
+    """Stream a line window without retaining the skipped patch prefix."""
+    collected = bytearray()
+    current_line = 1
+    returned_lines = 0
+    at_line_start = True
+    include_current_line = False
+
+    while True:
+        chunk = stream.readline(max_bytes + 1)
+        if not chunk:
+            return bytes(collected), returned_lines, False
+
+        if at_line_start:
+            if current_line < offset:
+                include_current_line = False
+            elif returned_lines >= limit:
+                return bytes(collected), returned_lines, True
+            else:
+                include_current_line = True
+                returned_lines += 1
+
+        if include_current_line:
+            remaining = max_bytes - len(collected)
+            if len(chunk) > remaining:
+                collected.extend(chunk[:remaining])
+                return bytes(collected), returned_lines, True
+            collected.extend(chunk)
+
+        if chunk.endswith(b"\n"):
+            current_line += 1
+            at_line_start = True
+        else:
+            at_line_start = False
+
 def git_grep(pattern, workspace_root, request_timeout=15):
     """Run git grep and return matched lines."""
     try:
@@ -463,29 +498,32 @@ def execute_tool_request(
             if process.stdout is None:
                 process.kill()
                 raise ValueError("git diff did not provide a readable output stream")
-            capture_limit = max_response_bytes + 1
             with ThreadPoolExecutor(max_workers=1) as reader:
-                future = reader.submit(process.stdout.read, capture_limit)
+                future = reader.submit(
+                    _read_bounded_line_window,
+                    process.stdout,
+                    offset,
+                    limit,
+                    max_response_bytes,
+                )
                 try:
-                    raw_output = future.result(timeout=request_timeout)
+                    raw_output, returned_lines, has_more = future.result(
+                        timeout=request_timeout
+                    )
                 except FutureTimeoutError:
                     process.kill()
                     raise ValueError(
                         f"git diff timed out after {request_timeout}s"
                     )
-            capture_truncated = len(raw_output) > max_response_bytes
-            if capture_truncated:
+            if has_more:
                 process.kill()
             return_code = process.wait(timeout=request_timeout)
             output = raw_output.decode("utf-8", errors="replace")
-            if return_code != 0 and not capture_truncated:
+            if return_code != 0 and not has_more:
                 raise ValueError(
                     f"git diff failed: {mask_secrets(output.strip())}"
                 )
-            lines = output.splitlines(keepends=True)
-            start = offset - 1
-            window = "".join(lines[start:start + limit])
-            masked_patch = mask_secrets(window)
+            masked_patch = mask_secrets(output)
             encoded_patch = masked_patch.encode("utf-8", errors="replace")
             if len(encoded_patch) > max_response_bytes:
                 marker = b"\n[truncated]"
@@ -504,8 +542,9 @@ def execute_tool_request(
                 "patch": patch,
                 "range": {
                     "offset": offset,
-                    "lines": len(lines[start:start + limit]),
-                    "total_lines": len(lines),
+                    "returned_lines": returned_lines,
+                    "has_more": has_more,
+                    "truncated": has_more,
                 },
             }
 

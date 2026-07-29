@@ -147,6 +147,9 @@ def test_read_pr_diff_uses_bounded_file_scoped_merge_base_argv(
     assert result["result"]["path"] == "src/app.py"
     assert "diff --git a/src/app.py b/src/app.py" in result["result"]["patch"]
     assert result["result"]["range"]["offset"] == 1
+    assert result["result"]["range"]["returned_lines"] == 4
+    assert result["result"]["range"]["has_more"] is False
+    assert result["result"]["range"]["truncated"] is False
     assert seen["args"] == [
         "git",
         "--literal-pathspecs",
@@ -214,10 +217,10 @@ def test_read_pr_diff_bounds_capture_before_large_single_line_is_materialized(
     observed = {}
 
     class BoundedStream(io.BytesIO):
-        def read(self, size=-1):
-            observed["read_size"] = size
+        def readline(self, size=-1):
+            observed.setdefault("read_sizes", []).append(size)
             assert 0 < size <= 12001
-            return super().read(size)
+            return super().readline(size)
 
     class FakeProcess:
         def __init__(self):
@@ -246,6 +249,60 @@ def test_read_pr_diff_bounds_capture_before_large_single_line_is_materialized(
     )
 
     assert result["status"] == "ok"
-    assert observed["read_size"] == 12001
+    assert max(observed["read_sizes"]) == 12001
     assert process.killed is True
     assert len(result["result"]["patch"].encode("utf-8")) <= 12000
+    assert result["result"]["range"]["returned_lines"] == 1
+    assert result["result"]["range"]["has_more"] is True
+    assert result["result"]["range"]["truncated"] is True
+
+
+def test_read_pr_diff_streams_to_later_offset_beyond_response_byte_cap(
+    monkeypatch, tmp_path,
+):
+    base_sha = "1" * 40
+    head_sha = "2" * 40
+    path = "src/app.py"
+    (tmp_path / "src").mkdir()
+    (tmp_path / path).write_text("head\n", encoding="utf-8")
+    early_lines = [f"+early-{index:04d}-{'x' * 80}\n" for index in range(180)]
+    late_lines = ["@@ -900,2 +900,2 @@\n", "-late-old\n", "+late-new\n", "+after\n"]
+    patch_bytes = "".join((*early_lines, *late_lines)).encode("utf-8")
+    assert len(patch_bytes) > 12000
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.BytesIO(patch_bytes)
+            self.returncode = 0
+            self.killed = False
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+        def wait(self, timeout):
+            return self.returncode
+
+    process = FakeProcess()
+    monkeypatch.setattr(
+        tool_executors.subprocess, "Popen",
+        lambda *args, **kwargs: process,
+    )
+
+    result = tool_executors.execute_tool_request(
+        "read_pr_diff",
+        {"path": path, "offset": 181, "limit": 3},
+        str(tmp_path), set(), "", (), 12000, 15,
+        base_sha=base_sha, head_sha=head_sha,
+        allowed_diff_paths=(path,),
+    )
+
+    assert result["status"] == "ok"
+    assert result["result"]["patch"] == "".join(late_lines[:3])
+    assert result["result"]["range"] == {
+        "offset": 181,
+        "returned_lines": 3,
+        "has_more": True,
+        "truncated": True,
+    }
+    assert process.killed is True
