@@ -140,6 +140,18 @@ class ControllerPhase(str, Enum):
     COMPLETE = "complete"
 
 
+@dataclass
+class PlannerRequestBudget:
+    """Controller-owned cap for all provider requests in one planning attempt."""
+
+    remaining: int = 3
+
+    def consume(self) -> None:
+        if self.remaining <= 0:
+            raise ValueError("planner physical request budget exhausted")
+        self.remaining -= 1
+
+
 @dataclass(frozen=True)
 class RoleRequest:
     """Controller-authoritative, lease-bearing input for one role request."""
@@ -151,6 +163,7 @@ class RoleRequest:
     timeout_sec: float
     max_tokens: int
     context: Mapping[str, object]
+    planner_request_budget: PlannerRequestBudget | None = None
 
     def __post_init__(self) -> None:
         if not self.role.strip() or not self.request_id.strip():
@@ -1128,6 +1141,7 @@ class ReviewController:
         component: object,
         method: str,
         context: Mapping[str, object],
+        planner_request_budget: PlannerRequestBudget | None = None,
     ) -> object:
         state.journal.emit("model_request_started", {
             "request_id": request_id,
@@ -1154,6 +1168,7 @@ class ReviewController:
                 timeout_sec=timeout,
                 max_tokens=state.inputs.config.session_limits.output_tokens or 4096,
                 context=frozen_context,
+                planner_request_budget=planner_request_budget,
             )
             value = CALLBACK_POOL.run(
                 lambda: self._call_role_component(component, method, request),
@@ -1206,6 +1221,7 @@ class ReviewController:
             self._degrade(state, "planner", "deterministic assignment fallback")
             return fallback_assignment_plan(state.obligations, inputs.topology, inputs.config)
         raw: object
+        request_budget = PlannerRequestBudget()
         try:
             raw = self._model_request(
                 state,
@@ -1214,6 +1230,7 @@ class ReviewController:
                 phase=RunPhase.PLANNING,
                 component=self.planner,
                 method="plan",
+                planner_request_budget=request_budget,
                 context={
                     "obligations": state.obligations,
                     "topology": inputs.topology,
@@ -1230,7 +1247,7 @@ class ReviewController:
             state.plan_source = "model_validated"
             return plan
         except AssignmentPlanError as first_error:
-            if bool(getattr(raw, "finalization_attempted", False)):
+            if request_budget.remaining <= 0:
                 self._degrade(state, "planner", _bounded_error(first_error))
             else:
                 try:
@@ -1242,6 +1259,7 @@ class ReviewController:
                         phase=RunPhase.PLANNING,
                         component=self.planner,
                         method="repair",
+                        planner_request_budget=request_budget,
                         context={
                             "obligations": state.obligations,
                             "topology": inputs.topology,

@@ -342,16 +342,6 @@ class _ConfiguredGateway(OpenAIModelGateway):
         return super().complete(request)
 
 
-class _PlannerResponse(dict[str, object]):
-    """A parsed planner mapping carrying its bounded-turn completion state."""
-
-    def __init__(
-        self, value: Mapping[str, object], *, finalization_attempted: bool,
-    ) -> None:
-        super().__init__(value)
-        self.finalization_attempted = finalization_attempted
-
-
 class _BoundedRoleAdapter(GatewayRoleAdapter):
     def __init__(
         self, gateway, system_prompt: str, max_tokens: int,
@@ -403,6 +393,8 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
         ))
         for attempt in range(3):
             finalization = attempt == 2
+            if bounded_request.planner_request_budget is not None:
+                bounded_request.planner_request_budget.consume()
             result = self.gateway.complete(ModelTurnRequest(
                 role=bounded_request.role,
                 conversation=conversation,
@@ -421,9 +413,7 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
                 ),
             ))
             try:
-                return _PlannerResponse(
-                    _json_object(result.text), finalization_attempted=finalization,
-                )
+                return _json_object(result.text)
             except (TypeError, ValueError):
                 if attempt == 2 or result.finish_reason != "length" or not result.text:
                     raise
