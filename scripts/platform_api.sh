@@ -170,8 +170,23 @@ platform_pr_files_all() {
   if _platform_is_forgejo; then
     _forgejo_py list-pr-files "$1" "$2"
   else
-    gh api --paginate --slurp "repos/$1/pulls/$2/files?per_page=100" \
-      --jq 'add // []'
+    local pages_file status
+    pages_file="$(mktemp)" || return 1
+    if gh api --paginate "repos/$1/pulls/$2/files?per_page=100" \
+      > "$pages_file"; then
+      :
+    else
+      status=$?
+      rm -f "$pages_file"
+      return "$status"
+    fi
+    if jq -s 'add // []' < "$pages_file"; then
+      status=0
+    else
+      status=$?
+    fi
+    rm -f "$pages_file"
+    return "$status"
   fi
 }
 

@@ -114,9 +114,63 @@ check "local fallback includes removed base content" \
 check "platform_pr_files" \
   "$(run_seam github "" 'platform_pr_files o/r 7')" \
   "gh api repos/o/r/pulls/7/files?per_page=100"
-check "platform_pr_files_all paginates and slurps" \
-  "$(run_seam github "" 'platform_pr_files_all o/r 7')" \
-  "gh api --paginate --slurp repos/o/r/pulls/7/files?per_page=100 --jq add // []"
+check "platform_pr_files_all delegates page merging to jq" \
+  "$(run_seam github "" 'jq(){ cat >/dev/null; echo "jq $*"; }; platform_pr_files_all o/r 7')" \
+  "jq -s add // []"
+
+COMPAT_BIN="$TMP/compat-bin"
+mkdir -p "$COMPAT_BIN"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'if [[ " $* " == *" --slurp "* && " $* " == *" --jq "* ]]; then' \
+  '  echo "the --slurp option is not supported with --jq or --template" >&2' \
+  '  exit 1' \
+  'fi' \
+  'if [[ "$1" == "api" && " $* " == *" --paginate "* ]]; then' \
+  '  printf "%s\n" "[{\"filename\":\"first.txt\"}]" "[{\"filename\":\"second.txt\"}]"' \
+  '  exit 0' \
+  'fi' \
+  'exit 2' > "$COMPAT_BIN/gh"
+chmod +x "$COMPAT_BIN/gh"
+COMPAT_FILES="$(
+  (
+    export PATH="$COMPAT_BIN:$PATH"
+    export PLATFORM=github
+    unset _PLATFORM_API_SOURCED
+    # shellcheck disable=SC1090
+    source "$SEAM"
+    platform_pr_files_all o/r 7
+  ) 2>/dev/null || true
+)"
+check "platform_pr_files_all works when gh rejects slurp with jq" \
+  "$(printf '%s\n' "$COMPAT_FILES" | jq -c . 2>/dev/null || true)" \
+  '[{"filename":"first.txt"},{"filename":"second.txt"}]'
+
+FAIL_BIN="$TMP/fail-bin"
+mkdir -p "$FAIL_BIN"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'echo "HTTP 503: unavailable" >&2' \
+  'exit 1' > "$FAIL_BIN/gh"
+chmod +x "$FAIL_BIN/gh"
+FILES_FAILURE_STATUS="$(
+  (
+    export PATH="$FAIL_BIN:$PATH"
+    export PLATFORM=github
+    unset _PLATFORM_API_SOURCED
+    set +o pipefail
+    # shellcheck disable=SC1090
+    source "$SEAM"
+    if platform_pr_files_all o/r 7 >/dev/null 2>&1; then
+      echo 0
+    else
+      echo $?
+    fi
+  )
+)"
+check "platform_pr_files_all preserves gh failure without caller pipefail" \
+  "$FILES_FAILURE_STATUS" "1"
+
 check "platform_issue_get" \
   "$(run_seam github "" 'platform_issue_get o/r 9')" \
   "gh api repos/o/r/issues/9"
