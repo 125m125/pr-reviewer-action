@@ -794,6 +794,33 @@ def test_finalizer_prompt_enumerates_controller_orientation_vocabulary(
     assert "component_ids and recipe_ids" in prompt
 
 
+def test_specialist_prompt_requires_exact_honest_changed_locations(
+    monkeypatch, tmp_path,
+):
+    from pr_reviewer.specialist_runtime.assignments import Assignment
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger
+    from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    assignment = Assignment(
+        id="location-contract", title="Location contract",
+        objective="Review one changed file", obligation_ids=(), recipe_ids=(),
+        lenses=(), seed_paths=(), boundary_paths=(), expected_evidence=(),
+        estimated_turns=1, priority="normal",
+    )
+    session = controller._cli_session_factory(
+        assignment, SessionLease(RunPhase.INITIAL, 10**20), None,
+        EvidenceStore(), CoverageLedger(()), (), "session:test:g0",
+    )
+    prompt = session.conversation.system
+
+    assert "exact changed repository path or `path:line`" in prompt
+    assert "omit the line rather than inferring" in prompt
+
+
 def _shell_prompt_environment(
     tmp_path: Path, *, inline: str = "", file_name: str = "", mode: str = "replace"
 ) -> dict[str, str]:

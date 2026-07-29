@@ -90,6 +90,9 @@ class CandidateVerificationRequest:
 
 
 class ReviewOrientationTopic(str, Enum):
+    IMPLEMENTATION = "implementation"
+    DOCUMENTATION = "documentation"
+    REPOSITORY_BEHAVIOR = "repository_behavior"
     DATABASE = "database"
     AUTHORIZATION = "authorization"
     CACHING = "caching"
@@ -105,6 +108,9 @@ class ReviewOrientationTopic(str, Enum):
 
 
 _TOPIC_LABELS = {
+    ReviewOrientationTopic.IMPLEMENTATION: "Runtime implementation behavior",
+    ReviewOrientationTopic.DOCUMENTATION: "Documentation and operator guidance",
+    ReviewOrientationTopic.REPOSITORY_BEHAVIOR: "Repository behavior and integration",
     ReviewOrientationTopic.DATABASE: "Database and persistence",
     ReviewOrientationTopic.AUTHORIZATION: "Authorization boundaries",
     ReviewOrientationTopic.CACHING: "Caching and invalidation",
@@ -220,6 +226,27 @@ def _path(value: object) -> tuple[str, int | None, str]:
     return normalized, line, "ok"
 
 
+def _exact_changed_location(
+    value: object,
+    changed_files: tuple[str, ...],
+) -> tuple[str, int | None, str]:
+    raw = _unicode(value).strip()
+    if not raw:
+        return "", None, "missing"
+    for path in changed_files:
+        if raw == path:
+            return path, None, "ok"
+    for path in sorted(changed_files, key=len, reverse=True):
+        prefix = path + ":"
+        if not raw.startswith(prefix):
+            continue
+        line_text = raw[len(prefix):]
+        if re.fullmatch(r"[1-9]\d*", line_text):
+            return path, int(line_text), "ok"
+        break
+    return "", None, "invalid"
+
+
 def _stable_strings(values: object) -> tuple[str, ...]:
     if values is None:
         return ()
@@ -234,7 +261,7 @@ def _normalized_severity(value: object) -> str:
 
 
 def _normalized_candidate(candidate: CandidateFinding) -> CandidateFinding:
-    affected_file, line, _ = _path(candidate.affected_location)
+    affected_file, _, _ = _path(candidate.affected_location)
     claim_identity = _identity_text(candidate.claim)
     category = _identity_text(candidate.category).replace(" ", "-")
     identity = "\x1f".join((affected_file, category, claim_identity))
@@ -242,7 +269,7 @@ def _normalized_candidate(candidate: CandidateFinding) -> CandidateFinding:
     return replace(
         candidate,
         root_cause_fingerprint=fingerprint,
-        affected_location=affected_file + (f":{line}" if affected_file and line else ""),
+        affected_location=_unicode(candidate.affected_location).strip(),
         severity=_normalized_severity(candidate.severity),
         category=category,
         supporting_evidence_ids=_stable_strings(candidate.supporting_evidence_ids),
@@ -356,13 +383,13 @@ def _authorize(
     raw_candidate = _candidate_from_accepted(value)
     if raw_candidate is None:
         return None, "unsupported-accepted-value"
-    raw_file, _, location_state = _path(raw_candidate.affected_location)
     candidate = _normalized_candidate(raw_candidate)
-    affected_file, line, _ = _path(candidate.affected_location)
+    affected_file, line, location_state = _exact_changed_location(
+        raw_candidate.affected_location,
+        changed_files,
+    )
     if location_state != "ok" or not affected_file:
         return None, "missing-changed-causal-file"
-    if affected_file not in changed_files:
-        return None, "off-change-causal-file"
     if not _identity_text(candidate.claim) or not _identity_text(candidate.causal_chain):
         return None, "missing-required-finding-detail"
     raw_consequences = (
@@ -1013,13 +1040,20 @@ def project_review_handoff(
         and context.unresolved_thread_count > 0
         else 0
     )
-    thread_severity = _normalized_severity(context.highest_thread_severity)
+    raw_thread_severity = _unicode(context.highest_thread_severity).strip().lower()
+    thread_severity = (
+        raw_thread_severity
+        if raw_thread_severity in _SEVERITY_RANK
+        else None
+    )
     thread_status = None
     if thread_count:
-        candidate_thread_status = (
-            f"{thread_count} unresolved review note(s); "
-            f"highest material severity: {thread_severity}."
-        )
+        candidate_thread_status = f"{thread_count} unresolved review note(s)"
+        if thread_severity:
+            candidate_thread_status += (
+                f"; highest material severity: {thread_severity}"
+            )
+        candidate_thread_status += "."
         if renderable(
             candidate_thread_status,
             f"Thread status: {candidate_thread_status}",
@@ -1180,8 +1214,11 @@ def _verification_note(
     )
     if not obligation_ids:
         return None
-    file, line, state = _path(candidate.affected_location)
-    if state != "ok" or file not in changed_files:
+    file, line, state = _exact_changed_location(
+        candidate.affected_location,
+        changed_files,
+    )
+    if state != "ok":
         file, line = "", None
     evidence_ids = tuple(sorted(
         item for item in candidate.supporting_evidence_ids + candidate.contradicting_evidence_ids
@@ -1237,8 +1274,11 @@ def _mapping_verification(
     )
     if not obligation_ids or any(item not in obligations for item in obligation_ids):
         return None
-    file, parsed_line, state = _path(value.get("file", ""))
-    if state != "ok" or file not in changed_files:
+    file, parsed_line, state = _exact_changed_location(
+        value.get("file", ""),
+        changed_files,
+    )
+    if state != "ok":
         file, parsed_line = "", None
     line = _valid_line(value.get("line"))
     if "line" not in value:

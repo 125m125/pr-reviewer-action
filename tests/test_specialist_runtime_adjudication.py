@@ -52,7 +52,7 @@ def _candidate(
     candidate_id: str = "candidate-1",
     *,
     claim: str = "A retry can duplicate the write",
-    location: str = "./src\\store.py:41",
+    location: str = "src/store.py:41",
     category: str = "database",
     evidence_ids: tuple[str, ...] = (),
     contradicting_ids: tuple[str, ...] = (),
@@ -135,6 +135,31 @@ def test_fingerprint_normalizes_file_category_claim_and_ignores_line():
     assert first_review.accepted[0].root_cause_fingerprint == second_review.accepted[0].root_cause_fingerprint
     assert first_review.accepted[0].affected_file == "src/store.py"
     assert second_review.accepted[0].line == 99
+
+
+def test_non_exact_candidate_location_stays_general_without_inferred_anchor():
+    store, evidence_id = _store()
+    candidate = _candidate(
+        evidence_ids=(evidence_id,),
+        location="./src\\store.py:41",
+    )
+
+    review = _adjudicate(
+        (candidate,), {candidate.candidate_id: "keep"}, store,
+    )
+    notes = build_review_notes(
+        review,
+        store,
+        "review_comment",
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert review.accepted == ()
+    assert len(notes) == 1
+    assert notes[0].kind is ReviewNoteKind.VERIFICATION_REQUEST
+    assert notes[0].file is None
+    assert notes[0].line is None
 
 
 def test_critic_action_vocabulary_is_closed():
@@ -316,6 +341,22 @@ def test_handoff_compactly_names_distinct_degraded_stages_without_details():
     assert "exception" not in handoff.markdown.lower()
 
 
+def test_handoff_thread_status_omits_severity_without_a_material_finding():
+    handoff = build_review_handoff(
+        ReviewHandoffContext(
+            unresolved_thread_count=2,
+            highest_thread_severity=None,
+        ),
+        review=AdjudicatedReview(),
+        evidence=EvidenceStore(),
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert handoff.thread_status == "2 unresolved review note(s)."
+    assert "highest material severity" not in handoff.markdown
+
+
 def test_disparate_or_generic_findings_do_not_get_artificial_theme():
     store, evidence_id = _store()
     disparate = (
@@ -419,6 +460,31 @@ def test_unanchored_keep_becomes_typed_verification_request_note():
     assert notes[0].kind is ReviewNoteKind.VERIFICATION_REQUEST
     assert notes[0].file is None
     assert "Why human input is needed" in notes[0].markdown
+
+
+def test_exact_changed_file_without_line_stays_file_anchored():
+    store, evidence_id = _store()
+    candidate = _candidate(
+        evidence_ids=(evidence_id,),
+        location="src/store.py",
+    )
+    review = _adjudicate(
+        (candidate,), {candidate.candidate_id: "keep"}, store,
+    )
+
+    notes = build_review_notes(
+        review,
+        store,
+        "review_comment",
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert len(review.accepted) == 1
+    assert len(notes) == 1
+    assert notes[0].kind is ReviewNoteKind.FINDING
+    assert notes[0].file == "src/store.py"
+    assert notes[0].line is None
 
 
 def test_runtime_supported_severity_policy_and_approval_gate():

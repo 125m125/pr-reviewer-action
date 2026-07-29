@@ -100,7 +100,10 @@ _SPECIALIST_SYSTEM = (
     "tools or concise analysis and do not emit a whole-PR verdict. When the controller asks "
     "for a checkpoint, return only the requested checkpoint object matching its schema. "
     "When the controller asks for finalization, return only the requested final report object "
-    "matching its schema and derive it from retained evidence and the latest checkpoint."
+    "matching its schema and derive it from retained evidence and the latest checkpoint. "
+    "For every candidate finding, affected_location must be an exact changed repository path "
+    "or `path:line` using a defensible changed new-file line; omit the line rather than "
+    "inferring an unsupported path or line."
 )
 
 

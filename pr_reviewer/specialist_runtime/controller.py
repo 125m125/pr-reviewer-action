@@ -84,6 +84,60 @@ from .web_evidence import SourceAccessRequest
 _SCHEMA_VERSION = 2
 _MAX_ARTIFACT_STRING = 16 * 1024
 _MAX_ARTIFACT_ITEMS = 2_000
+_SIGNAL_ORIENTATION_TOPICS = {
+    "implementation": (ReviewOrientationTopic.IMPLEMENTATION,),
+    "documentation": (ReviewOrientationTopic.DOCUMENTATION,),
+    "other": (ReviewOrientationTopic.REPOSITORY_BEHAVIOR,),
+    "test": (ReviewOrientationTopic.TEST_COVERAGE,),
+    "tests": (ReviewOrientationTopic.TEST_COVERAGE,),
+    "schema_contract": (ReviewOrientationTopic.API_CONTRACTS,),
+    "producer": (ReviewOrientationTopic.API_CONTRACTS,),
+    "consumer": (ReviewOrientationTopic.API_CONTRACTS,),
+    "generated": (ReviewOrientationTopic.GENERATED_ARTIFACTS,),
+    "migration": (ReviewOrientationTopic.DATABASE,),
+    "persistence": (ReviewOrientationTopic.DATABASE,),
+    "messaging": (ReviewOrientationTopic.CROSS_COMPONENT_CONTRACTS,),
+    "delivery": (ReviewOrientationTopic.FAILURE_RECOVERY,),
+    "deployment": (ReviewOrientationTopic.DEPLOYMENT,),
+    "deployment_artifact": (ReviewOrientationTopic.DEPLOYMENT,),
+    "build_manifest": (ReviewOrientationTopic.DEPLOYMENT,),
+    "configuration": (ReviewOrientationTopic.DEPLOYMENT,),
+    "trust_boundary": (
+        ReviewOrientationTopic.AUTHORIZATION,
+        ReviewOrientationTopic.SECURITY,
+    ),
+    "interaction": (ReviewOrientationTopic.CROSS_COMPONENT_CONTRACTS,),
+    "auth_changes": (
+        ReviewOrientationTopic.AUTHORIZATION,
+        ReviewOrientationTopic.SECURITY,
+    ),
+    "public_route_changes": (
+        ReviewOrientationTopic.AUTHORIZATION,
+        ReviewOrientationTopic.API_CONTRACTS,
+    ),
+    "file_serving_changes": (ReviewOrientationTopic.SECURITY,),
+    "path_handling_changes": (ReviewOrientationTopic.SECURITY,),
+    "secret_handling_changes": (ReviewOrientationTopic.SECURITY,),
+    "linked_security_issue": (ReviewOrientationTopic.SECURITY,),
+    "linked_audit_issue": (ReviewOrientationTopic.SECURITY,),
+    "dependency_changes": (ReviewOrientationTopic.DEPLOYMENT,),
+}
+
+
+def _orientation_topics(values: Iterable[object]) -> tuple[ReviewOrientationTopic, ...]:
+    selected: set[ReviewOrientationTopic] = set()
+    for value in values:
+        normalized = str(value or "").strip().casefold().replace("-", "_")
+        if not normalized:
+            continue
+        try:
+            selected.add(ReviewOrientationTopic(normalized))
+        except ValueError:
+            pass
+        selected.update(_SIGNAL_ORIENTATION_TOPICS.get(normalized, ()))
+    return tuple(topic for topic in ReviewOrientationTopic if topic in selected)
+
+
 class _FrozenArtifactDict(dict):
     """JSON-serializable mapping with an immutable public mutation surface."""
 
@@ -1782,24 +1836,100 @@ class ReviewController:
             state.journal.emit("candidate_disposition", _json_value(disposition))
 
     def _handoff_context(self, state: _RunState, status: str) -> ReviewHandoffContext:
+        assert state.coverage is not None
+        coverage = state.coverage.snapshot()
+        obligation_statuses = dict(coverage.obligation_statuses)
+        evidence_by_obligation = dict(coverage.evidence_by_obligation)
+        reviewed_obligations = tuple(
+            item for item in state.obligations
+            if evidence_by_obligation.get(item.id)
+            or obligation_statuses.get(item.id) is ObligationStatus.COVERED
+        )
+        completed_assignments = tuple(
+            state.assignments[assignment_id]
+            for assignment_id in sorted(state.assignment_sessions)
+            if assignment_id in state.assignments
+        )
+        change_topics = _orientation_topics(
+            state.inputs.topology.get("file_roles", ())
+        )
+        if not change_topics and state.inputs.changed_files:
+            change_topics = (ReviewOrientationTopic.REPOSITORY_BEHAVIOR,)
+        specialist_topics = _orientation_topics(
+            lens
+            for assignment in completed_assignments
+            for lens in assignment.lenses
+        )
+        coverage_boundary_topics = _orientation_topics(
+            signal
+            for obligation in reviewed_obligations
+            for signal in (
+                obligation.origin,
+                *obligation.required_evidence_categories,
+                *(
+                    (obligation.subject,)
+                    if obligation.origin == "risk-rule"
+                    else ()
+                ),
+            )
+        )
         recipe_ids = tuple(sorted(
             item.id for item in state.inputs.policy.recipes
-            if state.coverage is not None
-            and state.coverage.recipe_statuses().get(item.id) != "not_applicable"
+            if state.coverage.recipe_statuses().get(item.id)
+            in {"covered", "partially_covered"}
         ))
+        unresolved_obligations = tuple(
+            item for item in state.obligations
+            if item.mandatory
+            and obligation_statuses.get(item.id) is not ObligationStatus.COVERED
+        )
+        finding_topics = _orientation_topics(
+            item.category for item in state.review.accepted
+        )
+        risk_topics = _orientation_topics(
+            state.inputs.classification.get("risk_flags", ())
+        )
+        unresolved_topics = _orientation_topics(
+            signal
+            for obligation in unresolved_obligations
+            for signal in (
+                obligation.origin,
+                obligation.subject,
+                *obligation.required_evidence_categories,
+            )
+        )
+        relationship_topics = (
+            (ReviewOrientationTopic.CROSS_COMPONENT_CONTRACTS,)
+            if state.inputs.topology.get("relationships")
+            else ()
+        )
+        review_emphasis_topics = tuple(dict.fromkeys((
+            *finding_topics,
+            *risk_topics,
+            *relationship_topics,
+            *unresolved_topics,
+        )))[:3]
+        material_severities = tuple(
+            note.severity for note in state.notes
+            if note.severity in {"info", "minor", "major", "blocker"}
+        )
         return ReviewHandoffContext(
             recommendation=state.verdict,
             status=status,
+            change_topics=change_topics,
             component_ids=tuple(sorted(
                 str(item.get("id", "")) for item in state.inputs.topology.get("components", ())
                 if isinstance(item, Mapping) and str(item.get("id", "")).strip()
             )),
+            specialist_topics=specialist_topics,
             recipe_ids=recipe_ids,
-            unresolved_thread_count=len(state.review.accepted),
+            coverage_boundary_topics=coverage_boundary_topics,
+            unresolved_thread_count=len(state.notes),
             highest_thread_severity=max(
-                (item.severity for item in state.review.accepted), default=None,
+                material_severities, default=None,
                 key=lambda value: {"info": 0, "minor": 1, "major": 2, "blocker": 3}.get(value, 0),
             ),
+            review_emphasis_topics=review_emphasis_topics,
             material_coverage_limited=bool(state.degradations),
             degraded_stages=tuple(
                 str(item.get("component", ""))
@@ -1809,48 +1939,72 @@ class ReviewController:
             source_access_requests=tuple(state.source_requests),
         )
 
-    @staticmethod
-    def _allowed_orientation_topics(
-        state: _RunState,
-    ) -> frozenset[ReviewOrientationTopic]:
-        values: list[str] = []
-        values.extend(str(item) for item in state.inputs.classification.get("risk_flags", ()))
-        values.extend(str(item) for item in state.inputs.topology.get("file_roles", ()))
-        for assignment in state.assignments.values():
-            values.extend(assignment.lenses)
-        for obligation in state.obligations:
-            values.extend((obligation.origin, obligation.subject, *obligation.required_evidence))
-        values.extend(item.category for item in state.review.accepted)
-        normalized = " ".join(values).lower().replace("-", "_")
-        return frozenset(
-            topic for topic in ReviewOrientationTopic
-            if topic.value in normalized
-        )
-
     def _apply_finalizer_proposal(
         self,
         state: _RunState,
         base: ReviewHandoffContext,
         proposal: FinalizerProposal,
     ) -> ReviewHandoffContext:
-        allowed_topics = self._allowed_orientation_topics(state)
         allowed_components = set(base.component_ids)
         allowed_recipes = set(base.recipe_ids)
 
-        def topics(values: Iterable[ReviewOrientationTopic]) -> tuple[ReviewOrientationTopic, ...]:
+        def topics(
+            values: Iterable[ReviewOrientationTopic],
+            allowed: Iterable[ReviewOrientationTopic],
+        ) -> tuple[ReviewOrientationTopic, ...]:
+            allowed_topics = set(allowed)
             return tuple(sorted(
                 {item for item in values if item in allowed_topics},
                 key=lambda item: item.value,
             ))
 
-        return replace(
+        selected = replace(
             base,
-            change_topics=topics(proposal.change_topics),
+            change_topics=topics(proposal.change_topics, base.change_topics),
             component_ids=tuple(sorted(set(proposal.component_ids) & allowed_components)),
-            specialist_topics=topics(proposal.specialist_topics),
+            specialist_topics=topics(
+                proposal.specialist_topics,
+                base.specialist_topics,
+            ),
             recipe_ids=tuple(sorted(set(proposal.recipe_ids) & allowed_recipes)),
-            coverage_boundary_topics=topics(proposal.coverage_boundary_topics),
-            review_emphasis_topics=topics(proposal.review_emphasis_topics),
+            coverage_boundary_topics=topics(
+                proposal.coverage_boundary_topics,
+                base.coverage_boundary_topics,
+            ),
+            review_emphasis_topics=topics(
+                proposal.review_emphasis_topics,
+                base.review_emphasis_topics,
+            ),
+        )
+        if not state.degradations:
+            return selected
+        return replace(
+            selected,
+            change_topics=tuple(sorted(
+                {*base.change_topics, *selected.change_topics},
+                key=lambda item: item.value,
+            )),
+            component_ids=tuple(sorted({
+                *base.component_ids, *selected.component_ids,
+            })),
+            specialist_topics=tuple(sorted(
+                {*base.specialist_topics, *selected.specialist_topics},
+                key=lambda item: item.value,
+            )),
+            recipe_ids=tuple(sorted({
+                *base.recipe_ids, *selected.recipe_ids,
+            })),
+            coverage_boundary_topics=tuple(sorted(
+                {
+                    *base.coverage_boundary_topics,
+                    *selected.coverage_boundary_topics,
+                },
+                key=lambda item: item.value,
+            )),
+            review_emphasis_topics=tuple(dict.fromkeys((
+                *selected.review_emphasis_topics,
+                *base.review_emphasis_topics,
+            )))[:3],
         )
 
     @staticmethod
@@ -1903,6 +2057,16 @@ class ReviewController:
             "blocking_finding_ids": state.blocking_finding_ids,
             "blocking_obligation_ids": state.blocking_obligation_ids,
         })
+        try:
+            state.notes = build_review_notes(
+                state.review, state.evidence, state.effective_publishing_mode,
+                obligations=obligation_map, changed_files=state.inputs.changed_files,
+                verification_requests=state.inputs.verification_requests,
+                source_access_requests=state.source_requests,
+            )
+        except Exception as exc:
+            self._degrade(state, "review_notes", _bounded_error(exc))
+            state.notes = ()
         status = "degraded" if state.degradations else "complete"
         context = self._handoff_context(state, status)
         if self.finalizer is not None and state.deadline.remaining(now=self.clock()) > 0:
@@ -1960,16 +2124,6 @@ class ReviewController:
         except Exception as exc:
             self._degrade(state, "finalizer", _bounded_error(exc))
             state.handoff = self._minimal_handoff(state.verdict, True)
-        try:
-            state.notes = build_review_notes(
-                state.review, state.evidence, state.effective_publishing_mode,
-                obligations=obligation_map, changed_files=state.inputs.changed_files,
-                verification_requests=state.inputs.verification_requests,
-                source_access_requests=state.source_requests,
-            )
-        except Exception as exc:
-            self._degrade(state, "review_notes", _bounded_error(exc))
-            state.notes = ()
 
     def _phase_allocations(self, state: _RunState) -> list[dict[str, object]]:
         shares = state.inputs.config.phase_shares

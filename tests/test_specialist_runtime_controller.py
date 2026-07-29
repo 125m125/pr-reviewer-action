@@ -819,13 +819,27 @@ def test_duplicate_candidate_ids_reject_every_occurrence_without_first_wins(tmp_
     assert all(item["reason"] == "duplicate-candidate-id" for item in collisions)
 
 
-def test_finalizer_failure_builds_deterministic_minimal_sparse_handoff(tmp_path):
+def test_finalizer_failure_builds_useful_sparse_handoff_from_controller_state(tmp_path):
     def broken_finalizer(*args):
         raise RuntimeError("finalizer timed out")
 
     result = _controller(tmp_path, finalizer=broken_finalizer).run(_inputs(tmp_path))
 
     assert result.handoff.markdown.startswith("## AI Review Handoff")
+    assert "Runtime implementation behavior" in result.handoff.change_map
+    assert "Component: worker" in result.handoff.change_map
+    assert result.handoff.specialist_focuses == ("Failure recovery",)
+    assert result.handoff.recipe_focuses == ("Repository recipe: delivery",)
+    assert result.handoff.coverage_boundaries == (
+        "Runtime implementation behavior",
+    )
+    assert result.handoff.thread_status == (
+        "1 unresolved review note(s); highest material severity: minor."
+    )
+    assert result.handoff.review_emphasis == ("Failure recovery",)
+    assert len(result.handoff.review_emphasis) <= 3
+    assert "A retry can process one delivery twice" not in result.handoff.markdown
+    assert "read_file" not in result.handoff.markdown
     assert "review the complete change" in result.handoff.markdown
     assert any(
         item["component"] == "finalizer" for item in result.artifact["degradation"]
@@ -866,9 +880,40 @@ def test_deadline_stops_exploration_and_preserves_finalization_reserve(tmp_path)
     assert len(finalizer_calls) == 1
     assert result.artifact["timing"]["finalization_reserve_seconds"] == 10
     assert result.artifact["unknowns"]
+    assert "Runtime implementation behavior" in result.handoff.change_map
+    assert result.handoff.specialist_focuses == ()
+    assert result.handoff.recipe_focuses == ()
+    assert result.handoff.thread_status is None
     assert any(
         item["component"] == "deadline" for item in result.artifact["degradation"]
     )
+
+
+def test_degraded_handoff_rejects_focus_from_failed_planned_assignment(tmp_path):
+    def planner(request):
+        raw = _planner_role(request)
+        raw["assignments"][0]["lenses"] = ["security"]
+        return raw
+
+    def broken_factory(*_args):
+        raise RuntimeError("specialist unavailable")
+
+    def finalizer(_request):
+        return FinalizerProposal(
+            component_ids=("worker",),
+            specialist_topics=(ReviewOrientationTopic.SECURITY,),
+        )
+
+    result = _controller(
+        tmp_path,
+        planner=planner,
+        session_factory=broken_factory,
+        finalizer=finalizer,
+    ).run(_inputs(tmp_path))
+
+    assert result.artifact["evaluation_status"] == "degraded"
+    assert result.handoff.specialist_focuses == ()
+    assert "Security-sensitive behavior" not in result.handoff.markdown
 
 
 def test_failed_specialist_requests_retain_attempt_budget_without_event_replay(tmp_path):
