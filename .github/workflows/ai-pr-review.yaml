@@ -2,7 +2,6 @@ name: AI PR Review
 
 on:
   pull_request:
-    branches: ["main"]
     # Reviews are requested explicitly by a maintainer adding `ai-review`.
     types: [labeled]
 
