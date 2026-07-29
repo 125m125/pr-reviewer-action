@@ -34,9 +34,8 @@ from .adjudication import (
 from .assignments import (
     Assignment,
     AssignmentPlan,
-    AssignmentPlanError,
+    apply_planner_transformations,
     fallback_assignment_plan,
-    repair_prompt,
     validate_assignment_plan,
 )
 from .budget import BudgetLedger, RunDeadline, SessionLease
@@ -531,6 +530,7 @@ class _RunState:
     plan: AssignmentPlan = field(default_factory=lambda: AssignmentPlan(()))
     plan_source: str = "deterministic_fallback"
     planner_repaired: bool = False
+    planner_diagnostics: list[str] = field(default_factory=list)
     assignments: dict[str, Assignment] = field(default_factory=dict)
     ownership: dict[str, SessionOwnership] = field(default_factory=dict)
     sessions: dict[str, object] = field(default_factory=dict)
@@ -1315,10 +1315,12 @@ class ReviewController:
 
     def _plan(self, state: _RunState) -> AssignmentPlan:
         inputs = state.inputs
+        base_plan = fallback_assignment_plan(
+            state.obligations, inputs.topology, inputs.config,
+        )
+        state.plan_source = "deterministic_base"
         if self.planner is None or self.clock() >= state.deadline.cutoff_for(RunPhase.PLANNING):
-            self._degrade(state, "planner", "deterministic assignment fallback")
-            return fallback_assignment_plan(state.obligations, inputs.topology, inputs.config)
-        raw: object
+            return base_plan
         request_budget = PlannerRequestBudget()
         try:
             raw = self._model_request(
@@ -1330,6 +1332,7 @@ class ReviewController:
                 method="plan",
                 planner_request_budget=request_budget,
                 context={
+                    "base_plan": base_plan,
                     "obligations": state.obligations,
                     "topology": inputs.topology,
                     "config": inputs.config,
@@ -1337,53 +1340,27 @@ class ReviewController:
                     "policy": inputs.policy,
                 },
             )
-            if not isinstance(raw, Mapping):
-                raise AssignmentPlanError("planner result must be an object")
-            plan = self.assignment_validator(
-                raw, state.obligations, inputs.topology, inputs.config,
+            result = apply_planner_transformations(
+                raw if isinstance(raw, Mapping) else {},
+                base_plan,
+                state.obligations,
+                inputs.config,
             )
-            state.plan_source = "model_validated"
-            return plan
-        except AssignmentPlanError as first_error:
-            if request_budget.remaining <= 0:
-                self._degrade(state, "planner", _bounded_error(first_error))
-            else:
-                try:
-                    repair = repair_prompt(first_error.errors, raw if isinstance(raw, Mapping) else {})
-                    repaired = self._model_request(
-                        state,
-                        role="planner",
-                        request_id="planner:repair:1",
-                        phase=RunPhase.PLANNING,
-                        component=self.planner,
-                        method="repair",
-                        planner_request_budget=request_budget,
-                        context={
-                            "obligations": state.obligations,
-                            "topology": inputs.topology,
-                            "config": inputs.config,
-                            "repair": repair,
-                            "pr_metadata": inputs.pr_metadata,
-                            "policy": inputs.policy,
-                        },
-                    )
-                    if not isinstance(repaired, Mapping):
-                        raise AssignmentPlanError("planner repair must be an object")
-                    plan = self.assignment_validator(
-                        repaired, state.obligations, inputs.topology, inputs.config,
-                    )
-                    state.plan_source = "model_repaired_validated"
-                    state.planner_repaired = True
-                    return plan
-                except Exception as exc:
-                    self._degrade(state, "planner", _bounded_error(exc))
+            state.planner_diagnostics.extend(result.ignored)
+            if result.plan != base_plan:
+                state.plan_source = "deterministic_base_transformed"
+            for diagnostic in result.ignored:
+                state.journal.emit("planner_transformation_ignored", {
+                    "reason": diagnostic,
+                })
+            return result.plan
         except Exception as exc:
-            self._degrade(state, "planner", _bounded_error(exc))
-        state.journal.emit("recovery", {
-            "component": "planner", "action": "deterministic_assignment_plan",
-        })
-        state.plan_source = "deterministic_fallback"
-        return fallback_assignment_plan(state.obligations, inputs.topology, inputs.config)
+            diagnostic = _bounded_error(exc)
+            state.planner_diagnostics.append(diagnostic)
+            state.journal.emit("planner_transformation_ignored", {
+                "reason": diagnostic,
+            })
+            return base_plan
 
     def _ownership(self, assignment: Assignment, session_id: str, state: _RunState) -> SessionOwnership:
         return session_ownership_for_assignment(
@@ -2278,6 +2255,7 @@ class ReviewController:
             "assignment_plan": {
                 "source": state.plan_source,
                 "planner_repaired": state.planner_repaired,
+                "ignored_transformations": list(state.planner_diagnostics),
                 "unassigned_obligation_ids": list(state.plan.unassigned_obligation_ids),
                 "unassigned_obligation_reasons": dict(
                     state.plan.unassigned_obligation_reasons
@@ -3069,6 +3047,7 @@ class ReviewController:
                 "assignment_plan": {
                     "source": state.plan_source,
                     "planner_repaired": state.planner_repaired,
+                    "ignored_transformations": list(state.planner_diagnostics),
                     "unassigned_obligation_ids": list(
                         state.plan.unassigned_obligation_ids,
                     ),

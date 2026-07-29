@@ -58,12 +58,14 @@ def test_multilingual_fixture_exercises_cross_stack_and_v1_recipe_migration():
     assert fixture["policy_input_version"] == 1
     assert result.artifact["policy"]["version"] == 2
     assert result.artifact["assignment_plan"] == {
-        "source": "model_repaired_validated",
-        "planner_repaired": True,
+        "source": "deterministic_base_transformed",
+        "planner_repaired": False,
+        "ignored_transformations": [],
         "unassigned_obligation_ids": [],
+        "unassigned_obligation_reasons": {},
     }
     assert [item["id"] for item in result.artifact["assignments"]] == [
-        "cross-stack-contract-audit",
+        "fallback-combined-1",
     ]
     assert {
         item["language"] for item in fixture["representative_changes"]
@@ -108,8 +110,8 @@ def test_recorded_failure_injections_have_deterministic_terminal_behavior():
     assert failures["no_progress_resume"]["budget_reset"] is False
     assert failures["reconstruction"]["reason"] == "repetitive-transcript"
     assert failures["reconstruction"]["recoveries"] == 1
-    assert failures["planner_repair"]["repair_requests"] == 1
-    assert failures["planner_repair"]["source"] == "model_repaired_validated"
+    assert failures["planner_repair"]["repair_requests"] == 0
+    assert failures["planner_repair"]["source"] == "deterministic_base_transformed"
     assert failures["failed_critic"]["terminal"] is True
     assert failures["failed_critic"]["fallback"] == "conservative"
     assert failures["deadline_cutoff"]["deadline_violation"] is False
@@ -158,7 +160,6 @@ def test_provider_fixture_contains_only_explicit_openai_responses():
 
     assert scenario["request_order"] == [
         "planner-initial",
-        "planner-repair",
         "specialist-tools",
         "specialist-checkpoint",
         "specialist-final",

@@ -64,16 +64,16 @@ _ORIENTATION_TOPIC_VOCABULARY = ", ".join(
 )
 _ROLE_SYSTEM = {
     "planner": (
-        "Plan a bounded specialist assignment set covering every supplied mandatory "
-        "obligation. Return only {\"assignments\":[...]}. Every assignment must contain "
-        "id, title, objective, obligation_ids, lenses, seed_paths, boundary_paths, "
-        "estimated_turns, priority, and overlap_justification. Use exact obligation_ids "
-        "from the supplied immutable set; never invent or paraphrase them. "
-        "expected_evidence is derived by the controller from those IDs, so any model value "
-        "is ignored. Assignment paths may contain only paths from the assigned obligations' "
-        "immutable scope or seed hints. "
-        "When an obligation has scope_ref or seed_hints_ref, resolve it through the "
-        "top-level path_sets map before selecting assignment paths."
+        "The controller has already created the authoritative deterministic base plan. "
+        "Suggest only optional bounded transformations and return "
+        "{\"transformations\":[...]}. Supported kinds are reorder, merge, split, and "
+        "improve. Transformations reference existing assignment and obligation IDs; split "
+        "IDs are derived by the controller. You cannot remove obligations, change immutable "
+        "risk or recipe isolation, or use paths outside the affected obligations' immutable "
+        "scope and seed hints. Do not estimate turns or capacity. Omitted assignments stay "
+        "unchanged, and each invalid transformation is ignored independently. Improve may "
+        "refine objective, lenses, seed_paths, or boundary_paths. Merge and split apply only "
+        "to compatible ordinary assignments."
     ),
     "negotiator": (
         "Propose only bounded resume, consultation, follow-up, or unknown actions for the "

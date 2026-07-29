@@ -27,9 +27,11 @@ from pr_reviewer.specialist_runtime.types import (
 def test_planner_system_prompt_declares_controller_owned_fields_and_paths():
     prompt = cli._ROLE_SYSTEM["planner"]
 
-    assert "exact obligation_ids" in prompt
-    assert "expected_evidence is derived by the controller" in prompt
-    assert "only paths from the assigned obligations" in prompt
+    assert "deterministic base plan" in prompt
+    assert "optional bounded transformations" in prompt
+    assert all(kind in prompt for kind in ("reorder", "merge", "split", "improve"))
+    assert "cannot remove obligations" in prompt
+    assert "Do not estimate turns" in prompt
 
 
 def runtime_source_paths() -> tuple[Path, ...]:
@@ -928,7 +930,7 @@ def test_default_lm_studio_requests_use_role_and_session_protocols_not_legacy_ve
     forbidden = "Return STRICT JSON with keys verdict and review_markdown"
     assert forbidden not in planner_system
     assert forbidden not in specialist_system
-    assert "bounded specialist assignment set" in planner_system
+    assert "optional bounded transformations" in planner_system
     assert "checkpoint" in specialist_system
     assert "final" in specialist_system
     assert "response_format" not in planner_payload

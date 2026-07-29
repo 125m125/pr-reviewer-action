@@ -57,6 +57,12 @@ class AssignmentPlan:
     unassigned_obligation_reasons: tuple[tuple[str, str], ...] = ()
 
 
+@dataclass(frozen=True)
+class PlannerTransformationResult:
+    plan: AssignmentPlan
+    ignored: tuple[str, ...] = ()
+
+
 def _assignable_obligations(obligations: Iterable[CoverageObligation]) -> tuple[CoverageObligation, ...]:
     """Exclude Task 3's non-mandatory, evidence-free lifecycle bookkeeping."""
     return tuple(item for item in obligations if item.mandatory and item.required_evidence_categories)
@@ -322,6 +328,317 @@ def validate_assignment_plan(
     return AssignmentPlan(assignments=_with_primary_ownership(
         _with_scheduling_weights(assignments, runtime_config)
     ))
+
+
+def _bounded_transformation_error(index: int, reason: str) -> str:
+    clean = " ".join(str(reason).split())
+    return f"transformation {index}: {clean[:300]}"
+
+
+def _is_isolated_assignment(
+    assignment: Assignment, obligation_by_id: Mapping[str, CoverageObligation],
+) -> bool:
+    return any(
+        _recipe_execution(obligation_by_id[obligation_id]) in {"dedicated", "independent"}
+        for obligation_id in assignment.obligation_ids
+        if obligation_id in obligation_by_id
+    )
+
+
+def _replace_assignment(
+    assignments: list[Assignment], assignment_id: str, replacement: Assignment,
+) -> None:
+    assignments[assignments.index(next(
+        item for item in assignments if item.id == assignment_id
+    ))] = replacement
+
+
+def _rebuild_assignment(
+    original: Assignment,
+    obligation_ids: Iterable[str],
+    obligation_by_id: Mapping[str, CoverageObligation],
+    config: RuntimeConfig,
+    *,
+    assignment_id: str | None = None,
+) -> Assignment:
+    ids = tuple(obligation_ids)
+    obligations = tuple(obligation_by_id[item] for item in ids)
+    allowed_paths = {
+        path.replace("\\", "/").strip("/")
+        for obligation in obligations
+        for path in (*obligation.scope, *obligation.seed_hints)
+    }
+    return replace(
+        original,
+        id=assignment_id or original.id,
+        obligation_ids=ids,
+        recipe_ids=tuple(sorted({
+            item.recipe_id for item in obligations if item.recipe_id
+        })),
+        seed_paths=tuple(path for path in original.seed_paths if path in allowed_paths),
+        boundary_paths=tuple(path for path in original.boundary_paths if path in allowed_paths),
+        expected_evidence=tuple(sorted({
+            category for item in obligations
+            for category in item.required_evidence_categories
+        })),
+        priority=_priority(obligations),
+        estimated_turns=min(
+            max(1, config.session_limits.model_turns), max(1, len(ids)),
+        ),
+        primary_obligation_ids=(),
+    )
+
+
+def _transformed_plan_errors(
+    assignments: tuple[Assignment, ...],
+    base_plan: AssignmentPlan,
+    obligation_by_id: Mapping[str, CoverageObligation],
+    runtime_config: RuntimeConfig,
+) -> list[str]:
+    errors: list[str] = []
+    assignment_ids = [item.id for item in assignments]
+    if len(assignment_ids) != len(set(assignment_ids)):
+        errors.append("assignment IDs must remain unique")
+    base_owned = {
+        obligation_id
+        for item in base_plan.assignments
+        for obligation_id in item.obligation_ids
+    }
+    transformed_owned = {
+        obligation_id
+        for item in assignments
+        for obligation_id in item.obligation_ids
+    }
+    if transformed_owned != base_owned:
+        errors.append("transformations must preserve complete base obligation ownership")
+    for assignment in assignments:
+        if not assignment.obligation_ids:
+            errors.append(f"assignment '{assignment.id}' must own an obligation")
+            continue
+        unknown = sorted(set(assignment.obligation_ids) - set(obligation_by_id))
+        if unknown:
+            errors.append(
+                f"assignment '{assignment.id}' contains unknown obligations: "
+                + ", ".join(unknown)
+            )
+            continue
+        obligations = tuple(
+            obligation_by_id[item] for item in assignment.obligation_ids
+        )
+        if assignment.priority != _priority(obligations):
+            errors.append(
+                f"assignment '{assignment.id}' changed immutable risk priority"
+            )
+        allowed_paths = {
+            path.replace("\\", "/").strip("/")
+            for obligation in obligations
+            for path in (*obligation.scope, *obligation.seed_hints)
+        }
+        outside = sorted(
+            set((*assignment.seed_paths, *assignment.boundary_paths)) - allowed_paths
+        )
+        if outside:
+            errors.append(
+                f"assignment '{assignment.id}' paths outside immutable obligation scope: "
+                + ", ".join(outside)
+            )
+    errors.extend(_validate_overlap(assignments, obligation_by_id))
+    errors.extend(_validate_recipe_execution(assignments, obligation_by_id))
+    errors.extend(_validate_budget(assignments, runtime_config))
+    return errors
+
+
+def _next_split_id(base_id: str, used_ids: set[str]) -> str:
+    suffix = 2
+    while f"{base_id}-split-{suffix}" in used_ids:
+        suffix += 1
+    assignment_id = f"{base_id}-split-{suffix}"
+    used_ids.add(assignment_id)
+    return assignment_id
+
+
+def apply_planner_transformations(
+    raw: Mapping[str, Any],
+    base_plan: AssignmentPlan,
+    obligations: Iterable[CoverageObligation],
+    runtime_config: RuntimeConfig,
+) -> PlannerTransformationResult:
+    """Apply optional planner improvements without transferring ownership authority."""
+    assignable = _validated_assignable_obligations(obligations)
+    obligation_by_id = {item.id: item for item in assignable}
+    transformations = raw.get("transformations") if isinstance(raw, Mapping) else None
+    if not isinstance(transformations, list):
+        return PlannerTransformationResult(
+            base_plan, ("planner result transformations must be an array",),
+        )
+    assignments = list(base_plan.assignments)
+    ignored: list[str] = []
+    selected_transformations = transformations[:64]
+    if len(transformations) > len(selected_transformations):
+        ignored.append(
+            f"planner returned {len(transformations)} transformations; only the first "
+            f"{len(selected_transformations)} were considered"
+        )
+    for index, transformation in enumerate(selected_transformations):
+        before = list(assignments)
+        try:
+            if not isinstance(transformation, Mapping):
+                raise ValueError("must be an object")
+            kind = transformation.get("kind")
+            by_id = {item.id: item for item in assignments}
+            if kind == "reorder":
+                requested = transformation.get("assignment_ids")
+                if not isinstance(requested, list) or any(
+                    not isinstance(item, str) for item in requested
+                ):
+                    raise ValueError("reorder assignment_ids must be an array of strings")
+                if len(set(requested)) != len(requested) or any(
+                    item not in by_id for item in requested
+                ):
+                    raise ValueError("reorder references unknown or duplicate assignment IDs")
+                assignments = [by_id[item] for item in requested] + [
+                    item for item in assignments if item.id not in requested
+                ]
+            elif kind == "improve":
+                assignment_id = transformation.get("assignment_id")
+                if not isinstance(assignment_id, str) or assignment_id not in by_id:
+                    raise ValueError("improve references an unknown assignment ID")
+                item = by_id[assignment_id]
+                changes: dict[str, object] = {}
+                for field in ("objective",):
+                    if field in transformation:
+                        value = transformation[field]
+                        if not isinstance(value, str) or not value.strip():
+                            raise ValueError(f"{field} must be a non-empty string")
+                        changes[field] = value.strip()
+                if "lenses" in transformation:
+                    errors: list[str] = []
+                    changes["lenses"] = _strings(
+                        transformation["lenses"], "lenses", errors,
+                    )
+                    if errors:
+                        raise ValueError("; ".join(errors))
+                allowed_paths = {
+                    path.replace("\\", "/").strip("/")
+                    for obligation_id in item.obligation_ids
+                    for path in (
+                        *obligation_by_id[obligation_id].scope,
+                        *obligation_by_id[obligation_id].seed_hints,
+                    )
+                }
+                for field in ("seed_paths", "boundary_paths"):
+                    if field in transformation:
+                        errors = []
+                        paths = _paths(transformation[field], field, errors)
+                        outside = sorted(set(paths) - allowed_paths)
+                        if outside:
+                            errors.append(
+                                "paths outside immutable obligation scope: "
+                                + ", ".join(outside)
+                            )
+                        if errors:
+                            raise ValueError("; ".join(errors))
+                        changes[field] = paths
+                _replace_assignment(assignments, assignment_id, replace(item, **changes))
+            elif kind == "merge":
+                target_id = transformation.get("target_assignment_id")
+                source_ids = transformation.get("source_assignment_ids")
+                if not isinstance(target_id, str) or target_id not in by_id:
+                    raise ValueError("merge references an unknown target assignment ID")
+                if not isinstance(source_ids, list) or not source_ids or any(
+                    not isinstance(item, str) for item in source_ids
+                ):
+                    raise ValueError("merge source_assignment_ids must be a non-empty array")
+                merge_ids = [target_id, *source_ids]
+                if len(set(merge_ids)) != len(merge_ids) or any(
+                    item not in by_id for item in merge_ids
+                ):
+                    raise ValueError("merge references unknown or duplicate assignment IDs")
+                merged = [by_id[item] for item in merge_ids]
+                if any(_is_isolated_assignment(item, obligation_by_id) for item in merged):
+                    raise ValueError("cannot merge an isolated recipe assignment")
+                target = by_id[target_id]
+                obligation_ids = tuple(dict.fromkeys(
+                    obligation_id for item in merged
+                    for obligation_id in item.obligation_ids
+                ))
+                rebuilt = _rebuild_assignment(
+                    target, obligation_ids, obligation_by_id, runtime_config,
+                )
+                assignments = [
+                    rebuilt if item.id == target_id else item
+                    for item in assignments if item.id not in source_ids
+                ]
+            elif kind == "split":
+                assignment_id = transformation.get("assignment_id")
+                groups = transformation.get("obligation_groups")
+                if not isinstance(assignment_id, str) or assignment_id not in by_id:
+                    raise ValueError("split references an unknown assignment ID")
+                original = by_id[assignment_id]
+                if _is_isolated_assignment(original, obligation_by_id):
+                    raise ValueError("cannot split an isolated recipe assignment")
+                if not isinstance(groups, list) or len(groups) < 2:
+                    raise ValueError("split obligation_groups must contain at least two groups")
+                parsed_groups: list[tuple[str, ...]] = []
+                seen: set[str] = set()
+                for group in groups:
+                    if not isinstance(group, list) or not group or any(
+                        not isinstance(item, str) for item in group
+                    ):
+                        raise ValueError("split groups must be non-empty arrays of obligation IDs")
+                    ids = tuple(group)
+                    if set(ids) - set(original.obligation_ids) or seen.intersection(ids):
+                        raise ValueError("split uses foreign or duplicate obligation IDs")
+                    seen.update(ids)
+                    parsed_groups.append(ids)
+                remainder = tuple(
+                    item for item in original.obligation_ids if item not in seen
+                )
+                if remainder:
+                    parsed_groups.append(remainder)
+                if len(assignments) + len(parsed_groups) - 1 > runtime_config.max_sessions:
+                    raise ValueError("split exceeds controller-owned session cap")
+                used_ids = {
+                    item.id for item in assignments if item.id != original.id
+                }
+                split_items = [
+                    _rebuild_assignment(
+                        original, group, obligation_by_id, runtime_config,
+                        assignment_id=(
+                            original.id if split_index == 0
+                            else _next_split_id(original.id, used_ids)
+                        ),
+                    )
+                    for split_index, group in enumerate(parsed_groups)
+                ]
+                position = assignments.index(original)
+                assignments[position:position + 1] = split_items
+            else:
+                raise ValueError(f"unsupported transformation kind: {kind!r}")
+            invariant_errors = _transformed_plan_errors(
+                tuple(assignments), base_plan, obligation_by_id, runtime_config,
+            )
+            if invariant_errors:
+                raise ValueError("; ".join(invariant_errors))
+        except (KeyError, StopIteration, TypeError, ValueError) as exc:
+            assignments = before
+            ignored.append(_bounded_transformation_error(index, str(exc)))
+    final_errors = _transformed_plan_errors(
+        tuple(assignments), base_plan, obligation_by_id, runtime_config,
+    )
+    if final_errors:
+        ignored.append(_bounded_transformation_error(
+            len(selected_transformations), "; ".join(final_errors),
+        ))
+        assignments = list(base_plan.assignments)
+    plan = AssignmentPlan(
+        assignments=_with_primary_ownership(
+            _with_scheduling_weights(tuple(assignments), runtime_config)
+        ),
+        unassigned_obligation_ids=base_plan.unassigned_obligation_ids,
+        unassigned_obligation_reasons=base_plan.unassigned_obligation_reasons,
+    )
+    return PlannerTransformationResult(plan=plan, ignored=tuple(ignored))
 
 
 def repair_prompt(errors: Iterable[str], previous_plan: Mapping[str, Any]) -> dict[str, Any]:

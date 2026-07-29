@@ -5,6 +5,7 @@ from pr_reviewer.specialist_runtime.types import BudgetLimits, CoverageObligatio
 
 from pr_reviewer.specialist_runtime.assignments import (
     AssignmentPlanError,
+    apply_planner_transformations,
     fallback_assignment_plan,
     planner_prompt,
     repair_prompt,
@@ -104,6 +105,233 @@ def complete_plan_for(obligations, id="queue-loss-boundary"):
                    expected_evidence=["artifact"], lenses=["release"],
                    seed_paths=["contracts/event.proto"], boundary_paths=[], priority="normal"),
     ]}
+
+
+def test_planner_transformations_apply_valid_items_independently(
+    obligations, topology, runtime_config,
+):
+    base = fallback_assignment_plan(obligations, topology, runtime_config)
+    ordinary = next(item for item in base.assignments if not item.recipe_ids)
+    result = apply_planner_transformations({
+        "transformations": [
+            {
+                "kind": "improve",
+                "assignment_id": ordinary.id,
+                "objective": "Trace worker delivery from producer to consumer.",
+                "lenses": ["delivery", "failure-recovery"],
+                "seed_paths": ["worker/a.py"],
+            },
+            {
+                "kind": "reorder",
+                "assignment_ids": [ordinary.id],
+            },
+        ],
+    }, base, obligations, runtime_config)
+
+    assert result.plan.assignments[0].id == ordinary.id
+    assert result.plan.assignments[0].objective == (
+        "Trace worker delivery from producer to consumer."
+    )
+    assert result.plan.assignments[0].lenses == ("delivery", "failure-recovery")
+    assert result.ignored == ()
+
+
+def test_planner_transformations_ignore_invalid_item_but_keep_valid_item(
+    obligations, topology, runtime_config,
+):
+    base = fallback_assignment_plan(obligations, topology, runtime_config)
+    ordinary = next(item for item in base.assignments if not item.recipe_ids)
+    result = apply_planner_transformations({
+        "transformations": [
+            {
+                "kind": "improve",
+                "assignment_id": ordinary.id,
+                "seed_paths": ["outside/immutable/scope.py"],
+            },
+            {
+                "kind": "improve",
+                "assignment_id": ordinary.id,
+                "objective": "Inspect the reachable worker behavior.",
+            },
+        ],
+    }, base, obligations, runtime_config)
+
+    transformed = next(item for item in result.plan.assignments if item.id == ordinary.id)
+    assert transformed.objective == "Inspect the reachable worker behavior."
+    assert transformed.seed_paths == ordinary.seed_paths
+    assert len(result.ignored) == 1
+    assert "outside immutable obligation scope" in result.ignored[0]
+
+
+def test_planner_transformation_diagnostics_are_bounded(
+    obligations, topology, runtime_config,
+):
+    base = fallback_assignment_plan(obligations, topology, runtime_config)
+    result = apply_planner_transformations({
+        "transformations": [
+            {"kind": "unsupported", "payload": "x" * 10_000}
+            for _ in range(200)
+        ],
+    }, base, obligations, runtime_config)
+
+    assert len(result.ignored) <= 65
+    assert all(len(item) <= 330 for item in result.ignored)
+
+
+def test_repeated_split_allocates_unique_controller_owned_assignment_ids():
+    obligations = tuple(
+        CoverageObligation(
+            obligation_id=f"topology:item-{index}:implementation",
+            origin="topology",
+            subject=f"item-{index}",
+            required_evidence_categories=("implementation",),
+            scope=(f"src/item_{index}.py",),
+            seed_hints=(f"src/item_{index}.py",),
+        )
+        for index in range(4)
+    )
+    topology = {
+        "changed_files": [path for item in obligations for path in item.scope],
+        "components": [{
+            "id": "all-items",
+            "changed_files": [path for item in obligations for path in item.scope],
+        }],
+        "relationships": [],
+    }
+    config = RuntimeConfig(
+        max_sessions=6,
+        session_limits=BudgetLimits(model_turns=8, tool_calls=8, recoveries=1),
+    )
+    base = fallback_assignment_plan(obligations, topology, config)
+    original = base.assignments[0]
+    result = apply_planner_transformations({
+        "transformations": [
+            {
+                "kind": "split",
+                "assignment_id": original.id,
+                "obligation_groups": [
+                    list(original.obligation_ids[:2]),
+                    [original.obligation_ids[2]],
+                ],
+            },
+            {
+                "kind": "split",
+                "assignment_id": original.id,
+                "obligation_groups": [
+                    [original.obligation_ids[0]],
+                    [original.obligation_ids[1]],
+                ],
+            },
+        ],
+    }, base, obligations, config)
+
+    assignment_ids = [item.id for item in result.plan.assignments]
+    owned = [
+        obligation_id
+        for item in result.plan.assignments
+        for obligation_id in item.obligation_ids
+    ]
+    assert result.ignored == ()
+    assert len(assignment_ids) == len(set(assignment_ids))
+    assert sorted(owned) == sorted(item.id for item in obligations)
+
+
+def test_planner_omissions_never_remove_base_ownership(
+    obligations, topology, runtime_config,
+):
+    base = fallback_assignment_plan(obligations, topology, runtime_config)
+    result = apply_planner_transformations(
+        {"transformations": []}, base, obligations, runtime_config,
+    )
+
+    assert result.plan == base
+    assert {
+        obligation_id
+        for item in result.plan.assignments
+        for obligation_id in item.obligation_ids
+    } == {
+        item.id for item in obligations
+        if item.mandatory and item.required_evidence_categories
+    }
+
+
+def test_planner_cannot_merge_or_split_isolated_recipe_assignments(
+    obligations, topology, runtime_config,
+):
+    base = fallback_assignment_plan(obligations, topology, runtime_config)
+    isolated = next(
+        item for item in base.assignments
+        if "security" in item.recipe_ids
+    )
+    ordinary = next(item for item in base.assignments if not item.recipe_ids)
+    result = apply_planner_transformations({
+        "transformations": [
+            {
+                "kind": "merge",
+                "target_assignment_id": ordinary.id,
+                "source_assignment_ids": [isolated.id],
+            },
+            {
+                "kind": "split",
+                "assignment_id": isolated.id,
+                "obligation_groups": [[isolated.obligation_ids[0]]],
+            },
+        ],
+    }, base, obligations, runtime_config)
+
+    assert result.plan == base
+    assert len(result.ignored) == 2
+    assert all("isolated recipe" in reason for reason in result.ignored)
+
+
+def test_planner_can_merge_and_split_ordinary_assignments_on_existing_boundaries(
+    obligations, topology, runtime_config,
+):
+    roomy = RuntimeConfig(
+        review_deadline_sec=runtime_config.review_deadline_sec,
+        model_request_timeout_sec=runtime_config.model_request_timeout_sec,
+        concurrency=runtime_config.concurrency,
+        max_sessions=5,
+        session_limits=runtime_config.session_limits,
+    )
+    base = fallback_assignment_plan(obligations, topology, roomy)
+    ordinary = [item for item in base.assignments if not any(
+        obligation.recipe_execution in {"dedicated", "independent"}
+        or obligation.requires_independent_verification
+        for obligation in obligations
+        if obligation.id in item.obligation_ids
+    )]
+    assert len(ordinary) >= 2
+    merged = apply_planner_transformations({
+        "transformations": [{
+            "kind": "merge",
+            "target_assignment_id": ordinary[0].id,
+            "source_assignment_ids": [ordinary[1].id],
+        }],
+    }, base, obligations, roomy)
+    merged_item = next(
+        item for item in merged.plan.assignments if item.id == ordinary[0].id
+    )
+    expected_ids = set(ordinary[0].obligation_ids + ordinary[1].obligation_ids)
+    assert set(merged_item.obligation_ids) == expected_ids
+
+    split = apply_planner_transformations({
+        "transformations": [{
+            "kind": "split",
+            "assignment_id": merged_item.id,
+            "obligation_groups": [[item] for item in sorted(expected_ids)],
+        }],
+    }, merged.plan, obligations, roomy)
+    assert split.ignored == ()
+    assert {
+        obligation_id
+        for item in split.plan.assignments
+        for obligation_id in item.obligation_ids
+    } == {
+        obligation_id
+        for item in base.assignments
+        for obligation_id in item.obligation_ids
+    }
 
 
 def test_planner_cannot_omit_recipe_obligation(obligations, topology, runtime_config):

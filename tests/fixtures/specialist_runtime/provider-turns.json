@@ -5,7 +5,6 @@
     "multilingual": {
       "request_order": [
         "planner-initial",
-        "planner-repair",
         "specialist-tools",
         "specialist-checkpoint",
         "specialist-final",
@@ -26,27 +25,7 @@
               "index": 0,
               "message": {
                 "role": "assistant",
-                "content": "{\"assignments\":[{\"id\":\"too-broad\",\"title\":\"Broad pass\",\"objective\":\"Review everything\",\"obligation_ids\":[],\"lenses\":[\"general\"],\"seed_paths\":[],\"boundary_paths\":[],\"expected_evidence\":[],\"estimated_turns\":1,\"priority\":\"normal\",\"overlap_justification\":\"\"}]}"
-              },
-              "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 2}
-          }
-        },
-        "planner-repair": {
-          "expect": {
-            "role": "planner",
-            "tools_enabled": false,
-            "response_schema_name": "specialist_planner"
-          },
-          "response": {
-            "id": "chatcmpl-planner-repair",
-            "object": "chat.completion",
-            "choices": [{
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "{\"assignments\":[{\"id\":\"cross-stack-contract-audit\",\"title\":\"Cross-stack contract audit\",\"objective\":\"Trace the changed API and event contract through every producer, consumer, migration, deployment artifact, and test.\",\"obligation_ids\":[\"obligation:recipe:cross-language-contract:interaction:edec5ab1904a\",\"obligation:recipe:deployment-rollout:deployment-artifact:7bb554316399\",\"obligation:risk-rule:schema-changes:risk-assessment:4aa7fd38013b\",\"obligation:topology:contracts-order-event-schema-json:consumer:53c8f5e2d566\",\"obligation:topology:contracts-order-event-schema-json:implementation:b57372513732\",\"obligation:topology:contracts-order-event-schema-json:producer:42ca4db59e94\",\"obligation:topology:db-migrations-v42-order-status-sql:implementation:e3d595e0465a\",\"obligation:topology:deploy-k8s-order-worker-yaml:implementation:7e0204a9458c\",\"obligation:topology:java-api-to-order-contract:interaction:7da5b698b788\",\"obligation:topology:order-contract-to-python-messaging:interaction:a35939cab811\",\"obligation:topology:order-contract-to-typescript-consumer:interaction:048d17c9fff3\",\"obligation:topology:order-deployment:deployment-artifact:4fd33e41198c\",\"obligation:topology:order-store-to-order-deployment:interaction:c4942a5fb641\",\"obligation:topology:order-store:migration:80066a2fbb3a\",\"obligation:topology:order-store:persistence:f6c6d8fba857\",\"obligation:topology:order-worker-deployment:deployment-artifact:4128fc6ad77b\",\"obligation:topology:python-messaging-to-order-store:interaction:3e26931b6dcb\",\"obligation:topology:python-messaging:consumer:ec89c6c37935\",\"obligation:topology:python-messaging:delivery:fb5b398a39da\",\"obligation:topology:python-messaging:producer:bca10ac5d93f\",\"obligation:topology:relevant-tests:tests:6c17d8d1bc72\",\"obligation:topology:src-main-java-example-api-ordercontroller-java:implementation:d577a16b2edb\",\"obligation:topology:tests-java-ordercontrollertest-java:implementation:38c9abf890dd\",\"obligation:topology:tests-python-test-order-worker-py:implementation:da089070551e\",\"obligation:topology:web-src-order-client-ts:implementation:90781ad84511\",\"obligation:topology:web-tests-order-client-spec-ts:implementation:2d10e0a0cbe6\",\"obligation:topology:workers-messaging-order-worker-py:implementation:e1e64f7eccf7\"],\"lenses\":[\"contract\",\"delivery\",\"migration\"],\"seed_paths\":[\"contracts/order-event.schema.json\",\"db/migrations/V42__order_status.sql\",\"deploy/k8s/order-worker.yaml\",\"src/main/java/example/api/OrderController.java\",\"tests/java/OrderControllerTest.java\",\"tests/python/test_order_worker.py\",\"web/src/order-client.ts\",\"web/tests/order-client.spec.ts\",\"workers/messaging/order_worker.py\"],\"boundary_paths\":[],\"expected_evidence\":[\"consumer\",\"delivery\",\"deployment-artifact\",\"implementation\",\"interaction\",\"migration\",\"persistence\",\"producer\",\"risk-assessment\",\"tests\"],\"estimated_turns\":3,\"priority\":\"critical\",\"overlap_justification\":\"\"}]}"
+                "content": "{\"transformations\":[{\"kind\":\"merge\",\"target_assignment_id\":\"fallback-combined-1\",\"source_assignment_ids\":[\"fallback-combined-2\"]},{\"kind\":\"improve\",\"assignment_id\":\"fallback-combined-1\",\"objective\":\"Trace the changed API and event contract through every producer, consumer, migration, deployment artifact, and test.\",\"lenses\":[\"contract\",\"delivery\",\"migration\"]}]}"
               },
               "finish_reason": "stop"
             }],
@@ -195,7 +174,7 @@
       "recovery_reason": "repetitive-transcript"
     },
     "planner_repair": {
-      "expected": {"repair_requests": 1, "source": "model_repaired_validated"}
+      "expected": {"repair_requests": 0, "source": "deterministic_base_transformed"}
     },
     "failed_critic": {
       "expected": {"terminal": true, "fallback": "conservative"}

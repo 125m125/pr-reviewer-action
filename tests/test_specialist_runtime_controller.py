@@ -365,16 +365,71 @@ def test_planner_failure_uses_deterministic_assignment_plan(tmp_path):
     result = _controller(tmp_path, planner=broken_planner).run(_inputs(tmp_path))
 
     assert result.artifact["assignments"][0]["id"].startswith("fallback-")
-    assert result.artifact["evaluation_status"] == "degraded"
-    assert any(
+    assert result.artifact["evaluation_status"] == "complete"
+    assert result.artifact["assignment_plan"]["ignored_transformations"]
+    assert not any(
         item["component"] == "planner" for item in result.artifact["degradation"]
     )
-    assert "planner" in result.handoff.coverage_warning
     assert "planner unavailable" not in result.handoff.markdown
     assert result.publishing_ready is True
 
 
-def test_invalid_planner_final_json_uses_reserved_fourth_repair_request(
+def test_optional_planner_absence_keeps_authoritative_base_without_degradation(tmp_path):
+    result = _controller(tmp_path, planner=None).run(_inputs(tmp_path))
+
+    assert result.artifact["assignment_plan"]["source"] == "deterministic_base"
+    assert not any(
+        item["component"] == "planner" for item in result.artifact["degradation"]
+    )
+    assert result.artifact["assignments"]
+
+
+def test_invalid_planner_items_are_diagnostic_and_valid_items_still_apply(tmp_path):
+    def planner(request):
+        base = request.context["base_plan"]
+        assignment = base.assignments[0]
+        return {"transformations": [
+            {
+                "kind": "improve",
+                "assignment_id": assignment.id,
+                "seed_paths": ["invented/outside.py"],
+            },
+            {
+                "kind": "improve",
+                "assignment_id": assignment.id,
+                "objective": "Trace the worker's reachable delivery behavior.",
+            },
+        ]}
+
+    result = _controller(tmp_path, planner=planner).run(_inputs(tmp_path))
+
+    assert result.artifact["assignment_plan"]["source"] == (
+        "deterministic_base_transformed"
+    )
+    assert result.artifact["assignment_plan"]["ignored_transformations"]
+    assert result.artifact["assignments"][0]["objective"] == (
+        "Trace the worker's reachable delivery behavior."
+    )
+    assert not any(
+        item["component"] == "planner" for item in result.artifact["degradation"]
+    )
+
+
+def test_planner_has_no_whole_plan_semantic_repair_loop(tmp_path):
+    calls = []
+
+    def planner(request):
+        calls.append(request.request_id)
+        return {"assignments": []}
+
+    result = _controller(tmp_path, planner=planner).run(_inputs(tmp_path))
+
+    assert calls == ["planner:1"]
+    assert result.artifact["assignment_plan"]["source"] == "deterministic_base"
+    assert result.artifact["assignments"]
+
+
+def test_invalid_planner_final_json_keeps_base_without_semantic_repair(
     monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
@@ -434,13 +489,14 @@ def test_invalid_planner_final_json_uses_reserved_fourth_repair_request(
 
     plan = controller._plan(state)
 
-    assert len(payloads) == 4
-    assert payloads[3]["reasoning_effort"] == "none"
-    assert state.plan_source == "deterministic_fallback"
+    assert len(payloads) == 3
+    assert payloads[2]["reasoning_effort"] == "none"
+    assert state.plan_source == "deterministic_base"
+    assert state.planner_diagnostics
     assert plan.assignments[0].id.startswith("fallback-")
 
 
-def test_planner_reserves_one_request_for_semantic_repair_after_two_continuations(
+def test_planner_uses_continuations_but_no_whole_plan_semantic_repair(
     monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
@@ -502,15 +558,14 @@ def test_planner_reserves_one_request_for_semantic_repair_after_two_continuation
 
     plan = controller._plan(state)
 
-    assert len(payloads) == 4
+    assert len(payloads) == 3
     assert payloads[2]["reasoning_effort"] == "none"
-    assert payloads[3]["reasoning_effort"] == "none"
-    assert state.plan_source == "model_repaired_validated"
-    assert state.planner_repaired is True
-    assert plan.assignments[0].id == "worker-flow"
+    assert state.plan_source == "deterministic_base"
+    assert state.planner_repaired is False
+    assert plan.assignments[0].id.startswith("fallback-")
 
 
-def test_invalid_repair_continuation_cannot_exceed_four_request_budget(
+def test_planner_continuation_stops_after_first_structured_response(
     monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
@@ -571,17 +626,13 @@ def test_invalid_repair_continuation_cannot_exceed_four_request_budget(
 
     plan = controller._plan(state)
 
-    assert len(payloads) == 4
-    assert payloads[2]["reasoning_effort"] == "none"
-    assert payloads[3]["reasoning_effort"] == "none"
-    assert payloads[2]["messages"][-1] == {
-        "role": "user", "content": "Return only the required JSON object.",
-    }
-    assert state.plan_source == "deterministic_fallback"
+    assert len(payloads) == 2
+    assert state.plan_source == "deterministic_base"
+    assert state.planner_diagnostics
     assert plan.assignments[0].id.startswith("fallback-")
 
 
-def test_planner_semantic_repair_uses_remaining_logical_request_budget(
+def test_planner_does_not_spend_a_second_request_on_semantic_repair(
     monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
@@ -628,10 +679,10 @@ def test_planner_semantic_repair_uses_remaining_logical_request_budget(
 
     plan = controller._plan(state)
 
-    assert len(payloads) == 2
-    assert state.plan_source == "model_repaired_validated"
-    assert state.planner_repaired is True
-    assert plan.assignments[0].id == "worker-flow"
+    assert len(payloads) == 1
+    assert state.plan_source == "deterministic_base"
+    assert state.planner_repaired is False
+    assert plan.assignments[0].id.startswith("fallback-")
 
 
 def test_specialist_failure_gets_one_bounded_followup_reassignment(tmp_path):
@@ -773,7 +824,7 @@ def test_degraded_session_is_promoted_once_across_initial_followup_and_finalizat
     )
     assert result.artifact["evaluation_status"] == "degraded"
     assert specialist_degradations == ({
-        "component": "specialist:worker-flow",
+        "component": "specialist:fallback-combined-1",
         "reason": "specialist completed with degraded retained state",
     },)
     assert result.handoff.status == "AI review completed with material coverage limits"
@@ -958,7 +1009,7 @@ def test_finalizer_failure_builds_useful_sparse_handoff_from_controller_state(tm
     assert result.handoff.markdown.startswith("## AI Review Handoff")
     assert "Runtime implementation behavior" in result.handoff.change_map
     assert "Component: worker" in result.handoff.change_map
-    assert result.handoff.specialist_focuses == ("Failure recovery",)
+    assert result.handoff.specialist_focuses == ()
     assert result.handoff.recipe_focuses == ("Repository recipe: delivery",)
     assert result.handoff.coverage_boundaries == (
         "Runtime implementation behavior",
@@ -1531,7 +1582,7 @@ def test_repeated_dangling_final_references_promote_top_level_specialist_degrada
     assert len(gateway.requests) == 4
     assert result.artifact["evaluation_status"] == "degraded"
     assert tuple(result.artifact["degradation"]) == ({
-        "component": "specialist:worker-flow",
+        "component": "specialist:fallback-combined-1",
         "reason": "specialist completed with degraded retained state",
     },)
     assert result.artifact["sessions"][0]["degraded"] is True
@@ -1740,7 +1791,7 @@ def test_planner_receives_typed_phase_lease_request(tmp_path):
         pr_metadata={"title": "Preserve retry intent", "body": "No duplicate work"},
     ))
 
-    assert result.artifact["assignment_plan"]["source"] == "model_validated"
+    assert result.artifact["assignment_plan"]["source"] == "deterministic_base"
     assert len(requests) == 1
     request = requests[0]
     assert isinstance(request, RoleRequest)
@@ -1784,7 +1835,7 @@ def test_hanging_planner_is_cut_off_and_late_result_is_ignored(tmp_path):
     time.sleep(0.02)
 
     assert elapsed < 1
-    assert result.artifact["assignment_plan"]["source"] == "deterministic_fallback"
+    assert result.artifact["assignment_plan"]["source"] == "deterministic_base"
     assert json.dumps(result.artifact, sort_keys=True) == before
 
 
@@ -2737,7 +2788,7 @@ def test_role_callback_receives_only_detached_bounded_role_request(tmp_path):
 
     result = _controller(tmp_path, planner=planner).run(inputs)
 
-    assert result.artifact["assignment_plan"]["source"] == "model_validated"
+    assert result.artifact["assignment_plan"]["source"] == "deterministic_base"
     assert len(observed) == 1
     assert len(observed[0]) == 1
     assert isinstance(observed[0][0], RoleRequest)

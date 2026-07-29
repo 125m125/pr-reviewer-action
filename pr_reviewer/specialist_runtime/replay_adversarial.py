@@ -259,8 +259,14 @@ def _completion_controller_run(
     raw: Mapping[str, Any],
     order: Sequence[str],
 ) -> dict[str, Any]:
-    coordinator = _CompletionOrder(order)
-    planner_gateway = _RecordedGateway((raw["planner_response"],))
+    assignment_aliases = {
+        "assignment-a": "fallback-combined-1",
+        "assignment-b": "fallback-combined-1-split-2",
+    }
+    authoritative_order = tuple(
+        assignment_aliases.get(item, item) for item in order
+    )
+    coordinator = _CompletionOrder(authoritative_order)
     session_gateways: dict[str, _RecordedGateway] = {}
 
     def session_factory(
@@ -274,8 +280,15 @@ def _completion_controller_run(
     ) -> SpecialistSession:
         del snapshot, obligations
         assignment_id = str(getattr(assignment, "id"))
+        recorded_id = next(
+            (
+                alias for alias, authoritative in assignment_aliases.items()
+                if authoritative == assignment_id
+            ),
+            assignment_id,
+        )
         gateway = _RecordedGateway(
-            raw["session_responses"][assignment_id],
+            raw["session_responses"][recorded_id],
             before=lambda index, request: coordinator.before(
                 assignment_id, index, request,
             ),
@@ -323,7 +336,28 @@ def _completion_controller_run(
     topology = _controller_topology()
     with tempfile.TemporaryDirectory(prefix="completion-inversion-") as temp_dir:
         controller = ReviewController(
-            planner=GatewayRoleAdapter(planner_gateway),
+            planner=lambda request: {
+                "transformations": [
+                    {
+                        "kind": "merge",
+                        "target_assignment_id": "fallback-combined-1",
+                        "source_assignment_ids": ["fallback-combined-2"],
+                    },
+                    {
+                        "kind": "split",
+                        "assignment_id": "fallback-combined-1",
+                        "obligation_groups": [
+                            [
+                                "obligation:topology:a-to-b:interaction:0a65f4aa488f",
+                                "obligation:topology:src-a-py:implementation:a24afd9558cf",
+                            ],
+                            [
+                                "obligation:topology:src-b-py:implementation:acdc539c18ab",
+                            ],
+                        ],
+                    },
+                ],
+            },
             session_factory=session_factory,
             artifact_output_root=Path(temp_dir),
         )
@@ -341,7 +375,6 @@ def _completion_controller_run(
             publishing_mode="comment",
             pr_metadata={"title": "Completion inversion"},
         ))
-    planner_gateway.assert_complete()
     gateway_consumption = {
         assignment_id: (gateway.index, len(gateway.turns))
         for assignment_id, gateway in session_gateways.items()
@@ -349,7 +382,7 @@ def _completion_controller_run(
     for gateway in session_gateways.values():
         gateway.assert_complete()
     return {
-        "target_order": list(order),
+        "target_order": list(authoritative_order),
         "actual_order": list(coordinator.actual),
         "coverage": {
             key: {
