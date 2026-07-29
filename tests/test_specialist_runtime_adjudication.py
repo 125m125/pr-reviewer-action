@@ -293,7 +293,12 @@ def test_handoff_compactly_names_distinct_degraded_stages_without_details():
         ReviewHandoffContext(
             status="degraded",
             material_coverage_limited=True,
-            degraded_stages=("planner", "negotiator", "planner"),
+            degraded_stages=(
+                "planner",
+                "negotiator",
+                "planner",
+                "specialist:private-assignment-id",
+            ),
         ),
         review=AdjudicatedReview(),
         evidence=EvidenceStore(),
@@ -303,9 +308,10 @@ def test_handoff_compactly_names_distinct_degraded_stages_without_details():
 
     assert handoff.coverage_warning == (
         "Material evidence or session coverage is incomplete. "
-        "Affected stages: negotiator, planner."
+        "Affected stages: negotiator, planner, specialist."
     )
     assert handoff.markdown.count("planner") == 1
+    assert "private-assignment-id" not in handoff.markdown
     assert "exception" not in handoff.markdown.lower()
 
 

@@ -1043,7 +1043,13 @@ def project_review_handoff(
     if context.material_coverage_limited:
         candidate_warning = "Material evidence or session coverage is incomplete."
         degraded_stages = _structured_ids(
-            context.degraded_stages,
+            tuple(
+                "specialist"
+                if isinstance(value, str)
+                and value.strip().casefold().startswith("specialist:")
+                else value
+                for value in context.degraded_stages
+            ),
             forbidden=forbidden,
             limit=6,
         )

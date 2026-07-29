@@ -769,11 +769,10 @@ def _write_json(path: Path, value: object) -> None:
 
 def _summary_cell(value: object, *, limit: int = 240) -> str:
     text = " ".join(str(value or "").split())[:limit]
-    return (
-        html.escape(text)
-        .replace("\\", "\\\\")
-        .replace("|", "\\|")
-        .replace("`", "\\`")
+    return re.sub(
+        r"([\\`*{}\[\]()#+\-.!_|>~])",
+        r"\\\1",
+        html.escape(text),
     )
 
 
@@ -858,9 +857,11 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
     )
     if not isinstance(assignment_plan, Mapping):
         assignment_plan = {}
-    plan_source = _summary_cell(
-        assignment_plan.get("source", "unknown"),
-        limit=80,
+    plan_source_value = str(assignment_plan.get("source", "unknown"))
+    plan_source = (
+        plan_source_value
+        if re.fullmatch(r"[a-z0-9_-]{1,80}", plan_source_value)
+        else "unknown"
     )
     planner_repaired = str(
         bool(assignment_plan.get("planner_repaired", False))

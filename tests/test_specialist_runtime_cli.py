@@ -94,10 +94,13 @@ class ScriptedController:
             "degradation": [
                 {
                     "component": "planner",
-                    "reason": "invalid | plan\n### injected heading",
+                    "reason": (
+                        "invalid | plan\n### injected heading "
+                        "![image](https://evil.example/x) **bold**"
+                    ),
                 },
                 {
-                    "component": "negotiator",
+                    "component": "negotiator[details](https://evil.example)",
                     "reason": "fallback after <timeout>",
                 },
             ],
@@ -174,9 +177,14 @@ def test_cli_writes_structured_handoff_notes_artifact_and_compatibility_output(
     assert controller.inputs.changed_files == ("src/app.py",)
     summary = (tmp_path / "specialist-review-summary.md").read_text()
     assert "- Assignment plan: `deterministic_fallback` (repaired: `false`)" in summary
-    assert "| planner | invalid \\| plan ### injected heading |" in summary
-    assert "| negotiator | fallback after &lt;timeout&gt; |" in summary
+    assert "| planner | invalid \\| plan \\#\\#\\# injected heading " in summary
     assert "\n### injected heading" not in summary
+    assert "![image](" not in summary
+    assert "**bold**" not in summary
+    assert "[details](" not in summary
+    assert "\\!\\[image\\]\\(https://evil\\.example/x\\)" in summary
+    assert "negotiator\\[details\\]\\(https://evil\\.example\\)" in summary
+    assert "fallback after &lt;timeout&gt;" in summary
 
 
 def test_cli_rejects_incomplete_or_wrong_current_head_snapshot(monkeypatch, tmp_path):
