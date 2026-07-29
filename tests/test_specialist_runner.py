@@ -35,6 +35,12 @@ def test_context_collects_complete_head_bound_snapshot_only_for_specialists():
     assert "pr-files-head.txt" in context
 
 
+def test_context_materializes_immutable_base_and_head_shas_for_specialists():
+    context = (ROOT / "scripts" / "sections" / "context.sh").read_text(encoding="utf-8")
+    assert "baseRefOid: .base.sha" in context
+    assert "headRefOid: .head.sha" in context
+
+
 def test_run_review_owns_specialist_artifact_workspace():
     script = (ROOT / "scripts" / "run_review.sh").read_text(encoding="utf-8")
     assert 'SPECIALIST_ARTIFACT_ROOT="$(pwd -P)"' in script

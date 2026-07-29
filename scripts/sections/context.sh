@@ -15,7 +15,7 @@ if [[ -s pr-object.json && "$(jq -r '.number // empty' pr-object.json 2>/dev/nul
 else
   platform_pr_get "$REPO" "$PR_NUMBER" > pr-object.json
 fi
-jq '{number, title, body, headRefOid: .head.sha, baseRefName: .base.ref, headRefName: .head.ref, author: {login: (.user.login // "")}, changedFiles: .changed_files, additions, deletions, url: .html_url}' \
+jq '{number, title, body, headRefOid: .head.sha, baseRefOid: .base.sha, baseRefName: .base.ref, headRefName: .head.ref, author: {login: (.user.login // "")}, changedFiles: .changed_files, additions, deletions, url: .html_url}' \
   pr-object.json > pr.json
 
 IS_FORK_PR="$(jq -r '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' pr-object.json 2>/dev/null || echo false)"
