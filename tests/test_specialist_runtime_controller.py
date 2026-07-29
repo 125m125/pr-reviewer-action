@@ -393,6 +393,7 @@ def test_invalid_second_planner_continuation_cannot_start_a_fourth_request(
 ):
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
     monkeypatch.setenv("AI_MODEL", "local-model")
+    monkeypatch.setenv("AI_REASONING_EFFORT", "high")
     controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
     now = time.monotonic()
     controller.clock = lambda: now
@@ -442,6 +443,10 @@ def test_invalid_second_planner_continuation_cannot_start_a_fourth_request(
     plan = controller._plan(state)
 
     assert len(payloads) == 3
+    assert payloads[2]["reasoning_effort"] == "none"
+    assert payloads[2]["messages"][-1] == {
+        "role": "user", "content": "Return only the required JSON object.",
+    }
     assert state.plan_source == "deterministic_fallback"
     assert plan.assignments[0].id.startswith("fallback-")
 

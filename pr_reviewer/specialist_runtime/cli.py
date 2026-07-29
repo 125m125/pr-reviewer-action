@@ -392,9 +392,14 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
             ensure_ascii=False,
         ))
         for attempt in range(3):
-            finalization = attempt == 2
-            if bounded_request.planner_request_budget is not None:
-                bounded_request.planner_request_budget.consume()
+            budget = bounded_request.planner_request_budget
+            finalization = (
+                budget.remaining == 1
+                if budget is not None
+                else attempt == 2
+            )
+            if budget is not None:
+                budget.consume()
             result = self.gateway.complete(ModelTurnRequest(
                 role=bounded_request.role,
                 conversation=conversation,
