@@ -123,7 +123,7 @@ jobs:
           specialist_max_recoveries_per_session: "1"
 
           specialist_planner_max_tokens: "8192"
-          specialist_planner_max_context_bytes: "120000"
+          specialist_planner_max_context_bytes: "400000"
 
           specialist_pass_timeout_sec: "1200"
           specialist_max_tokens: "8192"

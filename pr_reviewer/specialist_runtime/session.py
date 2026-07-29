@@ -110,6 +110,13 @@ _RECOVERY_REASONS = frozenset({
 })
 _MAX_FINALIZATION_DIAGNOSTIC_IDS = 20
 _MAX_FINALIZATION_DIAGNOSTIC_ID_CHARS = 256
+_CHECKPOINT_RETENTION_INSTRUCTION = (
+    " Preserve every material issue by including its full object in "
+    "candidate_findings and its matching candidate_id in candidate_finding_ids; "
+    "an issue omitted from either field will not survive the checkpoint. Use only "
+    "exact retained evidence IDs (evidence:<hash>) from successful tool results in "
+    "evidence_ids and supporting_evidence_ids; repository paths are not evidence IDs."
+)
 
 
 def _strings(value: object) -> tuple[str, ...]:
@@ -739,7 +746,9 @@ class SpecialistSession:
     def request_checkpoint(self, reason: str = "controller-request") -> SessionResult:
         """Request a structured checkpoint; never force a final report."""
         self.conversation.add_user(
-            "Checkpoint requested (not a final report). Reason: " + str(reason)
+            "Checkpoint requested (not a final report). Reason: "
+            + str(reason)
+            + _CHECKPOINT_RETENTION_INSTRUCTION
         )
         try:
             turn = self._request(tools_enabled=False, schema=_CHECKPOINT_SCHEMA)
@@ -753,6 +762,7 @@ class SpecialistSession:
         if checkpoint is None:
             self.conversation.add_user(
                 "Repair the previous checkpoint as one JSON object matching the schema."
+                + _CHECKPOINT_RETENTION_INSTRUCTION
             )
             try:
                 repair = self._request(tools_enabled=False, schema=_CHECKPOINT_SCHEMA)

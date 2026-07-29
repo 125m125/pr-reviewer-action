@@ -72,3 +72,11 @@ def test_dogfood_workflow_always_uploads_only_structured_specialist_diagnostics(
         for path in uploaded_paths
         for forbidden in ("review-corpus", "ai-response", "tool-harness")
     )
+
+
+def test_dogfood_workflow_temporarily_allows_large_planner_preflight():
+    workflow = _WORKFLOW.read_text(encoding="utf-8").splitlines()
+
+    assert _scalar(
+        workflow, "specialist_planner_max_context_bytes", 10,
+    ) == '"400000"'

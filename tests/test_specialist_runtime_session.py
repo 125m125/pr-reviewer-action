@@ -237,6 +237,25 @@ def test_invalid_exploration_stop_forces_checkpoint_before_later_finalization():
     assert gateway.requests[2].messages_contain("Finalize this specialist assessment once")
 
 
+def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract():
+    gateway = ScriptedGateway([
+        invalid_response("plain-text material issue"),
+        invalid_response('{"evidence_ids":["a.py"]}'),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    session = make_session(gateway)
+
+    session.explore()
+
+    checkpoint_request = gateway.requests[1].messages
+    repair_request = gateway.requests[2].messages
+    for prompt in (checkpoint_request, repair_request):
+        assert "candidate_findings" in prompt
+        assert "candidate_finding_ids" in prompt
+        assert "exact retained evidence IDs" in prompt
+        assert "repository paths are not evidence IDs" in prompt
+
+
 def test_hanging_specialist_gateways_share_global_orphan_cap():
     release = threading.Event()
     entered = []
