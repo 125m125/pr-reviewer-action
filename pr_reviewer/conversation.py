@@ -209,7 +209,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "Execute a named read-only command definition from a fixed "
             "allowlist. Raw shell text is never accepted; only the catalog "
             "names git_status_short, git_diff_stat, git_diff_name_only are "
-            "permitted."
+            "permitted. During specialist reviews the diff commands compare "
+            "the controller-owned immutable pull-request base and head commits, "
+            "not the clean worktree or model-provided revisions."
         ),
         "parameters": {
             "type": "object",

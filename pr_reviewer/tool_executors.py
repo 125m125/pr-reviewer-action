@@ -49,6 +49,7 @@ ALLOWED_COMMANDS = {
     "git_diff_stat": ["git", "diff", "--stat", "HEAD"],
     "git_diff_name_only": ["git", "diff", "--name-only", "HEAD"],
 }
+_GIT_OBJECT_ID_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 
 def command_catalog_markdown():
     return ", ".join(sorted(ALLOWED_COMMANDS))
@@ -301,7 +302,14 @@ def web_search(
     except Exception as exc:
         return {"error": str(exc)}
 
-def run_command(command, workspace_root, request_timeout=30):
+def run_command(
+    command,
+    workspace_root,
+    request_timeout=30,
+    *,
+    base_sha=None,
+    head_sha=None,
+):
     """Execute a named read-only command definition.
 
     The planner may choose only command names from ALLOWED_COMMANDS. Raw shell
@@ -317,6 +325,21 @@ def run_command(command, workspace_root, request_timeout=30):
                 + command_catalog_markdown()
             )
         }
+    args = list(args)
+    if command_name in {"git_diff_stat", "git_diff_name_only"} and (
+        base_sha is not None or head_sha is not None
+    ):
+        if (
+            not isinstance(base_sha, str)
+            or not isinstance(head_sha, str)
+            or not _GIT_OBJECT_ID_RE.fullmatch(base_sha)
+            or not _GIT_OBJECT_ID_RE.fullmatch(head_sha)
+        ):
+            return {"error": "Immutable diff range requires valid base and head object IDs"}
+        option = "--stat" if command_name == "git_diff_stat" else "--name-only"
+        args = [
+            "git", "diff", option, "--find-renames", base_sha, head_sha, "--",
+        ]
 
     try:
         result = subprocess.run(
@@ -366,6 +389,8 @@ def execute_tool_request(
     model_identity="",
     search_scan_limit=25,
     deadline_at=None,
+    base_sha=None,
+    head_sha=None,
 ):
     """Execute a single tool request and return the result dict.
 
@@ -505,7 +530,13 @@ def execute_tool_request(
             command = args.get("command", "")
             if not command:
                 raise ValueError("Missing 'command' argument")
-            res = run_command(command, workspace_root, request_timeout)
+            res = run_command(
+                command,
+                workspace_root,
+                request_timeout,
+                base_sha=base_sha,
+                head_sha=head_sha,
+            )
             if res.get("error"):
                 raise ValueError(res["error"])
             stdout_text = res.get("stdout", "")

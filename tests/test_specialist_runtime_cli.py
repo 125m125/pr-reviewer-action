@@ -124,7 +124,7 @@ def test_cli_writes_structured_handoff_notes_artifact_and_compatibility_output(
     monkeypatch.setenv("PUBLISH_MODE", "review_comment")
     monkeypatch.setattr(cli, "_git_changed_files", lambda *_: ("src/app.py",))
     controller = ScriptedController(tmp_path)
-    monkeypatch.setattr(cli, "build_controller", lambda config: controller)
+    monkeypatch.setattr(cli, "build_controller", lambda config, **_kwargs: controller)
 
     assert cli.main() == 0
 
@@ -257,6 +257,100 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
         "session:test:g0",
     )
     assert session.recovery_max_tokens == 456
+
+
+def test_specialist_diff_command_uses_controller_owned_review_range(
+    monkeypatch, tmp_path,
+):
+    subprocess.run(
+        ["git", "init", "-q"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "review@example.test"],
+        cwd=tmp_path, check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"],
+        cwd=tmp_path, check=True, capture_output=True, text=True,
+    )
+    reviewed = tmp_path / "reviewed.txt"
+    reviewed.write_text("base\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "reviewed.txt"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "base"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    )
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    reviewed.write_text("head\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "commit", "-qam", "head"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    )
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    monkeypatch.setenv("AI_BASE_URL", "http://model.invalid/v1")
+    monkeypatch.setenv("AI_MODEL", "model")
+    monkeypatch.setenv("IS_FORK_PR", "false")
+    controller = cli.build_controller(
+        cli.CliConfig.from_env(workspace=tmp_path),
+        immutable_diff_range=(base_sha, head_sha),
+    )
+
+    from pr_reviewer.specialist_runtime.assignments import Assignment
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger
+    from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+
+    session = controller._cli_session_factory(
+        Assignment(
+            id="a", title="A", objective="Review", obligation_ids=(),
+            recipe_ids=(), lenses=(), seed_paths=(), boundary_paths=(),
+            expected_evidence=(), estimated_turns=1, priority="normal",
+        ),
+        SessionLease(RunPhase.INITIAL, 10**20),
+        None,
+        EvidenceStore(),
+        CoverageLedger(()),
+        (),
+        "session:test:g0",
+    )
+    result = session.execute_tool(
+        "run_command",
+        {
+            "command": "git_diff_name_only",
+            "base_sha": "3" * 40,
+            "head_sha": "4" * 40,
+        },
+    )
+
+    assert result["status"] == "ok"
+    assert result["result"]["stdout"] == "reviewed.txt"
+    assert subprocess.run(
+        ["git", "status", "--porcelain"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    ).stdout == ""
+
+
+def test_controller_rejects_symbolic_or_malformed_diff_revisions(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://model.invalid/v1")
+    monkeypatch.setenv("AI_MODEL", "model")
+
+    with pytest.raises(ValueError, match="immutable diff range"):
+        cli.build_controller(
+            cli.CliConfig.from_env(workspace=tmp_path),
+            immutable_diff_range=("HEAD", "2" * 40),
+        )
 
 
 def test_planner_context_byte_limit_stops_oversized_request_before_transport(

@@ -12,6 +12,7 @@ from enum import Enum
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import subprocess
 import sys
 from typing import Any, Mapping
@@ -589,7 +590,23 @@ def _role_prompt(base: str, role: str) -> str:
     return base.rstrip() + "\n\n" + _ROLE_SYSTEM[role]
 
 
-def build_controller(config: CliConfig) -> ReviewController:
+def build_controller(
+    config: CliConfig,
+    *,
+    immutable_diff_range: tuple[str, str] | None = None,
+) -> ReviewController:
+    if immutable_diff_range is not None and (
+        not isinstance(immutable_diff_range, tuple)
+        or len(immutable_diff_range) != 2
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-fA-F]{40,64}", value) is None
+            for value in immutable_diff_range
+        )
+    ):
+        raise ValueError(
+            "immutable diff range must contain full base and head object IDs"
+        )
     gateway = _ConfiguredGateway(
         base_url=config.base_url,
         api_key=config.api_key,
@@ -689,6 +706,8 @@ def build_controller(config: CliConfig) -> ReviewController:
                 secure_fetcher=bounded_fetcher, evidence_store=evidence,
                 session_id=session_id, model_identity=config.role_models["specialist"],
                 deadline_at=deadline_at,
+                base_sha=immutable_diff_range[0] if immutable_diff_range else None,
+                head_sha=immutable_diff_range[1] if immutable_diff_range else None,
             )
 
         return SpecialistSession(
@@ -847,7 +866,13 @@ def main() -> int:
     workspace = load_workspace(config)
     if workspace.policy_warning:
         print("WARN: " + workspace.policy_warning, file=sys.stderr)
-    controller = build_controller(config)
+    controller = build_controller(
+        config,
+        immutable_diff_range=(
+            workspace.inputs.base_sha,
+            workspace.inputs.head_sha,
+        ),
+    )
     session_factory = getattr(controller, "_cli_session_factory", None)
     if session_factory is not None:
         session_factory.source_policy = SourcePolicy.from_review_policy(workspace.inputs.policy)
