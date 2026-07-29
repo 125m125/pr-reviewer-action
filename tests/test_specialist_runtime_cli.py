@@ -10,6 +10,7 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 
 from pr_reviewer.specialist_runtime import cli
+from pr_reviewer.specialist_runtime.adjudication import ReviewOrientationTopic
 from pr_reviewer.specialist_runtime.budget import SessionLease
 from pr_reviewer.specialist_runtime.callbacks import freeze_callback_value
 from pr_reviewer.specialist_runtime.controller import ReviewResult, RoleRequest
@@ -688,6 +689,20 @@ def test_json_schema_mode_uses_json_object_for_each_controller_role(monkeypatch,
     assert len(captured) == len(roles)
     for payload in captured:
         assert payload["response_format"] == {"type": "json_object"}
+
+
+def test_finalizer_prompt_enumerates_controller_orientation_vocabulary(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    prompt = controller.finalizer.system_prompt
+
+    for topic in ReviewOrientationTopic:
+        assert f"`{topic.value}`" in prompt
+    assert "component_ids and recipe_ids" in prompt
 
 
 def _shell_prompt_environment(
