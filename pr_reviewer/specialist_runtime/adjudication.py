@@ -501,6 +501,51 @@ def _decision_rows(critic_result: object) -> tuple[Mapping[str, Any], ...]:
     return tuple(item for item in critic_result if isinstance(item, Mapping))
 
 
+def _contradicts_stable_github_line_semantics(candidate: CandidateFinding) -> bool:
+    """Recognize the narrow claim that GitHub review lines may be zero-based."""
+    fields = (
+        _unicode(candidate.claim).casefold(),
+        _unicode(candidate.causal_chain).casefold(),
+        _unicode(candidate.manual_validation).casefold(),
+    )
+    for text in fields:
+        if "github" not in text:
+            continue
+        coordinate_assertion = (
+            re.search(
+                r"\b(?:zero[- ](?:based|indexed))\s+"
+                r"(?:(?:github|diff|review|comment)\s+){0,3}"
+                r"(?:lines?|locations?|coordinates?)\b",
+                text,
+            )
+            is not None
+            or re.search(
+                r"\b(?:lines?|locations?|coordinates?)\b.{0,40}"
+                r"\b(?:may|might|could)\b.{0,30}"
+                r"\b(?:be|use)\b.{0,15}\bzero[- ](?:based|indexed)\b",
+                text,
+            )
+            is not None
+            or re.search(
+                r"\b(?:accepts?|allows?|supports?|uses?)\b.{0,30}"
+                r"\bline\s+(?:0|zero)\b",
+                text,
+            )
+            is not None
+            or re.search(
+                r"\bline\s+(?:0|zero)\b.{0,30}"
+                r"\b(?:valid|accepted|allowed|supported)\b",
+                text,
+            )
+            is not None
+        )
+        if coordinate_assertion and any(
+            term in text for term in ("diff", "review", "comment", "api")
+        ):
+            return True
+    return False
+
+
 def _merge_findings(group: Iterable[AcceptedFinding], representative_id: str) -> AcceptedFinding:
     values = tuple(sorted(group, key=lambda item: item.candidate_id))
     representative = next(item for item in values if item.candidate_id == representative_id)
@@ -621,6 +666,15 @@ def adjudicate_candidates(
             )
             continue
         if action == "request_verification":
+            if _contradicts_stable_github_line_semantics(candidate):
+                disposition = CandidateDisposition(
+                    candidate_id,
+                    "reject",
+                    "deterministic-platform-contradiction",
+                )
+                rejected[candidate_id] = disposition
+                dispositions[candidate_id] = disposition
+                continue
             verification[candidate_id] = CandidateVerificationRequest(
                 candidate, "critic-requested-verification"
             )

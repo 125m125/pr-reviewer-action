@@ -174,6 +174,51 @@ def test_critic_action_vocabulary_is_closed():
     assert review.rejected[0].reason == "invalid-critic-action"
 
 
+def test_critic_cannot_request_verification_that_github_review_lines_may_be_zero_based():
+    candidate = _candidate(
+        claim=(
+            "The `_exact_changed_location` function rejects line 0. If a system "
+            "uses zero-based locations, this will be treated as invalid."
+        ),
+        causal_chain=(
+            "The concern assumes GitHub review comments may accept zero-based "
+            "diff locations."
+        ),
+        consequence="A valid GitHub inline review comment could be discarded.",
+        manual_validation="Check whether the GitHub review API accepts line 0.",
+    )
+
+    review = _adjudicate(
+        (candidate,),
+        {candidate.candidate_id: "request_verification"},
+        EvidenceStore(),
+    )
+
+    assert review.verification_requests == ()
+    assert review.rejected[0].reason == "deterministic-platform-contradiction"
+
+
+def test_critic_preserves_genuine_github_diff_side_location_ambiguity():
+    candidate = _candidate(
+        claim="The requested line exists on both sides of the GitHub diff",
+        causal_chain=(
+            "The candidate names a changed line but retained evidence does not identify "
+            "whether the old or new side is intended."
+        ),
+        consequence="The review comment could attach to the wrong side of the diff.",
+        manual_validation="Inspect the patch and select LEFT or RIGHT for the location.",
+    )
+
+    review = _adjudicate(
+        (candidate,),
+        {candidate.candidate_id: "request_verification"},
+        EvidenceStore(),
+    )
+
+    assert review.rejected == ()
+    assert review.verification_requests[0].reason == "critic-requested-verification"
+
+
 def test_high_risk_unresolved_controller_obligation_blocks_by_policy():
     obligation = _obligation(
         "obligation-high-risk",

@@ -123,6 +123,40 @@ def _adjudicate(
     )
 
 
+@pytest.mark.parametrize(
+    ("claim", "causal_chain"),
+    (
+        (
+            "GitHub comment preview may use a zero-based array index",
+            "The renderer uses index 0 to select a diff line from a local array.",
+        ),
+        (
+            (
+                "`_exact_changed_location` rejects line 0. If an input parser uses a "
+                "zero-based list index, its first entry is skipped."
+            ),
+            "The concern is limited to local parser indexing.",
+        ),
+    ),
+)
+def test_zero_based_non_coordinate_concerns_remain_verification_requests(
+    claim: str,
+    causal_chain: str,
+):
+    candidate = _candidate(claim=claim, causal_chain=causal_chain)
+
+    review = adjudicate_candidates(
+        (candidate,),
+        {candidate.candidate_id: "request_verification"},
+        EvidenceStore(),
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert review.rejected == ()
+    assert review.verification_requests[0].reason == "critic-requested-verification"
+
+
 def test_factual_adjudication_requires_controller_authority_inputs():
     store, evidence_id = _store()
     candidate = _candidate(evidence_ids=(evidence_id,))
