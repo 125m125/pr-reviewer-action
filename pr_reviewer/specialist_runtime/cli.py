@@ -57,7 +57,9 @@ _ROLE_SYSTEM = {
         "Plan a bounded specialist assignment set covering every supplied mandatory "
         "obligation. Return only {\"assignments\":[...]}. Every assignment must contain "
         "id, title, objective, obligation_ids, lenses, seed_paths, boundary_paths, "
-        "expected_evidence, estimated_turns, priority, and overlap_justification."
+        "expected_evidence, estimated_turns, priority, and overlap_justification. "
+        "When an obligation has scope_ref or seed_hints_ref, resolve it through the "
+        "top-level path_sets map before selecting assignment paths."
     ),
     "negotiator": (
         "Propose only bounded resume, consultation, follow-up, or unknown actions for the "
@@ -332,15 +334,22 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
         self, gateway, system_prompt: str, max_tokens: int,
         response_format_override: str | None = None,
         max_context_bytes: int | None = None,
+        context_projector=None,
     ):
         super().__init__(gateway, system_prompt, response_format_override)
         self.max_tokens = max_tokens
         self.max_context_bytes = max_context_bytes
+        self.context_projector = context_projector
 
     def complete(self, request):
+        context = (
+            self.context_projector(request.context)
+            if self.context_projector is not None
+            else request.context
+        )
         if self.max_context_bytes is not None:
             context_bytes = len(json.dumps(
-                _json_value(request.context),
+                _json_value(context),
                 sort_keys=True,
                 separators=(",", ":"),
                 ensure_ascii=False,
@@ -350,7 +359,11 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
                     f"{request.role} context exceeds configured byte limit "
                     f"({context_bytes}>{self.max_context_bytes})"
                 )
-        return super().complete(replace(request, max_tokens=min(request.max_tokens, self.max_tokens)))
+        return super().complete(replace(
+            request,
+            context=context,
+            max_tokens=min(request.max_tokens, self.max_tokens),
+        ))
 
 
 def _load_json(path: Path, *, expected: type) -> Any:
@@ -630,7 +643,9 @@ def build_controller(
     role_response_format = "json_object" if config.response_format == "json_schema" else None
     planner = _BoundedRoleAdapter(
         gateway, _role_prompt(config.system_prompt, "planner"), config.planner_max_tokens,
-        role_response_format, max_context_bytes=config.planner_max_context_bytes,
+        role_response_format,
+        max_context_bytes=config.planner_max_context_bytes,
+        context_projector=_compact_planner_context,
     )
     negotiator = _BoundedRoleAdapter(
         gateway, _role_prompt(config.system_prompt, "negotiator"), config.max_tokens,
@@ -770,6 +785,61 @@ def _json_value(value: object) -> object:
             for item in fields(value)
         }
     return value
+
+
+def _compact_planner_context(value: object) -> object:
+    """Deduplicate repeated obligation path arrays on the model wire only."""
+    projected = _json_value(value)
+    if not isinstance(projected, dict):
+        return projected
+    obligations = projected.get("obligations")
+    if isinstance(obligations, list):
+        obligation_values = obligations
+    elif isinstance(obligations, dict):
+        obligation_values = list(obligations.values())
+    else:
+        return projected
+
+    occurrences: dict[tuple[str, ...], int] = {}
+    for obligation in obligation_values:
+        if not isinstance(obligation, dict):
+            continue
+        for field_name in ("scope", "seed_hints"):
+            paths = obligation.get(field_name)
+            if (
+                isinstance(paths, list)
+                and len(paths) > 1
+                and all(isinstance(path, str) for path in paths)
+            ):
+                key = tuple(paths)
+                occurrences[key] = occurrences.get(key, 0) + 1
+
+    shared = sorted(
+        (paths for paths, count in occurrences.items() if count > 1),
+    )
+    if not shared:
+        return projected
+    references = {
+        paths: f"path-set-{index}"
+        for index, paths in enumerate(shared, start=1)
+    }
+    projected["path_sets"] = {
+        references[paths]: list(paths)
+        for paths in shared
+    }
+    for obligation in obligation_values:
+        if not isinstance(obligation, dict):
+            continue
+        for field_name in ("scope", "seed_hints"):
+            paths = obligation.get(field_name)
+            if not isinstance(paths, list):
+                continue
+            reference = references.get(tuple(paths))
+            if reference is None:
+                continue
+            obligation.pop(field_name)
+            obligation[f"{field_name}_ref"] = reference
+    return projected
 
 
 def _write_json(path: Path, value: object) -> None:

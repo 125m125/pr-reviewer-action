@@ -488,6 +488,82 @@ def test_planner_context_byte_limit_stops_oversized_request_before_transport(
     assert captured == []
 
 
+def test_planner_compacts_repeated_path_sets_before_context_preflight(
+    monkeypatch, tmp_path,
+):
+    changed_files = [
+        f"services/component-{index:03d}/src/implementation.py"
+        for index in range(108)
+    ]
+    obligations = [
+        {
+            "obligation_id": f"obligation:global:{index}",
+            "origin": "topology",
+            "subject": f"global-{index}",
+            "required_evidence_categories": ["implementation"],
+            "risk_tier": "high",
+            "scope": list(changed_files),
+            "seed_hints": list(changed_files),
+        }
+        for index in range(36)
+    ]
+    context = {
+        "obligations": obligations,
+        "topology": {
+            "changed_files": list(changed_files),
+            "components": [{
+                "id": "repository",
+                "changed_files": list(changed_files),
+            }],
+        },
+        "config": {"max_sessions": 8},
+        "policy": {"version": 2},
+        "pr_metadata": {"title": "Large cross-cutting change"},
+    }
+    raw_bytes = len(json.dumps(
+        context, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8"))
+    assert raw_bytes > 120_000
+
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    monkeypatch.setenv("SPECIALIST_PLANNER_MAX_CONTEXT_BYTES", "120000")
+    controller = cli.build_controller(
+        cli.CliConfig.from_env(workspace=tmp_path),
+    )
+    captured = []
+    controller.planner.gateway.transport = _successful_transport(captured)
+
+    controller.planner.complete(RoleRequest(
+        role="planner",
+        request_id="planner:large-repeated-scopes",
+        phase=RunPhase.PLANNING,
+        lease=SessionLease(RunPhase.PLANNING, 10**20),
+        timeout_sec=30,
+        max_tokens=512,
+        context=context,
+    ))
+
+    assert captured
+    compact = json.loads(captured[0]["messages"][-1]["content"])
+    compact_bytes = len(json.dumps(
+        compact, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8"))
+    assert compact_bytes < 120_000
+    assert len(compact["path_sets"]) == 1
+    path_set_id, retained_paths = next(iter(compact["path_sets"].items()))
+    assert retained_paths == changed_files
+    for original, projected in zip(obligations, compact["obligations"]):
+        assert "scope" not in projected
+        assert "seed_hints" not in projected
+        assert projected["scope_ref"] == path_set_id
+        assert projected["seed_hints_ref"] == path_set_id
+        assert compact["path_sets"][projected["scope_ref"]] == original["scope"]
+        assert compact["path_sets"][projected["seed_hints_ref"]] == original["seed_hints"]
+    assert obligations[0]["scope"] == changed_files
+    assert obligations[0]["seed_hints"] == changed_files
+
+
 def test_planner_serializes_frozen_policy_context_without_mappingproxy_copy(
     monkeypatch, tmp_path,
 ):
