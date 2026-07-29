@@ -36,9 +36,11 @@ jobs:
         id: info
         run: |
           actions_dir="$(dirname "$RUNNER_TEMP")/_actions"
-          echo "uid=$(id -u)" >> "$GITHUB_OUTPUT"
-          echo "gid=$(id -g)" >> "$GITHUB_OUTPUT"
-          echo "actions_dir=$actions_dir" >> "$GITHUB_OUTPUT"
+          {
+            echo "uid=$(id -u)"
+            echo "gid=$(id -g)"
+            echo "actions_dir=$actions_dir"
+          } >> "$GITHUB_OUTPUT"
 
   review:
     name: Review with LM Studio
