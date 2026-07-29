@@ -4,7 +4,7 @@
 
 **Goal:** Preserve truncated planner reasoning and force a bounded JSON answer instead of immediately degrading to deterministic fallback.
 
-**Architecture:** Add a planner-specific bounded role adapter that owns one temporary conversation across at most three physical requests. Keep controller validation and fallback unchanged.
+**Architecture:** Add a planner-specific bounded role adapter that owns one temporary conversation across at most three completion-producing model calls. Keep controller validation and fallback unchanged.
 
 **Tech Stack:** Python 3, pytest, OpenAI-compatible chat-completions payloads.
 
@@ -13,7 +13,7 @@
 - At most one reasoning continuation and one reasoning-disabled final request.
 - Reuse the same absolute planning deadline.
 - Do not weaken planner validation, evidence rules, or context limits.
-- The configured planner token limit governs planner physical requests.
+- The configured planner token limit governs planner model calls.
 
 ---
 

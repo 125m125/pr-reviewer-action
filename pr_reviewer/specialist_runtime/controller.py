@@ -148,7 +148,7 @@ class PlannerRequestBudget:
 
     def consume(self) -> None:
         if self.remaining <= 0:
-            raise ValueError("planner physical request budget exhausted")
+            raise ValueError("planner model-call budget exhausted")
         self.remaining -= 1
 
 

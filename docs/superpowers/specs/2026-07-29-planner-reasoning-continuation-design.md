@@ -8,8 +8,9 @@ in `reasoning_content` before emitting the required JSON plan.
 
 ## Design
 
-The planner role keeps one temporary `Conversation` for its bounded physical
-requests. Its configured `specialist_planner_max_tokens` value is the actual
+The planner role keeps one temporary `Conversation` for its bounded
+completion-producing model calls. Its configured
+`specialist_planner_max_tokens` value is the actual
 per-request output allowance rather than being reduced by the generic
 specialist-session output cap.
 
@@ -21,8 +22,11 @@ parseable JSON, the adapter retains any additional intermediate text and makes
 one final request with `reasoning_effort: none`, tools disabled, and an
 ephemeral instruction to return only the required JSON object.
 
-The sequence is capped at three physical requests: initial reasoning,
-reasoning continuation, and forced JSON finalization. Successful structured
+The sequence is capped at three completion-producing model calls: initial
+reasoning, reasoning continuation, and forced JSON finalization. An HTTP
+request rejected before inference because a provider does not support
+`response_format`, followed by the existing compatibility retry, remains one
+model call because it produces at most one completion. Successful structured
 output returns immediately. Transport errors, non-truncation malformed output,
 deadline exhaustion, or failure of the final request continue to use the
 controller's existing deterministic planner fallback.
@@ -33,8 +37,8 @@ controller's existing deterministic planner fallback.
 - Do not publish or persist reasoning in review artifacts.
 - Do not copy reasoning into specialist sessions or other controller roles.
 - Do not relax assignment validation or planner context admission limits.
-- Every physical request uses the same immutable compact planner context and
-  the existing absolute planning-phase deadline.
+- Every completion-producing call uses the same immutable compact planner
+  context and the existing absolute planning-phase deadline.
 
 ## Verification
 
