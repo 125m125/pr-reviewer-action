@@ -101,3 +101,37 @@ the existing deterministic fallback is used.
    ```
 
    Result: 103 passed in 3.36s.
+
+## Final-review fix: global finalization mode
+
+The adapter previously used its local continuation index to determine forced
+finalization. A semantic repair starts a fresh adapter loop, so its globally
+third request could still retain configured reasoning. Finalization now uses
+the shared planner budget's last remaining unit when that budget is present;
+the adapter-local third-turn rule remains only for unbudgeted direct calls.
+
+### Regression TDD evidence
+
+1. Extended the second-continuation semantic-repair transport regression to
+   configure `AI_REASONING_EFFORT=high` and assert that its globally third
+   payload sends `reasoning_effort: none` plus the JSON-only user instruction.
+2. RED command:
+
+   ```powershell
+   $env:PYTHONPATH = (Get-Location).Path
+   .\.venv\Scripts\pytest.exe -q tests/test_specialist_runtime_controller.py -k invalid_second_planner_continuation
+   ```
+
+   Result: failed as expected: the third payload carried `high` rather than
+   `none` reasoning effort.
+3. GREEN verification:
+
+   ```powershell
+   $env:PYTHONPATH = (Get-Location).Path
+   .\.venv\Scripts\pytest.exe -q tests/test_specialist_runtime_cli.py tests/test_specialist_runtime_controller.py
+   ```
+
+   Result: 103 passed in 3.37s.
+
+   The complete specialist-runtime suite, expanded with `Get-ChildItem` for
+   PowerShell, also passed: 515 passed in 8.48s.
