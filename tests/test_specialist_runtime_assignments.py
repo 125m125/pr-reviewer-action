@@ -132,6 +132,25 @@ def test_model_created_focus_preserves_recipe_identity(obligations, topology, ru
     assert "disabled" not in plan.assignments[0].recipe_ids
 
 
+@pytest.mark.parametrize("planner_evidence", [None, ["code behavior", "downstream effect"]])
+def test_planner_expected_evidence_is_derived_from_immutable_obligations(
+    obligations, topology, runtime_config, planner_evidence,
+):
+    raw = complete_plan_for(obligations)
+    if planner_evidence is None:
+        del raw["assignments"][0]["expected_evidence"]
+    else:
+        raw["assignments"][0]["expected_evidence"] = planner_evidence
+
+    plan = validate_assignment_plan(raw, obligations, topology, runtime_config)
+
+    assert plan.assignments[0].expected_evidence == (
+        "consumer",
+        "implementation",
+        "interaction",
+    )
+
+
 def test_schema_requires_every_assignment_field(obligations, topology, runtime_config):
     raw = complete_plan_for(obligations)
     del raw["assignments"][0]["boundary_paths"]
@@ -356,8 +375,53 @@ def test_fallback_globally_prioritizes_post_chunk_risk(topology):
     assert plan.unassigned_obligation_ids == ("topology:worker:z-low",)
 
 
+def test_fallback_coalesces_topology_groups_to_own_every_obligation_within_capacity():
+    paths = [f"canaries/canary_{index}.py" for index in range(4)]
+    topology = {
+        "changed_files": paths,
+        "components": [
+            {"id": f"canary-{index}", "changed_files": [path]}
+            for index, path in enumerate(paths)
+        ],
+        "relationships": [],
+    }
+    obligations = tuple(
+        CoverageObligation(
+            obligation_id=f"topology:canary-{index}:implementation",
+            origin="topology",
+            subject=f"canary-{index}",
+            required_evidence_categories=("implementation",),
+            risk_tier="high",
+            scope=(path,),
+            seed_hints=(path,),
+        )
+        for index, path in enumerate(paths)
+    )
+    one_lane = RuntimeConfig(
+        review_deadline_sec=600,
+        model_request_timeout_sec=100,
+        concurrency=1,
+        max_sessions=1,
+        session_limits=BudgetLimits(model_turns=6, tool_calls=20, recoveries=1),
+    )
+
+    plan = fallback_assignment_plan(obligations, topology, one_lane)
+
+    assert len(plan.assignments) == 1
+    assert set(plan.assignments[0].obligation_ids) == {item.id for item in obligations}
+    assert plan.unassigned_obligation_ids == ()
+
+
 def test_planner_prompt_includes_immutable_obligation_ids_only(obligations, topology, runtime_config):
     prompt = planner_prompt(obligations, topology, runtime_config)
 
     assert "recipe:delivery:consumer" in prompt["obligations"]
     assert "recipe-marker:disabled" not in prompt["obligations"]
+    assert prompt["authority"]["obligation_ids"] == "exact immutable identifiers; do not invent or paraphrase"
+    assert prompt["authority"]["paths"] == (
+        "seed_paths and boundary_paths may contain only paths from each assigned "
+        "obligation's scope or seed_hints"
+    )
+    assert prompt["authority"]["expected_evidence"] == (
+        "derived by the controller from assigned obligation_ids; planner values are ignored"
+    )

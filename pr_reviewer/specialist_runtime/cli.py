@@ -67,7 +67,11 @@ _ROLE_SYSTEM = {
         "Plan a bounded specialist assignment set covering every supplied mandatory "
         "obligation. Return only {\"assignments\":[...]}. Every assignment must contain "
         "id, title, objective, obligation_ids, lenses, seed_paths, boundary_paths, "
-        "expected_evidence, estimated_turns, priority, and overlap_justification. "
+        "estimated_turns, priority, and overlap_justification. Use exact obligation_ids "
+        "from the supplied immutable set; never invent or paraphrase them. "
+        "expected_evidence is derived by the controller from those IDs, so any model value "
+        "is ignored. Assignment paths may contain only paths from the assigned obligations' "
+        "immutable scope or seed hints. "
         "When an obligation has scope_ref or seed_hints_ref, resolve it through the "
         "top-level path_sets map before selecting assignment paths."
     ),

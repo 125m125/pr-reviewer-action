@@ -14,7 +14,7 @@ from .types import CoverageObligation
 
 _REQUIRED_FIELDS = (
     "id", "title", "objective", "obligation_ids", "lenses", "seed_paths",
-    "boundary_paths", "expected_evidence", "estimated_turns", "priority",
+    "boundary_paths", "estimated_turns", "priority",
     "overlap_justification",
 )
 _PRIORITY_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
@@ -131,7 +131,6 @@ def _parse_assignment(
     lenses = _strings(raw["lenses"], f"{label} lenses", errors)
     seed_paths = _paths(raw["seed_paths"], f"{label} seed_paths", errors)
     boundary_paths = _paths(raw["boundary_paths"], f"{label} boundary_paths", errors)
-    expected_evidence = _strings(raw["expected_evidence"], f"{label} expected_evidence", errors)
     estimated_turns = raw["estimated_turns"]
     if isinstance(estimated_turns, bool) or not isinstance(estimated_turns, int) or estimated_turns <= 0:
         errors.append(f"{label} estimated_turns must be a positive integer")
@@ -149,14 +148,11 @@ def _parse_assignment(
     else:
         overlap_justification = overlap_justification.strip()
 
-    required_evidence = {
+    expected_evidence = tuple(sorted({
         evidence for obligation_id in obligation_ids
         if obligation_id in obligation_by_id
         for evidence in obligation_by_id[obligation_id].required_evidence_categories
-    }
-    missing_evidence = sorted(required_evidence - set(expected_evidence))
-    if missing_evidence:
-        errors.append(f"{label} expected_evidence omits required categories: {', '.join(missing_evidence)}")
+    }))
     recipe_ids = tuple(sorted({
         obligation_by_id[obligation_id].recipe_id for obligation_id in obligation_ids
         if obligation_id in obligation_by_id and obligation_by_id[obligation_id].recipe_id
@@ -405,16 +401,32 @@ def fallback_assignment_plan(
                 chunk_key = key if len(chunks) == 1 else f"{key}:chunk:{index}"
                 candidates.append((chunk_key, chunk))
     candidates.sort(key=lambda item: (_PRIORITY_RANK[_priority(item[1])], item[0]))
+    isolated_candidates: list[tuple[str, list[CoverageObligation]]] = []
+    ordinary_items: list[CoverageObligation] = []
+    for key, items in candidates:
+        if key.startswith("recipe:dedicated:") or key.startswith("recipe:independent:"):
+            isolated_candidates.append((key, items))
+        else:
+            ordinary_items.extend(items)
+    ordinary_candidates = [
+        (
+            f"combined:{index // per_assignment_capacity + 1}",
+            ordinary_items[index:index + per_assignment_capacity],
+        )
+        for index in range(0, len(ordinary_items), per_assignment_capacity)
+    ] if per_assignment_capacity > 0 else []
+    candidates = isolated_candidates + ordinary_candidates
+    candidates.sort(key=lambda item: (_PRIORITY_RANK[_priority(item[1])], item[0]))
     assignments: list[Assignment] = []
     turns_used = 0
     overflow_groups: list[tuple[str, list[CoverageObligation]]] = []
-    for index, (key, items) in enumerate(candidates):
+    for key, items in candidates:
         assignment = _fallback_assignment(key, tuple(sorted(items, key=lambda item: item.id)), runtime_config)
         if len(assignments) >= runtime_config.max_sessions or (
             turns_used + assignment.estimated_turns > _deadline_turn_capacity(runtime_config)
         ):
-            overflow_groups = candidates[index:]
-            break
+            overflow_groups.append((key, items))
+            continue
         assignments.append(assignment)
         turns_used += assignment.estimated_turns
     unassigned = tuple(sorted(
@@ -433,6 +445,16 @@ def planner_prompt(
     """Return the planner's immutable, structured input surface."""
     return {
         "required_assignment_fields": list(_REQUIRED_FIELDS),
+        "authority": {
+            "obligation_ids": "exact immutable identifiers; do not invent or paraphrase",
+            "paths": (
+                "seed_paths and boundary_paths may contain only paths from each assigned "
+                "obligation's scope or seed_hints"
+            ),
+            "expected_evidence": (
+                "derived by the controller from assigned obligation_ids; planner values are ignored"
+            ),
+        },
         "obligations": {
             item.id: {
                 "origin": item.origin, "subject": item.subject,
