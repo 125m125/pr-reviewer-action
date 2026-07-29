@@ -194,6 +194,18 @@ def _read_bounded_line_window(stream, offset, limit, max_bytes):
         else:
             at_line_start = False
 
+def _kill_and_reap(process, request_timeout):
+    """Best-effort bounded child cleanup without replacing the primary error."""
+    cleanup_timeout = max(0.001, min(float(request_timeout), 1.0))
+    try:
+        process.kill()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=cleanup_timeout)
+    except Exception:
+        pass
+
 def git_grep(pattern, workspace_root, request_timeout=15):
     """Run git grep and return matched lines."""
     try:
@@ -511,13 +523,19 @@ def execute_tool_request(
                         timeout=request_timeout
                     )
                 except FutureTimeoutError:
-                    process.kill()
+                    _kill_and_reap(process, request_timeout)
                     raise ValueError(
                         f"git diff timed out after {request_timeout}s"
                     )
             if has_more:
                 process.kill()
-            return_code = process.wait(timeout=request_timeout)
+            try:
+                return_code = process.wait(timeout=request_timeout)
+            except subprocess.TimeoutExpired:
+                _kill_and_reap(process, request_timeout)
+                raise ValueError(
+                    f"git diff timed out after {request_timeout}s"
+                )
             output = raw_output.decode("utf-8", errors="replace")
             if return_code != 0 and not has_more:
                 raise ValueError(

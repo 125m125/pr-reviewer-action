@@ -1,5 +1,6 @@
 import io
 import subprocess
+import threading
 from pathlib import Path
 
 from pr_reviewer import tool_executors
@@ -306,3 +307,91 @@ def test_read_pr_diff_streams_to_later_offset_beyond_response_byte_cap(
         "truncated": True,
     }
     assert process.killed is True
+
+
+def test_read_pr_diff_reader_timeout_kills_and_attempts_bounded_reap(
+    monkeypatch, tmp_path,
+):
+    path = "slow.patch"
+    (tmp_path / path).write_text("head\n", encoding="utf-8")
+    released = threading.Event()
+
+    class BlockingStream:
+        def readline(self, size=-1):
+            released.wait(1)
+            return b""
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = BlockingStream()
+            self.kill_calls = 0
+            self.wait_calls = []
+
+        def kill(self):
+            self.kill_calls += 1
+            released.set()
+
+        def wait(self, timeout):
+            self.wait_calls.append(timeout)
+            raise RuntimeError("cleanup failure must not mask reader timeout")
+
+    process = FakeProcess()
+    monkeypatch.setattr(
+        tool_executors.subprocess, "Popen",
+        lambda *args, **kwargs: process,
+    )
+
+    result = tool_executors.execute_tool_request(
+        "read_pr_diff", {"path": path}, str(tmp_path),
+        set(), "", (), 12000, 0.01,
+        base_sha="1" * 40, head_sha="2" * 40,
+        allowed_diff_paths=(path,),
+    )
+
+    assert result["status"] == "error"
+    assert "git diff timed out after 0.01s" in result["result"]["error"]
+    assert "cleanup failure" not in result["result"]["error"]
+    assert process.kill_calls == 1
+    assert len(process.wait_calls) == 1
+    assert 0 < process.wait_calls[0] <= 1
+
+
+def test_read_pr_diff_wait_timeout_kills_and_reaps_before_error(
+    monkeypatch, tmp_path,
+):
+    path = "slow-exit.patch"
+    (tmp_path / path).write_text("head\n", encoding="utf-8")
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.BytesIO(b"+complete patch line\n")
+            self.kill_calls = 0
+            self.wait_calls = []
+
+        def kill(self):
+            self.kill_calls += 1
+
+        def wait(self, timeout):
+            self.wait_calls.append(timeout)
+            if len(self.wait_calls) == 1:
+                raise subprocess.TimeoutExpired("git diff", timeout)
+            return -9
+
+    process = FakeProcess()
+    monkeypatch.setattr(
+        tool_executors.subprocess, "Popen",
+        lambda *args, **kwargs: process,
+    )
+
+    result = tool_executors.execute_tool_request(
+        "read_pr_diff", {"path": path}, str(tmp_path),
+        set(), "", (), 12000, 0.01,
+        base_sha="1" * 40, head_sha="2" * 40,
+        allowed_diff_paths=(path,),
+    )
+
+    assert result["status"] == "error"
+    assert "git diff timed out after 0.01s" in result["result"]["error"]
+    assert process.kill_calls == 1
+    assert len(process.wait_calls) == 2
+    assert all(0 < timeout <= 1 for timeout in process.wait_calls)
