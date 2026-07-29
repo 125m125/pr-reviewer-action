@@ -796,7 +796,8 @@ def test_handoff_rechecks_every_dynamic_value_after_prefix_and_rendering():
         "Repository recipe: safe-recipe",
         "Approve",
         "AI review complete",
-        "2 unresolved review note(s); highest material severity: major.",
+        "2 detail review notes prepared for publication; "
+        "highest proposed finding severity: major.",
         "Material evidence or session coverage is incomplete.",
     )
     records = tuple(

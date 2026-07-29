@@ -1909,7 +1909,7 @@ class ReviewController:
             *relationship_topics,
             *unresolved_topics,
         )))[:3]
-        material_severities = tuple(
+        prepared_finding_severities = tuple(
             note.severity for note in state.notes
             if note.severity in {"info", "minor", "major", "blocker"}
         )
@@ -1926,7 +1926,7 @@ class ReviewController:
             coverage_boundary_topics=coverage_boundary_topics,
             unresolved_thread_count=len(state.notes),
             highest_thread_severity=max(
-                material_severities, default=None,
+                prepared_finding_severities, default=None,
                 key=lambda value: {"info": 0, "minor": 1, "major": 2, "blocker": 3}.get(value, 0),
             ),
             review_emphasis_topics=review_emphasis_topics,

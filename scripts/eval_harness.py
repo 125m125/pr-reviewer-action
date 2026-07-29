@@ -448,6 +448,14 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
         degradations, (str, bytes)
     ):
         degradations = ()
+    prepared_notes = artifact.get("notes", ())
+    if not isinstance(prepared_notes, Sequence) or isinstance(
+        prepared_notes, (str, bytes)
+    ):
+        prepared_notes = ()
+    prepared_note_count = sum(
+        1 for item in prepared_notes if isinstance(item, Mapping)
+    )
     context = ReviewHandoffContext(
         recommendation=verdict_value,
         status=str(artifact.get("evaluation_status") or ""),
@@ -456,13 +464,13 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
         specialist_topics=topics("specialist_topics"),
         recipe_ids=values("recipe_ids"),
         coverage_boundary_topics=topics("coverage_boundary_topics"),
-        unresolved_thread_count=len(accepted),
+        unresolved_thread_count=prepared_note_count,
         highest_thread_severity=(
             max(
                 (str(item.get("severity") or "info") for item in accepted),
                 key=lambda value: severity_rank.get(value, 0),
             )
-            if accepted else None
+            if accepted and prepared_note_count else None
         ),
         review_emphasis_topics=topics("review_emphasis_topics"),
         material_coverage_limited=bool(artifact.get("degradation")),

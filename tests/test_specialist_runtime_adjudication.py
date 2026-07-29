@@ -341,7 +341,7 @@ def test_handoff_compactly_names_distinct_degraded_stages_without_details():
     assert "exception" not in handoff.markdown.lower()
 
 
-def test_handoff_thread_status_omits_severity_without_a_material_finding():
+def test_handoff_prepared_note_status_omits_severity_without_a_material_finding():
     handoff = build_review_handoff(
         ReviewHandoffContext(
             unresolved_thread_count=2,
@@ -353,8 +353,11 @@ def test_handoff_thread_status_omits_severity_without_a_material_finding():
         changed_files=CHANGED_FILES,
     )
 
-    assert handoff.thread_status == "2 unresolved review note(s)."
-    assert "highest material severity" not in handoff.markdown
+    assert handoff.thread_status == "2 detail review notes prepared for publication."
+    assert "**Prepared detail notes:**" in handoff.markdown
+    assert "highest proposed finding severity" not in handoff.markdown
+    assert "unresolved" not in handoff.markdown.casefold()
+    assert "thread status" not in handoff.markdown.casefold()
 
 
 def test_disparate_or_generic_findings_do_not_get_artificial_theme():

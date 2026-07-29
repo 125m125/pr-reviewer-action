@@ -146,6 +146,8 @@ class ReviewHandoffContext:
     specialist_topics: tuple[ReviewOrientationTopic, ...] = ()
     recipe_ids: tuple[str, ...] = ()
     coverage_boundary_topics: tuple[ReviewOrientationTopic, ...] = ()
+    # Compatibility names for a pre-publication aggregate. These values describe
+    # prepared detail notes only; they never represent GitHub resolution state.
     unresolved_thread_count: int = 0
     highest_thread_severity: str | None = None
     review_emphasis_topics: tuple[ReviewOrientationTopic, ...] = ()
@@ -927,7 +929,7 @@ def render_review_handoff(handoff: ReviewHandoff) -> str:
                 "- Coverage boundaries: " + "; ".join(handoff.coverage_boundaries)
             )
     if handoff.thread_status:
-        lines.extend(("", f"**Thread status:** {handoff.thread_status}"))
+        lines.extend(("", f"**Prepared detail notes:** {handoff.thread_status}"))
     if theme_label:
         lines.extend(("", f"**Aggregate finding theme:** {theme_label}"))
     if handoff.review_emphasis:
@@ -1033,30 +1035,37 @@ def project_review_handoff(
     review_emphasis = _topic_values(
         context.review_emphasis_topics, forbidden=forbidden, limit=3
     )
-    thread_count = (
+    prepared_note_count = (
         context.unresolved_thread_count
         if isinstance(context.unresolved_thread_count, int)
         and not isinstance(context.unresolved_thread_count, bool)
         and context.unresolved_thread_count > 0
         else 0
     )
-    raw_thread_severity = _unicode(context.highest_thread_severity).strip().lower()
-    thread_severity = (
-        raw_thread_severity
-        if raw_thread_severity in _SEVERITY_RANK
+    raw_prepared_severity = _unicode(context.highest_thread_severity).strip().lower()
+    prepared_severity = (
+        raw_prepared_severity
+        if raw_prepared_severity in _SEVERITY_RANK
         else None
     )
     thread_status = None
-    if thread_count:
-        candidate_thread_status = f"{thread_count} unresolved review note(s)"
-        if thread_severity:
+    if prepared_note_count:
+        note_label = (
+            "detail review note"
+            if prepared_note_count == 1
+            else "detail review notes"
+        )
+        candidate_thread_status = (
+            f"{prepared_note_count} {note_label} prepared for publication"
+        )
+        if prepared_severity:
             candidate_thread_status += (
-                f"; highest material severity: {thread_severity}"
+                f"; highest proposed finding severity: {prepared_severity}"
             )
         candidate_thread_status += "."
         if renderable(
             candidate_thread_status,
-            f"Thread status: {candidate_thread_status}",
+            f"Prepared detail notes: {candidate_thread_status}",
         ):
             thread_status = candidate_thread_status
     theme, theme_label = _aggregate_theme_categories(

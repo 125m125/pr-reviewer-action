@@ -331,10 +331,10 @@ def test_eval_rejects_forged_structured_handoff_lines(mutation):
             "\n**Aggregate finding theme:** Database and persistence\n"
         )
     elif mutation == "thread_status":
-        original = f"**Thread status:** {handoff['thread_status']}"
+        original = f"**Prepared detail notes:** {handoff['thread_status']}"
         handoff["thread_status"] = novel
         handoff["markdown"] = handoff["markdown"].replace(
-            original, f"**Thread status:** {novel}",
+            original, f"**Prepared detail notes:** {novel}",
         )
     elif mutation == "coverage_warning":
         original = f"**Material coverage warning:** {handoff['coverage_warning']}"
@@ -507,6 +507,42 @@ def test_eval_accepts_production_capped_normalized_and_filtered_handoff():
         "Repository recipe: recipe-f",
     )
     assert eval_harness_module._unsupported_handoff_lines(artifact) == []
+
+
+def test_eval_validates_prepared_notes_without_inferring_thread_state():
+    context = ReviewHandoffContext(
+        recommendation="request_changes",
+        status="complete",
+        unresolved_thread_count=2,
+        highest_thread_severity="major",
+    )
+    handoff = build_review_handoff(
+        context,
+        review=AdjudicatedReview(),
+        evidence=EvidenceStore(),
+        obligations={},
+        changed_files=(),
+    )
+    artifact = {
+        "accepted_candidates": [{"severity": "major"}],
+        "coverage": {},
+        "degradation": [],
+        "evaluation_status": "complete",
+        "events": [],
+        "handoff": asdict(handoff),
+        "notes": [
+            {"kind": "finding", "fingerprint": "finding:one"},
+            {
+                "kind": "verification_request",
+                "fingerprint": "verification_request:two",
+            },
+        ],
+        "verdict": {"value": "request_changes"},
+    }
+
+    assert eval_harness_module._unsupported_handoff_lines(artifact) == []
+    assert "unresolved" not in handoff.markdown.casefold()
+    assert "thread status" not in handoff.markdown.casefold()
 
 
 def test_false_adversarial_predicate_is_a_mandatory_gate():

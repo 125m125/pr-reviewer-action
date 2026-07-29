@@ -834,7 +834,8 @@ def test_finalizer_failure_builds_useful_sparse_handoff_from_controller_state(tm
         "Runtime implementation behavior",
     )
     assert result.handoff.thread_status == (
-        "1 unresolved review note(s); highest material severity: minor."
+        "1 detail review note prepared for publication; "
+        "highest proposed finding severity: minor."
     )
     assert result.handoff.review_emphasis == ("Failure recovery",)
     assert len(result.handoff.review_emphasis) <= 3
@@ -844,6 +845,32 @@ def test_finalizer_failure_builds_useful_sparse_handoff_from_controller_state(tm
     assert any(
         item["component"] == "finalizer" for item in result.artifact["degradation"]
     )
+
+
+def test_re_review_handoff_does_not_claim_prepared_notes_are_open_threads(tmp_path):
+    def broken_finalizer(*_args):
+        raise RuntimeError("finalizer timed out")
+
+    inputs = replace(
+        _inputs(tmp_path),
+        pr_metadata={
+            "review_cycle": "re-review",
+            "previously_resolved_note_fingerprints": ("candidate-delivery",),
+        },
+    )
+    result = _controller(
+        tmp_path,
+        finalizer=broken_finalizer,
+    ).run(inputs)
+
+    assert result.handoff.thread_status == (
+        "1 detail review note prepared for publication; "
+        "highest proposed finding severity: minor."
+    )
+    assert "**Prepared detail notes:**" in result.handoff.markdown
+    assert "unresolved" not in result.handoff.markdown.casefold()
+    assert "open thread" not in result.handoff.markdown.casefold()
+    assert "resolved thread" not in result.handoff.markdown.casefold()
 
 
 class _Clock:
