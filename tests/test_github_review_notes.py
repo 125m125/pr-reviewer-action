@@ -1526,6 +1526,56 @@ def test_sticky_post_timeout_reconciles_exact_owned_body_without_retry(monkeypat
     assert finds == [None, body]
 
 
+def test_sticky_refresh_rejects_untrusted_comment_id_without_a_write(monkeypatch, tmp_path):
+    client = GhReviewClient(action_root=tmp_path)
+    writes = []
+    monkeypatch.setattr(
+        client,
+        "_api_write",
+        lambda endpoint, method, payload: writes.append((endpoint, method, payload)),
+    )
+
+    with pytest.raises(ValueError):
+        client.update_sticky(
+            "owner/repo",
+            17,
+            "<!-- ai-pr-review-specialist-handoff -->\nReview link",
+            known_comment_id=74,
+        )
+
+    assert writes == []
+
+
+def test_sticky_refresh_rejects_a_trusted_id_for_a_different_pull_request(monkeypatch, tmp_path):
+    client = GhReviewClient(action_root=tmp_path)
+    initial_body = "<!-- ai-pr-review-specialist-handoff -->\nInitial handoff"
+    writes = []
+
+    def find(_repo, _pr_number, expected_body=None):
+        del expected_body
+        return None
+
+    def write(endpoint, method, payload):
+        writes.append((endpoint, method, payload))
+        return {"id": 74, "url": _issue_url(74)}
+
+    monkeypatch.setattr(client, "find_specialist_handoff", find)
+    monkeypatch.setattr(client, "_api_write", write)
+    created = client.update_sticky("owner/repo", 17, initial_body)
+
+    with pytest.raises(ValueError):
+        client.update_sticky(
+            "owner/repo",
+            18,
+            "<!-- ai-pr-review-specialist-handoff -->\nReview link",
+            known_comment_id=created["id"],
+        )
+
+    assert writes == [
+        ("repos/owner/repo/issues/17/comments", "POST", {"body": initial_body}),
+    ]
+
+
 def test_sticky_refresh_patches_known_comment_when_comment_list_is_stale(monkeypatch, tmp_path):
     client = GhReviewClient(action_root=tmp_path)
     initial_body = "<!-- ai-pr-review-specialist-handoff -->\nInitial handoff"

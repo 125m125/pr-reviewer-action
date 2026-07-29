@@ -2084,6 +2084,7 @@ class GhReviewClient:
         self.action_root = Path(action_root).resolve()
         self.timeout = max(1, min(int(timeout), 300))
         self._repo_context: tuple[str, int] | None = None
+        self._trusted_sticky_comment_ids: dict[tuple[str, int], set[int]] = {}
 
     def _input_call(self, args: list[str], payload: Mapping[str, Any]) -> dict[str, Any]:
         fd, path = tempfile.mkstemp(prefix="ai-pr-review-publish-", suffix=".json")
@@ -2177,9 +2178,12 @@ class GhReviewClient:
         known_comment_id: int | None = None,
     ) -> Mapping[str, Any]:
         self._split_repo(repo)
+        sticky_key = (repo, pr_number)
         if known_comment_id is None:
             existing = self.find_specialist_handoff(repo, pr_number)
             comment_id = existing["id"] if existing is not None else None
+            if comment_id is not None:
+                self._trusted_sticky_comment_ids.setdefault(sticky_key, set()).add(comment_id)
         else:
             if (
                 not isinstance(known_comment_id, int)
@@ -2187,6 +2191,12 @@ class GhReviewClient:
                 or known_comment_id <= 0
             ):
                 raise ValueError("known sticky comment id must be a positive integer")
+            if known_comment_id not in self._trusted_sticky_comment_ids.get(
+                sticky_key, set()
+            ):
+                raise ValueError(
+                    "known sticky comment id is not trusted for this pull request"
+                )
             comment_id = known_comment_id
         if comment_id is None:
             endpoint = f"repos/{repo}/issues/{pr_number}/comments"
@@ -2195,12 +2205,18 @@ class GhReviewClient:
             endpoint = f"repos/{repo}/issues/comments/{comment_id}"
             method = "PATCH"
         try:
-            return self._api_write(endpoint, method, {"body": body})
+            result = self._api_write(endpoint, method, {"body": body})
+            if method == "POST":
+                self._trusted_sticky_comment_ids.setdefault(sticky_key, set()).add(result["id"])
+            return result
         except Exception:
             reconciled = self.find_specialist_handoff(
                 repo, pr_number, expected_body=body
             )
             if reconciled is not None:
+                self._trusted_sticky_comment_ids.setdefault(sticky_key, set()).add(
+                    reconciled["id"]
+                )
                 return reconciled
             raise
 
