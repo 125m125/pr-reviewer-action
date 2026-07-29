@@ -241,18 +241,19 @@ def test_dedicated_and_independent_recipes_are_isolated(obligations, topology, r
         validate_assignment_plan(raw, obligations, topology, runtime_config)
 
 
-def test_deadline_turn_capacity_rejects_plan_without_other_caps(obligations, topology):
+def test_deadline_budget_does_not_pre_reject_owned_work(obligations, topology):
     raw = complete_plan_for(obligations)
     deadline_only = RuntimeConfig(
         review_deadline_sec=900, model_request_timeout_sec=300, concurrency=1, max_sessions=4,
         session_limits=BudgetLimits(model_turns=12, tool_calls=20, recoveries=1),
     )
 
-    with pytest.raises(AssignmentPlanError, match="deadline turn capacity"):
-        validate_assignment_plan(raw, obligations, topology, deadline_only)
+    plan = validate_assignment_plan(raw, obligations, topology, deadline_only)
+
+    assert not plan.unassigned_obligation_ids
 
 
-def test_per_lane_deadline_turn_capacity_rejects_long_assignment(topology):
+def test_model_estimate_is_normalized_instead_of_enforcing_per_lane_capacity(topology):
     obligation = CoverageObligation(
         obligation_id="topology:worker:high", origin="topology", subject="worker",
         required_evidence_categories=("implementation",), risk_tier="high",
@@ -266,8 +267,9 @@ def test_per_lane_deadline_turn_capacity_rejects_long_assignment(topology):
         session_limits=BudgetLimits(model_turns=12, tool_calls=20, recoveries=1),
     )
 
-    with pytest.raises(AssignmentPlanError, match="per-lane deadline turn capacity"):
-        validate_assignment_plan(raw, (obligation,), topology, two_lanes)
+    plan = validate_assignment_plan(raw, (obligation,), topology, two_lanes)
+
+    assert plan.assignments[0].estimated_turns == 1
 
 
 def test_repair_prompt_contains_only_errors_and_previous_plan(obligations):
@@ -298,7 +300,7 @@ def test_fallback_prioritizes_high_risk_and_keeps_capacity_overflow_explicit(top
     assert plan.unassigned_obligation_ids
 
 
-def test_fallback_stops_at_deadline_turn_capacity(topology, obligations):
+def test_fallback_preserves_ownership_despite_small_estimated_deadline_capacity(topology, obligations):
     config = RuntimeConfig(
         review_deadline_sec=900, model_request_timeout_sec=300, concurrency=1, max_sessions=4,
         session_limits=BudgetLimits(model_turns=12, tool_calls=20, recoveries=1),
@@ -306,11 +308,11 @@ def test_fallback_stops_at_deadline_turn_capacity(topology, obligations):
 
     plan = fallback_assignment_plan(obligations, topology, config)
 
-    assert len(plan.assignments) == 2
-    assert plan.unassigned_obligation_ids
+    assert len(plan.assignments) <= config.max_sessions
+    assert plan.unassigned_obligation_ids == ()
 
 
-def test_fallback_chunks_ordinary_group_to_per_lane_deadline_capacity(topology):
+def test_fallback_keeps_one_ordinary_group_independent_of_deadline_estimates(topology):
     obligations = tuple(CoverageObligation(
         obligation_id=f"topology:worker:{index}", origin="topology", subject="worker",
         required_evidence_categories=(f"implementation-{index}",), risk_tier="high",
@@ -323,11 +325,11 @@ def test_fallback_chunks_ordinary_group_to_per_lane_deadline_capacity(topology):
 
     plan = fallback_assignment_plan(obligations, topology, two_lanes)
 
-    assert [item.estimated_turns for item in plan.assignments] == [2, 1]
+    assert [item.estimated_turns for item in plan.assignments] == [3]
     assert not plan.unassigned_obligation_ids
 
 
-def test_fallback_overflows_oversized_dedicated_recipe_group(topology):
+def test_fallback_keeps_dedicated_recipe_isolated_without_estimated_turn_overflow(topology):
     obligations = tuple(CoverageObligation(
         obligation_id=f"recipe:release:{index}", origin="recipe", subject="release",
         required_evidence_categories=(f"artifact-{index}",), risk_tier="high",
@@ -340,11 +342,12 @@ def test_fallback_overflows_oversized_dedicated_recipe_group(topology):
 
     plan = fallback_assignment_plan(obligations, topology, two_lanes)
 
-    assert not plan.assignments
-    assert plan.unassigned_obligation_ids == tuple(item.id for item in obligations)
+    assert len(plan.assignments) == 1
+    assert plan.assignments[0].obligation_ids == tuple(item.id for item in obligations)
+    assert not plan.unassigned_obligation_ids
 
 
-def test_fallback_globally_prioritizes_post_chunk_risk(topology):
+def test_fallback_globally_prioritizes_groups_without_dropping_lower_risk_ownership(topology):
     obligations = (
         CoverageObligation(
             obligation_id="topology:worker:a-critical", origin="topology", subject="worker",
@@ -372,7 +375,74 @@ def test_fallback_globally_prioritizes_post_chunk_risk(topology):
 
     assert [item.priority for item in plan.assignments] == ["critical", "high"]
     assert "topology:queue:m-high" in assigned_ids
-    assert plan.unassigned_obligation_ids == ("topology:worker:z-low",)
+    assert "topology:worker:z-low" in assigned_ids
+    assert plan.unassigned_obligation_ids == ()
+
+
+def test_fallback_reports_obligations_impossible_under_isolation_session_cap(topology):
+    obligations = tuple(CoverageObligation(
+        obligation_id=f"recipe:isolated-{index}:boundary",
+        origin="recipe",
+        subject=f"isolated-{index}",
+        required_evidence_categories=("boundary",),
+        recipe_id=f"isolated-{index}",
+        recipe_execution="independent",
+        requires_independent_verification=True,
+        risk_tier="high",
+        scope=("worker/a.py",),
+    ) for index in range(3))
+    two_sessions = RuntimeConfig(
+        review_deadline_sec=3_600,
+        model_request_timeout_sec=300,
+        concurrency=1,
+        max_sessions=2,
+        session_limits=BudgetLimits(model_turns=32, tool_calls=20, recoveries=1),
+    )
+
+    plan = fallback_assignment_plan(obligations, topology, two_sessions)
+
+    assert len(plan.assignments) == 2
+    assert plan.unassigned_obligation_ids == ("recipe:isolated-2:boundary",)
+    assert plan.unassigned_obligation_reasons == ((
+        "recipe:isolated-2:boundary",
+        "max_sessions exhausted after deterministic risk and tie-break ordering",
+    ),)
+
+
+def test_fallback_admits_critical_ordinary_work_before_low_risk_isolated_recipe(topology):
+    obligations = (
+        CoverageObligation(
+            obligation_id="recipe:low-isolated:boundary",
+            origin="recipe",
+            subject="low-isolated",
+            required_evidence_categories=("boundary",),
+            recipe_id="low-isolated",
+            recipe_execution="independent",
+            requires_independent_verification=True,
+            risk_tier="low",
+            scope=("worker/a.py",),
+        ),
+        CoverageObligation(
+            obligation_id="topology:queue:critical",
+            origin="topology",
+            subject="queue",
+            required_evidence_categories=("implementation",),
+            risk_tier="critical",
+            scope=("queue/consumer.py",),
+        ),
+    )
+    one_session = RuntimeConfig(
+        review_deadline_sec=3_600,
+        model_request_timeout_sec=300,
+        concurrency=1,
+        max_sessions=1,
+        session_limits=BudgetLimits(model_turns=32, tool_calls=20, recoveries=1),
+    )
+
+    plan = fallback_assignment_plan(obligations, topology, one_session)
+
+    assert plan.assignments[0].obligation_ids == ("topology:queue:critical",)
+    assert plan.unassigned_obligation_ids == ("recipe:low-isolated:boundary",)
 
 
 def test_fallback_coalesces_topology_groups_to_own_every_obligation_within_capacity():
@@ -409,6 +479,64 @@ def test_fallback_coalesces_topology_groups_to_own_every_obligation_within_capac
 
     assert len(plan.assignments) == 1
     assert set(plan.assignments[0].obligation_ids) == {item.id for item in obligations}
+    assert plan.unassigned_obligation_ids == ()
+
+
+def test_model_estimated_turns_do_not_control_assignment_validity_or_capacity(
+    obligations, topology, runtime_config,
+):
+    raw = complete_plan_for(obligations)
+    for assignment_item in raw["assignments"]:
+        assignment_item["estimated_turns"] = 10_000
+
+    plan = validate_assignment_plan(raw, obligations, topology, runtime_config)
+
+    assert all(
+        item.estimated_turns <= runtime_config.session_limits.model_turns
+        for item in plan.assignments
+    )
+    assert not plan.unassigned_obligation_ids
+
+
+def test_dogfood_shape_assigns_all_topology_obligations_without_estimated_turn_arithmetic():
+    paths = [f"canaries/canary_{index}.py" for index in range(40)]
+    topology = {
+        "changed_files": paths,
+        "components": [
+            {"id": f"canary-{index}", "changed_files": [path]}
+            for index, path in enumerate(paths)
+        ],
+        "relationships": [],
+    }
+    obligations = tuple(
+        CoverageObligation(
+            obligation_id=f"topology:canary-{index}:implementation",
+            origin="topology",
+            subject=f"canary-{index}",
+            required_evidence_categories=("implementation",),
+            risk_tier="high" if index < 2 else "normal",
+            scope=(path,),
+            seed_hints=(path,),
+        )
+        for index, path in enumerate(paths)
+    )
+    dogfood = RuntimeConfig(
+        review_deadline_sec=3_600,
+        model_request_timeout_sec=300,
+        concurrency=1,
+        max_sessions=8,
+        session_limits=BudgetLimits(model_turns=32, tool_calls=40, recoveries=2),
+    )
+
+    plan = fallback_assignment_plan(obligations, topology, dogfood)
+
+    assigned = {
+        obligation_id
+        for assignment_item in plan.assignments
+        for obligation_id in assignment_item.obligation_ids
+    }
+    assert assigned == {item.id for item in obligations}
+    assert len(plan.assignments) <= dogfood.max_sessions
     assert plan.unassigned_obligation_ids == ()
 
 

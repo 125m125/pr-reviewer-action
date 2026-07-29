@@ -2279,6 +2279,9 @@ class ReviewController:
                 "source": state.plan_source,
                 "planner_repaired": state.planner_repaired,
                 "unassigned_obligation_ids": list(state.plan.unassigned_obligation_ids),
+                "unassigned_obligation_reasons": dict(
+                    state.plan.unassigned_obligation_reasons
+                ),
             },
             "assignments": [_json_value(state.assignments[key]) for key in sorted(state.assignments)],
             "base_sha": state.inputs.base_sha,
@@ -2843,12 +2846,16 @@ class ReviewController:
                     "obligation_ids": item.obligation_ids,
                     "source": state.plan_source,
                 })
+            unassigned_reasons = dict(state.plan.unassigned_obligation_reasons)
             for obligation_id in state.plan.unassigned_obligation_ids:
                 state.coverage.mark_unresolved(obligation_id)
                 obligation = state.coverage.obligation(obligation_id)
                 state.unknowns.append({
                     "obligation_id": obligation_id,
-                    "reason": "deterministic assignment capacity exhausted",
+                    "reason": unassigned_reasons.get(
+                        obligation_id,
+                        "deterministic assignment capacity exhausted",
+                    ),
                     "resolution_policy": obligation.unresolved_policy,
                 })
 
@@ -3064,6 +3071,9 @@ class ReviewController:
                     "planner_repaired": state.planner_repaired,
                     "unassigned_obligation_ids": list(
                         state.plan.unassigned_obligation_ids,
+                    ),
+                    "unassigned_obligation_reasons": dict(
+                        state.plan.unassigned_obligation_reasons
                     ),
                 },
                 "assignments": [

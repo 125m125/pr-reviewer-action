@@ -14,7 +14,7 @@ from .types import CoverageObligation
 
 _REQUIRED_FIELDS = (
     "id", "title", "objective", "obligation_ids", "lenses", "seed_paths",
-    "boundary_paths", "estimated_turns", "priority",
+    "boundary_paths", "priority",
     "overlap_justification",
 )
 _PRIORITY_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
@@ -54,6 +54,7 @@ class Assignment:
 class AssignmentPlan:
     assignments: tuple[Assignment, ...]
     unassigned_obligation_ids: tuple[str, ...] = ()
+    unassigned_obligation_reasons: tuple[tuple[str, str], ...] = ()
 
 
 def _assignable_obligations(obligations: Iterable[CoverageObligation]) -> tuple[CoverageObligation, ...]:
@@ -131,10 +132,9 @@ def _parse_assignment(
     lenses = _strings(raw["lenses"], f"{label} lenses", errors)
     seed_paths = _paths(raw["seed_paths"], f"{label} seed_paths", errors)
     boundary_paths = _paths(raw["boundary_paths"], f"{label} boundary_paths", errors)
-    estimated_turns = raw["estimated_turns"]
-    if isinstance(estimated_turns, bool) or not isinstance(estimated_turns, int) or estimated_turns <= 0:
-        errors.append(f"{label} estimated_turns must be a positive integer")
-        estimated_turns = 0
+    # Retained on the wire for backwards compatibility only. Scheduling weight
+    # is derived by the controller after the immutable ownership is validated.
+    estimated_turns = 1
     priority = raw["priority"]
     if not isinstance(priority, str) or priority.strip().lower() not in _PRIORITY_RANK:
         errors.append(f"{label} priority must be critical, high, normal, or low")
@@ -264,14 +264,18 @@ def _validate_budget(assignments: tuple[Assignment, ...], config: RuntimeConfig)
     errors: list[str] = []
     if len(assignments) > config.max_sessions:
         errors.append(f"session cap exceeded: {len(assignments)} assignments > {config.max_sessions}")
-    for assignment in assignments:
-        if assignment.estimated_turns > config.session_limits.model_turns:
-            errors.append(f"assignment '{assignment.id}' estimated turns exceed per-session limit")
-        if assignment.estimated_turns > _per_lane_deadline_turn_capacity(config):
-            errors.append(f"assignment '{assignment.id}' estimated turns exceed per-lane deadline turn capacity")
-    if sum(item.estimated_turns for item in assignments) > _deadline_turn_capacity(config):
-        errors.append("estimated turns exceed deadline turn capacity")
     return errors
+
+
+def _with_scheduling_weights(
+    assignments: tuple[Assignment, ...], config: RuntimeConfig,
+) -> tuple[Assignment, ...]:
+    """Derive a coarse ordering hint without treating it as runtime capacity."""
+    limit = max(1, config.session_limits.model_turns)
+    return tuple(
+        replace(item, estimated_turns=min(limit, max(1, len(item.obligation_ids))))
+        for item in assignments
+    )
 
 
 def validate_assignment_plan(
@@ -315,7 +319,9 @@ def validate_assignment_plan(
     errors.extend(_validate_budget(assignments, runtime_config))
     if errors:
         raise AssignmentPlanError(errors)
-    return AssignmentPlan(assignments=_with_primary_ownership(assignments))
+    return AssignmentPlan(assignments=_with_primary_ownership(
+        _with_scheduling_weights(assignments, runtime_config)
+    ))
 
 
 def repair_prompt(errors: Iterable[str], previous_plan: Mapping[str, Any]) -> dict[str, Any]:
@@ -372,70 +378,67 @@ def _fallback_assignment(key: str, obligations: tuple[CoverageObligation, ...], 
 def fallback_assignment_plan(
     obligations: Iterable[CoverageObligation], topology: Mapping[str, Any], runtime_config: RuntimeConfig,
 ) -> AssignmentPlan:
-    """Create a policy-preserving deterministic plan, recording capacity overflow."""
+    """Create complete controller-owned coverage within the hard session cap."""
     groups: dict[str, list[CoverageObligation]] = defaultdict(list)
     components = _component_paths(topology)
     for obligation in _validated_assignable_obligations(obligations):
         groups[_fallback_group(obligation, components)].append(obligation)
     ordered = sorted(groups.items(), key=lambda item: (_PRIORITY_RANK[_priority(item[1])], item[0]))
-    per_assignment_capacity = min(
-        runtime_config.session_limits.model_turns,
-        _per_lane_deadline_turn_capacity(runtime_config),
-    )
-    candidates: list[tuple[str, list[CoverageObligation]]] = []
-    pre_overflow: list[CoverageObligation] = []
+    isolated_candidates: list[tuple[str, list[CoverageObligation]]] = []
+    ordinary_groups: list[tuple[str, list[CoverageObligation]]] = []
     for key, group in ordered:
         items = sorted(group, key=lambda item: item.id)
-        isolated = key.startswith("recipe:dedicated:") or key.startswith("recipe:independent:")
-        if per_assignment_capacity <= 0:
-            pre_overflow.extend(items)
-        elif isolated:
-            if len(items) > per_assignment_capacity:
-                pre_overflow.extend(items)
-            else:
-                candidates.append((key, items))
-        else:
-            chunks = [items[index:index + per_assignment_capacity]
-                      for index in range(0, len(items), per_assignment_capacity)]
-            for index, chunk in enumerate(chunks, start=1):
-                chunk_key = key if len(chunks) == 1 else f"{key}:chunk:{index}"
-                candidates.append((chunk_key, chunk))
-    candidates.sort(key=lambda item: (_PRIORITY_RANK[_priority(item[1])], item[0]))
-    isolated_candidates: list[tuple[str, list[CoverageObligation]]] = []
-    ordinary_items: list[CoverageObligation] = []
-    for key, items in candidates:
         if key.startswith("recipe:dedicated:") or key.startswith("recipe:independent:"):
             isolated_candidates.append((key, items))
         else:
-            ordinary_items.extend(items)
-    ordinary_candidates = [
-        (
-            f"combined:{index // per_assignment_capacity + 1}",
-            ordinary_items[index:index + per_assignment_capacity],
+            ordinary_groups.append((key, items))
+
+    ordinary_candidates: list[tuple[str, list[CoverageObligation]]] = []
+    if ordinary_groups and runtime_config.max_sessions > 0:
+        # Preserve room for isolated candidates while always creating at least
+        # one ordinary contender so immutable risk, not isolation kind, decides
+        # who receives the final hard session slot.
+        ordinary_slots = max(
+            1,
+            runtime_config.max_sessions
+            - min(len(isolated_candidates), runtime_config.max_sessions - 1),
         )
-        for index in range(0, len(ordinary_items), per_assignment_capacity)
-    ] if per_assignment_capacity > 0 else []
-    candidates = isolated_candidates + ordinary_candidates
-    candidates.sort(key=lambda item: (_PRIORITY_RANK[_priority(item[1])], item[0]))
-    assignments: list[Assignment] = []
-    turns_used = 0
-    overflow_groups: list[tuple[str, list[CoverageObligation]]] = []
-    for key, items in candidates:
-        assignment = _fallback_assignment(key, tuple(sorted(items, key=lambda item: item.id)), runtime_config)
-        if len(assignments) >= runtime_config.max_sessions or (
-            turns_used + assignment.estimated_turns > _deadline_turn_capacity(runtime_config)
-        ):
-            overflow_groups.append((key, items))
-            continue
-        assignments.append(assignment)
-        turns_used += assignment.estimated_turns
+        bucket_count = min(ordinary_slots, len(ordinary_groups))
+        buckets: list[list[CoverageObligation]] = [[] for _ in range(bucket_count)]
+        for index, (_, items) in enumerate(ordinary_groups):
+            buckets[index % bucket_count].extend(items)
+        ordinary_candidates = [
+            (f"combined:{index + 1}", items)
+            for index, items in enumerate(buckets)
+            if items
+        ]
+
+    candidates = sorted(
+        (*isolated_candidates, *ordinary_candidates),
+        key=lambda item: (_PRIORITY_RANK[_priority(item[1])], item[0]),
+    )
+    admitted = candidates[:runtime_config.max_sessions]
+    overflow_groups = candidates[runtime_config.max_sessions:]
+    assignments = [
+        _fallback_assignment(key, tuple(sorted(items, key=lambda item: item.id)), runtime_config)
+        for key, items in admitted
+    ]
     unassigned = tuple(sorted(
-        [obligation.id for obligation in pre_overflow]
-        + [obligation.id for _, items in overflow_groups for obligation in items]
+        obligation.id for _, items in overflow_groups for obligation in items
     ))
+    reasons = tuple(
+        (
+            obligation_id,
+            "max_sessions exhausted after deterministic risk and tie-break ordering",
+        )
+        for obligation_id in unassigned
+    )
     return AssignmentPlan(
-        assignments=_with_primary_ownership(tuple(assignments)),
+        assignments=_with_primary_ownership(
+            _with_scheduling_weights(tuple(assignments), runtime_config)
+        ),
         unassigned_obligation_ids=unassigned,
+        unassigned_obligation_reasons=reasons,
     )
 
 
