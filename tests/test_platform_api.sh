@@ -67,6 +67,50 @@ check "platform_pr_head_sha" \
 check "platform_pr_diff" \
   "$(run_seam github "" 'platform_pr_diff o/r 7')" \
   "gh pr diff 7 --repo o/r"
+
+echo ""
+echo "=== github backend: rejected remote diff falls back to local git ==="
+LOCAL_REPO="$TMP/local-diff-repo"
+FALLBACK_BIN="$TMP/fallback-bin"
+mkdir -p "$LOCAL_REPO" "$FALLBACK_BIN"
+git -C "$LOCAL_REPO" init -q
+git -C "$LOCAL_REPO" config user.name "Platform Test"
+git -C "$LOCAL_REPO" config user.email "platform-test@example.invalid"
+printf 'base-only\n' > "$LOCAL_REPO/tracked.txt"
+git -C "$LOCAL_REPO" add tracked.txt
+git -C "$LOCAL_REPO" commit -q -m base
+BASE_SHA="$(git -C "$LOCAL_REPO" rev-parse HEAD)"
+printf 'head-only\n' > "$LOCAL_REPO/tracked.txt"
+git -C "$LOCAL_REPO" commit -q -am head
+HEAD_SHA="$(git -C "$LOCAL_REPO" rev-parse HEAD)"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'if [[ "$1" == "pr" && "$2" == "diff" ]]; then' \
+  '  echo "HTTP 406: diff exceeded 20000 lines" >&2' \
+  '  exit 1' \
+  'fi' \
+  'if [[ "$1" == "api" ]]; then' \
+  '  printf "%s\t%s\n" "$BASE_SHA" "$HEAD_SHA"' \
+  '  exit 0' \
+  'fi' \
+  'exit 2' > "$FALLBACK_BIN/gh"
+chmod +x "$FALLBACK_BIN/gh"
+LOCAL_DIFF="$(
+  (
+    cd "$LOCAL_REPO"
+    export PATH="$FALLBACK_BIN:$PATH"
+    export PLATFORM=github BASE_SHA HEAD_SHA
+    unset _PLATFORM_API_SOURCED
+    # shellcheck disable=SC1090
+    source "$SEAM"
+    platform_pr_diff o/r 7
+  ) 2>/dev/null || true
+)"
+check "local fallback includes head content" \
+  "$(printf '%s\n' "$LOCAL_DIFF" | grep -c '^+head-only$' || true)" "1"
+check "local fallback includes removed base content" \
+  "$(printf '%s\n' "$LOCAL_DIFF" | grep -c '^-base-only$' || true)" "1"
+
 check "platform_pr_files" \
   "$(run_seam github "" 'platform_pr_files o/r 7')" \
   "gh api repos/o/r/pulls/7/files?per_page=100"

@@ -120,7 +120,37 @@ platform_pr_diff() {
   if _platform_is_forgejo; then
     _forgejo_py get-pr-diff "$1" "$2"
   else
-    gh pr diff "$2" --repo "$1"
+    local diff_file pr_shas base_sha head_sha
+    diff_file="$(mktemp)" || return 1
+    if gh pr diff "$2" --repo "$1" > "$diff_file"; then
+      cat "$diff_file"
+      rm -f "$diff_file"
+      return 0
+    fi
+    rm -f "$diff_file"
+
+    # GitHub rejects rendered PR diffs above its server-side line limit. The
+    # action checkout has full history, so reproduce PR diff semantics locally
+    # from the merge base instead of retrying the same API response.
+    if ! pr_shas="$(
+      gh api "repos/$1/pulls/$2" --jq '[.base.sha, .head.sha] | @tsv'
+    )"; then
+      return 1
+    fi
+    IFS=$'\t' read -r base_sha head_sha <<< "$pr_shas"
+    if [[ ! "$base_sha" =~ ^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$ ]] \
+      || [[ ! "$head_sha" =~ ^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$ ]]; then
+      echo "GitHub returned invalid base/head SHAs for pull request diff fallback" >&2
+      return 1
+    fi
+    if ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null \
+      || ! git cat-file -e "${head_sha}^{commit}" 2>/dev/null; then
+      echo "Pull request diff fallback requires a full checkout containing base and head commits" >&2
+      return 1
+    fi
+
+    echo "GitHub PR diff unavailable; generating the merge-base diff from the local checkout" >&2
+    git diff --no-ext-diff --no-color --find-renames "${base_sha}...${head_sha}"
   fi
 }
 
