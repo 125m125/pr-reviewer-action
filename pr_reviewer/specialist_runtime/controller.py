@@ -1230,34 +1230,37 @@ class ReviewController:
             state.plan_source = "model_validated"
             return plan
         except AssignmentPlanError as first_error:
-            try:
-                repair = repair_prompt(first_error.errors, raw if isinstance(raw, Mapping) else {})
-                repaired = self._model_request(
-                    state,
-                    role="planner",
-                    request_id="planner:repair:1",
-                    phase=RunPhase.PLANNING,
-                    component=self.planner,
-                    method="repair",
-                    context={
-                        "obligations": state.obligations,
-                        "topology": inputs.topology,
-                        "config": inputs.config,
-                        "repair": repair,
-                        "pr_metadata": inputs.pr_metadata,
-                        "policy": inputs.policy,
-                    },
-                )
-                if not isinstance(repaired, Mapping):
-                    raise AssignmentPlanError("planner repair must be an object")
-                plan = self.assignment_validator(
-                    repaired, state.obligations, inputs.topology, inputs.config,
-                )
-                state.plan_source = "model_repaired_validated"
-                state.planner_repaired = True
-                return plan
-            except Exception as exc:
-                self._degrade(state, "planner", _bounded_error(exc))
+            if bool(getattr(raw, "finalization_attempted", False)):
+                self._degrade(state, "planner", _bounded_error(first_error))
+            else:
+                try:
+                    repair = repair_prompt(first_error.errors, raw if isinstance(raw, Mapping) else {})
+                    repaired = self._model_request(
+                        state,
+                        role="planner",
+                        request_id="planner:repair:1",
+                        phase=RunPhase.PLANNING,
+                        component=self.planner,
+                        method="repair",
+                        context={
+                            "obligations": state.obligations,
+                            "topology": inputs.topology,
+                            "config": inputs.config,
+                            "repair": repair,
+                            "pr_metadata": inputs.pr_metadata,
+                            "policy": inputs.policy,
+                        },
+                    )
+                    if not isinstance(repaired, Mapping):
+                        raise AssignmentPlanError("planner repair must be an object")
+                    plan = self.assignment_validator(
+                        repaired, state.obligations, inputs.topology, inputs.config,
+                    )
+                    state.plan_source = "model_repaired_validated"
+                    state.planner_repaired = True
+                    return plan
+                except Exception as exc:
+                    self._degrade(state, "planner", _bounded_error(exc))
         except Exception as exc:
             self._degrade(state, "planner", _bounded_error(exc))
         state.journal.emit("recovery", {

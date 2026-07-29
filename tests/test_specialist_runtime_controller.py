@@ -12,6 +12,7 @@ import time
 import pytest
 
 from pr_reviewer.conversation import Conversation
+from pr_reviewer.specialist_runtime import cli
 from pr_reviewer.specialist_runtime.adjudication import (
     ReviewHandoffContext,
     ReviewOrientationTopic,
@@ -23,6 +24,7 @@ from pr_reviewer.specialist_runtime.controller import (
     ReviewController,
     ReviewInputs,
     ReviewResult,
+    _RunState,
     _atomic_write_json,
     _directory_fsync_status,
 )
@@ -34,7 +36,7 @@ from pr_reviewer.specialist_runtime.callbacks import (
 from pr_reviewer.specialist_runtime.events import EventJournal
 from pr_reviewer.specialist_runtime.evidence import EvidenceStore
 from pr_reviewer.specialist_runtime.coverage import derive_obligations
-from pr_reviewer.specialist_runtime.budget import BudgetLedger
+from pr_reviewer.specialist_runtime.budget import BudgetLedger, RunDeadline
 from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy, RuntimeConfig
 from pr_reviewer.specialist_runtime.model_gateway import ModelTurnResult
 from pr_reviewer.specialist_runtime.scheduler import SessionScheduler
@@ -326,6 +328,64 @@ def test_planner_failure_uses_deterministic_assignment_plan(tmp_path):
     assert "planner" in result.handoff.coverage_warning
     assert "planner unavailable" not in result.handoff.markdown
     assert result.publishing_ready is True
+
+
+def test_truncated_planner_final_json_does_not_trigger_a_fourth_provider_request(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    now = time.monotonic()
+    controller.clock = lambda: now
+    payloads = []
+    responses = iter((
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"role": "assistant", "reasoning_content": "first reasoning"},
+            }],
+            "usage": {},
+        },
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"role": "assistant", "reasoning_content": "second reasoning"},
+            }],
+            "usage": {},
+        },
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": '{"assignments":[]}'},
+            }],
+            "usage": {},
+        },
+    ))
+
+    def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
+        payloads.append(payload)
+        return next(responses)
+
+    controller.planner.gateway.transport = transport
+    inputs = _inputs(tmp_path)
+    state = _RunState(
+        inputs=inputs,
+        journal=EventJournal(),
+        deadline=RunDeadline(
+            now, inputs.config.review_deadline_sec, inputs.config.phase_shares,
+        ),
+        evidence=EvidenceStore(),
+        obligations=derive_obligations(
+            inputs.topology, inputs.classification, inputs.policy,
+        ),
+    )
+
+    plan = controller._plan(state)
+
+    assert len(payloads) == 3
+    assert state.plan_source == "deterministic_fallback"
+    assert plan.assignments[0].id.startswith("fallback-")
 
 
 def test_specialist_failure_gets_one_bounded_followup_reassignment(tmp_path):
