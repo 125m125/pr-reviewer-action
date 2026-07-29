@@ -683,6 +683,177 @@ def test_planner_continues_truncated_reasoning_then_forces_json_response(
     assert payloads[2]["response_format"] == {"type": "json_object"}
 
 
+def test_negotiator_continues_truncated_reasoning_then_forces_json_response(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    monkeypatch.setenv("AI_RESPONSE_FORMAT", "json_schema")
+    monkeypatch.setenv("AI_REASONING_EFFORT", "high")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    payloads = []
+    responses = iter((
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"role": "assistant", "reasoning_content": "unfinished reasoning"},
+            }],
+            "usage": {},
+        },
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": '{"actions":[{"kind":"stop","assignment_id":"a"}]}',
+                },
+            }],
+            "usage": {},
+        },
+    ))
+
+    def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
+        payloads.append(payload)
+        return next(responses)
+
+    controller.negotiator.gateway.transport = transport
+
+    assert controller.negotiator.complete(
+        _role_request("negotiator", RunPhase.FOLLOWUP)
+    ) == {"actions": [{"kind": "stop", "assignment_id": "a"}]}
+    assert len(payloads) == 2
+    assert any(
+        message == {"role": "assistant", "content": "unfinished reasoning"}
+        for message in payloads[1]["messages"]
+    )
+    assert payloads[1]["reasoning_effort"] == "none"
+    assert payloads[1]["response_format"] == {"type": "json_object"}
+
+
+def test_finalizer_continues_length_response_even_when_interim_text_is_empty(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    payloads = []
+    responses = iter((
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {"role": "assistant", "content": ""},
+            }],
+            "usage": {},
+        },
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": '{"recommendation":"Review the boundary."}',
+                },
+            }],
+            "usage": {},
+        },
+    ))
+
+    def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
+        payloads.append(payload)
+        return next(responses)
+
+    controller.finalizer.gateway.transport = transport
+    assert controller.finalizer.complete(
+        _role_request("finalizer", RunPhase.FINALIZATION)
+    ) == {"recommendation": "Review the boundary."}
+    assert len(payloads) == 2
+    assert payloads[1]["reasoning_effort"] == "none"
+
+
+def test_finalizer_accepts_one_fenced_json_object_followed_by_prose(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+
+    def transport(_base_url, _api_format, _payload, _api_key, _timeout, **_kwargs):
+        return {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        "```json\n"
+                        '{"recommendation":"Recheck {runtime} behavior."}\n'
+                        "```\nThe report above is final."
+                    ),
+                },
+            }],
+            "usage": {},
+        }
+
+    controller.finalizer.gateway.transport = transport
+    assert controller.finalizer.complete(
+        _role_request("finalizer", RunPhase.FINALIZATION)
+    ) == {"recommendation": "Recheck {runtime} behavior."}
+
+
+def test_structured_role_rejects_ambiguous_multiple_json_objects(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+
+    def transport(_base_url, _api_format, _payload, _api_key, _timeout, **_kwargs):
+        return {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": '{"a":1}\n{"b":2}'},
+            }],
+            "usage": {},
+        }
+
+    controller.finalizer.gateway.transport = transport
+    with pytest.raises(ValueError, match="exactly one JSON object"):
+        controller.finalizer.complete(
+            _role_request("finalizer", RunPhase.FINALIZATION)
+        )
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        '"quoted prose with an escaped quote \\" and {}" {"real":1}',
+        '[{"nested":"object"}]',
+    ),
+)
+def test_structured_role_ignores_quoted_braces_and_rejects_container_objects(
+    monkeypatch, tmp_path, content,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+
+    def transport(_base_url, _api_format, _payload, _api_key, _timeout, **_kwargs):
+        return {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": content},
+            }],
+            "usage": {},
+        }
+
+    controller.finalizer.gateway.transport = transport
+    if content.startswith("["):
+        with pytest.raises(ValueError, match="exactly one JSON object"):
+            controller.finalizer.complete(
+                _role_request("finalizer", RunPhase.FINALIZATION)
+            )
+    else:
+        assert controller.finalizer.complete(
+            _role_request("finalizer", RunPhase.FINALIZATION)
+        ) == {"real": 1}
+
+
 def test_planner_uses_its_configured_output_limit_over_session_limit(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
     monkeypatch.setenv("AI_MODEL", "local-model")

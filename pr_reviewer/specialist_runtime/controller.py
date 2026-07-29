@@ -394,14 +394,58 @@ def _validated_critic_result(
 
 
 def _json_object(text: str) -> Mapping[str, object]:
-    candidate = str(text or "").strip()
-    if candidate.startswith("```"):
-        lines = candidate.splitlines()
-        candidate = "\n".join(lines[1:-1]).strip() if len(lines) >= 3 else candidate
-    value = json.loads(candidate)
-    if not isinstance(value, Mapping):
-        raise ValueError("role model response must be one JSON object")
-    return value
+    """Extract one unambiguous JSON object from a structured-role response.
+
+    Compatible endpoints do not consistently honor response-format hints and
+    may wrap an otherwise valid object in a fence or append a short
+    explanation.  Scan balanced top-level object spans while respecting JSON
+    strings, but fail closed if the response contains zero or multiple valid
+    objects.
+    """
+    source = str(text or "")
+    objects: list[Mapping[str, object]] = []
+    start: int | None = None
+    depth = 0
+    array_depth = 0
+    in_string = False
+    escaped = False
+    for index, character in enumerate(source):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+            continue
+        if start is not None:
+            if character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        value = json.loads(source[start:index + 1])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+                    else:
+                        if isinstance(value, Mapping):
+                            objects.append(value)
+                    start = None
+            continue
+        if character == "[":
+            array_depth += 1
+        elif character == "]":
+            array_depth = max(0, array_depth - 1)
+        elif character == "{" and array_depth == 0:
+            start = index
+            depth = 1
+    if len(objects) != 1:
+        raise ValueError("role model response must contain exactly one JSON object")
+    return objects[0]
 
 
 @dataclass(frozen=True)
