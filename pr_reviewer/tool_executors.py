@@ -338,7 +338,8 @@ def run_command(
             return {"error": "Immutable diff range requires valid base and head object IDs"}
         option = "--stat" if command_name == "git_diff_stat" else "--name-only"
         args = [
-            "git", "diff", option, "--find-renames", base_sha, head_sha, "--",
+            "git", "diff", option, "--find-renames",
+            f"{base_sha}...{head_sha}", "--",
         ]
 
     try:
@@ -391,6 +392,7 @@ def execute_tool_request(
     deadline_at=None,
     base_sha=None,
     head_sha=None,
+    allowed_diff_paths=(),
 ):
     """Execute a single tool request and return the result dict.
 
@@ -415,6 +417,69 @@ def execute_tool_request(
             if res.get("range"):
                 result_payload["range"] = res["range"]
             tool_result["result"] = result_payload
+
+        elif tool_name == "read_pr_diff":
+            path = args.get("path", "")
+            if not path:
+                raise ValueError("Missing 'path' argument")
+            if (
+                not isinstance(base_sha, str)
+                or not isinstance(head_sha, str)
+                or not _GIT_OBJECT_ID_RE.fullmatch(base_sha)
+                or not _GIT_OBJECT_ID_RE.fullmatch(head_sha)
+            ):
+                raise ValueError(
+                    "Immutable PR patch requires valid controller base and head object IDs"
+                )
+            resolved, err = _resolve_workspace_path(path, workspace_root)
+            if err:
+                raise ValueError(err)
+            root = Path(workspace_root).resolve()
+            normalized_path = resolved.relative_to(root).as_posix()
+            allowed = {
+                candidate.replace("\\", "/").strip("/")
+                for candidate in allowed_diff_paths
+                if isinstance(candidate, str) and candidate
+            }
+            if normalized_path not in allowed:
+                raise ValueError("Path is outside this specialist assignment")
+            requested_context = _opt_int(args.get("context_lines"))
+            context_lines = max(
+                0, min(3 if requested_context is None else requested_context, 20)
+            )
+            offset = max(_opt_int(args.get("offset")) or 1, 1)
+            limit = max(1, min(_opt_int(args.get("limit")) or 400, 400))
+            diff_args = [
+                "git", "diff", "--no-ext-diff", "--no-color",
+                "--find-renames", f"--unified={context_lines}",
+                f"{base_sha}...{head_sha}", "--", normalized_path,
+            ]
+            completed = subprocess.run(
+                diff_args,
+                cwd=workspace_root,
+                capture_output=True,
+                text=True,
+                timeout=request_timeout,
+            )
+            if completed.returncode != 0:
+                raise ValueError(
+                    f"git diff failed: {mask_secrets((completed.stderr or '').strip())}"
+                )
+            lines = (completed.stdout or "").splitlines(keepends=True)
+            start = offset - 1
+            window = "".join(lines[start:start + limit])
+            patch, _ = mask_and_truncate(
+                mask_secrets(window), max_response_bytes
+            )
+            tool_result["result"] = {
+                "path": normalized_path,
+                "patch": patch,
+                "range": {
+                    "offset": offset,
+                    "lines": len(lines[start:start + limit]),
+                    "total_lines": len(lines),
+                },
+            }
 
         elif tool_name == "git_log":
             max_count = max(1, min(_opt_int(args.get("max_count")) or 20, 100))

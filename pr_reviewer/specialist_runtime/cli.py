@@ -20,7 +20,11 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 import hashlib
 
-from pr_reviewer.conversation import Conversation, web_tool_schemas
+from pr_reviewer.conversation import (
+    Conversation,
+    SPECIALIST_PR_DIFF_SCHEMA,
+    web_tool_schemas,
+)
 from pr_reviewer.specialists import build_topology
 from pr_reviewer.tool_executors import execute_tool_request
 
@@ -368,7 +372,10 @@ def _git_changed_files(workspace: Path, base_sha: str, head_sha: str) -> tuple[s
         if checked.returncode != 0:
             raise ValueError(f"current {label} commit is unavailable in the review workspace")
     result = subprocess.run(
-        ["git", "diff", "--name-only", "-z", "--find-renames", base_sha, head_sha],
+        [
+            "git", "diff", "--name-only", "-z", "--find-renames",
+            f"{base_sha}...{head_sha}", "--",
+        ],
         cwd=workspace, capture_output=True, check=False,
     )
     if result.returncode != 0:
@@ -654,6 +661,8 @@ def build_controller(
             )
         )
         tools = web_tool_schemas(config.search_url, policy) if tools_allowed else []
+        if tools_allowed:
+            tools.append(SPECIALIST_PR_DIFF_SCHEMA)
         conversation = Conversation(
             system=config.system_prompt.rstrip() + "\n\n" + _SPECIALIST_SYSTEM,
             tool_schemas=tools,
@@ -709,6 +718,9 @@ def build_controller(
                 deadline_at=deadline_at,
                 base_sha=immutable_diff_range[0] if immutable_diff_range else None,
                 head_sha=immutable_diff_range[1] if immutable_diff_range else None,
+                allowed_diff_paths=tuple(dict.fromkeys(
+                    (*assignment.seed_paths, *assignment.boundary_paths)
+                )),
             )
 
         return SpecialistSession(

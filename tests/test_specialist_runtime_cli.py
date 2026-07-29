@@ -340,7 +340,7 @@ def test_specialist_diff_command_uses_controller_owned_review_range(
     session = controller._cli_session_factory(
         Assignment(
             id="a", title="A", objective="Review", obligation_ids=(),
-            recipe_ids=(), lenses=(), seed_paths=(), boundary_paths=(),
+            recipe_ids=(), lenses=(), seed_paths=("reviewed.txt",), boundary_paths=(),
             expected_evidence=(), estimated_turns=1, priority="normal",
         ),
         SessionLease(RunPhase.INITIAL, 10**20),
@@ -361,6 +361,28 @@ def test_specialist_diff_command_uses_controller_owned_review_range(
 
     assert result["status"] == "ok"
     assert result["result"]["stdout"] == "reviewed.txt"
+    assert "read_pr_diff" in {
+        item["name"] for item in session.conversation.tool_schemas
+    }
+    patch = session.execute_tool(
+        "read_pr_diff",
+        {
+            "path": "reviewed.txt",
+            "context_lines": 3,
+            "base_sha": "3" * 40,
+            "head_sha": "4" * 40,
+        },
+    )
+    assert patch["status"] == "ok"
+    assert patch["result"]["path"] == "reviewed.txt"
+    assert "-base" in patch["result"]["patch"]
+    assert "+head" in patch["result"]["patch"]
+    rejected = session.execute_tool(
+        "read_pr_diff",
+        {"path": "outside.txt"},
+    )
+    assert rejected["status"] == "error"
+    assert "assignment" in rejected["result"]["error"].lower()
     assert subprocess.run(
         ["git", "status", "--porcelain"], cwd=tmp_path, check=True,
         capture_output=True, text=True,
@@ -378,6 +400,68 @@ def test_controller_rejects_symbolic_or_malformed_diff_revisions(
             cli.CliConfig.from_env(workspace=tmp_path),
             immutable_diff_range=("HEAD", "2" * 40),
         )
+
+
+def test_git_changed_files_uses_merge_base_when_target_branch_advances(tmp_path):
+    subprocess.run(
+        ["git", "init", "-q"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "review@example.test"],
+        cwd=tmp_path, check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Review Test"],
+        cwd=tmp_path, check=True, capture_output=True, text=True,
+    )
+    (tmp_path / "base.txt").write_text("initial\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "base.txt"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "common"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "feature"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    )
+    (tmp_path / "feature.txt").write_text("feature\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "feature.txt"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "feature"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    )
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "checkout", "-q", "master"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    )
+    (tmp_path / "target-only.txt").write_text("advanced\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "target-only.txt"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "target advances"], cwd=tmp_path,
+        check=True, capture_output=True, text=True,
+    )
+    advanced_base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    assert cli._git_changed_files(
+        tmp_path, advanced_base_sha, head_sha,
+    ) == ("feature.txt",)
 
 
 def test_planner_context_byte_limit_stops_oversized_request_before_transport(

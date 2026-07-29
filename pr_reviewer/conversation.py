@@ -210,8 +210,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "allowlist. Raw shell text is never accepted; only the catalog "
             "names git_status_short, git_diff_stat, git_diff_name_only are "
             "permitted. During specialist reviews the diff commands compare "
-            "the controller-owned immutable pull-request base and head commits, "
-            "not the clean worktree or model-provided revisions."
+            "the controller-owned immutable pull-request base merge-base and "
+            "head commits (base...head), not the clean worktree or "
+            "model-provided revisions."
         ),
         "parameters": {
             "type": "object",
@@ -226,6 +227,39 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
 ]
+
+SPECIALIST_PR_DIFF_SCHEMA: dict[str, Any] = {
+    "name": "read_pr_diff",
+    "description": (
+        "Read a bounded patch for one file in this specialist's assignment. "
+        "The controller compares the immutable pull-request base merge-base "
+        "to the immutable head (base...head); revisions cannot be supplied by "
+        "the model. Paths outside the assignment boundaries are rejected."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Repository-relative assigned file path.",
+            },
+            "context_lines": {
+                "type": "integer",
+                "description": "Unified context lines (0-20, default 3).",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Optional 1-based first patch line to return.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Optional patch-line limit (1-400, default 400).",
+            },
+        },
+        "required": ["path"],
+        "additionalProperties": False,
+    },
+}
 
 # Opt-in tool: advertised only when a search endpoint is configured (see
 # run_native_loop). web_fetch needs the exact URL up front; web_search lets a
