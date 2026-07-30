@@ -1344,6 +1344,7 @@ def test_negotiator_failure_uses_live_budget_fallback_resume(tmp_path):
 
     def broken_negotiator(state):
         assert state.session_resources[0].remaining_model_turns == 7
+        assert state.session_resources[0].remaining_tool_calls == 8
         raise RuntimeError("negotiator invalid response")
 
     result = _controller(tmp_path,

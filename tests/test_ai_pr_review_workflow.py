@@ -80,3 +80,14 @@ def test_dogfood_workflow_temporarily_allows_large_planner_preflight():
     assert _scalar(
         workflow, "specialist_planner_max_context_bytes", 10,
     ) == '"400000"'
+
+
+def test_dogfood_workflow_allows_multiple_tools_per_specialist_turn():
+    workflow = _WORKFLOW.read_text(encoding="utf-8").splitlines()
+
+    assert _scalar(
+        workflow, "specialist_max_model_turns_per_session", 10,
+    ) == '"64"'
+    assert _scalar(
+        workflow, "specialist_max_tool_calls_per_session", 10,
+    ) == '"128"'

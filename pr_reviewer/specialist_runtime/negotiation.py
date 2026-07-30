@@ -72,6 +72,7 @@ class SessionResources:
     session_id: str
     remaining_model_turns: int
     lease_remaining_sec: float
+    remaining_tool_calls: int
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -82,6 +83,12 @@ class SessionResources:
             or self.remaining_model_turns < 0
         ):
             raise ValueError("remaining_model_turns must be a non-negative integer")
+        if (
+            isinstance(self.remaining_tool_calls, bool)
+            or not isinstance(self.remaining_tool_calls, int)
+            or self.remaining_tool_calls < 0
+        ):
+            raise ValueError("remaining_tool_calls must be a non-negative integer")
         if not isfinite(self.lease_remaining_sec) or self.lease_remaining_sec < 0:
             raise ValueError("lease_remaining_sec must be non-negative and finite")
 
@@ -105,6 +112,7 @@ class NegotiationState:
     new_session_turns_remaining: int
     new_session_turn_cap: int
     new_session_lease_remaining_sec: float
+    new_session_tool_call_cap: int
 
     def __post_init__(self) -> None:
         obligation_ids = [item.id for item in self.obligations]
@@ -154,6 +162,7 @@ class NegotiationState:
             self.followup_sessions_started, self.max_followup_sessions,
             self.new_session_turns_remaining,
             self.new_session_turn_cap,
+            self.new_session_tool_call_cap,
         )
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in numeric_counts):
             raise ValueError("session counts and remaining turns must be non-negative integers")
@@ -363,6 +372,8 @@ def _validate_feasibility(
             continue
         if turns > resource.remaining_model_turns:
             errors.append(f"session '{session_id}' exceeds its remaining model-turn budget")
+        if resource.remaining_tool_calls == 0:
+            errors.append(f"session '{session_id}' has no remaining tool-call budget")
         if turns * state.seconds_per_turn > resource.lease_remaining_sec:
             errors.append(f"session '{session_id}' exceeds its remaining lease")
 
@@ -381,6 +392,8 @@ def _validate_feasibility(
         errors.append("new session exceeds its available lease")
     if any(item.estimated_turns > state.new_session_turn_cap for item in new_session_actions):
         errors.append("new session exceeds the controller-owned per-session turn cap")
+    if new_session_actions and state.new_session_tool_call_cap == 0:
+        errors.append("new session has no controller-owned tool-call budget")
     return errors
 
 

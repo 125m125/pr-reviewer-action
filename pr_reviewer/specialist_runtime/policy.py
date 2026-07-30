@@ -228,7 +228,7 @@ class RuntimeConfig:
     max_sessions: int = 8
     max_followup_sessions: int = 2
     session_limits: BudgetLimits = field(
-        default_factory=lambda: BudgetLimits(model_turns=64, tool_calls=20, recoveries=1)
+        default_factory=lambda: BudgetLimits(model_turns=64, tool_calls=128, recoveries=1)
     )
     deprecation_warnings: tuple[str, ...] = ()
 
@@ -279,7 +279,7 @@ class RuntimeConfig:
             session_limits=BudgetLimits(
                 model_turns=setting("SPECIALIST_MAX_MODEL_TURNS_PER_SESSION", 64),
                 tool_calls=setting(
-                    "SPECIALIST_MAX_TOOL_CALLS_PER_SESSION", 20,
+                    "SPECIALIST_MAX_TOOL_CALLS_PER_SESSION", 128,
                     alias="SPECIALIST_MAX_TOOL_CALLS_PER_PASS",
                 ),
                 recoveries=setting("SPECIALIST_MAX_RECOVERIES_PER_SESSION", 1),

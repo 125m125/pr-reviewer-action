@@ -261,7 +261,7 @@ class CliConfig:
         aliases = (
             ("SPECIALIST_MAX_SESSIONS", "8", "SPECIALIST_MAX_INITIAL_PASSES", "6"),
             ("SPECIALIST_MAX_FOLLOWUP_SESSIONS", "2", "SPECIALIST_MAX_FOLLOWUP_PASSES", "2"),
-            ("SPECIALIST_MAX_TOOL_CALLS_PER_SESSION", "20", "SPECIALIST_MAX_TOOL_CALLS_PER_PASS", "20"),
+            ("SPECIALIST_MAX_TOOL_CALLS_PER_SESSION", "128", "SPECIALIST_MAX_TOOL_CALLS_PER_PASS", "128"),
         )
         for current, current_default, alias, alias_default in aliases:
             if alias in source and source.get(alias) != alias_default:

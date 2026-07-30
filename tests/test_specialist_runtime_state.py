@@ -9,6 +9,7 @@ from pr_reviewer.specialist_runtime.budget import (
     SessionLease,
 )
 from pr_reviewer.specialist_runtime.events import RunArtifactProjector, RunEvent
+from pr_reviewer.specialist_runtime.policy import RuntimeConfig
 from pr_reviewer.specialist_runtime.types import BudgetLimits, PhaseShares, RunPhase
 
 
@@ -23,6 +24,20 @@ def test_lifetime_budget_never_resets_on_recovery():
     assert snapshot.recoveries == 1
     with pytest.raises(BudgetExceeded):
         ledger.record_recovery("context-pressure")
+
+
+def test_default_session_budget_supports_multiple_tools_per_model_turn():
+    config = RuntimeConfig()
+    ledger = BudgetLedger(config.session_limits)
+
+    for _ in range(config.session_limits.model_turns):
+        ledger.reserve_model_turn()
+        ledger.reserve_tool_calls(2)
+
+    assert config.session_limits.model_turns == 64
+    assert config.session_limits.tool_calls == 128
+    assert ledger.remaining_model_turns() == 0
+    assert ledger.remaining_tool_calls() == 0
 
 
 def test_phase_shares_must_total_one_hundred():

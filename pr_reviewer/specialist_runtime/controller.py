@@ -2353,13 +2353,18 @@ class ReviewController:
             ledger = getattr(session, "budget", None)
             if isinstance(ledger, BudgetLedger):
                 remaining_turns = ledger.remaining_model_turns()
+                remaining_tools = ledger.remaining_tool_calls()
             else:
                 remaining_turns = max(
                     0, state.inputs.config.session_limits.model_turns - result.budget.model_turns,
                 )
+                remaining_tools = max(
+                    0, state.inputs.config.session_limits.tool_calls - result.budget.tool_calls,
+                )
             resources.append(SessionResources(
                 session_id=session_id,
                 remaining_model_turns=remaining_turns,
+                remaining_tool_calls=remaining_tools,
                 lease_remaining_sec=session.lease.remaining(now=self.clock()),
             ))
         checkpoints = tuple(
@@ -2384,6 +2389,7 @@ class ReviewController:
                 * state.inputs.config.session_limits.model_turns,
             ),
             new_session_turn_cap=state.inputs.config.session_limits.model_turns,
+            new_session_tool_call_cap=state.inputs.config.session_limits.tool_calls,
             new_session_lease_remaining_sec=state.deadline.remaining_for_exploration(
                 now=self.clock(),
             ),

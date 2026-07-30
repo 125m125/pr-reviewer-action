@@ -81,6 +81,7 @@ def state_for(
     max_followup_sessions: int = 1,
     new_session_turns_remaining: int = 4,
     new_session_turn_cap: int = 2,
+    new_session_tool_call_cap: int = 3,
     new_session_lease_remaining_sec: float = 100.0,
     remaining_deadline_sec: float = 100.0,
     assignments: tuple[Assignment | SpecialistAssignment, ...] | None = None,
@@ -105,8 +106,14 @@ def state_for(
             SessionOwnership("S2", "A2", primary_obligation_ids=("OB2",)),
         ),
         session_resources=resources or (
-            SessionResources("S1", remaining_model_turns=3, lease_remaining_sec=100.0),
-            SessionResources("S2", remaining_model_turns=3, lease_remaining_sec=100.0),
+            SessionResources(
+                "S1", remaining_model_turns=3, remaining_tool_calls=3,
+                lease_remaining_sec=100.0,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=3, remaining_tool_calls=3,
+                lease_remaining_sec=100.0,
+            ),
         ),
         remaining_deadline_sec=remaining_deadline_sec,
         seconds_per_turn=10.0,
@@ -116,6 +123,7 @@ def state_for(
         max_followup_sessions=max_followup_sessions,
         new_session_turns_remaining=new_session_turns_remaining,
         new_session_turn_cap=new_session_turn_cap,
+        new_session_tool_call_cap=new_session_tool_call_cap,
         new_session_lease_remaining_sec=new_session_lease_remaining_sec,
     )
 
@@ -131,6 +139,59 @@ def resume_raw(**updates):
     }
     raw.update(updates)
     return {"actions": [raw]}
+
+
+def test_tool_exhausted_durable_session_cannot_resume_but_new_session_can():
+    state = state_for(resources=(
+        SessionResources(
+            "S1", remaining_model_turns=3, remaining_tool_calls=0,
+            lease_remaining_sec=100.0,
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=3, remaining_tool_calls=3,
+            lease_remaining_sec=100.0,
+        ),
+    ))
+
+    with pytest.raises(
+        NegotiationError, match="session 'S1' has no remaining tool-call budget",
+    ):
+        validate_negotiation(resume_raw(), state)
+
+    proposal = validate_negotiation({
+        "actions": [{
+            "kind": "new_session",
+            "obligation_ids": ["OB1"],
+            "expected_evidence": ["tests"],
+            "estimated_turns": 2,
+            "reason": "The durable owner exhausted its evidence tools.",
+        }],
+    }, state)
+
+    assert proposal.actions[0].kind == "new_session"
+
+
+def test_tool_exhausted_session_can_record_unknown_when_no_new_session_is_available():
+    state = state_for(
+        resources=(
+            SessionResources(
+                "S1", remaining_model_turns=3, remaining_tool_calls=0,
+                lease_remaining_sec=100.0,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=3, remaining_tool_calls=0,
+                lease_remaining_sec=100.0,
+            ),
+        ),
+        current_session_count=2,
+        max_sessions=2,
+        max_followup_sessions=0,
+        new_session_turns_remaining=0,
+    )
+
+    action = fallback_next_action(state)
+
+    assert action.kind == "record_unknown"
 
 
 def test_reconcile_wave_uses_evidence_predicates_not_declared_coverage():
@@ -455,8 +516,14 @@ def test_planner_secondary_owner_can_be_selected_for_consultation():
         assignments=assignments,
         session_ownership=ownership,
         resources=(
-            SessionResources("S1", remaining_model_turns=3, lease_remaining_sec=100.0),
-            SessionResources("S2", remaining_model_turns=3, lease_remaining_sec=100.0),
+            SessionResources(
+                "S1", remaining_model_turns=3, lease_remaining_sec=100.0,
+                remaining_tool_calls=3,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=3, lease_remaining_sec=100.0,
+                remaining_tool_calls=3,
+            ),
         ),
     )
     raw = resume_raw(kind="consult", session_id="S2", estimated_turns=1)
@@ -633,8 +700,14 @@ def test_proposals_cannot_repeat_covered_work_or_exceed_lease_or_deadline():
         validate_negotiation(resume_raw(), state_for(covered=("OB1",)))
 
     resources = (
-        SessionResources("S1", remaining_model_turns=3, lease_remaining_sec=15.0),
-        SessionResources("S2", remaining_model_turns=3, lease_remaining_sec=100.0),
+        SessionResources(
+            "S1", remaining_model_turns=3, lease_remaining_sec=15.0,
+            remaining_tool_calls=3,
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=3, lease_remaining_sec=100.0,
+            remaining_tool_calls=3,
+        ),
     )
     with pytest.raises(NegotiationError, match="lease"):
         validate_negotiation(resume_raw(), state_for(resources=resources))
@@ -700,6 +773,7 @@ def test_negotiation_uses_explicit_session_to_specialist_assignment_ownership():
         ),),
         resources=(SessionResources(
             "durable-session-9", remaining_model_turns=3, lease_remaining_sec=100.0,
+            remaining_tool_calls=3,
         ),),
     )
 
@@ -720,6 +794,7 @@ def test_multiple_actions_cannot_target_same_durable_session_even_when_disjoint(
         ),),
         resources=(SessionResources(
             "S1", remaining_model_turns=4, lease_remaining_sec=100.0,
+            remaining_tool_calls=3,
         ),),
     )
     raw = {"actions": [
@@ -806,8 +881,14 @@ def test_fallback_resumes_useful_primary_owner_for_highest_risk_gap():
 
 def test_fallback_creates_one_narrow_session_when_primary_owner_is_infeasible():
     resources = (
-        SessionResources("S1", remaining_model_turns=3, lease_remaining_sec=100.0),
-        SessionResources("S2", remaining_model_turns=0, lease_remaining_sec=100.0),
+        SessionResources(
+            "S1", remaining_model_turns=3, lease_remaining_sec=100.0,
+            remaining_tool_calls=3,
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=0, lease_remaining_sec=100.0,
+            remaining_tool_calls=0,
+        ),
     )
 
     action = fallback_next_action(state_for(resources=resources))
@@ -819,8 +900,14 @@ def test_fallback_creates_one_narrow_session_when_primary_owner_is_infeasible():
 
 def test_fallback_records_policy_governed_unknown_when_no_work_is_feasible():
     resources = (
-        SessionResources("S1", remaining_model_turns=0, lease_remaining_sec=0.0),
-        SessionResources("S2", remaining_model_turns=0, lease_remaining_sec=0.0),
+        SessionResources(
+            "S1", remaining_model_turns=0, lease_remaining_sec=0.0,
+            remaining_tool_calls=0,
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=0, lease_remaining_sec=0.0,
+            remaining_tool_calls=0,
+        ),
     )
 
     action = fallback_next_action(

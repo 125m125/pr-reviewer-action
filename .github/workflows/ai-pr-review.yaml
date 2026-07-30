@@ -118,7 +118,7 @@ jobs:
           specialist_max_sessions: "8"
           specialist_max_followup_sessions: "2"
           specialist_max_model_turns_per_session: "64"
-          specialist_max_tool_calls_per_session: "20"
+          specialist_max_tool_calls_per_session: "128"
           specialist_max_recoveries_per_session: "1"
 
           specialist_planner_max_tokens: "8192"

@@ -111,7 +111,7 @@ inputs:
   specialist_max_tool_calls_per_session:
     description: Lifetime read-only tool-call limit for one logical specialist session.
     required: false
-    default: "20"
+    default: "128"
   specialist_max_recoveries_per_session:
     description: Lifetime reconstruction limit for one logical specialist session.
     required: false
@@ -139,7 +139,7 @@ inputs:
   specialist_max_tool_calls_per_pass:
     description: Deprecated one-release alias for specialist_max_tool_calls_per_session.
     required: false
-    default: "20"
+    default: "128"
   specialist_tool_mode:
     description: Specialist evidence mode. native_loop is used; packet is deprecated and emits a migration warning.
     required: false
