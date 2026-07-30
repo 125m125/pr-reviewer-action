@@ -61,7 +61,14 @@ def _candidate(
     causal_chain: str = "The retry repeats a write after an ambiguous response.",
     consequence: str = "A user action can be persisted twice.",
     manual_validation: str = "Force an ambiguous retry and verify exactly one write is persisted.",
+    confidence_rationale: str | None = None,
 ) -> CandidateFinding:
+    rationale = confidence_rationale or (
+        "consequence_support:reachable_input_path; "
+        f"evidence_ids={','.join(evidence_ids)}; "
+        "input=ambiguous response; condition=retry repeats a write; "
+        "outcome=A user action can be persisted twice"
+    )
     return CandidateFinding(
         candidate_id=candidate_id,
         root_cause_fingerprint="model-controlled-value",
@@ -75,6 +82,7 @@ def _candidate(
         related_obligation_ids=obligation_ids,
         collector_session_id="session-1",
         model_identity="specialist-model",
+        confidence_rationale=rationale,
         user_visible_consequence=consequence,
         manual_validation=manual_validation,
     )
@@ -242,6 +250,12 @@ def test_defensive_revalidation_cannot_publish_zero_based_github_line_hypothesis
         claim="GitHub review comment lines might be zero-based",
         causal_chain="GitHub may accept line 0 for a review comment location.",
         evidence_ids=(evidence_id,),
+        confidence_rationale=(
+            "consequence_support:reachable_input_path; "
+            f"evidence_ids={evidence_id}; input=line 0; "
+            "condition=GitHub may accept line 0; "
+            "outcome=A user action can be persisted twice"
+        ),
         manual_validation="Check whether the GitHub review API accepts line 0.",
     )
     accepted = _adjudicate(
@@ -419,6 +433,95 @@ def test_handoff_is_sparse_and_uses_only_genuine_structured_theme():
     assert len(handoff.review_emphasis) == 3
     assert "review the complete change" in handoff.markdown
     assert "Source access requests" not in handoff.markdown
+
+
+def test_handoff_renders_concise_behavioral_sections_without_component_inventory():
+    handoff = build_review_handoff(
+        ReviewHandoffContext(
+            what_changed=(
+                "`src/store.py` changes database persistence behavior.",
+                "`src/store.py` changes database persistence behavior.",
+            ),
+            ai_reviewed=(
+                "Reviewed database persistence behavior in `src/store.py`.",
+            ),
+            component_ids=("store",),
+            review_emphasis_topics=(
+                ReviewOrientationTopic.DATABASE,
+                ReviewOrientationTopic.FAILURE_RECOVERY,
+                ReviewOrientationTopic.CROSS_COMPONENT_CONTRACTS,
+                ReviewOrientationTopic.SECURITY,
+            ),
+        ),
+        review=AdjudicatedReview(),
+        evidence=EvidenceStore(),
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert "### What changed" in handoff.markdown
+    assert "### What the AI reviewed" in handoff.markdown
+    assert "### Human focus" in handoff.markdown
+    assert handoff.what_changed == (
+        "`src/store.py` changes database persistence behavior.",
+    )
+    assert handoff.ai_reviewed == (
+        "Reviewed database persistence behavior in `src/store.py`.",
+    )
+    assert len(handoff.human_focus) == 3
+    assert "Component: store" not in handoff.markdown
+    assert "### Change map" not in handoff.markdown
+    assert "### AI focus and coverage" not in handoff.markdown
+
+
+def test_handoff_drops_behavioral_summaries_without_an_authorized_changed_path():
+    handoff = build_review_handoff(
+        ReviewHandoffContext(
+            what_changed=(
+                "`src/store.py` changes database persistence behavior.",
+                "`src/invented.py` changes authorization behavior.",
+                "A path-free behavioral claim.",
+            ),
+            ai_reviewed=(
+                "Reviewed retry behavior using evidence:evidence-forged.",
+                "Reviewed persistence behavior in `src/store.py`.",
+            ),
+        ),
+        review=AdjudicatedReview(),
+        evidence=EvidenceStore(),
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert handoff.what_changed == (
+        "`src/store.py` changes database persistence behavior.",
+    )
+    assert handoff.ai_reviewed == (
+        "Reviewed persistence behavior in `src/store.py`.",
+    )
+    assert "invented.py" not in handoff.markdown
+    assert "path-free" not in handoff.markdown
+    assert "evidence-forged" not in handoff.markdown
+
+
+def test_handoff_caps_behavioral_summary_count_and_length():
+    changed_files = tuple(f"src/module-{index}.py" for index in range(7))
+    summaries = (
+        "`src/module-0.py` " + ("x" * 145),
+    ) + tuple(
+        f"`{path}` changes runtime implementation behavior."
+        for path in changed_files
+    )
+    handoff = build_review_handoff(
+        ReviewHandoffContext(what_changed=summaries),
+        review=AdjudicatedReview(),
+        evidence=EvidenceStore(),
+        obligations=_obligations(),
+        changed_files=changed_files,
+    )
+
+    assert len(handoff.what_changed) == 5
+    assert all(len(item) <= 160 for item in handoff.what_changed)
 
 
 def test_handoff_compactly_names_distinct_degraded_stages_without_details():

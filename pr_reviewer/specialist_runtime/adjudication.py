@@ -68,6 +68,7 @@ class AcceptedFinding:
     supporting_citations: tuple[EvidenceCitation, ...]
     contradicting_citations: tuple[EvidenceCitation, ...]
     manual_validation: str
+    confidence_rationale: str
     collector_session_id: str = ""
     model_identity: str = ""
     contributor_candidate_ids: tuple[str, ...] = ()
@@ -156,6 +157,8 @@ class ReviewHandoffContext:
     diagnostics_url: str | None = None
     source_access_requests: tuple[SourceAccessRequest, ...] = ()
     access_request_url: str | None = None
+    what_changed: tuple[str, ...] = ()
+    ai_reviewed: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -351,6 +354,112 @@ def _citation(record: EvidenceRecord) -> EvidenceCitation:
     )
 
 
+def _consequence_support_reason(
+    candidate: CandidateFinding,
+    *,
+    supporting: tuple[EvidenceRecord, ...],
+    contradictions: tuple[EvidenceRecord, ...],
+    related: tuple[CoverageObligation, ...],
+    affected_file: str,
+) -> str:
+    """Require typed evidence for the consequence, not merely the changed mechanism."""
+    prefix = "consequence_support:"
+    rationale = _unicode(candidate.confidence_rationale).strip()
+    if not rationale.casefold().startswith(prefix):
+        return "consequence-not-supported"
+    declaration = rationale[len(prefix):]
+    head, *raw_fields = declaration.split(";")
+    kind = head.strip().casefold()
+    details: dict[str, str] = {}
+    for raw_field in raw_fields:
+        key, separator, value = raw_field.partition("=")
+        if not separator or not key.strip() or not value.strip():
+            continue
+        details[key.strip().casefold()] = value.strip()
+    cited_ids = {
+        item.strip()
+        for item in details.get("evidence_ids", "").split(",")
+        if item.strip()
+    }
+    supporting_by_id = {record.id: record for record in supporting}
+    contradiction_by_id = {record.id: record for record in contradictions}
+    if not cited_ids or not cited_ids <= (supporting_by_id.keys() | contradiction_by_id.keys()):
+        return "consequence-not-supported"
+    cited_support = tuple(
+        supporting_by_id[item] for item in sorted(cited_ids & supporting_by_id.keys())
+    )
+    cited_contradictions = tuple(
+        contradiction_by_id[item] for item in sorted(cited_ids & contradiction_by_id.keys())
+    )
+
+    if kind == "reachable_input_path":
+        causal_identity = _detail_identity(candidate.causal_chain)
+        consequence_identity = _detail_identity(candidate.user_visible_consequence)
+        input_identity = _detail_identity(details.get("input", ""))
+        condition_identity = _detail_identity(details.get("condition", ""))
+        outcome_identity = _detail_identity(details.get("outcome", ""))
+        if (
+            input_identity
+            and input_identity in causal_identity
+            and condition_identity
+            and condition_identity in causal_identity
+            and outcome_identity
+            and outcome_identity in consequence_identity
+            and any(record.source_path == affected_file for record in cited_support)
+        ):
+            return ""
+    elif kind == "failing_behavioral_test":
+        if all(details.get(key) for key in ("test", "observed")) and any(
+            record.category.casefold() in {"test", "tests", "test-result", "behavioral-test"}
+            or record.tool.casefold() in {"pytest", "run_tests", "test"}
+            for record in cited_support
+        ):
+            return ""
+    elif kind == "violated_invariant":
+        obligation_id = details.get("obligation_id", "")
+        obligation = next((item for item in related if item.id == obligation_id), None)
+        contract = details.get("contract", "").strip()
+        contract_kind, separator, contract_value = contract.partition(":")
+        if contract.casefold() == "subject":
+            contract_kind, contract_value = "subject", ""
+            separator = ":"
+        authoritative_contracts = set()
+        if obligation is not None:
+            authoritative_contracts.add(("subject", ""))
+            authoritative_contracts.update(
+                ("predicate_index", str(index))
+                for index, _item in enumerate(obligation.satisfaction_predicates)
+            )
+        if all((
+            cited_support,
+            obligation is not None,
+            separator,
+            details.get("violation"),
+            (contract_kind.casefold(), contract_value.strip())
+            in authoritative_contracts,
+        )):
+            return ""
+    elif kind == "affected_consumer":
+        source_paths = {record.source_path for record in cited_support if record.source_path}
+        if (
+            all(details.get(key) for key in ("producer", "consumer", "outcome"))
+            and details["producer"] in source_paths
+            and details["consumer"] in source_paths
+        ):
+            return ""
+    elif kind == "contradicting_evidence":
+        linked = any(
+            set(record.contradicts) & supporting_by_id.keys()
+            for record in cited_contradictions
+        ) or any(
+            set(record.contradicts) & contradiction_by_id.keys()
+            for record in cited_support
+        )
+        if details.get("conflict") and cited_contradictions and linked:
+            return ""
+    return "consequence-not-supported"
+
+
 def _candidate_from_accepted(value: AcceptedFinding | CandidateFinding) -> CandidateFinding | None:
     if isinstance(value, CandidateFinding):
         return value
@@ -369,6 +478,7 @@ def _candidate_from_accepted(value: AcceptedFinding | CandidateFinding) -> Candi
         related_obligation_ids=value.related_obligation_ids,
         collector_session_id=value.collector_session_id,
         model_identity=value.model_identity,
+        confidence_rationale=value.confidence_rationale,
         user_visible_consequence=value.user_visible_consequence,
         manual_validation=value.manual_validation,
     )
@@ -457,6 +567,24 @@ def _authorize(
     contradictions = tuple(sorted(
         (record for record in contradiction_records if record), key=lambda item: item.id
     ))
+    consequence_support_reason = _consequence_support_reason(
+        candidate,
+        supporting=satisfying,
+        contradictions=contradictions,
+        related=related,
+        affected_file=affected_file,
+    )
+    cited_support = tuple(record for record in satisfying if record.id in {
+        item.strip()
+        for part in _unicode(candidate.confidence_rationale).split(";")
+        if part.strip().casefold().startswith("evidence_ids=")
+        for item in part.split("=", 1)[1].split(",")
+        if item.strip()
+    })
+    if any(not record.content.strip() or record.truncated for record in cited_support):
+        consequence_support_reason = "consequence-not-supported"
+    if consequence_support_reason:
+        return None, consequence_support_reason
     supporting_citations = tuple(_citation(record) for record in satisfying)
     contradicting_citations = tuple(_citation(record) for record in contradictions)
     return AcceptedFinding(
@@ -476,6 +604,7 @@ def _authorize(
         supporting_citations=supporting_citations,
         contradicting_citations=contradicting_citations,
         manual_validation=validations[0],
+        confidence_rationale=candidate.confidence_rationale,
         user_visible_consequences=consequences,
         manual_validations=validations,
         collector_session_id=candidate.collector_session_id,
@@ -618,6 +747,7 @@ def _merge_findings(group: Iterable[AcceptedFinding], representative_id: str) ->
         ),
         user_visible_consequence=consequences[0],
         manual_validation=validations[0],
+        confidence_rationale=representative.confidence_rationale,
         user_visible_consequences=consequences,
         manual_validations=validations,
         contributor_candidate_ids=tuple(sorted({
@@ -701,6 +831,13 @@ def adjudicate_candidates(
                 rejected=rejected,
                 dispositions=dispositions,
             )
+            continue
+        if candidate.severity == "info":
+            disposition = CandidateDisposition(
+                candidate_id, "reject", "non-actionable-info",
+            )
+            rejected[candidate_id] = disposition
+            dispositions[candidate_id] = disposition
             continue
         authorized, reason = _authorize(
             candidate,
@@ -988,31 +1125,21 @@ def render_review_handoff(handoff: ReviewHandoff) -> str:
         lines.extend(("", f"**Recommendation:** {handoff.recommendation}"))
     if handoff.status:
         lines.extend(("", f"**Status:** {handoff.status}"))
-    if handoff.change_map:
-        lines.extend(("", "### Change map", "", *[
-            f"- {item}" for item in handoff.change_map
+    if handoff.what_changed:
+        lines.extend(("", "### What changed", "", *[
+            f"- {item}" for item in handoff.what_changed
         ]))
-    if handoff.reviewed_focuses:
-        lines.extend(("", "### AI focus and coverage", ""))
-        if handoff.specialist_focuses:
-            lines.append(
-                "- Specialist focus: " + "; ".join(handoff.specialist_focuses)
-            )
-        if handoff.recipe_focuses:
-            lines.append(
-                "- Repository recipes: " + "; ".join(handoff.recipe_focuses)
-            )
-        if handoff.coverage_boundaries:
-            lines.append(
-                "- Coverage boundaries: " + "; ".join(handoff.coverage_boundaries)
-            )
+    if handoff.ai_reviewed:
+        lines.extend(("", "### What the AI reviewed", "", *[
+            f"- {item}" for item in handoff.ai_reviewed
+        ]))
     if handoff.thread_status:
         lines.extend(("", f"**Prepared detail notes:** {handoff.thread_status}"))
     if theme_label:
         lines.extend(("", f"**Aggregate finding theme:** {theme_label}"))
-    if handoff.review_emphasis:
-        lines.extend(("", "### Human review focus", "", *[
-            f"- {item}" for item in handoff.review_emphasis
+    if handoff.human_focus:
+        lines.extend(("", "### Human focus", "", *[
+            f"- {item}" for item in handoff.human_focus
         ]))
     lines.extend((
         "",
@@ -1037,6 +1164,7 @@ def project_review_handoff(
     finding_categories: Iterable[str],
     forbidden_detail_roots: Iterable[object],
     obligations: Mapping[str, CoverageObligation],
+    changed_files: Iterable[str] = (),
 ) -> ReviewHandoff:
     """Project and render a sparse handoff from authoritative structured state."""
     if not isinstance(context, ReviewHandoffContext):
@@ -1113,6 +1241,36 @@ def project_review_handoff(
     review_emphasis = _topic_values(
         context.review_emphasis_topics, forbidden=forbidden, limit=3
     )
+    changed_paths = tuple(sorted(
+        {
+            _unicode(path).strip()
+            for path in changed_files
+            if _unicode(path).strip()
+        }
+        | {
+            path
+            for value in obligations.values()
+            for path in (*value.scope, *value.seed_hints)
+            if path
+        }
+    ))
+
+    def behavioral_summaries(values: Iterable[object], *, limit: int) -> tuple[str, ...]:
+        selected: list[str] = []
+        for value in values:
+            text = " ".join(_unicode(value).split())
+            if not text or len(text) > 160 or not renderable(text):
+                continue
+            if not any(f"`{path}`" in text for path in changed_paths):
+                continue
+            if text not in selected:
+                selected.append(text)
+            if len(selected) == limit:
+                break
+        return tuple(selected)
+
+    what_changed = behavioral_summaries(context.what_changed, limit=5)
+    ai_reviewed = behavioral_summaries(context.ai_reviewed, limit=5)
     prepared_note_count = (
         context.unresolved_thread_count
         if isinstance(context.unresolved_thread_count, int)
@@ -1222,6 +1380,9 @@ def project_review_handoff(
         coverage_warning=coverage_warning,
         access_request_count=access_count,
         access_request_url=access_url,
+        what_changed=what_changed,
+        ai_reviewed=ai_reviewed,
+        human_focus=review_emphasis,
     )
     return replace(projection, markdown=render_review_handoff(projection))
 
@@ -1261,6 +1422,7 @@ def build_review_handoff(
         finding_categories=(item.category for item in authoritative),
         forbidden_detail_roots=detail_roots,
         obligations=obligation_map,
+        changed_files=changed_files,
     )
 
 

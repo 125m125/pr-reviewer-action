@@ -89,7 +89,16 @@ def _candidate(
     obligation_ids: tuple[str, ...] = ("obligation-store",),
     consequence: str = "A user action can be persisted twice.",
     manual_validation: str = "Force an ambiguous retry and verify only one write and audit event.",
+    confidence_rationale: str | None = None,
 ) -> CandidateFinding:
+    rationale = confidence_rationale
+    if rationale is None:
+        rationale = (
+            "consequence_support:reachable_input_path; "
+            f"evidence_ids={','.join(evidence_ids)}; "
+            "input=ambiguous response; condition=retry repeats a write; "
+            "outcome=A user action can be persisted twice"
+        )
     return CandidateFinding(
         candidate_id=candidate_id,
         root_cause_fingerprint="model-value",
@@ -102,6 +111,7 @@ def _candidate(
         related_obligation_ids=obligation_ids,
         collector_session_id="session-1",
         model_identity="specialist",
+        confidence_rationale=rationale,
         user_visible_consequence=consequence,
         manual_validation=manual_validation,
     )
@@ -174,6 +184,217 @@ def test_unrelated_evidence_id_cannot_launder_candidate_into_acceptance():
     assert review.accepted == ()
     assert review.verification_requests[0].candidate.candidate_id == candidate.candidate_id
     assert review.verification_requests[0].reason == "evidence-does-not-satisfy-related-obligation"
+
+
+@pytest.mark.parametrize(
+    ("claim", "causal_chain", "consequence", "rationale"),
+    (
+        (
+            "The changed regex may classify an additional topic.",
+            "The new alternation is present in the changed classifier.",
+            "Unrelated reviews may silently receive the wrong specialist.",
+            "The retained source confirms the regex changed.",
+        ),
+        (
+            "Derived expected evidence may reduce specialist rigor.",
+            "The controller now derives evidence labels from obligations.",
+            "Specialists may miss material defects because their instructions are weaker.",
+            "The retained source confirms expected_evidence is controller-derived.",
+        ),
+    ),
+)
+def test_changed_mechanism_alone_cannot_authorize_hypothetical_consequence(
+    claim: str,
+    causal_chain: str,
+    consequence: str,
+    rationale: str,
+):
+    store, evidence_id = _store(content="the cited implementation mechanism changed")
+    candidate = _candidate(
+        evidence_ids=(evidence_id,),
+        claim=claim,
+        causal_chain=causal_chain,
+        consequence=consequence,
+        confidence_rationale=rationale,
+    )
+
+    review = _adjudicate((candidate,), store)
+
+    assert review.accepted == ()
+    assert review.verification_requests[0].reason == "consequence-not-supported"
+
+
+@pytest.mark.parametrize(
+    ("claim", "causal_chain", "consequence", "rationale"),
+    (
+        (
+            "Repository paths can escape the checkout.",
+            "An input of ../outside enters read_repository_file without containment validation.",
+            "A reviewer can read a file outside the checked-out repository.",
+            (
+                "consequence_support:reachable_input_path; input=../outside; "
+                "condition=without containment validation; "
+                "outcome=A reviewer can read a file outside the checked-out repository"
+            ),
+        ),
+        (
+            "Delivery diagnostics disclose the caller token.",
+            "An invalid endpoint reaches delivery_failure_diagnostic with the raw token.",
+            "The secret is returned in the failure diagnostic.",
+            (
+                "consequence_support:reachable_input_path; input=invalid endpoint; "
+                "condition=with the raw token; "
+                "outcome=The secret is returned in the failure diagnostic"
+            ),
+        ),
+    ),
+)
+def test_concrete_reachable_security_consequence_remains_actionable(
+    claim: str,
+    causal_chain: str,
+    consequence: str,
+    rationale: str,
+):
+    store, evidence_id = _store(content=causal_chain)
+    rationale = rationale.replace(
+        "consequence_support:reachable_input_path;",
+        f"consequence_support:reachable_input_path; evidence_ids={evidence_id};",
+    )
+    candidate = _candidate(
+        evidence_ids=(evidence_id,),
+        claim=claim,
+        causal_chain=causal_chain,
+        consequence=consequence,
+        confidence_rationale=rationale,
+    )
+
+    review = _adjudicate((candidate,), store)
+
+    assert tuple(item.candidate_id for item in review.accepted) == ("candidate-1",)
+
+
+def test_model_cannot_invent_an_invariant_as_consequence_authority():
+    store, evidence_id = _store()
+    candidate = _candidate(
+        evidence_ids=(evidence_id,),
+        confidence_rationale=(
+            "consequence_support:violated_invariant; "
+            f"evidence_ids={evidence_id}; obligation_id=obligation-store; "
+            "contract=predicate_index:99; violation=the code is slower"
+        ),
+    )
+
+    review = _adjudicate((candidate,), store)
+
+    assert review.accepted == ()
+    assert review.verification_requests[0].reason == "consequence-not-supported"
+
+
+def test_controller_owned_obligation_subject_can_authorize_violated_invariant():
+    store, evidence_id = _store()
+    candidate = _candidate(
+        evidence_ids=(evidence_id,),
+        confidence_rationale=(
+            "consequence_support:violated_invariant; "
+            f"evidence_ids={evidence_id}; obligation_id=obligation-store; "
+            "contract=subject; violation=an ambiguous retry repeats the write"
+        ),
+    )
+
+    review = _adjudicate((candidate,), store)
+
+    assert tuple(item.candidate_id for item in review.accepted) == ("candidate-1",)
+
+
+def test_typed_words_without_explicit_retained_evidence_cannot_authorize_consequence():
+    store, evidence_id = _store()
+    candidate = _candidate(
+        evidence_ids=(evidence_id,),
+        confidence_rationale=(
+            "consequence_support:reachable_input_path; "
+            "input=anything; condition=anything; outcome=anything"
+        ),
+    )
+
+    review = _adjudicate((candidate,), store)
+
+    assert review.accepted == ()
+    assert review.verification_requests[0].reason == "consequence-not-supported"
+
+
+def test_retained_id_plus_arbitrary_typed_words_cannot_game_reachable_path():
+    store, evidence_id = _store()
+    candidate = _candidate(
+        evidence_ids=(evidence_id,),
+        confidence_rationale=(
+            "consequence_support:reachable_input_path; "
+            f"evidence_ids={evidence_id}; input=anything; "
+            "condition=something; outcome=some result"
+        ),
+    )
+
+    review = _adjudicate((candidate,), store)
+
+    assert review.accepted == ()
+    assert review.verification_requests[0].reason == "consequence-not-supported"
+
+
+def test_critic_cannot_rescue_unavailable_evidence_by_repeating_specialist_prose():
+    store, evidence_id = _store(content="")
+    rationale = (
+        "consequence_support:reachable_input_path; "
+        f"evidence_ids={evidence_id}; input=../outside; "
+        "condition=unchecked join; outcome=read outside checkout"
+    )
+    candidate = _candidate(
+        evidence_ids=(evidence_id,),
+        causal_chain="../outside reaches an unchecked join before the file read.",
+        consequence="A file outside the checkout can be read.",
+        confidence_rationale=rationale.replace(
+            "condition=unchecked join; outcome=read outside checkout",
+            "condition=unchecked join; outcome=A file outside the checkout can be read",
+        ),
+    )
+    rationale = candidate.confidence_rationale
+    obligations = _controller_obligations()
+
+    unconfirmed = adjudicate_candidates(
+        (candidate,),
+        {"actions": [{"candidate_id": candidate.candidate_id, "action": "keep"}]},
+        store,
+        obligations=obligations,
+        changed_files=CHANGED_FILES,
+    )
+    confirmed = adjudicate_candidates(
+        (candidate,),
+        {"actions": [{
+            "candidate_id": candidate.candidate_id,
+            "action": "keep",
+            "confidence_rationale": rationale,
+        }]},
+        store,
+        obligations=obligations,
+        changed_files=CHANGED_FILES,
+    )
+
+    assert unconfirmed.accepted == ()
+    assert unconfirmed.verification_requests[0].reason == "consequence-not-supported"
+    assert confirmed.accepted == ()
+    assert confirmed.verification_requests[0].reason == "consequence-not-supported"
+
+
+def test_info_candidate_is_not_published_as_an_actionable_finding():
+    store, evidence_id = _store()
+    candidate = _candidate(
+        evidence_ids=(evidence_id,),
+        severity="info",
+    )
+
+    review = _adjudicate((candidate,), store)
+
+    assert review.accepted == ()
+    assert review.verification_requests == ()
+    assert review.rejected[0].reason == "non-actionable-info"
 
 
 @pytest.mark.parametrize("location", ["", "src/other.py:8", "C:\\repo\\src\\store.py:41"])
@@ -265,6 +486,12 @@ def test_public_fingerprint_is_stable_across_causal_rewording():
         first,
         candidate_id="second",
         causal_chain="An ambiguous result causes the write operation to run again.",
+        confidence_rationale=(
+            "consequence_support:reachable_input_path; "
+            f"evidence_ids={evidence_id}; input=ambiguous result; "
+            "condition=write operation to run again; "
+            "outcome=A user action can be persisted twice"
+        ),
     )
 
     first_review = _adjudicate((first,), store)
@@ -297,6 +524,12 @@ def test_same_claim_with_opposite_causal_root_is_not_exact_dedup():
         first,
         candidate_id="candidate-b",
         causal_chain="The retry does not repeat a write after an ambiguous response.",
+        confidence_rationale=(
+            "consequence_support:reachable_input_path; "
+            f"evidence_ids={evidence_id}; input=ambiguous response; "
+            "condition=retry does not repeat a write; "
+            "outcome=A user action can be persisted twice"
+        ),
     )
 
     review = _adjudicate((opposite, first), store)
@@ -319,6 +552,12 @@ def test_explicit_critic_merge_combines_distinct_claims_under_same_causal_root()
         claim="The duplicate write emits two audit events",
         user_visible_consequence="Operators see duplicate audit entries for one action.",
         manual_validation="Trigger one retry and verify the audit log has one entry.",
+        confidence_rationale=(
+            "consequence_support:reachable_input_path; "
+            f"evidence_ids={evidence_id}; input=ambiguous response; "
+            "condition=retry repeats a write; "
+            "outcome=Operators see duplicate audit entries for one action"
+        ),
     )
 
     review = adjudicate_candidates(
@@ -634,8 +873,9 @@ def test_handoff_taxonomy_excludes_short_claims_and_preserves_useful_topic():
 
     assert "Auth" not in handoff.markdown
     assert "Cache" not in handoff.markdown
-    assert "database-worker" in handoff.markdown
+    assert "database-worker" not in handoff.markdown
     assert "Database and persistence" in handoff.markdown
+    assert handoff.human_focus == ("Database and persistence",)
 
 
 def test_handoff_excludes_exact_evidence_content_source_id_and_hash():
@@ -666,8 +906,10 @@ def test_handoff_excludes_exact_evidence_content_source_id_and_hash():
     assert record.content_hash not in handoff.markdown
     assert evidence_id not in handoff.markdown
     assert (record.source_path or "not-present") not in handoff.markdown
-    assert "safe-component" in handoff.markdown
-    assert "safe-recipe" in handoff.markdown
+    assert "safe-component" not in handoff.markdown
+    assert "safe-recipe" not in handoff.markdown
+    assert handoff.what_changed == ()
+    assert handoff.ai_reviewed == ()
 
 
 def test_handoff_recursively_excludes_unknown_request_obligation_and_source_details():
@@ -736,7 +978,10 @@ def test_handoff_recursively_excludes_unknown_request_obligation_and_source_deta
 
     assert all(item not in handoff.markdown for item in injected)
     assert "Database and persistence" not in handoff.markdown
-    assert "safe-component" in handoff.markdown
+    assert "safe-component" not in handoff.markdown
+    assert handoff.what_changed == ()
+    assert handoff.ai_reviewed == ()
+    assert handoff.access_request_count == 0
 
 
 def test_handoff_recursively_excludes_every_evidence_record_and_provenance_field():
@@ -819,7 +1064,9 @@ def test_handoff_recursively_excludes_every_evidence_record_and_provenance_field
 
     assert all(item not in handoff.markdown for item in injected)
     assert "Database and persistence" not in handoff.markdown
-    assert "safe-component" in handoff.markdown
+    assert "safe-component" not in handoff.markdown
+    assert handoff.what_changed == ()
+    assert handoff.ai_reviewed == ()
 
 
 def test_handoff_rechecks_every_dynamic_value_after_prefix_and_rendering():
@@ -962,6 +1209,12 @@ def test_notes_quote_bounded_single_line_values_and_never_raw_evidence():
         evidence_ids=(evidence_id,),
         claim="# Finding\nA failed retry duplicates the write",
         causal_chain="* markdown\nThe retry repeats the write.",
+        confidence_rationale=(
+            "consequence_support:reachable_input_path; "
+            f"evidence_ids={evidence_id}; input=retry; "
+            "condition=retry repeats the write; "
+            "outcome=A user action can be persisted twice"
+        ),
     )
     review = _adjudicate((candidate,), store)
 

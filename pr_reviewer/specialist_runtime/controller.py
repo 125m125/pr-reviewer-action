@@ -15,6 +15,7 @@ import json
 from math import isfinite
 import os
 from pathlib import Path
+import re
 import secrets
 import tempfile
 import time
@@ -22,6 +23,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from pr_reviewer.conversation import Conversation
+from pr_reviewer.specialists import classify_file_roles
 from .adjudication import (
     AdjudicatedReview,
     ReviewHandoffContext,
@@ -30,6 +32,7 @@ from .adjudication import (
     apply_runtime_verdict_policy,
     build_review_handoff,
     build_review_notes,
+    review_orientation_label,
 )
 from .assignments import (
     Assignment,
@@ -121,6 +124,145 @@ _SIGNAL_ORIENTATION_TOPICS = {
     "linked_audit_issue": (ReviewOrientationTopic.SECURITY,),
     "dependency_changes": (ReviewOrientationTopic.DEPLOYMENT,),
 }
+
+_HANDOFF_RISK_ORDER = {
+    "critical": 0,
+    "high": 1,
+    "normal": 2,
+    "low": 3,
+}
+
+
+def _behavioral_handoff_candidates(
+    *,
+    changed_files: Iterable[str],
+    topology: Mapping[str, Any],
+    obligations: Iterable[CoverageObligation],
+    evidence_records: Iterable[object],
+    reviewed_obligation_ids: Iterable[str],
+    allow_role_fallback: bool = False,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Build bounded, controller-backed behavioral summaries across the full PR."""
+    changed = tuple(dict.fromkeys(str(path) for path in changed_files if str(path)))
+    changed_set = set(changed)
+    obligation_items = tuple(obligations)
+    reviewed_ids = set(reviewed_obligation_ids)
+    facts_value = topology.get("changed_contract_facts", {})
+    facts = facts_value if isinstance(facts_value, Mapping) else {}
+    evidence_paths = {
+        str(getattr(record, "source_path", "") or "")
+        for record in evidence_records
+    }
+
+    by_path: dict[str, list[CoverageObligation]] = {path: [] for path in changed}
+    for obligation in obligation_items:
+        paths = {
+            path for path in (*obligation.scope, *obligation.seed_hints)
+            if path in changed_set
+        }
+        if obligation.subject in changed_set:
+            paths.add(obligation.subject)
+        for path in paths:
+            by_path[path].append(obligation)
+
+    def path_priority(path: str) -> tuple[int, str]:
+        return (
+            min(
+                (
+                    _HANDOFF_RISK_ORDER.get(item.risk_tier, 2)
+                    for item in by_path[path]
+                ),
+                default=2,
+            ),
+            path,
+        )
+
+    def fact_values(path: str, key: str) -> tuple[str, ...]:
+        item = facts.get(path)
+        if not isinstance(item, Mapping):
+            return ()
+        values = item.get(key, ())
+        if not isinstance(values, (list, tuple)):
+            return ()
+        normalized = []
+        for value in values:
+            safe = re.sub(r"[^A-Za-z0-9 .:/+_-]+", " ", str(value))
+            safe = " ".join(safe.split())[:120]
+            if safe and safe not in normalized:
+                normalized.append(safe)
+        return tuple(normalized[:5])
+
+    def change_type(path: str) -> str:
+        item = facts.get(path)
+        value = item.get("change_type") if isinstance(item, Mapping) else None
+        return value if value in {"adds", "removes", "modifies", "changes"} else "changes"
+
+    def contract_label(path: str) -> str | None:
+        candidates = sorted(
+            (
+                item for item in by_path[path]
+                if item.subject and item.subject != path
+            ),
+            key=lambda item: (
+                _HANDOFF_RISK_ORDER.get(item.risk_tier, 2),
+                item.subject,
+            ),
+        )
+        return candidates[0].subject if candidates else None
+
+    what_changed: list[str] = []
+    ai_reviewed: list[str] = []
+    summarized_paths: set[str] = set()
+
+    def add_summary(path: str, *, fallback: bool) -> None:
+        used_role_fallback = fallback
+        verb = change_type(path)
+        symbols = fact_values(path, "symbols")
+        action_inputs = fact_values(path, "action_inputs")
+        workflow_steps = fact_values(path, "workflow_steps")
+        if action_inputs:
+            summary = f"`{path}` {verb} the `{action_inputs[0]}` action input contract."
+            reviewed_behavior = f"the `{action_inputs[0]}` action input contract"
+        elif workflow_steps:
+            summary = f"`{path}` {verb} the `{workflow_steps[0]}` workflow step."
+            reviewed_behavior = f"the `{workflow_steps[0]}` workflow step contract"
+        elif symbols:
+            summary = f"`{path}` {verb} `{symbols[0]}()` behavior."
+            reviewed_behavior = f"the `{symbols[0]}()` behavior"
+        elif fallback:
+            topics = _orientation_topics(classify_file_roles(path))
+            topic = topics[0] if topics else ReviewOrientationTopic.REPOSITORY_BEHAVIOR
+            label = (
+                review_orientation_label(topic)
+                or "Repository behavior and integration"
+            ).lower()
+            summary = f"`{path}` {verb} {label}."
+            reviewed_behavior = f"{label} in `{path}`"
+        else:
+            return
+        if len(what_changed) < 5:
+            what_changed.append(summary)
+            summarized_paths.add(path)
+        path_reviewed = (
+            path in evidence_paths
+            or any(item.id in reviewed_ids for item in by_path[path])
+        )
+        if path_reviewed and len(ai_reviewed) < 5:
+            contract = None if used_role_fallback else contract_label(path)
+            suffix = f" and {contract} contract" if contract else ""
+            ai_reviewed.append(
+                f"Reviewed {reviewed_behavior}{suffix}."
+            )
+
+    ordered_paths = sorted(changed, key=path_priority)
+    for path in ordered_paths:
+        add_summary(path, fallback=False)
+    minimum = min(2, len(changed))
+    if allow_role_fallback or len(what_changed) < minimum:
+        for path in ordered_paths:
+            if path not in summarized_paths and len(what_changed) < max(minimum, 5 if allow_role_fallback else minimum):
+                add_summary(path, fallback=True)
+    return tuple(what_changed), tuple(ai_reviewed)
 
 
 def _orientation_topics(values: Iterable[object]) -> tuple[ReviewOrientationTopic, ...]:
@@ -246,6 +388,8 @@ class FinalizerProposal:
     coverage_boundary_topics: tuple[ReviewOrientationTopic, ...] = ()
     review_emphasis_topics: tuple[ReviewOrientationTopic, ...] = ()
     recommendation: str | None = None
+    what_changed: tuple[str, ...] = ()
+    ai_reviewed: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -346,6 +490,8 @@ def _finalizer_proposal(value: object) -> FinalizerProposal:
         coverage_boundary_topics=topics("coverage_boundary_topics"),
         review_emphasis_topics=topics("review_emphasis_topics"),
         recommendation=recommendation,
+        what_changed=identifiers("what_changed"),
+        ai_reviewed=identifiers("ai_reviewed"),
     )
 
 
@@ -373,6 +519,8 @@ def _validated_critic_result(
     for row in rows:
         if not isinstance(row, Mapping):
             raise ValueError("critic actions must contain objects")
+        if set(row) - {"candidate_id", "action", "target_id"}:
+            raise ValueError("critic action contains unsupported fields")
         candidate_id = str(row.get("candidate_id") or "").strip()
         action = str(row.get("action") or "").strip().lower()
         target_id = str(row.get("target_id") or "").strip()
@@ -1809,7 +1957,7 @@ class ReviewController:
             ))
             decisions.append({
                 "candidate_id": item.candidate_id,
-                "action": "keep" if unambiguous else "reject",
+                "action": "request_verification" if unambiguous else "reject",
             })
         return {"decisions": decisions}
 
@@ -1824,6 +1972,37 @@ class ReviewController:
             critic_result = self._conservative_critic(candidates)
         else:
             try:
+                retained = {
+                    record.id: record
+                    for record in state.evidence.snapshot().records
+                    if record.is_usable_for_coverage
+                }
+                candidate_evidence = {}
+                for candidate in candidates:
+                    excerpts = []
+                    for evidence_id in (
+                        *candidate.supporting_evidence_ids,
+                        *candidate.contradicting_evidence_ids,
+                    ):
+                        record = retained.get(evidence_id)
+                        if record is None:
+                            continue
+                        excerpt = record.content.encode("utf-8")[:1200].decode(
+                            "utf-8", errors="replace",
+                        )
+                        excerpts.append({
+                            "evidence_id": record.id,
+                            "path": record.source_path,
+                            "category": record.category,
+                            "tool": record.tool,
+                            "status": record.status,
+                            "content_hash": record.content_hash,
+                            "content_excerpt": excerpt,
+                            "truncated": record.truncated,
+                            "redacted": record.redacted,
+                            "contradicts": record.contradicts,
+                        })
+                    candidate_evidence[candidate.candidate_id] = tuple(excerpts)
                 critic_result = self._model_request(
                     state,
                     role="critic",
@@ -1833,6 +2012,7 @@ class ReviewController:
                     method="adjudicate",
                     context={
                         "candidates": candidates,
+                        "candidate_evidence": candidate_evidence,
                         "obligations": obligation_map,
                         "changed_files": state.inputs.changed_files,
                         "pr_metadata": state.inputs.pr_metadata,
@@ -1934,6 +2114,18 @@ class ReviewController:
             note.severity for note in state.notes
             if note.severity in {"info", "minor", "major", "blocker"}
         )
+
+        what_changed, ai_reviewed = _behavioral_handoff_candidates(
+            changed_files=state.inputs.changed_files,
+            topology=state.inputs.topology,
+            obligations=state.obligations,
+            evidence_records=state.evidence.snapshot().records,
+            reviewed_obligation_ids=tuple(item.id for item in reviewed_obligations),
+            allow_role_fallback=(
+                status == "degraded"
+                or "changed_contract_facts" not in state.inputs.topology
+            ),
+        )
         return ReviewHandoffContext(
             recommendation=state.verdict,
             status=status,
@@ -1958,6 +2150,8 @@ class ReviewController:
                 if str(item.get("component", "")).strip()
             ),
             source_access_requests=tuple(state.source_requests),
+            what_changed=what_changed,
+            ai_reviewed=ai_reviewed,
         )
 
     def _apply_finalizer_proposal(
@@ -1979,6 +2173,17 @@ class ReviewController:
                 key=lambda item: item.value,
             ))
 
+        def selected_summaries(
+            proposed: Iterable[str],
+            allowed: tuple[str, ...],
+            *,
+            minimum: int = 0,
+        ) -> tuple[str, ...]:
+            selected = tuple(
+                dict.fromkeys(item for item in proposed if item in set(allowed))
+            )[:5]
+            return selected if len(selected) >= minimum else allowed[:5]
+
         selected = replace(
             base,
             change_topics=topics(proposal.change_topics, base.change_topics),
@@ -1995,6 +2200,15 @@ class ReviewController:
             review_emphasis_topics=topics(
                 proposal.review_emphasis_topics,
                 base.review_emphasis_topics,
+            ),
+            what_changed=selected_summaries(
+                proposal.what_changed,
+                base.what_changed,
+                minimum=min(2, len(base.what_changed)),
+            ),
+            ai_reviewed=selected_summaries(
+                proposal.ai_reviewed, base.ai_reviewed,
+                minimum=min(1, len(base.ai_reviewed)),
             ),
         )
         if not state.degradations:
@@ -2107,6 +2321,10 @@ class ReviewController:
                         "unknowns": tuple(state.unknowns),
                         "policy": state.inputs.policy,
                         "pr_metadata": state.inputs.pr_metadata,
+                        "handoff_summary_candidates": {
+                            "what_changed": context.what_changed,
+                            "ai_reviewed": context.ai_reviewed,
+                        },
                     },
                 )
                 proposal = _finalizer_proposal(proposed)
@@ -2127,6 +2345,8 @@ class ReviewController:
                     "review_emphasis_topics": tuple(
                         item.value for item in context.review_emphasis_topics
                     ),
+                    "what_changed": context.what_changed,
+                    "ai_reviewed": context.ai_reviewed,
                 })
             except Exception as exc:
                 self._degrade(state, "finalizer", _bounded_error(exc))
@@ -2665,6 +2885,9 @@ class ReviewController:
                 "coverage_warning": None,
                 "access_request_count": 0,
                 "access_request_url": None,
+                "what_changed": [],
+                "ai_reviewed": [],
+                "human_focus": [],
             },
             "notes": [],
             "verdict": {

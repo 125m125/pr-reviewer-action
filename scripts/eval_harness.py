@@ -443,6 +443,20 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
         source_requests, (str, bytes)
     ):
         source_requests = ()
+    authorized_changed_paths = {
+        str(value.get("path") or "").strip()
+        for value in artifact.get("evidence", ())
+        if isinstance(value, Mapping) and str(value.get("path") or "").strip()
+    }
+    for assignment in artifact.get("assignments", ()):
+        if not isinstance(assignment, Mapping):
+            continue
+        for key in ("seed_paths", "boundary_paths"):
+            raw_paths = assignment.get(key, ())
+            if isinstance(raw_paths, Sequence) and not isinstance(raw_paths, (str, bytes)):
+                authorized_changed_paths.update(
+                    str(path).strip() for path in raw_paths if str(path).strip()
+                )
     degradations = artifact.get("degradation", ())
     if not isinstance(degradations, Sequence) or isinstance(
         degradations, (str, bytes)
@@ -481,6 +495,8 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
             and str(item.get("component", "")).strip()
         ),
         source_access_requests=tuple(source_requests),
+        what_changed=values("what_changed"),
+        ai_reviewed=values("ai_reviewed"),
     )
     expected = project_review_handoff(
         context,
@@ -492,6 +508,7 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
             artifact.get("evidence", ()),
         ),
         obligations=obligations,
+        changed_files=tuple(sorted(authorized_changed_paths)),
     )
 
     structured_fields = (
@@ -508,6 +525,9 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
         "coverage_warning",
         "access_request_count",
         "access_request_url",
+        "what_changed",
+        "ai_reviewed",
+        "human_focus",
     )
     sequence_fields = {
         "change_map",
@@ -516,6 +536,9 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
         "recipe_focuses",
         "coverage_boundaries",
         "review_emphasis",
+        "what_changed",
+        "ai_reviewed",
+        "human_focus",
     }
     unsupported = [
         f"handoff has invalid projection value: {value}"

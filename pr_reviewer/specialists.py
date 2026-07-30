@@ -236,6 +236,60 @@ def build_topology(
             "generator_config": [_posix(v) for v in artifact.get("generator_config", [])][:20],
             "output_paths": [_posix(v) for v in outputs][:20],
         })
+    changed_contract_facts: dict[str, dict[str, list[str]]] = {}
+    for item in pr_files:
+        path = _posix(item.get("filename"))
+        patch = item.get("patch")
+        if not path:
+            continue
+        change_type = {
+            "added": "adds",
+            "removed": "removes",
+            "modified": "modifies",
+            "renamed": "modifies",
+            "copied": "adds",
+        }.get(str(item.get("status") or "").strip().lower(), "modifies")
+        symbols: list[str] = []
+        action_inputs: list[str] = []
+        workflow_steps: list[str] = []
+        action_section = ""
+        for line in patch.splitlines() if isinstance(patch, str) else ():
+            yaml_line = line[1:] if line[:1] in {"+", "-", " "} else line
+            if path in {"action.yml", "action.yaml"}:
+                section_match = re.match(r"^(inputs|outputs|runs|branding):\s*$", yaml_line)
+                if section_match:
+                    action_section = section_match.group(1)
+            if not line.startswith("+") or line.startswith("+++"):
+                continue
+            added = line[1:]
+            symbol_match = re.match(
+                r"\s*(?:async\s+)?(?:def|class|function)\s+([A-Za-z_][A-Za-z0-9_]*)",
+                added,
+            )
+            if symbol_match and symbol_match.group(1) not in symbols:
+                symbols.append(symbol_match.group(1))
+            if path in {"action.yml", "action.yaml"} and action_section == "inputs":
+                input_match = re.match(r"\s{2}([A-Za-z_][A-Za-z0-9_-]*):\s*$", added)
+                if input_match and input_match.group(1) not in {
+                    "name", "description", "inputs", "outputs", "runs", "branding",
+                } and input_match.group(1) not in action_inputs:
+                    action_inputs.append(input_match.group(1))
+            if path.startswith(".github/workflows/"):
+                step_match = re.match(r"\s*-\s+name:\s*(.+?)\s*$", added)
+                if step_match:
+                    step = re.sub(
+                        r"[^A-Za-z0-9 .:/+_-]+", " ",
+                        step_match.group(1).strip("'\""),
+                    )
+                    step = " ".join(step.split())[:120]
+                    if step and step not in workflow_steps:
+                        workflow_steps.append(step)
+        changed_contract_facts[path] = {
+            "symbols": symbols[:5],
+            "action_inputs": action_inputs[:5],
+            "workflow_steps": workflow_steps[:5],
+            "change_type": change_type,
+        }
     return {
         "changed_files": changed,
         "components": list(components.values()),
@@ -247,4 +301,5 @@ def build_topology(
         "risk_flags": _strings(classification.get("risk_flags")),
         "pr_kind": str(classification.get("pr_kind") or "unknown"),
         "generated_artifacts": generated_artifacts,
+        "changed_contract_facts": changed_contract_facts,
     }

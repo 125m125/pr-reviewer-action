@@ -25,8 +25,10 @@ from pr_reviewer.specialist_runtime.controller import (
     ReviewInputs,
     ReviewResult,
     _RunState,
+    _behavioral_handoff_candidates,
     _atomic_write_json,
     _directory_fsync_status,
+    _validated_critic_result,
 )
 from pr_reviewer.specialist_runtime.callbacks import (
     CALLBACK_POOL,
@@ -62,6 +64,41 @@ def test_controller_public_api_is_importable():
     assert ReviewController
     assert ReviewInputs
     assert ReviewResult
+
+
+def test_critic_schema_does_not_allow_prose_to_rewrite_consequence_support():
+    candidate = CandidateFinding("candidate-1", "root", "claim")
+    rationale = "consequence_support:reachable_input_path; evidence_ids=evidence:1"
+
+    with pytest.raises(ValueError, match="unsupported fields"):
+        _validated_critic_result(
+            {"actions": [{
+                "candidate_id": candidate.candidate_id,
+                "action": "keep",
+                "confidence_rationale": rationale,
+            }]},
+            (candidate,),
+        )
+
+
+def test_critic_receives_bounded_retained_evidence_excerpt_and_metadata(tmp_path):
+    observed = {}
+
+    def critic(request):
+        observed.update(request.context)
+        return _critic_role(request)
+
+    _controller(tmp_path, critic=critic).run(_inputs(tmp_path))
+
+    evidence = observed["candidate_evidence"]
+    assert tuple(evidence) == ("candidate-delivery",)
+    item = evidence["candidate-delivery"][0]
+    assert item["evidence_id"].startswith("evidence:")
+    assert item["path"] == "src/worker.py"
+    assert item["category"] == "implementation"
+    assert item["tool"] == "read_file"
+    assert item["content_excerpt"] == "def process(): pass"
+    assert len(item["content_excerpt"].encode("utf-8")) <= 1200
 
 
 def _policy() -> ReviewPolicy:
@@ -188,6 +225,12 @@ class _SuccessfulSession:
             related_obligation_ids=(first_obligation,),
             collector_session_id=self.session_id,
             model_identity="specialist-test",
+            confidence_rationale=(
+                "consequence_support:reachable_input_path; "
+                f"evidence_ids={evidence_ids[0]}; input=ambiguous result; "
+                "condition=retry path repeats processing; "
+                "outcome=One delivery can be applied twice"
+            ),
             user_visible_consequence="One delivery can be applied twice.",
             manual_validation="Force the retry path and verify one processing result.",
         ),)
@@ -952,7 +995,12 @@ def test_malformed_critic_result_uses_evidence_gated_conservative_fallback(
     assert [
         item["candidate_id"]
         for item in result.artifact["accepted_candidates"]
-    ] == ["candidate-delivery"]
+    ] == []
+    assert any(
+        item["candidate_id"] == "candidate-delivery"
+        and item["action"] == "request_verification"
+        for item in result.artifact["candidate_dispositions"]
+    )
     critic_degradations = [
         item for item in result.artifact["degradation"]
         if item["component"] == "critic"
@@ -1007,8 +1055,13 @@ def test_finalizer_failure_builds_useful_sparse_handoff_from_controller_state(tm
     result = _controller(tmp_path, finalizer=broken_finalizer).run(_inputs(tmp_path))
 
     assert result.handoff.markdown.startswith("## AI Review Handoff")
-    assert "Runtime implementation behavior" in result.handoff.change_map
-    assert "Component: worker" in result.handoff.change_map
+    assert result.handoff.what_changed == (
+        "`src/worker.py` changes runtime implementation behavior.",
+    )
+    assert result.handoff.ai_reviewed == (
+        "Reviewed runtime implementation behavior in `src/worker.py`.",
+    )
+    assert "Component: worker" not in result.handoff.markdown
     assert result.handoff.specialist_focuses == ()
     assert result.handoff.recipe_focuses == ("Repository recipe: delivery",)
     assert result.handoff.coverage_boundaries == (
@@ -1025,6 +1078,176 @@ def test_finalizer_failure_builds_useful_sparse_handoff_from_controller_state(tm
     assert "review the complete change" in result.handoff.markdown
     assert any(
         item["component"] == "finalizer" for item in result.artifact["degradation"]
+    )
+
+
+def test_finalizer_can_only_select_controller_backed_behavioral_summaries(tmp_path):
+    def finalizer(request):
+        assert request.context["handoff_summary_candidates"]["what_changed"] == (
+            "`src/worker.py` changes runtime implementation behavior.",
+        )
+        return {
+            "what_changed": [
+                "`src/worker.py` changes runtime implementation behavior.",
+                "`src/invented.py` changes authentication behavior.",
+            ],
+            "ai_reviewed": [
+                "Reviewed runtime implementation behavior in `src/worker.py`.",
+                "Reviewed an invented contract in `src/invented.py`.",
+            ],
+            "review_emphasis_topics": ["failure_recovery"],
+        }
+
+    result = _controller(tmp_path, finalizer=finalizer).run(_inputs(tmp_path))
+
+    assert result.handoff.what_changed == (
+        "`src/worker.py` changes runtime implementation behavior.",
+    )
+    assert result.handoff.ai_reviewed == (
+        "Reviewed runtime implementation behavior in `src/worker.py`.",
+    )
+    assert "invented" not in result.handoff.markdown
+    assert result.handoff.human_focus == ("Failure recovery",)
+
+
+def test_finalizer_cannot_reduce_multi_file_change_summary_below_two_items(tmp_path):
+    inputs = replace(
+        _inputs(tmp_path),
+        changed_files=("src/worker.py", "src/helper.py"),
+        topology={
+            "changed_files": ["src/worker.py", "src/helper.py"],
+            "file_roles": ["implementation"],
+            "components": [],
+        },
+    )
+
+    def finalizer(request):
+        return {"what_changed": [request.context[
+            "handoff_summary_candidates"
+        ]["what_changed"][0]]}
+
+    result = _controller(tmp_path, finalizer=finalizer).run(inputs)
+
+    assert len(result.handoff.what_changed) == 2
+
+
+def test_behavioral_handoff_candidates_prioritize_high_risk_beyond_file_prefix():
+    changed_files = tuple(f"src/prefix_{index}.py" for index in range(6)) + (
+        "action.yml",
+    )
+    obligations = (
+        CoverageObligation(
+            obligation_id="ordinary-prefix",
+            origin="topology",
+            subject="src/prefix_0.py",
+            scope=("src/prefix_0.py",),
+            risk_tier="normal",
+        ),
+        CoverageObligation(
+            obligation_id="high-risk-input",
+            origin="risk-rule",
+            subject="action input compatibility",
+            scope=("action.yml",),
+            risk_tier="critical",
+        ),
+    )
+    topology = {
+        "changed_contract_facts": {
+            "action.yml": {
+                "action_inputs": ["publish_mode"],
+                "symbols": [],
+                "workflow_steps": [],
+                "change_type": "modifies",
+            },
+        },
+    }
+
+    what_changed, _ai_reviewed = _behavioral_handoff_candidates(
+        changed_files=changed_files,
+        topology=topology,
+        obligations=obligations,
+        evidence_records=(),
+        reviewed_obligation_ids=(),
+    )
+
+    assert what_changed[0] == (
+        "`action.yml` modifies the `publish_mode` action input contract."
+    )
+    assert len(what_changed) <= 5
+
+
+def test_behavioral_handoff_candidates_name_changed_symbols_and_reviewed_contracts():
+    obligation = CoverageObligation(
+        obligation_id="runtime-validation",
+        origin="risk-rule",
+        subject="planner validation",
+        scope=("pr_reviewer/planner.py",),
+        risk_tier="high",
+    )
+    topology = {
+        "changed_contract_facts": {
+            "pr_reviewer/planner.py": {
+                "symbols": ["validate_assignment_plan"],
+                "action_inputs": [],
+                "workflow_steps": [],
+                "change_type": "modifies",
+            },
+        },
+    }
+
+    what_changed, ai_reviewed = _behavioral_handoff_candidates(
+        changed_files=("pr_reviewer/planner.py",),
+        topology=topology,
+        obligations=(obligation,),
+        evidence_records=(),
+        reviewed_obligation_ids=("runtime-validation",),
+    )
+
+    assert what_changed == (
+        "`pr_reviewer/planner.py` modifies `validate_assignment_plan()` behavior.",
+    )
+    assert ai_reviewed == (
+        "Reviewed the `validate_assignment_plan()` behavior and planner validation contract.",
+    )
+
+
+def test_behavioral_handoff_candidates_fill_two_safe_fallbacks_for_sparse_patches():
+    changed_files = ("docs/guide.md", "src/runtime.py", "src/third.py")
+    topology = {
+        "changed_contract_facts": {
+            "docs/guide.md": {
+                "symbols": [],
+                "action_inputs": [],
+                "workflow_steps": [],
+                "change_type": "modifies",
+            },
+            "src/runtime.py": {
+                "symbols": [],
+                "action_inputs": [],
+                "workflow_steps": [],
+                "change_type": "adds",
+            },
+            "src/third.py": {
+                "symbols": [],
+                "action_inputs": [],
+                "workflow_steps": [],
+                "change_type": "removes",
+            },
+        },
+    }
+
+    what_changed, _ = _behavioral_handoff_candidates(
+        changed_files=changed_files,
+        topology=topology,
+        obligations=(),
+        evidence_records=(),
+        reviewed_obligation_ids=(),
+    )
+
+    assert len(what_changed) >= 2
+    assert what_changed[:2] == (
+        "`docs/guide.md` modifies documentation and operator guidance.",
+        "`src/runtime.py` adds runtime implementation behavior.",
     )
 
 
@@ -2114,7 +2337,7 @@ def test_finalizer_proposal_selects_only_authorized_orientation(tmp_path):
 
     result = _controller(tmp_path, finalizer=finalizer).run(_inputs(tmp_path))
 
-    assert "Component: worker" in result.handoff.markdown
+    assert "`src/worker.py` changes runtime implementation behavior." in result.handoff.markdown
     assert "invented" not in result.handoff.markdown
     assert "Failure recovery" in result.handoff.markdown
     assert "Security" not in result.handoff.markdown
@@ -2150,7 +2373,7 @@ def test_finalizer_filters_invalid_topics_without_discarding_valid_selection(
     result = _controller(tmp_path, finalizer=finalizer).run(_inputs(tmp_path))
 
     assert result.handoff.review_emphasis == ("Failure recovery",)
-    assert "Component: worker" in result.handoff.markdown
+    assert "`src/worker.py` changes runtime implementation behavior." in result.handoff.markdown
     assert "invented-private-topic" not in result.handoff.markdown
     assert not any(
         item["component"] == "finalizer"

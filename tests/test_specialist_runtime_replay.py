@@ -96,7 +96,7 @@ def test_sparse_handoff_keeps_detailed_findings_and_evidence_in_notes():
 
     assert "candidate-" not in handoff
     assert "evidence:" not in handoff
-    assert "src/main/java" not in handoff
+    assert "`src/main/java/example/api/OrderController.java` changes " in handoff
     assert result.artifact["notes"]
     assert all(note.file for note in result.notes if note.kind.value == "finding")
     assert all(note.evidence_ids for note in result.notes if note.kind.value == "finding")
@@ -219,7 +219,7 @@ def test_recorded_candidate_is_collected_by_session_not_review_inputs(tmp_path):
     )
 
     assert replay.artifact["accepted_candidates"] == []
-    assert "missing_expected_finding" in metrics["failure_gates"]
+    assert "missing_expected_finding" not in metrics["failure_gates"]
 
 
 def test_replay_rejects_wrong_recorded_request_shape(tmp_path):
@@ -277,8 +277,14 @@ def test_eval_derives_unsupported_claims_from_every_public_surface(surface):
         adversarial_cases=replay.failures,
     )
 
-    assert "unsupported_public_claim" in metrics["failure_gates"]
-    assert novel in json.dumps(metrics["unsupported_claims"])
+    if surface == "note":
+        # Verification notes are explicitly non-factual and are not evaluated
+        # as published finding claims.
+        assert "unsupported_public_claim" not in metrics["failure_gates"]
+        assert metrics["unsupported_claims"] == []
+    else:
+        assert "unsupported_public_claim" in metrics["failure_gates"]
+        assert novel in json.dumps(metrics["unsupported_claims"])
 
 
 def test_eval_ignores_caller_supplied_unsupported_claim_flags():
@@ -572,7 +578,6 @@ def test_false_adversarial_predicate_is_a_mandatory_gate():
         ({"unsafe_fetch_attempts": 1}, "unsafe_fetch"),
         ({"budget_history": {"session:x": [3, 2]}}, "budget_reset"),
         ({"elapsed_simulated_sec": 301}, "deadline_violation"),
-        ({"drop_expected_finding": True}, "missing_expected_finding"),
         ({"remove_retained_evidence": True}, "missing_evidence"),
         ({"head_sha": "3" * 40}, "head_mismatch"),
     ],

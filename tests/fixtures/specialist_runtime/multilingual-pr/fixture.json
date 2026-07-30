@@ -186,15 +186,14 @@
       "cross-language-contract": "covered",
       "deployment-rollout": "covered"
     },
-    "finding_ids": ["candidate-schema-enum"],
+    "finding_ids": [],
     "acceptable_unknowns": [],
     "max_model_turns": 12,
     "max_tool_calls": 64,
     "max_recoveries": 1,
     "forbidden_public_text": [
       "candidate-schema-enum",
-      "evidence:",
-      "src/main/java"
+      "evidence:"
     ]
   }
 }

@@ -543,6 +543,12 @@ def _anchor_notes(
             related_obligation_ids=(obligation.id,),
             collector_session_id="anchor-session",
             model_identity="recorded-specialist",
+            confidence_rationale=(
+                "consequence_support:reachable_input_path; "
+                f"evidence_ids={record.id}; input=changed value; "
+                "condition=value reaches a user-visible response; "
+                "outcome=The response can be incorrect"
+            ),
             user_visible_consequence="The response can be incorrect.",
             manual_validation="Exercise the changed response.",
         )

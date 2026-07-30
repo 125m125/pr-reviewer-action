@@ -67,7 +67,16 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
                     "related_obligation_ids": {
                         "type": "array", "items": {"type": "string"},
                     },
-                    "confidence_rationale": {"type": "string"},
+                    "confidence_rationale": {
+                        "type": "string",
+                        "description": (
+                            "Typed consequence support declaration. Start with "
+                            "consequence_support: and one of reachable_input_path, "
+                            "failing_behavioral_test, violated_invariant, affected_consumer, "
+                            "or contradicting_evidence, followed by evidence_ids containing "
+                            "exact retained evidence IDs and the form's required key=value details."
+                        ),
+                    },
                     "user_visible_consequence": {"type": "string"},
                     "manual_validation": {"type": "string"},
                 },

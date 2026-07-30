@@ -142,6 +142,12 @@ class ReviewHandoff:
     coverage_warning: str | None = None
     access_request_count: int = 0
     access_request_url: str | None = None
+    # Version-2 behavioral summary. The older orientation fields above remain
+    # serialized for replay compatibility, but are not the normal human-facing
+    # handoff.
+    what_changed: tuple[str, ...] = ()
+    ai_reviewed: tuple[str, ...] = ()
+    human_focus: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

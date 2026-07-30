@@ -699,6 +699,9 @@ def _publication_id(
             "coverage_warning": handoff.coverage_warning,
             "access_request_count": handoff.access_request_count,
             "access_request_url": handoff.access_request_url,
+            "what_changed": list(handoff.what_changed),
+            "ai_reviewed": list(handoff.ai_reviewed),
+            "human_focus": list(handoff.human_focus),
         },
     }
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -2072,6 +2075,9 @@ mutation ResolveManagedThread($threadId: ID!) {
 }
 """.strip()
 
+_SPECIALIST_HANDOFF_MARKER = "<!-- ai-pr-review-specialist-handoff -->"
+_TRUSTED_WORKFLOW_COMMENT_AUTHOR = "github-actions[bot]"
+
 
 class GhReviewClient:
     """Production GitHub client using argv lists and 0600 input files.
@@ -2179,11 +2185,20 @@ class GhReviewClient:
     ) -> Mapping[str, Any]:
         self._split_repo(repo)
         sticky_key = (repo, pr_number)
+        duplicates: tuple[Mapping[str, Any], ...] = ()
         if known_comment_id is None:
-            existing = self.find_specialist_handoff(repo, pr_number)
+            managed = self._trusted_specialist_handoffs(repo, pr_number)
+            existing = max(managed, key=lambda item: item["id"]) if managed else None
             comment_id = existing["id"] if existing is not None else None
             if comment_id is not None:
                 self._trusted_sticky_comment_ids.setdefault(sticky_key, set()).add(comment_id)
+                duplicates = tuple(sorted(
+                    (
+                        item for item in managed
+                        if item["id"] != comment_id
+                    ),
+                    key=lambda item: item["id"],
+                ))
         else:
             if (
                 not isinstance(known_comment_id, int)
@@ -2208,7 +2223,6 @@ class GhReviewClient:
             result = self._api_write(endpoint, method, {"body": body})
             if method == "POST":
                 self._trusted_sticky_comment_ids.setdefault(sticky_key, set()).add(result["id"])
-            return result
         except Exception:
             reconciled = self.find_specialist_handoff(
                 repo, pr_number, expected_body=body
@@ -2217,13 +2231,31 @@ class GhReviewClient:
                 self._trusted_sticky_comment_ids.setdefault(sticky_key, set()).add(
                     reconciled["id"]
                 )
-                return reconciled
-            raise
+                result = reconciled
+            else:
+                raise
+        cleanup_errors = []
+        for duplicate in duplicates:
+            try:
+                self._api_write(
+                    f"repos/{repo}/issues/comments/{duplicate['id']}",
+                    "DELETE",
+                    {},
+                )
+            except Exception:
+                cleanup_errors.append(
+                    f"duplicate sticky cleanup failed for comment {duplicate['id']}"
+                )
+        if cleanup_errors:
+            return {**result, "cleanup_errors": tuple(cleanup_errors[:10])}
+        return result
 
     def _api_write(
         self, endpoint: str, method: str, payload: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         result = self._input_call(["api", endpoint, "--method", method], payload)
+        if method == "DELETE":
+            return {"deleted": True}
         comment_id = result.get("id")
         url = result.get("html_url")
         if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id <= 0:
@@ -2235,20 +2267,40 @@ class GhReviewClient:
     def find_specialist_handoff(
         self, repo: str, pr_number: int, expected_body: str | None = None
     ) -> Mapping[str, Any] | None:
+        matches = self._trusted_specialist_handoffs(
+            repo, pr_number, expected_body=expected_body,
+        )
+        return max(matches, key=lambda item: item["id"]) if matches else None
+
+    def _trusted_specialist_handoffs(
+        self, repo: str, pr_number: int, expected_body: str | None = None
+    ) -> tuple[Mapping[str, Any], ...]:
         matches = []
         for node, viewer_login in self._owned_issue_comment_nodes(repo, pr_number):
             body = node.get("body")
+            author = node.get("author")
+            author_login = (
+                author.get("login") if isinstance(author, Mapping) else None
+            )
+            trusted_author = (
+                (
+                    node.get("viewerDidAuthor") is True
+                    and author_login == viewer_login
+                )
+                or author_login == _TRUSTED_WORKFLOW_COMMENT_AUTHOR
+            )
             if (
                 isinstance(body, str)
-                and body.startswith("<!-- ai-pr-review-specialist-handoff -->")
+                and (
+                    body == _SPECIALIST_HANDOFF_MARKER
+                    or body.startswith(_SPECIALIST_HANDOFF_MARKER + "\n")
+                )
                 and (expected_body is None or body == expected_body)
-                and node.get("viewerDidAuthor") is True
-                and isinstance(node.get("author"), Mapping)
-                and node["author"].get("login") == viewer_login
+                and trusted_author
             ):
                 comment = self._validated_issue_comment(node, label="sticky comment")
                 matches.append(comment)
-        return max(matches, key=lambda item: item["id"]) if matches else None
+        return tuple(matches)
 
     @staticmethod
     def _validated_issue_comment(
@@ -2274,8 +2326,15 @@ class GhReviewClient:
         pr = repository.get("pullRequest") if isinstance(repository, Mapping) else None
         viewer_login = viewer.get("login") if isinstance(viewer, Mapping) else None
         pull_request_id = pr.get("id") if isinstance(pr, Mapping) else None
+        repository_full_name = (
+            repository.get("nameWithOwner")
+            if isinstance(repository, Mapping)
+            else None
+        )
         if not isinstance(viewer_login, str) or not viewer_login:
             raise RuntimeError("sticky viewer identity is missing")
+        if repository_full_name != repo:
+            raise RuntimeError("sticky repository identity is invalid")
         if not isinstance(pull_request_id, str) or not pull_request_id:
             raise RuntimeError("sticky pull request id is missing")
         nodes = self._paged_nodes(

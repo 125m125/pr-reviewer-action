@@ -54,6 +54,9 @@ def _handoff(value: object) -> ReviewHandoff:
         coverage_warning=value.get("coverage_warning"),
         access_request_count=value.get("access_request_count", 0),
         access_request_url=value.get("access_request_url"),
+        what_changed=tuple(value.get("what_changed") or ()),
+        ai_reviewed=tuple(value.get("ai_reviewed") or ()),
+        human_focus=tuple(value.get("human_focus") or ()),
     )
 
 

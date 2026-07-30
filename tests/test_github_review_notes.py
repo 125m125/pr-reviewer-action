@@ -1473,9 +1473,11 @@ def test_gh_client_uses_0600_input_files_and_keeps_note_text_out_of_argv(
 def test_sticky_updates_only_owned_specialist_marker_comment(monkeypatch, tmp_path):
     client = GhReviewClient(action_root=tmp_path)
     writes = []
-    monkeypatch.setattr(client, "find_specialist_handoff", lambda *_args: {
-        "id": 88, "url": _issue_url(88)
-    }, raising=False)
+    monkeypatch.setattr(
+        client,
+        "_trusted_specialist_handoffs",
+        lambda *_args, **_kwargs: ({"id": 88, "url": _issue_url(88)},),
+    )
     monkeypatch.setattr(
         client,
         "_api_write",
@@ -1498,6 +1500,343 @@ def test_sticky_updates_only_owned_specialist_marker_comment(monkeypatch, tmp_pa
     assert result == {"id": 88, "url": _issue_url(88)}
 
 
+def test_sticky_updates_newest_exact_managed_handoff_not_newest_issue_comment(
+    monkeypatch, tmp_path
+):
+    client = GhReviewClient(action_root=tmp_path)
+    comments = [
+        {
+            "databaseId": 41,
+            "url": _issue_url(41),
+            "body": "<!-- ai-pr-review-specialist-handoff -->\nOlder handoff",
+            "viewerDidAuthor": True,
+            "author": {"login": "bot"},
+        },
+        {
+            "databaseId": 73,
+            "url": _issue_url(73),
+            "body": "<!-- ai-pr-review-specialist-handoff -->\nNewer handoff",
+            "viewerDidAuthor": True,
+            "author": {"login": "bot"},
+        },
+        {
+            "databaseId": 99,
+            "url": _issue_url(99),
+            "body": "Unrelated newer comment",
+            "viewerDidAuthor": True,
+            "author": {"login": "bot"},
+        },
+    ]
+    writes = []
+
+    def fake_graphql(query, _variables):
+        if "ManagedReviewIdentity" in query:
+            return {"data": {
+                "viewer": {"login": "bot"},
+                "repository": {
+                    "nameWithOwner": "owner/repo",
+                    "pullRequest": {"id": "PR-node"},
+                },
+            }}
+        if "ManagedIssueComments" in query:
+            return {"data": {"node": {"comments": _connection(comments)}}}
+        raise AssertionError(query)
+
+    monkeypatch.setattr(client, "_graphql", fake_graphql)
+    monkeypatch.setattr(
+        client,
+        "_api_write",
+        lambda endpoint, method, payload: writes.append((endpoint, method, payload))
+        or {"id": 73, "url": _issue_url(73)},
+    )
+
+    client.update_sticky(
+        "owner/repo",
+        17,
+        "<!-- ai-pr-review-specialist-handoff -->\nCurrent handoff",
+    )
+
+    assert writes == [(
+        "repos/owner/repo/issues/comments/73",
+        "PATCH",
+        {"body": "<!-- ai-pr-review-specialist-handoff -->\nCurrent handoff"},
+    ), (
+        "repos/owner/repo/issues/comments/41",
+        "DELETE",
+        {},
+    )]
+
+
+def test_sticky_duplicate_cleanup_keeps_newest_and_ignores_untrusted_or_spoofed(
+    monkeypatch, tmp_path
+):
+    client = GhReviewClient(action_root=tmp_path)
+    comments = [
+        {
+            "databaseId": 41,
+            "url": _issue_url(41),
+            "body": "<!-- ai-pr-review-specialist-handoff -->\nOlder trusted",
+            "viewerDidAuthor": True,
+            "author": {"login": "bot"},
+        },
+        {
+            "databaseId": 73,
+            "url": _issue_url(73),
+            "body": "<!-- ai-pr-review-specialist-handoff -->\nNewest trusted",
+            "viewerDidAuthor": True,
+            "author": {"login": "bot"},
+        },
+        {
+            "databaseId": 88,
+            "url": _issue_url(88),
+            "body": "<!-- ai-pr-review-specialist-handoff -->\nUntrusted copy",
+            "viewerDidAuthor": False,
+            "author": {"login": "unknown"},
+        },
+        {
+            "databaseId": 89,
+            "url": _issue_url(89),
+            "body": "<!-- ai-pr-review-specialist-handoff -->spoof",
+            "viewerDidAuthor": True,
+            "author": {"login": "bot"},
+        },
+    ]
+    writes = []
+
+    def fake_graphql(query, _variables):
+        if "ManagedReviewIdentity" in query:
+            return {"data": {
+                "viewer": {"login": "bot"},
+                "repository": {
+                    "nameWithOwner": "owner/repo",
+                    "pullRequest": {"id": "PR-node"},
+                },
+            }}
+        if "ManagedIssueComments" in query:
+            return {"data": {"node": {"comments": _connection(comments)}}}
+        raise AssertionError(query)
+
+    monkeypatch.setattr(client, "_graphql", fake_graphql)
+    monkeypatch.setattr(
+        client,
+        "_api_write",
+        lambda endpoint, method, payload: writes.append((endpoint, method, payload))
+        or ({"deleted": True} if method == "DELETE" else {
+            "id": 73, "url": _issue_url(73),
+        }),
+    )
+
+    client.update_sticky(
+        "owner/repo",
+        17,
+        "<!-- ai-pr-review-specialist-handoff -->\nCurrent handoff",
+    )
+
+    assert writes == [
+        (
+            "repos/owner/repo/issues/comments/73",
+            "PATCH",
+            {"body": "<!-- ai-pr-review-specialist-handoff -->\nCurrent handoff"},
+        ),
+        ("repos/owner/repo/issues/comments/41", "DELETE", {}),
+    ]
+
+
+def test_sticky_duplicate_cleanup_failure_surfaces_without_patch_or_create(
+    monkeypatch, tmp_path
+):
+    client = GhReviewClient(action_root=tmp_path)
+    comments = [
+        {
+            "databaseId": comment_id,
+            "url": _issue_url(comment_id),
+            "body": "<!-- ai-pr-review-specialist-handoff -->\nManaged",
+            "viewerDidAuthor": True,
+            "author": {"login": "bot"},
+        }
+        for comment_id in (41, 73)
+    ]
+    writes = []
+
+    def fake_graphql(query, _variables):
+        if "ManagedReviewIdentity" in query:
+            return {"data": {
+                "viewer": {"login": "bot"},
+                "repository": {
+                    "nameWithOwner": "owner/repo",
+                    "pullRequest": {"id": "PR-node"},
+                },
+            }}
+        if "ManagedIssueComments" in query:
+            return {"data": {"node": {"comments": _connection(comments)}}}
+        raise AssertionError(query)
+
+    def fail_delete(endpoint, method, payload):
+        writes.append((endpoint, method, payload))
+        if method == "DELETE":
+            raise RuntimeError("delete failed")
+        return {"id": 73, "url": _issue_url(73)}
+
+    monkeypatch.setattr(client, "_graphql", fake_graphql)
+    monkeypatch.setattr(client, "_api_write", fail_delete)
+
+    result = client.update_sticky(
+        "owner/repo",
+        17,
+        "<!-- ai-pr-review-specialist-handoff -->\nCurrent handoff",
+    )
+
+    assert result["id"] == 73
+    assert result["url"] == _issue_url(73)
+    assert result["cleanup_errors"] == (
+        "duplicate sticky cleanup failed for comment 41",
+    )
+    assert writes == [
+        (
+            "repos/owner/repo/issues/comments/73",
+            "PATCH",
+            {"body": "<!-- ai-pr-review-specialist-handoff -->\nCurrent handoff"},
+        ),
+        ("repos/owner/repo/issues/comments/41", "DELETE", {}),
+    ]
+
+
+def test_sticky_ignores_marker_prefix_spoof_and_creates_when_no_exact_marker(
+    monkeypatch, tmp_path
+):
+    client = GhReviewClient(action_root=tmp_path)
+    writes = []
+
+    def fake_graphql(query, _variables):
+        if "ManagedReviewIdentity" in query:
+            return {"data": {
+                "viewer": {"login": "bot"},
+                "repository": {
+                    "nameWithOwner": "owner/repo",
+                    "pullRequest": {"id": "PR-node"},
+                },
+            }}
+        if "ManagedIssueComments" in query:
+            return {"data": {"node": {"comments": _connection([{
+                "databaseId": 88,
+                "url": _issue_url(88),
+                "body": (
+                    "<!-- ai-pr-review-specialist-handoff -->copied\n"
+                    "Not a managed handoff"
+                ),
+                "viewerDidAuthor": True,
+                "author": {"login": "bot"},
+            }])}}}
+        raise AssertionError(query)
+
+    monkeypatch.setattr(client, "_graphql", fake_graphql)
+    monkeypatch.setattr(
+        client,
+        "_api_write",
+        lambda endpoint, method, payload: writes.append((endpoint, method, payload))
+        or {"id": 101, "url": _issue_url(101)},
+    )
+
+    client.update_sticky(
+        "owner/repo",
+        17,
+        "<!-- ai-pr-review-specialist-handoff -->\nCurrent handoff",
+    )
+
+    assert writes == [(
+        "repos/owner/repo/issues/17/comments",
+        "POST",
+        {"body": "<!-- ai-pr-review-specialist-handoff -->\nCurrent handoff"},
+    )]
+
+
+def test_sticky_rejects_repository_identity_mismatch_before_write(monkeypatch, tmp_path):
+    client = GhReviewClient(action_root=tmp_path)
+    writes = []
+
+    def fake_graphql(query, _variables):
+        if "ManagedReviewIdentity" in query:
+            return {"data": {
+                "viewer": {"login": "bot"},
+                "repository": {
+                    "nameWithOwner": "attacker/repo",
+                    "pullRequest": {"id": "PR-node"},
+                },
+            }}
+        raise AssertionError(query)
+
+    monkeypatch.setattr(client, "_graphql", fake_graphql)
+    monkeypatch.setattr(
+        client,
+        "_api_write",
+        lambda endpoint, method, payload: writes.append((endpoint, method, payload)),
+    )
+
+    with pytest.raises(RuntimeError, match="repository identity"):
+        client.update_sticky(
+            "owner/repo",
+            17,
+            "<!-- ai-pr-review-specialist-handoff -->\nCurrent handoff",
+        )
+
+    assert writes == []
+
+
+def test_sticky_updates_exact_github_actions_bot_handoff_after_viewer_identity_changes(
+    monkeypatch, tmp_path
+):
+    client = GhReviewClient(action_root=tmp_path)
+    writes = []
+
+    def fake_graphql(query, _variables):
+        if "ManagedReviewIdentity" in query:
+            return {"data": {
+                "viewer": {"login": "current-review-app[bot]"},
+                "repository": {
+                    "nameWithOwner": "owner/repo",
+                    "pullRequest": {"id": "PR-node"},
+                },
+            }}
+        if "ManagedIssueComments" in query:
+            return {"data": {"node": {"comments": _connection([
+                {
+                    "databaseId": 71,
+                    "url": _issue_url(71),
+                    "body": "<!-- ai-pr-review-specialist-handoff -->\nPrevious run",
+                    "viewerDidAuthor": False,
+                    "author": {"login": "github-actions[bot]"},
+                },
+                {
+                    "databaseId": 89,
+                    "url": _issue_url(89),
+                    "body": "<!-- ai-pr-review-specialist-handoff -->\nCopied marker",
+                    "viewerDidAuthor": False,
+                    "author": {"login": "untrusted-user"},
+                },
+            ])}}}
+        raise AssertionError(query)
+
+    monkeypatch.setattr(client, "_graphql", fake_graphql)
+    monkeypatch.setattr(
+        client,
+        "_api_write",
+        lambda endpoint, method, payload: writes.append((endpoint, method, payload))
+        or {"id": 71, "url": _issue_url(71)},
+    )
+
+    client.update_sticky(
+        "owner/repo",
+        17,
+        "<!-- ai-pr-review-specialist-handoff -->\nCurrent run",
+    )
+
+    assert writes == [(
+        "repos/owner/repo/issues/comments/71",
+        "PATCH",
+        {"body": "<!-- ai-pr-review-specialist-handoff -->\nCurrent run"},
+    )]
+
+
 def test_sticky_post_timeout_reconciles_exact_owned_body_without_retry(monkeypatch, tmp_path):
     client = GhReviewClient(action_root=tmp_path)
     body = "<!-- ai-pr-review-specialist-handoff -->\nSparse handoff"
@@ -1516,6 +1855,7 @@ def test_sticky_post_timeout_reconciles_exact_owned_body_without_retry(monkeypat
         raise TimeoutError("server committed before timeout")
 
     monkeypatch.setattr(client, "find_specialist_handoff", find)
+    monkeypatch.setattr(client, "_trusted_specialist_handoffs", lambda *_args: ())
     monkeypatch.setattr(client, "_api_write", ambiguous_write)
 
     assert client.update_sticky("owner/repo", 17, body) == {
@@ -1523,7 +1863,7 @@ def test_sticky_post_timeout_reconciles_exact_owned_body_without_retry(monkeypat
         "url": _issue_url(74),
     }
     assert len(writes) == 1
-    assert finds == [None, body]
+    assert finds == [body]
 
 
 def test_sticky_refresh_rejects_untrusted_comment_id_without_a_write(monkeypatch, tmp_path):
@@ -1560,6 +1900,7 @@ def test_sticky_refresh_rejects_a_trusted_id_for_a_different_pull_request(monkey
         return {"id": 74, "url": _issue_url(74)}
 
     monkeypatch.setattr(client, "find_specialist_handoff", find)
+    monkeypatch.setattr(client, "_trusted_specialist_handoffs", lambda *_args: ())
     monkeypatch.setattr(client, "_api_write", write)
     created = client.update_sticky("owner/repo", 17, initial_body)
 
@@ -1592,6 +1933,7 @@ def test_sticky_refresh_patches_known_comment_when_comment_list_is_stale(monkeyp
         return {"id": 74, "url": _issue_url(74)}
 
     monkeypatch.setattr(client, "find_specialist_handoff", find)
+    monkeypatch.setattr(client, "_trusted_specialist_handoffs", lambda *_args: ())
     monkeypatch.setattr(client, "_api_write", write)
 
     created = client.update_sticky("owner/repo", 17, initial_body)
@@ -1600,7 +1942,7 @@ def test_sticky_refresh_patches_known_comment_when_comment_list_is_stale(monkeyp
     )
 
     assert refreshed == {"id": 74, "url": _issue_url(74)}
-    assert finds == [None]
+    assert finds == []
     assert writes == [
         ("repos/owner/repo/issues/17/comments", "POST", {"body": initial_body}),
         ("repos/owner/repo/issues/comments/74", "PATCH", {"body": refreshed_body}),
@@ -1664,6 +2006,17 @@ def test_production_client_rejects_malformed_mutation_success_objects(monkeypatc
         client.add_review_thread({"pullRequestReviewId": "R"})
     with pytest.raises(RuntimeError, match="submitted review"):
         client.submit_review("R", "COMMENT", "body")
+
+
+def test_production_comment_delete_accepts_github_empty_success_response(
+    monkeypatch, tmp_path
+):
+    client = GhReviewClient(action_root=tmp_path)
+    monkeypatch.setattr(client, "_input_call", lambda *_args, **_kwargs: {})
+
+    assert client._api_write(
+        "repos/owner/repo/issues/comments/41", "DELETE", {}
+    ) == {"deleted": True}
 
 
 @pytest.mark.parametrize(
@@ -2064,6 +2417,9 @@ def test_specialist_publish_cli_loads_only_typed_final_artifacts(tmp_path, monke
             "recipe_focuses": ["Repository recipe: delivery"],
             "coverage_boundaries": ["Failure recovery"],
             "review_emphasis": ["Failure recovery"],
+            "what_changed": ["`a.py` changes runtime behavior."],
+            "ai_reviewed": ["Reviewed runtime behavior in `a.py`."],
+            "human_focus": ["Failure recovery"],
         },
         "notes.json": [{
             "kind": "finding",
@@ -2121,6 +2477,9 @@ def test_specialist_publish_cli_loads_only_typed_final_artifacts(tmp_path, monke
     assert handoff.specialist_focuses == ()
     assert handoff.recipe_focuses == ("Repository recipe: delivery",)
     assert handoff.coverage_boundaries == ("Failure recovery",)
+    assert handoff.what_changed == ("`a.py` changes runtime behavior.",)
+    assert handoff.ai_reviewed == ("Reviewed runtime behavior in `a.py`.",)
+    assert handoff.human_focus == ("Failure recovery",)
     assert isinstance(captured["publish"]["notes"][0], ReviewNote)
     assert isinstance(captured["publish"]["policy_result"], RuntimeVerdictPolicyResult)
     assert captured["publish"]["changed_files"] == ("a.py",)
