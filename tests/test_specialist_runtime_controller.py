@@ -21,6 +21,7 @@ from pr_reviewer.specialist_runtime.adjudication import (
 from pr_reviewer.specialist_runtime.controller import (
     EvidenceSeed,
     FinalizerProposal,
+    GatewayRoleAdapter,
     RoleRequest,
     ReviewController,
     ReviewInputs,
@@ -79,6 +80,82 @@ def test_controller_public_api_is_importable():
     assert ReviewController
     assert ReviewInputs
     assert ReviewResult
+
+
+def test_gateway_role_repair_continues_from_retained_reasoning_and_content():
+    payloads = []
+
+    class Gateway:
+        def __init__(self):
+            self.responses = iter((
+                ModelTurnResult(
+                    response={},
+                    tool_calls=(),
+                    text='{"partial":',
+                    text_source="content",
+                    finish_reason="length",
+                    usage={},
+                    request_diagnostics={},
+                    content='{"partial":',
+                    reasoning="private analysis",
+                ),
+                ModelTurnResult(
+                    response={},
+                    tool_calls=(),
+                    text='{"complete":true}',
+                    text_source="content",
+                    finish_reason="stop",
+                    usage={},
+                    request_diagnostics={},
+                    content='{"complete":true}',
+                    reasoning="",
+                ),
+            ))
+
+        def complete(self, request):
+            payloads.append(request.conversation.to_request_payload(
+                "openai",
+                "m",
+                verdict_turn=True,
+                keep_full_history_on_verdict=True,
+                ephemeral_user_note=request.ephemeral_user_note,
+                reasoning_effort=request.reasoning_effort,
+            ))
+            return next(self.responses)
+
+    adapter = GatewayRoleAdapter(Gateway(), response_format_override="json_object")
+    request = RoleRequest(
+        role="handoff_summarizer",
+        request_id="handoff_summarizer:test",
+        phase=RunPhase.FINALIZATION,
+        lease=controller_module.SessionLease(RunPhase.FINALIZATION, 10**20),
+        timeout_sec=30,
+        max_tokens=512,
+        context={"facts": ["src/app.py"]},
+    )
+
+    assert adapter.complete(request) == {"complete": True}
+    assert len(payloads) == 2
+    assert payloads[1]["messages"] == [
+        {
+            "role": "system",
+            "content": "Return only the requested structured JSON object.",
+        },
+        {
+            "role": "user",
+            "content": '{"facts":["src/app.py"]}',
+        },
+        {
+            "role": "assistant",
+            "content": '{"partial":',
+            "reasoning_content": "private analysis",
+        },
+        {
+            "role": "user",
+            "content": "Return only the required JSON object.",
+        },
+    ]
+    assert payloads[1]["reasoning_effort"] == "none"
 
 
 def test_critic_schema_does_not_allow_prose_to_rewrite_consequence_support():

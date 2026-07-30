@@ -15,7 +15,10 @@ from typing import Any, Callable, Mapping, Protocol
 
 from pr_reviewer.conversation import Conversation
 from pr_reviewer.stream_watchdog import StreamWatchdog
-from pr_reviewer.tool_loop import extract_intermediate_turn
+from pr_reviewer.tool_loop import (
+    effective_intermediate_text,
+    extract_intermediate_turn_parts,
+)
 from pr_reviewer.transport import run_chat_request
 
 # ``transport`` adds scripts/ to sys.path before importing this module's
@@ -62,6 +65,8 @@ class ModelTurnResult:
     request_diagnostics: dict[str, Any]
     stream_watchdog_triggered: bool = False
     stream_watchdog_reason: str = ""
+    content: str = ""
+    reasoning: str = ""
 
 
 class ModelGateway(Protocol):
@@ -146,7 +151,13 @@ class OpenAIModelGateway:
             requested_response_format=response_format,
             stream_watchdog=(StreamWatchdog("openai") if request.stream and self.stream_watchdog else None),
         )
-        calls, text, text_source, finish_reason = extract_intermediate_turn(response, "openai")
+        calls, content, reasoning, finish_reason = extract_intermediate_turn_parts(
+            response, "openai"
+        )
+        text, text_source = effective_intermediate_text(
+            {"content": content, "reasoning_content": reasoning},
+            "openai",
+        )
         usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
         return ModelTurnResult(
             response=response,
@@ -158,6 +169,8 @@ class OpenAIModelGateway:
             request_diagnostics=diagnostics,
             stream_watchdog_triggered=bool(response.get("stream_watchdog_triggered")),
             stream_watchdog_reason=str(response.get("stream_watchdog_reason") or ""),
+            content=content,
+            reasoning=reasoning,
         )
 
     def complete_payload(

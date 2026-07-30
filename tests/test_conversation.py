@@ -185,6 +185,56 @@ def test_old_assistant_text_compaction_preserves_recent_analysis():
     assert texts[3].startswith("new-b:") and len(texts[3]) > 100
 
 
+def test_openai_replays_reasoning_content_and_tool_calls_in_one_assistant_turn():
+    conv = Conversation(system="s")
+    conv.add_user("review")
+    conv.add_assistant_reasoning("private chain")
+    conv.add_assistant_text("visible progress")
+    conv.add_assistant_tool_calls([{
+        "id": "call-1",
+        "name": "read_file",
+        "arguments": '{"path":"src/app.py"}',
+    }])
+
+    payload = conv.to_request_payload("openai", "m", max_tokens=64)
+
+    assert payload["messages"][2] == {
+        "role": "assistant",
+        "reasoning_content": "private chain",
+        "content": "visible progress",
+        "tool_calls": [{
+            "id": "call-1",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": '{"path":"src/app.py"}',
+            },
+        }],
+    }
+
+
+def test_old_assistant_reasoning_is_bounded_without_mutating_visible_content():
+    conv = Conversation(system="s")
+    conv.add_assistant_reasoning("old:" + "x" * 2000)
+    conv.add_assistant_text("visible")
+    conv.add_assistant_reasoning("new:" + "y" * 2000)
+
+    assert conv.truncate_oldest_assistant_reasoning(100, keep_newest=1) == 1
+
+    reasoning = [
+        event["content"]
+        for event in conv.events
+        if event["kind"] == "assistant_reasoning"
+    ]
+    assert len(reasoning[0].encode()) <= 100
+    assert reasoning[1].startswith("new:") and len(reasoning[1]) > 100
+    assert [
+        event["content"]
+        for event in conv.events
+        if event["kind"] == "assistant_text"
+    ] == ["visible"]
+
+
 def test_anthropic_ephemeral_note_merges_into_existing_user_turn():
     conv = Conversation(system="s")
     conv.add_user("review")
@@ -215,6 +265,37 @@ def test_completed_history_collapse_keeps_recent_pairs_and_open_call_contract():
     notes = [e for e in conv.events if e.get("compaction_note")]
     assert len(notes) == 1
     assert "read_file" in notes[0]["content"]
+
+
+def test_completed_history_collapse_does_not_graft_old_reasoning_onto_new_turn():
+    conv = Conversation(system="s")
+    conv.add_user("review")
+    conv.add_assistant_reasoning("old private reasoning")
+    conv.add_assistant_tool_calls([{
+        "id": "old-call",
+        "name": "read_file",
+        "arguments": '{"path":"old.py"}',
+    }])
+    conv.add_tool_result("old-call", {"content": "old evidence"})
+    conv.add_assistant_text("new visible analysis")
+    conv.add_assistant_tool_calls([{
+        "id": "new-call",
+        "name": "read_file",
+        "arguments": '{"path":"new.py"}',
+    }])
+    conv.add_tool_result("new-call", {"content": "new evidence"})
+
+    conv.collapse_oldest_completed_history(1200, keep_newest_results=1)
+    payload = conv.to_request_payload("openai", "m", max_tokens=64)
+
+    retained = next(
+        message
+        for message in payload["messages"]
+        if message.get("tool_calls")
+    )
+    assert "reasoning_content" not in retained
+    assert retained["content"] == "new visible analysis"
+    assert retained["tool_calls"][0]["id"] == "new-call"
 
 
 class TestAnthropicCachePrefix:

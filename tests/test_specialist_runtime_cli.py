@@ -740,15 +740,27 @@ def test_planner_continues_truncated_reasoning_then_forces_json_response(
         for payload in payloads
     )
     assert any(
-        message == {"role": "assistant", "content": "first reasoning"}
+        message == {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "first reasoning",
+        }
         for message in payloads[1]["messages"]
     )
     assert any(
-        message == {"role": "assistant", "content": "first reasoning"}
+        message == {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "first reasoning",
+        }
         for message in payloads[2]["messages"]
     )
     assert any(
-        message == {"role": "assistant", "content": "second reasoning"}
+        message == {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "second reasoning",
+        }
         for message in payloads[2]["messages"]
     )
     assert payloads[2]["reasoning_effort"] == "none"
@@ -795,11 +807,130 @@ def test_negotiator_continues_truncated_reasoning_then_forces_json_response(
     ) == {"actions": [{"kind": "stop", "assignment_id": "a"}]}
     assert len(payloads) == 2
     assert any(
-        message == {"role": "assistant", "content": "unfinished reasoning"}
+        message == {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "unfinished reasoning",
+        }
         for message in payloads[1]["messages"]
     )
     assert payloads[1]["reasoning_effort"] == "none"
     assert payloads[1]["response_format"] == {"type": "json_object"}
+
+
+def test_critic_reasoning_only_length_response_is_retained_for_forced_json(
+    monkeypatch, tmp_path,
+):
+    """Regression for production run 30543173785."""
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    monkeypatch.setenv("AI_RESPONSE_FORMAT", "json_schema")
+    monkeypatch.setenv("AI_REASONING_EFFORT", "high")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    payloads = []
+    responses = iter((
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "critic analysis " * 1200,
+                },
+            }],
+            "usage": {"completion_tokens": 18000},
+        },
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": '{"actions":[]}',
+                },
+            }],
+            "usage": {},
+        },
+    ))
+
+    def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
+        payloads.append(payload)
+        return next(responses)
+
+    controller.critic.gateway.transport = transport
+
+    assert controller.critic.complete(
+        _role_request("critic", RunPhase.FINALIZATION)
+    ) == {"actions": []}
+    assert len(payloads) == 2
+    retained = [
+        message for message in payloads[1]["messages"]
+        if message.get("role") == "assistant"
+    ]
+    assert retained == [{
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "critic analysis " * 1200,
+    }]
+    assert payloads[1]["reasoning_effort"] == "none"
+    assert payloads[1]["response_format"] == {"type": "json_object"}
+
+
+def test_change_summarizer_repair_keeps_reasoning_and_partial_content(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    monkeypatch.setenv("AI_REASONING_EFFORT", "high")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    payloads = []
+    responses = iter((
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": '{"overview":"partial',
+                    "reasoning_content": "retain the validated path set",
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": '{"overview":"complete"}',
+                },
+            }],
+            "usage": {},
+        },
+    ))
+
+    def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
+        payloads.append(payload)
+        return next(responses)
+
+    controller.change_summarizer.gateway.transport = transport
+
+    assert controller.change_summarizer.complete(
+        _role_request("change_summarizer", RunPhase.PLANNING)
+    ) == {"overview": "complete"}
+    assert len(payloads) == 2
+    assert payloads[1]["messages"][1] == {
+        "role": "user",
+        "content": "{}",
+    }
+    assert payloads[1]["messages"][2] == {
+        "role": "assistant",
+        "content": '{"overview":"partial',
+        "reasoning_content": "retain the validated path set",
+    }
+    assert payloads[1]["messages"][3] == {
+        "role": "user",
+        "content": "Return only the required JSON object.",
+    }
+    assert payloads[1]["reasoning_effort"] == "none"
 
 
 def test_finalizer_continues_length_response_even_when_interim_text_is_empty(

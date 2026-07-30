@@ -662,6 +662,19 @@ class GatewayRoleAdapter:
     response_format_override: str | None = None
 
     def complete(self, request: RoleRequest) -> object:
+        return self._complete_recoverable_structured_role(request)
+
+    def _complete_recoverable_structured_role(
+        self,
+        request: RoleRequest,
+        *,
+        max_attempts: int = 2,
+        before_attempt: Callable[[int], None] | None = None,
+        force_final: Callable[[int], bool] | None = None,
+    ) -> object:
+        """Continue one bounded structured role without losing private state."""
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
         conversation = Conversation(system=self.system_prompt)
         conversation.add_user(json.dumps(
             _json_value(request.context),
@@ -669,19 +682,51 @@ class GatewayRoleAdapter:
             separators=(",", ":"),
             ensure_ascii=False,
         ))
-        result = self.gateway.complete(ModelTurnRequest(
-            role=request.role,
-            conversation=conversation,
-            max_tokens=request.max_tokens,
-            response_schema=None,
-            tools_enabled=False,
-            timeout_sec=request.timeout_sec,
-            deadline_at=request.lease.deadline_at,
-            stream=False,
-            response_schema_name=f"specialist_{request.role}",
-            response_format_override=self.response_format_override,
-        ))
-        return _json_object(result.text)
+        for attempt in range(max_attempts):
+            if before_attempt is not None:
+                before_attempt(attempt)
+            finalization = (
+                force_final(attempt)
+                if force_final is not None
+                else attempt == max_attempts - 1
+            )
+            result = self.gateway.complete(ModelTurnRequest(
+                role=request.role,
+                conversation=conversation,
+                max_tokens=request.max_tokens,
+                response_schema=None,
+                tools_enabled=False,
+                timeout_sec=request.timeout_sec,
+                deadline_at=request.lease.deadline_at,
+                stream=False,
+                response_schema_name=f"specialist_{request.role}",
+                response_format_override=self.response_format_override,
+                reasoning_effort="none" if finalization else None,
+                ephemeral_user_note=(
+                    "Return only the required JSON object."
+                    if finalization else None
+                ),
+            ))
+            content = result.content
+            if not content and result.text_source == "content":
+                # Compatibility for test/provider adapters built before
+                # ModelTurnResult gained explicit ordinary-content state.
+                content = result.text
+            try:
+                return _json_object(content)
+            except (TypeError, ValueError):
+                if (
+                    attempt == max_attempts - 1
+                    or result.finish_reason != "length"
+                ):
+                    raise
+                if result.reasoning:
+                    conversation.add_assistant_reasoning(result.reasoning)
+                if content:
+                    conversation.add_assistant_text(content)
+                if result.tool_calls:
+                    conversation.add_assistant_tool_calls(result.tool_calls)
+        raise AssertionError("structured-role continuation loop exhausted")
 
 
 @dataclass(frozen=True)

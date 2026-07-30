@@ -306,6 +306,9 @@ def web_tool_schemas(search_url: str, source_policy: Any) -> list[dict[str, Any]
 # (bytes). Roughly tracks the executor's own internal caps so a tool's
 # truncated response doesn't grow on every loop round.
 TOOL_RESULT_MAX_BYTES = 8000
+# Bound private continuation state at ingress. Older reasoning turns are also
+# eligible for context compaction below.
+ASSISTANT_REASONING_MAX_BYTES = 128_000
 
 # Approximate bytes-per-token used by the budget helpers. Deliberately
 # conservative (under-fills) — local models reject over-long prompts harder
@@ -480,6 +483,7 @@ class Conversation:
     system: str = ""
     # Ordered neutral events. Each item is a dict with a ``kind`` discriminator:
     #   {"kind": "user", "content": str}
+    #   {"kind": "assistant_reasoning", "content": str}
     #   {"kind": "assistant_text", "content": str}
     #   {"kind": "assistant_tool_calls", "calls": [{"id", "name", "arguments"}]}
     #   {"kind": "tool_result", "call_id": str, "result": Any, "is_error": bool}
@@ -500,6 +504,18 @@ class Conversation:
 
     def add_assistant_text(self, content: str) -> None:
         self.events.append({"kind": "assistant_text", "content": content})
+
+    def add_assistant_reasoning(
+        self,
+        content: str,
+        *,
+        max_bytes: int = ASSISTANT_REASONING_MAX_BYTES,
+    ) -> None:
+        """Append bounded private reasoning for endpoint continuation only."""
+        if not isinstance(content, str) or not content:
+            return
+        bounded, _ = truncate_text(content, max_bytes)
+        self.events.append({"kind": "assistant_reasoning", "content": bounded})
 
     def add_assistant_tool_calls(self, calls: Iterable[dict[str, Any]]) -> None:
         """Append an assistant turn carrying tool-call requests.
@@ -583,7 +599,13 @@ class Conversation:
             1
             for e in self.events
             if e["kind"]
-            in ("user", "assistant_text", "assistant_tool_calls", "tool_result")
+            in (
+                "user",
+                "assistant_reasoning",
+                "assistant_text",
+                "assistant_tool_calls",
+                "tool_result",
+            )
         )
 
     def open_tool_call_ids(self) -> set[str]:
@@ -616,7 +638,12 @@ class Conversation:
         for e in self.events:
             # 16 bytes/msg overhead approximates role/formatting tokens.
             total_bytes += 16
-            if e["kind"] in ("user", "assistant_text", "system_note"):
+            if e["kind"] in (
+                "user",
+                "assistant_reasoning",
+                "assistant_text",
+                "system_note",
+            ):
                 total_bytes += len(e["content"].encode("utf-8"))
             elif e["kind"] == "assistant_tool_calls":
                 for c in e["calls"]:
@@ -675,6 +702,27 @@ class Conversation:
                 shrunk += 1
         return shrunk
 
+    def truncate_oldest_assistant_reasoning(
+        self, max_bytes_per_reasoning: int, *, keep_newest: int = 2
+    ) -> int:
+        """Bound older private reasoning while preserving recent continuation."""
+        indices = [
+            i
+            for i, event in enumerate(self.events)
+            if event["kind"] == "assistant_reasoning"
+        ]
+        old = indices[:-max(keep_newest, 0)] if keep_newest else indices
+        shrunk = 0
+        for index in old:
+            body = self.events[index]["content"]
+            if len(body.encode("utf-8")) <= max_bytes_per_reasoning:
+                continue
+            bounded, _ = truncate_text(body, max_bytes_per_reasoning)
+            if bounded != body:
+                self.events[index]["content"] = bounded
+                shrunk += 1
+        return shrunk
+
     def collapse_oldest_completed_history(
         self, max_notebook_bytes: int, *, keep_newest_results: int = 2
     ) -> int:
@@ -691,14 +739,78 @@ class Conversation:
         keep = max(keep_newest_results, 0)
         old_results = result_events[:-keep] if keep else result_events
         old_ids = {e["call_id"] for e in old_results}
+
+        # Reasoning, visible content, and calls from one provider turn are
+        # stored as adjacent neutral events and rendered back as one assistant
+        # message. Select those events atomically so compaction cannot graft an
+        # old turn's reasoning onto a newer turn's content or calls.
+        assistant_kinds = {
+            "assistant_reasoning",
+            "assistant_text",
+            "assistant_tool_calls",
+        }
+        assistant_groups: list[list[int]] = []
+        current_group: list[int] = []
+        for index, event in enumerate(self.events):
+            if event["kind"] in assistant_kinds:
+                current_group.append(index)
+            elif current_group:
+                assistant_groups.append(current_group)
+                current_group = []
+        if current_group:
+            assistant_groups.append(current_group)
+
+        call_group_indices: set[int] = set()
+        old_call_turn_indices: set[int] = set()
+        for group in assistant_groups:
+            call_ids = {
+                call["id"]
+                for index in group
+                if self.events[index]["kind"] == "assistant_tool_calls"
+                for call in self.events[index]["calls"]
+            }
+            if not call_ids:
+                continue
+            call_group_indices.update(group)
+            if call_ids.issubset(old_ids):
+                old_call_turn_indices.update(group)
+
         assistant_text_indices = [
-            i for i, e in enumerate(self.events) if e["kind"] == "assistant_text"
+            i
+            for i, e in enumerate(self.events)
+            if e["kind"] == "assistant_text" and i not in call_group_indices
         ]
-        old_text_indices = set(
+        old_text_indices = {
+            index
+            for index in old_call_turn_indices
+            if self.events[index]["kind"] == "assistant_text"
+        } | set(
             assistant_text_indices[:-keep] if keep else assistant_text_indices
         )
-        if not old_ids and not old_text_indices and not any(
-            e.get("compaction_note") for e in self.events
+        assistant_reasoning_indices = [
+            i
+            for i, event in enumerate(self.events)
+            if (
+                event["kind"] == "assistant_reasoning"
+                and i not in call_group_indices
+            )
+        ]
+        old_reasoning_indices = {
+            index
+            for index in old_call_turn_indices
+            if self.events[index]["kind"] == "assistant_reasoning"
+        } | set(
+            assistant_reasoning_indices[:-keep]
+            if keep
+            else assistant_reasoning_indices
+        )
+        if (
+            not old_ids
+            and not old_text_indices
+            and not old_reasoning_indices
+            and not any(
+                e.get("compaction_note") for e in self.events
+            )
         ):
             return 0
 
@@ -726,6 +838,9 @@ class Conversation:
         for i in sorted(old_text_indices):
             text, _ = truncate_text(self.events[i].get("content", ""), 800)
             notebook_lines.append(f"- Earlier assistant analysis: {text}")
+        for i in sorted(old_reasoning_indices):
+            text, _ = truncate_text(self.events[i].get("content", ""), 800)
+            notebook_lines.append(f"- Earlier assistant reasoning: {text}")
 
         notebook, _ = truncate_text("\n".join(notebook_lines), max_notebook_bytes)
         new_events: list[dict[str, Any]] = []
@@ -733,6 +848,11 @@ class Conversation:
             if event.get("compaction_note"):
                 continue
             if event["kind"] == "assistant_text" and i in old_text_indices:
+                continue
+            if (
+                event["kind"] == "assistant_reasoning"
+                and i in old_reasoning_indices
+            ):
                 continue
             if event["kind"] == "tool_result" and event["call_id"] in old_ids:
                 continue
@@ -815,8 +935,30 @@ class Conversation:
             kind = e["kind"]
             if kind == "user":
                 messages.append({"role": "user", "content": e["content"]})
+            elif kind == "assistant_reasoning":
+                if (
+                    messages
+                    and messages[-1].get("role") == "assistant"
+                    and "tool_calls" not in messages[-1]
+                    and "reasoning_content" not in messages[-1]
+                ):
+                    messages[-1]["reasoning_content"] = e["content"]
+                else:
+                    messages.append({
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": e["content"],
+                    })
             elif kind == "assistant_text":
-                messages.append({"role": "assistant", "content": e["content"]})
+                if (
+                    messages
+                    and messages[-1].get("role") == "assistant"
+                    and "tool_calls" not in messages[-1]
+                    and not messages[-1].get("content")
+                ):
+                    messages[-1]["content"] = e["content"]
+                else:
+                    messages.append({"role": "assistant", "content": e["content"]})
             elif kind == "assistant_tool_calls":
                 calls = normalize_assistant_tool_calls_openai(
                     [
@@ -832,21 +974,22 @@ class Conversation:
                 )
                 if not calls:
                     continue
-                interleaved_text = None
                 if (
                     messages
                     and messages[-1].get("role") == "assistant"
-                    and isinstance(messages[-1].get("content"), str)
                     and "tool_calls" not in messages[-1]
                 ):
-                    interleaved_text = messages.pop()["content"]
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": interleaved_text,
-                        "tool_calls": calls,
-                    }
-                )
+                    assistant = messages.pop()
+                    assistant["tool_calls"] = calls
+                    messages.append(assistant)
+                else:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": calls,
+                        }
+                    )
             elif kind == "tool_result":
                 messages.append(
                     {
@@ -885,14 +1028,36 @@ class Conversation:
             if kind == "user":
                 _flush_tool_results()
                 messages.append({"role": "user", "content": e["content"]})
+            elif kind == "assistant_reasoning":
+                _flush_tool_results()
+                block = {"type": "text", "text": e["content"]}
+                if (
+                    messages
+                    and messages[-1].get("role") == "assistant"
+                    and isinstance(messages[-1].get("content"), list)
+                    and all(
+                        isinstance(item, dict) and item.get("type") == "text"
+                        for item in messages[-1]["content"]
+                    )
+                ):
+                    messages[-1]["content"].append(block)
+                else:
+                    messages.append({"role": "assistant", "content": [block]})
             elif kind == "assistant_text":
                 _flush_tool_results()
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": e["content"]}],
-                    }
-                )
+                block = {"type": "text", "text": e["content"]}
+                if (
+                    messages
+                    and messages[-1].get("role") == "assistant"
+                    and isinstance(messages[-1].get("content"), list)
+                    and all(
+                        isinstance(item, dict) and item.get("type") == "text"
+                        for item in messages[-1]["content"]
+                    )
+                ):
+                    messages[-1]["content"].append(block)
+                else:
+                    messages.append({"role": "assistant", "content": [block]})
             elif kind == "assistant_tool_calls":
                 _flush_tool_results()
                 blocks: list[dict[str, Any]] = []

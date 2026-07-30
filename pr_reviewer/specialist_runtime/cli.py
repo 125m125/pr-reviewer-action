@@ -35,7 +35,6 @@ from .controller import (
     ReviewController,
     ReviewInputs,
     ReviewResult,
-    _json_object,
 )
 from .model_gateway import ModelTurnRequest, OpenAIModelGateway
 from .policy import (
@@ -431,88 +430,27 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
             ),
         )
         if request.role != "planner":
-            if request.role not in {"negotiator", "finalizer"}:
-                return super().complete(bounded_request)
             return self._complete_recoverable_structured_role(bounded_request)
 
-        conversation = Conversation(system=self.system_prompt)
-        conversation.add_user(json.dumps(
-            _json_value(bounded_request.context),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ))
-        for attempt in range(3):
-            budget = bounded_request.planner_request_budget
-            finalization = (
+        budget = bounded_request.planner_request_budget
+
+        def consume_attempt(_attempt: int) -> None:
+            if budget is not None:
+                budget.consume()
+
+        def force_final(attempt: int) -> bool:
+            return (
                 budget.remaining <= 2
                 if budget is not None
                 else attempt == 2
             )
-            if budget is not None:
-                budget.consume()
-            result = self.gateway.complete(ModelTurnRequest(
-                role=bounded_request.role,
-                conversation=conversation,
-                max_tokens=bounded_request.max_tokens,
-                response_schema=None,
-                tools_enabled=False,
-                timeout_sec=bounded_request.timeout_sec,
-                deadline_at=bounded_request.lease.deadline_at,
-                stream=False,
-                response_schema_name="specialist_planner",
-                response_format_override=self.response_format_override,
-                reasoning_effort="none" if finalization else None,
-                ephemeral_user_note=(
-                    "Return only the required JSON object."
-                    if finalization else None
-                ),
-            ))
-            try:
-                return _json_object(result.text)
-            except (TypeError, ValueError):
-                if attempt == 2 or result.finish_reason != "length" or not result.text:
-                    raise
-                conversation.add_assistant_text(result.text)
 
-        raise AssertionError("planner continuation loop exhausted")
-
-    def _complete_recoverable_structured_role(self, request):
-        """Allow one bounded continuation before forcing structured output."""
-        conversation = Conversation(system=self.system_prompt)
-        conversation.add_user(json.dumps(
-            _json_value(request.context),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ))
-        for attempt in range(2):
-            finalization = attempt == 1
-            result = self.gateway.complete(ModelTurnRequest(
-                role=request.role,
-                conversation=conversation,
-                max_tokens=request.max_tokens,
-                response_schema=None,
-                tools_enabled=False,
-                timeout_sec=request.timeout_sec,
-                deadline_at=request.lease.deadline_at,
-                stream=False,
-                response_schema_name=f"specialist_{request.role}",
-                response_format_override=self.response_format_override,
-                reasoning_effort="none" if finalization else None,
-                ephemeral_user_note=(
-                    "Return only the required JSON object."
-                    if finalization else None
-                ),
-            ))
-            try:
-                return _json_object(result.text)
-            except (TypeError, ValueError):
-                if attempt == 1 or result.finish_reason != "length":
-                    raise
-                if result.text:
-                    conversation.add_assistant_text(result.text)
-        raise AssertionError("structured-role continuation loop exhausted")
+        return self._complete_recoverable_structured_role(
+            bounded_request,
+            max_attempts=3,
+            before_attempt=consume_attempt,
+            force_final=force_final,
+        )
 
 
 def _load_json(path: Path, *, expected: type) -> Any:

@@ -373,8 +373,49 @@ def test_qwen_reasoning_fallback_is_preserved_in_next_request():
         conv, post, execute, api_format="openai", model="m", budgets=LoopBudgets()
     )
     prior = next(m for m in payloads[1]["messages"] if m.get("tool_calls"))
-    assert prior["content"] == "I found a cancellation race; inspect the test."
+    assert prior["content"] == "\n\n"
+    assert prior["reasoning_content"] == (
+        "I found a cancellation race; inspect the test."
+    )
     assert outcome.text_sources[0] == "reasoning_fallback"
+
+
+def test_tool_turn_preserves_reasoning_separately_when_content_is_also_present():
+    conv = fresh_conversation()
+    payloads = []
+    responses = [
+        {
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "I will inspect the effect test.",
+                    "reasoning_content": "The changed cleanup path may race.",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"src/effect.spec.ts"}',
+                        },
+                    }],
+                },
+            }]
+        },
+        openai_text_response("done"),
+    ]
+
+    def post(payload):
+        payloads.append(payload)
+        return responses.pop(0)
+
+    execute, _ = recording_execute()
+    drive_tool_loop(
+        conv, post, execute, api_format="openai", model="m", budgets=LoopBudgets()
+    )
+
+    prior = next(message for message in payloads[1]["messages"] if message.get("tool_calls"))
+    assert prior["reasoning_content"] == "The changed cleanup path may race."
+    assert prior["content"] == "I will inspect the effect test."
 
 
 def test_budget_notes_are_correct_and_do_not_accumulate():
