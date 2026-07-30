@@ -230,6 +230,63 @@ def test_cli_accepts_only_complete_api_snapshot_bound_to_event_head(monkeypatch,
     assert cli.load_workspace(cli.CliConfig.from_env()).inputs.changed_files == ("src/app.py",)
 
 
+def test_load_workspace_uses_immutable_local_diff_when_api_patches_are_absent(
+    monkeypatch,
+    tmp_path,
+):
+    def git(*args):
+        return subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "review@example.test")
+    git("config", "user.name", "Review Test")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text(
+        "def old_name():\n    return 1\n",
+        encoding="utf-8",
+    )
+    git("add", ".")
+    git("commit", "-q", "-m", "base")
+    base_sha = git("rev-parse", "HEAD")
+    (tmp_path / "src" / "app.py").write_text(
+        "def old_name():\n    return 1\n\n"
+        "def immutable_change():\n    return 2\n",
+        encoding="utf-8",
+    )
+    git("add", ".")
+    git("commit", "-q", "-m", "head")
+    head_sha = git("rev-parse", "HEAD")
+    (tmp_path / "pr.json").write_text(json.dumps({
+        "number": 17,
+        "baseRefOid": base_sha,
+        "headRefOid": head_sha,
+        "changedFiles": 1,
+        "title": "Local facts",
+        "body": "",
+    }), encoding="utf-8")
+    (tmp_path / "pr-files.raw.json").write_text(
+        '[{"filename":"src/app.py","status":"modified"}]',
+        encoding="utf-8",
+    )
+    (tmp_path / "classification.json").write_text(
+        '{"pr_kind":"app_code","risk_flags":[]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("REPO", "owner/repo")
+
+    workspace = cli.load_workspace(cli.CliConfig.from_env(workspace=tmp_path))
+
+    facts = workspace.inputs.topology["change_facts"]["src/app.py"]
+    assert facts["symbols"] == ["immutable_change"]
+    assert facts["hunk_summaries"]
+
+
 def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_BASE_URL", "http://model.invalid/v1")
     monkeypatch.setenv("AI_API_KEY", "secret")
@@ -258,9 +315,11 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
 
     gateway = controller.planner.gateway
     assert gateway.role_models == {
-        "planner": "planner", "specialist": "worker", "negotiator": "critic",
+        "change_summarizer": "planner", "planner": "planner",
+        "specialist": "worker", "negotiator": "critic",
         "critic": "critic", "finalizer": "finalizer",
     }
+    assert controller.change_summarizer.gateway is gateway
     assert gateway.stream_watchdog is False
     assert config.request_timeout_sec == 41
     assert config.max_tokens == 1234

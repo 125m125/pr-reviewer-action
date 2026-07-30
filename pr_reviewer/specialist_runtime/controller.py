@@ -86,6 +86,15 @@ from .web_evidence import SourceAccessRequest
 _SCHEMA_VERSION = 2
 _MAX_ARTIFACT_STRING = 16 * 1024
 _MAX_ARTIFACT_ITEMS = 2_000
+_MAX_CHANGE_OVERVIEW_ITEMS = 12
+_PROHIBITED_OVERVIEW_CLAIM = re.compile(
+    r"(?i)\b(?:approve|request[_ -]?changes|verdict|findings?|blocker|"
+    r"bugs?|defects?|vulnerabilit(?:y|ies)|regressions?|"
+    r"coverage\s+(?:is\s+)?(?:complete|sufficient|verified)|"
+    r"tests?\s+(?:pass|passed|passing)|"
+    r"(?:all|fully|completely)\b.{0,40}\b(?:covered|reviewed|verified|tested))\b"
+)
+_BACKTICK_REFERENCE = re.compile(r"`([^`\r\n]{1,300})`")
 _SIGNAL_ORIENTATION_TOPICS = {
     "implementation": (ReviewOrientationTopic.IMPLEMENTATION,),
     "documentation": (ReviewOrientationTopic.DOCUMENTATION,),
@@ -673,6 +682,230 @@ class ReviewInputs:
     adapter_configuration: Mapping[str, Any] = field(default_factory=dict)
 
 
+def _change_components(
+    inputs: ReviewInputs,
+) -> tuple[set[str], dict[str, str]]:
+    component_ids: set[str] = set()
+    path_components: dict[str, str] = {}
+    explicit = inputs.topology.get("path_components", {})
+    if isinstance(explicit, Mapping):
+        for path, component in explicit.items():
+            clean_path = str(path).replace("\\", "/").strip("/")
+            clean_component = str(component).strip()
+            if clean_path and clean_component:
+                path_components[clean_path] = clean_component
+                component_ids.add(clean_component)
+    for item in inputs.topology.get("components", ()):
+        if not isinstance(item, Mapping):
+            continue
+        component = str(item.get("id") or "").strip()
+        if not component:
+            continue
+        component_ids.add(component)
+        for path in item.get("changed_files", ()):
+            clean_path = str(path).replace("\\", "/").strip("/")
+            if clean_path:
+                path_components.setdefault(clean_path, component)
+    return component_ids, path_components
+
+
+def _overview_text(value: object, label: str, *, limit: int) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"change overview {label} must be non-empty text")
+    text = " ".join(value.split())
+    if len(text) > limit:
+        raise ValueError(f"change overview {label} exceeds its bound")
+    if _PROHIBITED_OVERVIEW_CLAIM.search(text):
+        raise ValueError(
+            f"change overview {label} claims verdict, findings, or coverage"
+        )
+    return text
+
+
+def _validated_change_overview(
+    value: object,
+    inputs: ReviewInputs,
+) -> dict[str, object]:
+    """Admit only bounded orientation backed by changed paths/components."""
+    if not isinstance(value, Mapping):
+        raise ValueError("change overview must be an object")
+    fields = {
+        "overview", "key_changes", "cross_component_effects", "uncertainties",
+    }
+    if set(value) != fields:
+        raise ValueError("change overview fields are invalid")
+    changed_paths = {
+        str(path).replace("\\", "/").strip("/")
+        for path in inputs.changed_files
+        if str(path).strip()
+    }
+    component_ids, path_components = _change_components(inputs)
+
+    def admitted_text(raw: object, label: str, *, limit: int) -> str:
+        text = _overview_text(raw, label, limit=limit)
+        for reference in _BACKTICK_REFERENCE.findall(text):
+            path = reference.replace("\\", "/").strip("/")
+            if "/" in path and path not in changed_paths:
+                raise ValueError(
+                    "change overview contains an unchanged path reference"
+                )
+        return text
+
+    overview = admitted_text(value.get("overview"), "overview", limit=1000)
+
+    raw_changes = value.get("key_changes")
+    if (
+        isinstance(raw_changes, (str, bytes))
+        or not isinstance(raw_changes, (tuple, list))
+        or len(raw_changes) > _MAX_CHANGE_OVERVIEW_ITEMS
+    ):
+        raise ValueError("change overview key_changes must be a bounded array")
+    key_changes: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for row in raw_changes:
+        if not isinstance(row, Mapping) or set(row) != {
+            "path", "component", "summary",
+        }:
+            raise ValueError("change overview key change fields are invalid")
+        path = str(row.get("path") or "").replace("\\", "/").strip("/")
+        component = str(row.get("component") or "").strip()
+        if path not in changed_paths or path in seen_paths:
+            raise ValueError("change overview contains unchanged or duplicate path")
+        if component not in component_ids:
+            raise ValueError("change overview contains unknown component")
+        expected_component = path_components.get(path)
+        if expected_component and component != expected_component:
+            raise ValueError("change overview path/component binding is invalid")
+        summary = admitted_text(
+            row.get("summary"), f"summary for {path}", limit=500,
+        )
+        key_changes.append({
+            "path": path,
+            "component": component,
+            "summary": summary,
+        })
+        seen_paths.add(path)
+
+    raw_effects = value.get("cross_component_effects")
+    if (
+        isinstance(raw_effects, (str, bytes))
+        or not isinstance(raw_effects, (tuple, list))
+        or len(raw_effects) > 8
+    ):
+        raise ValueError(
+            "change overview cross_component_effects must be a bounded array"
+        )
+    effects: list[dict[str, object]] = []
+    for row in raw_effects:
+        if not isinstance(row, Mapping) or set(row) != {"components", "summary"}:
+            raise ValueError("change overview cross-component fields are invalid")
+        components = row.get("components")
+        if (
+            isinstance(components, (str, bytes))
+            or not isinstance(components, (tuple, list))
+        ):
+            raise ValueError("change overview components must be an array")
+        selected = tuple(dict.fromkeys(
+            str(component).strip() for component in components
+            if str(component).strip()
+        ))
+        if len(selected) < 2 or len(selected) > 6:
+            raise ValueError("change overview cross-component effect is invalid")
+        if any(component not in component_ids for component in selected):
+            raise ValueError("change overview contains unknown component")
+        effects.append({
+            "components": selected,
+            "summary": admitted_text(
+                row.get("summary"), "cross-component summary", limit=500,
+            ),
+        })
+
+    raw_uncertainties = value.get("uncertainties")
+    if (
+        isinstance(raw_uncertainties, (str, bytes))
+        or not isinstance(raw_uncertainties, (tuple, list))
+        or len(raw_uncertainties) > 8
+    ):
+        raise ValueError("change overview uncertainties must be a bounded array")
+    uncertainties = tuple(
+        admitted_text(item, "uncertainty", limit=400)
+        for item in raw_uncertainties
+    )
+    return {
+        "overview": overview,
+        "key_changes": tuple(key_changes),
+        "cross_component_effects": tuple(effects),
+        "uncertainties": uncertainties,
+    }
+
+
+def _deterministic_change_overview(inputs: ReviewInputs) -> dict[str, object]:
+    facts_value = inputs.topology.get(
+        "change_facts",
+        inputs.topology.get("changed_contract_facts", {}),
+    )
+    facts = facts_value if isinstance(facts_value, Mapping) else {}
+    component_ids, path_components = _change_components(inputs)
+    fallback_component = sorted(component_ids)[0] if len(component_ids) == 1 else ""
+    changes: list[dict[str, str]] = []
+    for path in inputs.changed_files[:_MAX_CHANGE_OVERVIEW_ITEMS]:
+        fact_value = facts.get(path, {})
+        fact = fact_value if isinstance(fact_value, Mapping) else {}
+        signals: list[str] = []
+        for field_name, label in (
+            ("symbols", "symbols"),
+            ("action_inputs", "action inputs"),
+            ("workflow_steps", "workflow steps"),
+            ("workflow_keys", "workflow keys"),
+            ("headings", "headings"),
+            ("change_excerpts", "documentation excerpts"),
+            ("hunk_summaries", "hunks"),
+        ):
+            values = fact.get(field_name, ())
+            if (
+                isinstance(values, (tuple, list))
+                and values
+                and len(signals) < 3
+            ):
+                selected = ", ".join(
+                    " ".join(str(item).split())[:100]
+                    for item in values[:3]
+                    if str(item).strip()
+                )
+                if selected:
+                    signals.append(f"{label}: {selected}")
+        change_type = str(fact.get("change_type") or "changes").strip()
+        summary = change_type.capitalize()
+        if signals:
+            summary += " " + "; ".join(signals)
+        component = path_components.get(path, fallback_component)
+        if not component:
+            component = "repository"
+            component_ids.add(component)
+        changes.append({
+            "path": path,
+            "component": component,
+            "summary": summary[:500],
+        })
+    omitted = max(0, len(inputs.changed_files) - len(changes))
+    overview = (
+        f"{len(inputs.changed_files)} changed "
+        f"{'path' if len(inputs.changed_files) == 1 else 'paths'} across "
+        f"{max(1, len(component_ids))} "
+        f"{'component' if len(component_ids) == 1 else 'components'}."
+    )
+    uncertainties = (
+        (f"{omitted} additional changed paths are omitted from this bounded overview.",)
+        if omitted else ()
+    )
+    return {
+        "overview": overview,
+        "key_changes": tuple(changes),
+        "cross_component_effects": (),
+        "uncertainties": uncertainties,
+    }
+
+
 @dataclass(frozen=True)
 class ReviewResult:
     artifact: Mapping[str, Any]
@@ -703,6 +936,7 @@ class _RunState:
     plan_source: str = "deterministic_fallback"
     planner_repaired: bool = False
     planner_diagnostics: list[str] = field(default_factory=list)
+    change_overview: Mapping[str, object] = field(default_factory=dict)
     assignments: dict[str, Assignment] = field(default_factory=dict)
     ownership: dict[str, SessionOwnership] = field(default_factory=dict)
     sessions: dict[str, object] = field(default_factory=dict)
@@ -1108,6 +1342,7 @@ class ReviewController:
     def __init__(
         self,
         *,
+        change_summarizer: object | None = None,
         planner: object | None = None,
         planner_gateway: object | None = None,
         session_factory: Callable[..., object] | None = None,
@@ -1131,6 +1366,7 @@ class ReviewController:
             raise ValueError(
                 "non-empty evidence_store is unbound; provide an EvidenceSeed"
             )
+        self.change_summarizer = change_summarizer
         self.planner = (
             planner if planner is not None
             else GatewayRoleAdapter(planner_gateway) if planner_gateway is not None
@@ -1599,6 +1835,7 @@ class ReviewController:
                     "config": inputs.config,
                     "pr_metadata": inputs.pr_metadata,
                     "policy": inputs.policy,
+                    "change_overview": state.change_overview,
                 },
             )
             result = apply_planner_transformations(
@@ -1623,6 +1860,45 @@ class ReviewController:
                 "reason": diagnostic,
             })
             return base_plan
+
+    def _summarize_changes(self, state: _RunState) -> Mapping[str, object]:
+        fallback = _deterministic_change_overview(state.inputs)
+        if (
+            self.change_summarizer is None
+            or self.clock() >= state.deadline.cutoff_for(RunPhase.PLANNING)
+        ):
+            return fallback
+        try:
+            proposed = self._model_request(
+                state,
+                role="change_summarizer",
+                request_id="change_summarizer:1",
+                phase=RunPhase.PLANNING,
+                component=self.change_summarizer,
+                method="summarize",
+                context={
+                    "change_facts": state.inputs.topology.get(
+                        "change_facts",
+                        state.inputs.topology.get("changed_contract_facts", {}),
+                    ),
+                    "changed_files": state.inputs.changed_files,
+                    "components": state.inputs.topology.get("components", ()),
+                    "path_components": state.inputs.topology.get(
+                        "path_components", {},
+                    ),
+                    "relationships": state.inputs.topology.get(
+                        "relationships", (),
+                    ),
+                    "pr_metadata": {
+                        key: state.inputs.pr_metadata.get(key, "")
+                        for key in ("title", "body")
+                    },
+                },
+            )
+            return _validated_change_overview(proposed, state.inputs)
+        except Exception as exc:
+            self._degrade(state, "change_summarizer", _bounded_error(exc))
+            return fallback
 
     def _ownership(self, assignment: Assignment, session_id: str, state: _RunState) -> SessionOwnership:
         return session_ownership_for_assignment(
@@ -1681,7 +1957,7 @@ class ReviewController:
         )
         args = (
             assignment, lease, snapshot, local_evidence, local_coverage,
-            state.obligations, expected_session_id,
+            state.obligations, expected_session_id, state.change_overview,
         )
         session = factory(*args if any(
             item.kind is inspect.Parameter.VAR_POSITIONAL
@@ -1948,6 +2224,7 @@ class ReviewController:
                         "negotiation_state": negotiation_state,
                         "pr_metadata": state.inputs.pr_metadata,
                         "policy": state.inputs.policy,
+                        "change_overview": state.change_overview,
                     },
                 )
                 if not isinstance(raw, Mapping):
@@ -2131,6 +2408,7 @@ class ReviewController:
                         "changed_files": state.inputs.changed_files,
                         "pr_metadata": state.inputs.pr_metadata,
                         "policy": state.inputs.policy,
+                        "change_overview": state.change_overview,
                     },
                 )
                 critic_result = _validated_critic_result(
@@ -2446,6 +2724,7 @@ class ReviewController:
                             "what_changed": context.what_changed,
                             "ai_reviewed": context.ai_reviewed,
                         },
+                        "change_overview": state.change_overview,
                     },
                 )
                 proposal = _finalizer_proposal(proposed)
@@ -2602,6 +2881,7 @@ class ReviewController:
                     state.plan.unassigned_obligation_reasons
                 ),
             },
+            "change_overview": _json_value(state.change_overview),
             "assignments": [_json_value(state.assignments[key]) for key in sorted(state.assignments)],
             "base_sha": state.inputs.base_sha,
             "budgets": {
@@ -3158,6 +3438,7 @@ class ReviewController:
                 for item in state.obligations
             )
             state.coverage = CoverageLedger(state.obligations)
+            state.change_overview = self._summarize_changes(state)
             state.plan = self._plan(state)
             state.assignments = {
                 item.id: item for item in state.plan.assignments

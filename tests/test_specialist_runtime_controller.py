@@ -13,6 +13,7 @@ import pytest
 
 from pr_reviewer.conversation import Conversation
 from pr_reviewer.specialist_runtime import cli
+from pr_reviewer.specialist_runtime import controller as controller_module
 from pr_reviewer.specialist_runtime.adjudication import (
     ReviewHandoffContext,
     ReviewOrientationTopic,
@@ -46,6 +47,7 @@ from pr_reviewer.specialist_runtime.session import (
     SessionResult,
     SpecialistSession,
     SpecialistRequestEvent,
+    specialist_assignment_prompt,
 )
 from pr_reviewer.specialist_runtime.types import (
     BudgetLimits,
@@ -79,6 +81,85 @@ def test_critic_schema_does_not_allow_prose_to_rewrite_consequence_support():
             }]},
             (candidate,),
         )
+
+
+@pytest.mark.parametrize(
+    "proposal",
+    [
+        {
+            "overview": "Updates worker delivery.",
+            "key_changes": [{
+                "path": "src/unchanged.py",
+                "component": "worker",
+                "summary": "Changes retry behavior.",
+            }],
+            "cross_component_effects": [],
+            "uncertainties": [],
+        },
+        {
+            "overview": "Updates worker delivery.",
+            "key_changes": [{
+                "path": "src/worker.py",
+                "component": "unknown-component",
+                "summary": "Changes retry behavior.",
+            }],
+            "cross_component_effects": [],
+            "uncertainties": [],
+        },
+        {
+            "overview": "Updates worker delivery.",
+            "key_changes": [],
+            "cross_component_effects": [],
+            "uncertainties": [],
+            "verdict": "approve",
+        },
+        {
+            "overview": "Updates worker delivery.",
+            "key_changes": [],
+            "cross_component_effects": [],
+            "uncertainties": [],
+            "findings": [{"path": "src/worker.py", "claim": "bug"}],
+        },
+        {
+            "overview": "All changed behavior is fully covered and verified.",
+            "key_changes": [],
+            "cross_component_effects": [],
+            "uncertainties": [],
+        },
+        {
+            "overview": "Also changes `src/unchanged.py`.",
+            "key_changes": [],
+            "cross_component_effects": [],
+            "uncertainties": [],
+        },
+        {
+            "overview": "Updates worker delivery.",
+            "key_changes": [{
+                "path": "src/worker.py",
+                "component": "worker",
+                "summary": "Introduces a bug that drops retries.",
+            }],
+            "cross_component_effects": [],
+            "uncertainties": [],
+        },
+    ],
+)
+def test_change_overview_rejects_non_authoritative_claims(proposal, tmp_path):
+    inputs = replace(
+        _inputs(tmp_path),
+        topology={
+            **_inputs(tmp_path).topology,
+            "change_facts": {
+                "src/worker.py": {
+                    "change_type": "modifies",
+                    "symbols": ["deliver"],
+                },
+            },
+        },
+    )
+
+    with pytest.raises(ValueError):
+        controller_module._validated_change_overview(proposal, inputs)
 
 
 def test_critic_receives_bounded_retained_evidence_excerpt_and_metadata(tmp_path):
@@ -399,6 +480,150 @@ def _controller(tmp_path, **overrides):
     }
     values.update(overrides)
     return ReviewController(**values)
+
+
+def test_one_validated_change_overview_reaches_every_review_role(tmp_path):
+    observed = {}
+    inputs = replace(
+        _inputs(tmp_path),
+        topology={
+            **_inputs(tmp_path).topology,
+            "change_facts": {
+                "src/worker.py": {
+                    "change_type": "modifies",
+                    "symbols": ["deliver", "retry_delivery"],
+                    "hunk_summaries": ["new lines 8-10: retry_delivery"],
+                    "headings": [],
+                    "change_excerpts": [],
+                },
+            },
+        },
+        candidate_findings=(CandidateFinding(
+            candidate_id="overview-candidate",
+            root_cause_fingerprint="overview-root",
+            claim="Retry behavior may duplicate delivery.",
+            affected_location="src/worker.py:8",
+            causal_chain="A retry repeats delivery after an ambiguous result.",
+            severity="minor",
+            category="failure_recovery",
+            supporting_evidence_ids=("evidence:missing",),
+            related_obligation_ids=(),
+            user_visible_consequence="A delivery may be applied twice.",
+            manual_validation="Force an ambiguous result and count deliveries.",
+        ),),
+    )
+    proposal = {
+        "overview": "Worker delivery adds bounded retry orchestration.",
+        "key_changes": [{
+            "path": "src/worker.py",
+            "component": "worker",
+            "summary": "Adds retry orchestration around delivery.",
+        }],
+        "cross_component_effects": [],
+        "uncertainties": ["Runtime retry outcomes still require specialist evidence."],
+    }
+
+    def summarizer(request):
+        observed["change_summarizer"] = request.context
+        return proposal
+
+    def planner(request):
+        observed["planner"] = request.context["change_overview"]
+        return {"transformations": []}
+
+    def negotiator(request):
+        observed["negotiator"] = request.context["change_overview"]
+        raise RuntimeError("capture negotiator context")
+
+    def critic(request):
+        observed["critic"] = request.context["change_overview"]
+        return {
+            "actions": [{
+                "candidate_id": item.candidate_id,
+                "action": "reject",
+            } for item in request.context["candidates"]]
+        }
+
+    def finalizer(request):
+        observed["finalizer"] = request.context["change_overview"]
+        return FinalizerProposal(component_ids=("worker",))
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id, change_overview,
+    ):
+        del lease, snapshot, coverage
+        prompt = specialist_assignment_prompt(
+            assignment,
+            change_overview=change_overview,
+        )
+        observed["specialist"] = json.loads(
+            prompt.split("\n", 1)[1]
+        )["change_overview"]
+        return _ResumeSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    result = ReviewController(
+        change_summarizer=summarizer,
+        planner=planner,
+        session_factory=factory,
+        negotiator=negotiator,
+        critic=critic,
+        finalizer=finalizer,
+        clock=lambda: 0.0,
+        artifact_output_root=tmp_path,
+    ).run(inputs)
+
+    expected = observed["planner"]
+    assert expected["overview"] == proposal["overview"]
+    assert observed["specialist"] == controller_module._json_value(expected)
+    assert observed["negotiator"] == expected
+    assert observed["critic"] == expected
+    assert observed["finalizer"] == expected
+    assert controller_module._json_value(
+        observed["change_summarizer"]["change_facts"]
+    ) == inputs.topology["change_facts"]
+    assert controller_module._json_value(
+        result.artifact["change_overview"]
+    ) == controller_module._json_value(expected)
+
+
+def test_malformed_change_summary_falls_back_to_bounded_facts(tmp_path):
+    observed = {}
+    inputs = replace(
+        _inputs(tmp_path),
+        topology={
+            **_inputs(tmp_path).topology,
+            "change_facts": {
+                "src/worker.py": {
+                    "change_type": "modifies",
+                    "symbols": ["deliver", "retry_delivery"],
+                    "hunk_summaries": ["new lines 8-10: retry_delivery"],
+                },
+            },
+        },
+    )
+
+    def planner(request):
+        observed.update(request.context["change_overview"])
+        return {"transformations": []}
+
+    result = _controller(
+        tmp_path,
+        change_summarizer=lambda _request: {"overview": 7},
+        planner=planner,
+    ).run(inputs)
+
+    assert observed["overview"]
+    assert len(json.dumps(
+        controller_module._json_value(observed)
+    ).encode("utf-8")) <= 12_000
+    assert observed["key_changes"][0]["path"] == "src/worker.py"
+    assert any(
+        item["component"] == "change_summarizer"
+        for item in result.artifact["degradation"]
+    )
 
 
 def test_planner_failure_uses_deterministic_assignment_plan(tmp_path):

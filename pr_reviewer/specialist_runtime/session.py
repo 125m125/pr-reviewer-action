@@ -304,7 +304,11 @@ def _assignment_json_value(value: object) -> object:
     return value
 
 
-def specialist_assignment_prompt(assignment: object) -> str:
+def specialist_assignment_prompt(
+    assignment: object,
+    *,
+    change_overview: Mapping[str, object] | None = None,
+) -> str:
     """Serialize the immutable semantic assignment for initial and recovery turns."""
     lenses = getattr(assignment, "analytical_lens", "")
     if not lenses:
@@ -347,6 +351,7 @@ def specialist_assignment_prompt(assignment: object) -> str:
             "predicates. Bounded, truncated, or omitted context does not prove "
             "that other content is absent."
         ),
+        "change_overview": _assignment_json_value(change_overview or {}),
     }
     return "Immutable specialist assignment:\n" + json.dumps(
         payload, sort_keys=True,

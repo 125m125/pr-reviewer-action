@@ -25,7 +25,7 @@ from pr_reviewer.conversation import (
     SPECIALIST_PR_DIFF_SCHEMA,
     web_tool_schemas,
 )
-from pr_reviewer.specialists import build_topology
+from pr_reviewer.specialists import build_change_facts, build_topology
 from pr_reviewer.tool_executors import execute_tool_request
 
 from .budget import BudgetLedger
@@ -63,6 +63,16 @@ _ORIENTATION_TOPIC_VOCABULARY = ", ".join(
     f"`{topic.value}`" for topic in ReviewOrientationTopic
 )
 _ROLE_SYSTEM = {
+    "change_summarizer": (
+        "Summarize only the supplied immutable local-diff facts. Return exactly "
+        "{\"overview\":string,\"key_changes\":[{\"path\":string,\"component\":string,"
+        "\"summary\":string}],\"cross_component_effects\":[{\"components\":[string,"
+        "...],\"summary\":string}],\"uncertainties\":[string,...]}. Every path and "
+        "component must be copied exactly from the supplied controller facts. Do not "
+        "state a verdict, finding, severity, test result, review result, or coverage "
+        "claim. Prefer behavioral intent from bounded symbols, workflow keys/steps, "
+        "and Markdown/AsciiDoc headings or excerpts; do not reproduce a full diff."
+    ),
     "planner": (
         "The controller has already created the authoritative deterministic base plan. "
         "Suggest only optional bounded transformations and return "
@@ -294,6 +304,9 @@ class CliConfig:
         specialist_model = source.get("SPECIALIST_MODEL", "").strip() or model
         critic_model = source.get("SPECIALIST_CRITIC_MODEL", "").strip() or specialist_model
         role_models = {
+            "change_summarizer": (
+                source.get("SPECIALIST_PLANNER_MODEL", "").strip() or model
+            ),
             "planner": source.get("SPECIALIST_PLANNER_MODEL", "").strip() or model,
             "specialist": specialist_model,
             "negotiator": critic_model,
@@ -677,8 +690,21 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
     )
     policy = policy_decision.policy
     warning = "; ".join(policy_warnings)
+    try:
+        change_facts = build_change_facts(
+            root, base_sha, head_sha, changed_files,
+        )
+    except ValueError:
+        # Synthetic/offline fixtures may carry placeholder identities. Real
+        # action inputs are full object IDs; never treat API patch text as an
+        # immutable substitute when the local range cannot be established.
+        change_facts = {}
     topology = build_topology(
-        complete_pr_files, classification, _tracked_paths(root), policy.legacy_projection(),
+        complete_pr_files,
+        classification,
+        _tracked_paths(root),
+        policy.legacy_projection(),
+        change_facts=change_facts,
     )
     publish_mode = config.environment.get("PUBLISH_MODE", "review_comment").strip().lower()
     if publish_mode not in {"comment", "review_comment", "review_verdict"}:
@@ -775,6 +801,13 @@ def build_controller(
         reasoning_effort=config.reasoning_effort,
     )
     role_response_format = "json_object" if config.response_format == "json_schema" else None
+    change_summarizer = _BoundedRoleAdapter(
+        gateway,
+        _role_prompt(config.system_prompt, "change_summarizer"),
+        config.planner_max_tokens,
+        role_response_format,
+        max_context_bytes=config.planner_max_context_bytes,
+    )
     planner = _BoundedRoleAdapter(
         gateway, _role_prompt(config.system_prompt, "planner"), config.planner_max_tokens,
         role_response_format,
@@ -794,7 +827,16 @@ def build_controller(
         role_response_format,
     )
 
-    def session_factory(assignment, lease, snapshot, evidence, coverage, obligations, session_id):
+    def session_factory(
+        assignment,
+        lease,
+        snapshot,
+        evidence,
+        coverage,
+        obligations,
+        session_id,
+        change_overview=None,
+    ):
         del snapshot
         assigned_obligation_ids = set(dict.fromkeys((
             *getattr(assignment, "primary_obligation_ids", ()),
@@ -844,7 +886,10 @@ def build_controller(
             system=config.system_prompt.rstrip() + "\n\n" + _SPECIALIST_SYSTEM,
             tool_schemas=tools,
         )
-        conversation.add_user(specialist_assignment_prompt(assignment))
+        conversation.add_user(specialist_assignment_prompt(
+            assignment,
+            change_overview=change_overview,
+        ))
         def execute(
             name: str,
             arguments: dict[str, Any],
@@ -922,6 +967,7 @@ def build_controller(
     # The current-head policy is attached after workspace loading in main.
     session_factory.source_policy = SourcePolicy(())  # type: ignore[attr-defined]
     controller = ReviewController(
+        change_summarizer=change_summarizer,
         planner=planner,
         session_factory=session_factory,
         negotiator=negotiator,

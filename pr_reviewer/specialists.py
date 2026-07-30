@@ -10,7 +10,8 @@ from __future__ import annotations
 import fnmatch
 import re
 from collections import defaultdict
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+import subprocess
 from typing import Any, Iterable
 
 
@@ -35,6 +36,9 @@ LANGUAGES = {
     ".yaml": "yaml", ".yml": "yaml", ".json": "json", ".xml": "xml",
     ".sh": "shell", ".ps1": "powershell",
 }
+_MAX_CHANGE_FACT_PATHS = 500
+_MAX_LOCAL_PATCH_BYTES = 32_000
+_MAX_CHANGE_ITEMS = 5
 
 
 
@@ -126,12 +130,224 @@ def _component_for(path: str, roots: list[str]) -> str:
     return first
 
 
+def _change_type(status: object) -> str:
+    return {
+        "a": "adds",
+        "added": "adds",
+        "c": "adds",
+        "copied": "adds",
+        "d": "removes",
+        "removed": "removes",
+        "m": "modifies",
+        "modified": "modifies",
+        "r": "modifies",
+        "renamed": "modifies",
+        "t": "modifies",
+    }.get(str(status or "").strip().lower(), "modifies")
+
+
+def _clean_fact_text(value: object, *, limit: int = 160) -> str:
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    return " ".join(text.split())[:limit]
+
+
+def _facts_from_patch(
+    path: str,
+    status: object,
+    patch: object,
+    *,
+    include_intent: bool = False,
+) -> dict[str, object]:
+    symbols: list[str] = []
+    hunk_summaries: list[str] = []
+    action_inputs: list[str] = []
+    workflow_steps: list[str] = []
+    workflow_keys: list[str] = []
+    headings: list[str] = []
+    change_excerpts: list[str] = []
+    action_section = ""
+    lines = patch.splitlines() if isinstance(patch, str) else ()
+    for line in lines:
+        hunk_match = re.match(
+            r"^@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,(\d+))?\s+@@\s*(.*)$",
+            line,
+        )
+        if hunk_match and len(hunk_summaries) < _MAX_CHANGE_ITEMS:
+            start = int(hunk_match.group(1))
+            count = int(hunk_match.group(2) or "1")
+            if count == 0:
+                line_label = (
+                    f"deletion-only hunk near new-file line {start} "
+                    "(no new lines)"
+                )
+            elif count == 1:
+                line_label = f"new line {start}"
+            else:
+                line_label = f"new lines {start}-{start + count - 1}"
+            context = re.sub(
+                r"[^A-Za-z0-9 _().,:/+[\]-]+", " ",
+                hunk_match.group(3),
+            )
+            context = " ".join(context.split())[:120]
+            hunk_summaries.append(
+                f"{line_label}: {context}" if context else line_label
+            )
+            if path.endswith(".py"):
+                context_symbol = re.match(
+                    r"\s*(?:async\s+)?(?:def|class)\s+"
+                    r"([A-Za-z_][A-Za-z0-9_]*)",
+                    hunk_match.group(3),
+                )
+                if context_symbol and context_symbol.group(1) not in symbols:
+                    symbols.append(context_symbol.group(1))
+        yaml_line = line[1:] if line[:1] in {"+", "-", " "} else line
+        if path in {"action.yml", "action.yaml"}:
+            section_match = re.match(
+                r"^(inputs|outputs|runs|branding):\s*$", yaml_line,
+            )
+            if section_match:
+                action_section = section_match.group(1)
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        added = line[1:]
+        symbol_match = re.match(
+            r"\s*(?:async\s+)?(?:def|class|function)\s+"
+            r"([A-Za-z_][A-Za-z0-9_]*)",
+            added,
+        )
+        if symbol_match and symbol_match.group(1) not in symbols:
+            symbols.append(symbol_match.group(1))
+        if path in {"action.yml", "action.yaml"} and action_section == "inputs":
+            input_match = re.match(
+                r"\s{2}([A-Za-z_][A-Za-z0-9_-]*):\s*$", added,
+            )
+            if input_match and input_match.group(1) not in {
+                "name", "description", "inputs", "outputs", "runs", "branding",
+            } and input_match.group(1) not in action_inputs:
+                action_inputs.append(input_match.group(1))
+        if path.startswith(".github/workflows/"):
+            step_match = re.match(r"\s*-\s+name:\s*(.+?)\s*$", added)
+            if step_match:
+                step = re.sub(
+                    r"[^A-Za-z0-9 .:/+_-]+", " ",
+                    step_match.group(1).strip("'\""),
+                )
+                step = " ".join(step.split())[:120]
+                if step and step not in workflow_steps:
+                    workflow_steps.append(step)
+            key_match = re.match(
+                r"\s*(?:-\s+)?([A-Za-z_][A-Za-z0-9_-]*):(?:\s|$)",
+                added,
+            )
+            if (
+                key_match
+                and key_match.group(1) not in workflow_keys
+                and len(workflow_keys) < _MAX_CHANGE_ITEMS
+            ):
+                workflow_keys.append(key_match.group(1))
+        if include_intent and path.lower().endswith((".md", ".adoc", ".asciidoc")):
+            heading_match = (
+                re.match(r"\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", added)
+                if path.lower().endswith(".md")
+                else re.match(r"={1,6}\s+(.+?)\s*$", added)
+            )
+            if heading_match:
+                heading = _clean_fact_text(heading_match.group(1))
+                if heading and heading not in headings:
+                    headings.append(heading)
+            else:
+                excerpt = _clean_fact_text(added)
+                if excerpt and excerpt not in change_excerpts:
+                    change_excerpts.append(excerpt)
+    result: dict[str, object] = {
+        "symbols": symbols[:_MAX_CHANGE_ITEMS],
+        "hunk_summaries": hunk_summaries[:_MAX_CHANGE_ITEMS],
+        "action_inputs": action_inputs[:_MAX_CHANGE_ITEMS],
+        "workflow_steps": workflow_steps[:_MAX_CHANGE_ITEMS],
+        "change_type": _change_type(status),
+    }
+    if include_intent:
+        result.update({
+            "workflow_keys": workflow_keys[:_MAX_CHANGE_ITEMS],
+            "headings": headings[:_MAX_CHANGE_ITEMS],
+            "change_excerpts": change_excerpts[:_MAX_CHANGE_ITEMS],
+        })
+    return result
+
+
+def build_change_facts(
+    workspace: Path | str,
+    base_sha: str,
+    head_sha: str,
+    changed_paths: Iterable[str],
+) -> dict[str, dict[str, object]]:
+    """Build bounded semantic facts from the immutable local review range."""
+    if (
+        re.fullmatch(r"[0-9a-fA-F]{40,64}", str(base_sha or "")) is None
+        or re.fullmatch(r"[0-9a-fA-F]{40,64}", str(head_sha or "")) is None
+    ):
+        raise ValueError("change facts require full base and head object IDs")
+    root = Path(workspace)
+    paths = tuple(dict.fromkeys(
+        path for path in (_posix(item) for item in changed_paths) if path
+    ))[:_MAX_CHANGE_FACT_PATHS]
+    status_result = subprocess.run(
+        [
+            "git", "diff", "--name-status", "--find-renames",
+            f"{base_sha}...{head_sha}", "--",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    local_status: dict[str, str] = {}
+    if status_result.returncode == 0:
+        for line in status_result.stdout.splitlines():
+            columns = line.split("\t")
+            if len(columns) < 2:
+                continue
+            status = columns[0][:1]
+            path = _posix(columns[-1])
+            if path:
+                local_status[path] = status
+    facts: dict[str, dict[str, object]] = {}
+    for path in paths:
+        result = subprocess.run(
+            [
+                "git", "diff", "--no-ext-diff", "--no-color",
+                "--find-renames", "--unified=3",
+                f"{base_sha}...{head_sha}", "--", path,
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        patch = result.stdout if result.returncode == 0 else ""
+        patch = patch.encode("utf-8")[:_MAX_LOCAL_PATCH_BYTES].decode(
+            "utf-8", errors="replace",
+        )
+        facts[path] = _facts_from_patch(
+            path,
+            local_status.get(path, "modified"),
+            patch,
+            include_intent=True,
+        )
+    return facts
+
+
 def build_topology(
     pr_files: list[dict[str, Any]],
     classification: dict[str, Any] | None,
     tracked_paths: Iterable[str],
     config: dict[str, Any] | None = None,
     workspace_paths: Iterable[str] | None = None,
+    change_facts: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, Any]:
     classification = classification or {}
     config = config or {}
@@ -237,96 +453,18 @@ def build_topology(
             "output_paths": [_posix(v) for v in outputs][:20],
         })
     changed_contract_facts: dict[str, dict[str, object]] = {}
+    immutable_facts = change_facts or {}
     for item in pr_files:
         path = _posix(item.get("filename"))
         patch = item.get("patch")
         if not path:
             continue
-        change_type = {
-            "added": "adds",
-            "removed": "removes",
-            "modified": "modifies",
-            "renamed": "modifies",
-            "copied": "adds",
-        }.get(str(item.get("status") or "").strip().lower(), "modifies")
-        symbols: list[str] = []
-        hunk_summaries: list[str] = []
-        action_inputs: list[str] = []
-        workflow_steps: list[str] = []
-        action_section = ""
-        for line in patch.splitlines() if isinstance(patch, str) else ():
-            hunk_match = re.match(
-                r"^@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,(\d+))?\s+@@\s*(.*)$",
-                line,
-            )
-            if hunk_match and len(hunk_summaries) < 5:
-                start = int(hunk_match.group(1))
-                count = int(hunk_match.group(2) or "1")
-                if count == 0:
-                    line_label = (
-                        f"deletion-only hunk near new-file line {start} "
-                        "(no new lines)"
-                    )
-                elif count == 1:
-                    line_label = f"new line {start}"
-                else:
-                    line_label = f"new lines {start}-{start + count - 1}"
-                context = re.sub(
-                    r"[^A-Za-z0-9 _().,:/+[\]-]+", " ",
-                    hunk_match.group(3),
-                )
-                context = " ".join(context.split())[:120]
-                hunk_summaries.append(
-                    f"{line_label}: {context}" if context else line_label
-                )
-                if path.endswith(".py"):
-                    context_symbol = re.match(
-                        r"\s*(?:async\s+)?(?:def|class)\s+"
-                        r"([A-Za-z_][A-Za-z0-9_]*)",
-                        hunk_match.group(3),
-                    )
-                    if (
-                        context_symbol
-                        and context_symbol.group(1) not in symbols
-                    ):
-                        symbols.append(context_symbol.group(1))
-            yaml_line = line[1:] if line[:1] in {"+", "-", " "} else line
-            if path in {"action.yml", "action.yaml"}:
-                section_match = re.match(r"^(inputs|outputs|runs|branding):\s*$", yaml_line)
-                if section_match:
-                    action_section = section_match.group(1)
-            if not line.startswith("+") or line.startswith("+++"):
-                continue
-            added = line[1:]
-            symbol_match = re.match(
-                r"\s*(?:async\s+)?(?:def|class|function)\s+([A-Za-z_][A-Za-z0-9_]*)",
-                added,
-            )
-            if symbol_match and symbol_match.group(1) not in symbols:
-                symbols.append(symbol_match.group(1))
-            if path in {"action.yml", "action.yaml"} and action_section == "inputs":
-                input_match = re.match(r"\s{2}([A-Za-z_][A-Za-z0-9_-]*):\s*$", added)
-                if input_match and input_match.group(1) not in {
-                    "name", "description", "inputs", "outputs", "runs", "branding",
-                } and input_match.group(1) not in action_inputs:
-                    action_inputs.append(input_match.group(1))
-            if path.startswith(".github/workflows/"):
-                step_match = re.match(r"\s*-\s+name:\s*(.+?)\s*$", added)
-                if step_match:
-                    step = re.sub(
-                        r"[^A-Za-z0-9 .:/+_-]+", " ",
-                        step_match.group(1).strip("'\""),
-                    )
-                    step = " ".join(step.split())[:120]
-                    if step and step not in workflow_steps:
-                        workflow_steps.append(step)
-        changed_contract_facts[path] = {
-            "symbols": symbols[:5],
-            "hunk_summaries": hunk_summaries,
-            "action_inputs": action_inputs[:5],
-            "workflow_steps": workflow_steps[:5],
-            "change_type": change_type,
-        }
+        local = immutable_facts.get(path)
+        changed_contract_facts[path] = (
+            dict(local)
+            if isinstance(local, dict)
+            else _facts_from_patch(path, item.get("status"), patch)
+        )
     return {
         "changed_files": changed,
         "components": list(components.values()),
@@ -338,5 +476,6 @@ def build_topology(
         "risk_flags": _strings(classification.get("risk_flags")),
         "pr_kind": str(classification.get("pr_kind") or "unknown"),
         "generated_artifacts": generated_artifacts,
+        "change_facts": changed_contract_facts,
         "changed_contract_facts": changed_contract_facts,
     }

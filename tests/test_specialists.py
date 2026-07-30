@@ -1,6 +1,103 @@
+import subprocess
+
 import pytest
 
+from pr_reviewer import specialists
 from pr_reviewer.specialists import build_topology, classify_file_roles
+
+
+def _git(root, *args):
+    return subprocess.run(
+        ["git", *args],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_local_diff_facts_do_not_depend_on_github_patch_text(tmp_path):
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "review@example.test")
+    _git(tmp_path, "config", "user.name", "Review Test")
+    (tmp_path / "src").mkdir()
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "src" / "worker.py").write_text(
+        "def deliver(message):\n    return message\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".github" / "workflows" / "review.yml").write_text(
+        "jobs:\n  review:\n    steps: []\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docs" / "guide.md").write_text(
+        "# Guide\n\nOld text.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docs" / "operations.adoc").write_text(
+        "= Operations\n\nOld text.\n",
+        encoding="utf-8",
+    )
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-q", "-m", "base")
+    base_sha = _git(tmp_path, "rev-parse", "HEAD")
+
+    (tmp_path / "src" / "worker.py").write_text(
+        "def deliver(message):\n    return message\n\n"
+        "def retry_delivery(message):\n    return deliver(message)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".github" / "workflows" / "review.yml").write_text(
+        "jobs:\n  review:\n    steps:\n      - name: Verify immutable diff\n"
+        "        run: pytest\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docs" / "guide.md").write_text(
+        "# Guide\n\n## Immutable changes\n\nUses the local comparison.\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docs" / "operations.adoc").write_text(
+        "= Operations\n\n== Review range\n\nUses base to head.\n",
+        encoding="utf-8",
+    )
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-q", "-m", "head")
+    head_sha = _git(tmp_path, "rev-parse", "HEAD")
+    paths = (
+        "src/worker.py",
+        ".github/workflows/review.yml",
+        "docs/guide.md",
+        "docs/operations.adoc",
+    )
+
+    facts = specialists.build_change_facts(
+        tmp_path, base_sha, head_sha, paths,
+    )
+    topology = build_topology(
+        [{"filename": path, "status": "modified"} for path in paths],
+        {},
+        paths,
+        change_facts=facts,
+    )
+
+    assert topology["changed_contract_facts"]["src/worker.py"]["symbols"] == [
+        "retry_delivery"
+    ]
+    workflow = topology["changed_contract_facts"][
+        ".github/workflows/review.yml"
+    ]
+    assert "Verify immutable diff" in workflow["workflow_steps"]
+    assert "run" in workflow["workflow_keys"]
+    assert topology["changed_contract_facts"]["docs/guide.md"]["headings"] == [
+        "Immutable changes"
+    ]
+    assert topology["changed_contract_facts"]["docs/operations.adoc"][
+        "headings"
+    ] == ["Review range"]
+    assert "Uses the local comparison." in topology["changed_contract_facts"][
+        "docs/guide.md"
+    ]["change_excerpts"]
 
 
 def test_topology_extracts_bounded_changed_symbols_and_contract_names_from_patches():
