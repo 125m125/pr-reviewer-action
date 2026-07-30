@@ -383,6 +383,91 @@ def test_critic_cannot_rescue_unavailable_evidence_by_repeating_specialist_prose
     assert confirmed.verification_requests[0].reason == "consequence-not-supported"
 
 
+@pytest.mark.parametrize(
+    ("contradiction_content", "force_truncated"),
+    (
+        ("", False),
+        ("retained contradiction detail", True),
+    ),
+)
+def test_contradiction_consequence_with_empty_or_truncated_citation_requires_verification(
+    contradiction_content: str,
+    force_truncated: bool,
+):
+    store = EvidenceStore()
+    support = store.add_tool_result(
+        session_id="session-1",
+        tool="read_file",
+        arguments={"path": "src/store.py"},
+        result={"status": "ok", "content": "write_with_retry()"},
+        category="implementation",
+    )
+    contradiction = store.add_tool_result(
+        session_id="session-1",
+        tool="read_file",
+        arguments={"path": "src/store.py"},
+        result={"status": "ok", "content": contradiction_content},
+        category="implementation",
+        contradicts=(support.id,),
+    )
+    if force_truncated:
+        snapshot = store.snapshot()
+        store = EvidenceStore.from_snapshot(replace(
+            snapshot,
+            records=tuple(
+                replace(record, truncated=True)
+                if record.id == contradiction.id else record
+                for record in snapshot.records
+            ),
+        ))
+    candidate = replace(
+        _candidate(
+            evidence_ids=(support.id,),
+            confidence_rationale=(
+                "consequence_support:contradicting_evidence; "
+                f"evidence_ids={support.id},{contradiction.id}; "
+                "conflict=the retained records disagree about retry behavior"
+            ),
+        ),
+        contradicting_evidence_ids=(contradiction.id,),
+    )
+
+    review = _adjudicate((candidate,), store)
+
+    assert review.accepted == ()
+    assert review.verification_requests[0].reason == "consequence-not-supported"
+
+
+def test_contradiction_consequence_with_complete_citations_remains_actionable():
+    store, support_id = _store()
+    contradiction = store.add_tool_result(
+        session_id="session-1",
+        tool="read_file",
+        arguments={"path": "src/store.py"},
+        result={"status": "ok", "content": "retry_is_idempotent = False"},
+        category="implementation",
+        contradicts=(support_id,),
+    )
+    candidate = replace(
+        _candidate(
+            evidence_ids=(support_id,),
+            confidence_rationale=(
+                "consequence_support:contradicting_evidence; "
+                f"evidence_ids={support_id},{contradiction.id}; "
+                "conflict=the retained records disagree about retry behavior"
+            ),
+        ),
+        contradicting_evidence_ids=(contradiction.id,),
+    )
+
+    review = _adjudicate((candidate,), store)
+
+    assert tuple(item.candidate_id for item in review.accepted) == (
+        candidate.candidate_id,
+    )
+    assert review.verification_requests == ()
+
+
 def test_info_candidate_is_not_published_as_an_actionable_finding():
     store, evidence_id = _store()
     candidate = _candidate(

@@ -250,8 +250,9 @@ def _behavioral_handoff_candidates(
         if path_reviewed and len(ai_reviewed) < 5:
             contract = None if used_role_fallback else contract_label(path)
             suffix = f" and {contract} contract" if contract else ""
+            location = "" if f"`{path}`" in reviewed_behavior else f" in `{path}`"
             ai_reviewed.append(
-                f"Reviewed {reviewed_behavior}{suffix}."
+                f"Reviewed {reviewed_behavior}{location}{suffix}."
             )
 
     ordered_paths = sorted(changed, key=path_priority)

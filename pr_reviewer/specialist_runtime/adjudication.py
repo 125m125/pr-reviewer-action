@@ -574,14 +574,18 @@ def _authorize(
         related=related,
         affected_file=affected_file,
     )
-    cited_support = tuple(record for record in satisfying if record.id in {
+    cited_ids = {
         item.strip()
         for part in _unicode(candidate.confidence_rationale).split(";")
         if part.strip().casefold().startswith("evidence_ids=")
         for item in part.split("=", 1)[1].split(",")
         if item.strip()
-    })
-    if any(not record.content.strip() or record.truncated for record in cited_support):
+    }
+    cited_records = tuple(
+        record for record in (*satisfying, *contradictions)
+        if record.id in cited_ids
+    )
+    if any(not record.content.strip() or record.truncated for record in cited_records):
         consequence_support_reason = "consequence-not-supported"
     if consequence_support_reason:
         return None, consequence_support_reason

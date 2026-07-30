@@ -1207,7 +1207,32 @@ def test_behavioral_handoff_candidates_name_changed_symbols_and_reviewed_contrac
         "`pr_reviewer/planner.py` modifies `validate_assignment_plan()` behavior.",
     )
     assert ai_reviewed == (
-        "Reviewed the `validate_assignment_plan()` behavior and planner validation contract.",
+        "Reviewed the `validate_assignment_plan()` behavior in "
+        "`pr_reviewer/planner.py` and planner validation contract.",
+    )
+
+
+def test_controller_handoff_retains_reviewed_contract_fact_with_authorized_path(tmp_path):
+    inputs = replace(
+        _inputs(tmp_path),
+        topology={
+            **_inputs(tmp_path).topology,
+            "changed_contract_facts": {
+                "src/worker.py": {
+                    "symbols": ["process"],
+                    "action_inputs": [],
+                    "workflow_steps": [],
+                    "change_type": "modifies",
+                },
+            },
+        },
+    )
+
+    result = _controller(tmp_path).run(inputs)
+
+    assert result.handoff.ai_reviewed == (
+        "Reviewed the `process()` behavior in `src/worker.py` "
+        "and delivery contract.",
     )
 
 
