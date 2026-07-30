@@ -876,7 +876,12 @@ class SpecialistSession:
                 and self._request_events[-1].status == "completed"
             ):
                 raise
-            self.latest_checkpoint = self._project_checkpoint(self._current_gaps)
+            self.latest_checkpoint = self._project_checkpoint(
+                self._current_gaps,
+                candidate_retention_unknown=bool(
+                    candidate_signal and candidate_signal.is_material
+                ),
+            )
             self.state = SessionState.CHECKPOINT
             return self._snapshot(degraded=True)
         if turn.text:

@@ -351,6 +351,24 @@ def test_exploration_candidate_text_survives_checkpoint_handoff_as_unknown():
     assert "candidate-retention-unknown" in result.checkpoint.unknowns
 
 
+def test_checkpoint_admission_failure_preserves_exploration_candidate_unknown():
+    """A failed checkpoint request cannot erase prior malformed candidate material."""
+    gateway = ScriptedGateway([
+        invalid_response(
+            '{"unresolved": [], "candidate_findings": '
+            '[{"candidate_id": "candidate-lost", "claim": "material issue"}]'
+        ),
+        TimeoutError("checkpoint provider timed out"),
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    result = session.explore()
+
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+    assert len(gateway.requests) == 2
+
+
 def test_partial_candidate_retention_is_reported_when_one_candidate_survives():
     """One admitted candidate cannot mask a separately dropped declaration."""
     executor_result = {
