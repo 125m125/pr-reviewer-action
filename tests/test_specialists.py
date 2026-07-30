@@ -36,18 +36,21 @@ def test_topology_extracts_bounded_changed_symbols_and_contract_names_from_patch
     assert topology["changed_contract_facts"] == {
         "action.yml": {
             "symbols": [],
+            "hunk_summaries": [],
             "action_inputs": ["publish_mode"],
             "workflow_steps": [],
             "change_type": "modifies",
         },
         ".github/workflows/review.yml": {
             "symbols": [],
+            "hunk_summaries": [],
             "action_inputs": [],
             "workflow_steps": ["Publish review https://evil.example now"],
             "change_type": "adds",
         },
         "src/planner.py": {
             "symbols": ["validate_assignment_plan"],
+            "hunk_summaries": [],
             "action_inputs": [],
             "workflow_steps": [],
             "change_type": "modifies",
@@ -72,17 +75,44 @@ def test_topology_retains_safe_change_type_when_patch_is_missing_or_truncated():
     assert topology["changed_contract_facts"] == {
         "src/new.py": {
             "symbols": [],
+            "hunk_summaries": [],
             "action_inputs": [],
             "workflow_steps": [],
             "change_type": "adds",
         },
         "docs/guide.md": {
             "symbols": [],
+            "hunk_summaries": [],
             "action_inputs": [],
             "workflow_steps": [],
             "change_type": "modifies",
         },
     }
+
+
+def test_topology_extracts_bounded_changed_hunk_context():
+    topology = build_topology(
+        [{
+            "filename": "worker/delivery.py",
+            "status": "modified",
+            "patch": (
+                "@@ -15,4 +18,7 @@ def deliver(message):\n"
+                " context\n"
+                "+    acknowledge(message)\n"
+                "@@ -70,2 +76,3 @@ class RetryQueue:\n"
+                "+    attempts += 1"
+            ),
+        }],
+        {},
+        ("worker/delivery.py",),
+    )
+
+    assert topology["changed_contract_facts"]["worker/delivery.py"][
+        "hunk_summaries"
+    ] == [
+        "new lines 18-24: def deliver(message):",
+        "new lines 76-78: class RetryQueue:",
+    ]
 
 
 def files(*paths):

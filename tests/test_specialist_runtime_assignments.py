@@ -781,3 +781,250 @@ def test_planner_prompt_includes_immutable_obligation_ids_only(obligations, topo
     assert prompt["authority"]["expected_evidence"] == (
         "derived by the controller from assigned obligation_ids; planner values are ignored"
     )
+
+
+def test_assignment_brief_explains_each_owned_obligation(runtime_config):
+    obligations = (
+        CoverageObligation(
+            obligation_id="topology:worker:delivery",
+            origin="topology",
+            subject="worker delivery",
+            explanation="The worker now acknowledges messages after persistence.",
+            required_evidence_categories=("implementation", "test"),
+            satisfaction_predicates=(
+                "The changed acknowledgement order is traced.",
+                "Failure behavior is covered by a test.",
+            ),
+            risk_tier="high",
+            scope=("worker/delivery.py", "tests/test_delivery.py"),
+            seed_hints=("worker/delivery.py",),
+        ),
+    )
+    topology = {
+        "changed_files": ["worker/delivery.py", "tests/test_delivery.py"],
+        "components": [{
+            "id": "worker",
+            "changed_files": ["worker/delivery.py", "tests/test_delivery.py"],
+        }],
+        "changed_contract_facts": {},
+    }
+
+    assignment_item = fallback_assignment_plan(
+        obligations, topology, runtime_config,
+    ).assignments[0]
+
+    assert len(assignment_item.obligation_briefs) == 1
+    brief = assignment_item.obligation_briefs[0]
+    assert brief.obligation_id == "topology:worker:delivery"
+    assert brief.subject == "worker delivery"
+    assert brief.explanation == (
+        "The worker now acknowledges messages after persistence."
+    )
+    assert brief.risk_tier == "high"
+    assert brief.required_evidence == ("implementation", "test")
+    assert brief.satisfaction_predicates == (
+        "The changed acknowledgement order is traced.",
+        "Failure behavior is covered by a test.",
+    )
+
+
+def test_assignment_brief_contains_scoped_changed_behavior(runtime_config):
+    obligations = (
+        CoverageObligation(
+            obligation_id="topology:worker:delivery",
+            origin="topology",
+            subject="worker delivery",
+            required_evidence_categories=("implementation",),
+            scope=("worker/delivery.py",),
+            seed_hints=("worker/delivery.py",),
+        ),
+    )
+    topology = {
+        "changed_files": ["worker/delivery.py", "docs/unrelated.md"],
+        "components": [{
+            "id": "worker",
+            "changed_files": ["worker/delivery.py"],
+        }],
+        "changed_contract_facts": {
+            "worker/delivery.py": {
+                "change_type": "modifies",
+                "symbols": ["deliver"],
+                "hunk_summaries": [
+                    "new lines 18-24: def deliver(message):",
+                ],
+                "action_inputs": [],
+                "workflow_steps": [],
+            },
+            "docs/unrelated.md": {
+                "change_type": "modifies",
+                "symbols": [],
+                "hunk_summaries": ["new lines 1-3"],
+                "action_inputs": [],
+                "workflow_steps": [],
+            },
+        },
+    }
+
+    assignment_item = fallback_assignment_plan(
+        obligations, topology, runtime_config,
+    ).assignments[0]
+
+    assert tuple(item.path for item in assignment_item.changed_context) == (
+        "worker/delivery.py",
+    )
+    assert assignment_item.changed_context[0].symbols == ("deliver",)
+    assert assignment_item.changed_context[0].hunk_summaries == (
+        "new lines 18-24: def deliver(message):",
+    )
+
+
+def test_merged_deterministic_assignment_retains_each_scoped_change_context(
+    runtime_config,
+):
+    obligations = (
+        CoverageObligation(
+            obligation_id="topology:worker:implementation",
+            origin="topology",
+            subject="worker delivery",
+            required_evidence_categories=("implementation",),
+            scope=("worker/delivery.py",),
+        ),
+        CoverageObligation(
+            obligation_id="topology:queue:test",
+            origin="topology",
+            subject="queue retry tests",
+            required_evidence_categories=("test",),
+            scope=("tests/test_queue.py",),
+        ),
+    )
+    topology = {
+        "changed_files": ["worker/delivery.py", "tests/test_queue.py"],
+        "components": [
+            {"id": "worker", "changed_files": ["worker/delivery.py"]},
+            {"id": "queue", "changed_files": ["tests/test_queue.py"]},
+        ],
+        "changed_contract_facts": {
+            "worker/delivery.py": {
+                "change_type": "modifies",
+                "symbols": ["deliver"],
+                "hunk_summaries": [],
+            },
+            "tests/test_queue.py": {
+                "change_type": "modifies",
+                "symbols": ["test_retry"],
+                "hunk_summaries": [],
+            },
+        },
+    }
+    base = fallback_assignment_plan(obligations, topology, runtime_config)
+    assert len(base.assignments) == 2
+    target, source = base.assignments
+
+    transformed = apply_planner_transformations(
+        {
+            "transformations": [{
+                "kind": "merge",
+                "target_assignment_id": target.id,
+                "source_assignment_ids": [source.id],
+            }],
+        },
+        base,
+        obligations,
+        runtime_config,
+    ).plan
+
+    assert {
+        item.path for item in transformed.assignments[0].changed_context
+    } == {"worker/delivery.py", "tests/test_queue.py"}
+
+
+def test_merged_changed_context_reports_paths_omitted_by_the_bound():
+    paths = tuple(f"components/c{index}/behavior.py" for index in range(14))
+    obligations = tuple(
+        CoverageObligation(
+            obligation_id=f"topology:c{index}:implementation",
+            origin="topology",
+            subject=f"component c{index}",
+            required_evidence_categories=("implementation",),
+            scope=(path,),
+        )
+        for index, path in enumerate(paths)
+    )
+    topology = {
+        "changed_files": list(paths),
+        "components": [
+            {"id": f"c{index}", "changed_files": [path]}
+            for index, path in enumerate(paths)
+        ],
+        "changed_contract_facts": {},
+    }
+    two_sessions = RuntimeConfig(
+        review_deadline_sec=600,
+        model_request_timeout_sec=100,
+        concurrency=1,
+        max_sessions=2,
+        session_limits=BudgetLimits(model_turns=6, tool_calls=20, recoveries=1),
+    )
+    base = fallback_assignment_plan(obligations, topology, two_sessions)
+    target, source = base.assignments
+
+    merged = apply_planner_transformations(
+        {
+            "transformations": [{
+                "kind": "merge",
+                "target_assignment_id": target.id,
+                "source_assignment_ids": [source.id],
+            }],
+        },
+        base,
+        obligations,
+        two_sessions,
+    ).plan.assignments[0]
+
+    assert len(merged.changed_context) == 12
+    assert merged.changed_context_omitted_paths == 2
+
+
+def test_deterministic_group_titles_describe_behavior_not_capacity_bucket():
+    obligations = (
+        CoverageObligation(
+            obligation_id="topology:worker:implementation",
+            origin="topology",
+            subject="worker delivery",
+            required_evidence_categories=("implementation",),
+            scope=("worker/delivery.py",),
+        ),
+        CoverageObligation(
+            obligation_id="topology:queue:test",
+            origin="topology",
+            subject="queue retry tests",
+            required_evidence_categories=("test",),
+            scope=("tests/test_queue.py",),
+        ),
+    )
+    topology = {
+        "changed_files": ["worker/delivery.py", "tests/test_queue.py"],
+        "components": [
+            {"id": "worker", "changed_files": ["worker/delivery.py"]},
+            {"id": "queue", "changed_files": ["tests/test_queue.py"]},
+        ],
+        "changed_contract_facts": {},
+    }
+    one_session = RuntimeConfig(
+        review_deadline_sec=600,
+        model_request_timeout_sec=100,
+        concurrency=1,
+        max_sessions=1,
+        session_limits=BudgetLimits(model_turns=6, tool_calls=20, recoveries=1),
+    )
+
+    assignment_item = fallback_assignment_plan(
+        obligations, topology, one_session,
+    ).assignments[0]
+    semantic_text = f"{assignment_item.title} {assignment_item.objective}".lower()
+
+    assert "worker delivery" in semantic_text
+    assert "queue retry tests" in semantic_text
+    assert "combined:" not in semantic_text
+    assert "capacity" not in semantic_text
+    assert "deterministically cover" not in semantic_text

@@ -1002,6 +1002,128 @@ def test_specialist_prompt_requires_exact_honest_changed_locations(
     assert "omit the line rather than inferring" in prompt
 
 
+def test_assignment_prompt_requires_diff_first_investigation(
+    monkeypatch, tmp_path,
+):
+    from pr_reviewer.specialist_runtime.assignments import Assignment
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger
+    from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    prompt = controller._cli_session_factory(
+        Assignment(
+            id="delivery",
+            title="Worker delivery behavior",
+            objective="Verify worker delivery behavior from changed diffs.",
+            obligation_ids=("topology:worker:delivery",),
+            recipe_ids=(),
+            lenses=("delivery",),
+            seed_paths=("worker/delivery.py",),
+            boundary_paths=("queue/consumer.py",),
+            expected_evidence=("implementation",),
+            estimated_turns=1,
+            priority="high",
+        ),
+        SessionLease(RunPhase.INITIAL, 10**20),
+        None,
+        EvidenceStore(),
+        CoverageLedger(()),
+        (),
+        "session:test:g0",
+    ).conversation.system
+
+    assert prompt.index("read_pr_diff") < prompt.index("read_file")
+    assert "assigned changed diffs first" in prompt
+    assert "surrounding source" in prompt
+    assert "bounded or truncated" in prompt
+    assert "does not prove the omitted content is absent" in prompt
+
+
+def test_specialist_assignment_message_serializes_semantic_brief_and_context(
+    monkeypatch, tmp_path,
+):
+    from pr_reviewer.specialist_runtime.assignments import fallback_assignment_plan
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger
+    from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+    from pr_reviewer.specialist_runtime.types import CoverageObligation
+
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    config = cli.CliConfig.from_env(workspace=tmp_path)
+    controller = cli.build_controller(config)
+    obligation = CoverageObligation(
+        obligation_id="topology:worker:delivery",
+        origin="topology",
+        subject="worker delivery",
+        explanation="Trace acknowledgement after persistence.",
+        required_evidence_categories=("implementation",),
+        satisfaction_predicates=("The acknowledgement ordering is verified.",),
+        risk_tier="high",
+        scope=("worker/delivery.py",),
+        seed_hints=("worker/delivery.py",),
+    )
+    assignment_item = fallback_assignment_plan(
+        (obligation,),
+        {
+            "changed_files": ["worker/delivery.py"],
+            "components": [{
+                "id": "worker",
+                "changed_files": ["worker/delivery.py"],
+            }],
+            "changed_contract_facts": {
+                "worker/delivery.py": {
+                    "change_type": "modifies",
+                    "symbols": ["deliver"],
+                    "hunk_summaries": [
+                        "new lines 18-24: def deliver(message):",
+                    ],
+                    "action_inputs": [],
+                    "workflow_steps": [],
+                },
+            },
+        },
+        config.runtime,
+    ).assignments[0]
+
+    session = controller._cli_session_factory(
+        assignment_item,
+        SessionLease(RunPhase.INITIAL, 10**20),
+        None,
+        EvidenceStore(),
+        CoverageLedger((obligation,)),
+        (obligation,),
+        "session:test:g0",
+    )
+    content = session.conversation.events[0]["content"]
+    payload = json.loads(content.split("\n", 1)[1])
+
+    assert payload["obligation_briefs"] == [{
+        "obligation_id": "topology:worker:delivery",
+        "subject": "worker delivery",
+        "explanation": "Trace acknowledgement after persistence.",
+        "risk_tier": "high",
+        "required_evidence": ["implementation"],
+        "satisfaction_predicates": [
+            "The acknowledgement ordering is verified.",
+        ],
+        "scope": ["worker/delivery.py"],
+    }]
+    assert payload["changed_context"] == [{
+        "path": "worker/delivery.py",
+        "change_type": "modifies",
+        "symbols": ["deliver"],
+        "hunk_summaries": [
+            "new lines 18-24: def deliver(message):",
+        ],
+        "action_inputs": [],
+        "workflow_steps": [],
+    }]
+    assert "bounded orientation" in payload["changed_context_semantics"]
+
+
 def _shell_prompt_environment(
     tmp_path: Path, *, inline: str = "", file_name: str = "", mode: str = "replace"
 ) -> dict[str, str]:

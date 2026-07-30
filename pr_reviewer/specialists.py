@@ -236,7 +236,7 @@ def build_topology(
             "generator_config": [_posix(v) for v in artifact.get("generator_config", [])][:20],
             "output_paths": [_posix(v) for v in outputs][:20],
         })
-    changed_contract_facts: dict[str, dict[str, list[str]]] = {}
+    changed_contract_facts: dict[str, dict[str, object]] = {}
     for item in pr_files:
         path = _posix(item.get("filename"))
         patch = item.get("patch")
@@ -250,10 +250,31 @@ def build_topology(
             "copied": "adds",
         }.get(str(item.get("status") or "").strip().lower(), "modifies")
         symbols: list[str] = []
+        hunk_summaries: list[str] = []
         action_inputs: list[str] = []
         workflow_steps: list[str] = []
         action_section = ""
         for line in patch.splitlines() if isinstance(patch, str) else ():
+            hunk_match = re.match(
+                r"^@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,(\d+))?\s+@@\s*(.*)$",
+                line,
+            )
+            if hunk_match and len(hunk_summaries) < 5:
+                start = int(hunk_match.group(1))
+                count = int(hunk_match.group(2) or "1")
+                line_label = (
+                    f"new line {start}"
+                    if count == 1
+                    else f"new lines {start}-{start + max(1, count) - 1}"
+                )
+                context = re.sub(
+                    r"[^A-Za-z0-9 _().,:/+[\]-]+", " ",
+                    hunk_match.group(3),
+                )
+                context = " ".join(context.split())[:120]
+                hunk_summaries.append(
+                    f"{line_label}: {context}" if context else line_label
+                )
             yaml_line = line[1:] if line[:1] in {"+", "-", " "} else line
             if path in {"action.yml", "action.yaml"}:
                 section_match = re.match(r"^(inputs|outputs|runs|branding):\s*$", yaml_line)
@@ -286,6 +307,7 @@ def build_topology(
                         workflow_steps.append(step)
         changed_contract_facts[path] = {
             "symbols": symbols[:5],
+            "hunk_summaries": hunk_summaries,
             "action_inputs": action_inputs[:5],
             "workflow_steps": workflow_steps[:5],
             "change_type": change_type,

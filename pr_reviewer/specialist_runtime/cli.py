@@ -109,7 +109,13 @@ _ROLE_SYSTEM = {
 }
 _SPECIALIST_SYSTEM = (
     "You are one durable code-review specialist. Investigate only the immutable assignment "
-    "and permitted boundaries with the advertised read-only tools. During exploration, use "
+    "and permitted boundaries with the advertised read-only tools. Inspect the assigned changed "
+    "diffs first with read_pr_diff, using the supplied changed_context only as bounded orientation. "
+    "Then use read_file for the minimum surrounding source, declarations, callers, or tests needed "
+    "to evaluate the assigned predicates; do not start with generic whole-file exploration. "
+    "A successful tool call can still be bounded or truncated. A truncation marker, omitted range, "
+    "or bounded changed_context does not prove the omitted content is absent; request a narrower "
+    "diff or source range, or record the evidence limit. During exploration, use "
     "tools or concise analysis and do not emit a whole-PR verdict. When the controller asks "
     "for a checkpoint, return only the requested checkpoint object matching its schema. "
     "When the controller asks for finalization, return only the requested final report object "
@@ -810,6 +816,7 @@ def build_controller(
             system=config.system_prompt.rstrip() + "\n\n" + _SPECIALIST_SYSTEM,
             tool_schemas=tools,
         )
+        conversation.add_user(_specialist_assignment_prompt(assignment))
         def execute(
             name: str,
             arguments: dict[str, Any],
@@ -913,6 +920,47 @@ def _json_value(value: object) -> object:
             for item in fields(value)
         }
     return value
+
+
+def _specialist_assignment_prompt(assignment: object) -> str:
+    lenses = getattr(assignment, "analytical_lens", "")
+    if not lenses:
+        lenses = ", ".join(getattr(assignment, "lenses", ()))
+    primary = tuple(getattr(assignment, "primary_obligation_ids", ()))
+    all_ids = tuple(getattr(assignment, "obligation_ids", ()))
+    independent = tuple(getattr(assignment, "independent_obligation_ids", ()))
+    payload = {
+        "assignment_id": getattr(
+            assignment, "assignment_id", getattr(assignment, "id", ""),
+        ),
+        "title": getattr(assignment, "title", ""),
+        "objective": getattr(assignment, "objective", ""),
+        "obligation_ids": list(dict.fromkeys((*primary, *all_ids, *independent))),
+        "independent_obligation_ids": list(independent),
+        "analytical_lens": lenses,
+        "seed_paths": list(getattr(assignment, "seed_paths", ())),
+        "permitted_boundaries": list(getattr(
+            assignment,
+            "permitted_boundaries",
+            getattr(assignment, "boundary_paths", ()),
+        )),
+        "obligation_briefs": _json_value(getattr(
+            assignment, "obligation_briefs", (),
+        )),
+        "changed_context": _json_value(getattr(
+            assignment, "changed_context", (),
+        )),
+        "changed_context_omitted_paths": int(getattr(
+            assignment, "changed_context_omitted_paths", 0,
+        )),
+        "changed_context_semantics": (
+            "This is bounded orientation to assigned changed paths, not proof of "
+            "complete diff or file coverage. Inspect assigned diffs before surrounding source."
+        ),
+    }
+    return "Immutable specialist assignment:\n" + json.dumps(
+        payload, sort_keys=True,
+    )
 
 
 def _compact_planner_context(value: object) -> object:

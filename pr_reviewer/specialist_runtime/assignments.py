@@ -18,6 +18,8 @@ _REQUIRED_FIELDS = (
     "overlap_justification",
 )
 _PRIORITY_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+_MAX_CHANGED_CONTEXT_PATHS = 12
+_MAX_CHANGED_CONTEXT_ITEMS = 5
 
 
 class AssignmentPlanError(ValueError):
@@ -26,6 +28,31 @@ class AssignmentPlanError(ValueError):
     def __init__(self, errors: Iterable[str] | str) -> None:
         self.errors = (errors,) if isinstance(errors, str) else tuple(errors)
         super().__init__("; ".join(self.errors))
+
+
+@dataclass(frozen=True)
+class ObligationBrief:
+    """Bounded controller-authored context for one immutable obligation ID."""
+
+    obligation_id: str
+    subject: str
+    explanation: str
+    risk_tier: str
+    required_evidence: tuple[str, ...]
+    satisfaction_predicates: tuple[str, ...]
+    scope: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ChangedPathContext:
+    """Bounded orientation to changed behavior within assignment scope."""
+
+    path: str
+    change_type: str
+    symbols: tuple[str, ...] = ()
+    hunk_summaries: tuple[str, ...] = ()
+    action_inputs: tuple[str, ...] = ()
+    workflow_steps: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -43,6 +70,9 @@ class Assignment:
     priority: str
     overlap_justification: str = ""
     primary_obligation_ids: tuple[str, ...] = ()
+    obligation_briefs: tuple[ObligationBrief, ...] = ()
+    changed_context: tuple[ChangedPathContext, ...] = ()
+    changed_context_omitted_paths: int = 0
 
     @property
     def assignment_id(self) -> str:
@@ -289,7 +319,6 @@ def validate_assignment_plan(
     runtime_config: RuntimeConfig,
 ) -> AssignmentPlan:
     """Validate model grouping; the immutable obligation set remains authoritative."""
-    del topology
     assignable = _validated_assignable_obligations(obligations)
     obligation_by_id = {item.id: item for item in assignable}
     errors: list[str] = []
@@ -303,7 +332,10 @@ def validate_assignment_plan(
         errors.extend(assignment_errors)
         if assignment is not None:
             parsed.append(assignment)
-    assignments = tuple(parsed)
+    assignments = tuple(
+        _with_semantic_brief(item, obligation_by_id, topology)
+        for item in parsed
+    )
     if len({item.id for item in assignments}) != len(assignments):
         errors.append("assignment ids must be unique")
     assigned_ids = {obligation_id for item in assignments for obligation_id in item.obligation_ids}
@@ -368,6 +400,10 @@ def _rebuild_assignment(
         for obligation in obligations
         for path in (*obligation.scope, *obligation.seed_hints)
     }
+    scoped_context = tuple(
+        item for item in original.changed_context
+        if item.path in allowed_paths
+    )
     return replace(
         original,
         id=assignment_id or original.id,
@@ -386,6 +422,12 @@ def _rebuild_assignment(
             max(1, config.session_limits.model_turns), max(1, len(ids)),
         ),
         primary_obligation_ids=(),
+        obligation_briefs=_obligation_briefs(obligations),
+        changed_context=scoped_context[:_MAX_CHANGED_CONTEXT_PATHS],
+        changed_context_omitted_paths=(
+            original.changed_context_omitted_paths
+            + max(0, len(scoped_context) - _MAX_CHANGED_CONTEXT_PATHS)
+        ),
     )
 
 
@@ -558,6 +600,20 @@ def apply_planner_transformations(
                 if any(_is_isolated_assignment(item, obligation_by_id) for item in merged):
                     raise ValueError("cannot merge an isolated recipe assignment")
                 target = by_id[target_id]
+                merged_context = {
+                    context.path: context
+                    for item in merged
+                    for context in item.changed_context
+                }
+                target = replace(
+                    target,
+                    changed_context=tuple(
+                        merged_context[path] for path in sorted(merged_context)
+                    ),
+                    changed_context_omitted_paths=sum(
+                        item.changed_context_omitted_paths for item in merged
+                    ),
+                )
                 obligation_ids = tuple(dict.fromkeys(
                     obligation_id for item in merged
                     for obligation_id in item.obligation_ids
@@ -661,6 +717,137 @@ def _component_paths(topology: Mapping[str, Any]) -> dict[str, set[str]]:
     return result
 
 
+def _bounded_text(value: object, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _obligation_briefs(
+    obligations: Iterable[CoverageObligation],
+) -> tuple[ObligationBrief, ...]:
+    return tuple(
+        ObligationBrief(
+            obligation_id=item.id,
+            subject=_bounded_text(item.subject, 160),
+            explanation=_bounded_text(item.explanation, 500),
+            risk_tier=item.risk_tier,
+            required_evidence=tuple(
+                _bounded_text(value, 80)
+                for value in item.required_evidence_categories[:16]
+            ),
+            satisfaction_predicates=tuple(
+                _bounded_text(value, 240)
+                for value in item.satisfaction_predicates[:12]
+            ),
+            scope=tuple(item.scope[:32]),
+        )
+        for item in obligations
+    )
+
+
+def _bounded_fact_strings(value: object) -> tuple[str, ...]:
+    if not isinstance(value, (tuple, list)):
+        return ()
+    return tuple(
+        text for text in (
+            _bounded_text(item, 160)
+            for item in value[:_MAX_CHANGED_CONTEXT_ITEMS]
+        )
+        if text
+    )
+
+
+def _changed_context(
+    obligations: Iterable[CoverageObligation],
+    topology: Mapping[str, Any],
+) -> tuple[tuple[ChangedPathContext, ...], int]:
+    relevant_paths = {
+        path.replace("\\", "/").strip("/")
+        for obligation in obligations
+        for path in (*obligation.scope, *obligation.seed_hints)
+        if path
+    }
+    changed_paths = {
+        str(path).replace("\\", "/").strip("/")
+        for path in topology.get("changed_files", ())
+        if isinstance(path, str) and path
+    }
+    facts_value = topology.get("changed_contract_facts", {})
+    facts = facts_value if isinstance(facts_value, Mapping) else {}
+    scoped_paths = sorted(
+        path for path in relevant_paths
+        if path in changed_paths or path in facts
+    )
+    selected = scoped_paths[:_MAX_CHANGED_CONTEXT_PATHS]
+    context: list[ChangedPathContext] = []
+    for path in selected:
+        raw = facts.get(path, {})
+        fact = raw if isinstance(raw, Mapping) else {}
+        context.append(ChangedPathContext(
+            path=path,
+            change_type=_bounded_text(fact.get("change_type", "changes"), 24)
+            or "changes",
+            symbols=_bounded_fact_strings(fact.get("symbols")),
+            hunk_summaries=_bounded_fact_strings(fact.get("hunk_summaries")),
+            action_inputs=_bounded_fact_strings(fact.get("action_inputs")),
+            workflow_steps=_bounded_fact_strings(fact.get("workflow_steps")),
+        ))
+    return tuple(context), max(0, len(scoped_paths) - len(selected))
+
+
+def _with_semantic_brief(
+    assignment: Assignment,
+    obligation_by_id: Mapping[str, CoverageObligation],
+    topology: Mapping[str, Any],
+) -> Assignment:
+    obligations = tuple(
+        obligation_by_id[item]
+        for item in assignment.obligation_ids
+        if item in obligation_by_id
+    )
+    changed_context, omitted = _changed_context(obligations, topology)
+    return replace(
+        assignment,
+        obligation_briefs=_obligation_briefs(obligations),
+        changed_context=changed_context,
+        changed_context_omitted_paths=omitted,
+    )
+
+
+def _semantic_theme(obligation: CoverageObligation) -> str:
+    subject = _bounded_text(obligation.subject, 80) or "assigned behavior"
+    lowered = subject.lower()
+    if "interaction" in obligation.required_evidence_categories and "interaction" not in lowered:
+        subject += " interaction"
+    elif any(
+        "test" in category.lower()
+        for category in obligation.required_evidence_categories
+    ) and "test" not in lowered:
+        subject += " tests"
+    if (
+        obligation.recipe_id
+        and obligation.recipe_id.lower() not in subject.lower()
+    ):
+        subject = f"{_bounded_text(obligation.recipe_id, 48)} {subject}"
+    return subject
+
+
+def _join_semantic_themes(obligations: Iterable[CoverageObligation]) -> str:
+    themes = tuple(dict.fromkeys(
+        _semantic_theme(item)
+        for item in sorted(obligations, key=lambda item: item.id)
+    ))
+    visible = themes[:3]
+    if not visible:
+        return "assigned behavior"
+    if len(visible) == 1:
+        result = visible[0]
+    else:
+        result = ", ".join(visible[:-1]) + " and " + visible[-1]
+    if len(themes) > len(visible):
+        result += f" and {len(themes) - len(visible)} related behaviors"
+    return result
+
+
 def _fallback_group(obligation: CoverageObligation, component_paths: Mapping[str, set[str]]) -> str:
     execution = _recipe_execution(obligation)
     if obligation.recipe_id and execution in {"dedicated", "independent"}:
@@ -676,19 +863,31 @@ def _fallback_group(obligation: CoverageObligation, component_paths: Mapping[str
     return f"repository:{obligation.subject}"
 
 
-def _fallback_assignment(key: str, obligations: tuple[CoverageObligation, ...], config: RuntimeConfig) -> Assignment:
+def _fallback_assignment(
+    key: str,
+    obligations: tuple[CoverageObligation, ...],
+    config: RuntimeConfig,
+    topology: Mapping[str, Any],
+) -> Assignment:
     suffix = re.sub(r"[^a-z0-9]+", "-", key.lower()).strip("-") or "review"
     seed_paths = tuple(sorted({path for item in obligations for path in item.seed_hints}))
     boundary_paths = tuple(sorted({path for item in obligations for path in item.scope if path not in seed_paths}))
-    return Assignment(
-        id=f"fallback-{suffix}", title=f"Fallback {key}",
-        objective=f"Deterministically cover {key} obligations.",
+    themes = _join_semantic_themes(obligations)
+    assignment = Assignment(
+        id=f"fallback-{suffix}", title=f"Review {themes}",
+        objective=(
+            f"Verify changed behavior for {themes} from the scoped diffs, "
+            "required evidence, and satisfaction predicates."
+        ),
         obligation_ids=tuple(item.id for item in obligations),
         recipe_ids=tuple(sorted({item.recipe_id for item in obligations if item.recipe_id})),
         lenses=("deterministic-coverage",), seed_paths=seed_paths, boundary_paths=boundary_paths,
         expected_evidence=tuple(sorted({category for item in obligations for category in item.required_evidence_categories})),
         estimated_turns=len(obligations),
         priority=_priority(obligations),
+    )
+    return _with_semantic_brief(
+        assignment, {item.id: item for item in obligations}, topology,
     )
 
 
@@ -737,7 +936,12 @@ def fallback_assignment_plan(
     admitted = candidates[:runtime_config.max_sessions]
     overflow_groups = candidates[runtime_config.max_sessions:]
     assignments = [
-        _fallback_assignment(key, tuple(sorted(items, key=lambda item: item.id)), runtime_config)
+        _fallback_assignment(
+            key,
+            tuple(sorted(items, key=lambda item: item.id)),
+            runtime_config,
+            topology,
+        )
         for key, items in admitted
     ]
     unassigned = tuple(sorted(
