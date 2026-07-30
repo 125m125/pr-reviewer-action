@@ -1235,6 +1235,36 @@ def test_handoff_prioritizes_material_code_over_plan_documents():
     ]
 
 
+def test_handoff_file_kind_outranks_security_signals_in_tests_and_docs():
+    changed_files = (
+        "docs/security/runtime.md",
+        "tests/security/test_runtime.py",
+        "src/runtime.py",
+    )
+    topology = {
+        "changed_contract_facts": {
+            path: {
+                "symbols": ["review_runtime"],
+                "change_type": "modifies",
+            }
+            for path in changed_files
+        },
+    }
+
+    what_changed, _ = _behavioral_handoff_candidates(
+        changed_files=changed_files,
+        topology=topology,
+        obligations=(),
+        evidence_records=(),
+        reviewed_obligation_ids=(),
+        allow_role_fallback=True,
+    )
+
+    assert what_changed[0].startswith("`src/runtime.py` ")
+    assert what_changed[1].startswith("`tests/security/test_runtime.py` ")
+    assert what_changed[2].startswith("`docs/security/runtime.md` ")
+
+
 def test_ai_reviewed_uses_retained_code_evidence_paths():
     """Reviewed Python components appear when evidence proves inspection."""
     class Evidence:
@@ -1344,6 +1374,20 @@ def test_candidate_retention_failure_is_not_reported_as_clean_zero(tmp_path):
     class CandidateLossSession(_SuccessfulSession):
         def explore(self):
             result = super().explore()
+            obligation = next(
+                item for item in self.obligations
+                if item.id == self.assignment.obligation_ids[0]
+            )
+            collection = next(
+                item for item in reversed(self.evidence_store.snapshot().collections)
+                if item.session_id == self.session_id
+                and item.evidence_id == result.checkpoint.evidence_ids[0]
+            )
+            self.evidence_store.associate_collection(
+                collection.id,
+                obligation_id=obligation.id,
+                categories=obligation.required_evidence_categories,
+            )
             self.candidate_findings = ()
             return replace(
                 result,
@@ -1378,6 +1422,82 @@ def test_candidate_retention_failure_is_not_reported_as_clean_zero(tmp_path):
     assert len(retention_notes) == 1
     assert retention_notes[0].file == "src/worker.py"
     assert retention_notes[0].severity is None
+
+
+def test_cross_session_retention_evidence_only_warns_without_anchored_note(tmp_path):
+    inputs = _inputs(tmp_path)
+    obligation = next(
+        item for item in derive_obligations(
+            inputs.topology,
+            inputs.classification,
+            inputs.policy,
+        )
+        if item.mandatory and item.required_evidence_categories
+    )
+    seed_store = EvidenceStore()
+    record, collection = seed_store.add_tool_result_with_collection(
+        session_id="prior-session",
+        tool="read_file",
+        arguments={
+            "path": "src/worker.py",
+            "category": obligation.required_evidence_categories[0],
+        },
+        result={"status": "ok", "content": "def process(): pass"},
+        category=obligation.required_evidence_categories[0],
+    )
+    seed_store.associate_collection(
+        collection.id,
+        obligation_id=obligation.id,
+        categories=obligation.required_evidence_categories,
+    )
+
+    class BaselineCandidateLossSession(_SuccessfulSession):
+        def explore(self):
+            self.candidate_findings = ()
+            checkpoint = SessionCheckpoint(
+                session_id=self.session_id,
+                state=SessionState.CHECKPOINT,
+                evidence_ids=(record.id,),
+                unknowns=("candidate-retention-unknown",),
+            )
+            return SessionResult(
+                session_id=self.session_id,
+                state=SessionState.CHECKPOINT,
+                checkpoint=checkpoint,
+                budget=BudgetUsage(model_turns=1),
+                degraded=True,
+            )
+
+        def finalize(self):
+            result = self.explore()
+            return replace(result, state=SessionState.COMPLETE)
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return BaselineCandidateLossSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    result = _controller(
+        tmp_path,
+        session_factory=factory,
+        evidence_seed=EvidenceSeed(
+            repository=inputs.repository,
+            head_sha=inputs.head_sha,
+            snapshot=seed_store.snapshot(),
+        ),
+    ).run(inputs)
+
+    assert "candidate finding retention was incomplete" in (
+        result.handoff.coverage_warning or ""
+    ).casefold()
+    assert not any(
+        "candidate retention" in note.markdown.casefold()
+        for note in result.notes
+    )
 
 
 def test_controller_handoff_retains_reviewed_contract_fact_with_authorized_path(tmp_path):

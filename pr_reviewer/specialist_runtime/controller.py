@@ -168,7 +168,15 @@ def _behavioral_handoff_candidates(
         for path in paths:
             by_path[path].append(obligation)
 
-    def materiality(path: str) -> int:
+    def file_kind(path: str) -> int:
+        roles = set(classify_file_roles(path))
+        if "documentation" in roles:
+            return 2
+        if "test" in roles:
+            return 1
+        return 0
+
+    def behavior_priority(path: str) -> int:
         roles = set(classify_file_roles(path))
         if "trust-boundary" in roles:
             return 0
@@ -176,15 +184,12 @@ def _behavioral_handoff_candidates(
             return 2
         if "implementation" in roles and "test" not in roles:
             return 1
-        if "test" in roles:
-            return 3
-        if "documentation" in roles:
-            return 4
         return 2
 
-    def path_priority(path: str) -> tuple[int, int, str]:
+    def path_priority(path: str) -> tuple[int, int, int, str]:
         return (
-            materiality(path),
+            file_kind(path),
+            behavior_priority(path),
             min(
                 (
                     _HANDOFF_RISK_ORDER.get(item.risk_tier, 2)
@@ -1293,12 +1298,17 @@ class ReviewController:
     ) -> tuple[Mapping[str, object], ...]:
         """Return one non-defect verification note for locatable retention loss."""
         changed = set(state.inputs.changed_files)
+        snapshot = state.evidence.snapshot()
         records = {
             record.id: record
-            for record in state.evidence.snapshot().records
+            for record in snapshot.records
             if record.is_usable_for_coverage
         }
-        candidates: list[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = []
+        obligation_ids = {item.id for item in state.obligations}
+        candidates: dict[
+            tuple[str, str],
+            tuple[set[str], set[str]],
+        ] = {}
         for result in state.session_results.values():
             checkpoint = result.checkpoint
             if (
@@ -1312,28 +1322,41 @@ class ReviewController:
                 if ownership is not None
                 else None
             )
-            obligation_ids = tuple(
+            assignment_obligation_ids = tuple(
                 item for item in getattr(assignment, "obligation_ids", ())
-                if any(obligation.id == item for obligation in state.obligations)
+                if item in obligation_ids
             )
-            if not obligation_ids:
+            if not assignment_obligation_ids:
                 continue
-            evidence_by_path: dict[str, list[str]] = {}
             for evidence_id in getattr(checkpoint, "evidence_ids", ()):
                 record = records.get(evidence_id)
                 path = str(getattr(record, "source_path", "") or "")
-                if record is not None and path in changed:
-                    evidence_by_path.setdefault(path, []).append(evidence_id)
-            for path, evidence_ids in evidence_by_path.items():
-                candidates.append((
-                    path,
-                    result.session_id,
-                    obligation_ids,
-                    tuple(sorted(set(evidence_ids))),
-                ))
+                if record is None or path not in changed:
+                    continue
+                associated_obligation_ids = {
+                    obligation_id
+                    for obligation_id in assignment_obligation_ids
+                    if any(
+                        collection.session_id == result.session_id
+                        for collection, _association
+                        in snapshot.associations_for(
+                            evidence_id,
+                            obligation_id,
+                        )
+                    )
+                }
+                if not associated_obligation_ids:
+                    continue
+                associated, evidence = candidates.setdefault(
+                    (path, result.session_id),
+                    (set(), set()),
+                )
+                associated.update(associated_obligation_ids)
+                evidence.add(evidence_id)
         if not candidates:
             return ()
-        path, _session_id, obligation_ids, evidence_ids = sorted(candidates)[0]
+        path, session_id = sorted(candidates)[0]
+        associated, evidence = candidates[(path, session_id)]
         return ({
             "question": (
                 f"Verify the reviewed behavior in `{path}` because candidate "
@@ -1343,8 +1366,8 @@ class ReviewController:
                 "A specialist reported material candidate-retention loss. "
                 "This is a coverage check, not a confirmed defect."
             ),
-            "related_obligation_ids": obligation_ids,
-            "evidence_ids": evidence_ids,
+            "related_obligation_ids": tuple(sorted(associated)),
+            "evidence_ids": tuple(sorted(evidence)),
             "file": path,
         },)
 
