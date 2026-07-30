@@ -69,9 +69,11 @@ _ROLE_SYSTEM = {
         "\"summary\":string}],\"cross_component_effects\":[{\"components\":[string,"
         "...],\"summary\":string}],\"uncertainties\":[string,...]}. Every path and "
         "component must be copied exactly from the supplied controller facts. Do not "
-        "state a verdict, finding, severity, test result, review result, or coverage "
-        "claim. Prefer behavioral intent from bounded symbols, workflow keys/steps, "
-        "and Markdown/AsciiDoc headings or excerpts; do not reproduce a full diff."
+        "state a consequence, defect, risk, verdict, finding, severity, approval or "
+        "merge-safety judgment, verification result, test result, review result, or "
+        "coverage claim. Describe only changed behavior and purpose from bounded "
+        "symbols, workflow keys/steps, and Markdown/AsciiDoc headings or excerpts; "
+        "do not reproduce a full diff."
     ),
     "planner": (
         "The controller has already created the authoritative deterministic base plan. "
@@ -695,10 +697,19 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
             root, base_sha, head_sha, changed_files,
         )
     except ValueError:
-        # Synthetic/offline fixtures may carry placeholder identities. Real
-        # action inputs are full object IDs; never treat API patch text as an
-        # immutable substitute when the local range cannot be established.
-        change_facts = {}
+        change_facts = {
+            "facts": {},
+            "bounded": True,
+            "path_limit": 500,
+            "included_path_count": 0,
+            "omitted_path_count": len(changed_files),
+            "failed_path_count": 0,
+            "status": "degraded",
+            "failures": [{
+                "scope": "range",
+                "reason": "immutable object IDs are invalid",
+            }],
+        }
     topology = build_topology(
         complete_pr_files,
         classification,
@@ -962,6 +973,7 @@ def build_controller(
             recovery_evidence_bytes=max(
                 1_000, config.recovery_max_tokens * 4,
             ),
+            change_overview=change_overview,
         )
 
     # The current-head policy is attached after workspace loading in main.

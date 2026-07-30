@@ -71,16 +71,20 @@ def test_local_diff_facts_do_not_depend_on_github_patch_text(tmp_path):
         "docs/operations.adoc",
     )
 
-    facts = specialists.build_change_facts(
+    change_facts = specialists.build_change_facts(
         tmp_path, base_sha, head_sha, paths,
     )
     topology = build_topology(
         [{"filename": path, "status": "modified"} for path in paths],
         {},
         paths,
-        change_facts=facts,
+        change_facts=change_facts,
     )
 
+    assert change_facts["bounded"] is True
+    assert change_facts["included_path_count"] == 4
+    assert change_facts["omitted_path_count"] == 0
+    facts = change_facts["facts"]
     assert topology["changed_contract_facts"]["src/worker.py"]["symbols"] == [
         "retry_delivery"
     ]
@@ -98,6 +102,104 @@ def test_local_diff_facts_do_not_depend_on_github_patch_text(tmp_path):
     assert "Uses the local comparison." in topology["changed_contract_facts"][
         "docs/guide.md"
     ]["change_excerpts"]
+
+
+def test_authoritative_change_facts_stay_capped_when_api_patches_are_missing(
+    monkeypatch,
+    tmp_path,
+):
+    paths = tuple(f"src/module_{index}.py" for index in range(501))
+
+    def fake_run(arguments, **_kwargs):
+        if "--name-status" in arguments:
+            stdout = "".join(f"M\t{path}\n" for path in paths)
+        else:
+            path = arguments[-1]
+            stdout = (
+                f"@@ -0,0 +1,2 @@\n"
+                f"+def changed_{path.split('_')[-1].split('.')[0]}():\n"
+                "+    pass\n"
+            )
+        return subprocess.CompletedProcess(arguments, 0, stdout, "")
+
+    monkeypatch.setattr(specialists.subprocess, "run", fake_run)
+    change_facts = specialists.build_change_facts(
+        tmp_path, "a" * 40, "b" * 40, paths,
+    )
+    topology = build_topology(
+        [{"filename": path, "status": "modified"} for path in paths],
+        {},
+        paths,
+        change_facts=change_facts,
+    )
+
+    assert change_facts["included_path_count"] == 500
+    assert change_facts["omitted_path_count"] == 1
+    assert len(change_facts["facts"]) == 500
+    assert paths[-1] not in change_facts["facts"]
+    assert paths[-1] in topology["changed_contract_facts"]
+    assert topology["changed_contract_facts"][paths[-1]]["symbols"] == []
+    assert paths[-1] not in topology["change_facts"]["facts"]
+
+
+def test_failed_per_path_diff_is_explicit_and_not_an_empty_authoritative_fact(
+    monkeypatch,
+    tmp_path,
+):
+    path = "src/app.py"
+
+    def fake_run(arguments, **_kwargs):
+        if "--name-status" in arguments:
+            return subprocess.CompletedProcess(
+                arguments, 0, f"M\t{path}\n", "",
+            )
+        return subprocess.CompletedProcess(
+            arguments, 128, "", "fatal: diff failed",
+        )
+
+    monkeypatch.setattr(specialists.subprocess, "run", fake_run)
+
+    change_facts = specialists.build_change_facts(
+        tmp_path, "a" * 40, "b" * 40, (path,),
+    )
+
+    assert change_facts["status"] == "degraded"
+    assert change_facts["facts"] == {}
+    assert change_facts["failed_path_count"] == 1
+    assert change_facts["omitted_path_count"] == 1
+    assert change_facts["failures"] == [{
+        "scope": "path",
+        "path": path,
+        "reason": "immutable diff command failed",
+    }]
+
+
+def test_failed_range_diff_is_explicit_and_skips_per_path_commands(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    def fake_run(arguments, **_kwargs):
+        calls.append(arguments)
+        return subprocess.CompletedProcess(
+            arguments, 128, "", "fatal: bad range",
+        )
+
+    monkeypatch.setattr(specialists.subprocess, "run", fake_run)
+
+    change_facts = specialists.build_change_facts(
+        tmp_path, "a" * 40, "b" * 40, ("src/app.py",),
+    )
+
+    assert len(calls) == 1
+    assert change_facts["status"] == "degraded"
+    assert change_facts["facts"] == {}
+    assert change_facts["omitted_path_count"] == 1
+    assert change_facts["failures"] == [{
+        "scope": "range",
+        "reason": "immutable diff range unavailable",
+    }]
 
 
 def test_topology_extracts_bounded_changed_symbols_and_contract_names_from_patches():

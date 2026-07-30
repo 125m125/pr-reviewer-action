@@ -443,6 +443,7 @@ class SpecialistSession:
         recovery_evidence_bytes: int = 8_000,
         clock: Callable[[], float] = time.monotonic,
         wire_safety_tokens: int = 256,
+        change_overview: Mapping[str, object] | None = None,
     ) -> None:
         if not session_id.strip():
             raise ValueError("session_id must not be empty")
@@ -454,6 +455,10 @@ class SpecialistSession:
             raise ValueError("request timeout and max tokens must be positive")
         self.session_id = session_id
         self.assignment = assignment
+        self.change_overview = json.loads(json.dumps(
+            _assignment_json_value(change_overview or {}),
+            sort_keys=True,
+        ))
         self.conversation = conversation
         self.gateway = gateway
         self.execute_tool = execute_tool
@@ -516,7 +521,10 @@ class SpecialistSession:
         self.conversation.tool_schemas = schemas
 
     def _assignment_prompt(self) -> str:
-        return specialist_assignment_prompt(self.assignment)
+        return specialist_assignment_prompt(
+            self.assignment,
+            change_overview=self.change_overview,
+        )
 
     @property
     def request_events(self) -> tuple[SpecialistRequestEvent, ...]:

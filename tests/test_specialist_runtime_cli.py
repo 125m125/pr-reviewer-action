@@ -282,7 +282,9 @@ def test_load_workspace_uses_immutable_local_diff_when_api_patches_are_absent(
 
     workspace = cli.load_workspace(cli.CliConfig.from_env(workspace=tmp_path))
 
-    facts = workspace.inputs.topology["change_facts"]["src/app.py"]
+    change_facts = workspace.inputs.topology["change_facts"]
+    assert change_facts["status"] == "ok"
+    facts = change_facts["facts"]["src/app.py"]
     assert facts["symbols"] == ["immutable_change"]
     assert facts["hunk_summaries"]
 
@@ -1313,6 +1315,16 @@ def test_recovery_reuses_complete_semantic_assignment_prompt(
         ),),
         changed_context_omitted_paths=3,
     )
+    change_overview = {
+        "overview": "Worker delivery adds retry orchestration.",
+        "key_changes": [{
+            "path": "worker/delivery.py",
+            "component": "worker",
+            "summary": "Adds retry orchestration around delivery.",
+        }],
+        "cross_component_effects": [],
+        "uncertainties": [],
+    }
     session = controller._cli_session_factory(
         assignment,
         SessionLease(RunPhase.INITIAL, 10**20),
@@ -1321,6 +1333,7 @@ def test_recovery_reuses_complete_semantic_assignment_prompt(
         CoverageLedger((obligation,)),
         (obligation,),
         "session:test:g0",
+        change_overview,
     )
     initial_assignment = session.conversation.events[0]["content"]
 
@@ -1332,6 +1345,8 @@ def test_recovery_reuses_complete_semantic_assignment_prompt(
     assert payload["obligation_briefs"][0]["obligation_id"] == obligation.id
     assert payload["changed_context"][0]["path"] == "worker/delivery.py"
     assert payload["changed_context_omitted_paths"] == 3
+    assert payload["change_overview"] == change_overview
+    assert session.change_overview == change_overview
     assert payload["exploration_contract"].index("read_pr_diff") < (
         payload["exploration_contract"].index("read_file")
     )

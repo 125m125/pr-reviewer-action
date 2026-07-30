@@ -280,7 +280,7 @@ def build_change_facts(
     base_sha: str,
     head_sha: str,
     changed_paths: Iterable[str],
-) -> dict[str, dict[str, object]]:
+) -> dict[str, object]:
     """Build bounded semantic facts from the immutable local review range."""
     if (
         re.fullmatch(r"[0-9a-fA-F]{40,64}", str(base_sha or "")) is None
@@ -288,9 +288,10 @@ def build_change_facts(
     ):
         raise ValueError("change facts require full base and head object IDs")
     root = Path(workspace)
-    paths = tuple(dict.fromkeys(
+    all_paths = tuple(dict.fromkeys(
         path for path in (_posix(item) for item in changed_paths) if path
-    ))[:_MAX_CHANGE_FACT_PATHS]
+    ))
+    paths = all_paths[:_MAX_CHANGE_FACT_PATHS]
     status_result = subprocess.run(
         [
             "git", "diff", "--name-status", "--find-renames",
@@ -303,18 +304,39 @@ def build_change_facts(
         errors="replace",
         check=False,
     )
+    if status_result.returncode != 0:
+        return {
+            "facts": {},
+            "bounded": True,
+            "path_limit": _MAX_CHANGE_FACT_PATHS,
+            "included_path_count": 0,
+            "omitted_path_count": len(all_paths),
+            "failed_path_count": 0,
+            "status": "degraded",
+            "failures": [{
+                "scope": "range",
+                "reason": "immutable diff range unavailable",
+            }],
+        }
     local_status: dict[str, str] = {}
-    if status_result.returncode == 0:
-        for line in status_result.stdout.splitlines():
-            columns = line.split("\t")
-            if len(columns) < 2:
-                continue
-            status = columns[0][:1]
-            path = _posix(columns[-1])
-            if path:
-                local_status[path] = status
+    for line in status_result.stdout.splitlines():
+        columns = line.split("\t")
+        if len(columns) < 2:
+            continue
+        status = columns[0][:1]
+        path = _posix(columns[-1])
+        if path:
+            local_status[path] = status
     facts: dict[str, dict[str, object]] = {}
+    failures: list[dict[str, str]] = []
     for path in paths:
+        if path not in local_status:
+            failures.append({
+                "scope": "path",
+                "path": path,
+                "reason": "immutable diff path unavailable",
+            })
+            continue
         result = subprocess.run(
             [
                 "git", "diff", "--no-ext-diff", "--no-color",
@@ -328,7 +350,21 @@ def build_change_facts(
             errors="replace",
             check=False,
         )
-        patch = result.stdout if result.returncode == 0 else ""
+        if result.returncode != 0:
+            failures.append({
+                "scope": "path",
+                "path": path,
+                "reason": "immutable diff command failed",
+            })
+            continue
+        patch = result.stdout
+        if not patch.strip():
+            failures.append({
+                "scope": "path",
+                "path": path,
+                "reason": "immutable diff path unavailable",
+            })
+            continue
         patch = patch.encode("utf-8")[:_MAX_LOCAL_PATCH_BYTES].decode(
             "utf-8", errors="replace",
         )
@@ -338,7 +374,16 @@ def build_change_facts(
             patch,
             include_intent=True,
         )
-    return facts
+    return {
+        "facts": facts,
+        "bounded": True,
+        "path_limit": _MAX_CHANGE_FACT_PATHS,
+        "included_path_count": len(facts),
+        "omitted_path_count": len(all_paths) - len(facts),
+        "failed_path_count": len(failures),
+        "status": "degraded" if failures else "ok",
+        "failures": failures,
+    }
 
 
 def build_topology(
@@ -347,7 +392,7 @@ def build_topology(
     tracked_paths: Iterable[str],
     config: dict[str, Any] | None = None,
     workspace_paths: Iterable[str] | None = None,
-    change_facts: dict[str, dict[str, object]] | None = None,
+    change_facts: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     classification = classification or {}
     config = config or {}
@@ -453,7 +498,16 @@ def build_topology(
             "output_paths": [_posix(v) for v in outputs][:20],
         })
     changed_contract_facts: dict[str, dict[str, object]] = {}
-    immutable_facts = change_facts or {}
+    immutable_facts_value = (
+        change_facts.get("facts", {})
+        if isinstance(change_facts, dict)
+        else {}
+    )
+    immutable_facts = (
+        immutable_facts_value
+        if isinstance(immutable_facts_value, dict)
+        else {}
+    )
     for item in pr_files:
         path = _posix(item.get("filename"))
         patch = item.get("patch")
@@ -465,7 +519,7 @@ def build_topology(
             if isinstance(local, dict)
             else _facts_from_patch(path, item.get("status"), patch)
         )
-    return {
+    topology = {
         "changed_files": changed,
         "components": list(components.values()),
         "path_components": path_component,
@@ -476,6 +530,8 @@ def build_topology(
         "risk_flags": _strings(classification.get("risk_flags")),
         "pr_kind": str(classification.get("pr_kind") or "unknown"),
         "generated_artifacts": generated_artifacts,
-        "change_facts": changed_contract_facts,
         "changed_contract_facts": changed_contract_facts,
     }
+    if change_facts is not None:
+        topology["change_facts"] = change_facts
+    return topology

@@ -62,6 +62,19 @@ from pr_reviewer.specialist_runtime.types import (
 from pr_reviewer.specialist_runtime.web_evidence import SourceAccessRequest
 
 
+def _change_facts_payload(facts, *, status="ok", failures=()):
+    return {
+        "facts": facts,
+        "bounded": True,
+        "path_limit": 500,
+        "included_path_count": len(facts),
+        "omitted_path_count": 0,
+        "failed_path_count": 0,
+        "status": status,
+        "failures": list(failures),
+    }
+
+
 def test_controller_public_api_is_importable():
     assert ReviewController
     assert ReviewInputs
@@ -133,6 +146,18 @@ def test_critic_schema_does_not_allow_prose_to_rewrite_consequence_support():
             "uncertainties": [],
         },
         {
+            "overview": "Also changes src/unchanged.py.",
+            "key_changes": [],
+            "cross_component_effects": [],
+            "uncertainties": [],
+        },
+        {
+            "overview": "Also changes README.md.",
+            "key_changes": [],
+            "cross_component_effects": [],
+            "uncertainties": [],
+        },
+        {
             "overview": "Updates worker delivery.",
             "key_changes": [{
                 "path": "src/worker.py",
@@ -142,6 +167,34 @@ def test_critic_schema_does_not_allow_prose_to_rewrite_consequence_support():
             "cross_component_effects": [],
             "uncertainties": [],
         },
+        {
+            "overview": "Updates worker delivery.",
+            "key_changes": [{
+                "path": "src/worker.py",
+                "component": "worker",
+                "summary": "The change drops retries.",
+            }],
+            "cross_component_effects": [],
+            "uncertainties": [],
+        },
+        {
+            "overview": "The interaction can cause data loss.",
+            "key_changes": [],
+            "cross_component_effects": [],
+            "uncertainties": [],
+        },
+        {
+            "overview": "Updates worker delivery.",
+            "key_changes": [],
+            "cross_component_effects": [],
+            "uncertainties": ["The pull request is safe to merge."],
+        },
+        {
+            "overview": "Updates worker delivery.",
+            "key_changes": [],
+            "cross_component_effects": [],
+            "uncertainties": ["Every branch is tested."],
+        },
     ],
 )
 def test_change_overview_rejects_non_authoritative_claims(proposal, tmp_path):
@@ -149,17 +202,99 @@ def test_change_overview_rejects_non_authoritative_claims(proposal, tmp_path):
         _inputs(tmp_path),
         topology={
             **_inputs(tmp_path).topology,
-            "change_facts": {
+            "change_facts": _change_facts_payload({
                 "src/worker.py": {
                     "change_type": "modifies",
                     "symbols": ["deliver"],
                 },
-            },
+            }),
         },
     )
 
     with pytest.raises(ValueError):
         controller_module._validated_change_overview(proposal, inputs)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["overview", "key_change", "cross_component_effect", "uncertainty"],
+)
+def test_change_overview_rejects_plain_unchanged_paths_in_every_prose_field(
+    field,
+    tmp_path,
+):
+    inputs = replace(
+        _inputs(tmp_path),
+        changed_files=("src/worker.py", "docs/guide.md"),
+        topology={
+            "changed_files": ["src/worker.py", "docs/guide.md"],
+            "path_components": {
+                "src/worker.py": "worker",
+                "docs/guide.md": "docs",
+            },
+            "components": [
+                {"id": "worker", "changed_files": ["src/worker.py"]},
+                {"id": "docs", "changed_files": ["docs/guide.md"]},
+            ],
+            "change_facts": _change_facts_payload({}),
+        },
+    )
+    invalid = "References src/unchanged.py and README.md."
+    proposal = {
+        "overview": "Updates worker delivery and documentation.",
+        "key_changes": [{
+            "path": "src/worker.py",
+            "component": "worker",
+            "summary": "Adds retry orchestration.",
+        }],
+        "cross_component_effects": [{
+            "components": ["worker", "docs"],
+            "summary": "Aligns worker behavior with its guide.",
+        }],
+        "uncertainties": ["Runtime intent remains bounded to changed facts."],
+    }
+    if field == "overview":
+        proposal["overview"] = invalid
+    elif field == "key_change":
+        proposal["key_changes"][0]["summary"] = invalid
+    elif field == "cross_component_effect":
+        proposal["cross_component_effects"][0]["summary"] = invalid
+    else:
+        proposal["uncertainties"][0] = invalid
+
+    with pytest.raises(ValueError, match="unchanged path"):
+        controller_module._validated_change_overview(proposal, inputs)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://docs.example.com/guide.md",
+        "www.example.com/guide.md",
+        "docs.example.com/guide.md",
+    ],
+)
+def test_change_overview_path_validation_ignores_urls(tmp_path, url):
+    inputs = _inputs(tmp_path)
+    proposal = {
+        "overview": (
+            "Updates worker delivery using design context from "
+            f"{url}."
+        ),
+        "key_changes": [{
+            "path": "src/worker.py",
+            "component": "worker",
+            "summary": "Adds retry orchestration.",
+        }],
+        "cross_component_effects": [],
+        "uncertainties": [],
+    }
+
+    validated = controller_module._validated_change_overview(
+        proposal, inputs,
+    )
+
+    assert validated["overview"] == proposal["overview"]
 
 
 def test_critic_receives_bounded_retained_evidence_excerpt_and_metadata(tmp_path):
@@ -488,7 +623,7 @@ def test_one_validated_change_overview_reaches_every_review_role(tmp_path):
         _inputs(tmp_path),
         topology={
             **_inputs(tmp_path).topology,
-            "change_facts": {
+            "change_facts": _change_facts_payload({
                 "src/worker.py": {
                     "change_type": "modifies",
                     "symbols": ["deliver", "retry_delivery"],
@@ -496,7 +631,7 @@ def test_one_validated_change_overview_reaches_every_review_role(tmp_path):
                     "headings": [],
                     "change_excerpts": [],
                 },
-            },
+            }),
         },
         candidate_findings=(CandidateFinding(
             candidate_id="overview-candidate",
@@ -595,13 +730,13 @@ def test_malformed_change_summary_falls_back_to_bounded_facts(tmp_path):
         _inputs(tmp_path),
         topology={
             **_inputs(tmp_path).topology,
-            "change_facts": {
+            "change_facts": _change_facts_payload({
                 "src/worker.py": {
                     "change_type": "modifies",
                     "symbols": ["deliver", "retry_delivery"],
                     "hunk_summaries": ["new lines 8-10: retry_delivery"],
                 },
-            },
+            }),
         },
     )
 
@@ -622,6 +757,50 @@ def test_malformed_change_summary_falls_back_to_bounded_facts(tmp_path):
     assert observed["key_changes"][0]["path"] == "src/worker.py"
     assert any(
         item["component"] == "change_summarizer"
+        for item in result.artifact["degradation"]
+    )
+
+
+def test_failed_immutable_diff_uses_explicit_degraded_fallback(tmp_path):
+    observed = {}
+    summarizer_called = False
+    inputs = replace(
+        _inputs(tmp_path),
+        topology={
+            **_inputs(tmp_path).topology,
+            "change_facts": _change_facts_payload(
+                {},
+                status="degraded",
+                failures=({
+                    "scope": "range",
+                    "reason": "immutable diff range unavailable",
+                },),
+            ),
+        },
+    )
+
+    def summarizer(_request):
+        nonlocal summarizer_called
+        summarizer_called = True
+        return {}
+
+    def planner(request):
+        observed.update(request.context["change_overview"])
+        return {"transformations": []}
+
+    result = _controller(
+        tmp_path,
+        change_summarizer=summarizer,
+        planner=planner,
+    ).run(inputs)
+
+    assert summarizer_called is False
+    assert observed["key_changes"][0]["path"] == "src/worker.py"
+    assert observed["key_changes"][0]["summary"] == "Changes"
+    assert result.artifact["evaluation_status"] == "degraded"
+    assert any(
+        item["component"] == "change_facts"
+        and item["reason"] == "immutable diff range unavailable"
         for item in result.artifact["degradation"]
     )
 

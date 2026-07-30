@@ -88,13 +88,30 @@ _MAX_ARTIFACT_STRING = 16 * 1024
 _MAX_ARTIFACT_ITEMS = 2_000
 _MAX_CHANGE_OVERVIEW_ITEMS = 12
 _PROHIBITED_OVERVIEW_CLAIM = re.compile(
-    r"(?i)\b(?:approve|request[_ -]?changes|verdict|findings?|blocker|"
-    r"bugs?|defects?|vulnerabilit(?:y|ies)|regressions?|"
+    r"(?i)\b(?:approve|approval|request[_ -]?changes|verdict|findings?|"
+    r"blocker|bugs?|defects?|vulnerabilit(?:y|ies)|regressions?|risks?|"
+    r"unsafe|safe\s+to\s+merge|ready\s+to\s+merge|merge[- ]safe|"
+    r"drops?|dropped|dropping|data\s+loss|corrupts?|corrupted|"
+    r"prevents?|causes?|leads?\s+to|results?\s+in|"
     r"coverage\s+(?:is\s+)?(?:complete|sufficient|verified)|"
     r"tests?\s+(?:pass|passed|passing)|"
+    r"(?:is|are|was|were|has\s+been|have\s+been)\s+"
+    r"(?:fully\s+)?(?:verified|validated|tested|covered)|"
+    r"every\s+(?:branch|path|case)\s+(?:is\s+)?tested|"
     r"(?:all|fully|completely)\b.{0,40}\b(?:covered|reviewed|verified|tested))\b"
 )
-_BACKTICK_REFERENCE = re.compile(r"`([^`\r\n]{1,300})`")
+_PATH_WITH_DIRECTORY = re.compile(
+    r"(?<![A-Za-z0-9_./:-])"
+    r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z][A-Za-z0-9_-]{0,15}"
+)
+_ROOT_FILE_REFERENCE = re.compile(
+    r"(?<![A-Za-z0-9_./:-])"
+    r"[A-Za-z0-9_-]+\.[A-Za-z][A-Za-z0-9_-]{0,15}\b"
+)
+_URL_REFERENCE = re.compile(
+    r"(?i)\b(?:https?://|www\.|"
+    r"(?:[A-Za-z0-9-]+\.)+(?:com|org|net|io|dev|edu|gov|co|app)/)\S+"
+)
 _SIGNAL_ORIENTATION_TOPICS = {
     "implementation": (ReviewOrientationTopic.IMPLEMENTATION,),
     "documentation": (ReviewOrientationTopic.DOCUMENTATION,),
@@ -722,6 +739,50 @@ def _overview_text(value: object, label: str, *, limit: int) -> str:
     return text
 
 
+def _prose_path_references(value: str) -> tuple[str, ...]:
+    normalized = value.replace("\\", "/")
+    references: list[str] = []
+    occupied: list[tuple[int, int]] = []
+    url_spans = tuple(match.span() for match in _URL_REFERENCE.finditer(normalized))
+    for match in _PATH_WITH_DIRECTORY.finditer(normalized):
+        if any(start <= match.start() < end for start, end in url_spans):
+            continue
+        reference = match.group(0).rstrip(".,;:!?)]}")
+        if reference and reference not in references:
+            references.append(reference)
+        occupied.append(match.span())
+    for match in _ROOT_FILE_REFERENCE.finditer(normalized):
+        if any(start <= match.start() < end for start, end in occupied):
+            continue
+        if any(start <= match.start() < end for start, end in url_spans):
+            continue
+        reference = match.group(0).rstrip(".,;:!?)]}")
+        if reference.lower().startswith("www."):
+            continue
+        if reference and reference not in references:
+            references.append(reference)
+    return tuple(references)
+
+
+def _authoritative_change_facts(
+    topology: Mapping[str, Any],
+) -> tuple[Mapping[str, object], Mapping[str, object] | None]:
+    value = topology.get("change_facts")
+    if isinstance(value, Mapping) and "facts" in value:
+        facts = value.get("facts")
+        return (
+            facts if isinstance(facts, Mapping) else {},
+            value,
+        )
+    if isinstance(value, Mapping):
+        return value, None
+    compatibility = topology.get("changed_contract_facts", {})
+    return (
+        compatibility if isinstance(compatibility, Mapping) else {},
+        None,
+    )
+
+
 def _validated_change_overview(
     value: object,
     inputs: ReviewInputs,
@@ -743,9 +804,9 @@ def _validated_change_overview(
 
     def admitted_text(raw: object, label: str, *, limit: int) -> str:
         text = _overview_text(raw, label, limit=limit)
-        for reference in _BACKTICK_REFERENCE.findall(text):
+        for reference in _prose_path_references(text):
             path = reference.replace("\\", "/").strip("/")
-            if "/" in path and path not in changed_paths:
+            if path not in changed_paths:
                 raise ValueError(
                     "change overview contains an unchanged path reference"
                 )
@@ -840,11 +901,7 @@ def _validated_change_overview(
 
 
 def _deterministic_change_overview(inputs: ReviewInputs) -> dict[str, object]:
-    facts_value = inputs.topology.get(
-        "change_facts",
-        inputs.topology.get("changed_contract_facts", {}),
-    )
-    facts = facts_value if isinstance(facts_value, Mapping) else {}
+    facts, metadata = _authoritative_change_facts(inputs.topology)
     component_ids, path_components = _change_components(inputs)
     fallback_component = sorted(component_ids)[0] if len(component_ids) == 1 else ""
     changes: list[dict[str, str]] = []
@@ -894,15 +951,23 @@ def _deterministic_change_overview(inputs: ReviewInputs) -> dict[str, object]:
         f"{max(1, len(component_ids))} "
         f"{'component' if len(component_ids) == 1 else 'components'}."
     )
-    uncertainties = (
-        (f"{omitted} additional changed paths are omitted from this bounded overview.",)
-        if omitted else ()
-    )
+    uncertainties: list[str] = []
+    if omitted:
+        uncertainties.append(
+            f"{omitted} additional changed paths are omitted from this bounded overview."
+        )
+    if metadata is not None:
+        fact_omitted = metadata.get("omitted_path_count", 0)
+        if isinstance(fact_omitted, int) and fact_omitted > 0:
+            uncertainties.append(
+                f"Immutable semantic facts are unavailable for {fact_omitted} changed "
+                f"{'path' if fact_omitted == 1 else 'paths'}."
+            )
     return {
         "overview": overview,
         "key_changes": tuple(changes),
         "cross_component_effects": (),
-        "uncertainties": uncertainties,
+        "uncertainties": tuple(uncertainties),
     }
 
 
@@ -1863,6 +1928,24 @@ class ReviewController:
 
     def _summarize_changes(self, state: _RunState) -> Mapping[str, object]:
         fallback = _deterministic_change_overview(state.inputs)
+        change_facts = state.inputs.topology.get("change_facts")
+        if (
+            isinstance(change_facts, Mapping)
+            and change_facts.get("status") == "degraded"
+        ):
+            failures = change_facts.get("failures", ())
+            first = (
+                failures[0]
+                if isinstance(failures, (tuple, list)) and failures
+                else {}
+            )
+            reason = (
+                str(first.get("reason") or "").strip()
+                if isinstance(first, Mapping)
+                else ""
+            ) or "immutable local diff facts are unavailable"
+            self._degrade(state, "change_facts", reason)
+            return fallback
         if (
             self.change_summarizer is None
             or self.clock() >= state.deadline.cutoff_for(RunPhase.PLANNING)
@@ -1877,9 +1960,12 @@ class ReviewController:
                 component=self.change_summarizer,
                 method="summarize",
                 context={
-                    "change_facts": state.inputs.topology.get(
-                        "change_facts",
-                        state.inputs.topology.get("changed_contract_facts", {}),
+                    "change_facts": (
+                        change_facts
+                        if isinstance(change_facts, Mapping)
+                        else state.inputs.topology.get(
+                            "changed_contract_facts", {},
+                        )
                     ),
                     "changed_files": state.inputs.changed_files,
                     "components": state.inputs.topology.get("components", ()),
