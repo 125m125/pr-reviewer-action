@@ -279,6 +279,17 @@ def build_topology(
                 hunk_summaries.append(
                     f"{line_label}: {context}" if context else line_label
                 )
+                if path.endswith(".py"):
+                    context_symbol = re.match(
+                        r"\s*(?:async\s+)?(?:def|class)\s+"
+                        r"([A-Za-z_][A-Za-z0-9_]*)",
+                        hunk_match.group(3),
+                    )
+                    if (
+                        context_symbol
+                        and context_symbol.group(1) not in symbols
+                    ):
+                        symbols.append(context_symbol.group(1))
             yaml_line = line[1:] if line[:1] in {"+", "-", " "} else line
             if path in {"action.yml", "action.yaml"}:
                 section_match = re.match(r"^(inputs|outputs|runs|branding):\s*$", yaml_line)

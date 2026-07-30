@@ -115,6 +115,32 @@ def test_topology_extracts_bounded_changed_hunk_context():
     ]
 
 
+def test_modified_python_function_is_a_changed_contract_fact():
+    """A changed body is attributed using its diff hunk/function context."""
+    topology = build_topology(
+        [{
+            "filename": "pr_reviewer/specialist_runtime/controller.py",
+            "status": "modified",
+            "patch": (
+                "@@ -2100,4 +2110,7 @@ def _handoff_context(self, state, status):\n"
+                "         reviewed_obligations = tuple(\n"
+                "+            item for item in state.obligations\n"
+                "+            if evidence_by_obligation.get(item.id)\n"
+            ),
+        }],
+        {},
+        ("pr_reviewer/specialist_runtime/controller.py",),
+    )
+
+    facts = topology["changed_contract_facts"][
+        "pr_reviewer/specialist_runtime/controller.py"
+    ]
+    assert facts["symbols"] == ["_handoff_context"]
+    assert facts["hunk_summaries"] == [
+        "new lines 2110-2116: def _handoff_context(self, state, status):",
+    ]
+
+
 def test_topology_labels_zero_count_new_range_as_deletion_only():
     topology = build_topology(
         [{

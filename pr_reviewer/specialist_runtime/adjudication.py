@@ -153,6 +153,7 @@ class ReviewHandoffContext:
     highest_thread_severity: str | None = None
     review_emphasis_topics: tuple[ReviewOrientationTopic, ...] = ()
     material_coverage_limited: bool = False
+    candidate_retention_limited: bool = False
     degraded_stages: tuple[str, ...] = ()
     diagnostics_url: str | None = None
     source_access_requests: tuple[SourceAccessRequest, ...] = ()
@@ -1325,6 +1326,11 @@ def project_review_handoff(
     coverage_warning = None
     if context.material_coverage_limited:
         candidate_warning = "Material evidence or session coverage is incomplete."
+        if context.candidate_retention_limited:
+            candidate_warning += (
+                " Candidate finding retention was incomplete; published finding "
+                "counts may be incomplete and must not be read as clean coverage."
+            )
         degraded_stages = _structured_ids(
             tuple(
                 "specialist"

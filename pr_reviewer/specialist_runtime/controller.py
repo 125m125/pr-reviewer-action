@@ -132,6 +132,8 @@ _HANDOFF_RISK_ORDER = {
     "low": 3,
 }
 
+_CANDIDATE_RETENTION_UNKNOWN = "candidate-retention-unknown"
+
 
 def _behavioral_handoff_candidates(
     *,
@@ -152,6 +154,7 @@ def _behavioral_handoff_candidates(
     evidence_paths = {
         str(getattr(record, "source_path", "") or "")
         for record in evidence_records
+        if bool(getattr(record, "is_usable_for_coverage", False))
     }
 
     by_path: dict[str, list[CoverageObligation]] = {path: [] for path in changed}
@@ -165,8 +168,23 @@ def _behavioral_handoff_candidates(
         for path in paths:
             by_path[path].append(obligation)
 
-    def path_priority(path: str) -> tuple[int, str]:
+    def materiality(path: str) -> int:
+        roles = set(classify_file_roles(path))
+        if "trust-boundary" in roles:
+            return 0
+        if {"deployment", "build-manifest", "configuration"} & roles:
+            return 2
+        if "implementation" in roles and "test" not in roles:
+            return 1
+        if "test" in roles:
+            return 3
+        if "documentation" in roles:
+            return 4
+        return 2
+
+    def path_priority(path: str) -> tuple[int, int, str]:
         return (
+            materiality(path),
             min(
                 (
                     _HANDOFF_RISK_ORDER.get(item.risk_tier, 2)
@@ -696,6 +714,7 @@ class _RunState:
     candidate_occurrences: dict[str, CandidateFinding] = field(default_factory=dict)
     collision_dispositions: list[dict[str, object]] = field(default_factory=list)
     source_requests: list[SourceAccessRequest] = field(default_factory=list)
+    retention_verification_requests: tuple[Mapping[str, object], ...] = ()
     unknowns: list[dict[str, object]] = field(default_factory=list)
     degradations: list[dict[str, str]] = field(default_factory=list)
     review: AdjudicatedReview = field(default_factory=AdjudicatedReview)
@@ -1224,6 +1243,7 @@ class ReviewController:
             len(state.review.accepted)
             + len(state.review.verification_requests)
             + len(state.inputs.verification_requests)
+            + len(state.retention_verification_requests)
             + len(state.source_requests)
         )
 
@@ -1258,6 +1278,75 @@ class ReviewController:
             component,
             "specialist completed with degraded retained state",
         )
+
+    @staticmethod
+    def _candidate_retention_limited(state: _RunState) -> bool:
+        return any(
+            _CANDIDATE_RETENTION_UNKNOWN
+            in tuple(getattr(result.checkpoint, "unknowns", ()))
+            for result in state.session_results.values()
+        )
+
+    def _candidate_retention_verification_requests(
+        self,
+        state: _RunState,
+    ) -> tuple[Mapping[str, object], ...]:
+        """Return one non-defect verification note for locatable retention loss."""
+        changed = set(state.inputs.changed_files)
+        records = {
+            record.id: record
+            for record in state.evidence.snapshot().records
+            if record.is_usable_for_coverage
+        }
+        candidates: list[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = []
+        for result in state.session_results.values():
+            checkpoint = result.checkpoint
+            if (
+                _CANDIDATE_RETENTION_UNKNOWN
+                not in tuple(getattr(checkpoint, "unknowns", ()))
+            ):
+                continue
+            ownership = state.ownership.get(result.session_id)
+            assignment = (
+                state.assignments.get(ownership.assignment_id)
+                if ownership is not None
+                else None
+            )
+            obligation_ids = tuple(
+                item for item in getattr(assignment, "obligation_ids", ())
+                if any(obligation.id == item for obligation in state.obligations)
+            )
+            if not obligation_ids:
+                continue
+            evidence_by_path: dict[str, list[str]] = {}
+            for evidence_id in getattr(checkpoint, "evidence_ids", ()):
+                record = records.get(evidence_id)
+                path = str(getattr(record, "source_path", "") or "")
+                if record is not None and path in changed:
+                    evidence_by_path.setdefault(path, []).append(evidence_id)
+            for path, evidence_ids in evidence_by_path.items():
+                candidates.append((
+                    path,
+                    result.session_id,
+                    obligation_ids,
+                    tuple(sorted(set(evidence_ids))),
+                ))
+        if not candidates:
+            return ()
+        path, _session_id, obligation_ids, evidence_ids = sorted(candidates)[0]
+        return ({
+            "question": (
+                f"Verify the reviewed behavior in `{path}` because candidate "
+                "retention was incomplete."
+            ),
+            "reason": (
+                "A specialist reported material candidate-retention loss. "
+                "This is a coverage check, not a confirmed defect."
+            ),
+            "related_obligation_ids": obligation_ids,
+            "evidence_ids": evidence_ids,
+            "file": path,
+        },)
 
     def _quarantine_session(
         self, state: _RunState, session_id: str, reason: str,
@@ -2146,6 +2235,7 @@ class ReviewController:
             ),
             review_emphasis_topics=review_emphasis_topics,
             material_coverage_limited=bool(state.degradations),
+            candidate_retention_limited=self._candidate_retention_limited(state),
             degraded_stages=tuple(
                 str(item.get("component", ""))
                 for item in state.degradations
@@ -2295,10 +2385,16 @@ class ReviewController:
             "blocking_obligation_ids": state.blocking_obligation_ids,
         })
         try:
+            state.retention_verification_requests = (
+                self._candidate_retention_verification_requests(state)
+            )
             state.notes = build_review_notes(
                 state.review, state.evidence, state.effective_publishing_mode,
                 obligations=obligation_map, changed_files=state.inputs.changed_files,
-                verification_requests=state.inputs.verification_requests,
+                verification_requests=(
+                    *state.inputs.verification_requests,
+                    *state.retention_verification_requests,
+                ),
                 source_access_requests=state.source_requests,
             )
         except Exception as exc:

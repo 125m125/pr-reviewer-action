@@ -1176,6 +1176,133 @@ def test_behavioral_handoff_candidates_prioritize_high_risk_beyond_file_prefix()
     assert len(what_changed) <= 5
 
 
+def test_handoff_prioritizes_material_code_over_plan_documents():
+    """Large runtime changes cannot be displaced by docs/workflow paths."""
+    changed_files = (
+        ".github/workflows/review.yml",
+        "docs/plan-a.md",
+        "docs/plan-b.md",
+        "docs/plan-c.md",
+        "docs/plan-d.md",
+        "pr_reviewer/specialist_runtime/controller.py",
+        "pr_reviewer/specialist_runtime/assignments.py",
+        "pr_reviewer/specialist_runtime/adjudication.py",
+    )
+    topology = {
+        "changed_contract_facts": {
+            path: {
+                "symbols": [],
+                "action_inputs": [],
+                "workflow_steps": ["Run review"] if path.startswith(".github/") else [],
+                "hunk_summaries": ["new lines 1-8: documentation"],
+                "change_type": "modifies",
+            }
+            for path in changed_files
+        },
+    }
+    topology["changed_contract_facts"][
+        "pr_reviewer/specialist_runtime/controller.py"
+    ].update({
+        "symbols": ["_handoff_context"],
+        "hunk_summaries": ["new lines 2100-2619: def _handoff_context(self, state, status):"],
+    })
+    topology["changed_contract_facts"][
+        "pr_reviewer/specialist_runtime/assignments.py"
+    ].update({
+        "symbols": ["build_assignment_brief"],
+        "hunk_summaries": ["new lines 300-696: def build_assignment_brief(assignment):"],
+    })
+    topology["changed_contract_facts"][
+        "pr_reviewer/specialist_runtime/adjudication.py"
+    ].update({
+        "symbols": ["project_review_handoff"],
+        "hunk_summaries": ["new lines 1100-1444: def project_review_handoff(context):"],
+    })
+
+    what_changed, _ = _behavioral_handoff_candidates(
+        changed_files=changed_files,
+        topology=topology,
+        obligations=(),
+        evidence_records=(),
+        reviewed_obligation_ids=(),
+        allow_role_fallback=True,
+    )
+
+    assert [item.split("`", 2)[1] for item in what_changed[:3]] == [
+        "pr_reviewer/specialist_runtime/adjudication.py",
+        "pr_reviewer/specialist_runtime/assignments.py",
+        "pr_reviewer/specialist_runtime/controller.py",
+    ]
+
+
+def test_ai_reviewed_uses_retained_code_evidence_paths():
+    """Reviewed Python components appear when evidence proves inspection."""
+    class Evidence:
+        source_path = "pr_reviewer/specialist_runtime/controller.py"
+        is_usable_for_coverage = True
+
+    topology = {
+        "changed_contract_facts": {
+            "docs/plan.md": {
+                "symbols": [],
+                "action_inputs": [],
+                "workflow_steps": [],
+                "hunk_summaries": ["new lines 1-200: plan"],
+                "change_type": "modifies",
+            },
+            "pr_reviewer/specialist_runtime/controller.py": {
+                "symbols": ["_handoff_context"],
+                "action_inputs": [],
+                "workflow_steps": [],
+                "hunk_summaries": [
+                    "new lines 2100-2619: def _handoff_context(self, state, status):",
+                ],
+                "change_type": "modifies",
+            },
+        },
+    }
+
+    _, ai_reviewed = _behavioral_handoff_candidates(
+        changed_files=(
+            "docs/plan.md",
+            "pr_reviewer/specialist_runtime/controller.py",
+        ),
+        topology=topology,
+        obligations=(),
+        evidence_records=(Evidence(),),
+        reviewed_obligation_ids=(),
+        allow_role_fallback=True,
+    )
+
+    assert ai_reviewed == (
+        "Reviewed the `_handoff_context()` behavior in "
+        "`pr_reviewer/specialist_runtime/controller.py`.",
+    )
+
+
+def test_ai_reviewed_ignores_unsuccessful_evidence_paths():
+    class FailedEvidence:
+        source_path = "pr_reviewer/specialist_runtime/controller.py"
+        is_usable_for_coverage = False
+
+    _, ai_reviewed = _behavioral_handoff_candidates(
+        changed_files=("pr_reviewer/specialist_runtime/controller.py",),
+        topology={
+            "changed_contract_facts": {
+                "pr_reviewer/specialist_runtime/controller.py": {
+                    "symbols": ["_handoff_context"],
+                    "change_type": "modifies",
+                },
+            },
+        },
+        obligations=(),
+        evidence_records=(FailedEvidence(),),
+        reviewed_obligation_ids=(),
+    )
+
+    assert ai_reviewed == ()
+
+
 def test_behavioral_handoff_candidates_name_changed_symbols_and_reviewed_contracts():
     obligation = CoverageObligation(
         obligation_id="runtime-validation",
@@ -1210,6 +1337,47 @@ def test_behavioral_handoff_candidates_name_changed_symbols_and_reviewed_contrac
         "Reviewed the `validate_assignment_plan()` behavior in "
         "`pr_reviewer/planner.py` and planner validation contract.",
     )
+
+
+def test_candidate_retention_failure_is_not_reported_as_clean_zero(tmp_path):
+    """Material discarded candidates produce an honest degraded warning/note."""
+    class CandidateLossSession(_SuccessfulSession):
+        def explore(self):
+            result = super().explore()
+            self.candidate_findings = ()
+            return replace(
+                result,
+                checkpoint=replace(
+                    result.checkpoint,
+                    candidate_finding_ids=(),
+                    unknowns=("candidate-retention-unknown",),
+                ),
+                degraded=True,
+            )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return CandidateLossSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    result = _controller(tmp_path, session_factory=factory).run(_inputs(tmp_path))
+
+    assert result.artifact["accepted_candidates"] == ()
+    assert "candidate finding retention was incomplete" in (
+        result.handoff.coverage_warning or ""
+    ).casefold()
+    retention_notes = [
+        note for note in result.notes
+        if note.kind.value == "verification_request"
+        and "candidate retention" in note.markdown.casefold()
+    ]
+    assert len(retention_notes) == 1
+    assert retention_notes[0].file == "src/worker.py"
+    assert retention_notes[0].severity is None
 
 
 def test_controller_handoff_retains_reviewed_contract_fact_with_authorized_path(tmp_path):
@@ -1271,8 +1439,8 @@ def test_behavioral_handoff_candidates_fill_two_safe_fallbacks_for_sparse_patche
 
     assert len(what_changed) >= 2
     assert what_changed[:2] == (
-        "`docs/guide.md` modifies documentation and operator guidance.",
         "`src/runtime.py` adds runtime implementation behavior.",
+        "`src/third.py` removes runtime implementation behavior.",
     )
 
 
