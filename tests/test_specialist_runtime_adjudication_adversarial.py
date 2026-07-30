@@ -13,6 +13,7 @@ from pr_reviewer.specialist_runtime.adjudication import (
     apply_runtime_verdict_policy,
     build_review_handoff,
     build_review_notes,
+    consolidate_candidates,
 )
 from pr_reviewer.specialist_runtime.evidence import (
     EvidenceProvenance,
@@ -130,6 +131,148 @@ def _adjudicate(
         store,
         obligations=obligations or _controller_obligations(),
         changed_files=changed_files,
+    )
+
+
+@pytest.mark.parametrize(
+    ("second_anchor", "second_category"),
+    (
+        ("parse_budget", "budget-validation"),
+        ("validate_budget", "workflow-trigger"),
+    ),
+)
+def test_controller_root_identity_does_not_merge_unrelated_same_file_concerns(
+    second_anchor,
+    second_category,
+):
+    first = _candidate(
+        "candidate-a",
+        claim="validate_budget permits an oversized output allowance",
+        causal_chain="validate_budget compares the wrong remaining-token value.",
+        category="budget-validation",
+    )
+    second = _candidate(
+        "candidate-b",
+        claim=f"{second_anchor} takes an unrelated faulty branch",
+        causal_chain=f"The changed {second_anchor} contract selects the wrong input.",
+        category=second_category,
+    )
+
+    result = consolidate_candidates(
+        (first, second),
+        changed_files=CHANGED_FILES,
+        change_facts={
+            "src/store.py": {
+                "symbols": ("validate_budget", "parse_budget"),
+            },
+        },
+        obligations=_controller_obligations(),
+    )
+
+    assert tuple(item.candidate_id for item in result.candidates) == (
+        "candidate-a",
+        "candidate-b",
+    )
+    assert result.dispositions == ()
+
+
+def test_matching_model_fingerprints_cannot_merge_different_controller_roots():
+    first = replace(
+        _candidate(
+            "candidate-a",
+            claim="_exact_changed_location rejects a normalized path",
+            causal_chain="_exact_changed_location compares the raw path.",
+            category="path-normalization",
+        ),
+        root_cause_fingerprint="model-says-same-root",
+    )
+    second = replace(
+        _candidate(
+            "candidate-b",
+            claim="_normalized_candidate retains an invalid location",
+            causal_chain="_normalized_candidate preserves the raw path.",
+            category="path-normalization",
+        ),
+        root_cause_fingerprint="model-says-same-root",
+    )
+
+    result = consolidate_candidates(
+        (first, second),
+        changed_files=CHANGED_FILES,
+        change_facts={
+            "src/store.py": {
+                "symbols": (
+                    "_exact_changed_location",
+                    "_normalized_candidate",
+                ),
+            },
+        },
+        obligations=_controller_obligations(),
+    )
+
+    assert tuple(item.candidate_id for item in result.candidates) == (
+        "candidate-a",
+        "candidate-b",
+    )
+    fingerprints = {
+        item.root_cause_fingerprint for item in result.candidates
+    }
+    assert fingerprints != {"model-says-same-root"}
+    assert len(fingerprints) == 2
+
+
+def test_single_changed_anchor_does_not_merge_anchorless_same_file_concerns():
+    first = _candidate(
+        "candidate-a",
+        claim="The output allowance can exceed the remaining model context",
+        causal_chain="A boundary comparison uses the wrong remaining-token value.",
+        category="input-validation",
+    )
+    second = _candidate(
+        "candidate-b",
+        claim="Malformed numeric text can reach integer conversion",
+        causal_chain="An unchecked string is converted before validation.",
+        category="input-validation",
+    )
+
+    result = consolidate_candidates(
+        (first, second),
+        changed_files=CHANGED_FILES,
+        change_facts={"src/store.py": {"symbols": ("validate_budget",)}},
+        obligations={},
+    )
+
+    assert tuple(item.candidate_id for item in result.candidates) == (
+        "candidate-a",
+        "candidate-b",
+    )
+    assert result.dispositions == ()
+
+
+def test_changed_anchor_requires_a_complete_symbol_match():
+    first = _candidate(
+        "candidate-a",
+        claim="validate_budget_window computes the wrong model allowance",
+        causal_chain="validate_budget_window reads an outdated limit.",
+        category="budget-validation",
+    )
+    second = _candidate(
+        "candidate-b",
+        claim="validate_budget_limits permits a negative reserve",
+        causal_chain="validate_budget_limits skips the reserve guard.",
+        category="budget-validation",
+    )
+
+    result = consolidate_candidates(
+        (first, second),
+        changed_files=CHANGED_FILES,
+        change_facts={"src/store.py": {"symbols": ("validate_budget",)}},
+        obligations={},
+    )
+
+    assert tuple(item.candidate_id for item in result.candidates) == (
+        "candidate-a",
+        "candidate-b",
     )
 
 

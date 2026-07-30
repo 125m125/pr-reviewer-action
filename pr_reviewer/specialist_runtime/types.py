@@ -145,6 +145,8 @@ class CandidateFinding:
     confidence_rationale: str = ""
     user_visible_consequence: str = ""
     manual_validation: str = ""
+    contributor_candidate_ids: tuple[str, ...] = ()
+    controller_root_fingerprint: str = ""
 
 
 @dataclass(frozen=True)

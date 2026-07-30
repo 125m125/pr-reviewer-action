@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from pr_reviewer.specialist_runtime.adjudication import (
     AdjudicatedReview,
+    CandidateDisposition,
     ReviewHandoffContext,
     ReviewOrientationTopic,
     adjudicate_candidates,
     apply_runtime_verdict_policy,
     build_review_handoff,
     build_review_notes,
+    consolidate_candidates,
 )
 from pr_reviewer.specialist_runtime.evidence import EvidenceStore
 from pr_reviewer.specialist_runtime.types import (
@@ -114,6 +118,291 @@ def _adjudicate(
         obligations=obligations or _obligations(),
         changed_files=CHANGED_FILES,
     )
+
+
+@pytest.mark.parametrize(
+    ("path", "anchor_field", "anchor", "category", "first_claim", "second_claim"),
+    (
+        (
+            "scripts/sections/config.sh",
+            "symbols",
+            "validate_budget",
+            "budget-validation",
+            "validate_budget accepts an output budget larger than the model window",
+            "The validate_budget guard does not cap output tokens to the context window",
+        ),
+        (
+            ".github/workflows/ai-pr-review.yaml",
+            "workflow_keys",
+            "pull_request_target",
+            "workflow-trigger",
+            "pull_request_target runs the reviewer with target-repository privileges",
+            "The pull_request_target trigger exposes the privileged review path",
+        ),
+        (
+            "pr_reviewer/specialist_runtime/adjudication.py",
+            "symbols",
+            "_consequence_support_reason",
+            "rationale-format",
+            "_consequence_support_reason rejects a valid confidence_rationale layout",
+            "A supported confidence_rationale is misparsed by _consequence_support_reason",
+        ),
+        (
+            "pr_reviewer/specialist_runtime/adjudication.py",
+            "symbols",
+            "_exact_changed_location",
+            "location-normalization",
+            "_exact_changed_location rejects normalized changed paths",
+            "Changed-path normalization is lost at _exact_changed_location",
+        ),
+    ),
+)
+def test_controller_root_identity_consolidates_production_shaped_specialist_clusters(
+    path,
+    anchor_field,
+    anchor,
+    category,
+    first_claim,
+    second_claim,
+):
+    candidates = (
+        _candidate(
+            "specialist-a",
+            claim=first_claim,
+            location=f"{path}:41",
+            category=category,
+            evidence_ids=("evidence:a",),
+            causal_chain=f"{anchor} applies the changed contract incorrectly.",
+        ),
+        _candidate(
+            "specialist-b",
+            claim=second_claim,
+            location=path,
+            category=category,
+            evidence_ids=("evidence:b",),
+            causal_chain=f"The changed {anchor} contract takes the same faulty branch.",
+        ),
+    )
+
+    result = consolidate_candidates(
+        candidates,
+        changed_files=(path,),
+        change_facts={path: {anchor_field: (anchor,)}},
+        obligations=_obligations(),
+        valid_evidence_ids=("evidence:a", "evidence:b"),
+    )
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0].contributor_candidate_ids == (
+        "specialist-a",
+        "specialist-b",
+    )
+    assert result.dispositions == (
+        CandidateDisposition(
+            candidate_id="specialist-b",
+            action="merge",
+            reason="controller-root-identity",
+            target_id="specialist-a",
+        ),
+    )
+
+
+def test_controller_root_merge_retains_precise_location_valid_evidence_obligations_and_severity():
+    implementation = _obligation("obligation-implementation")
+    contract = _obligation("obligation-contract")
+    first = _candidate(
+        "budget-a",
+        claim="validate_budget permits an oversized output allowance",
+        location="src/store.py:41",
+        category="budget-validation",
+        evidence_ids=("evidence:a", "missing:evidence"),
+        obligation_ids=(implementation.id,),
+        severity="minor",
+        causal_chain="validate_budget compares the wrong remaining-token value.",
+    )
+    second = _candidate(
+        "budget-b",
+        claim="The output-token guard can exceed the remaining model context",
+        location="src/store.py",
+        category="budget-validation",
+        evidence_ids=("evidence:b",),
+        contradicting_ids=("evidence:contradiction", "missing:contradiction"),
+        obligation_ids=(contract.id,),
+        severity="major",
+        causal_chain="The changed validate_budget contract uses the same incorrect comparison.",
+    )
+
+    result = consolidate_candidates(
+        (second, first),
+        changed_files=CHANGED_FILES,
+        change_facts={"src/store.py": {"symbols": ("validate_budget",)}},
+        obligations=_obligations(implementation, contract),
+        valid_evidence_ids=(
+            "evidence:a",
+            "evidence:b",
+            "evidence:contradiction",
+        ),
+    )
+
+    assert len(result.candidates) == 1
+    merged = result.candidates[0]
+    assert merged.candidate_id == "budget-a"
+    assert merged.affected_location == "src/store.py:41"
+    assert merged.supporting_evidence_ids == ("evidence:a", "evidence:b")
+    assert merged.contradicting_evidence_ids == ("evidence:contradiction",)
+    assert merged.related_obligation_ids == (
+        "obligation-contract",
+        "obligation-implementation",
+    )
+    assert merged.severity == "major"
+    assert merged.root_cause_fingerprint.startswith("root:")
+
+
+def test_unsupported_duplicate_cannot_supply_a_more_precise_location():
+    store, evidence_id = _store()
+    supported = _candidate(
+        "supported",
+        claim="validate_budget permits an oversized output allowance",
+        location="src/store.py",
+        category="budget-validation",
+        evidence_ids=(evidence_id,),
+        causal_chain="validate_budget compares the wrong remaining-token value.",
+    )
+    unsupported = _candidate(
+        "unsupported",
+        claim="The validate_budget output guard can overrun remaining context",
+        location="src/store.py:1",
+        category="budget-validation",
+        evidence_ids=("missing:evidence",),
+        causal_chain="The changed validate_budget contract uses the same comparison.",
+    )
+
+    result = consolidate_candidates(
+        (unsupported, supported),
+        changed_files=CHANGED_FILES,
+        change_facts={"src/store.py": {"symbols": ("validate_budget",)}},
+        obligations=_obligations(),
+        evidence=store,
+    )
+
+    assert result.candidates[0].affected_location == "src/store.py"
+
+
+def test_obligation_irrelevant_evidence_cannot_promote_merged_severity():
+    store = EvidenceStore()
+    supporting = store.add_tool_result(
+        session_id="session-1",
+        tool="read_file",
+        arguments={"path": "src/store.py"},
+        result={"status": "ok", "content": "validate_budget()"},
+        category="implementation",
+    )
+    unrelated = store.add_tool_result(
+        session_id="session-2",
+        tool="read_file",
+        arguments={"path": "README.md"},
+        result={"status": "ok", "content": "budget documentation"},
+        category="documentation",
+    )
+    supported = _candidate(
+        "supported",
+        claim="validate_budget permits an oversized output allowance",
+        category="budget-validation",
+        evidence_ids=(supporting.id,),
+        severity="minor",
+        causal_chain="validate_budget compares the wrong remaining-token value.",
+    )
+    unsupported_blocker = _candidate(
+        "unsupported-blocker",
+        claim="The validate_budget output guard can overrun remaining context",
+        category="budget-validation",
+        evidence_ids=(unrelated.id,),
+        severity="blocker",
+        causal_chain="The changed validate_budget contract uses the same comparison.",
+    )
+
+    result = consolidate_candidates(
+        (unsupported_blocker, supported),
+        changed_files=CHANGED_FILES,
+        change_facts={"src/store.py": {"symbols": ("validate_budget",)}},
+        obligations=_obligations(),
+        evidence=store,
+    )
+
+    assert result.candidates[0].severity == "minor"
+
+
+def test_shared_valid_evidence_cannot_launder_location_or_severity():
+    store, evidence_id = _store()
+    first = _candidate(
+        "candidate-a",
+        claim="validate_budget permits an oversized output allowance",
+        location="src/store.py:41",
+        category="budget-validation",
+        evidence_ids=(evidence_id,),
+        severity="minor",
+        causal_chain="validate_budget compares the wrong remaining-token value.",
+    )
+    hostile_duplicate = _candidate(
+        "candidate-b",
+        claim="The validate_budget output guard causes total service failure",
+        location="src/store.py:1",
+        category="budget-validation",
+        evidence_ids=(evidence_id,),
+        severity="blocker",
+        causal_chain="The changed validate_budget contract uses the same comparison.",
+    )
+
+    result = consolidate_candidates(
+        (first, hostile_duplicate),
+        changed_files=CHANGED_FILES,
+        change_facts={"src/store.py": {"symbols": ("validate_budget",)}},
+        obligations=_obligations(),
+        evidence=store,
+    )
+
+    assert result.candidates[0].affected_location == "src/store.py"
+    assert result.candidates[0].severity == "minor"
+
+
+def test_unique_unrelated_evidence_cannot_unlock_shared_support_donation():
+    store, shared_id = _store()
+    unrelated = store.add_tool_result(
+        session_id="session-2",
+        tool="read_file",
+        arguments={"path": "README.md"},
+        result={"status": "ok", "content": "budget documentation"},
+        category="documentation",
+    )
+    first = _candidate(
+        "candidate-a",
+        claim="validate_budget permits an oversized output allowance",
+        location="src/store.py:41",
+        category="budget-validation",
+        evidence_ids=(shared_id,),
+        severity="minor",
+        causal_chain="validate_budget compares the wrong remaining-token value.",
+    )
+    hostile_duplicate = _candidate(
+        "candidate-b",
+        claim="The validate_budget output guard causes total service failure",
+        location="src/store.py:1",
+        category="budget-validation",
+        evidence_ids=(shared_id, unrelated.id),
+        severity="blocker",
+        causal_chain="The changed validate_budget contract uses the same comparison.",
+    )
+
+    result = consolidate_candidates(
+        (first, hostile_duplicate),
+        changed_files=CHANGED_FILES,
+        change_facts={"src/store.py": {"symbols": ("validate_budget",)}},
+        obligations=_obligations(),
+        evidence=store,
+    )
+
+    assert result.candidates[0].affected_location == "src/store.py"
+    assert result.candidates[0].severity == "minor"
 
 
 def test_critic_cannot_publish_candidate_without_retained_evidence():

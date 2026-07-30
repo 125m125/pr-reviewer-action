@@ -33,6 +33,7 @@ from .adjudication import (
     apply_runtime_verdict_policy,
     build_review_handoff,
     build_review_notes,
+    consolidate_candidates,
     review_orientation_label,
 )
 from .assignments import (
@@ -2509,10 +2510,11 @@ class ReviewController:
             )
         state.candidates.clear()
         state.collision_dispositions.clear()
+        unique_candidates: list[CandidateFinding] = []
         for candidate_id in sorted(grouped):
             occurrences = grouped[candidate_id]
             if len(occurrences) == 1:
-                state.candidates[candidate_id] = occurrences[0][1]
+                unique_candidates.append(occurrences[0][1])
                 continue
             for occurrence_ref, candidate in occurrences:
                 disposition = {
@@ -2526,6 +2528,22 @@ class ReviewController:
                 }
                 state.collision_dispositions.append(disposition)
                 state.journal.emit("candidate_disposition", disposition)
+        change_facts, _metadata = _authoritative_change_facts(
+            state.inputs.topology,
+        )
+        consolidated = consolidate_candidates(
+            unique_candidates,
+            changed_files=state.inputs.changed_files,
+            change_facts=change_facts,
+            obligations={item.id: item for item in state.obligations},
+            evidence=state.evidence.snapshot(),
+        )
+        for candidate in consolidated.candidates:
+            state.candidates[candidate.candidate_id] = candidate
+        for disposition in consolidated.dispositions:
+            projected = _json_value(disposition)
+            state.collision_dispositions.append(projected)
+            state.journal.emit("candidate_disposition", projected)
         return tuple(state.candidates[key] for key in sorted(state.candidates))
 
     @staticmethod

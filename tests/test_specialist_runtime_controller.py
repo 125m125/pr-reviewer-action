@@ -56,6 +56,7 @@ from pr_reviewer.specialist_runtime.types import (
     CandidateFinding,
     CoverageObligation,
     PhaseShares,
+    ReviewNoteKind,
     RunPhase,
     SessionCheckpoint,
     SessionState,
@@ -1531,6 +1532,141 @@ def test_malformed_critic_result_uses_evidence_gated_conservative_fallback(
     ]
     assert len(critic_degradations) == 1
     assert "private" not in critic_degradations[0]["reason"]
+
+
+def test_critic_degradation_emits_one_verification_request_per_controller_root(
+    tmp_path,
+):
+    evidence_store = EvidenceStore()
+    evidence_ids = tuple(
+        evidence_store.add_tool_result(
+            session_id=f"seed-{index}",
+            tool="read_file",
+            arguments={"path": "src/worker.py"},
+            result={"status": "ok", "content": "def validate_budget(): pass"},
+            category="implementation",
+        ).id
+        for index in range(2)
+    )
+    obligation = CoverageObligation(
+        obligation_id="obligation-budget",
+        origin="topology",
+        subject="validate_budget output-token contract",
+        required_evidence_categories=("implementation",),
+        satisfaction_predicates=("recorded_evidence",),
+        scope=("src/worker.py",),
+        mandatory=True,
+    )
+    candidates = (
+        CandidateFinding(
+            candidate_id="budget-line",
+            root_cause_fingerprint="model-root-a",
+            claim="validate_budget permits output tokens beyond the model window",
+            affected_location="src/worker.py:7",
+            causal_chain="validate_budget compares the output allowance to the wrong budget.",
+            severity="major",
+            category="budget-validation",
+            supporting_evidence_ids=(evidence_ids[0],),
+            related_obligation_ids=(obligation.id,),
+            confidence_rationale="Retained code shows the changed comparison.",
+            user_visible_consequence="A review request can exceed the model context.",
+            manual_validation="Set a small model window and inspect the request budget.",
+        ),
+        CandidateFinding(
+            candidate_id="budget-path",
+            root_cause_fingerprint="model-root-b",
+            claim="The validate_budget output guard can overrun remaining context",
+            affected_location="src/worker.py",
+            causal_chain="The changed validate_budget contract uses the same wrong comparison.",
+            severity="minor",
+            category="budget-validation",
+            supporting_evidence_ids=(evidence_ids[1],),
+            related_obligation_ids=(obligation.id,),
+            confidence_rationale="A second specialist traced the same comparison.",
+            user_visible_consequence="The endpoint can reject an oversized review request.",
+            manual_validation="Exercise validate_budget at the context boundary.",
+        ),
+    )
+    inputs = replace(
+        _inputs(tmp_path),
+        topology={
+            **_inputs(tmp_path).topology,
+            "change_facts": _change_facts_payload({
+                "src/worker.py": {
+                    "change_type": "modifies",
+                    "symbols": ["validate_budget"],
+                    "hunk_summaries": ["new lines 7-10: validate_budget"],
+                    "headings": [],
+                    "change_excerpts": [],
+                },
+            }),
+        },
+        candidate_findings=candidates,
+    )
+    critic_inputs = []
+
+    class NoCandidateSession(_SuccessfulSession):
+        def explore(self):
+            result = super().explore()
+            self.candidate_findings = ()
+            return replace(
+                result,
+                checkpoint=replace(
+                    result.checkpoint,
+                    candidate_finding_ids=(),
+                ),
+            )
+
+    def factory(
+        assignment, lease, snapshot, retained_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return NoCandidateSession(
+            assignment, retained_store, obligations, expected_session_id,
+        )
+
+    def degraded_critic(request):
+        critic_inputs.extend(request.context["candidates"])
+        raise RuntimeError("critic unavailable")
+
+    result = _controller(
+        tmp_path,
+        session_factory=factory,
+        critic=degraded_critic,
+        evidence_seed=EvidenceSeed(
+            repository=inputs.repository,
+            head_sha=inputs.head_sha,
+            snapshot=evidence_store.snapshot(),
+        ),
+        obligation_deriver=lambda *args, **kwargs: (obligation,),
+    ).run(inputs)
+
+    assert len(critic_inputs) == 1
+    assert critic_inputs[0].candidate_id == "budget-line"
+    assert critic_inputs[0].contributor_candidate_ids == (
+        "budget-line",
+        "budget-path",
+    )
+    root_dispositions = [
+        item for item in result.artifact["candidate_dispositions"]
+        if item["candidate_id"] in {"budget-line", "budget-path"}
+    ]
+    assert sum(
+        item["action"] == "request_verification"
+        for item in root_dispositions
+    ) == 1
+    assert any(
+        item["candidate_id"] == "budget-path"
+        and item["action"] == "merge"
+        and item["target_id"] == "budget-line"
+        for item in root_dispositions
+    )
+    assert len([
+        note for note in result.notes
+        if note.kind is ReviewNoteKind.VERIFICATION_REQUEST
+        and "validate_budget" in note.markdown
+    ]) == 1
 
 
 def test_duplicate_candidate_ids_reject_every_occurrence_without_first_wins(tmp_path):

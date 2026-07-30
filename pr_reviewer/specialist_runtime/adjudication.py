@@ -42,6 +42,12 @@ class CandidateDisposition:
 
 
 @dataclass(frozen=True)
+class CandidateConsolidation:
+    candidates: tuple[CandidateFinding, ...] = ()
+    dispositions: tuple[CandidateDisposition, ...] = ()
+
+
+@dataclass(frozen=True)
 class EvidenceCitation:
     evidence_id: str
     category: str
@@ -271,7 +277,10 @@ def _normalized_candidate(candidate: CandidateFinding) -> CandidateFinding:
     claim_identity = _identity_text(candidate.claim)
     category = _identity_text(candidate.category).replace(" ", "-")
     identity = "\x1f".join((affected_file, category, claim_identity))
-    fingerprint = "finding:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    fingerprint = (
+        candidate.controller_root_fingerprint
+        or "finding:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    )
     return replace(
         candidate,
         root_cause_fingerprint=fingerprint,
@@ -281,6 +290,432 @@ def _normalized_candidate(candidate: CandidateFinding) -> CandidateFinding:
         supporting_evidence_ids=_stable_strings(candidate.supporting_evidence_ids),
         contradicting_evidence_ids=_stable_strings(candidate.contradicting_evidence_ids),
         related_obligation_ids=_stable_strings(candidate.related_obligation_ids),
+        contributor_candidate_ids=_stable_strings(
+            candidate.contributor_candidate_ids or (candidate.candidate_id,)
+        ),
+    )
+
+
+_CHANGE_ANCHOR_FIELDS = (
+    "symbols",
+    "action_inputs",
+    "workflow_steps",
+    "workflow_keys",
+    "headings",
+)
+
+
+def _controller_root_anchor(
+    candidate: CandidateFinding,
+    *,
+    path: str,
+    change_facts: Mapping[str, object],
+    obligations: Mapping[str, CoverageObligation],
+) -> str | None:
+    anchors: dict[str, str] = {}
+    raw_fact = change_facts.get(path, {})
+    fact = raw_fact if isinstance(raw_fact, Mapping) else {}
+    for field_name in _CHANGE_ANCHOR_FIELDS:
+        raw_values = fact.get(field_name, ())
+        if (
+            isinstance(raw_values, (str, bytes))
+            or not isinstance(raw_values, Iterable)
+        ):
+            continue
+        for value in raw_values:
+            identity = _identity_text(value)
+            if len(identity) < 4:
+                continue
+            anchors[f"{field_name}:{identity}"] = identity
+
+    for obligation_id in candidate.related_obligation_ids:
+        obligation = obligations.get(obligation_id)
+        if obligation is None:
+            continue
+        scoped_paths = {
+            _path(value)[0]
+            for value in (*obligation.scope, *obligation.seed_hints)
+            if _path(value)[2] == "ok"
+        }
+        if scoped_paths and path not in scoped_paths:
+            continue
+        for value in (obligation.subject, *obligation.satisfaction_predicates):
+            identity = _identity_text(value)
+            if len(identity) < 4:
+                continue
+            anchors[f"contract:{identity}"] = identity
+
+    if not anchors:
+        return None
+
+    def contains_anchor(text: str, anchor: str) -> bool:
+        return re.search(
+            rf"(?<![\w]){re.escape(anchor)}(?![\w])",
+            text,
+            flags=re.UNICODE,
+        ) is not None
+
+    for detail in (
+        candidate.claim,
+        candidate.causal_chain,
+        candidate.user_visible_consequence,
+        candidate.manual_validation,
+    ):
+        text = _identity_text(detail)
+        matched = {
+            key: value for key, value in anchors.items()
+            if contains_anchor(text, value)
+        }
+        if not matched:
+            continue
+        maximal = {
+            key: value for key, value in matched.items()
+            if not any(
+                value != other and value in other
+                for other in matched.values()
+            )
+        }
+        if len(maximal) == 1:
+            return next(iter(maximal))
+        return None
+    return None
+
+
+def _controller_root_identity(
+    candidate: CandidateFinding,
+    *,
+    changed_files: set[str],
+    change_facts: Mapping[str, object],
+    obligations: Mapping[str, CoverageObligation],
+) -> tuple[str, str, str] | None:
+    path, _, location_state = _path(candidate.affected_location)
+    category = _identity_text(candidate.category).replace(" ", "-")
+    if location_state != "ok" or path not in changed_files or not category:
+        return None
+    anchor = _controller_root_anchor(
+        candidate,
+        path=path,
+        change_facts=change_facts,
+        obligations=obligations,
+    )
+    if anchor is None:
+        return None
+    return path, anchor, category
+
+
+def _root_fingerprint(identity: tuple[str, str, str]) -> str:
+    return "root:" + hashlib.sha256(
+        "\x1f".join(identity).encode("utf-8")
+    ).hexdigest()
+
+
+def _consolidated_candidate(
+    values: Iterable[CandidateFinding],
+    *,
+    identity: tuple[str, str, str],
+    obligations: Mapping[str, CoverageObligation],
+    valid_evidence_ids: set[str] | None,
+    supported_evidence_by_candidate: Mapping[str, frozenset[str]],
+) -> CandidateFinding:
+    candidates = tuple(sorted(values, key=lambda item: item.candidate_id))
+    path = identity[0]
+
+    def valid_support(candidate: CandidateFinding) -> tuple[str, ...]:
+        if valid_evidence_ids is None:
+            return _stable_strings(candidate.supporting_evidence_ids)
+        return tuple(
+            evidence_id
+            for evidence_id in _stable_strings(candidate.supporting_evidence_ids)
+            if evidence_id in valid_evidence_ids
+        )
+
+    evidence_owner_counts: dict[str, int] = {}
+    for candidate in candidates:
+        for evidence_id in supported_evidence_by_candidate.get(
+            candidate.candidate_id, frozenset(),
+        ):
+            evidence_owner_counts[evidence_id] = (
+                evidence_owner_counts.get(evidence_id, 0) + 1
+            )
+    donor_candidate_ids = {
+        candidate.candidate_id
+        for candidate in candidates
+        if any(
+            evidence_owner_counts.get(evidence_id) == 1
+            for evidence_id in supported_evidence_by_candidate.get(
+                candidate.candidate_id, frozenset(),
+            )
+        )
+    }
+
+    def content_rank(candidate: CandidateFinding) -> tuple[object, ...]:
+        known_obligations = set(candidate.related_obligation_ids) & obligations.keys()
+        return (
+            -(candidate.candidate_id in donor_candidate_ids),
+            -bool(known_obligations),
+            -sum(bool(_identity_text(value)) for value in (
+                candidate.claim,
+                candidate.causal_chain,
+                candidate.user_visible_consequence,
+                candidate.manual_validation,
+            )),
+            candidate.candidate_id,
+        )
+
+    representative = min(candidates, key=content_rank)
+    location_candidates = tuple(
+        candidate for candidate in candidates
+        if candidate.candidate_id in donor_candidate_ids
+    )
+    if location_candidates:
+        located: list[tuple[int, int, str, CandidateFinding]] = []
+        for candidate in location_candidates:
+            candidate_path, line, location_state = _path(
+                candidate.affected_location
+            )
+            if location_state == "ok" and candidate_path == path:
+                located.append((
+                    0 if line is not None else 1,
+                    line or 0,
+                    candidate.candidate_id,
+                    candidate,
+                ))
+        best_location = min(located)[3] if located else representative
+        _, best_line, _ = _path(best_location.affected_location)
+    else:
+        locations = {
+            (candidate_path, line)
+            for candidate in candidates
+            for candidate_path, line, location_state in (
+                _path(candidate.affected_location),
+            )
+            if location_state == "ok" and candidate_path == path
+        }
+        best_line = (
+            next(iter(locations))[1]
+            if len(locations) == 1
+            else None
+        )
+    affected_location = path + (
+        f":{best_line}" if best_line is not None else ""
+    )
+
+    supporting = tuple(sorted({
+        evidence_id
+        for candidate in candidates
+        for evidence_id in candidate.supporting_evidence_ids
+        if valid_evidence_ids is None or evidence_id in valid_evidence_ids
+    }))
+    contradicting = tuple(sorted({
+        evidence_id
+        for candidate in candidates
+        for evidence_id in candidate.contradicting_evidence_ids
+        if valid_evidence_ids is None or evidence_id in valid_evidence_ids
+    }))
+    if not supporting:
+        supporting = tuple(sorted({
+            evidence_id
+            for candidate in candidates
+            for evidence_id in candidate.supporting_evidence_ids
+        }))
+    if not contradicting and valid_evidence_ids is None:
+        contradicting = tuple(sorted({
+            evidence_id
+            for candidate in candidates
+            for evidence_id in candidate.contradicting_evidence_ids
+        }))
+    related_obligations = tuple(sorted({
+        obligation_id
+        for candidate in candidates
+        for obligation_id in candidate.related_obligation_ids
+        if obligation_id in obligations
+    }))
+    if not related_obligations:
+        related_obligations = tuple(sorted({
+            obligation_id
+            for candidate in candidates
+            for obligation_id in candidate.related_obligation_ids
+        }))
+
+    severity_candidates = tuple(
+        candidate for candidate in candidates
+        if candidate.candidate_id in donor_candidate_ids
+    )
+    severity_selector = max if severity_candidates else min
+    severity = severity_selector(
+        severity_candidates or candidates,
+        key=lambda item: (
+            _SEVERITY_RANK[_normalized_severity(item.severity)],
+            item.candidate_id,
+        ),
+    ).severity
+    contributors = tuple(sorted({
+        contributor
+        for candidate in candidates
+        for contributor in (
+            candidate.contributor_candidate_ids
+            or (candidate.candidate_id,)
+        )
+    }))
+    return replace(
+        representative,
+        root_cause_fingerprint=_root_fingerprint(identity),
+        controller_root_fingerprint=_root_fingerprint(identity),
+        affected_location=affected_location,
+        severity=_normalized_severity(severity),
+        category=identity[2],
+        supporting_evidence_ids=supporting,
+        contradicting_evidence_ids=contradicting,
+        related_obligation_ids=related_obligations,
+        contributor_candidate_ids=contributors,
+    )
+
+
+def consolidate_candidates(
+    candidates: Iterable[CandidateFinding],
+    *,
+    changed_files: Iterable[str],
+    change_facts: Mapping[str, object],
+    obligations: Mapping[str, CoverageObligation],
+    valid_evidence_ids: Iterable[str] | None = None,
+    evidence: EvidenceStore | EvidenceSnapshot | None = None,
+) -> CandidateConsolidation:
+    """Conservatively collapse candidates sharing controller-derived roots."""
+    obligation_map, changed = _controller_state(obligations, changed_files)
+    if not isinstance(change_facts, Mapping):
+        raise TypeError("change_facts must be a controller-owned mapping")
+    if evidence is not None and valid_evidence_ids is not None:
+        raise ValueError("provide evidence or valid_evidence_ids, not both")
+    evidence_snapshot = _snapshot(evidence) if evidence is not None else None
+    records = (
+        {record.id: record for record in evidence_snapshot.records}
+        if evidence_snapshot is not None
+        else {}
+    )
+    valid_ids = (
+        {
+            record.id for record in records.values()
+            if record.is_usable_for_coverage
+        }
+        if evidence_snapshot is not None
+        else (
+            set(_stable_strings(valid_evidence_ids))
+            if valid_evidence_ids is not None
+            else None
+        )
+    )
+    candidate_values = tuple(candidates)
+
+    def root_supporting_evidence(
+        candidate: CandidateFinding,
+    ) -> frozenset[str]:
+        if evidence_snapshot is None:
+            return frozenset(
+                set(candidate.supporting_evidence_ids)
+                & (
+                    valid_ids
+                    if valid_ids is not None
+                    else set(candidate.supporting_evidence_ids)
+                )
+            )
+        related = tuple(
+            obligation_map[obligation_id]
+            for obligation_id in candidate.related_obligation_ids
+            if obligation_id in obligation_map
+        )
+        satisfying_ids: set[str] = set()
+        for evidence_id in candidate.supporting_evidence_ids:
+            record = records.get(evidence_id)
+            if record is None or not record.is_usable_for_coverage:
+                continue
+            for obligation in related:
+                associations = evidence_snapshot.associations_for(
+                    record.id, obligation.id,
+                )
+                if associations:
+                    if any(
+                        evidence_satisfies_obligation(
+                            replace(record, category=category),
+                            obligation,
+                        )
+                        for _collection, association in associations
+                        for category in association.categories
+                    ):
+                        satisfying_ids.add(evidence_id)
+                elif evidence_satisfies_obligation(record, obligation):
+                    satisfying_ids.add(evidence_id)
+        return frozenset(satisfying_ids)
+
+    supported_evidence_by_candidate = {
+        candidate.candidate_id: root_supporting_evidence(candidate)
+        for candidate in candidate_values
+    }
+    grouped: dict[tuple[str, ...], list[CandidateFinding]] = {}
+    for index, candidate in enumerate(candidate_values):
+        if not isinstance(candidate, CandidateFinding):
+            raise TypeError("candidates must contain CandidateFinding values")
+        identity = _controller_root_identity(
+            candidate,
+            changed_files=set(changed),
+            change_facts=change_facts,
+            obligations=obligation_map,
+        )
+        key = (
+            ("root", *identity)
+            if identity is not None
+            else ("candidate", str(index), candidate.candidate_id)
+        )
+        grouped.setdefault(key, []).append(candidate)
+
+    consolidated: list[CandidateFinding] = []
+    dispositions: list[CandidateDisposition] = []
+    for key in sorted(grouped):
+        values = grouped[key]
+        if key[0] != "root" or len(values) == 1:
+            candidate = values[0]
+            controller_fingerprint = (
+                _root_fingerprint((key[1], key[2], key[3]))
+                if key[0] == "root"
+                else ""
+            )
+            consolidated.append(replace(
+                candidate,
+                root_cause_fingerprint=(
+                    controller_fingerprint
+                    or candidate.root_cause_fingerprint
+                ),
+                controller_root_fingerprint=controller_fingerprint,
+                contributor_candidate_ids=(
+                    candidate.contributor_candidate_ids
+                    or (candidate.candidate_id,)
+                ),
+            ))
+            continue
+        identity = (key[1], key[2], key[3])
+        merged = _consolidated_candidate(
+            values,
+            identity=identity,
+            obligations=obligation_map,
+            valid_evidence_ids=valid_ids,
+            supported_evidence_by_candidate=supported_evidence_by_candidate,
+        )
+        consolidated.append(merged)
+        for candidate in sorted(values, key=lambda item: item.candidate_id):
+            if candidate.candidate_id == merged.candidate_id:
+                continue
+            dispositions.append(CandidateDisposition(
+                candidate_id=candidate.candidate_id,
+                action="merge",
+                reason="controller-root-identity",
+                target_id=merged.candidate_id,
+            ))
+    return CandidateConsolidation(
+        candidates=tuple(sorted(
+            consolidated, key=lambda item: item.candidate_id,
+        )),
+        dispositions=tuple(sorted(
+            dispositions, key=lambda item: item.candidate_id,
+        )),
     )
 
 
@@ -482,6 +917,8 @@ def _candidate_from_accepted(value: AcceptedFinding | CandidateFinding) -> Candi
         confidence_rationale=value.confidence_rationale,
         user_visible_consequence=value.user_visible_consequence,
         manual_validation=value.manual_validation,
+        contributor_candidate_ids=value.contributor_candidate_ids,
+        controller_root_fingerprint=value.root_cause_fingerprint,
     )
 
 
@@ -614,7 +1051,9 @@ def _authorize(
         manual_validations=validations,
         collector_session_id=candidate.collector_session_id,
         model_identity=candidate.model_identity,
-        contributor_candidate_ids=(candidate.candidate_id,),
+        contributor_candidate_ids=(
+            candidate.contributor_candidate_ids or (candidate.candidate_id,)
+        ),
     ), ""
 
 
