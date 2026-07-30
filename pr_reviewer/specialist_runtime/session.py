@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import inspect
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import PurePosixPath
 from typing import Any, Callable, Mapping
 
@@ -183,19 +183,36 @@ class _CandidateRetentionSignal:
     """Bounded candidate declarations observed across checkpoint attempts."""
 
     candidate_ids: tuple[str, ...] = ()
-    candidate_shapes: int = 0
+    unidentified_shapes: int = 0
+    omitted_candidate_ids: int = 0
 
     @property
     def is_material(self) -> bool:
-        return bool(self.candidate_ids or self.candidate_shapes)
+        return bool(
+            self.candidate_ids
+            or self.unidentified_shapes
+            or self.omitted_candidate_ids
+        )
 
     def merged(self, other: "_CandidateRetentionSignal") -> "_CandidateRetentionSignal":
+        combined_ids = tuple(dict.fromkeys((
+            *self.candidate_ids,
+            *other.candidate_ids,
+        )))
         return _CandidateRetentionSignal(
-            candidate_ids=tuple(dict.fromkeys((
-                *self.candidate_ids,
-                *other.candidate_ids,
-            )))[:_MAX_CHECKPOINT_CANDIDATE_IDS],
-            candidate_shapes=max(self.candidate_shapes, other.candidate_shapes),
+            candidate_ids=combined_ids[:_MAX_CHECKPOINT_CANDIDATE_IDS],
+            unidentified_shapes=min(
+                _MAX_CHECKPOINT_CANDIDATE_IDS,
+                max(self.unidentified_shapes, other.unidentified_shapes),
+            ),
+            omitted_candidate_ids=min(
+                _MAX_CHECKPOINT_CANDIDATE_IDS,
+                max(
+                    self.omitted_candidate_ids,
+                    other.omitted_candidate_ids,
+                    len(combined_ids) - _MAX_CHECKPOINT_CANDIDATE_IDS,
+                ),
+            ),
         )
 
 
@@ -204,29 +221,59 @@ def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
     raw = _json_object(text)
     if not isinstance(raw, Mapping):
         return _CandidateRetentionSignal(
-            candidate_shapes=1 if _contains_candidate_shaped_text(text) else 0,
+            unidentified_shapes=1 if _contains_candidate_shaped_text(text) else 0,
         )
     if "candidate_finding_ids" not in raw and "candidate_findings" not in raw:
         return _CandidateRetentionSignal(
-            candidate_shapes=1 if _contains_candidate_shaped_text(text) else 0,
+            unidentified_shapes=1 if _contains_candidate_shaped_text(text) else 0,
         )
-    candidate_ids = list(_strings(raw.get("candidate_finding_ids")))
+    candidate_ids: list[str] = []
+    unidentified_shapes = 0
+    omitted_candidate_ids = 0
+    raw_declared_ids = raw.get("candidate_finding_ids")
+    if isinstance(raw_declared_ids, list):
+        if len(raw_declared_ids) > _MAX_CHECKPOINT_CANDIDATE_IDS:
+            omitted_candidate_ids = 1
+        for value in raw_declared_ids[:_MAX_CHECKPOINT_CANDIDATE_IDS + 1]:
+            candidate_id = str(value).strip()
+            if candidate_id:
+                candidate_ids.append(candidate_id)
+    elif raw_declared_ids is not None and raw_declared_ids != ():
+        unidentified_shapes = 1
     raw_candidates = raw.get("candidate_findings")
-    candidate_shapes = 0
     if isinstance(raw_candidates, list):
-        candidate_shapes = min(len(raw_candidates), _MAX_CHECKPOINT_CANDIDATE_IDS)
-        for value in raw_candidates[:_MAX_CHECKPOINT_CANDIDATE_IDS]:
+        if len(raw_candidates) > _MAX_CHECKPOINT_CANDIDATE_IDS:
+            omitted_candidate_ids = 1
+        for value in raw_candidates[:_MAX_CHECKPOINT_CANDIDATE_IDS + 1]:
             if isinstance(value, Mapping):
                 candidate_id = str(value.get("candidate_id") or "").strip()
                 if candidate_id:
                     candidate_ids.append(candidate_id)
+                else:
+                    unidentified_shapes += 1
+            else:
+                unidentified_shapes += 1
+    elif raw_candidates is not None and raw_candidates != ():
+        unidentified_shapes += 1
+    bounded_ids: list[str] = []
+    for candidate_id in dict.fromkeys(candidate_ids):
+        if len(candidate_id) > _MAX_CHECKPOINT_CANDIDATE_ID_CHARS:
+            omitted_candidate_ids = 1
+            continue
+        bounded_ids.append(candidate_id)
+    if len(bounded_ids) > _MAX_CHECKPOINT_CANDIDATE_IDS:
+        omitted_candidate_ids = max(
+            omitted_candidate_ids,
+            len(bounded_ids) - _MAX_CHECKPOINT_CANDIDATE_IDS,
+        )
     return _CandidateRetentionSignal(
-        candidate_ids=tuple(dict.fromkeys(
-            item[:_MAX_CHECKPOINT_CANDIDATE_ID_CHARS]
-            for item in candidate_ids
-            if item
-        ))[:_MAX_CHECKPOINT_CANDIDATE_IDS],
-        candidate_shapes=candidate_shapes,
+        candidate_ids=tuple(bounded_ids[:_MAX_CHECKPOINT_CANDIDATE_IDS]),
+        unidentified_shapes=min(
+            unidentified_shapes, _MAX_CHECKPOINT_CANDIDATE_IDS,
+        ),
+        omitted_candidate_ids=min(
+            omitted_candidate_ids, _MAX_CHECKPOINT_CANDIDATE_IDS,
+        ),
     )
 
 
@@ -239,7 +286,70 @@ def _candidate_retention_lost(
     admitted = set(checkpoint.candidate_finding_ids) if checkpoint is not None else set()
     return bool(
         set(signal.candidate_ids) - admitted
-        or signal.candidate_shapes > len(signal.candidate_ids)
+        or signal.unidentified_shapes
+        or signal.omitted_candidate_ids
+    )
+
+
+def _assignment_json_value(value: object) -> object:
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _assignment_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (tuple, list)):
+        return [_assignment_json_value(item) for item in value]
+    return value
+
+
+def specialist_assignment_prompt(assignment: object) -> str:
+    """Serialize the immutable semantic assignment for initial and recovery turns."""
+    lenses = getattr(assignment, "analytical_lens", "")
+    if not lenses:
+        lenses = ", ".join(getattr(assignment, "lenses", ()))
+    primary = tuple(getattr(assignment, "primary_obligation_ids", ()))
+    all_ids = tuple(getattr(assignment, "obligation_ids", ()))
+    independent = tuple(getattr(assignment, "independent_obligation_ids", ()))
+    payload = {
+        "assignment_id": getattr(
+            assignment, "assignment_id", getattr(assignment, "id", ""),
+        ),
+        "title": getattr(assignment, "title", ""),
+        "objective": getattr(assignment, "objective", ""),
+        "obligation_ids": list(dict.fromkeys((*primary, *all_ids, *independent))),
+        "independent_obligation_ids": list(independent),
+        "analytical_lens": lenses,
+        "seed_paths": list(getattr(assignment, "seed_paths", ())),
+        "permitted_boundaries": list(getattr(
+            assignment,
+            "permitted_boundaries",
+            getattr(assignment, "boundary_paths", ()),
+        )),
+        "obligation_briefs": _assignment_json_value(getattr(
+            assignment, "obligation_briefs", (),
+        )),
+        "changed_context": _assignment_json_value(getattr(
+            assignment, "changed_context", (),
+        )),
+        "changed_context_omitted_paths": int(getattr(
+            assignment, "changed_context_omitted_paths", 0,
+        )),
+        "changed_context_semantics": (
+            "This is bounded orientation to assigned changed paths, not proof of "
+            "complete diff or file coverage."
+        ),
+        "exploration_contract": (
+            "Inspect assigned changed diffs first with read_pr_diff, using "
+            "changed_context only as bounded orientation. Then use read_file only "
+            "for the minimum surrounding source needed to evaluate assigned "
+            "predicates. Bounded, truncated, or omitted context does not prove "
+            "that other content is absent."
+        ),
+    }
+    return "Immutable specialist assignment:\n" + json.dumps(
+        payload, sort_keys=True,
     )
 
 
@@ -360,8 +470,9 @@ class SpecialistSession:
         self.wire_safety_tokens = max(0, int(wire_safety_tokens))
         self.state = SessionState.CREATED
         self._current_gaps = self._assigned_obligation_ids()
-        self.latest_checkpoint = self._project_checkpoint(())
         self.candidate_findings: tuple[CandidateFinding, ...] = ()
+        self._candidate_retention_signal = _CandidateRetentionSignal()
+        self.latest_checkpoint = self._project_checkpoint(())
         self.source_access_requests: tuple[SourceAccessRequest, ...] = ()
         self._successful_requests: dict[str, EvidenceRecord] = {}
         self._successful_collections: dict[str, str] = {}
@@ -400,25 +511,7 @@ class SpecialistSession:
         self.conversation.tool_schemas = schemas
 
     def _assignment_prompt(self) -> str:
-        lenses = getattr(self.assignment, "analytical_lens", "")
-        if not lenses:
-            lenses = ", ".join(getattr(self.assignment, "lenses", ()))
-        payload = {
-            "assignment_id": self.assignment.assignment_id,
-            "objective": self.assignment.objective,
-            "obligation_ids": list(self._assigned_obligation_ids()),
-            "independent_obligation_ids": list(
-                getattr(self.assignment, "independent_obligation_ids", ())
-            ),
-            "analytical_lens": lenses,
-            "seed_paths": list(self.assignment.seed_paths),
-            "permitted_boundaries": list(getattr(
-                self.assignment,
-                "permitted_boundaries",
-                getattr(self.assignment, "boundary_paths", ()),
-            )),
-        }
-        return "Immutable specialist assignment:\n" + json.dumps(payload, sort_keys=True)
+        return specialist_assignment_prompt(self.assignment)
 
     @property
     def request_events(self) -> tuple[SpecialistRequestEvent, ...]:
@@ -577,18 +670,23 @@ class SpecialistSession:
                 if "model context limit" not in str(exc):
                     raise
                 return self.request_checkpoint("context-pressure")
+            self._candidate_retention_signal = (
+                self._candidate_retention_signal.merged(
+                    _candidate_retention_signal(turn.text)
+                )
+            )
             if turn.text:
                 self.conversation.add_assistant_text(turn.text)
             if not turn.tool_calls:
                 checkpoint = self._checkpoint_from_text(turn.text)
-                candidate_signal = _candidate_retention_signal(turn.text)
                 if (
                     checkpoint is None
-                    or _candidate_retention_lost(candidate_signal, checkpoint)
+                    or _candidate_retention_lost(
+                        self._candidate_retention_signal, checkpoint,
+                    )
                 ):
                     return self.request_checkpoint(
                         "model-stopped-without-valid-checkpoint",
-                        candidate_signal=candidate_signal,
                     )
                 self.latest_checkpoint = checkpoint
                 self.state = SessionState.CHECKPOINT
@@ -862,6 +960,10 @@ class SpecialistSession:
         candidate_signal: _CandidateRetentionSignal | None = None,
     ) -> SessionResult:
         """Request a structured checkpoint; never force a final report."""
+        if candidate_signal is not None:
+            self._candidate_retention_signal = (
+                self._candidate_retention_signal.merged(candidate_signal)
+            )
         self.conversation.add_user(
             "Checkpoint requested (not a final report). Reason: "
             + str(reason)
@@ -876,22 +978,24 @@ class SpecialistSession:
                 and self._request_events[-1].status == "completed"
             ):
                 raise
-            self.latest_checkpoint = self._project_checkpoint(
-                self._current_gaps,
-                candidate_retention_unknown=bool(
-                    candidate_signal and candidate_signal.is_material
-                ),
+            checkpoint = self._project_checkpoint(self._current_gaps)
+            self.latest_checkpoint = (
+                self._checkpoint_with_retention_unknown(checkpoint)
+                if _candidate_retention_lost(
+                    self._candidate_retention_signal, checkpoint,
+                )
+                else checkpoint
             )
             self.state = SessionState.CHECKPOINT
             return self._snapshot(degraded=True)
+        self._candidate_retention_signal = self._candidate_retention_signal.merged(
+            _candidate_retention_signal(turn.text)
+        )
         if turn.text:
             self.conversation.add_assistant_text(turn.text)
         checkpoint = self._checkpoint_from_text(turn.text)
-        candidate_signal = (candidate_signal or _CandidateRetentionSignal()).merged(
-            _candidate_retention_signal(turn.text)
-        )
         needs_repair = checkpoint is None or _candidate_retention_lost(
-            candidate_signal, checkpoint,
+            self._candidate_retention_signal, checkpoint,
         )
         if needs_repair:
             self.conversation.add_user(
@@ -909,14 +1013,16 @@ class SpecialistSession:
                     raise
                 repair = None
             if repair is not None:
+                self._candidate_retention_signal = (
+                    self._candidate_retention_signal.merged(
+                        _candidate_retention_signal(repair.text)
+                    )
+                )
                 if repair.text:
                     self.conversation.add_assistant_text(repair.text)
                 checkpoint = self._checkpoint_from_text(repair.text)
-                candidate_signal = candidate_signal.merged(
-                    _candidate_retention_signal(repair.text)
-                )
         retention_unknown = _candidate_retention_lost(
-            candidate_signal, checkpoint,
+            self._candidate_retention_signal, checkpoint,
         )
         fallback_projection = checkpoint is None
         if fallback_projection:
@@ -1123,6 +1229,9 @@ class SpecialistSession:
             evidence_ids=tuple(
                 record.id for record in self.evidence_store.snapshot().records
                 if record.is_usable_for_coverage
+            ),
+            candidate_finding_ids=tuple(
+                item.candidate_id for item in self.candidate_findings
             ),
             obligation_statuses=tuple(sorted(self.coverage.obligation_statuses().items())),
             unknowns=self._current_gaps,

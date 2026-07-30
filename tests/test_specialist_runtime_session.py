@@ -57,6 +57,42 @@ def checkpoint_response(*, inspected, unresolved):
     )
 
 
+def candidate_checkpoint_response(candidate_ids):
+    executor_result = {
+        "tool": "read_file",
+        "status": "ok",
+        "result": {"content": "contents:a.py"},
+    }
+    evidence_id = canonical_evidence_key(
+        "read_file", {"path": "a.py"}, executor_result,
+    )
+    text = json.dumps({
+        "inspected": ["a.py"],
+        "unresolved": ["OB-tests"],
+        "candidate_finding_ids": list(candidate_ids),
+        "candidate_findings": [{
+            "candidate_id": candidate_id,
+            "root_cause_fingerprint": f"root:{candidate_id}",
+            "claim": f"The changed branch exposes issue {candidate_id}.",
+            "affected_location": "a.py:4",
+            "causal_chain": "The new state reaches an invalid branch.",
+            "severity": "major",
+            "category": "correctness",
+            "supporting_evidence_ids": [evidence_id],
+            "related_obligation_ids": ["OB-code"],
+            "confidence_rationale": "Direct retained file evidence.",
+            "user_visible_consequence": "The operation returns the wrong state.",
+            "manual_validation": "Run the state transition test.",
+        } for candidate_id in candidate_ids],
+        "unknowns": ["OB-tests"],
+    })
+    return ModelTurnResult(
+        response={}, tool_calls=(), text=text, text_source="content",
+        finish_reason="stop", usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+
+
 @dataclass(frozen=True)
 class RecordedRequest:
     messages: str
@@ -349,6 +385,101 @@ def test_exploration_candidate_text_survives_checkpoint_handoff_as_unknown():
     ]
     assert result.degraded is True
     assert "candidate-retention-unknown" in result.checkpoint.unknowns
+
+
+def test_tool_turn_candidate_signal_survives_resume_and_clean_checkpoint():
+    """Text beside a tool call remains a lifetime retention obligation."""
+    candidate_turn = tool_call_response(
+        "read_file", {"path": "a.py"}, call_id="candidate-tool",
+    )
+    candidate_turn = ModelTurnResult(**{
+        **candidate_turn.__dict__,
+        "text": (
+            '{"candidate_finding_ids":["candidate-tool-loss"],'
+            '"candidate_findings":[{"candidate_id":"candidate-tool-loss",'
+            '"claim":"material issue"}]}'
+        ),
+        "text_source": "content",
+    })
+    clean = checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])
+    gateway = ScriptedGateway([
+        candidate_turn,
+        clean,
+        clean,
+        clean,
+        clean,
+        clean,
+        clean,
+    ])
+    session = make_session(gateway, model_turns=7)
+
+    first = session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    resumed = session.explore()
+
+    assert first.degraded is True
+    assert resumed.degraded is True
+    assert "candidate-retention-unknown" in first.checkpoint.unknowns
+    assert "candidate-retention-unknown" in resumed.checkpoint.unknowns
+    assert resumed.checkpoint.candidate_finding_ids == ()
+    assert len(gateway.requests) == 7
+
+
+def test_anonymous_candidate_signal_cannot_be_cleared_by_unrelated_admission():
+    """An unidentified material shape remains unknown after a named admission."""
+    anonymous_turn = tool_call_response(
+        "read_file", {"path": "a.py"}, call_id="anonymous-tool",
+    )
+    anonymous_turn = ModelTurnResult(**{
+        **anonymous_turn.__dict__,
+        "text": '{"candidate_findings":[{"claim":"unidentified issue"}]}',
+        "text_source": "content",
+    })
+    named = candidate_checkpoint_response(("candidate-named",))
+    gateway = ScriptedGateway([anonymous_turn, named, named, named])
+    session = make_session(gateway, model_turns=4)
+
+    result = session.explore()
+
+    assert result.checkpoint.candidate_finding_ids == ("candidate-named",)
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+
+
+def test_candidate_id_overflow_cannot_be_cleared_by_bounded_admissions():
+    """IDs beyond the retention bound keep the conservative loss warning."""
+    declared_ids = tuple(f"candidate-{index:02d}" for index in range(21))
+    overflow_turn = tool_call_response(
+        "read_file", {"path": "a.py"}, call_id="overflow-tool",
+    )
+    overflow_turn = ModelTurnResult(**{
+        **overflow_turn.__dict__,
+        "text": json.dumps({
+            "candidate_finding_ids": list(declared_ids),
+        }),
+        "text_source": "content",
+    })
+    bounded = candidate_checkpoint_response(declared_ids[:20])
+    clean = checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])
+    gateway = ScriptedGateway([
+        overflow_turn,
+        bounded,
+        bounded,
+        bounded,
+        clean,
+        clean,
+        clean,
+    ])
+    session = make_session(gateway, model_turns=7)
+
+    first = session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    resumed = session.explore()
+
+    assert len(first.checkpoint.candidate_finding_ids) == 20
+    assert first.degraded is True
+    assert resumed.degraded is True
+    assert "candidate-retention-unknown" in resumed.checkpoint.unknowns
 
 
 def test_checkpoint_admission_failure_preserves_exploration_candidate_unknown():
@@ -1135,6 +1266,18 @@ def _session_with_retained_candidate(final_responses):
     session = make_session(gateway)
     session.explore()
     return session, gateway
+
+
+def test_checkpoint_admission_failure_keeps_already_admitted_candidate():
+    """A transport fallback does not turn a retained candidate into loss."""
+    session, _gateway = _session_with_retained_candidate([
+        TimeoutError("checkpoint provider timed out"),
+    ])
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
+    assert "candidate-retention-unknown" not in result.checkpoint.unknowns
 
 
 def test_finalization_repairs_dangling_candidate_references_without_dropping_valid_ids():

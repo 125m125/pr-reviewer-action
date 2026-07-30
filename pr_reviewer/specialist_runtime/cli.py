@@ -46,7 +46,7 @@ from .policy import (
     load_review_policy,
     parse_review_policy,
 )
-from .session import SpecialistSession
+from .session import SpecialistSession, specialist_assignment_prompt
 from .types import ReviewHandoff, ReviewNote, ReviewNoteKind
 from .web_evidence import SecureFetcher, SearxngSearchProvider, SourcePolicy
 
@@ -795,7 +795,35 @@ def build_controller(
     )
 
     def session_factory(assignment, lease, snapshot, evidence, coverage, obligations, session_id):
-        del snapshot, obligations
+        del snapshot
+        assigned_obligation_ids = set(dict.fromkeys((
+            *getattr(assignment, "primary_obligation_ids", ()),
+            *getattr(assignment, "obligation_ids", ()),
+            *getattr(assignment, "independent_obligation_ids", ()),
+        )))
+        authoritative_diff_paths = tuple(dict.fromkeys(
+            str(path).replace("\\", "/").strip("/")
+            for obligation in obligations
+            if getattr(
+                obligation, "id", getattr(obligation, "obligation_id", ""),
+            ) in assigned_obligation_ids
+            for path in (
+                *getattr(obligation, "scope", ()),
+                *getattr(obligation, "seed_hints", ()),
+            )
+            if str(path).strip()
+        ))
+        changed_context_paths = tuple(
+            str(getattr(item, "path", "")).replace("\\", "/").strip("/")
+            for item in getattr(assignment, "changed_context", ())
+            if str(getattr(item, "path", "")).strip()
+        )
+        allowed_diff_paths = tuple(dict.fromkeys((
+            *authoritative_diff_paths,
+            *assignment.seed_paths,
+            *assignment.boundary_paths,
+            *changed_context_paths,
+        )))
         policy = getattr(session_factory, "source_policy", SourcePolicy(()))
         fork_state = config.environment.get(
             "IS_FORK_PR", "unknown",
@@ -816,7 +844,7 @@ def build_controller(
             system=config.system_prompt.rstrip() + "\n\n" + _SPECIALIST_SYSTEM,
             tool_schemas=tools,
         )
-        conversation.add_user(_specialist_assignment_prompt(assignment))
+        conversation.add_user(specialist_assignment_prompt(assignment))
         def execute(
             name: str,
             arguments: dict[str, Any],
@@ -868,9 +896,7 @@ def build_controller(
                 deadline_at=deadline_at,
                 base_sha=immutable_diff_range[0] if immutable_diff_range else None,
                 head_sha=immutable_diff_range[1] if immutable_diff_range else None,
-                allowed_diff_paths=tuple(dict.fromkeys(
-                    (*assignment.seed_paths, *assignment.boundary_paths)
-                )),
+                allowed_diff_paths=allowed_diff_paths,
             )
 
         return SpecialistSession(
@@ -920,47 +946,6 @@ def _json_value(value: object) -> object:
             for item in fields(value)
         }
     return value
-
-
-def _specialist_assignment_prompt(assignment: object) -> str:
-    lenses = getattr(assignment, "analytical_lens", "")
-    if not lenses:
-        lenses = ", ".join(getattr(assignment, "lenses", ()))
-    primary = tuple(getattr(assignment, "primary_obligation_ids", ()))
-    all_ids = tuple(getattr(assignment, "obligation_ids", ()))
-    independent = tuple(getattr(assignment, "independent_obligation_ids", ()))
-    payload = {
-        "assignment_id": getattr(
-            assignment, "assignment_id", getattr(assignment, "id", ""),
-        ),
-        "title": getattr(assignment, "title", ""),
-        "objective": getattr(assignment, "objective", ""),
-        "obligation_ids": list(dict.fromkeys((*primary, *all_ids, *independent))),
-        "independent_obligation_ids": list(independent),
-        "analytical_lens": lenses,
-        "seed_paths": list(getattr(assignment, "seed_paths", ())),
-        "permitted_boundaries": list(getattr(
-            assignment,
-            "permitted_boundaries",
-            getattr(assignment, "boundary_paths", ()),
-        )),
-        "obligation_briefs": _json_value(getattr(
-            assignment, "obligation_briefs", (),
-        )),
-        "changed_context": _json_value(getattr(
-            assignment, "changed_context", (),
-        )),
-        "changed_context_omitted_paths": int(getattr(
-            assignment, "changed_context_omitted_paths", 0,
-        )),
-        "changed_context_semantics": (
-            "This is bounded orientation to assigned changed paths, not proof of "
-            "complete diff or file coverage. Inspect assigned diffs before surrounding source."
-        ),
-    }
-    return "Immutable specialist assignment:\n" + json.dumps(
-        payload, sort_keys=True,
-    )
 
 
 def _compact_planner_context(value: object) -> object:

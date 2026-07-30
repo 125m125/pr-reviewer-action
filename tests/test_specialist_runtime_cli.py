@@ -1124,6 +1124,160 @@ def test_specialist_assignment_message_serializes_semantic_brief_and_context(
     assert "bounded orientation" in payload["changed_context_semantics"]
 
 
+def test_improve_cannot_revoke_owned_changed_diff_authorization(
+    monkeypatch, tmp_path,
+):
+    """Planner presentation changes cannot remove an owned diff from the tool."""
+    from pr_reviewer.specialist_runtime.assignments import (
+        apply_planner_transformations,
+        fallback_assignment_plan,
+    )
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger
+    from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+    from pr_reviewer.specialist_runtime.types import CoverageObligation
+
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    monkeypatch.setenv("IS_FORK_PR", "false")
+    monkeypatch.setenv("REPO", "owner/repo")
+    config = cli.CliConfig.from_env(workspace=tmp_path)
+    controller = cli.build_controller(config)
+    obligation = CoverageObligation(
+        obligation_id="topology:worker:delivery",
+        origin="topology",
+        subject="worker delivery",
+        required_evidence_categories=("implementation",),
+        scope=("worker/delivery.py",),
+        seed_hints=("worker/delivery.py",),
+    )
+    topology = {
+        "changed_files": ["worker/delivery.py"],
+        "changed_contract_facts": {
+            "worker/delivery.py": {"change_type": "modifies"},
+        },
+    }
+    base = fallback_assignment_plan(
+        (obligation,), topology, config.runtime,
+    )
+    improved = apply_planner_transformations(
+        {
+            "transformations": [{
+                "kind": "improve",
+                "assignment_id": base.assignments[0].id,
+                "seed_paths": [],
+                "boundary_paths": [],
+            }],
+        },
+        base,
+        (obligation,),
+        config.runtime,
+        topology=topology,
+    ).plan.assignments[0]
+    captured = {}
+
+    def execute_tool(*args, **kwargs):
+        captured.update(kwargs)
+        return {"tool": args[0], "status": "ok", "result": {"content": "diff"}}
+
+    monkeypatch.setattr(cli, "execute_tool_request", execute_tool)
+    session = controller._cli_session_factory(
+        improved,
+        SessionLease(RunPhase.INITIAL, 10**20),
+        None,
+        EvidenceStore(),
+        CoverageLedger((obligation,)),
+        (obligation,),
+        "session:test:g0",
+    )
+
+    session.execute_tool("read_pr_diff", {"path": "worker/delivery.py"})
+
+    assert improved.seed_paths == ()
+    assert improved.boundary_paths == ()
+    assert captured["allowed_diff_paths"] == ("worker/delivery.py",)
+
+
+def test_recovery_reuses_complete_semantic_assignment_prompt(
+    monkeypatch, tmp_path,
+):
+    """Recovered sessions retain the exact initial semantic assignment."""
+    from pr_reviewer.specialist_runtime.assignments import (
+        Assignment,
+        ChangedPathContext,
+        ObligationBrief,
+    )
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger
+    from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+    from pr_reviewer.specialist_runtime.types import CoverageObligation
+
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    config = cli.CliConfig.from_env(workspace=tmp_path)
+    controller = cli.build_controller(config)
+    obligation = CoverageObligation(
+        obligation_id="topology:worker:delivery",
+        origin="topology",
+        subject="worker delivery",
+        explanation="Trace acknowledgement after persistence.",
+        required_evidence_categories=("implementation",),
+        satisfaction_predicates=("The acknowledgement ordering is verified.",),
+        risk_tier="high",
+        scope=("worker/delivery.py",),
+        seed_hints=("worker/delivery.py",),
+    )
+    assignment = Assignment(
+        id="delivery",
+        title="Worker delivery behavior",
+        objective="Verify worker delivery behavior from changed diffs.",
+        obligation_ids=(obligation.id,),
+        recipe_ids=(),
+        lenses=("delivery",),
+        seed_paths=("worker/delivery.py",),
+        boundary_paths=(),
+        expected_evidence=("implementation",),
+        estimated_turns=1,
+        priority="high",
+        obligation_briefs=(ObligationBrief(
+            obligation_id=obligation.id,
+            subject=obligation.subject,
+            explanation=obligation.explanation,
+            risk_tier=obligation.risk_tier,
+            required_evidence=obligation.required_evidence_categories,
+            satisfaction_predicates=obligation.satisfaction_predicates,
+            scope=obligation.scope,
+        ),),
+        changed_context=(ChangedPathContext(
+            path="worker/delivery.py",
+            change_type="modifies",
+            symbols=("deliver",),
+            hunk_summaries=("new lines 18-24: def deliver(message):",),
+        ),),
+        changed_context_omitted_paths=3,
+    )
+    session = controller._cli_session_factory(
+        assignment,
+        SessionLease(RunPhase.INITIAL, 10**20),
+        None,
+        EvidenceStore(),
+        CoverageLedger((obligation,)),
+        (obligation,),
+        "session:test:g0",
+    )
+    initial_assignment = session.conversation.events[0]["content"]
+
+    session.recover("repetitive-transcript")
+
+    recovered_assignment = session.conversation.events[0]["content"]
+    payload = json.loads(recovered_assignment.split("\n", 1)[1])
+    assert recovered_assignment == initial_assignment
+    assert payload["obligation_briefs"][0]["obligation_id"] == obligation.id
+    assert payload["changed_context"][0]["path"] == "worker/delivery.py"
+    assert payload["changed_context_omitted_paths"] == 3
+    assert payload["exploration_contract"].index("read_pr_diff") < (
+        payload["exploration_contract"].index("read_file")
+    )
+
+
 def _shell_prompt_environment(
     tmp_path: Path, *, inline: str = "", file_name: str = "", mode: str = "replace"
 ) -> dict[str, str]:
