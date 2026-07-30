@@ -720,12 +720,11 @@ class GatewayRoleAdapter:
                     or result.finish_reason != "length"
                 ):
                     raise
-                if result.reasoning:
-                    conversation.add_assistant_reasoning(result.reasoning)
-                if content:
-                    conversation.add_assistant_text(content)
-                if result.tool_calls:
-                    conversation.add_assistant_tool_calls(result.tool_calls)
+                conversation.add_assistant_turn(
+                    reasoning=result.reasoning,
+                    content=content,
+                    calls=result.tool_calls,
+                )
         raise AssertionError("structured-role continuation loop exhausted")
 
 

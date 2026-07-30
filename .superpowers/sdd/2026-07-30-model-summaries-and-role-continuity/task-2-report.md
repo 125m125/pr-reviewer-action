@@ -67,3 +67,30 @@ Additional checks:
   one bounded repair request.
 - The forced request carries retained history, disables reasoning with
   `reasoning_effort=none`, and requests only the required JSON object.
+
+## Fix round 1
+
+### RED
+
+- Adjacent no-tool turns: **1 failed, 72 deselected** because the conversation
+  had no explicit provider-turn boundary, so reasoning and content were
+  compacted by independent per-kind recency.
+- Specialist admission: **3 failed, 52 deselected** because exploration
+  checkpointing, explicit checkpoint repair, and finalization parsed the
+  reasoning fallback in `turn.text`. A reasoning-only JSON draft could
+  therefore be admitted or influence candidate-retention state.
+- Repair-branch mutation check: **2 failed, 55 deselected** when checkpoint
+  repair and final repair were temporarily switched back to `repair.text`,
+  proving reasoning-only repair JSON would otherwise be admitted.
+
+### GREEN
+
+- Added explicit neutral assistant-turn boundaries. Rendering respects those
+  boundaries, and compaction now retains/removes every reasoning, content, and
+  tool-call event in an assistant turn atomically.
+- Specialist exploration, checkpoint/repair, and final/repair always append
+  `turn.reasoning` as private reasoning history but parse and candidate-signal
+  only ordinary `turn.content`.
+- Task 2 focused suites: **360 passed**.
+- Broader specialist/runtime suites: **853 passed**.
+- `git diff --check` and `python -m compileall -q pr_reviewer`: clean.

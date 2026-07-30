@@ -688,13 +688,16 @@ class SpecialistSession:
                 return self.request_checkpoint("context-pressure")
             self._candidate_retention_signal = (
                 self._candidate_retention_signal.merged(
-                    _candidate_retention_signal(turn.text)
+                    _candidate_retention_signal(turn.content)
                 )
             )
-            if turn.text:
-                self.conversation.add_assistant_text(turn.text)
+            self.conversation.add_assistant_turn(
+                reasoning=turn.reasoning,
+                content=turn.content,
+                calls=turn.tool_calls,
+            )
             if not turn.tool_calls:
-                checkpoint = self._checkpoint_from_text(turn.text)
+                checkpoint = self._checkpoint_from_text(turn.content)
                 if (
                     checkpoint is None
                     or _candidate_retention_lost(
@@ -707,7 +710,6 @@ class SpecialistSession:
                 self.latest_checkpoint = checkpoint
                 self.state = SessionState.CHECKPOINT
                 return self._snapshot()
-            self.conversation.add_assistant_tool_calls(turn.tool_calls)
             progressed = self._execute_calls(turn.tool_calls)
             if self._tool_lease_exhausted:
                 return self.request_checkpoint("tool-lease-expired")
@@ -1005,11 +1007,14 @@ class SpecialistSession:
             self.state = SessionState.CHECKPOINT
             return self._snapshot(degraded=True)
         self._candidate_retention_signal = self._candidate_retention_signal.merged(
-            _candidate_retention_signal(turn.text)
+            _candidate_retention_signal(turn.content)
         )
-        if turn.text:
-            self.conversation.add_assistant_text(turn.text)
-        checkpoint = self._checkpoint_from_text(turn.text)
+        self.conversation.add_assistant_turn(
+            reasoning=turn.reasoning,
+            content=turn.content,
+            calls=turn.tool_calls,
+        )
+        checkpoint = self._checkpoint_from_text(turn.content)
         needs_repair = checkpoint is None or _candidate_retention_lost(
             self._candidate_retention_signal, checkpoint,
         )
@@ -1031,12 +1036,15 @@ class SpecialistSession:
             if repair is not None:
                 self._candidate_retention_signal = (
                     self._candidate_retention_signal.merged(
-                        _candidate_retention_signal(repair.text)
+                        _candidate_retention_signal(repair.content)
                     )
                 )
-                if repair.text:
-                    self.conversation.add_assistant_text(repair.text)
-                checkpoint = self._checkpoint_from_text(repair.text)
+                self.conversation.add_assistant_turn(
+                    reasoning=repair.reasoning,
+                    content=repair.content,
+                    calls=repair.tool_calls,
+                )
+                checkpoint = self._checkpoint_from_text(repair.content)
         retention_unknown = _candidate_retention_lost(
             self._candidate_retention_signal, checkpoint,
         )
@@ -1399,9 +1407,12 @@ class SpecialistSession:
                 "retained evidence. Return only the requested JSON; tools are disabled."
             )
             turn = self._request(tools_enabled=False, schema=_FINAL_SCHEMA)
-            if turn.text:
-                self.conversation.add_assistant_text(turn.text)
-            report, invalid_references = self._final_report_from_text(turn.text)
+            self.conversation.add_assistant_turn(
+                reasoning=turn.reasoning,
+                content=turn.content,
+                calls=turn.tool_calls,
+            )
+            report, invalid_references = self._final_report_from_text(turn.content)
             if report is None:
                 repair_instruction = (
                     "Schema repair: return exactly one final JSON object with non-empty "
@@ -1420,9 +1431,14 @@ class SpecialistSession:
                     )
                 self.conversation.add_user(repair_instruction)
                 repair = self._request(tools_enabled=False, schema=_FINAL_SCHEMA)
-                if repair.text:
-                    self.conversation.add_assistant_text(repair.text)
-                report, invalid_references = self._final_report_from_text(repair.text)
+                self.conversation.add_assistant_turn(
+                    reasoning=repair.reasoning,
+                    content=repair.content,
+                    calls=repair.tool_calls,
+                )
+                report, invalid_references = self._final_report_from_text(
+                    repair.content
+                )
                 if invalid_references:
                     self._record_invalid_final_references(
                         "repair", invalid_references,

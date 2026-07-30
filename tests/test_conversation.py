@@ -298,6 +298,37 @@ def test_completed_history_collapse_does_not_graft_old_reasoning_onto_new_turn()
     assert retained["tool_calls"][0]["id"] == "new-call"
 
 
+def test_completed_history_collapse_removes_all_fields_from_old_adjacent_turn():
+    conv = Conversation(system="s")
+    conv.add_user("review")
+    conv.add_assistant_turn(
+        reasoning="old private reasoning",
+        content="old visible analysis",
+    )
+    conv.add_assistant_turn(content="new visible analysis")
+
+    conv.collapse_oldest_completed_history(1200, keep_newest_results=1)
+    payload = conv.to_request_payload("openai", "m", max_tokens=64)
+
+    assistant_messages = [
+        message
+        for message in payload["messages"]
+        if message.get("role") == "assistant"
+    ]
+    assert assistant_messages == [{
+        "role": "assistant",
+        "content": "new visible analysis",
+    }]
+    assert not any(
+        event["kind"] in {"assistant_reasoning", "assistant_text"}
+        and event.get("content") in {
+            "old private reasoning",
+            "old visible analysis",
+        }
+        for event in conv.events
+    )
+
+
 class TestAnthropicCachePrefix:
     """Anthropic prompt caching is opt-in (#263 Part 2): cache_control markers
     on the stable prefix (system + tools). Default off — unchanged wire shape."""

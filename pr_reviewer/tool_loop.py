@@ -357,12 +357,11 @@ def _append_intermediate_assistant(
     calls: list[dict[str, Any]] | None = None,
 ) -> None:
     """Retain one provider turn without conflating private and visible text."""
-    if reasoning:
-        conversation.add_assistant_reasoning(reasoning)
-    if content:
-        conversation.add_assistant_text(content)
-    if calls:
-        conversation.add_assistant_tool_calls(calls)
+    conversation.add_assistant_turn(
+        reasoning=reasoning,
+        content=content,
+        calls=calls or (),
+    )
 
 
 def drive_tool_loop(

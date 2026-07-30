@@ -150,6 +150,21 @@ def invalid_response(text="not-json"):
     )
 
 
+def reasoning_only_response(value):
+    reasoning = json.dumps(value) if not isinstance(value, str) else value
+    return ModelTurnResult(
+        response={},
+        tool_calls=(),
+        text=reasoning,
+        text_source="reasoning_fallback",
+        finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+        content="",
+        reasoning=reasoning,
+    )
+
+
 def make_session(
     gateway, *, tool_calls=4, model_turns=8, recoveries=1,
     execute_tool=None, lease=None, assignment=None, obligations=None,
@@ -346,6 +361,71 @@ def test_malformed_checkpoint_is_repaired_before_projection():
     assert gateway.requests[1].tools_enabled is False
     assert gateway.requests[2].tools_enabled is False
     assert gateway.requests[2].messages_contain("Repair the previous checkpoint")
+
+
+def test_exploration_reasoning_json_is_not_admitted_or_candidate_signaled():
+    private_checkpoint = {
+        "inspected": ["a.py"],
+        "unresolved": [],
+        "candidate_finding_ids": ["private-candidate"],
+        "candidate_findings": [{
+            "candidate_id": "private-candidate",
+            "claim": "private draft only",
+        }],
+        "unknowns": [],
+    }
+    gateway = ScriptedGateway([
+        reasoning_only_response(private_checkpoint),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+
+    result = make_session(gateway).explore()
+
+    assert len(gateway.requests) == 2
+    assert result.degraded is False
+    assert result.checkpoint.candidate_finding_ids == ()
+    assert "candidate-retention-unknown" not in result.checkpoint.unknowns
+    assert gateway.requests[1].messages_contain("reasoning_content")
+    assert gateway.requests[1].messages_contain("private-candidate")
+
+
+def test_checkpoint_request_repairs_reasoning_only_json_from_retained_history():
+    gateway = ScriptedGateway([
+        reasoning_only_response({
+            "inspected": ["a.py"],
+            "unresolved": [],
+            "candidate_finding_ids": [],
+            "unknowns": [],
+        }),
+        checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway)
+
+    result = session.request_checkpoint("controller-request")
+
+    assert len(gateway.requests) == 2
+    assert result.degraded is False
+    assert "OB-tests" in result.checkpoint.unknowns
+    assert gateway.requests[1].messages_contain("reasoning_content")
+    assert gateway.requests[1].messages_contain("Repair the previous checkpoint")
+
+
+def test_checkpoint_reasoning_only_repair_degrades_to_projection():
+    gateway = ScriptedGateway([
+        invalid_response("not a checkpoint"),
+        reasoning_only_response({
+            "inspected": ["a.py"],
+            "unresolved": [],
+            "candidate_finding_ids": [],
+            "unknowns": [],
+        }),
+    ])
+    session = make_session(gateway)
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is True
+    assert set(result.checkpoint.unknowns) == {"OB-code", "OB-tests"}
 
 
 def test_unrecoverable_candidate_text_is_reported_as_retention_unknown():
@@ -1209,6 +1289,51 @@ def test_finalize_disables_tools_repairs_schema_once_and_is_once_only():
     assert len(gateway.requests) == 4
     assert gateway.requests[2].tools_enabled is False
     assert gateway.requests[3].tools_enabled is False
+
+
+def test_finalize_repairs_reasoning_only_json_without_admitting_private_report():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+        reasoning_only_response({
+            "summary": "private draft",
+            "recommendation": "approve",
+            "candidate_finding_ids": [],
+            "evidence_ids": [],
+            "unknowns": [],
+        }),
+        final_response(summary="declared repaired report"),
+    ])
+    session = make_session(gateway, model_turns=6)
+    session.explore()
+
+    result = session.finalize()
+
+    assert result.degraded is False
+    assert result.report["summary"] == "declared repaired report"
+    assert len(gateway.requests) == 3
+    assert gateway.requests[2].messages_contain("reasoning_content")
+    assert gateway.requests[2].messages_contain("private draft")
+
+
+def test_finalize_reasoning_only_repair_degrades_to_checkpoint_fallback():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+        invalid_response("not a report"),
+        reasoning_only_response({
+            "summary": "private repaired draft",
+            "recommendation": "approve",
+            "candidate_finding_ids": [],
+            "evidence_ids": [],
+            "unknowns": [],
+        }),
+    ])
+    session = make_session(gateway, model_turns=6)
+    session.explore()
+
+    result = session.finalize()
+
+    assert result.degraded is True
+    assert result.report["source"] == "checkpoint-fallback"
 
 
 def test_finalize_falls_back_to_structured_checkpoint_after_one_repair():

@@ -68,6 +68,13 @@ class ModelTurnResult:
     content: str = ""
     reasoning: str = ""
 
+    def __post_init__(self) -> None:
+        # Backward compatibility for in-process gateways that predate the
+        # explicit content field. Reasoning fallbacks are intentionally never
+        # promoted to declared content.
+        if self.text_source == "content" and self.content != self.text:
+            object.__setattr__(self, "content", self.text)
+
 
 class ModelGateway(Protocol):
     """Provider boundary consumed by specialist runtime sessions."""

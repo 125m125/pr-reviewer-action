@@ -486,6 +486,7 @@ class Conversation:
     #   {"kind": "assistant_reasoning", "content": str}
     #   {"kind": "assistant_text", "content": str}
     #   {"kind": "assistant_tool_calls", "calls": [{"id", "name", "arguments"}]}
+    #   {"kind": "assistant_turn_boundary"}
     #   {"kind": "tool_result", "call_id": str, "result": Any, "is_error": bool}
     #   {"kind": "system_note", "content": str}   # verdict-turn transcript etc.
     events: list[dict[str, Any]] = field(default_factory=list)
@@ -516,6 +517,22 @@ class Conversation:
             return
         bounded, _ = truncate_text(content, max_bytes)
         self.events.append({"kind": "assistant_reasoning", "content": bounded})
+
+    def add_assistant_turn(
+        self,
+        *,
+        reasoning: str = "",
+        content: str = "",
+        calls: Iterable[dict[str, Any]] = (),
+    ) -> None:
+        """Append one neutral provider turn with an explicit atomic boundary."""
+        start = len(self.events)
+        self.add_assistant_reasoning(reasoning)
+        if content:
+            self.add_assistant_text(content)
+        self.add_assistant_tool_calls(calls)
+        if len(self.events) > start:
+            self.events.append({"kind": "assistant_turn_boundary"})
 
     def add_assistant_tool_calls(self, calls: Iterable[dict[str, Any]]) -> None:
         """Append an assistant turn carrying tool-call requests.
@@ -754,14 +771,19 @@ class Conversation:
         for index, event in enumerate(self.events):
             if event["kind"] in assistant_kinds:
                 current_group.append(index)
+            elif event["kind"] == "assistant_turn_boundary":
+                if current_group:
+                    current_group.append(index)
+                    assistant_groups.append(current_group)
+                    current_group = []
             elif current_group:
                 assistant_groups.append(current_group)
                 current_group = []
         if current_group:
             assistant_groups.append(current_group)
 
-        call_group_indices: set[int] = set()
         old_call_turn_indices: set[int] = set()
+        standalone_groups: list[list[int]] = []
         for group in assistant_groups:
             call_ids = {
                 call["id"]
@@ -770,40 +792,30 @@ class Conversation:
                 for call in self.events[index]["calls"]
             }
             if not call_ids:
+                standalone_groups.append(group)
                 continue
-            call_group_indices.update(group)
             if call_ids.issubset(old_ids):
                 old_call_turn_indices.update(group)
 
-        assistant_text_indices = [
-            i
-            for i, e in enumerate(self.events)
-            if e["kind"] == "assistant_text" and i not in call_group_indices
-        ]
+        old_standalone_groups = (
+            standalone_groups[:-keep] if keep else standalone_groups
+        )
+        old_standalone_turn_indices = {
+            index for group in old_standalone_groups for index in group
+        }
+        old_assistant_turn_indices = (
+            old_call_turn_indices | old_standalone_turn_indices
+        )
         old_text_indices = {
             index
-            for index in old_call_turn_indices
+            for index in old_assistant_turn_indices
             if self.events[index]["kind"] == "assistant_text"
-        } | set(
-            assistant_text_indices[:-keep] if keep else assistant_text_indices
-        )
-        assistant_reasoning_indices = [
-            i
-            for i, event in enumerate(self.events)
-            if (
-                event["kind"] == "assistant_reasoning"
-                and i not in call_group_indices
-            )
-        ]
+        }
         old_reasoning_indices = {
             index
-            for index in old_call_turn_indices
+            for index in old_assistant_turn_indices
             if self.events[index]["kind"] == "assistant_reasoning"
-        } | set(
-            assistant_reasoning_indices[:-keep]
-            if keep
-            else assistant_reasoning_indices
-        )
+        }
         if (
             not old_ids
             and not old_text_indices
@@ -846,6 +858,11 @@ class Conversation:
         new_events: list[dict[str, Any]] = []
         for i, event in enumerate(self.events):
             if event.get("compaction_note"):
+                continue
+            if (
+                event["kind"] == "assistant_turn_boundary"
+                and i in old_assistant_turn_indices
+            ):
                 continue
             if event["kind"] == "assistant_text" and i in old_text_indices:
                 continue
@@ -931,13 +948,18 @@ class Conversation:
         OpenAI's non-streaming schema).
         """
         messages: list[dict[str, Any]] = []
+        assistant_turn_open = False
         for e in self.events:
             kind = e["kind"]
             if kind == "user":
                 messages.append({"role": "user", "content": e["content"]})
+                assistant_turn_open = False
+            elif kind == "assistant_turn_boundary":
+                assistant_turn_open = False
             elif kind == "assistant_reasoning":
                 if (
-                    messages
+                    assistant_turn_open
+                    and messages
                     and messages[-1].get("role") == "assistant"
                     and "tool_calls" not in messages[-1]
                     and "reasoning_content" not in messages[-1]
@@ -949,9 +971,11 @@ class Conversation:
                         "content": "",
                         "reasoning_content": e["content"],
                     })
+                assistant_turn_open = True
             elif kind == "assistant_text":
                 if (
-                    messages
+                    assistant_turn_open
+                    and messages
                     and messages[-1].get("role") == "assistant"
                     and "tool_calls" not in messages[-1]
                     and not messages[-1].get("content")
@@ -959,6 +983,7 @@ class Conversation:
                     messages[-1]["content"] = e["content"]
                 else:
                     messages.append({"role": "assistant", "content": e["content"]})
+                assistant_turn_open = True
             elif kind == "assistant_tool_calls":
                 calls = normalize_assistant_tool_calls_openai(
                     [
@@ -975,7 +1000,8 @@ class Conversation:
                 if not calls:
                     continue
                 if (
-                    messages
+                    assistant_turn_open
+                    and messages
                     and messages[-1].get("role") == "assistant"
                     and "tool_calls" not in messages[-1]
                 ):
@@ -990,6 +1016,7 @@ class Conversation:
                             "tool_calls": calls,
                         }
                     )
+                assistant_turn_open = True
             elif kind == "tool_result":
                 messages.append(
                     {
@@ -998,6 +1025,7 @@ class Conversation:
                         "content": _tool_result_envelope(e),
                     }
                 )
+                assistant_turn_open = False
             # system_note is only used for the verdict turn — handled in
             # to_request_payload, not here.
         return messages
@@ -1016,6 +1044,7 @@ class Conversation:
         """
         messages: list[dict[str, Any]] = []
         pending_tool_results: list[dict[str, Any]] = []
+        assistant_turn_open = False
 
         def _flush_tool_results() -> None:
             nonlocal pending_tool_results
@@ -1028,11 +1057,15 @@ class Conversation:
             if kind == "user":
                 _flush_tool_results()
                 messages.append({"role": "user", "content": e["content"]})
+                assistant_turn_open = False
+            elif kind == "assistant_turn_boundary":
+                assistant_turn_open = False
             elif kind == "assistant_reasoning":
                 _flush_tool_results()
                 block = {"type": "text", "text": e["content"]}
                 if (
-                    messages
+                    assistant_turn_open
+                    and messages
                     and messages[-1].get("role") == "assistant"
                     and isinstance(messages[-1].get("content"), list)
                     and all(
@@ -1043,11 +1076,13 @@ class Conversation:
                     messages[-1]["content"].append(block)
                 else:
                     messages.append({"role": "assistant", "content": [block]})
+                assistant_turn_open = True
             elif kind == "assistant_text":
                 _flush_tool_results()
                 block = {"type": "text", "text": e["content"]}
                 if (
-                    messages
+                    assistant_turn_open
+                    and messages
                     and messages[-1].get("role") == "assistant"
                     and isinstance(messages[-1].get("content"), list)
                     and all(
@@ -1058,11 +1093,13 @@ class Conversation:
                     messages[-1]["content"].append(block)
                 else:
                     messages.append({"role": "assistant", "content": [block]})
+                assistant_turn_open = True
             elif kind == "assistant_tool_calls":
                 _flush_tool_results()
                 blocks: list[dict[str, Any]] = []
                 if (
-                    messages
+                    assistant_turn_open
+                    and messages
                     and messages[-1].get("role") == "assistant"
                     and isinstance(messages[-1].get("content"), list)
                     and all(
@@ -1098,6 +1135,7 @@ class Conversation:
                     )
                 if blocks:
                     messages.append({"role": "assistant", "content": blocks})
+                    assistant_turn_open = True
             elif kind == "tool_result":
                 block: dict[str, Any] = {
                     "type": "tool_result",
@@ -1107,6 +1145,7 @@ class Conversation:
                 if e.get("is_error"):
                     block["is_error"] = True
                 pending_tool_results.append(block)
+                assistant_turn_open = False
             # system_note is verdict-turn only — handled in to_request_payload.
         _flush_tool_results()
         return messages
