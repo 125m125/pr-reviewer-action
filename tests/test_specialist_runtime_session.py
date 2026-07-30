@@ -256,6 +256,80 @@ def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract()
         assert "repository paths are not evidence IDs" in prompt
 
 
+def test_exploration_reserves_checkpoint_and_repair_turns():
+    """Exploration cannot consume the turns reserved for structured retention."""
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}, call_id="first"),
+        tool_call_response("read_file", {"path": "tests/test_a.py"}, call_id="second"),
+        invalid_response("malformed-checkpoint"),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    result = session.explore()
+
+    assert result.state.value == "checkpoint"
+    assert result.degraded is False
+    assert [request.tools_enabled for request in gateway.requests] == [
+        True, True, False, False,
+    ]
+    assert result.budget.model_turns == 4
+
+
+def test_checkpoint_request_includes_compact_schema_contract():
+    """The checkpoint user message describes required keys and candidate retention."""
+    gateway = ScriptedGateway([
+        invalid_response("plain-text conclusion"),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    session = make_session(gateway)
+
+    session.explore()
+
+    checkpoint_request = json.loads(gateway.requests[1].messages)[-1]["content"]
+    assert "Required keys:" in checkpoint_request
+    assert '"unresolved"' in checkpoint_request
+    assert '"candidate_finding_ids"' in checkpoint_request
+    assert '"candidate_findings"' in checkpoint_request
+    assert "include both its object and ID" in checkpoint_request
+
+
+def test_malformed_checkpoint_is_repaired_before_projection():
+    """One malformed structured checkpoint receives one bounded repair request."""
+    gateway = ScriptedGateway([
+        invalid_response("plain-text conclusion"),
+        invalid_response("still-malformed"),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    session = make_session(gateway)
+
+    result = session.explore()
+
+    assert result.degraded is False
+    assert len(gateway.requests) == 3
+    assert gateway.requests[1].tools_enabled is False
+    assert gateway.requests[2].tools_enabled is False
+    assert gateway.requests[2].messages_contain("Repair the previous checkpoint")
+
+
+def test_unrecoverable_candidate_text_is_reported_as_retention_unknown():
+    """Fallback state cannot look like a trustworthy zero-findings checkpoint."""
+    gateway = ScriptedGateway([
+        invalid_response(
+            '{"unresolved": [], "candidate_findings": '
+            '[{"candidate_id": "candidate-lost", "claim": "material issue"}]'
+        ),
+        invalid_response("still-not-json"),
+    ])
+    session = make_session(gateway, model_turns=2)
+
+    result = session.explore()
+
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+    assert result.checkpoint.candidate_finding_ids == ()
+
+
 def test_hanging_specialist_gateways_share_global_orphan_cap():
     release = threading.Event()
     entered = []

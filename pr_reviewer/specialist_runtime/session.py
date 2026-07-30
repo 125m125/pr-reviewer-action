@@ -119,9 +119,18 @@ _RECOVERY_REASONS = frozenset({
 })
 _MAX_FINALIZATION_DIAGNOSTIC_IDS = 20
 _MAX_FINALIZATION_DIAGNOSTIC_ID_CHARS = 256
+_CHECKPOINT_TURN_RESERVE = 2
+_CANDIDATE_RETENTION_UNKNOWN = "candidate-retention-unknown"
 _CHECKPOINT_RETENTION_INSTRUCTION = (
-    " Preserve every material issue by including its full object in "
-    "candidate_findings and its matching candidate_id in candidate_finding_ids; "
+    " Required keys: unresolved, candidate_finding_ids, candidate_findings, and "
+    "unknowns. Compact shape: {\"unresolved\":[\"OB-id\"],\"evidence_ids\":"
+    "[\"evidence:<hash>\"],\"candidate_finding_ids\":[\"candidate-id\"],"
+    "\"candidate_findings\":[{\"candidate_id\":\"candidate-id\",\"claim\":"
+    "\"...\",\"affected_location\":\"path:line\",\"causal_chain\":\"...\","
+    "\"supporting_evidence_ids\":[\"evidence:<hash>\"],\"related_obligation_ids\":"
+    "[\"OB-id\"],\"user_visible_consequence\":\"...\",\"manual_validation\":"
+    "\"...\"}],\"unknowns\":[\"OB-id\"]}. To preserve every material issue, "
+    "include both its object and ID in candidate_findings and candidate_finding_ids; "
     "an issue omitted from either field will not survive the checkpoint. Use only "
     "exact retained evidence IDs (evidence:<hash>) from successful tool results in "
     "evidence_ids and supporting_evidence_ids; repository paths are not evidence IDs."
@@ -156,6 +165,15 @@ def _json_object(text: str) -> dict[str, Any] | None:
                 return value
         return None
     return value if isinstance(value, dict) else None
+
+
+def _contains_candidate_shaped_text(text: str) -> bool:
+    """Recognize candidate payloads without retaining untrusted model text."""
+    lowered = text.lower() if isinstance(text, str) else ""
+    return (
+        "candidate_findings" in lowered
+        and ("candidate_id" in lowered or "claim" in lowered)
+    )
 
 
 def _normalized_path(value: object) -> str:
@@ -475,6 +493,17 @@ class SpecialistSession:
                 self._compact_conversation()
                 if self.conversation.approx_tokens() > self.max_context_tokens:
                     return self.request_checkpoint("context-pressure")
+            remaining_input_tokens = self.budget.remaining_input_tokens()
+            if (
+                remaining_input_tokens is not None
+                and self.conversation.approx_tokens() > remaining_input_tokens
+            ):
+                raise BudgetExhausted("input token limit exhausted")
+            remaining_output_tokens = self.budget.remaining_output_tokens()
+            if remaining_output_tokens is not None and remaining_output_tokens <= 0:
+                raise BudgetExhausted("output token limit exhausted")
+            if self.budget.remaining_model_turns() <= _CHECKPOINT_TURN_RESERVE:
+                return self.request_checkpoint("checkpoint-retention-reserve")
             try:
                 turn = self._request(tools_enabled=True, schema=None)
             except BudgetExhausted as exc:
@@ -485,7 +514,13 @@ class SpecialistSession:
                 self.conversation.add_assistant_text(turn.text)
             if not turn.tool_calls:
                 checkpoint = self._checkpoint_from_text(turn.text)
-                if checkpoint is None:
+                if (
+                    checkpoint is None
+                    or (
+                        _contains_candidate_shaped_text(turn.text)
+                        and not checkpoint.candidate_finding_ids
+                    )
+                ):
                     return self.request_checkpoint("model-stopped-without-valid-checkpoint")
                 self.latest_checkpoint = checkpoint
                 self.state = SessionState.CHECKPOINT
@@ -759,31 +794,61 @@ class SpecialistSession:
             + str(reason)
             + _CHECKPOINT_RETENTION_INSTRUCTION
         )
+        request_event_count = len(self._request_events)
         try:
             turn = self._request(tools_enabled=False, schema=_CHECKPOINT_SCHEMA)
         except (BudgetExhausted, TimeoutError):
+            if (
+                len(self._request_events) > request_event_count
+                and self._request_events[-1].status == "completed"
+            ):
+                raise
             self.latest_checkpoint = self._project_checkpoint(self._current_gaps)
             self.state = SessionState.CHECKPOINT
             return self._snapshot(degraded=True)
         if turn.text:
             self.conversation.add_assistant_text(turn.text)
         checkpoint = self._checkpoint_from_text(turn.text)
-        if checkpoint is None:
+        candidate_text_seen = _contains_candidate_shaped_text(turn.text)
+        needs_repair = checkpoint is None or (
+            candidate_text_seen and not checkpoint.candidate_finding_ids
+        )
+        if needs_repair:
             self.conversation.add_user(
                 "Repair the previous checkpoint as one JSON object matching the schema."
                 + _CHECKPOINT_RETENTION_INSTRUCTION
             )
+            repair_event_count = len(self._request_events)
             try:
                 repair = self._request(tools_enabled=False, schema=_CHECKPOINT_SCHEMA)
             except (BudgetExhausted, TimeoutError):
+                if (
+                    len(self._request_events) > repair_event_count
+                    and self._request_events[-1].status == "completed"
+                ):
+                    raise
                 repair = None
             if repair is not None:
                 if repair.text:
                     self.conversation.add_assistant_text(repair.text)
                 checkpoint = self._checkpoint_from_text(repair.text)
-        self.latest_checkpoint = checkpoint or self._project_checkpoint(self._current_gaps)
+                candidate_text_seen = candidate_text_seen or _contains_candidate_shaped_text(
+                    repair.text
+                )
+        retention_unknown = candidate_text_seen and (
+            checkpoint is None or not checkpoint.candidate_finding_ids
+        )
+        fallback_projection = checkpoint is None
+        if fallback_projection:
+            checkpoint = self._project_checkpoint(
+                self._current_gaps,
+                candidate_retention_unknown=retention_unknown,
+            )
+        elif retention_unknown:
+            checkpoint = self._checkpoint_with_retention_unknown(checkpoint)
+        self.latest_checkpoint = checkpoint
         self.state = SessionState.CHECKPOINT
-        return self._snapshot(degraded=checkpoint is None)
+        return self._snapshot(degraded=fallback_projection or retention_unknown)
 
     def _checkpoint_from_text(self, text: str) -> SessionCheckpoint | None:
         raw = _json_object(text)
@@ -942,14 +1007,37 @@ class SpecialistSession:
                 gaps.append(obligation_id)
         return tuple(gaps)
 
-    def _project_checkpoint(self, gaps: tuple[str, ...]) -> SessionCheckpoint:
+    def _checkpoint_with_retention_unknown(
+        self, checkpoint: SessionCheckpoint,
+    ) -> SessionCheckpoint:
+        unknowns = tuple(dict.fromkeys((
+            *checkpoint.unknowns,
+            _CANDIDATE_RETENTION_UNKNOWN,
+        )))
+        return SessionCheckpoint(
+            **{
+                **checkpoint.__dict__,
+                "unknowns": unknowns,
+                "proposed_next_actions": tuple(dict.fromkeys((
+                    *checkpoint.proposed_next_actions,
+                    _CANDIDATE_RETENTION_UNKNOWN,
+                ))),
+            }
+        )
+
+    def _project_checkpoint(
+        self,
+        gaps: tuple[str, ...],
+        *,
+        candidate_retention_unknown: bool = False,
+    ) -> SessionCheckpoint:
         for obligation_id in gaps:
             try:
                 self.coverage.mark_unresolved(obligation_id)
             except KeyError:
                 continue
         self._current_gaps = self._derive_current_gaps()
-        return SessionCheckpoint(
+        checkpoint = SessionCheckpoint(
             session_id=self.session_id,
             state=SessionState.CHECKPOINT,
             evidence_ids=tuple(
@@ -959,6 +1047,11 @@ class SpecialistSession:
             obligation_statuses=tuple(sorted(self.coverage.obligation_statuses().items())),
             unknowns=self._current_gaps,
             proposed_next_actions=self._current_gaps,
+        )
+        return (
+            self._checkpoint_with_retention_unknown(checkpoint)
+            if candidate_retention_unknown
+            else checkpoint
         )
 
     def apply_coverage_feedback(self, gaps: list[str] | tuple[str, ...]) -> None:
