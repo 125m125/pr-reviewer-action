@@ -115,6 +115,28 @@ def test_topology_extracts_bounded_changed_hunk_context():
     ]
 
 
+def test_topology_labels_zero_count_new_range_as_deletion_only():
+    topology = build_topology(
+        [{
+            "filename": "worker/legacy.py",
+            "status": "modified",
+            "patch": (
+                "@@ -18,4 +18,0 @@ def legacy_delivery(message):\n"
+                "-    send(message)"
+            ),
+        }],
+        {},
+        ("worker/legacy.py",),
+    )
+
+    assert topology["changed_contract_facts"]["worker/legacy.py"][
+        "hunk_summaries"
+    ] == [
+        "deletion-only hunk near new-file line 18 (no new lines): "
+        "def legacy_delivery(message):",
+    ]
+
+
 def files(*paths):
     return [{"filename": path} for path in paths]
 

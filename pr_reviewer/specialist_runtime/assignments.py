@@ -390,29 +390,34 @@ def _rebuild_assignment(
     obligation_ids: Iterable[str],
     obligation_by_id: Mapping[str, CoverageObligation],
     config: RuntimeConfig,
+    topology: Mapping[str, Any],
     *,
     assignment_id: str | None = None,
 ) -> Assignment:
     ids = tuple(obligation_ids)
     obligations = tuple(obligation_by_id[item] for item in ids)
-    allowed_paths = {
+    seed_paths = tuple(sorted({
         path.replace("\\", "/").strip("/")
-        for obligation in obligations
-        for path in (*obligation.scope, *obligation.seed_hints)
-    }
-    scoped_context = tuple(
-        item for item in original.changed_context
-        if item.path in allowed_paths
-    )
+        for obligation in obligations for path in obligation.seed_hints
+    }))
+    boundary_paths = tuple(sorted({
+        path.replace("\\", "/").strip("/")
+        for obligation in obligations for path in obligation.scope
+        if path.replace("\\", "/").strip("/") not in seed_paths
+    }))
+    changed_context, omitted = _changed_context(obligations, topology)
+    title, objective = _semantic_assignment_text(obligations)
     return replace(
         original,
         id=assignment_id or original.id,
+        title=title,
+        objective=objective,
         obligation_ids=ids,
         recipe_ids=tuple(sorted({
             item.recipe_id for item in obligations if item.recipe_id
         })),
-        seed_paths=tuple(path for path in original.seed_paths if path in allowed_paths),
-        boundary_paths=tuple(path for path in original.boundary_paths if path in allowed_paths),
+        seed_paths=seed_paths,
+        boundary_paths=boundary_paths,
         expected_evidence=tuple(sorted({
             category for item in obligations
             for category in item.required_evidence_categories
@@ -423,11 +428,8 @@ def _rebuild_assignment(
         ),
         primary_obligation_ids=(),
         obligation_briefs=_obligation_briefs(obligations),
-        changed_context=scoped_context[:_MAX_CHANGED_CONTEXT_PATHS],
-        changed_context_omitted_paths=(
-            original.changed_context_omitted_paths
-            + max(0, len(scoped_context) - _MAX_CHANGED_CONTEXT_PATHS)
-        ),
+        changed_context=changed_context,
+        changed_context_omitted_paths=omitted,
     )
 
 
@@ -504,6 +506,8 @@ def apply_planner_transformations(
     base_plan: AssignmentPlan,
     obligations: Iterable[CoverageObligation],
     runtime_config: RuntimeConfig,
+    *,
+    topology: Mapping[str, Any],
 ) -> PlannerTransformationResult:
     """Apply optional planner improvements without transferring ownership authority."""
     assignable = _validated_assignable_obligations(obligations)
@@ -600,26 +604,13 @@ def apply_planner_transformations(
                 if any(_is_isolated_assignment(item, obligation_by_id) for item in merged):
                     raise ValueError("cannot merge an isolated recipe assignment")
                 target = by_id[target_id]
-                merged_context = {
-                    context.path: context
-                    for item in merged
-                    for context in item.changed_context
-                }
-                target = replace(
-                    target,
-                    changed_context=tuple(
-                        merged_context[path] for path in sorted(merged_context)
-                    ),
-                    changed_context_omitted_paths=sum(
-                        item.changed_context_omitted_paths for item in merged
-                    ),
-                )
                 obligation_ids = tuple(dict.fromkeys(
                     obligation_id for item in merged
                     for obligation_id in item.obligation_ids
                 ))
                 rebuilt = _rebuild_assignment(
                     target, obligation_ids, obligation_by_id, runtime_config,
+                    topology,
                 )
                 assignments = [
                     rebuilt if item.id == target_id else item
@@ -660,6 +651,7 @@ def apply_planner_transformations(
                 split_items = [
                     _rebuild_assignment(
                         original, group, obligation_by_id, runtime_config,
+                        topology,
                         assignment_id=(
                             original.id if split_index == 0
                             else _next_split_id(original.id, used_ids)
@@ -848,6 +840,19 @@ def _join_semantic_themes(obligations: Iterable[CoverageObligation]) -> str:
     return result
 
 
+def _semantic_assignment_text(
+    obligations: Iterable[CoverageObligation],
+) -> tuple[str, str]:
+    themes = _join_semantic_themes(obligations)
+    return (
+        f"Review {themes}",
+        (
+            f"Verify changed behavior for {themes} from the scoped diffs, "
+            "required evidence, and satisfaction predicates."
+        ),
+    )
+
+
 def _fallback_group(obligation: CoverageObligation, component_paths: Mapping[str, set[str]]) -> str:
     execution = _recipe_execution(obligation)
     if obligation.recipe_id and execution in {"dedicated", "independent"}:
@@ -872,13 +877,9 @@ def _fallback_assignment(
     suffix = re.sub(r"[^a-z0-9]+", "-", key.lower()).strip("-") or "review"
     seed_paths = tuple(sorted({path for item in obligations for path in item.seed_hints}))
     boundary_paths = tuple(sorted({path for item in obligations for path in item.scope if path not in seed_paths}))
-    themes = _join_semantic_themes(obligations)
+    title, objective = _semantic_assignment_text(obligations)
     assignment = Assignment(
-        id=f"fallback-{suffix}", title=f"Review {themes}",
-        objective=(
-            f"Verify changed behavior for {themes} from the scoped diffs, "
-            "required evidence, and satisfaction predicates."
-        ),
+        id=f"fallback-{suffix}", title=title, objective=objective,
         obligation_ids=tuple(item.id for item in obligations),
         recipe_ids=tuple(sorted({item.recipe_id for item in obligations if item.recipe_id})),
         lenses=("deterministic-coverage",), seed_paths=seed_paths, boundary_paths=boundary_paths,

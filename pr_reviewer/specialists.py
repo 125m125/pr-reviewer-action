@@ -262,11 +262,15 @@ def build_topology(
             if hunk_match and len(hunk_summaries) < 5:
                 start = int(hunk_match.group(1))
                 count = int(hunk_match.group(2) or "1")
-                line_label = (
-                    f"new line {start}"
-                    if count == 1
-                    else f"new lines {start}-{start + max(1, count) - 1}"
-                )
+                if count == 0:
+                    line_label = (
+                        f"deletion-only hunk near new-file line {start} "
+                        "(no new lines)"
+                    )
+                elif count == 1:
+                    line_label = f"new line {start}"
+                else:
+                    line_label = f"new lines {start}-{start + count - 1}"
                 context = re.sub(
                     r"[^A-Za-z0-9 _().,:/+[\]-]+", " ",
                     hunk_match.group(3),

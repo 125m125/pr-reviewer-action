@@ -126,7 +126,7 @@ def test_planner_transformations_apply_valid_items_independently(
                 "assignment_ids": [ordinary.id],
             },
         ],
-    }, base, obligations, runtime_config)
+    }, base, obligations, runtime_config, topology=topology)
 
     assert result.plan.assignments[0].id == ordinary.id
     assert result.plan.assignments[0].objective == (
@@ -154,7 +154,7 @@ def test_planner_transformations_ignore_invalid_item_but_keep_valid_item(
                 "objective": "Inspect the reachable worker behavior.",
             },
         ],
-    }, base, obligations, runtime_config)
+    }, base, obligations, runtime_config, topology=topology)
 
     transformed = next(item for item in result.plan.assignments if item.id == ordinary.id)
     assert transformed.objective == "Inspect the reachable worker behavior."
@@ -172,7 +172,7 @@ def test_planner_transformation_diagnostics_are_bounded(
             {"kind": "unsupported", "payload": "x" * 10_000}
             for _ in range(200)
         ],
-    }, base, obligations, runtime_config)
+    }, base, obligations, runtime_config, topology=topology)
 
     assert len(result.ignored) <= 65
     assert all(len(item) <= 330 for item in result.ignored)
@@ -223,7 +223,7 @@ def test_repeated_split_allocates_unique_controller_owned_assignment_ids():
                 ],
             },
         ],
-    }, base, obligations, config)
+    }, base, obligations, config, topology=topology)
 
     assignment_ids = [item.id for item in result.plan.assignments]
     owned = [
@@ -242,6 +242,7 @@ def test_planner_omissions_never_remove_base_ownership(
     base = fallback_assignment_plan(obligations, topology, runtime_config)
     result = apply_planner_transformations(
         {"transformations": []}, base, obligations, runtime_config,
+        topology=topology,
     )
 
     assert result.plan == base
@@ -277,7 +278,7 @@ def test_planner_cannot_merge_or_split_isolated_recipe_assignments(
                 "obligation_groups": [[isolated.obligation_ids[0]]],
             },
         ],
-    }, base, obligations, runtime_config)
+    }, base, obligations, runtime_config, topology=topology)
 
     assert result.plan == base
     assert len(result.ignored) == 2
@@ -308,7 +309,7 @@ def test_planner_can_merge_and_split_ordinary_assignments_on_existing_boundaries
             "target_assignment_id": ordinary[0].id,
             "source_assignment_ids": [ordinary[1].id],
         }],
-    }, base, obligations, roomy)
+    }, base, obligations, roomy, topology=topology)
     merged_item = next(
         item for item in merged.plan.assignments if item.id == ordinary[0].id
     )
@@ -321,7 +322,7 @@ def test_planner_can_merge_and_split_ordinary_assignments_on_existing_boundaries
             "assignment_id": merged_item.id,
             "obligation_groups": [[item] for item in sorted(expected_ids)],
         }],
-    }, merged.plan, obligations, roomy)
+    }, merged.plan, obligations, roomy, topology=topology)
     assert split.ignored == ()
     assert {
         obligation_id
@@ -931,6 +932,7 @@ def test_merged_deterministic_assignment_retains_each_scoped_change_context(
         base,
         obligations,
         runtime_config,
+        topology=topology,
     ).plan
 
     assert {
@@ -979,10 +981,237 @@ def test_merged_changed_context_reports_paths_omitted_by_the_bound():
         base,
         obligations,
         two_sessions,
+        topology=topology,
     ).plan.assignments[0]
 
     assert len(merged.changed_context) == 12
     assert merged.changed_context_omitted_paths == 2
+
+
+def test_split_recomputes_context_after_parent_context_was_truncated():
+    paths = tuple(f"component/behavior_{index}.py" for index in range(14))
+    obligations = tuple(
+        CoverageObligation(
+            obligation_id=f"topology:component:behavior-{index}",
+            origin="topology",
+            subject=f"behavior {index}",
+            required_evidence_categories=("implementation",),
+            scope=(path,),
+        )
+        for index, path in enumerate(paths)
+    )
+    topology = {
+        "changed_files": list(paths),
+        "components": [{
+            "id": "component",
+            "changed_files": list(paths),
+        }],
+        "changed_contract_facts": {},
+    }
+    two_sessions = RuntimeConfig(
+        review_deadline_sec=600,
+        model_request_timeout_sec=100,
+        concurrency=1,
+        max_sessions=2,
+        session_limits=BudgetLimits(model_turns=8, tool_calls=20, recoveries=1),
+    )
+    base = fallback_assignment_plan(obligations, topology, two_sessions)
+    original = base.assignments[0]
+    assert len(original.changed_context) == 12
+    assert original.changed_context_omitted_paths == 2
+
+    split = apply_planner_transformations(
+        {
+            "transformations": [{
+                "kind": "split",
+                "assignment_id": original.id,
+                "obligation_groups": [
+                    list(original.obligation_ids[:7]),
+                    list(original.obligation_ids[7:]),
+                ],
+            }],
+        },
+        base,
+        obligations,
+        two_sessions,
+        topology=topology,
+    ).plan.assignments
+
+    paths_by_obligation = {
+        obligation.id: obligation.scope[0] for obligation in obligations
+    }
+    for assignment_item in split:
+        assert {
+            item.path for item in assignment_item.changed_context
+        } == {
+            paths_by_obligation[item]
+            for item in assignment_item.obligation_ids
+        }
+        assert assignment_item.changed_context_omitted_paths == 0
+
+
+def test_merge_recomputes_overlapping_context_omission_once():
+    paths = tuple(f"shared/behavior_{index}.py" for index in range(14))
+    obligations = (
+        CoverageObligation(
+            obligation_id="topology:producer:interaction",
+            origin="topology",
+            subject="producer interaction",
+            required_evidence_categories=("implementation",),
+            scope=paths,
+        ),
+        CoverageObligation(
+            obligation_id="topology:consumer:interaction",
+            origin="topology",
+            subject="consumer interaction",
+            required_evidence_categories=("implementation",),
+            scope=paths,
+        ),
+    )
+    topology = {
+        "changed_files": list(paths),
+        "components": [
+            {"id": "producer", "changed_files": list(paths[:7])},
+            {"id": "consumer", "changed_files": list(paths[7:])},
+        ],
+        "changed_contract_facts": {},
+    }
+    two_sessions = RuntimeConfig(
+        review_deadline_sec=600,
+        model_request_timeout_sec=100,
+        concurrency=1,
+        max_sessions=2,
+        session_limits=BudgetLimits(model_turns=8, tool_calls=20, recoveries=1),
+    )
+    base = fallback_assignment_plan(obligations, topology, two_sessions)
+    assert len(base.assignments) == 2
+    assert all(item.changed_context_omitted_paths == 2 for item in base.assignments)
+    target, source = base.assignments
+
+    merged = apply_planner_transformations(
+        {
+            "transformations": [{
+                "kind": "merge",
+                "target_assignment_id": target.id,
+                "source_assignment_ids": [source.id],
+            }],
+        },
+        base,
+        obligations,
+        two_sessions,
+        topology=topology,
+    ).plan.assignments[0]
+
+    assert len(merged.changed_context) == 12
+    assert merged.changed_context_omitted_paths == 2
+
+
+def test_split_regenerates_semantic_title_and_objective_for_each_child():
+    obligations = (
+        CoverageObligation(
+            obligation_id="topology:worker:implementation",
+            origin="topology",
+            subject="worker delivery",
+            required_evidence_categories=("implementation",),
+            scope=("worker/delivery.py",),
+        ),
+        CoverageObligation(
+            obligation_id="topology:queue:test",
+            origin="topology",
+            subject="queue retry tests",
+            required_evidence_categories=("test",),
+            scope=("tests/test_queue.py",),
+        ),
+    )
+    topology = {
+        "changed_files": ["worker/delivery.py", "tests/test_queue.py"],
+        "components": [{
+            "id": "repository",
+            "changed_files": ["worker/delivery.py", "tests/test_queue.py"],
+        }],
+        "changed_contract_facts": {},
+    }
+    two_sessions = RuntimeConfig(
+        max_sessions=2,
+        session_limits=BudgetLimits(model_turns=6, tool_calls=20, recoveries=1),
+    )
+    base = fallback_assignment_plan(obligations, topology, two_sessions)
+    original = base.assignments[0]
+
+    split = apply_planner_transformations(
+        {
+            "transformations": [{
+                "kind": "split",
+                "assignment_id": original.id,
+                "obligation_groups": [
+                    [obligations[0].id],
+                    [obligations[1].id],
+                ],
+            }],
+        },
+        base,
+        obligations,
+        two_sessions,
+        topology=topology,
+    ).plan.assignments
+
+    by_obligation = {
+        item.obligation_ids[0]: f"{item.title} {item.objective}".lower()
+        for item in split
+    }
+    assert "worker delivery" in by_obligation[obligations[0].id]
+    assert "queue retry tests" not in by_obligation[obligations[0].id]
+    assert "queue retry tests" in by_obligation[obligations[1].id]
+    assert "worker delivery" not in by_obligation[obligations[1].id]
+
+
+def test_merge_regenerates_semantic_title_and_objective_for_combined_ownership(
+    runtime_config,
+):
+    obligations = (
+        CoverageObligation(
+            obligation_id="topology:worker:implementation",
+            origin="topology",
+            subject="worker delivery",
+            required_evidence_categories=("implementation",),
+            scope=("worker/delivery.py",),
+        ),
+        CoverageObligation(
+            obligation_id="topology:queue:test",
+            origin="topology",
+            subject="queue retry tests",
+            required_evidence_categories=("test",),
+            scope=("tests/test_queue.py",),
+        ),
+    )
+    topology = {
+        "changed_files": ["worker/delivery.py", "tests/test_queue.py"],
+        "components": [
+            {"id": "worker", "changed_files": ["worker/delivery.py"]},
+            {"id": "queue", "changed_files": ["tests/test_queue.py"]},
+        ],
+        "changed_contract_facts": {},
+    }
+    base = fallback_assignment_plan(obligations, topology, runtime_config)
+    target, source = base.assignments
+
+    merged = apply_planner_transformations(
+        {
+            "transformations": [{
+                "kind": "merge",
+                "target_assignment_id": target.id,
+                "source_assignment_ids": [source.id],
+            }],
+        },
+        base,
+        obligations,
+        runtime_config,
+        topology=topology,
+    ).plan.assignments[0]
+    semantic_text = f"{merged.title} {merged.objective}".lower()
+
+    assert "worker delivery" in semantic_text
+    assert "queue retry tests" in semantic_text
 
 
 def test_deterministic_group_titles_describe_behavior_not_capacity_bucket():

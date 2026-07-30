@@ -1494,6 +1494,7 @@ class ReviewController:
                 base_plan,
                 state.obligations,
                 inputs.config,
+                topology=inputs.topology,
             )
             state.planner_diagnostics.extend(result.ignored)
             if result.plan != base_plan:
