@@ -121,6 +121,8 @@ _MAX_FINALIZATION_DIAGNOSTIC_IDS = 20
 _MAX_FINALIZATION_DIAGNOSTIC_ID_CHARS = 256
 _CHECKPOINT_TURN_RESERVE = 2
 _CANDIDATE_RETENTION_UNKNOWN = "candidate-retention-unknown"
+_MAX_CHECKPOINT_CANDIDATE_IDS = 20
+_MAX_CHECKPOINT_CANDIDATE_ID_CHARS = 256
 _CHECKPOINT_RETENTION_INSTRUCTION = (
     " Required keys: unresolved, candidate_finding_ids, candidate_findings, and "
     "unknowns. Compact shape: {\"unresolved\":[\"OB-id\"],\"evidence_ids\":"
@@ -173,6 +175,71 @@ def _contains_candidate_shaped_text(text: str) -> bool:
     return (
         "candidate_findings" in lowered
         and ("candidate_id" in lowered or "claim" in lowered)
+    )
+
+
+@dataclass(frozen=True)
+class _CandidateRetentionSignal:
+    """Bounded candidate declarations observed across checkpoint attempts."""
+
+    candidate_ids: tuple[str, ...] = ()
+    candidate_shapes: int = 0
+
+    @property
+    def is_material(self) -> bool:
+        return bool(self.candidate_ids or self.candidate_shapes)
+
+    def merged(self, other: "_CandidateRetentionSignal") -> "_CandidateRetentionSignal":
+        return _CandidateRetentionSignal(
+            candidate_ids=tuple(dict.fromkeys((
+                *self.candidate_ids,
+                *other.candidate_ids,
+            )))[:_MAX_CHECKPOINT_CANDIDATE_IDS],
+            candidate_shapes=max(self.candidate_shapes, other.candidate_shapes),
+        )
+
+
+def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
+    """Retain only bounded IDs/counts, never untrusted candidate prose."""
+    raw = _json_object(text)
+    if not isinstance(raw, Mapping):
+        return _CandidateRetentionSignal(
+            candidate_shapes=1 if _contains_candidate_shaped_text(text) else 0,
+        )
+    if "candidate_finding_ids" not in raw and "candidate_findings" not in raw:
+        return _CandidateRetentionSignal(
+            candidate_shapes=1 if _contains_candidate_shaped_text(text) else 0,
+        )
+    candidate_ids = list(_strings(raw.get("candidate_finding_ids")))
+    raw_candidates = raw.get("candidate_findings")
+    candidate_shapes = 0
+    if isinstance(raw_candidates, list):
+        candidate_shapes = min(len(raw_candidates), _MAX_CHECKPOINT_CANDIDATE_IDS)
+        for value in raw_candidates[:_MAX_CHECKPOINT_CANDIDATE_IDS]:
+            if isinstance(value, Mapping):
+                candidate_id = str(value.get("candidate_id") or "").strip()
+                if candidate_id:
+                    candidate_ids.append(candidate_id)
+    return _CandidateRetentionSignal(
+        candidate_ids=tuple(dict.fromkeys(
+            item[:_MAX_CHECKPOINT_CANDIDATE_ID_CHARS]
+            for item in candidate_ids
+            if item
+        ))[:_MAX_CHECKPOINT_CANDIDATE_IDS],
+        candidate_shapes=candidate_shapes,
+    )
+
+
+def _candidate_retention_lost(
+    signal: _CandidateRetentionSignal,
+    checkpoint: SessionCheckpoint | None,
+) -> bool:
+    if not signal.is_material:
+        return False
+    admitted = set(checkpoint.candidate_finding_ids) if checkpoint is not None else set()
+    return bool(
+        set(signal.candidate_ids) - admitted
+        or signal.candidate_shapes > len(signal.candidate_ids)
     )
 
 
@@ -514,14 +581,15 @@ class SpecialistSession:
                 self.conversation.add_assistant_text(turn.text)
             if not turn.tool_calls:
                 checkpoint = self._checkpoint_from_text(turn.text)
+                candidate_signal = _candidate_retention_signal(turn.text)
                 if (
                     checkpoint is None
-                    or (
-                        _contains_candidate_shaped_text(turn.text)
-                        and not checkpoint.candidate_finding_ids
-                    )
+                    or _candidate_retention_lost(candidate_signal, checkpoint)
                 ):
-                    return self.request_checkpoint("model-stopped-without-valid-checkpoint")
+                    return self.request_checkpoint(
+                        "model-stopped-without-valid-checkpoint",
+                        candidate_signal=candidate_signal,
+                    )
                 self.latest_checkpoint = checkpoint
                 self.state = SessionState.CHECKPOINT
                 return self._snapshot()
@@ -787,7 +855,12 @@ class SpecialistSession:
             )
         return _evidence_matches_obligation(record, obligation)
 
-    def request_checkpoint(self, reason: str = "controller-request") -> SessionResult:
+    def request_checkpoint(
+        self,
+        reason: str = "controller-request",
+        *,
+        candidate_signal: _CandidateRetentionSignal | None = None,
+    ) -> SessionResult:
         """Request a structured checkpoint; never force a final report."""
         self.conversation.add_user(
             "Checkpoint requested (not a final report). Reason: "
@@ -809,9 +882,11 @@ class SpecialistSession:
         if turn.text:
             self.conversation.add_assistant_text(turn.text)
         checkpoint = self._checkpoint_from_text(turn.text)
-        candidate_text_seen = _contains_candidate_shaped_text(turn.text)
-        needs_repair = checkpoint is None or (
-            candidate_text_seen and not checkpoint.candidate_finding_ids
+        candidate_signal = (candidate_signal or _CandidateRetentionSignal()).merged(
+            _candidate_retention_signal(turn.text)
+        )
+        needs_repair = checkpoint is None or _candidate_retention_lost(
+            candidate_signal, checkpoint,
         )
         if needs_repair:
             self.conversation.add_user(
@@ -832,11 +907,11 @@ class SpecialistSession:
                 if repair.text:
                     self.conversation.add_assistant_text(repair.text)
                 checkpoint = self._checkpoint_from_text(repair.text)
-                candidate_text_seen = candidate_text_seen or _contains_candidate_shaped_text(
-                    repair.text
+                candidate_signal = candidate_signal.merged(
+                    _candidate_retention_signal(repair.text)
                 )
-        retention_unknown = candidate_text_seen and (
-            checkpoint is None or not checkpoint.candidate_finding_ids
+        retention_unknown = _candidate_retention_lost(
+            candidate_signal, checkpoint,
         )
         fallback_projection = checkpoint is None
         if fallback_projection:
