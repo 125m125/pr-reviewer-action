@@ -21,6 +21,7 @@ import tempfile
 import time
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Protocol
+from urllib.parse import urlsplit
 
 from pr_reviewer.conversation import Conversation
 from pr_reviewer.specialists import classify_file_roles
@@ -74,6 +75,7 @@ from .scheduler import SessionScheduler, WaveResult, WaveSnapshot
 from .types import (
     BudgetUsage,
     CandidateFinding,
+    change_overview_orientation,
     CoverageObligation,
     ObligationStatus,
     ReviewHandoff,
@@ -89,12 +91,9 @@ _MAX_ARTIFACT_ITEMS = 2_000
 _MAX_CHANGE_OVERVIEW_ITEMS = 12
 _PROHIBITED_OVERVIEW_CLAIM = re.compile(
     r"(?i)\b(?:approve|approval|request[_ -]?changes|verdict|findings?|"
-    r"blocker|bugs?|defects?|vulnerabilit(?:y|ies)|regressions?|risks?|"
+    r"blocker|bugs?|defects?|vulnerabilit(?:y|ies)|"
     r"unsafe|safe\s+to\s+merge|ready\s+to\s+merge|merge[- ]safe|"
-    r"drops?|dropped|dropping|data\s+loss|corrupts?|corrupted|"
-    r"prevents?|causes?|leads?\s+to|results?\s+in|"
     r"coverage\s+(?:is\s+)?(?:complete|sufficient|verified)|"
-    r"tests?\s+(?:pass|passed|passing)|"
     r"(?:is|are|was|were|has\s+been|have\s+been)\s+"
     r"(?:fully\s+)?(?:verified|validated|tested|covered)|"
     r"every\s+(?:branch|path|case)\s+(?:is\s+)?tested|"
@@ -102,15 +101,24 @@ _PROHIBITED_OVERVIEW_CLAIM = re.compile(
 )
 _PATH_WITH_DIRECTORY = re.compile(
     r"(?<![A-Za-z0-9_./:-])"
-    r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z][A-Za-z0-9_-]{0,15}"
+    r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+"
 )
 _ROOT_FILE_REFERENCE = re.compile(
     r"(?<![A-Za-z0-9_./:-])"
-    r"[A-Za-z0-9_-]+\.[A-Za-z][A-Za-z0-9_-]{0,15}\b"
+    r"(?:[A-Za-z0-9_-]+\.[A-Za-z][A-Za-z0-9_-]{0,62}"
+    r"|\.[A-Za-z0-9_-]+)\b"
 )
-_URL_REFERENCE = re.compile(
-    r"(?i)\b(?:https?://|www\.|"
-    r"(?:[A-Za-z0-9-]+\.)+(?:com|org|net|io|dev|edu|gov|co|app)/)\S+"
+_PROSE_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_./-])[A-Za-z0-9_.-]+"
+    r"(?:/[A-Za-z0-9_.-]+)*(?![A-Za-z0-9_./-])"
+)
+_URL_CANDIDATE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_.-])(?:"
+    r"https?://[^\s<>()]+|"
+    r"www\.(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}(?:/[^\s<>()]*)?|"
+    r"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}/[^\s<>()]*|"
+    r"(?:[A-Za-z0-9-]+\.){2,}[A-Za-z]{2,63}"
+    r")"
 )
 _SIGNAL_ORIENTATION_TOPICS = {
     "implementation": (ReviewOrientationTopic.IMPLEMENTATION,),
@@ -687,6 +695,7 @@ class ReviewInputs:
     policy: ReviewPolicy
     config: RuntimeConfig
     changed_files: tuple[str, ...]
+    tracked_paths: tuple[str, ...] = ()
     artifact_path: Path | str = Path("specialist-review-artifact.json")
     allow_approve: bool = False
     publishing_mode: str = "review_comment"
@@ -739,13 +748,56 @@ def _overview_text(value: object, label: str, *, limit: int) -> str:
     return text
 
 
-def _prose_path_references(value: str) -> tuple[str, ...]:
+def _domain_name(value: str) -> bool:
+    labels = value.rstrip(".").split(".")
+    if len(labels) < 2 or not 2 <= len(labels[-1]) <= 63:
+        return False
+    if not labels[-1].isalpha():
+        return False
+    label_pattern = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    return all(bool(re.fullmatch(label_pattern, label)) for label in labels)
+
+
+def _url_reference_spans(value: str) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    for match in _URL_CANDIDATE.finditer(value):
+        candidate = match.group(0).rstrip(".,;:!?)]}")
+        parsed = urlsplit(
+            candidate if "://" in candidate else f"https://{candidate}",
+        )
+        hostname = parsed.hostname or ""
+        if hostname == "localhost" or _domain_name(hostname):
+            spans.append((match.start(), match.start() + len(candidate)))
+    return tuple(spans)
+
+
+def _prose_path_references(
+    value: str,
+    tracked_paths: Iterable[str] = (),
+) -> tuple[str, ...]:
     normalized = value.replace("\\", "/")
     references: list[str] = []
     occupied: list[tuple[int, int]] = []
-    url_spans = tuple(match.span() for match in _URL_REFERENCE.finditer(normalized))
+    url_spans = _url_reference_spans(normalized)
+
+    def is_url_span(start: int) -> bool:
+        return any(span_start <= start < span_end for span_start, span_end in url_spans)
+
+    tracked = {
+        str(path).replace("\\", "/").strip("/")
+        for path in tracked_paths
+        if str(path).strip()
+    }
+    for match in _PROSE_TOKEN.finditer(normalized):
+        if is_url_span(match.start()):
+            continue
+        reference = match.group(0).rstrip(".,;:!?)]}")
+        if reference in tracked:
+            if reference not in references:
+                references.append(reference)
+            occupied.append(match.span())
     for match in _PATH_WITH_DIRECTORY.finditer(normalized):
-        if any(start <= match.start() < end for start, end in url_spans):
+        if is_url_span(match.start()):
             continue
         reference = match.group(0).rstrip(".,;:!?)]}")
         if reference and reference not in references:
@@ -754,7 +806,7 @@ def _prose_path_references(value: str) -> tuple[str, ...]:
     for match in _ROOT_FILE_REFERENCE.finditer(normalized):
         if any(start <= match.start() < end for start, end in occupied):
             continue
-        if any(start <= match.start() < end for start, end in url_spans):
+        if is_url_span(match.start()):
             continue
         reference = match.group(0).rstrip(".,;:!?)]}")
         if reference.lower().startswith("www."):
@@ -800,11 +852,16 @@ def _validated_change_overview(
         for path in inputs.changed_files
         if str(path).strip()
     }
+    tracked_paths = {
+        str(path).replace("\\", "/").strip("/")
+        for path in (*inputs.tracked_paths, *inputs.changed_files)
+        if str(path).strip()
+    }
     component_ids, path_components = _change_components(inputs)
 
     def admitted_text(raw: object, label: str, *, limit: int) -> str:
         text = _overview_text(raw, label, limit=limit)
-        for reference in _prose_path_references(text):
+        for reference in _prose_path_references(text, tracked_paths):
             path = reference.replace("\\", "/").strip("/")
             if path not in changed_paths:
                 raise ValueError(
@@ -1900,7 +1957,9 @@ class ReviewController:
                     "config": inputs.config,
                     "pr_metadata": inputs.pr_metadata,
                     "policy": inputs.policy,
-                    "change_overview": state.change_overview,
+                    "change_overview": change_overview_orientation(
+                        state.change_overview,
+                    ),
                 },
             )
             result = apply_planner_transformations(
@@ -2310,7 +2369,9 @@ class ReviewController:
                         "negotiation_state": negotiation_state,
                         "pr_metadata": state.inputs.pr_metadata,
                         "policy": state.inputs.policy,
-                        "change_overview": state.change_overview,
+                        "change_overview": change_overview_orientation(
+                            state.change_overview,
+                        ),
                     },
                 )
                 if not isinstance(raw, Mapping):
@@ -2494,7 +2555,9 @@ class ReviewController:
                         "changed_files": state.inputs.changed_files,
                         "pr_metadata": state.inputs.pr_metadata,
                         "policy": state.inputs.policy,
-                        "change_overview": state.change_overview,
+                        "change_overview": change_overview_orientation(
+                            state.change_overview,
+                        ),
                     },
                 )
                 critic_result = _validated_critic_result(
@@ -2810,7 +2873,9 @@ class ReviewController:
                             "what_changed": context.what_changed,
                             "ai_reviewed": context.ai_reviewed,
                         },
-                        "change_overview": state.change_overview,
+                        "change_overview": change_overview_orientation(
+                            state.change_overview,
+                        ),
                     },
                 )
                 proposal = _finalizer_proposal(proposed)

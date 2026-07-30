@@ -21,6 +21,7 @@ from .request_attempts import RequestAttemptJournal
 from .types import (
     BudgetUsage,
     CandidateFinding,
+    change_overview_orientation,
     CoverageObligation,
     ObligationStatus,
     RunPhase,
@@ -351,7 +352,9 @@ def specialist_assignment_prompt(
             "predicates. Bounded, truncated, or omitted context does not prove "
             "that other content is absent."
         ),
-        "change_overview": _assignment_json_value(change_overview or {}),
+        "change_overview": _assignment_json_value(
+            change_overview_orientation(change_overview),
+        ),
     }
     return "Immutable specialist assignment:\n" + json.dumps(
         payload, sort_keys=True,

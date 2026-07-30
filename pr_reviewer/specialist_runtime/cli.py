@@ -710,10 +710,11 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
                 "reason": "immutable object IDs are invalid",
             }],
         }
+    tracked_paths = _tracked_paths(root)
     topology = build_topology(
         complete_pr_files,
         classification,
-        _tracked_paths(root),
+        tracked_paths,
         policy.legacy_projection(),
         change_facts=change_facts,
     )
@@ -734,6 +735,7 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
         policy=policy,
         config=config.runtime,
         changed_files=changed_files,
+        tracked_paths=tracked_paths,
         artifact_path="specialist-review-artifact.json",
         allow_approve=_bool(config.environment, "ALLOW_APPROVE", False),
         publishing_mode=publish_mode,

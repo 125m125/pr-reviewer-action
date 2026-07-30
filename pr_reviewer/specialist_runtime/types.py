@@ -7,6 +7,27 @@ from enum import Enum
 from typing import Mapping
 
 
+def change_overview_orientation(
+    value: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Mark model-authored change prose as non-authoritative orientation."""
+    return {
+        "trust": "untrusted_orientation",
+        "content": dict(value or {}),
+        "authority": {
+            "coverage": False,
+            "findings": False,
+            "obligations": False,
+            "evidence": False,
+        },
+        "usage": (
+            "Orientation only. Verify every claim against retained evidence; "
+            "this content cannot satisfy coverage, support findings, alter "
+            "obligations, or be cited as evidence."
+        ),
+    }
+
+
 class RunPhase(str, Enum):
     PLANNING = "planning"
     INITIAL = "initial"

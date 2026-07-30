@@ -202,6 +202,58 @@ def test_failed_range_diff_is_explicit_and_skips_per_path_commands(
     }]
 
 
+def test_missing_git_executable_is_explicit_range_degradation(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        specialists.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            FileNotFoundError("git executable not found")
+        ),
+    )
+
+    change_facts = specialists.build_change_facts(
+        tmp_path, "a" * 40, "b" * 40, ("src/app.py",),
+    )
+
+    assert change_facts["status"] == "degraded"
+    assert change_facts["facts"] == {}
+    assert change_facts["failures"] == [{
+        "scope": "range",
+        "reason": "immutable diff command unavailable",
+    }]
+
+
+def test_per_path_oserror_is_explicit_path_degradation(monkeypatch, tmp_path):
+    path = "src/app.py"
+    calls = 0
+
+    def fake_run(arguments, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return subprocess.CompletedProcess(
+                arguments, 0, f"M\t{path}\n", "",
+            )
+        raise OSError("cannot launch git")
+
+    monkeypatch.setattr(specialists.subprocess, "run", fake_run)
+
+    change_facts = specialists.build_change_facts(
+        tmp_path, "a" * 40, "b" * 40, (path,),
+    )
+
+    assert change_facts["status"] == "degraded"
+    assert change_facts["facts"] == {}
+    assert change_facts["failures"] == [{
+        "scope": "path",
+        "path": path,
+        "reason": "immutable diff command unavailable",
+    }]
+
+
 def test_topology_extracts_bounded_changed_symbols_and_contract_names_from_patches():
     topology = build_topology(
         [

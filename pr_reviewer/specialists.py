@@ -292,18 +292,33 @@ def build_change_facts(
         path for path in (_posix(item) for item in changed_paths) if path
     ))
     paths = all_paths[:_MAX_CHANGE_FACT_PATHS]
-    status_result = subprocess.run(
-        [
-            "git", "diff", "--name-status", "--find-renames",
-            f"{base_sha}...{head_sha}", "--",
-        ],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    try:
+        status_result = subprocess.run(
+            [
+                "git", "diff", "--name-status", "--find-renames",
+                f"{base_sha}...{head_sha}", "--",
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return {
+            "facts": {},
+            "bounded": True,
+            "path_limit": _MAX_CHANGE_FACT_PATHS,
+            "included_path_count": 0,
+            "omitted_path_count": len(all_paths),
+            "failed_path_count": 0,
+            "status": "degraded",
+            "failures": [{
+                "scope": "range",
+                "reason": "immutable diff command unavailable",
+            }],
+        }
     if status_result.returncode != 0:
         return {
             "facts": {},
@@ -337,19 +352,27 @@ def build_change_facts(
                 "reason": "immutable diff path unavailable",
             })
             continue
-        result = subprocess.run(
-            [
-                "git", "diff", "--no-ext-diff", "--no-color",
-                "--find-renames", "--unified=3",
-                f"{base_sha}...{head_sha}", "--", path,
-            ],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "git", "diff", "--no-ext-diff", "--no-color",
+                    "--find-renames", "--unified=3",
+                    f"{base_sha}...{head_sha}", "--", path,
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError:
+            failures.append({
+                "scope": "path",
+                "path": path,
+                "reason": "immutable diff command unavailable",
+            })
+            continue
         if result.returncode != 0:
             failures.append({
                 "scope": "path",

@@ -17,6 +17,7 @@ from pr_reviewer.specialist_runtime.controller import ReviewResult, RoleRequest
 from pr_reviewer.specialist_runtime.model_gateway import ModelTurnRequest
 from pr_reviewer.specialist_runtime.policy import ReviewPolicy
 from pr_reviewer.specialist_runtime.types import (
+    change_overview_orientation,
     ReviewHandoff,
     ReviewNote,
     ReviewNoteKind,
@@ -1345,7 +1346,9 @@ def test_recovery_reuses_complete_semantic_assignment_prompt(
     assert payload["obligation_briefs"][0]["obligation_id"] == obligation.id
     assert payload["changed_context"][0]["path"] == "worker/delivery.py"
     assert payload["changed_context_omitted_paths"] == 3
-    assert payload["change_overview"] == change_overview
+    assert payload["change_overview"] == change_overview_orientation(
+        change_overview,
+    )
     assert session.change_overview == change_overview
     assert payload["exploration_contract"].index("read_pr_diff") < (
         payload["exploration_contract"].index("read_file")
