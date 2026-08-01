@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import time
 
 import pytest
@@ -1717,7 +1718,7 @@ def test_finalizer_failure_builds_useful_sparse_handoff_from_controller_state(tm
 
     assert result.handoff.markdown.startswith("## AI Review Handoff")
     assert result.handoff.what_changed == (
-        "`src/worker.py` changes runtime implementation behavior.",
+        result.artifact["change_overview"]["overview"],
     )
     assert result.handoff.ai_reviewed == (
         "Reviewed runtime implementation behavior in `src/worker.py`.",
@@ -1738,7 +1739,8 @@ def test_finalizer_failure_builds_useful_sparse_handoff_from_controller_state(tm
     assert "read_file" not in result.handoff.markdown
     assert "review the complete change" in result.handoff.markdown
     assert any(
-        item["component"] == "finalizer" for item in result.artifact["degradation"]
+        item["component"] == "handoff_summarizer"
+        for item in result.artifact["degradation"]
     )
 
 
@@ -1762,7 +1764,7 @@ def test_finalizer_can_only_select_controller_backed_behavioral_summaries(tmp_pa
     result = _controller(tmp_path, finalizer=finalizer).run(_inputs(tmp_path))
 
     assert result.handoff.what_changed == (
-        "`src/worker.py` changes runtime implementation behavior.",
+        result.artifact["change_overview"]["overview"],
     )
     assert result.handoff.ai_reviewed == (
         "Reviewed runtime implementation behavior in `src/worker.py`.",
@@ -1771,7 +1773,163 @@ def test_finalizer_can_only_select_controller_backed_behavioral_summaries(tmp_pa
     assert result.handoff.human_focus == ("Failure recovery",)
 
 
-def test_finalizer_cannot_reduce_multi_file_change_summary_below_two_items(tmp_path):
+def test_handoff_summarizer_writes_behavioral_review_handoff_from_validated_state(
+    tmp_path,
+):
+    inputs = replace(
+        _inputs(tmp_path),
+        topology={
+            **_inputs(tmp_path).topology,
+            "components": [{"id": "worker", "paths": ["src/worker.py"]}],
+        },
+    )
+
+    def summarizer(request):
+        # The recorded wire-role name remains stable for offline replay.
+        assert request.role == "finalizer"
+        assert request.context["change_overview"]["content"]["overview"]
+        assert request.context["successful_review_facts"]["covered_obligation_ids"]
+        return {
+            "ai_reviewed_summary": (
+                "The review traced retry handling in `src/worker.py` through the "
+                "delivery obligation and its retained implementation evidence."
+            ),
+            "human_focus": (
+                "Recheck failure recovery at the worker boundary, especially behavior "
+                "after an ambiguous delivery result."
+            ),
+            "referenced_paths": ["src/worker.py"],
+            "referenced_component_ids": ["worker"],
+            "referenced_obligation_ids": [
+                request.context["successful_review_facts"][
+                    "covered_obligation_ids"
+                ][0]
+            ],
+        }
+
+    result = _controller(tmp_path, finalizer=summarizer).run(inputs)
+
+    assert result.handoff.what_changed == (
+        result.artifact["change_overview"]["overview"],
+    )
+    assert result.handoff.ai_reviewed == (
+        "The review traced retry handling in `src/worker.py` through the delivery "
+        "obligation and its retained implementation evidence.",
+    )
+    assert result.handoff.human_focus == (
+        "Recheck failure recovery at the worker boundary, especially behavior after "
+        "an ambiguous delivery result.",
+    )
+    behavioral_summary = " ".join((
+        *result.handoff.what_changed,
+        *result.handoff.ai_reviewed,
+        *result.handoff.human_focus,
+    ))
+    assert len(re.findall(r"[.!?](?:\s|$)", behavioral_summary)) == 3
+    assert "- `src/worker.py` changes runtime implementation behavior." not in (
+        result.handoff.markdown
+    )
+    from scripts.eval_harness import _unsupported_handoff_lines
+
+    assert _unsupported_handoff_lines(result.artifact) == []
+
+
+@pytest.mark.parametrize(
+    "proposal",
+    (
+        {
+            "ai_reviewed_summary": "The review covered `src/invented.py`.",
+            "human_focus": "Recheck the worker boundary.",
+            "referenced_paths": ["src/invented.py"],
+            "referenced_component_ids": ["worker"],
+            "referenced_obligation_ids": [],
+        },
+        {
+            "ai_reviewed_summary": "The review covered the invented gateway.",
+            "human_focus": "Recheck the worker boundary.",
+            "referenced_paths": [],
+            "referenced_component_ids": ["invented-gateway"],
+            "referenced_obligation_ids": [],
+        },
+        {
+            "ai_reviewed_summary": "The review traced the invented gateway.",
+            "human_focus": "Recheck the invented boundary.",
+            "referenced_paths": [],
+            "referenced_component_ids": [],
+            "referenced_obligation_ids": [],
+        },
+        {
+            "ai_reviewed_summary": "All obligations are fully covered; approve.",
+            "human_focus": "No further review is required.",
+            "referenced_paths": [],
+            "referenced_component_ids": [],
+            "referenced_obligation_ids": [],
+        },
+        {
+            "ai_reviewed_summary": "Retry behavior can duplicate delivery.",
+            "human_focus": "The blocker at src/worker.py:8 must be fixed.",
+            "referenced_paths": ["src/worker.py"],
+            "referenced_component_ids": ["worker"],
+            "referenced_obligation_ids": [],
+        },
+    ),
+)
+def test_handoff_summarizer_rejects_unsupported_or_detailed_prose(
+    proposal, tmp_path,
+):
+    result = _controller(
+        tmp_path, finalizer=lambda _request: proposal,
+    ).run(_inputs(tmp_path))
+
+    assert result.artifact["evaluation_status"] == "degraded"
+    assert any(
+        item["component"] == "handoff_summarizer"
+        for item in result.artifact["degradation"]
+    )
+    assert "invented" not in result.handoff.markdown
+    assert "fully covered" not in result.handoff.markdown
+    assert "duplicate delivery" not in result.handoff.markdown
+
+
+def test_change_overview_rejects_multi_sentence_handoff_summary(tmp_path):
+    inputs = _inputs(tmp_path)
+    proposal = {
+        "overview": (
+            "The worker now retries delivery. The action also changes its timeout."
+        ),
+        "key_changes": [{
+            "path": "src/worker.py",
+            "component": "worker",
+            "summary": "Adds bounded retry orchestration.",
+        }],
+        "cross_component_effects": [],
+        "uncertainties": [],
+    }
+
+    with pytest.raises(ValueError, match="one sentence"):
+        controller_module._validated_change_overview(proposal, inputs)
+
+
+def test_handoff_summarizer_failure_preserves_concise_coverage_warning(tmp_path):
+    result = _controller(
+        tmp_path,
+        change_summarizer=lambda *_args: (
+            _ for _ in ()
+        ).throw(RuntimeError("change summary failed")),
+        finalizer=lambda *_args: (_ for _ in ()).throw(RuntimeError("summary failed")),
+    ).run(_inputs(tmp_path))
+
+    assert result.handoff.what_changed == (
+        result.artifact["change_overview"]["overview"],
+    )
+    assert len(result.handoff.what_changed) == 1
+    assert len(result.handoff.ai_reviewed) <= 1
+    assert result.handoff.coverage_warning
+    assert "change_summarizer" in result.handoff.coverage_warning
+    assert "handoff_summarizer" in result.handoff.coverage_warning
+
+
+def test_finalizer_reuses_one_validated_whole_change_overview(tmp_path):
     inputs = replace(
         _inputs(tmp_path),
         changed_files=("src/worker.py", "src/helper.py"),
@@ -1789,7 +1947,9 @@ def test_finalizer_cannot_reduce_multi_file_change_summary_below_two_items(tmp_p
 
     result = _controller(tmp_path, finalizer=finalizer).run(inputs)
 
-    assert len(result.handoff.what_changed) == 2
+    assert result.handoff.what_changed == (
+        result.artifact["change_overview"]["overview"],
+    )
 
 
 def test_behavioral_handoff_candidates_prioritize_high_risk_beyond_file_prefix():
@@ -3311,7 +3471,7 @@ def test_finalizer_proposal_selects_only_authorized_orientation(tmp_path):
 
     result = _controller(tmp_path, finalizer=finalizer).run(_inputs(tmp_path))
 
-    assert "`src/worker.py` changes runtime implementation behavior." in result.handoff.markdown
+    assert result.artifact["change_overview"]["overview"] in result.handoff.markdown
     assert "invented" not in result.handoff.markdown
     assert "Failure recovery" in result.handoff.markdown
     assert "Security" not in result.handoff.markdown
@@ -3347,7 +3507,7 @@ def test_finalizer_filters_invalid_topics_without_discarding_valid_selection(
     result = _controller(tmp_path, finalizer=finalizer).run(_inputs(tmp_path))
 
     assert result.handoff.review_emphasis == ("Failure recovery",)
-    assert "`src/worker.py` changes runtime implementation behavior." in result.handoff.markdown
+    assert result.artifact["change_overview"]["overview"] in result.handoff.markdown
     assert "invented-private-topic" not in result.handoff.markdown
     assert not any(
         item["component"] == "finalizer"

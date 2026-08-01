@@ -121,6 +121,10 @@ _URL_CANDIDATE = re.compile(
     r"(?:[A-Za-z0-9-]+\.){2,}[A-Za-z]{2,63}"
     r")"
 )
+_HANDOFF_COMPONENT_REFERENCE = re.compile(
+    r"(?i)\b(?:the\s+)?([a-z][a-z0-9_-]{1,63})\s+"
+    r"(?:component|service|gateway|boundary)\b"
+)
 _SIGNAL_ORIENTATION_TOPICS = {
     "implementation": (ReviewOrientationTopic.IMPLEMENTATION,),
     "documentation": (ReviewOrientationTopic.DOCUMENTATION,),
@@ -452,6 +456,17 @@ class FinalizerProposal:
 
 
 @dataclass(frozen=True)
+class HandoffSummaryProposal:
+    """Bounded reviewer-facing prose with explicit controller-owned references."""
+
+    ai_reviewed_summary: str
+    human_focus: str
+    referenced_paths: tuple[str, ...] = ()
+    referenced_component_ids: tuple[str, ...] = ()
+    referenced_obligation_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class EvidenceSeed:
     """Explicit repository/head binding for intentionally reused evidence."""
 
@@ -551,6 +566,47 @@ def _finalizer_proposal(value: object) -> FinalizerProposal:
         recommendation=recommendation,
         what_changed=identifiers("what_changed"),
         ai_reviewed=identifiers("ai_reviewed"),
+    )
+
+
+def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
+    if isinstance(value, HandoffSummaryProposal):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("handoff summarizer must return an object")
+    expected = {
+        "ai_reviewed_summary", "human_focus", "referenced_paths",
+        "referenced_component_ids", "referenced_obligation_ids",
+    }
+    if set(value) != expected:
+        raise ValueError("handoff summarizer fields are invalid")
+
+    def text(key: str) -> str:
+        item = " ".join(str(value.get(key) or "").split())
+        if not item or len(item) > 600:
+            raise ValueError(f"handoff summarizer {key} is invalid")
+        # Keep each section a summary rather than a hidden finding list.
+        if len(re.findall(r"[.!?](?:\s|$)", item)) != 1:
+            raise ValueError(f"handoff summarizer {key} must be one sentence")
+        return item
+
+    def identifiers(key: str) -> tuple[str, ...]:
+        raw = value.get(key)
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, (tuple, list)):
+            raise TypeError(f"handoff summarizer {key} must be an array")
+        selected = tuple(dict.fromkeys(
+            str(item).strip() for item in raw if str(item).strip()
+        ))
+        if len(selected) > 12:
+            raise ValueError(f"handoff summarizer {key} is too large")
+        return selected
+
+    return HandoffSummaryProposal(
+        ai_reviewed_summary=text("ai_reviewed_summary"),
+        human_focus=text("human_focus"),
+        referenced_paths=identifiers("referenced_paths"),
+        referenced_component_ids=identifiers("referenced_component_ids"),
+        referenced_obligation_ids=identifiers("referenced_obligation_ids"),
     )
 
 
@@ -790,6 +846,8 @@ def _overview_text(value: object, label: str, *, limit: int) -> str:
         raise ValueError(
             f"change overview {label} claims verdict, findings, or coverage"
         )
+    if label == "overview" and len(re.findall(r"[.!?](?:\s|$)", text)) != 1:
+        raise ValueError("change overview must be exactly one sentence")
     return text
 
 
@@ -2735,6 +2793,10 @@ class ReviewController:
                 or "changed_contract_facts" not in state.inputs.topology
             ),
         )
+        overview = str(state.change_overview.get("overview") or "").strip()
+        if overview:
+            what_changed = (overview,)
+        ai_reviewed = ai_reviewed[:1]
         return ReviewHandoffContext(
             recommendation=state.verdict,
             status=status,
@@ -2761,6 +2823,7 @@ class ReviewController:
             ),
             source_access_requests=tuple(state.source_requests),
             what_changed=what_changed,
+            what_changed_is_validated_overview=bool(overview),
             ai_reviewed=ai_reviewed,
         )
 
@@ -2852,6 +2915,104 @@ class ReviewController:
             )))[:3],
         )
 
+    def _apply_handoff_summary_proposal(
+        self,
+        state: _RunState,
+        base: ReviewHandoffContext,
+        proposal: HandoffSummaryProposal,
+    ) -> ReviewHandoffContext:
+        """Admit concise prose only when every declared authority reference exists."""
+        changed_paths = set(state.inputs.changed_files)
+        component_ids = set(base.component_ids)
+        assert state.coverage is not None
+        coverage = state.coverage.snapshot()
+        covered_ids = {
+            obligation_id
+            for obligation_id, status in coverage.obligation_statuses
+            if status is ObligationStatus.COVERED
+        }
+        if not set(proposal.referenced_paths) <= changed_paths:
+            raise ValueError("handoff summary references an unchanged path")
+        if not set(proposal.referenced_component_ids) <= component_ids:
+            raise ValueError("handoff summary references an unknown component")
+        if not set(proposal.referenced_obligation_ids) <= covered_ids:
+            raise ValueError("handoff summary claims unsupported obligation coverage")
+
+        combined = (
+            proposal.ai_reviewed_summary + " " + proposal.human_focus
+        )
+        prose_paths = {
+            path.replace("\\", "/").strip("/")
+            for path in _prose_path_references(
+                combined, {*state.inputs.tracked_paths, *state.inputs.changed_files},
+            )
+        }
+        if not prose_paths <= set(proposal.referenced_paths):
+            raise ValueError("handoff summary contains an undeclared path")
+        declared_components = {
+            item.casefold() for item in proposal.referenced_component_ids
+        }
+        allowed_components = {item.casefold() for item in component_ids}
+        concrete_component_refs = {
+            match.group(1).casefold()
+            for match in _HANDOFF_COMPONENT_REFERENCE.finditer(combined)
+            if match.group(1).casefold() not in {
+                "cross", "human", "repository", "runtime", "security",
+                "system", "trust",
+            }
+        }
+        if (
+            not concrete_component_refs <= declared_components
+            or not concrete_component_refs <= allowed_components
+        ):
+            raise ValueError(
+                "handoff summary contains an undeclared or unknown component"
+            )
+
+        normalized = " ".join(combined.casefold().split())
+        forbidden_judgments = (
+            "approve", "request changes", "request_changes", "merge safe",
+            "safe to merge", "no further review", "no issues", "fully covered",
+            "all obligations", "complete coverage",
+        )
+        if any(value in normalized for value in forbidden_judgments):
+            raise ValueError("handoff summary attempts to change verdict or coverage")
+        if re.search(
+            r"(?:^|\s)(?:blocker|major|minor|finding|defect)\b|"
+            r"(?:^|[\s`])[^`\s]+:\d+(?:\b|`)",
+            normalized,
+        ):
+            raise ValueError("detailed findings belong in review notes")
+
+        # Do not let a candidate claim leak into the sticky handoff even when it
+        # happens to use valid changed paths and components.
+        detailed_claims = tuple(
+            " ".join(str(value).casefold().split())
+            for candidate in (
+                *state.review.accepted,
+                *state.review.unknowns,
+                *state.review.verification_requests,
+            )
+            for value in (
+                getattr(candidate, "claim", ""),
+                getattr(candidate, "user_visible_consequence", ""),
+            )
+            if len(" ".join(str(value).split())) >= 16
+        )
+        if any(claim in normalized for claim in detailed_claims):
+            raise ValueError("detailed finding claim belongs in a review note")
+
+        overview = str(state.change_overview.get("overview") or "").strip()
+        if not overview:
+            raise ValueError("validated change overview is unavailable")
+        return replace(
+            base,
+            what_changed=(overview,),
+            ai_reviewed=(proposal.ai_reviewed_summary,),
+            review_emphasis_topics=(),
+            human_focus=(proposal.human_focus,),
+        )
+
     @staticmethod
     def _minimal_handoff(verdict: str, degraded: bool) -> ReviewHandoff:
         recommendation = {
@@ -2922,6 +3083,13 @@ class ReviewController:
         context = self._handoff_context(state, status)
         if self.finalizer is not None and state.deadline.remaining(now=self.clock()) > 0:
             try:
+                coverage_snapshot = state.coverage.snapshot()
+                covered_obligation_ids = tuple(
+                    obligation_id
+                    for obligation_id, obligation_status
+                    in coverage_snapshot.obligation_statuses
+                    if obligation_status is ObligationStatus.COVERED
+                )
                 proposed = self._model_request(
                     state,
                     role="finalizer",
@@ -2944,37 +3112,102 @@ class ReviewController:
                         "change_overview": change_overview_orientation(
                             state.change_overview,
                         ),
+                        "successful_review_facts": {
+                            "covered_obligation_ids": covered_obligation_ids,
+                            "evidence_paths": tuple(sorted({
+                                record.source_path
+                                for record in state.evidence.snapshot().records
+                                if record.is_usable_for_coverage
+                                and record.source_path
+                            })),
+                            "specialist_scopes": tuple(
+                                tuple(assignment.boundary_paths)
+                                for assignment in state.assignments.values()
+                                if assignment.id in state.assignment_sessions
+                            ),
+                            "note_themes": tuple(sorted({
+                                note.severity for note in state.notes
+                                if note.severity
+                            })),
+                            "degraded_stages": context.degraded_stages,
+                        },
                     },
                 )
-                proposal = _finalizer_proposal(proposed)
-                context = self._apply_finalizer_proposal(state, context, proposal)
-                state.journal.emit("finalizer_proposal_applied", {
-                    "recommendation": proposal.recommendation,
-                    "change_topics": tuple(
-                        item.value for item in context.change_topics
-                    ),
-                    "component_ids": context.component_ids,
-                    "specialist_topics": tuple(
-                        item.value for item in context.specialist_topics
-                    ),
-                    "recipe_ids": context.recipe_ids,
-                    "coverage_boundary_topics": tuple(
-                        item.value for item in context.coverage_boundary_topics
-                    ),
-                    "review_emphasis_topics": tuple(
-                        item.value for item in context.review_emphasis_topics
-                    ),
-                    "what_changed": context.what_changed,
-                    "ai_reviewed": context.ai_reviewed,
-                })
+                if isinstance(proposed, Mapping) and {
+                    "ai_reviewed_summary", "human_focus",
+                } <= set(proposed):
+                    summary = _handoff_summary_proposal(proposed)
+                    context = self._apply_handoff_summary_proposal(
+                        state, context, summary,
+                    )
+                    state.journal.emit("handoff_summary_applied", {
+                        "referenced_paths": summary.referenced_paths,
+                        "referenced_component_ids": (
+                            summary.referenced_component_ids
+                        ),
+                        "referenced_obligation_ids": (
+                            summary.referenced_obligation_ids
+                        ),
+                        "change_topics": tuple(
+                            item.value for item in context.change_topics
+                        ),
+                        "component_ids": context.component_ids,
+                        "specialist_topics": tuple(
+                            item.value for item in context.specialist_topics
+                        ),
+                        "recipe_ids": context.recipe_ids,
+                        "coverage_boundary_topics": tuple(
+                            item.value for item in context.coverage_boundary_topics
+                        ),
+                        "review_emphasis_topics": (),
+                        "what_changed": context.what_changed,
+                        "what_changed_is_validated_overview": True,
+                        "ai_reviewed": context.ai_reviewed,
+                        "human_focus": context.human_focus,
+                    })
+                else:
+                    # Typed in-process integrations using the pre-v2 selector
+                    # remain readable; production adapters request authored prose.
+                    proposal = _finalizer_proposal(proposed)
+                    context = self._apply_finalizer_proposal(
+                        state, context, proposal,
+                    )
+                    state.journal.emit("finalizer_proposal_applied", {
+                        "recommendation": proposal.recommendation,
+                        "change_topics": tuple(
+                            item.value for item in context.change_topics
+                        ),
+                        "component_ids": context.component_ids,
+                        "specialist_topics": tuple(
+                            item.value for item in context.specialist_topics
+                        ),
+                        "recipe_ids": context.recipe_ids,
+                        "coverage_boundary_topics": tuple(
+                            item.value for item in context.coverage_boundary_topics
+                        ),
+                        "review_emphasis_topics": tuple(
+                            item.value for item in context.review_emphasis_topics
+                        ),
+                        "what_changed": context.what_changed,
+                        "what_changed_is_validated_overview": (
+                            context.what_changed_is_validated_overview
+                        ),
+                        "ai_reviewed": context.ai_reviewed,
+                    })
             except Exception as exc:
-                self._degrade(state, "finalizer", _bounded_error(exc))
+                self._degrade(state, "handoff_summarizer", _bounded_error(exc))
                 context = self._handoff_context(state, "degraded")
         elif self.finalizer is None:
-            self._degrade(state, "finalizer", "deterministic sparse handoff fallback")
+            self._degrade(
+                state, "handoff_summarizer",
+                "deterministic sparse handoff fallback",
+            )
             context = self._handoff_context(state, "degraded")
         else:
-            self._degrade(state, "deadline", "finalizer model skipped after absolute deadline")
+            self._degrade(
+                state, "deadline",
+                "handoff summarizer skipped after absolute deadline",
+            )
             context = self._handoff_context(state, "degraded")
         try:
             state.handoff = build_review_handoff(
@@ -2982,7 +3215,7 @@ class ReviewController:
                 obligations=obligation_map, changed_files=state.inputs.changed_files,
             )
         except Exception as exc:
-            self._degrade(state, "finalizer", _bounded_error(exc))
+            self._degrade(state, "handoff_summarizer", _bounded_error(exc))
             state.handoff = self._minimal_handoff(state.verdict, True)
 
     def _phase_allocations(self, state: _RunState) -> list[dict[str, object]]:

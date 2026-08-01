@@ -67,7 +67,8 @@ _ROLE_SYSTEM = {
         "{\"overview\":string,\"key_changes\":[{\"path\":string,\"component\":string,"
         "\"summary\":string}],\"cross_component_effects\":[{\"components\":[string,"
         "...],\"summary\":string}],\"uncertainties\":[string,...]}. Every path and "
-        "component must be copied exactly from the supplied controller facts. Do not "
+        "component must be copied exactly from the supplied controller facts. `overview` "
+        "must be exactly one concise sentence ending in punctuation. Do not "
         "state a consequence, defect, risk, verdict, finding, severity, approval or "
         "merge-safety judgment, verification result, test result, review result, or "
         "coverage claim. Describe only changed behavior and purpose from bounded "
@@ -116,6 +117,19 @@ _ROLE_SYSTEM = {
         + _ORIENTATION_TOPIC_VOCABULARY
         + ". component_ids and recipe_ids must use exact IDs present in the supplied state; "
         "detailed claims belong in review notes."
+    ),
+    "handoff_summarizer": (
+        "Write exactly one concise sentence for `ai_reviewed_summary` and one for "
+        "`human_focus`. Return "
+        "{\"ai_reviewed_summary\":string,\"human_focus\":string,"
+        "\"referenced_paths\":[string,...],\"referenced_component_ids\":[string,...],"
+        "\"referenced_obligation_ids\":[string,...]}. Orient a human reviewer around "
+        "behavior and review scope; do not list files, findings, severities, exact defect "
+        "claims, unknowns, verification requests, verdicts, approvals, or merge safety. "
+        "Use only successful_review_facts. Copy every referenced path, component ID, and "
+        "covered obligation ID exactly from that state and declare it in the corresponding "
+        "array. Do not claim complete coverage. The controller reuses the separately "
+        "validated change overview for What changed; do not rewrite it."
     ),
 }
 _SPECIALIST_SYSTEM = (
@@ -774,7 +788,8 @@ def build_controller(
         role_response_format,
     )
     finalizer = _BoundedRoleAdapter(
-        gateway, _role_prompt(config.system_prompt, "finalizer"), config.max_tokens,
+        gateway, _role_prompt(config.system_prompt, "handoff_summarizer"),
+        config.max_tokens,
         role_response_format,
     )
 

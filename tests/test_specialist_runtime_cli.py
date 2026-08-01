@@ -1154,7 +1154,7 @@ def test_json_schema_mode_uses_json_object_for_each_controller_role(monkeypatch,
         assert payload["response_format"] == {"type": "json_object"}
 
 
-def test_finalizer_prompt_enumerates_controller_orientation_vocabulary(
+def test_handoff_summarizer_prompt_limits_prose_to_controller_facts(
     monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
@@ -1162,10 +1162,12 @@ def test_finalizer_prompt_enumerates_controller_orientation_vocabulary(
 
     controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
     prompt = controller.finalizer.system_prompt
+    prompt_lower = prompt.casefold()
 
-    for topic in ReviewOrientationTopic:
-        assert f"`{topic.value}`" in prompt
-    assert "component_ids and recipe_ids" in prompt
+    assert "successful_review_facts" in prompt
+    assert "do not list files, findings, severities" in prompt
+    assert "do not claim complete coverage" in prompt_lower
+    assert "do not rewrite it" in prompt
 
 
 def test_specialist_prompt_requires_exact_honest_changed_locations(

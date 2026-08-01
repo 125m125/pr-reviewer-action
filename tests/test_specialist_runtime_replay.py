@@ -96,7 +96,7 @@ def test_sparse_handoff_keeps_detailed_findings_and_evidence_in_notes():
 
     assert "candidate-" not in handoff
     assert "evidence:" not in handoff
-    assert "`src/main/java/example/api/OrderController.java` changes " in handoff
+    assert result.artifact["change_overview"]["overview"] in handoff
     assert result.artifact["notes"]
     assert all(note.file for note in result.notes if note.kind.value == "finding")
     assert all(note.evidence_ids for note in result.notes if note.kind.value == "finding")

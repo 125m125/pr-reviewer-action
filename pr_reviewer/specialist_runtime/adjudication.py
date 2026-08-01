@@ -165,7 +165,9 @@ class ReviewHandoffContext:
     source_access_requests: tuple[SourceAccessRequest, ...] = ()
     access_request_url: str | None = None
     what_changed: tuple[str, ...] = ()
+    what_changed_is_validated_overview: bool = False
     ai_reviewed: tuple[str, ...] = ()
+    human_focus: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1570,21 +1572,17 @@ def render_review_handoff(handoff: ReviewHandoff) -> str:
     if handoff.status:
         lines.extend(("", f"**Status:** {handoff.status}"))
     if handoff.what_changed:
-        lines.extend(("", "### What changed", "", *[
-            f"- {item}" for item in handoff.what_changed
-        ]))
+        lines.extend(("", "### What changed", "", " ".join(handoff.what_changed)))
     if handoff.ai_reviewed:
-        lines.extend(("", "### What the AI reviewed", "", *[
-            f"- {item}" for item in handoff.ai_reviewed
-        ]))
+        lines.extend((
+            "", "### What the AI reviewed", "", " ".join(handoff.ai_reviewed),
+        ))
     if handoff.thread_status:
         lines.extend(("", f"**Prepared detail notes:** {handoff.thread_status}"))
     if theme_label:
         lines.extend(("", f"**Aggregate finding theme:** {theme_label}"))
     if handoff.human_focus:
-        lines.extend(("", "### Human focus", "", *[
-            f"- {item}" for item in handoff.human_focus
-        ]))
+        lines.extend(("", "### Human focus", "", " ".join(handoff.human_focus)))
     lines.extend((
         "",
         "These focus suggestions do not reduce responsibility to review the complete change.",
@@ -1699,13 +1697,17 @@ def project_review_handoff(
         }
     ))
 
-    def behavioral_summaries(values: Iterable[object], *, limit: int) -> tuple[str, ...]:
+    def behavioral_summaries(
+        values: Iterable[object], *, limit: int, require_path: bool,
+    ) -> tuple[str, ...]:
         selected: list[str] = []
         for value in values:
             text = " ".join(_unicode(value).split())
             if not text or len(text) > 160 or not renderable(text):
                 continue
-            if not any(f"`{path}`" in text for path in changed_paths):
+            if require_path and not any(
+                f"`{path}`" in text for path in changed_paths
+            ):
                 continue
             if text not in selected:
                 selected.append(text)
@@ -1713,8 +1715,23 @@ def project_review_handoff(
                 break
         return tuple(selected)
 
-    what_changed = behavioral_summaries(context.what_changed, limit=5)
-    ai_reviewed = behavioral_summaries(context.ai_reviewed, limit=5)
+    what_changed = behavioral_summaries(
+        context.what_changed,
+        limit=5,
+        require_path=not context.what_changed_is_validated_overview,
+    )
+    ai_reviewed = behavioral_summaries(
+        context.ai_reviewed, limit=3, require_path=True,
+    )
+    human_focus = tuple(
+        text
+        for value in context.human_focus[:2]
+        if (
+            (text := " ".join(_unicode(value).split()))
+            and len(text) <= 600
+            and renderable(text)
+        )
+    )
     prepared_note_count = (
         context.unresolved_thread_count
         if isinstance(context.unresolved_thread_count, int)
@@ -1831,7 +1848,7 @@ def project_review_handoff(
         access_request_url=access_url,
         what_changed=what_changed,
         ai_reviewed=ai_reviewed,
-        human_focus=review_emphasis,
+        human_focus=human_focus or review_emphasis,
     )
     return replace(projection, markdown=render_review_handoff(projection))
 

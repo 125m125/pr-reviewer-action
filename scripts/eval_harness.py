@@ -398,7 +398,12 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
 
     proposal: Mapping[str, Any] = {}
     for event in artifact.get("events", ()):
-        if isinstance(event, Mapping) and event.get("kind") == "finalizer_proposal_applied":
+        if (
+            isinstance(event, Mapping)
+            and event.get("kind") in {
+                "finalizer_proposal_applied", "handoff_summary_applied",
+            }
+        ):
             payload = event.get("payload")
             if isinstance(payload, Mapping):
                 proposal = payload
@@ -496,7 +501,11 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
         ),
         source_access_requests=tuple(source_requests),
         what_changed=values("what_changed"),
+        what_changed_is_validated_overview=bool(
+            proposal.get("what_changed_is_validated_overview", False)
+        ),
         ai_reviewed=values("ai_reviewed"),
+        human_focus=values("human_focus"),
     )
     expected = project_review_handoff(
         context,
