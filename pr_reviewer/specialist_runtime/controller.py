@@ -2145,7 +2145,11 @@ class ReviewController:
             )
             return _validated_change_overview(proposed, state.inputs)
         except Exception as exc:
-            self._degrade(state, "change_summarizer", _bounded_error(exc))
+            state.journal.emit("recovery", {
+                "component": "change_summarizer",
+                "action": "deterministic-fallback",
+                "reason": _bounded_error(exc),
+            })
             return fallback
 
     def _ownership(self, assignment: Assignment, session_id: str, state: _RunState) -> SessionOwnership:
@@ -2487,7 +2491,15 @@ class ReviewController:
                     raise NegotiationError("negotiator result must be an object")
                 return validate_negotiation(raw, negotiation_state).actions
             except Exception as exc:
-                self._degrade(state, "negotiator", _bounded_error(exc))
+                # Negotiation is an optimization layer. The deterministic
+                # fallback below can still produce a bounded follow-up, so a
+                # malformed optional proposal must not make the whole review
+                # appear materially degraded.
+                state.journal.emit("recovery", {
+                    "component": "negotiator",
+                    "action": "deterministic-fallback",
+                    "reason": _bounded_error(exc),
+                })
         try:
             action = fallback_next_action(negotiation_state)
             state.journal.emit("recovery", {
@@ -2796,7 +2808,10 @@ class ReviewController:
         overview = str(state.change_overview.get("overview") or "").strip()
         if overview:
             what_changed = (overview,)
-        ai_reviewed = ai_reviewed[:1]
+        # Keep a small set of behavioral themes in the deterministic fallback.
+        # A single path made the handoff look like a file inventory and hid
+        # the cross-component scope the specialists actually reviewed.
+        ai_reviewed = ai_reviewed[:3]
         return ReviewHandoffContext(
             recommendation=state.verdict,
             status=status,
@@ -3195,28 +3210,46 @@ class ReviewController:
                         "ai_reviewed": context.ai_reviewed,
                     })
             except Exception as exc:
-                self._degrade(state, "handoff_summarizer", _bounded_error(exc))
-                context = self._handoff_context(state, "degraded")
+                state.journal.emit("recovery", {
+                    "component": "handoff_summarizer",
+                    "action": "deterministic-fallback",
+                    "reason": _bounded_error(exc),
+                })
+                context = self._handoff_context(
+                    state, "degraded" if state.degradations else "complete",
+                )
         elif self.finalizer is None:
-            self._degrade(
-                state, "handoff_summarizer",
-                "deterministic sparse handoff fallback",
+            state.journal.emit("recovery", {
+                "component": "handoff_summarizer",
+                "action": "deterministic-fallback",
+                "reason": "no optional handoff summarizer configured",
+            })
+            context = self._handoff_context(
+                state, "degraded" if state.degradations else "complete",
             )
-            context = self._handoff_context(state, "degraded")
         else:
-            self._degrade(
-                state, "deadline",
-                "handoff summarizer skipped after absolute deadline",
+            state.journal.emit("recovery", {
+                "component": "handoff_summarizer",
+                "action": "deterministic-fallback",
+                "reason": "handoff summarizer skipped after absolute deadline",
+            })
+            context = self._handoff_context(
+                state, "degraded" if state.degradations else "complete",
             )
-            context = self._handoff_context(state, "degraded")
         try:
             state.handoff = build_review_handoff(
                 context, review=state.review, evidence=state.evidence,
                 obligations=obligation_map, changed_files=state.inputs.changed_files,
             )
         except Exception as exc:
-            self._degrade(state, "handoff_summarizer", _bounded_error(exc))
-            state.handoff = self._minimal_handoff(state.verdict, True)
+            state.journal.emit("recovery", {
+                "component": "handoff_summarizer",
+                "action": "deterministic-fallback",
+                "reason": _bounded_error(exc),
+            })
+            state.handoff = self._minimal_handoff(
+                state.verdict, bool(state.degradations),
+            )
 
     def _phase_allocations(self, state: _RunState) -> list[dict[str, object]]:
         shares = state.inputs.config.phase_shares

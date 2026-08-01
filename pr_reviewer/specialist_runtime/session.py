@@ -84,7 +84,8 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
                 "required": [
                     "candidate_id", "claim", "affected_location",
                     "causal_chain", "supporting_evidence_ids",
-                    "related_obligation_ids", "user_visible_consequence",
+                    "related_obligation_ids", "confidence_rationale",
+                    "user_visible_consequence",
                     "manual_validation",
                 ],
                 "additionalProperties": False,
@@ -131,7 +132,9 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
     "\"candidate_findings\":[{\"candidate_id\":\"candidate-id\",\"claim\":"
     "\"...\",\"affected_location\":\"path:line\",\"causal_chain\":\"...\","
     "\"supporting_evidence_ids\":[\"evidence:<hash>\"],\"related_obligation_ids\":"
-    "[\"OB-id\"],\"user_visible_consequence\":\"...\",\"manual_validation\":"
+    "[\"OB-id\"],\"confidence_rationale\":\"consequence_support:...; "
+    "evidence_ids=evidence:<hash>; ...\",\"user_visible_consequence\":\"...\","
+    "\"manual_validation\":"
     "\"...\"}],\"unknowns\":[\"OB-id\"]}. To preserve every material issue, "
     "include both its object and ID in candidate_findings and candidate_finding_ids; "
     "an issue omitted from either field will not survive the checkpoint. Use only "
@@ -1158,9 +1161,12 @@ class SpecialistSession:
         causal_chain = str(value.get("causal_chain") or "").strip()
         consequence = str(value.get("user_visible_consequence") or "").strip()
         validation = str(value.get("manual_validation") or "").strip()
+        confidence_rationale = str(
+            value.get("confidence_rationale") or ""
+        ).strip()
         if not all((
             candidate_id, claim, affected_location, causal_chain,
-            consequence, validation,
+            confidence_rationale, consequence, validation,
         )):
             return None
         supporting = _strings(value.get("supporting_evidence_ids"))
@@ -1195,9 +1201,7 @@ class SpecialistSession:
             model_identity=(
                 next(iter(model_identities)) if len(model_identities) == 1 else ""
             ),
-            confidence_rationale=str(
-                value.get("confidence_rationale") or ""
-            ).strip(),
+            confidence_rationale=confidence_rationale,
             user_visible_consequence=consequence,
             manual_validation=validation,
         )

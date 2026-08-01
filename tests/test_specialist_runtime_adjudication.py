@@ -990,6 +990,26 @@ def test_exact_changed_file_without_line_stays_file_anchored():
     assert notes[0].line is None
 
 
+@pytest.mark.parametrize("location", ("src/store.py:41-45", "src/store.py:save"))
+def test_changed_location_ranges_and_symbols_keep_file_anchor(location):
+    store, evidence_id = _store()
+    candidate = _candidate(evidence_ids=(evidence_id,), location=location)
+    review = _adjudicate((candidate,), {candidate.candidate_id: "keep"}, store)
+
+    notes = build_review_notes(
+        review,
+        store,
+        "review_comment",
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert len(notes) == 1
+    assert notes[0].kind is ReviewNoteKind.FINDING
+    assert notes[0].file == "src/store.py"
+    assert notes[0].line is None
+
+
 def test_runtime_supported_severity_policy_and_approval_gate():
     store, evidence_id = _store()
     candidate = _candidate(evidence_ids=(evidence_id,), severity="major")

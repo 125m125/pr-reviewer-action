@@ -257,6 +257,12 @@ def _exact_changed_location(
         line_text = raw[len(prefix):]
         if re.fullmatch(r"[1-9]\d*", line_text):
             return path, int(line_text), "ok"
+        # Preserve a defensible changed-file anchor when a specialist reports
+        # a range; GitHub cannot attach a single review line to that range.
+        if re.fullmatch(r"[1-9]\d*-[1-9]\d*", line_text):
+            return path, None, "ok"
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", line_text):
+            return path, None, "ok"
         break
     return "", None, "invalid"
 
