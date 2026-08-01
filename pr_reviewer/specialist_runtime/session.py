@@ -149,6 +149,46 @@ def _strings(value: object) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
 
 
+def _resolve_retained_evidence_id(
+    value: object,
+    retained: Mapping[str, EvidenceRecord],
+) -> str | None:
+    """Resolve an exact ID or one unambiguous model-shortened ID prefix."""
+    candidate = str(value or "").strip()
+    if candidate in retained:
+        return candidate
+    if not candidate.startswith("evidence:"):
+        return None
+    prefix = candidate[:-3] if candidate.endswith("...") else candidate
+    if len(prefix) < len("evidence:") + 8:
+        return None
+    matches = tuple(item for item in retained if item.startswith(prefix))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _rewrite_rationale_evidence_ids(
+    rationale: str,
+    retained: Mapping[str, EvidenceRecord],
+) -> str:
+    """Expand uniquely shortened evidence IDs in a typed rationale."""
+    parts = []
+    for part in rationale.split(";"):
+        key, separator, raw_values = part.partition("=")
+        if separator and key.strip().casefold() == "evidence_ids":
+            resolved = tuple(dict.fromkeys(
+                item
+                for item in (
+                    _resolve_retained_evidence_id(value, retained)
+                    for value in raw_values.split(",")
+                )
+                if item is not None
+            ))
+            parts.append(f"{key.strip()}={','.join(resolved)}")
+        else:
+            parts.append(part)
+    return ";".join(parts)
+
+
 def _json_object(text: str) -> dict[str, Any] | None:
     if not isinstance(text, str) or not text.strip():
         return None
@@ -1068,7 +1108,13 @@ class SpecialistSession:
         if raw is None or not isinstance(raw.get("unresolved"), list):
             return None
         retained = {record.id: record for record in self.evidence_store.snapshot().records}
-        evidence_ids = [item for item in _strings(raw.get("evidence_ids")) if item in retained]
+        evidence_ids = list(dict.fromkeys(
+            item for item in (
+                _resolve_retained_evidence_id(value, retained)
+                for value in _strings(raw.get("evidence_ids"))
+            )
+            if item is not None
+        ))
         inspected = {_normalized_path(item) for item in _strings(raw.get("inspected"))}
         for record in retained.values():
             if (
@@ -1084,10 +1130,17 @@ class SpecialistSession:
             for obligation_id, ids in declared.items():
                 if obligation_id not in assigned:
                     continue
-                for evidence_id in _strings(ids):
-                    record = retained.get(evidence_id)
+                for raw_evidence_id in _strings(ids):
+                    evidence_id = _resolve_retained_evidence_id(
+                        raw_evidence_id, retained,
+                    )
+                    record = retained.get(evidence_id) if evidence_id else None
                     obligation = self.coverage.obligation(obligation_id)
-                    if record is not None and self._record_matches_obligation(record, obligation):
+                    if (
+                        evidence_id is not None
+                        and record is not None
+                        and self._record_matches_obligation(record, obligation)
+                    ):
                         self.coverage.attach_evidence(obligation_id, evidence_id)
                         evidence_ids.append(evidence_id)
         # The compact `inspected` checkpoint form associates retained inspected
@@ -1169,12 +1222,25 @@ class SpecialistSession:
             confidence_rationale, consequence, validation,
         )):
             return None
-        supporting = _strings(value.get("supporting_evidence_ids"))
-        contradicting = _strings(value.get("contradicting_evidence_ids"))
+        raw_supporting = _strings(value.get("supporting_evidence_ids"))
+        raw_contradicting = _strings(value.get("contradicting_evidence_ids"))
+        supporting = tuple(dict.fromkeys(
+            item for item in (
+                _resolve_retained_evidence_id(value, retained)
+                for value in raw_supporting
+            )
+            if item is not None
+        ))
+        contradicting = tuple(dict.fromkeys(
+            item for item in (
+                _resolve_retained_evidence_id(value, retained)
+                for value in raw_contradicting
+            )
+            if item is not None
+        ))
         obligations = _strings(value.get("related_obligation_ids"))
         if (
             not supporting
-            or any(item not in retained for item in (*supporting, *contradicting))
             or not obligations
             or any(item not in assigned for item in obligations)
         ):
@@ -1201,7 +1267,9 @@ class SpecialistSession:
             model_identity=(
                 next(iter(model_identities)) if len(model_identities) == 1 else ""
             ),
-            confidence_rationale=confidence_rationale,
+            confidence_rationale=_rewrite_rationale_evidence_ids(
+                confidence_rationale, retained,
+            ),
             user_visible_consequence=consequence,
             manual_validation=validation,
         )

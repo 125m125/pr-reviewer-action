@@ -1402,6 +1402,29 @@ def test_degraded_session_is_promoted_once_across_initial_followup_and_finalizat
     assert "worker-flow" not in result.handoff.markdown
 
 
+def test_transient_initial_session_degradation_is_cleared_by_finalization(tmp_path):
+    class TransientlyDegradedSession(_ResumeSession):
+        def explore(self):
+            result = super().explore()
+            return replace(result, degraded=self.calls == 1)
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return TransientlyDegradedSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    result = _controller(tmp_path, session_factory=factory).run(_inputs(tmp_path))
+
+    assert not any(
+        item["component"].startswith("specialist:")
+        for item in result.artifact["degradation"]
+    )
+
+
 def test_critic_failure_rejects_ambiguous_candidate(tmp_path):
     ambiguous = CandidateFinding(
         candidate_id="ambiguous",
@@ -1920,6 +1943,10 @@ def test_handoff_summarizer_failure_preserves_concise_coverage_warning(tmp_path)
     ).run(_inputs(tmp_path))
 
     assert result.handoff.what_changed == (
+        result.artifact["change_overview"]["overview"],
+    )
+    assert not re.match(
+        r"^\d+ changed paths? across \d+ components?\.$",
         result.artifact["change_overview"]["overview"],
     )
     assert len(result.handoff.what_changed) == 1

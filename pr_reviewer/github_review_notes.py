@@ -2076,7 +2076,12 @@ mutation ResolveManagedThread($threadId: ID!) {
 """.strip()
 
 _SPECIALIST_HANDOFF_MARKER = "<!-- ai-pr-review-specialist-handoff -->"
-_TRUSTED_WORKFLOW_COMMENT_AUTHOR = "github-actions[bot]"
+_TRUSTED_WORKFLOW_COMMENT_AUTHORS = frozenset({
+    # REST represents the workflow actor with the ``[bot]`` suffix while
+    # GraphQL exposes the same actor as ``github-actions``.
+    "github-actions",
+    "github-actions[bot]",
+})
 
 
 class GhReviewClient:
@@ -2287,7 +2292,7 @@ class GhReviewClient:
                     node.get("viewerDidAuthor") is True
                     and author_login == viewer_login
                 )
-                or author_login == _TRUSTED_WORKFLOW_COMMENT_AUTHOR
+                or author_login in _TRUSTED_WORKFLOW_COMMENT_AUTHORS
             )
             if (
                 isinstance(body, str)

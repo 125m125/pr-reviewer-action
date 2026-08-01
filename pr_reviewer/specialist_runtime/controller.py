@@ -1105,12 +1105,46 @@ def _deterministic_change_overview(inputs: ReviewInputs) -> dict[str, object]:
             "summary": summary[:500],
         })
     omitted = max(0, len(inputs.changed_files) - len(changes))
-    overview = (
-        f"{len(inputs.changed_files)} changed "
-        f"{'path' if len(inputs.changed_files) == 1 else 'paths'} across "
-        f"{max(1, len(component_ids))} "
-        f"{'component' if len(component_ids) == 1 else 'components'}."
-    )
+    # A count is useful metadata but is not a human handoff. Build a bounded
+    # behavioral sentence from the same immutable facts when the model
+    # summarizer is unavailable or its proposal fails validation.
+    def overview_priority(row: Mapping[str, str]) -> tuple[int, str]:
+        roles = set(classify_file_roles(row["path"]))
+        if "trust-boundary" in roles:
+            rank = 0
+        elif "implementation" in roles and "test" not in roles:
+            rank = 1
+        elif {"configuration", "build-manifest"} & roles:
+            rank = 2
+        elif "test" in roles:
+            rank = 3
+        elif "documentation" in roles:
+            rank = 5
+        else:
+            rank = 4
+        return rank, row["path"]
+
+    selected_summaries: list[str] = []
+    for row in sorted(changes, key=overview_priority):
+        summary = " ".join(row["summary"].split())
+        if not summary or summary in selected_summaries:
+            continue
+        selected_summaries.append(summary.rstrip("."))
+        if len(selected_summaries) >= 3:
+            break
+    component_text = ", ".join(sorted(component_ids)[:5]) or "repository behavior"
+    if selected_summaries:
+        overview = (
+            f"This change updates {component_text}; key changes include "
+            + "; ".join(item[:220] for item in selected_summaries)
+            + "."
+        )
+    else:
+        overview = (
+            f"This change updates {component_text} across "
+            f"{len(inputs.changed_files)} changed "
+            f"{'path' if len(inputs.changed_files) == 1 else 'paths'}."
+        )
     uncertainties: list[str] = []
     if omitted:
         uncertainties.append(
@@ -1734,7 +1768,11 @@ class ReviewController:
         assignment_id: str,
         result: object,
     ) -> None:
-        if not bool(getattr(result, "degraded", False)):
+        checkpoint = getattr(result, "checkpoint", None)
+        retention_unknown = _CANDIDATE_RETENTION_UNKNOWN in tuple(
+            getattr(checkpoint, "unknowns", ())
+        )
+        if not bool(getattr(result, "degraded", False)) and not retention_unknown:
             return
         component = f"specialist:{assignment_id}"
         if any(item.get("component") == component for item in state.degradations):
@@ -2280,9 +2318,6 @@ class ReviewController:
             state.sessions[expected_session_id] = item.session
             state.assignment_sessions[item.assignment_id] = expected_session_id
             state.session_results[(item.assignment_id, expected_session_id)] = item.session_result
-            self._promote_degraded_session_result(
-                state, item.assignment_id, item.session_result,
-            )
             self._admit_specialist_request_events(state, item.session_result)
             state.ownership[item.session_result.session_id] = self._ownership(
                 assignment, item.session_result.session_id, state,
@@ -4020,6 +4055,15 @@ class ReviewController:
                             "specialist finalization completed at the absolute deadline",
                         )
                         break
+            # A checkpoint can be marked degraded while the worker is still
+            # recoverable.  Only promote the final retained result (or a
+            # session that could not be finalized) to the run-level status;
+            # otherwise a transient initial flag permanently poisons an
+            # otherwise successful finalization.
+            for (assignment_id, _session_id), result in tuple(
+                state.session_results.items()
+            ):
+                self._promote_degraded_session_result(state, assignment_id, result)
             candidates = self._collect_candidates(state)
             self._adjudicate(state, candidates)
             state.source_requests.extend(inputs.source_access_requests)

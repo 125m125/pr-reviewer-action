@@ -1837,6 +1837,51 @@ def test_sticky_updates_exact_github_actions_bot_handoff_after_viewer_identity_c
     )]
 
 
+def test_sticky_recognizes_graphql_github_actions_actor_name(
+    monkeypatch, tmp_path
+):
+    client = GhReviewClient(action_root=tmp_path)
+    writes = []
+
+    def fake_graphql(query, _variables):
+        if "ManagedReviewIdentity" in query:
+            return {"data": {
+                "viewer": {"login": "maintainer"},
+                "repository": {
+                    "nameWithOwner": "owner/repo",
+                    "pullRequest": {"id": "PR-node"},
+                },
+            }}
+        if "ManagedIssueComments" in query:
+            return {"data": {"node": {"comments": _connection([{
+                "databaseId": 41,
+                "url": _issue_url(41),
+                "body": "<!-- ai-pr-review-specialist-handoff -->\nPrevious run",
+                "viewerDidAuthor": False,
+                "author": {"login": "github-actions"},
+            }])}}}
+        raise AssertionError(query)
+
+    monkeypatch.setattr(client, "_graphql", fake_graphql)
+    monkeypatch.setattr(
+        client,
+        "_api_write",
+        lambda endpoint, method, payload: writes.append((endpoint, method, payload))
+        or {"id": 41, "url": _issue_url(41)},
+    )
+
+    client.update_sticky(
+        "owner/repo", 17,
+        "<!-- ai-pr-review-specialist-handoff -->\nCurrent run",
+    )
+
+    assert writes == [(
+        "repos/owner/repo/issues/comments/41",
+        "PATCH",
+        {"body": "<!-- ai-pr-review-specialist-handoff -->\nCurrent run"},
+    )]
+
+
 def test_sticky_post_timeout_reconciles_exact_owned_body_without_retry(monkeypatch, tmp_path):
     client = GhReviewClient(action_root=tmp_path)
     body = "<!-- ai-pr-review-specialist-handoff -->\nSparse handoff"

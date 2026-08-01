@@ -21,7 +21,11 @@ from pr_reviewer.specialist_runtime.evidence import (
 )
 from pr_reviewer.specialist_runtime.model_gateway import ModelTurnResult
 from pr_reviewer.specialist_runtime.request_attempts import RequestAttemptJournal
-from pr_reviewer.specialist_runtime.session import SpecialistSession
+from pr_reviewer.specialist_runtime.session import (
+    SpecialistSession,
+    _resolve_retained_evidence_id,
+    _rewrite_rationale_evidence_ids,
+)
 from pr_reviewer.specialist_runtime.types import (
     BudgetLimits,
     CoverageObligation,
@@ -91,6 +95,23 @@ def candidate_checkpoint_response(candidate_ids):
         finish_reason="stop", usage={"prompt_tokens": 3, "completion_tokens": 2},
         request_diagnostics={},
     )
+
+
+def test_shortened_evidence_ids_are_expanded_only_when_unambiguous():
+    retained = {
+        "evidence:abcdef0123456789": object(),
+        "evidence:fedcba9876543210": object(),
+    }
+
+    assert (
+        _resolve_retained_evidence_id("evidence:abcdef01...", retained)
+        == "evidence:abcdef0123456789"
+    )
+    assert _resolve_retained_evidence_id("evidence:abc...", retained) is None
+    assert _rewrite_rationale_evidence_ids(
+        "consequence_support:reachable_input_path; evidence_ids=evidence:abcdef01...",
+        retained,
+    ).endswith("evidence_ids=evidence:abcdef0123456789")
 
 
 @dataclass(frozen=True)
