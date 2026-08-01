@@ -45,12 +45,12 @@ replay and provider capacity have been demonstrated.
 | `specialist_max_sessions` | added | `8` | `8` | Bounds initial specialist assignments. |
 | `specialist_max_followup_sessions` | added | `2` | `2` | Bounds reassignment/critic follow-up. |
 | `specialist_max_model_turns_per_session` | added | `64` | `64` | Caps lifetime turns for each logical session, including recovery. |
-| `specialist_max_tool_calls_per_session` | added | `20` | `20` | Caps read-only evidence gathering per session. |
+| `specialist_max_tool_calls_per_session` | added | `128` | `128` | Allows multi-call evidence turns without exhausting tools before the 64-turn lifetime bound; actual calls remain controller-accounted. |
 | `specialist_max_recoveries_per_session` | added | `1` | `1` | Allows one bounded reconstruction without endless retrying. |
 | `specialist_config_file` | deprecated | `.github/ai-review-specialists.json` | Retain only while translating version-1 recipes | One-release compatibility alias; `review_policy_file` is the version-2 authority. |
 | `specialist_max_initial_passes` | deprecated | `6` | Replace with `specialist_max_sessions: "8"` | Legacy alias, not the version-2 session limit. |
 | `specialist_max_followup_passes` | deprecated | `2` | Replace with `specialist_max_followup_sessions: "2"` | Legacy alias, not the version-2 follow-up limit. |
-| `specialist_max_tool_calls_per_pass` | deprecated | `20` | Replace with `specialist_max_tool_calls_per_session: "20"` | Legacy alias; the new limit is lifetime-per-session. |
+| `specialist_max_tool_calls_per_pass` | deprecated | `128` | Replace with `specialist_max_tool_calls_per_session: "128"` | Legacy alias; the new limit is lifetime-per-session. |
 | `specialist_tool_mode` | retained | `native_loop` | `native_loop` | Uses durable read-only specialist sessions; `packet` is deprecated. |
 | `specialist_planner_max_tool_calls` | deprecated | `2` | Remove it; use `specialist_max_tool_calls_per_session` for evidence gathering | The planner role does not expose tools, so this compatibility input is a no-op and warns when customized. |
 | `specialist_planner_max_tokens` | retained | `2048` | `2048` | Keeps the planning scout concise before specialist work begins. |

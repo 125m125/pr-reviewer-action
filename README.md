@@ -220,14 +220,14 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_max_sessions` | Maximum initial specialist sessions | No | `8` |
 | `specialist_max_followup_sessions` | Maximum bounded follow-up specialist sessions | No | `2` |
 | `specialist_max_model_turns_per_session` | Lifetime model-turn limit for one logical specialist session | No | `64` |
-| `specialist_max_tool_calls_per_session` | Lifetime read-only tool-call limit for one logical specialist session | No | `20` |
+| `specialist_max_tool_calls_per_session` | Lifetime read-only tool-call limit for one logical specialist session | No | `128` |
 | `specialist_max_recoveries_per_session` | Lifetime reconstruction limit for one logical specialist session | No | `1` |
 | `specialist_config_file` | Deprecated one-release alias for a version-1 policy; migrate to `review_policy_file` | No | `.github/ai-review-specialists.json` |
 | `specialist_planner_max_tool_calls` | Deprecated no-op; the planner role does not expose tools. Use `specialist_max_tool_calls_per_session` | No | `2` |
 | `specialist_planner_max_tokens` | Completion-token ceiling for the bounded planning scout | No | `2048` |
 | `specialist_max_initial_passes` | Deprecated one-release alias for `specialist_max_sessions` | No | `6` |
 | `specialist_max_followup_passes` | Deprecated one-release alias for `specialist_max_followup_sessions` | No | `2` |
-| `specialist_max_tool_calls_per_pass` | Deprecated one-release alias for `specialist_max_tool_calls_per_session` | No | `20` |
+| `specialist_max_tool_calls_per_pass` | Deprecated one-release alias for `specialist_max_tool_calls_per_session` | No | `128` |
 | `specialist_tool_mode` | `native_loop` uses durable read-only specialist sessions; `packet` is deprecated | No | `native_loop` |
 | `specialist_planner_model` | Planning/scout model; empty inherits `ai_model` | No | `""` |
 | `specialist_model` | Specialist model; empty inherits `ai_model` | No | `""` |

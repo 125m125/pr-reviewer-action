@@ -99,6 +99,17 @@ def test_inert_legacy_limits_are_explicitly_deprecated_while_live_limits_remain_
     assert "durable sessions do not issue truncation-continuation turns" in text
 
 
+def test_migration_recommends_tool_capacity_for_multi_call_turns():
+    table = parse_migration_input_table()
+    text = MIGRATION.read_text(encoding="utf-8")
+
+    assert table["specialist_max_tool_calls_per_session"]["default"] == "128"
+    assert table["specialist_max_tool_calls_per_pass"]["default"] == "128"
+    assert "specialist_max_tool_calls_per_session: \"128\"" in text
+    assert "multi-call evidence turns" in text
+    assert "controller-accounted" in text
+
+
 def test_documented_v2_policy_parses_with_real_policy_api_and_is_source_safe(tmp_path):
     policy_path = tmp_path / "ai-review-policy.json"
     policy_path.write_text(json.dumps(documented_v2_policy()), encoding="utf-8")
