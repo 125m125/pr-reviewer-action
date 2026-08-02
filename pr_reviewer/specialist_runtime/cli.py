@@ -1032,6 +1032,106 @@ def _summary_cell(value: object, *, limit: int = 240) -> str:
     )
 
 
+def _degradation_summary_rows(
+    artifact: Mapping[str, object],
+) -> tuple[tuple[str, str, str], ...]:
+    """Project detailed runtime diagnostics into the step-summary-sized view.
+
+    The full event journal and session snapshots remain in the JSON artifact.
+    This projection keeps the GitHub step summary actionable without copying
+    model output or unbounded evidence into the job log.
+    """
+    degradations = tuple(
+        item for item in artifact.get("degradation", ())
+        if isinstance(item, Mapping)
+    )
+    events = tuple(
+        item for item in artifact.get("events", ())
+        if isinstance(item, Mapping)
+    )
+    sessions = {
+        str(item.get("assignment_id")): item
+        for item in artifact.get("sessions", ())
+        if isinstance(item, Mapping) and item.get("assignment_id")
+    }
+    rows: list[tuple[str, str, str]] = []
+    specialist_components = set()
+    for item in degradations:
+        component = str(item.get("component", "unknown"))
+        if not component.startswith("specialist:"):
+            rows.append((
+                component,
+                str(item.get("reason", "unspecified")),
+                "",
+            ))
+            continue
+        assignment_id = component.removeprefix("specialist:")
+        specialist_components.add(assignment_id)
+        result_events = tuple(
+            event.get("payload", {})
+            for event in events
+            if event.get("kind") == "specialist_result_degraded"
+            and isinstance(event.get("payload"), Mapping)
+            and event["payload"].get("assignment_id") == assignment_id
+        )
+        result_event = result_events[-1] if result_events else {}
+        session = sessions.get(assignment_id, {})
+        budget = session.get("budget", {})
+        diagnostics = tuple(
+            item for item in session.get("finalization_diagnostics", ())
+            if isinstance(item, Mapping)
+        )
+        invalid_ids = tuple(dict.fromkeys(
+            str(candidate_id)
+            for diagnostic in diagnostics
+            for candidate_id in diagnostic.get("candidate_finding_ids", ())
+            if str(candidate_id).strip()
+        ))
+        if invalid_ids:
+            repair_attempted = any(
+                str(diagnostic.get("attempt", "")) == "repair"
+                for diagnostic in diagnostics
+            )
+            reason = (
+                "finalization returned candidate IDs that were not retained"
+                + ("; bounded repair still returned invalid IDs" if repair_attempted else "")
+                + ": " + ", ".join(invalid_ids[:4])
+            )
+        elif bool(result_event.get("candidate_retention_unknown")):
+            reason = (
+                "candidate retention could not be proven after checkpoint"
+                f" (checkpoint candidates: {result_event.get('candidate_count', 0)})"
+            )
+        elif bool(result_event.get("result_degraded")):
+            reason = "specialist finalization degraded without a retained result"
+        else:
+            reason = str(item.get("reason", "unspecified"))
+        budget_text = ""
+        if isinstance(budget, Mapping):
+            budget_text = (
+                f"turns={budget.get('model_turns', '?')}; "
+                f"tools={budget.get('tool_calls', '?')}"
+            )
+        rows.append((component, reason, budget_text))
+
+    # Recovery events are not represented in the top-level degradation list,
+    # but they explain why a model-produced summary was replaced. Include
+    # them once so the step summary exposes that failure boundary too.
+    listed_components = {
+        str(item.get("component", "")) for item in degradations
+    }
+    for event in events:
+        if event.get("kind") != "recovery" or not isinstance(event.get("payload"), Mapping):
+            continue
+        payload = event["payload"]
+        component = str(payload.get("component", "recovery"))
+        if component in listed_components:
+            continue
+        listed_components.add(component)
+        rows.append((component, str(payload.get("reason", "unspecified")), ""))
+    return tuple(rows)
+
+
 def emit_deprecation_warnings(config: CliConfig) -> None:
     for name in config.deprecation_warnings:
         replacement = {
@@ -1122,10 +1222,7 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
     planner_repaired = str(
         bool(assignment_plan.get("planner_repaired", False))
     ).lower()
-    degradations = tuple(
-        item for item in artifact.get("degradation", ())
-        if isinstance(item, Mapping)
-    ) if isinstance(artifact, Mapping) else ()
+    diagnostic_rows = _degradation_summary_rows(artifact)
     summary_lines = [
         "# Specialist review",
         "",
@@ -1135,21 +1232,23 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
         f"- Publishing ready: `{str(result.publishing_ready).lower()}`",
         f"- Assignment plan: `{plan_source}` (repaired: `{planner_repaired}`)",
     ]
-    if degradations:
+    if diagnostic_rows:
         summary_lines.extend((
             "",
             "## Degradation diagnostics",
             "",
-            "| Component | Reason |",
-            "| --- | --- |",
+            "| Component | Diagnostic | Budget |",
+            "| --- | --- | --- |",
         ))
         summary_lines.extend(
             "| "
-            + _summary_cell(item.get("component", "unknown"), limit=80)
+            + _summary_cell(component, limit=80)
             + " | "
-            + _summary_cell(item.get("reason", "unspecified"))
+            + _summary_cell(reason)
+            + " | "
+            + _summary_cell(budget, limit=80)
             + " |"
-            for item in degradations
+            for component, reason, budget in diagnostic_rows
         )
     (root / "specialist-review-summary.md").write_text(
         "\n".join(summary_lines) + "\n",

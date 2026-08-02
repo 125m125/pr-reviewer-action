@@ -199,6 +199,63 @@ def test_cli_writes_structured_handoff_notes_artifact_and_compatibility_output(
     assert "fallback after &lt;timeout&gt;" in summary
 
 
+def test_degradation_summary_exposes_specialist_root_causes_without_model_dump():
+    artifact = {
+        "degradation": [
+            {
+                "component": "specialist:fallback-combined-1",
+                "reason": "specialist completed with degraded retained state",
+            },
+        ],
+        "events": [
+            {
+                "kind": "specialist_result_degraded",
+                "payload": {
+                    "assignment_id": "fallback-combined-1",
+                    "candidate_count": 2,
+                    "candidate_retention_unknown": False,
+                    "result_degraded": True,
+                },
+            },
+            {
+                "kind": "recovery",
+                "payload": {
+                    "component": "change_summarizer",
+                    "reason": "ValueError: summary claims coverage",
+                },
+            },
+        ],
+        "sessions": [
+            {
+                "assignment_id": "fallback-combined-1",
+                "budget": {"model_turns": 18, "tool_calls": 19},
+                "finalization_diagnostics": [
+                    {
+                        "attempt": "initial",
+                        "code": "invalid_candidate_finding_references",
+                        "candidate_finding_ids": ["finding:one", "finding:two"],
+                    },
+                    {
+                        "attempt": "repair",
+                        "code": "invalid_candidate_finding_references",
+                        "candidate_finding_ids": ["finding:one"],
+                    },
+                ],
+            },
+        ],
+    }
+
+    rows = cli._degradation_summary_rows(artifact)
+
+    assert rows[0] == (
+        "specialist:fallback-combined-1",
+        "finalization returned candidate IDs that were not retained; "
+        "bounded repair still returned invalid IDs: finding:one, finding:two",
+        "turns=18; tools=19",
+    )
+    assert rows[1] == ("change_summarizer", "ValueError: summary claims coverage", "")
+
+
 def test_cli_rejects_incomplete_or_wrong_current_head_snapshot(monkeypatch, tmp_path):
     write_review_workspace(tmp_path)
     monkeypatch.chdir(tmp_path)

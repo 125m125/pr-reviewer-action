@@ -1365,6 +1365,7 @@ class _RunState:
     collision_dispositions: list[dict[str, object]] = field(default_factory=list)
     source_requests: list[SourceAccessRequest] = field(default_factory=list)
     retention_verification_requests: tuple[Mapping[str, object], ...] = ()
+    coverage_verification_requests: tuple[Mapping[str, object], ...] = ()
     unknowns: list[dict[str, object]] = field(default_factory=list)
     degradations: list[dict[str, str]] = field(default_factory=list)
     review: AdjudicatedReview = field(default_factory=AdjudicatedReview)
@@ -1896,6 +1897,7 @@ class ReviewController:
             + len(state.review.verification_requests)
             + len(state.inputs.verification_requests)
             + len(state.retention_verification_requests)
+            + len(state.coverage_verification_requests)
             + len(state.source_requests)
         )
 
@@ -3301,6 +3303,7 @@ class ReviewController:
                 state.obligations,
                 state.blocking_obligation_ids,
             )
+            state.coverage_verification_requests = coverage_verification_requests
             state.notes = build_review_notes(
                 state.review, state.evidence, state.effective_publishing_mode,
                 obligations=obligation_map, changed_files=state.inputs.changed_files,
