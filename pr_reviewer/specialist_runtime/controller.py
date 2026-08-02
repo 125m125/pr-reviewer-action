@@ -586,8 +586,13 @@ def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
         if not item or len(item) > 600:
             raise ValueError(f"handoff summarizer {key} is invalid")
         # Keep each section a summary rather than a hidden finding list.
-        if len(re.findall(r"[.!?](?:\s|$)", item)) != 1:
-            raise ValueError(f"handoff summarizer {key} must be one sentence")
+        sentence_ends = list(re.finditer(r"[.!?](?:\s|$)", item))
+        if len(sentence_ends) > 1:
+            # Preserve the useful first sentence instead of discarding the
+            # complete handoff when a compatible model appends explanation.
+            item = item[:sentence_ends[0].end()].strip()
+        elif not sentence_ends:
+            item += "."
         return item
 
     def identifiers(key: str) -> tuple[str, ...]:
@@ -647,6 +652,76 @@ def _critic_response_diagnostics(value: object) -> dict[str, object]:
         "action_count": action_count,
         "ignored_fields": tuple(sorted(extra_fields)),
     }
+
+
+def _coverage_verification_requests(
+    obligations: Iterable[CoverageObligation],
+    blocking_obligation_ids: Iterable[str],
+) -> tuple[Mapping[str, object], ...]:
+    """Create explicit human checks for policy-blocking coverage gaps."""
+    obligation_map = {item.id: item for item in obligations}
+    requests: list[Mapping[str, object]] = []
+    for obligation_id in sorted({str(item).strip() for item in blocking_obligation_ids}):
+        obligation = obligation_map.get(obligation_id)
+        if obligation is None:
+            continue
+        subject = " ".join(str(obligation.subject).split()) or obligation.id
+        reason = " ".join(str(obligation.explanation).split()) or (
+            "The specialist review did not retain enough evidence to resolve "
+            "this mandatory high-risk obligation."
+        )
+        requests.append({
+            "question": (
+                "Can a human verify the unresolved high-risk obligation "
+                f"'{subject}' before merging?"
+            ),
+            "reason": reason,
+            "related_obligation_ids": (obligation.id,),
+        })
+    return tuple(requests)
+
+
+def _deterministic_handoff_focus(
+    obligations: Iterable[CoverageObligation],
+    blocking_obligation_ids: Iterable[str],
+    degraded: bool,
+) -> tuple[str, ...]:
+    del degraded
+    obligation_map = {item.id: item for item in obligations}
+    subjects = tuple(dict.fromkeys(
+        " ".join(str(obligation_map[item].subject).split())
+        for item in sorted({str(value).strip() for value in blocking_obligation_ids})
+        if item in obligation_map and str(obligation_map[item].subject).strip()
+    ))
+    if subjects:
+        return (
+            "Recheck the unresolved high-risk coverage questions in the detail "
+            "notes, especially " + "; ".join(subjects[:3]) + ".",
+        )
+    # Without a concrete unresolved obligation, keep the legacy orientation
+    # labels; there is no specific human action to summarize here.
+    return ()
+
+
+def _deterministic_reviewed_summary(
+    *,
+    changed_files: Iterable[str],
+    component_ids: Iterable[str],
+    reviewed_obligations: Iterable[CoverageObligation],
+) -> tuple[str, ...]:
+    del changed_files
+    if not tuple(reviewed_obligations):
+        return ()
+    components = tuple(dict.fromkeys(
+        " ".join(str(item).split())
+        for item in component_ids
+        if str(item).strip()
+    ))
+    scope = " and ".join(components[:4]) or "the affected components"
+    return (
+        "The AI checked retained evidence across " + scope + " for the assigned "
+        "review obligations; unresolved areas are listed in the detail notes.",
+    )
 
 
 def _validated_critic_result(
@@ -1147,43 +1222,81 @@ def _deterministic_change_overview(inputs: ReviewInputs) -> dict[str, object]:
     # A count is useful metadata but is not a human handoff. Build a bounded
     # behavioral sentence from the same immutable facts when the model
     # summarizer is unavailable or its proposal fails validation.
-    def overview_priority(row: Mapping[str, str]) -> tuple[int, str]:
-        roles = set(classify_file_roles(row["path"]))
-        if "trust-boundary" in roles:
-            rank = 0
-        elif "implementation" in roles and "test" not in roles:
-            rank = 1
-        elif {"configuration", "build-manifest"} & roles:
-            rank = 2
-        elif "test" in roles:
-            rank = 3
-        elif "documentation" in roles:
-            rank = 5
-        else:
-            rank = 4
-        return rank, row["path"]
+    changed_paths = tuple(str(path).replace("\\", "/") for path in inputs.changed_files)
+    path_roles = {
+        path: set(classify_file_roles(path)) for path in changed_paths
+    }
+    themes: list[str] = []
 
-    selected_summaries: list[str] = []
-    for row in sorted(changes, key=overview_priority):
-        summary = " ".join(row["summary"].split())
-        if not summary or summary in selected_summaries:
-            continue
-        selected_summaries.append(summary.rstrip("."))
-        if len(selected_summaries) >= 3:
-            break
-    component_text = ", ".join(sorted(component_ids)[:5]) or "repository behavior"
-    if selected_summaries:
-        overview = (
-            f"This change updates {component_text}; key changes include "
-            + "; ".join(item[:220] for item in selected_summaries)
-            + "."
-        )
-    else:
-        overview = (
-            f"This change updates {component_text} across "
-            f"{len(inputs.changed_files)} changed "
-            f"{'path' if len(inputs.changed_files) == 1 else 'paths'}."
-        )
+    def add_theme(value: str) -> None:
+        if value not in themes:
+            themes.append(value)
+
+    if any(
+        path == "action.yml" or ".github/workflows/" in path
+        for path in changed_paths
+    ):
+        add_theme("workflow/action configuration")
+    if any(
+        "implementation" in path_roles[path] or path.startswith("pr_reviewer/")
+        for path in changed_paths
+    ):
+        add_theme("review-runtime behavior")
+    if any(
+        "github_review_notes" in path or "publish" in path
+        for path in changed_paths
+    ):
+        add_theme("publishing and handoff behavior")
+    if any("test" in path_roles[path] or path.startswith("evals/") for path in changed_paths):
+        add_theme("regression/evaluation coverage")
+    if any("documentation" in path_roles[path] for path in changed_paths):
+        add_theme("operator documentation")
+    if not themes:
+        themes.append("repository behavior")
+
+    specifics: list[str] = []
+
+    def add_specific(value: str) -> None:
+        if value not in specifics:
+            specifics.append(value)
+
+    workflow_keys = {
+        str(key).casefold()
+        for fact in facts.values()
+        if isinstance(fact, Mapping)
+        for key in fact.get("workflow_keys", ())
+        if isinstance(fact.get("workflow_keys", ()), (list, tuple))
+    }
+    if "specialist_max_tool_calls_per_session" in workflow_keys:
+        add_specific("specialist tool-call budgeting")
+    if any(
+        path.endswith("conversation.py") or "reasoning" in path.casefold()
+        for path in changed_paths
+    ):
+        add_specific("reasoning/session continuity")
+    if any(
+        path.endswith("controller.py") or path.endswith("session.py")
+        for path in changed_paths
+    ):
+        add_specific("specialist-session recovery and candidate retention")
+    if any(
+        "github_review_notes" in path or "publish" in path
+        for path in changed_paths
+    ):
+        add_specific("review handoff publishing")
+    if any("test" in path_roles[path] or path.startswith("evals/") for path in changed_paths):
+        add_specific("regression verification")
+    if not specifics:
+        specifics.append("the changed components and their integration contracts")
+
+    component_text = ", ".join(sorted(component_ids)[:5]) or "the changed components"
+    overview = (
+        f"This change updates {component_text}; it covers "
+        + ", ".join(themes[:5])
+        + "; the main behavioral areas are "
+        + ", ".join(specifics[:4])
+        + "."
+    )
     uncertainties: list[str] = []
     if omitted:
         uncertainties.append(
@@ -2897,18 +3010,30 @@ class ReviewController:
         overview = str(state.change_overview.get("overview") or "").strip()
         if overview:
             what_changed = (overview,)
-        # Keep a small set of behavioral themes in the deterministic fallback.
-        # A single path made the handoff look like a file inventory and hid
-        # the cross-component scope the specialists actually reviewed.
-        ai_reviewed = ai_reviewed[:3]
+        component_ids = tuple(sorted(
+            str(item.get("id", ""))
+            for item in state.inputs.topology.get("components", ())
+            if isinstance(item, Mapping) and str(item.get("id", "")).strip()
+        ))
+        summarized_review = _deterministic_reviewed_summary(
+            changed_files=state.inputs.changed_files,
+            component_ids=component_ids,
+            reviewed_obligations=reviewed_obligations,
+        )
+        if summarized_review and status == "degraded":
+            ai_reviewed = summarized_review
+        else:
+            ai_reviewed = ai_reviewed[:3]
+        human_focus = _deterministic_handoff_focus(
+            state.obligations,
+            state.blocking_obligation_ids,
+            bool(state.degradations),
+        )
         return ReviewHandoffContext(
             recommendation=state.verdict,
             status=status,
             change_topics=change_topics,
-            component_ids=tuple(sorted(
-                str(item.get("id", "")) for item in state.inputs.topology.get("components", ())
-                if isinstance(item, Mapping) and str(item.get("id", "")).strip()
-            )),
+            component_ids=component_ids,
             specialist_topics=specialist_topics,
             recipe_ids=recipe_ids,
             coverage_boundary_topics=coverage_boundary_topics,
@@ -2929,6 +3054,7 @@ class ReviewController:
             what_changed=what_changed,
             what_changed_is_validated_overview=bool(overview),
             ai_reviewed=ai_reviewed,
+            human_focus=human_focus,
         )
 
     def _apply_finalizer_proposal(
@@ -3171,12 +3297,17 @@ class ReviewController:
             state.retention_verification_requests = (
                 self._candidate_retention_verification_requests(state)
             )
+            coverage_verification_requests = _coverage_verification_requests(
+                state.obligations,
+                state.blocking_obligation_ids,
+            )
             state.notes = build_review_notes(
                 state.review, state.evidence, state.effective_publishing_mode,
                 obligations=obligation_map, changed_files=state.inputs.changed_files,
                 verification_requests=(
                     *state.inputs.verification_requests,
                     *state.retention_verification_requests,
+                    *coverage_verification_requests,
                 ),
                 source_access_requests=state.source_requests,
             )
@@ -3185,6 +3316,13 @@ class ReviewController:
             state.notes = ()
         status = "degraded" if state.degradations else "complete"
         context = self._handoff_context(state, status)
+        # Keep the controller-owned prose as the safe fallback for degraded
+        # runs.  A finalizer response can be structurally valid while still
+        # collapsing into a file/method inventory; that is precisely the
+        # situation the deterministic handoff is meant to cover.  The model
+        # may still contribute authorized topics below, but it must not replace
+        # the human-facing behavioral overview or the explicit recheck focus.
+        deterministic_context = context
         if self.finalizer is not None and state.deadline.remaining(now=self.clock()) > 0:
             try:
                 coverage_snapshot = state.coverage.snapshot()
@@ -3325,6 +3463,25 @@ class ReviewController:
             context = self._handoff_context(
                 state, "degraded" if state.degradations else "complete",
             )
+        # Recompute after the optional finalizer: invoking it may itself have
+        # degraded the run, in which case the degraded handoff must include
+        # the broader behavioral fallback and its coverage warning.
+        deterministic_context = self._handoff_context(
+            state, "degraded" if state.degradations else "complete",
+        )
+        if state.degradations:
+            context = replace(
+                context,
+                what_changed=deterministic_context.what_changed,
+                what_changed_is_validated_overview=(
+                    deterministic_context.what_changed_is_validated_overview
+                ),
+                ai_reviewed=deterministic_context.ai_reviewed,
+                human_focus=deterministic_context.human_focus,
+            )
+            state.journal.emit("handoff_summary_guarded", {
+                "reason": "degraded-run-uses-controller-behavioral-prose",
+            })
         try:
             state.handoff = build_review_handoff(
                 context, review=state.review, evidence=state.evidence,

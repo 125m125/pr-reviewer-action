@@ -31,6 +31,10 @@ from pr_reviewer.specialist_runtime.controller import (
     _behavioral_handoff_candidates,
     _atomic_write_json,
     _critic_response_diagnostics,
+    _coverage_verification_requests,
+    _deterministic_handoff_focus,
+    _deterministic_reviewed_summary,
+    _deterministic_change_overview,
     _directory_fsync_status,
     _handoff_summary_proposal,
     _validated_critic_result,
@@ -225,6 +229,118 @@ def test_handoff_summary_parser_bounds_excess_reference_ids():
     })
 
     assert len(proposal.referenced_obligation_ids) == 12
+
+
+def test_handoff_summary_parser_keeps_first_sentence_of_overlong_focus():
+    proposal = _handoff_summary_proposal({
+        "ai_reviewed_summary": "Reviewed retained runtime evidence.",
+        "human_focus": (
+            "Recheck the unresolved runtime boundary. "
+            "The model could not retain all evidence."
+        ),
+        "referenced_paths": [],
+        "referenced_component_ids": [],
+        "referenced_obligation_ids": [],
+    })
+
+    assert proposal.human_focus == "Recheck the unresolved runtime boundary."
+
+
+def test_unresolved_high_risk_coverage_becomes_an_actionable_verification_request():
+    obligation = CoverageObligation(
+        obligation_id="obligation:high-risk",
+        origin="recipe",
+        subject="durable session recovery",
+        risk_tier="high",
+        unresolved_policy="block_when_unresolved",
+        explanation="The specialist did not retain enough recovery evidence.",
+    )
+
+    requests = _coverage_verification_requests((obligation,), (obligation.id,))
+
+    assert requests == ({
+        "question": (
+            "Can a human verify the unresolved high-risk obligation "
+            "'durable session recovery' before merging?"
+        ),
+        "reason": "The specialist did not retain enough recovery evidence.",
+        "related_obligation_ids": (obligation.id,),
+    },)
+
+
+def test_deterministic_change_overview_describes_behavioral_themes_not_hunks(tmp_path):
+    inputs = replace(
+        _inputs(tmp_path),
+        changed_files=(
+            ".github/workflows/ai-pr-review.yaml",
+            "pr_reviewer/conversation.py",
+            "pr_reviewer/specialist_runtime/controller.py",
+            "pr_reviewer/github_review_notes.py",
+        ),
+        topology={
+            "changed_files": [
+                ".github/workflows/ai-pr-review.yaml",
+                "pr_reviewer/conversation.py",
+                "pr_reviewer/specialist_runtime/controller.py",
+                "pr_reviewer/github_review_notes.py",
+            ],
+            "components": [
+                {"id": "orchestration", "changed_files": [
+                    "pr_reviewer/specialist_runtime/controller.py",
+                ]},
+            ],
+            "change_facts": {
+                "facts": {
+                    ".github/workflows/ai-pr-review.yaml": {
+                        "workflow_keys": ["specialist_max_tool_calls_per_session"],
+                    },
+                },
+            },
+        },
+    )
+
+    overview = _deterministic_change_overview(inputs)["overview"]
+
+    assert "workflow/action configuration" in overview
+    assert "specialist tool-call budgeting" in overview
+    assert "reasoning/session continuity" in overview
+    assert "new lines" not in overview
+
+
+def test_deterministic_handoff_focus_explains_unresolved_coverage():
+    obligation = CoverageObligation(
+        obligation_id="obligation:publishing",
+        origin="recipe",
+        subject="publishing hygiene",
+        risk_tier="high",
+        unresolved_policy="block_when_unresolved",
+    )
+
+    focus = _deterministic_handoff_focus((obligation,), (obligation.id,), True)
+
+    assert focus == (
+        "Recheck the unresolved high-risk coverage questions in the detail notes, "
+        "especially publishing hygiene.",
+    )
+
+
+def test_deterministic_reviewed_summary_describes_scope_not_methods():
+    summary = _deterministic_reviewed_summary(
+        changed_files=("pr_reviewer/conversation.py", "tests/test_runtime.py"),
+        component_ids=("model-transport", "tests"),
+        reviewed_obligations=(
+            CoverageObligation(
+                obligation_id="obligation:one",
+                origin="recipe",
+                subject="model transport",
+            ),
+        ),
+    )
+
+    assert summary == (
+        "The AI checked retained evidence across model-transport and tests for the "
+        "assigned review obligations; unresolved areas are listed in the detail notes.",
+    )
 
 
 @pytest.mark.parametrize(
@@ -2562,6 +2678,48 @@ def test_degraded_handoff_rejects_focus_from_failed_planned_assignment(tmp_path)
     assert result.artifact["evaluation_status"] == "degraded"
     assert result.handoff.specialist_focuses == ()
     assert "Security-sensitive behavior" not in result.handoff.markdown
+
+
+def test_degraded_handoff_keeps_controller_behavioral_prose_over_model_summary(
+    tmp_path,
+):
+    def planner(request):
+        raw = _planner_role(request)
+        raw["assignments"][0]["lenses"] = ["security"]
+        return raw
+
+    def broken_factory(*_args):
+        raise RuntimeError("specialist unavailable")
+
+    def finalizer(_request):
+        return {
+            "ai_reviewed_summary": (
+                "The model reviewed a list of files and methods."
+            ),
+            "human_focus": "Recheck the model's file list.",
+            "referenced_paths": [],
+            "referenced_component_ids": [],
+            "referenced_obligation_ids": [],
+        }
+
+    result = _controller(
+        tmp_path,
+        planner=planner,
+        session_factory=broken_factory,
+        finalizer=finalizer,
+    ).run(_inputs(tmp_path))
+
+    assert result.artifact["evaluation_status"] == "degraded"
+    assert result.handoff.ai_reviewed != (
+        "The model reviewed a list of files and methods.",
+    )
+    assert result.handoff.what_changed == (
+        result.artifact["change_overview"]["overview"],
+    )
+    assert any(
+        item["kind"] == "handoff_summary_guarded"
+        for item in result.artifact["events"]
+    )
 
 
 def test_failed_specialist_requests_retain_attempt_budget_without_event_replay(tmp_path):
