@@ -597,9 +597,10 @@ def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
         selected = tuple(dict.fromkeys(
             str(item).strip() for item in raw if str(item).strip()
         ))
-        if len(selected) > 12:
-            raise ValueError(f"handoff summarizer {key} is too large")
-        return selected
+        # Reference lists are orientation metadata, not an authorization
+        # surface. Keep the bounded prefix when a model over-produces them;
+        # rejecting the whole handoff loses otherwise valid prose.
+        return selected[:12]
 
     return HandoffSummaryProposal(
         ai_reviewed_summary=text("ai_reviewed_summary"),

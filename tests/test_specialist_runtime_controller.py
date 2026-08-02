@@ -32,6 +32,7 @@ from pr_reviewer.specialist_runtime.controller import (
     _atomic_write_json,
     _critic_response_diagnostics,
     _directory_fsync_status,
+    _handoff_summary_proposal,
     _validated_critic_result,
 )
 from pr_reviewer.specialist_runtime.callbacks import (
@@ -212,6 +213,18 @@ def test_critic_response_diagnostics_are_bounded_and_attachment_safe():
     assert diagnostics["ignored_fields"] == ("rationale",)
     assert len(diagnostics["response_digest"]) == 64
     assert "long model explanation" not in str(diagnostics)
+
+
+def test_handoff_summary_parser_bounds_excess_reference_ids():
+    proposal = _handoff_summary_proposal({
+        "ai_reviewed_summary": "Reviewed the changed runtime behavior.",
+        "human_focus": "Recheck the runtime boundary.",
+        "referenced_paths": [],
+        "referenced_component_ids": [],
+        "referenced_obligation_ids": [f"obligation:{index}" for index in range(20)],
+    })
+
+    assert len(proposal.referenced_obligation_ids) == 12
 
 
 @pytest.mark.parametrize(
