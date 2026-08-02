@@ -813,6 +813,28 @@ def test_handoff_caps_behavioral_summary_count_and_length():
     assert all(len(item) <= 160 for item in handoff.what_changed)
 
 
+def test_handoff_keeps_a_validated_overview_when_it_exceeds_detail_summary_limit():
+    overview = (
+        "This change updates orchestration, model transport, specialist runtime, "
+        "publishing, and regression tests; it changes session budgets, reasoning "
+        "continuity, candidate retention, and sticky handoff reconciliation. "
+        "The bounded summary deliberately carries the cross-component behavioral "
+        "themes needed by a human reviewer without copying individual findings."
+    )
+    handoff = build_review_handoff(
+        ReviewHandoffContext(
+            what_changed=(overview,),
+            what_changed_is_validated_overview=True,
+        ),
+        review=AdjudicatedReview(),
+        evidence=EvidenceStore(),
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert handoff.what_changed == (overview,)
+
+
 def test_handoff_compactly_names_distinct_degraded_stages_without_details():
     handoff = build_review_handoff(
         ReviewHandoffContext(

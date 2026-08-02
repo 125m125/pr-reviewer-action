@@ -1705,11 +1705,12 @@ def project_review_handoff(
 
     def behavioral_summaries(
         values: Iterable[object], *, limit: int, require_path: bool,
+        max_chars: int = 160,
     ) -> tuple[str, ...]:
         selected: list[str] = []
         for value in values:
             text = " ".join(_unicode(value).split())
-            if not text or len(text) > 160 or not renderable(text):
+            if not text or len(text) > max_chars or not renderable(text):
                 continue
             if require_path and not any(
                 f"`{path}`" in text for path in changed_paths
@@ -1725,6 +1726,11 @@ def project_review_handoff(
         context.what_changed,
         limit=5,
         require_path=not context.what_changed_is_validated_overview,
+        # The controller's immutable-facts fallback is already validated and
+        # intentionally describes several components.  It is a handoff
+        # overview, not an untrusted model claim, so allow it to be a little
+        # longer than an individual behavioral detail.
+        max_chars=600 if context.what_changed_is_validated_overview else 160,
     )
     ai_reviewed = behavioral_summaries(
         context.ai_reviewed, limit=3, require_path=True,

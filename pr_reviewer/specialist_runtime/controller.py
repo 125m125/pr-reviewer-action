@@ -615,6 +615,39 @@ _VALID_CRITIC_ACTIONS = frozenset({
 })
 
 
+def _critic_response_diagnostics(value: object) -> dict[str, object]:
+    """Return bounded attachment-only diagnostics for a critic response.
+
+    The model response itself can contain evidence text and is deliberately
+    not copied into the workflow log.  These shape diagnostics are enough to
+    explain a normalization or validation decision in the report artifact.
+    """
+    top_level_keys = (
+        tuple(sorted(str(key) for key in value))
+        if isinstance(value, Mapping) else ()
+    )
+    rows: object = (
+        value.get("actions", value.get("decisions"))
+        if isinstance(value, Mapping) else value
+    )
+    extra_fields: set[str] = set()
+    action_count = 0
+    if isinstance(rows, Iterable) and not isinstance(rows, (str, bytes, Mapping)):
+        for row in rows:
+            if isinstance(row, Mapping):
+                action_count += 1
+                extra_fields.update(
+                    str(key) for key in row
+                    if key not in {"candidate_id", "action", "target_id"}
+                )
+    return {
+        "response_digest": _digest(value),
+        "top_level_keys": top_level_keys,
+        "action_count": action_count,
+        "ignored_fields": tuple(sorted(extra_fields)),
+    }
+
+
 def _validated_critic_result(
     value: object,
     candidates: Iterable[CandidateFinding],
@@ -634,8 +667,6 @@ def _validated_critic_result(
     for row in rows:
         if not isinstance(row, Mapping):
             raise ValueError("critic actions must contain objects")
-        if set(row) - {"candidate_id", "action", "target_id"}:
-            raise ValueError("critic action contains unsupported fields")
         candidate_id = str(row.get("candidate_id") or "").strip()
         action = str(row.get("action") or "").strip().lower()
         target_id = str(row.get("target_id") or "").strip()
@@ -649,7 +680,14 @@ def _validated_critic_result(
         elif target_id:
             raise ValueError("critic target_id is only valid for merge")
         seen.add(candidate_id)
-        admitted.append(row)
+        # Models commonly add rationale/evidence fields despite the compact
+        # decision schema.  Those fields cannot change adjudication and are
+        # intentionally ignored; only the validated decision is admitted.
+        admitted.append({
+            "candidate_id": candidate_id,
+            "action": action,
+            "target_id": target_id,
+        })
     if seen != allowed_ids:
         raise ValueError("critic omitted candidate decisions")
     return {"actions": admitted}
@@ -1777,6 +1815,18 @@ class ReviewController:
         component = f"specialist:{assignment_id}"
         if any(item.get("component") == component for item in state.degradations):
             return
+        state.journal.emit("specialist_result_degraded", {
+            "assignment_id": assignment_id,
+            "session_id": str(getattr(result, "session_id", "")),
+            "result_degraded": bool(getattr(result, "degraded", False)),
+            "candidate_retention_unknown": retention_unknown,
+            "checkpoint_state": str(
+                getattr(checkpoint, "state", "")
+            ),
+            "candidate_count": len(tuple(
+                getattr(checkpoint, "candidate_finding_ids", ())
+            )),
+        })
         self._degrade(
             state,
             component,
@@ -2733,6 +2783,9 @@ class ReviewController:
                         ),
                     },
                 )
+                diagnostics = _critic_response_diagnostics(critic_result)
+                if diagnostics["ignored_fields"]:
+                    state.journal.emit("critic_response_normalized", diagnostics)
                 critic_result = _validated_critic_result(
                     critic_result, candidates,
                 )

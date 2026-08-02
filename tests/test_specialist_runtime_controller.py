@@ -30,6 +30,7 @@ from pr_reviewer.specialist_runtime.controller import (
     _RunState,
     _behavioral_handoff_candidates,
     _atomic_write_json,
+    _critic_response_diagnostics,
     _directory_fsync_status,
     _validated_critic_result,
 )
@@ -160,19 +161,57 @@ def test_gateway_role_repair_continues_from_retained_reasoning_and_content():
     assert payloads[1]["reasoning_effort"] == "none"
 
 
-def test_critic_schema_does_not_allow_prose_to_rewrite_consequence_support():
+def test_critic_schema_ignores_prose_instead_of_rewriting_consequence_support():
     candidate = CandidateFinding("candidate-1", "root", "claim")
     rationale = "consequence_support:reachable_input_path; evidence_ids=evidence:1"
 
-    with pytest.raises(ValueError, match="unsupported fields"):
-        _validated_critic_result(
-            {"actions": [{
-                "candidate_id": candidate.candidate_id,
-                "action": "keep",
-                "confidence_rationale": rationale,
-            }]},
-            (candidate,),
-        )
+    assert _validated_critic_result(
+        {"actions": [{
+            "candidate_id": candidate.candidate_id,
+            "action": "keep",
+            "confidence_rationale": rationale,
+        }]},
+        (candidate,),
+    ) == {"actions": [{
+        "candidate_id": candidate.candidate_id,
+        "action": "keep",
+        "target_id": "",
+    }]}
+
+
+def test_critic_ignores_non_decision_fields_from_compatible_model_output():
+    candidate = CandidateFinding("candidate-1", "root", "claim")
+
+    result = _validated_critic_result(
+        {"actions": [{
+            "candidate_id": candidate.candidate_id,
+            "action": "keep",
+            "target_id": None,
+            "reason": "supported by retained evidence",
+            "evidence_ids": ["evidence:1"],
+        }]},
+        (candidate,),
+    )
+
+    assert result == {"actions": [{
+        "candidate_id": candidate.candidate_id,
+        "action": "keep",
+        "target_id": "",
+    }]}
+
+
+def test_critic_response_diagnostics_are_bounded_and_attachment_safe():
+    diagnostics = _critic_response_diagnostics({"actions": [{
+        "candidate_id": "candidate-1",
+        "action": "keep",
+        "target_id": None,
+        "rationale": "long model explanation is not copied here",
+    }]})
+
+    assert diagnostics["action_count"] == 1
+    assert diagnostics["ignored_fields"] == ("rationale",)
+    assert len(diagnostics["response_digest"]) == 64
+    assert "long model explanation" not in str(diagnostics)
 
 
 @pytest.mark.parametrize(
@@ -1397,6 +1436,12 @@ def test_degraded_session_is_promoted_once_across_initial_followup_and_finalizat
         "component": "specialist:fallback-combined-1",
         "reason": "specialist completed with degraded retained state",
     },)
+    status_events = [
+        item for item in result.artifact["events"]
+        if item["kind"] == "specialist_result_degraded"
+    ]
+    assert status_events[0]["payload"]["result_degraded"] is True
+    assert status_events[0]["payload"]["candidate_retention_unknown"] is False
     assert result.handoff.status == "AI review completed with material coverage limits"
     assert result.handoff.coverage_warning.count("specialist") == 1
     assert "worker-flow" not in result.handoff.markdown
