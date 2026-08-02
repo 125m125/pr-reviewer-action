@@ -7,7 +7,6 @@
         "planner-initial",
         "specialist-tools",
         "specialist-checkpoint",
-        "specialist-final",
         "critic",
         "finalizer"
       ],
@@ -94,27 +93,7 @@
               "index": 0,
               "message": {
                 "role": "assistant",
-                "content": "{\"candidate_finding_ids\":[\"candidate-schema-enum\"],\"candidate_findings\":[{\"candidate_id\":\"candidate-schema-enum\",\"root_cause_fingerprint\":\"root:candidate-schema-enum\",\"claim\":\"The TypeScript consumer does not handle the new CANCELLED status.\",\"affected_location\":\"web/src/order-client.ts:7\",\"causal_chain\":\"The schema and Java producer add CANCELLED while the TypeScript exhaustive switch retains only CREATED and SHIPPED.\",\"severity\":\"major\",\"category\":\"correctness\",\"supporting_evidence_ids\":[\"evidence:133db09e11ae509b27521770cf3232718d7e7808b6059c5a0b43ec2d1bc1a74f\"],\"related_obligation_ids\":[\"obligation:topology:web-src-order-client-ts:implementation:90781ad84511\"],\"confidence_rationale\":\"consequence_support:reachable_input_path; evidence_ids=evidence:133db09e11ae509b27521770cf3232718d7e7808b6059c5a0b43ec2d1bc1a74f; input=CANCELLED; condition=switch retains only CREATED and SHIPPED; outcome=Cancelled orders render as an unknown state\",\"user_visible_consequence\":\"Cancelled orders render as an unknown state.\",\"manual_validation\":\"Run the TypeScript consumer test with a CANCELLED event.\"}],\"evidence_ids\":[],\"inspected\":[\"contracts/order-event.schema.json\",\"db/migrations/V42__order_status.sql\",\"deploy/k8s/order-worker.yaml\",\"src/main/java/example/api/OrderController.java\",\"tests/java/OrderControllerTest.java\",\"tests/python/test_order_worker.py\",\"web/src/order-client.ts\",\"web/tests/order-client.spec.ts\",\"workers/messaging/order_worker.py\"],\"unresolved\":[],\"hypotheses\":[],\"invariants_evaluated\":[],\"unknowns\":[],\"proposed_next_actions\":[]}"
-              },
-              "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 2}
-          }
-        },
-        "specialist-final": {
-          "expect": {
-            "role": "specialist",
-            "tools_enabled": false,
-            "response_schema_name": "specialist_final"
-          },
-          "response": {
-            "id": "chatcmpl-specialist-final",
-            "object": "chat.completion",
-            "choices": [{
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "{\"summary\":\"The assigned cross-stack behavior was checked against retained evidence.\",\"recommendation\":\"request_changes\",\"candidate_finding_ids\":[\"candidate-schema-enum\"],\"evidence_ids\":[\"evidence:4df9f89149fe87b969900db9628b3489d3eea7e4d5496c53ad3c625ee367d808\"],\"unknowns\":[]}"
+                "content": "{\"candidate_findings\":[{\"candidate_id\":\"candidate-schema-enum\",\"root_cause_fingerprint\":\"root:candidate-schema-enum\",\"claim\":\"The TypeScript consumer does not handle the new CANCELLED status.\",\"affected_location\":\"web/src/order-client.ts:7\",\"causal_chain\":\"The schema and Java producer add CANCELLED while the TypeScript exhaustive switch retains only CREATED and SHIPPED.\",\"severity\":\"major\",\"category\":\"correctness\",\"supporting_evidence_ids\":[\"evidence:133db09e11ae509b27521770cf3232718d7e7808b6059c5a0b43ec2d1bc1a74f\"],\"related_obligation_ids\":[\"obligation:topology:web-src-order-client-ts:implementation:90781ad84511\"],\"confidence_rationale\":\"consequence_support:reachable_input_path; evidence_ids=evidence:133db09e11ae509b27521770cf3232718d7e7808b6059c5a0b43ec2d1bc1a74f; input=CANCELLED; condition=switch retains only CREATED and SHIPPED; outcome=Cancelled orders render as an unknown state\",\"user_visible_consequence\":\"Cancelled orders render as an unknown state.\",\"manual_validation\":\"Run the TypeScript consumer test with a CANCELLED event.\"}],\"evidence_ids\":[],\"inspected\":[\"contracts/order-event.schema.json\",\"db/migrations/V42__order_status.sql\",\"deploy/k8s/order-worker.yaml\",\"src/main/java/example/api/OrderController.java\",\"tests/java/OrderControllerTest.java\",\"tests/python/test_order_worker.py\",\"web/src/order-client.ts\",\"web/tests/order-client.spec.ts\",\"workers/messaging/order_worker.py\"],\"unresolved\":[],\"hypotheses\":[],\"invariants_evaluated\":[],\"unknowns\":[],\"proposed_next_actions\":[]}"
               },
               "finish_reason": "stop"
             }],
@@ -188,8 +167,7 @@
         "finalization": 10
       },
       "responses": [
-        {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"deadline-checkpoint","choices":[{"index":0,"message":{"role":"assistant","content":"{\"inspected\":[],\"unresolved\":[\"obligation:topology:src-a-py:implementation:a24afd9558cf\"],\"hypotheses\":[],\"candidate_finding_ids\":[],\"invariants_evaluated\":[],\"unknowns\":[\"obligation:topology:src-a-py:implementation:a24afd9558cf\"],\"proposed_next_actions\":[]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}},
-        {"expect":{"role":"specialist","tools_enabled":false,"response_schema_name":"specialist_final"},"response":{"id":"deadline-final","choices":[{"index":0,"message":{"role":"assistant","content":"{\"summary\":\"Deadline-bounded review retained its checkpoint.\",\"recommendation\":\"controller-review-required\",\"candidate_finding_ids\":[],\"evidence_ids\":[],\"unknowns\":[\"obligation:topology:src-a-py:implementation:a24afd9558cf\"]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}}
+        {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"deadline-checkpoint","choices":[{"index":0,"message":{"role":"assistant","content":"{\"inspected\":[],\"unresolved\":[\"obligation:topology:src-a-py:implementation:a24afd9558cf\"],\"hypotheses\":[],\"candidate_finding_ids\":[],\"invariants_evaluated\":[],\"unknowns\":[\"obligation:topology:src-a-py:implementation:a24afd9558cf\"],\"proposed_next_actions\":[]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}}
       ]
     },
     "completion_inversion": {
@@ -249,13 +227,11 @@
       "session_responses": {
         "assignment-a": [
           {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"assignment-a-tools","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"a-interaction","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"interaction\",\"obligation_id\":\"obligation:topology:a-to-b:interaction:0a65f4aa488f\",\"path\":\"src/a.py\"}"}},{"id":"a-implementation","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:src-a-py:implementation:a24afd9558cf\",\"path\":\"src/a.py\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}},
-          {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"assignment-a-checkpoint","choices":[{"index":0,"message":{"role":"assistant","content":"{\"inspected\":[\"src/a.py\"],\"unresolved\":[],\"hypotheses\":[],\"candidate_finding_ids\":[],\"invariants_evaluated\":[],\"unknowns\":[],\"proposed_next_actions\":[]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}},
-          {"expect":{"role":"specialist","tools_enabled":false,"response_schema_name":"specialist_final"},"response":{"id":"assignment-a-final","choices":[{"index":0,"message":{"role":"assistant","content":"{\"summary\":\"Assignment A complete.\",\"recommendation\":\"approve\",\"candidate_finding_ids\":[],\"evidence_ids\":[],\"unknowns\":[]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}}
+          {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"assignment-a-checkpoint","choices":[{"index":0,"message":{"role":"assistant","content":"{\"inspected\":[\"src/a.py\"],\"unresolved\":[],\"hypotheses\":[],\"candidate_finding_ids\":[],\"invariants_evaluated\":[],\"unknowns\":[],\"proposed_next_actions\":[]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}}
         ],
         "assignment-b": [
           {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"assignment-b-tools","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"b-implementation","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:src-b-py:implementation:acdc539c18ab\",\"path\":\"src/b.py\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}},
-          {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"assignment-b-checkpoint","choices":[{"index":0,"message":{"role":"assistant","content":"{\"inspected\":[\"src/b.py\"],\"unresolved\":[],\"hypotheses\":[],\"candidate_finding_ids\":[],\"invariants_evaluated\":[],\"unknowns\":[],\"proposed_next_actions\":[]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}},
-          {"expect":{"role":"specialist","tools_enabled":false,"response_schema_name":"specialist_final"},"response":{"id":"assignment-b-final","choices":[{"index":0,"message":{"role":"assistant","content":"{\"summary\":\"Assignment B complete.\",\"recommendation\":\"approve\",\"candidate_finding_ids\":[],\"evidence_ids\":[],\"unknowns\":[]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}}
+          {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"assignment-b-checkpoint","choices":[{"index":0,"message":{"role":"assistant","content":"{\"inspected\":[\"src/b.py\"],\"unresolved\":[],\"hypotheses\":[],\"candidate_finding_ids\":[],\"invariants_evaluated\":[],\"unknowns\":[],\"proposed_next_actions\":[]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}}
         ]
       }
     },

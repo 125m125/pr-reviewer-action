@@ -4255,6 +4255,29 @@ class ReviewController:
                         state, session.assignment.id, result,
                     )
                     self._admit_specialist_request_events(state, result)
+                    checkpoint = getattr(result, "checkpoint", None)
+                    report = getattr(result, "report", None)
+                    journal.emit("specialist_finalized", {
+                        "assignment_id": session.assignment.id,
+                        "session_id": result.session_id,
+                        "source": (
+                            report.get("source")
+                            if isinstance(report, Mapping) else "unknown"
+                        ),
+                        "degraded": bool(getattr(result, "degraded", False)),
+                        "candidate_count": len(tuple(
+                            getattr(session, "candidate_findings", ())
+                        )),
+                        "evidence_count": len(tuple(
+                            getattr(checkpoint, "evidence_ids", ())
+                        )),
+                        "retention_unknown": bool(
+                            checkpoint is not None
+                            and _CANDIDATE_RETENTION_UNKNOWN in tuple(
+                                getattr(checkpoint, "unknowns", ())
+                            )
+                        ),
+                    })
                     journal.emit("session_transition", {
                         "session_id": result.session_id,
                         "state": result.state.value,

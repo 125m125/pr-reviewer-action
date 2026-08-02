@@ -46,7 +46,6 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
         "inspected": {"type": "array", "items": {"type": "string"}},
         "unresolved": {"type": "array", "items": {"type": "string"}},
         "hypotheses": {"type": "array", "items": {"type": "string"}},
-        "candidate_finding_ids": {"type": "array", "items": {"type": "string"}},
         "candidate_findings": {
             "type": "array",
             "items": {
@@ -99,19 +98,6 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-_FINAL_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "string"},
-        "recommendation": {"type": "string"},
-        "candidate_finding_ids": {"type": "array", "items": {"type": "string"}},
-        "evidence_ids": {"type": "array", "items": {"type": "string"}},
-        "unknowns": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["summary", "recommendation"],
-    "additionalProperties": False,
-}
-
 _RECOVERY_REASONS = frozenset({
     "repetitive-transcript",
     "polluted-transcript",
@@ -119,16 +105,15 @@ _RECOVERY_REASONS = frozenset({
     "invalid-provider-history",
     "transport-incompatibility",
 })
-_MAX_FINALIZATION_DIAGNOSTIC_IDS = 20
-_MAX_FINALIZATION_DIAGNOSTIC_ID_CHARS = 256
 _CHECKPOINT_TURN_RESERVE = 2
 _CANDIDATE_RETENTION_UNKNOWN = "candidate-retention-unknown"
 _MAX_CHECKPOINT_CANDIDATE_IDS = 20
 _MAX_CHECKPOINT_CANDIDATE_ID_CHARS = 256
 _CHECKPOINT_RETENTION_INSTRUCTION = (
-    " Required keys: unresolved, candidate_finding_ids, candidate_findings, and "
+    " Required keys: unresolved and candidate_findings (when material candidates "
+    "exist), and "
     "unknowns. Compact shape: {\"unresolved\":[\"OB-id\"],\"evidence_ids\":"
-    "[\"evidence:<hash>\"],\"candidate_finding_ids\":[\"candidate-id\"],"
+    "[\"evidence:<hash>\"],"
     "\"candidate_findings\":[{\"candidate_id\":\"candidate-id\",\"claim\":"
     "\"...\",\"affected_location\":\"path:line\",\"causal_chain\":\"...\","
     "\"supporting_evidence_ids\":[\"evidence:<hash>\"],\"related_obligation_ids\":"
@@ -136,8 +121,8 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
     "evidence_ids=evidence:<hash>; ...\",\"user_visible_consequence\":\"...\","
     "\"manual_validation\":"
     "\"...\"}],\"unknowns\":[\"OB-id\"]}. To preserve every material issue, "
-    "include both its object and ID in candidate_findings and candidate_finding_ids; "
-    "an issue omitted from either field will not survive the checkpoint. Use only "
+    "the controller derives internal candidate handles from candidate_findings. "
+    "Use only "
     "exact retained evidence IDs (evidence:<hash>) from successful tool results in "
     "evidence_ids and supporting_evidence_ids; repository paths are not evidence IDs."
 )
@@ -643,8 +628,7 @@ class SpecialistSession:
         self._request_turn += 1
         request_id = f"{self.session_id}:model:{self._request_turn}"
         schema_name = (
-            "specialist_checkpoint" if schema is _CHECKPOINT_SCHEMA
-            else "specialist_final" if schema is _FINAL_SCHEMA else None
+            "specialist_checkpoint" if schema is _CHECKPOINT_SCHEMA else None
         )
         self._request_events.append(SpecialistRequestEvent(
             request_id, "started", tools_enabled, schema_name,
@@ -1167,7 +1151,10 @@ class SpecialistSession:
                 )
                 if (
                     candidate is not None
-                    and candidate.candidate_id in declared_candidate_ids
+                    and (
+                        not declared_candidate_ids
+                        or candidate.candidate_id in declared_candidate_ids
+                    )
                     and candidate.candidate_id not in candidates
                 ):
                     candidates[candidate.candidate_id] = candidate
@@ -1466,61 +1453,20 @@ class SpecialistSession:
         return self._snapshot()
 
     def finalize(self) -> SessionResult:
-        """Finalize once with tools disabled and one bounded schema repair."""
+        """Close the session from its latest authoritative checkpoint."""
         if self._final_result is not None:
             return self._final_result
-        try:
-            self.lease.request_timeout(
-                self.request_timeout_sec, now=self.clock(),
-            )
-            self.state = SessionState.FINALIZING
-            self.conversation.add_user(
-                "Finalize this specialist assessment once from the latest checkpoint and "
-                "retained evidence. Return only the requested JSON; tools are disabled."
-            )
-            turn = self._request(tools_enabled=False, schema=_FINAL_SCHEMA)
-            self.conversation.add_assistant_turn(
-                reasoning=turn.reasoning,
-                content=turn.content,
-                calls=turn.tool_calls,
-            )
-            report, invalid_references = self._final_report_from_text(turn.content)
-            if report is None:
-                repair_instruction = (
-                    "Schema repair: return exactly one final JSON object with non-empty "
-                    "summary and recommendation fields. Tools remain disabled."
-                )
-                if invalid_references:
-                    diagnostic = self._record_invalid_final_references(
-                        "initial", invalid_references,
-                    )
-                    repair_instruction = (
-                        "Schema repair: candidate_finding_ids are references only. "
-                        "Remove these invalid references that are not defined in the "
-                        "latest checkpoint: "
-                        + json.dumps(list(diagnostic["candidate_finding_ids"]))
-                        + ". Return exactly one final JSON object; tools remain disabled."
-                    )
-                self.conversation.add_user(repair_instruction)
-                repair = self._request(tools_enabled=False, schema=_FINAL_SCHEMA)
-                self.conversation.add_assistant_turn(
-                    reasoning=repair.reasoning,
-                    content=repair.content,
-                    calls=repair.tool_calls,
-                )
-                report, invalid_references = self._final_report_from_text(
-                    repair.content
-                )
-                if invalid_references:
-                    self._record_invalid_final_references(
-                        "repair", invalid_references,
-                    )
-        except Exception:  # noqa: BLE001 - provider/admission failure degrades once
-            return self._cache_checkpoint_fallback()
-        if report is None:
-            return self._cache_checkpoint_fallback()
+        self.lease.request_timeout(
+            self.request_timeout_sec, now=self.clock(),
+        )
+        self.state = SessionState.FINALIZING
+        retention_unknown = _CANDIDATE_RETENTION_UNKNOWN in self.latest_checkpoint.unknowns
+        report = self._checkpoint_finalization_report()
         self.state = SessionState.COMPLETE
-        self._final_result = self._snapshot(report=report, degraded=False)
+        self._final_result = self._snapshot(
+            report=report,
+            degraded=retention_unknown,
+        )
         return self._final_result
 
     def _cache_checkpoint_fallback(self) -> SessionResult:
@@ -1530,55 +1476,21 @@ class SpecialistSession:
         )
         return self._final_result
 
-    def _final_report_from_text(
-        self, text: str,
-    ) -> tuple[dict[str, Any] | None, tuple[str, ...]]:
-        raw = _json_object(text)
-        if raw is None:
-            return None, ()
-        summary = raw.get("summary")
-        recommendation = raw.get("recommendation")
-        if not isinstance(summary, str) or not summary.strip():
-            return None, ()
-        if not isinstance(recommendation, str) or not recommendation.strip():
-            return None, ()
-        retained = {
-            record.id for record in self.evidence_store.snapshot().records
-            if record.is_usable_for_coverage
-        }
-        checkpoint_findings = set(self.latest_checkpoint.candidate_finding_ids)
-        declared_findings = _strings(raw.get("candidate_finding_ids"))
-        invalid_references = tuple(
-            item for item in declared_findings if item not in checkpoint_findings
-        )
-        if invalid_references:
-            return None, invalid_references
+    def _checkpoint_finalization_report(self) -> dict[str, Any]:
+        checkpoint = self.latest_checkpoint
+        covered = [
+            obligation_id for obligation_id, status in checkpoint.obligation_statuses
+            if status.value == "covered"
+        ]
         return {
-            "summary": summary.strip(),
-            "recommendation": recommendation.strip(),
-            "candidate_finding_ids": list(declared_findings),
-            "evidence_ids": [
-                item for item in _strings(raw.get("evidence_ids")) if item in retained
-            ],
-            "unknowns": list(_strings(raw.get("unknowns"))),
-            "source": "model-finalization",
-        }, ()
-
-    def _record_invalid_final_references(
-        self, attempt: str, invalid_references: tuple[str, ...],
-    ) -> dict[str, object]:
-        retained = tuple(
-            item[:_MAX_FINALIZATION_DIAGNOSTIC_ID_CHARS]
-            for item in invalid_references[:_MAX_FINALIZATION_DIAGNOSTIC_IDS]
-        )
-        diagnostic: dict[str, object] = {
-            "code": "invalid_candidate_finding_references",
-            "attempt": attempt,
-            "candidate_finding_ids": retained,
-            "omitted_count": max(0, len(invalid_references) - len(retained)),
+            "summary": "Specialist session closed from its latest valid checkpoint.",
+            "recommendation": "controller-review-required",
+            "candidate_finding_ids": list(checkpoint.candidate_finding_ids),
+            "evidence_ids": list(checkpoint.evidence_ids),
+            "covered_obligation_ids": covered,
+            "unknowns": list(checkpoint.unknowns),
+            "source": "checkpoint-finalization",
         }
-        self._finalization_diagnostics.append(diagnostic)
-        return diagnostic
 
     def _checkpoint_fallback_report(self) -> dict[str, Any]:
         checkpoint = self.latest_checkpoint

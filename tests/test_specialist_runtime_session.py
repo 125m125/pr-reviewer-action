@@ -259,15 +259,13 @@ def test_session_result_reports_each_actual_request_transition_once():
         "started", "completed",
     )
     assert tuple(item.status for item in final.request_events) == (
-        "started", "completed", "started", "completed",
+        "started", "completed",
     )
     assert repeated.request_events == final.request_events
     request_pairs = {}
     for event in final.request_events:
         request_pairs.setdefault(event.request_id, []).append(event.status)
-    assert tuple(request_pairs.values()) == (
-        ["started", "completed"], ["started", "completed"],
-    )
+    assert tuple(request_pairs.values()) == (["started", "completed"],)
 
 
 def test_exploration_budget_note_is_ephemeral_and_updates_per_turn():
@@ -295,7 +293,6 @@ def test_invalid_exploration_stop_forces_checkpoint_before_later_finalization():
     gateway = ScriptedGateway([
         invalid_response("plain-text conclusion"),
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
-        final_response(),
     ])
     session = make_session(gateway)
 
@@ -304,9 +301,42 @@ def test_invalid_exploration_stop_forces_checkpoint_before_later_finalization():
 
     assert checkpoint.state.value == "checkpoint"
     assert final.state.value == "complete"
-    assert [request.tools_enabled for request in gateway.requests] == [True, False, False]
+    assert [request.tools_enabled for request in gateway.requests] == [True, False]
     assert gateway.requests[1].messages_contain("Checkpoint requested (not a final report)")
-    assert gateway.requests[2].messages_contain("Finalize this specialist assessment once")
+
+
+def test_finalization_closes_from_valid_checkpoint_without_model_call():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    session = make_session(gateway)
+
+    session.explore()
+    result = session.finalize()
+
+    assert result.degraded is False
+    assert result.report["source"] == "checkpoint-finalization"
+    assert len(gateway.requests) == 1
+
+
+def test_checkpoint_derives_candidate_ids_from_candidate_objects():
+    response = candidate_checkpoint_response(["candidate-code"])
+    payload = json.loads(response.text)
+    payload.pop("candidate_finding_ids", None)
+    response = ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps(payload),
+        text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    session = make_session(ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        response,
+    ]))
+
+    result = session.explore()
+
+    assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
 
 
 def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract():
@@ -323,7 +353,7 @@ def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract()
     repair_request = gateway.requests[2].messages
     for prompt in (checkpoint_request, repair_request):
         assert "candidate_findings" in prompt
-        assert "candidate_finding_ids" in prompt
+        assert "candidate_finding_ids" not in prompt
         assert "exact retained evidence IDs" in prompt
         assert "repository paths are not evidence IDs" in prompt
 
@@ -361,9 +391,9 @@ def test_checkpoint_request_includes_compact_schema_contract():
     checkpoint_request = json.loads(gateway.requests[1].messages)[-1]["content"]
     assert "Required keys:" in checkpoint_request
     assert '"unresolved"' in checkpoint_request
-    assert '"candidate_finding_ids"' in checkpoint_request
+    assert '"candidate_finding_ids"' not in checkpoint_request
     assert '"candidate_findings"' in checkpoint_request
-    assert "include both its object and ID" in checkpoint_request
+    assert "controller derives internal candidate handles" in checkpoint_request
 
 
 def test_malformed_checkpoint_is_repaired_before_projection():
@@ -1290,88 +1320,20 @@ def test_session_consumes_task_three_assignment_contract():
     assert "correctness" in gateway.requests[0].messages
 
 
-def test_finalize_disables_tools_repairs_schema_once_and_is_once_only():
-    gateway = ScriptedGateway([
-        tool_call_response("read_file", {"path": "a.py"}),
-        checkpoint_response(inspected=["a.py"], unresolved=[]),
-        invalid_response(),
-        final_response(summary="repaired"),
-    ])
-    session = make_session(gateway, model_turns=8)
-    session.explore()
-
-    first = session.finalize()
-    second = session.finalize()
-
-    assert first is second
-    assert first.state.value == "complete"
-    assert first.report["summary"] == "repaired"
-    assert first.budget.model_turns == 4
-    assert len(gateway.requests) == 4
-    assert gateway.requests[2].tools_enabled is False
-    assert gateway.requests[3].tools_enabled is False
-
-
-def test_finalize_repairs_reasoning_only_json_without_admitting_private_report():
+def test_finalization_uses_checkpoint_state_and_ignores_extra_provider_responses():
     gateway = ScriptedGateway([
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
-        reasoning_only_response({
-            "summary": "private draft",
-            "recommendation": "approve",
-            "candidate_finding_ids": [],
-            "evidence_ids": [],
-            "unknowns": [],
-        }),
-        final_response(summary="declared repaired report"),
+        invalid_response("this must never be requested"),
     ])
-    session = make_session(gateway, model_turns=6)
+    session = make_session(gateway)
     session.explore()
 
     result = session.finalize()
 
     assert result.degraded is False
-    assert result.report["summary"] == "declared repaired report"
-    assert len(gateway.requests) == 3
-    assert gateway.requests[2].messages_contain("reasoning_content")
-    assert gateway.requests[2].messages_contain("private draft")
-
-
-def test_finalize_reasoning_only_repair_degrades_to_checkpoint_fallback():
-    gateway = ScriptedGateway([
-        checkpoint_response(inspected=[], unresolved=["OB-code"]),
-        invalid_response("not a report"),
-        reasoning_only_response({
-            "summary": "private repaired draft",
-            "recommendation": "approve",
-            "candidate_finding_ids": [],
-            "evidence_ids": [],
-            "unknowns": [],
-        }),
-    ])
-    session = make_session(gateway, model_turns=6)
-    session.explore()
-
-    result = session.finalize()
-
-    assert result.degraded is True
-    assert result.report["source"] == "checkpoint-fallback"
-
-
-def test_finalize_falls_back_to_structured_checkpoint_after_one_repair():
-    gateway = ScriptedGateway([
-        checkpoint_response(inspected=[], unresolved=["OB-code"]),
-        invalid_response("bad-one"),
-        invalid_response("bad-two"),
-    ])
-    session = make_session(gateway, model_turns=6)
-    session.explore()
-
-    result = session.finalize()
-
-    assert result.state.value == "complete"
-    assert result.degraded is True
-    assert result.report["source"] == "checkpoint-fallback"
+    assert result.report["source"] == "checkpoint-finalization"
     assert result.report["unknowns"] == ["OB-code", "OB-tests"]
+    assert len(gateway.requests) == 1
 
 
 def _session_with_retained_candidate(final_responses):
@@ -1426,142 +1388,17 @@ def test_checkpoint_admission_failure_keeps_already_admitted_candidate():
     assert "candidate-retention-unknown" not in result.checkpoint.unknowns
 
 
-def test_finalization_repairs_dangling_candidate_references_without_dropping_valid_ids():
-    session, gateway = _session_with_retained_candidate([
-        final_response(candidate_finding_ids=["candidate-code", "candidate-forged"]),
-        final_response(summary="repaired", candidate_finding_ids=["candidate-code"]),
-    ])
-
-    result = session.finalize()
-
-    assert result.degraded is False
-    assert result.report["summary"] == "repaired"
-    assert result.report["candidate_finding_ids"] == ["candidate-code"]
-    assert result.finalization_diagnostics == ({
-        "code": "invalid_candidate_finding_references",
-        "attempt": "initial",
-        "candidate_finding_ids": ("candidate-forged",),
-        "omitted_count": 0,
-    },)
-    assert gateway.requests[3].messages_contain("candidate-forged")
-    assert gateway.requests[3].messages_contain("latest checkpoint")
-
-
-def test_repeated_dangling_candidate_references_degrade_with_bounded_diagnostics():
-    forged_ids = [f"candidate-forged-{index}" for index in range(25)]
-    session, _gateway = _session_with_retained_candidate([
-        final_response(candidate_finding_ids=["candidate-code", *forged_ids]),
-        final_response(candidate_finding_ids=forged_ids),
-    ])
+def test_finalization_preserves_retention_unknown_as_degraded_checkpoint_state():
+    session, _gateway = _session_with_retained_candidate([])
+    session.latest_checkpoint = session._checkpoint_with_retention_unknown(
+        session.latest_checkpoint,
+    )
 
     result = session.finalize()
 
     assert result.degraded is True
-    assert result.report["source"] == "checkpoint-fallback"
-    assert result.report["candidate_finding_ids"] == ["candidate-code"]
-    assert tuple(
-        item["attempt"] for item in result.finalization_diagnostics
-    ) == ("initial", "repair")
-    assert all(
-        len(item["candidate_finding_ids"]) == 20
-        and item["omitted_count"] == 5
-        for item in result.finalization_diagnostics
-    )
-
-
-def test_finalize_falls_back_when_schema_repair_has_no_lifetime_turn_left():
-    gateway = ScriptedGateway([
-        checkpoint_response(inspected=[], unresolved=["OB-code"]),
-        invalid_response("last-turn-was-invalid"),
-    ])
-    session = make_session(gateway, model_turns=2)
-    session.explore()
-
-    result = session.finalize()
-
-    assert result.state.value == "complete"
-    assert result.degraded is True
-    assert result.report["source"] == "checkpoint-fallback"
-    assert result.budget.model_turns == 2
-    assert len(gateway.requests) == 2
-
-
-def test_exhausted_finalization_repair_records_no_unadmitted_request_attempt():
-    gateway = ScriptedGateway([
-        checkpoint_response(inspected=[], unresolved=["OB-code"]),
-        invalid_response("last-admitted-turn-was-invalid"),
-    ])
-    session = make_session(gateway, model_turns=2)
-    attempts = RequestAttemptJournal()
-    session.bind_request_attempt_journal(attempts, "assignment-1")
-    session.explore()
-
-    result = session.finalize()
-    recorded = attempts.close_since(0)
-
-    assert result.report["source"] == "checkpoint-fallback"
-    assert result.budget.model_turns == 2
-    assert len(gateway.requests) == 2
-    assert tuple(item.status for item in recorded) == ("completed", "completed")
-    assert tuple(event.status for event in result.request_events) == (
-        "started", "completed", "started", "completed",
-    )
-
-
-def test_initial_finalization_budget_exhaustion_caches_one_fallback():
-    gateway = ScriptedGateway([
-        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
-    ])
-    session = make_session(gateway, model_turns=1)
-    session.explore()
-
-    first = session.finalize()
-    second = session.finalize()
-
-    assert first is second
-    assert first.state.value == "complete"
-    assert first.degraded is True
-    assert first.report["source"] == "checkpoint-fallback"
-    assert len(gateway.requests) == 1
-
-
-def test_provider_exception_during_initial_finalization_caches_fallback():
-    gateway = ScriptedGateway([
-        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
-        RuntimeError("provider unavailable"),
-    ])
-    session = make_session(gateway)
-    session.explore()
-
-    first = session.finalize()
-    second = session.finalize()
-
-    assert first is second
-    assert first.state.value == "complete"
-    assert first.degraded is True
-    assert first.report["source"] == "checkpoint-fallback"
-    assert first.budget.model_turns == 2
-    assert len(gateway.requests) == 2
-
-
-def test_provider_exception_during_finalization_repair_caches_fallback():
-    gateway = ScriptedGateway([
-        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
-        invalid_response(),
-        RuntimeError("repair provider unavailable"),
-    ])
-    session = make_session(gateway)
-    session.explore()
-
-    first = session.finalize()
-    second = session.finalize()
-
-    assert first is second
-    assert first.state.value == "complete"
-    assert first.degraded is True
-    assert first.report["source"] == "checkpoint-fallback"
-    assert first.budget.model_turns == 3
-    assert len(gateway.requests) == 3
+    assert result.report["source"] == "checkpoint-finalization"
+    assert "candidate-retention-unknown" in result.report["unknowns"]
 
 
 def test_expired_lease_refuses_exploration_and_finalization_requests():
@@ -1574,12 +1411,8 @@ def test_expired_lease_refuses_exploration_and_finalization_requests():
 
     finalize_gateway = ScriptedGateway([])
     finalize_session = make_session(finalize_gateway, lease=lease)
-    first = finalize_session.finalize()
-    second = finalize_session.finalize()
+    with pytest.raises(TimeoutError, match="session lease expired"):
+        finalize_session.finalize()
 
     assert explore_gateway.requests == []
     assert finalize_gateway.requests == []
-    assert first is second
-    assert first.state.value == "complete"
-    assert first.degraded is True
-    assert first.report["source"] == "checkpoint-fallback"

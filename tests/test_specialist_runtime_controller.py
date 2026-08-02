@@ -3079,21 +3079,21 @@ def test_exhausted_schema_repair_cannot_inflate_artifact_model_turns(tmp_path):
     session_budgets = result.artifact["budgets"]["sessions"]
     attempts = result.artifact["budgets"]["request_attempts"]
 
-    assert len(gateway.requests) == 2, result.artifact["degradation"]
-    assert len(attempts) == 2
+    assert len(gateway.requests) == 1, result.artifact["degradation"]
+    assert len(attempts) == 1
     assert all(item["status"] == "completed" for item in attempts)
-    assert max(item["model_turns"] for item in session_budgets.values()) == 2
+    assert max(item["model_turns"] for item in session_budgets.values()) == 1
     assert all(
         item["model_turns"] <= inputs.config.session_limits.model_turns
         for item in session_budgets.values()
     )
-    assert result.artifact["budgets"]["totals"]["model_turns"] == 2
+    assert result.artifact["budgets"]["totals"]["model_turns"] == 1
     assert result.artifact["budgets"]["totals"]["model_turns"] <= (
         len(session_budgets) * inputs.config.session_limits.model_turns
     )
 
 
-def test_repeated_dangling_final_references_promote_top_level_specialist_degradation(
+def test_finalization_does_not_process_model_candidate_references(
     tmp_path,
 ):
     class DanglingFinalGateway:
@@ -3126,13 +3126,7 @@ def test_repeated_dangling_final_references_promote_top_level_specialist_degrada
                     "proposed_next_actions": [],
                 })
             else:
-                text = json.dumps({
-                    "summary": "candidate-forged-private-detail",
-                    "recommendation": "approve",
-                    "candidate_finding_ids": ["candidate-forged-private-detail"],
-                    "evidence_ids": [],
-                    "unknowns": [],
-                })
+                raise AssertionError("deterministic finalization must not call the model")
             return ModelTurnResult(
                 response={}, tool_calls=(), text=text, text_source="content",
                 finish_reason="stop",
@@ -3177,16 +3171,13 @@ def test_repeated_dangling_final_references_promote_top_level_specialist_degrada
 
     result = _controller(tmp_path, session_factory=factory).run(inputs)
 
-    assert len(gateway.requests) == 4
-    assert result.artifact["evaluation_status"] == "degraded"
-    assert tuple(result.artifact["degradation"]) == ({
-        "component": "specialist:fallback-combined-1",
-        "reason": "specialist completed with degraded retained state",
-    },)
-    assert result.artifact["sessions"][0]["degraded"] is True
-    assert result.handoff.status == "AI review completed with material coverage limits"
-    assert "Affected stages: specialist." in result.handoff.markdown
-    assert "candidate-forged-private-detail" not in result.handoff.markdown
+    assert len(gateway.requests) == 2
+    assert result.artifact["sessions"][0]["degraded"] is False
+    assert any(
+        event["kind"] == "specialist_finalized"
+        and event["payload"]["source"] == "checkpoint-finalization"
+        for event in result.artifact["events"]
+    )
 
 
 def test_artifact_write_failure_preserves_prior_file_and_valid_result(tmp_path):

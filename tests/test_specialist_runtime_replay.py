@@ -118,7 +118,7 @@ def test_recorded_failure_injections_have_deterministic_terminal_behavior():
     assert failures["deadline_cutoff"]["finalization_reserved"] is True
     assert failures["deadline_cutoff"]["cutoff_enforced"] is True
     assert failures["deadline_cutoff"]["terminal"] is True
-    assert failures["deadline_cutoff"]["provider_turns_consumed"] == 2
+    assert failures["deadline_cutoff"]["provider_turns_consumed"] == 1
     assert failures["completion_inversion"]["stable_projection"] is True
     assert failures["completion_inversion"]["coverage_stable"] is True
     assert failures["completion_inversion"]["evidence_stable"] is True
@@ -162,7 +162,6 @@ def test_provider_fixture_contains_only_explicit_openai_responses():
         "planner-initial",
         "specialist-tools",
         "specialist-checkpoint",
-        "specialist-final",
         "critic",
         "finalizer",
     ]
@@ -199,12 +198,6 @@ def test_recorded_candidate_is_collected_by_session_not_review_inputs(tmp_path):
     payload["candidate_findings"] = []
     payload["candidate_finding_ids"] = []
     checkpoint["content"] = json.dumps(payload, sort_keys=True)
-    final = provider["scenarios"]["multilingual"]["responses"][
-        "specialist-final"
-    ]["response"]["choices"][0]["message"]
-    final_payload = json.loads(final["content"])
-    final_payload["candidate_finding_ids"] = []
-    final["content"] = json.dumps(final_payload, sort_keys=True)
     provider["scenarios"]["multilingual"]["request_order"].remove("critic")
     provider["scenarios"]["multilingual"]["responses"].pop("critic")
     provider_path.write_text(json.dumps(provider), encoding="utf-8")
