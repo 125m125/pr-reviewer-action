@@ -407,7 +407,10 @@ def _parse_action(
     extra = sorted(set(raw) - _ACTION_FIELDS)
     if extra:
         errors.append(f"{label} has unsupported fields: {', '.join(extra)}")
-    kind = _normalise_action_kind(raw.get("kind"), errors=errors)
+    # Alias diagnostics are intentionally separate from fatal validation errors.
+    # The controller can journal the original value while legacy callers still
+    # receive the same validated action semantics.
+    kind = _normalise_action_kind(raw.get("kind"), errors=[])
     if kind is None:
         errors.append(
             f"{label} kind must be exactly resume, consult, new_session, or record_unknown"

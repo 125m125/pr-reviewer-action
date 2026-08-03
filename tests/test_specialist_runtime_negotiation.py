@@ -184,6 +184,20 @@ def test_compact_negotiation_normalizes_unambiguous_kind_alias():
     assert proposal.actions[0].kind == "record_unknown"
 
 
+def test_legacy_negotiation_normalizes_unambiguous_kind_alias():
+    proposal = validate_negotiation({
+        "actions": [{
+            "kind": "record-unknown",
+            "obligation_ids": ["OB1"],
+            "expected_evidence": ["tests"],
+            "estimated_turns": 0,
+            "reason": "No bounded evidence remains.",
+        }],
+    }, state_for())
+
+    assert proposal.actions[0].kind == "record_unknown"
+
+
 def test_tool_exhausted_durable_session_cannot_resume_but_new_session_can():
     state = state_for(resources=(
         SessionResources(

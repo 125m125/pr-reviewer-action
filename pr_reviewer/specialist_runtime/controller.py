@@ -2708,6 +2708,10 @@ class ReviewController:
                 if not isinstance(raw, Mapping):
                     raise NegotiationError("negotiator result must be an object")
                 raw_kind = raw.get("kind")
+                if raw_kind is None and isinstance(raw.get("actions"), list):
+                    action_items = raw["actions"]
+                    if len(action_items) == 1 and isinstance(action_items[0], Mapping):
+                        raw_kind = action_items[0].get("kind")
                 if isinstance(raw_kind, str) and raw_kind in {"record-unknown", "new-session"}:
                     state.journal.emit("negotiation_alias_normalized", {
                         "from": raw_kind,
@@ -4257,6 +4261,8 @@ class ReviewController:
                 if not reconciliation.uncovered_obligation_ids:
                     break
                 before_uncovered = set(reconciliation.uncovered_obligation_ids)
+                before_statuses = tuple(reconciliation.snapshot.obligation_statuses)
+                before_evidence = frozenset(state.evidence.snapshot().evidence_ids)
                 journal.emit("negotiation_round", {
                     "round": round_index + 1,
                     "uncovered_count": len(before_uncovered),
@@ -4275,11 +4281,16 @@ class ReviewController:
                 )
                 # record_unknown and infeasible proposals intentionally make no
                 # coverage progress; stop rather than repeatedly asking the model
-                # to emit the same action.
+                # to emit the same action. Evidence collection itself counts as
+                # progress even when it has not yet satisfied an obligation.
                 reconciliation = next_reconciliation
-                if before_uncovered.issubset(
-                    set(reconciliation.uncovered_obligation_ids)
-                ):
+                after_statuses = tuple(reconciliation.snapshot.obligation_statuses)
+                after_evidence = frozenset(state.evidence.snapshot().evidence_ids)
+                made_progress = (
+                    before_statuses != after_statuses
+                    or before_evidence != after_evidence
+                )
+                if not made_progress:
                     break
             for obligation_id in reconciliation.uncovered_obligation_ids:
                 if not any(item.get("obligation_id") == obligation_id for item in state.unknowns):
