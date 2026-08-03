@@ -1,0 +1,46 @@
+# Task 1 report: candidate update checkpoints
+
+Implemented the candidate lifecycle checkpoint protocol in
+`pr_reviewer/specialist_runtime/session.py`.
+
+## Changes
+
+- Checkpoints accept additive `candidate_updates` and `new_candidates` arrays.
+- Existing active candidates are carried forward when both arrays are empty.
+- `withdrawn` and `superseded` updates remove a known candidate from the active
+  findings; omission never withdraws a candidate.
+- Checkpoint requests include a compact active-candidate register with stable
+  candidate IDs, claims, and locations.
+- Retention accounting uses structured candidate fields, while malformed
+  candidate-shaped JSON remains conservatively degraded and ordinary prose is
+  not treated as candidate state.
+- Legacy `candidate_findings` checkpoints remain accepted for compatibility.
+
+## Verification
+
+Command:
+
+```text
+$env:PYTHONPATH='.'; .\\.venv\\Scripts\\pytest.exe tests/test_specialist_runtime_session.py -q
+```
+
+Output:
+
+```text
+.......................................................                  [100%]
+55 passed in 0.27s
+```
+
+Additional runtime regression suite:
+
+```text
+$env:PYTHONPATH='.'; .\\.venv\\Scripts\\pytest.exe tests/test_specialist_runtime_controller.py tests/test_specialist_runtime_replay.py tests/test_specialist_runtime_scheduler.py -q
+207 passed in 6.51s
+```
+
+## Concerns
+
+The legacy candidate object shape is intentionally retained for older model
+providers. New prompts prefer short candidate IDs and structured updates, but
+the controller still conservatively requests repair when malformed candidate
+objects cannot be accounted for.

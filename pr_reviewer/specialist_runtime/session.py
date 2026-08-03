@@ -98,6 +98,32 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+# Candidate lifecycle fields are additive so older providers can still emit the
+# legacy ``candidate_findings`` array.  New checkpoints use compact updates and
+# a separate array for genuinely new candidate objects.
+_CHECKPOINT_SCHEMA["properties"]["candidate_updates"] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "candidate_id": {"type": "string"},
+            "status": {
+                "type": "string",
+                "enum": ["active", "withdrawn", "superseded"],
+            },
+            "reason": {"type": "string"},
+            "evidence_ids": {"type": "array", "items": {"type": "string"}},
+            "superseded_by": {"type": "string"},
+        },
+        "required": ["candidate_id", "status"],
+        "additionalProperties": False,
+    },
+}
+_CHECKPOINT_SCHEMA["properties"]["new_candidates"] = {
+    "type": "array",
+    "items": _CHECKPOINT_SCHEMA["properties"]["candidate_findings"]["items"],
+}
+
 _RECOVERY_REASONS = frozenset({
     "repetitive-transcript",
     "polluted-transcript",
@@ -110,21 +136,19 @@ _CANDIDATE_RETENTION_UNKNOWN = "candidate-retention-unknown"
 _MAX_CHECKPOINT_CANDIDATE_IDS = 20
 _MAX_CHECKPOINT_CANDIDATE_ID_CHARS = 256
 _CHECKPOINT_RETENTION_INSTRUCTION = (
-    " Required keys: unresolved and candidate_findings (when material candidates "
-    "exist), and "
-    "unknowns. Compact shape: {\"unresolved\":[\"OB-id\"],\"evidence_ids\":"
-    "[\"evidence:<hash>\"],"
-    "\"candidate_findings\":[{\"candidate_id\":\"candidate-id\",\"claim\":"
-    "\"...\",\"affected_location\":\"path:line\",\"causal_chain\":\"...\","
-    "\"supporting_evidence_ids\":[\"evidence:<hash>\"],\"related_obligation_ids\":"
-    "[\"OB-id\"],\"confidence_rationale\":\"consequence_support:...; "
-    "evidence_ids=evidence:<hash>; ...\",\"user_visible_consequence\":\"...\","
-    "\"manual_validation\":"
-    "\"...\"}],\"unknowns\":[\"OB-id\"]}. To preserve every material issue, "
-    "the controller derives internal candidate handles from candidate_findings. "
-    "Use only "
-    "exact retained evidence IDs (evidence:<hash>) from successful tool results in "
+    " Required keys: unresolved, candidate_updates, new_candidates, and unknowns. "
+    "Empty candidate_updates and new_candidates arrays are valid and mean no "
+    "candidate state changed. Existing candidates remain active unless explicitly "
+    "updated with status withdrawn or superseded; omission never withdraws one. "
+    "Use compact candidate_updates entries such as "
+    "{\"candidate_id\":\"c1\",\"status\":\"withdrawn\",\"reason\":\"...\"}. "
+    "Put full candidate objects only in new_candidates. The legacy "
+    "\"candidate_findings\" array is accepted for compatibility; the "
+    "controller derives internal candidate handles from admitted candidate objects. "
+    "Use only exact "
+    "retained evidence IDs (evidence:<hash>) from successful tool results in "
     "evidence_ids and supporting_evidence_ids; repository paths are not evidence IDs."
+    " JSON shape starts with {\"unresolved\":[\"OB-id\"],\"candidate_updates\":[]}."
 )
 
 
@@ -246,13 +270,20 @@ class _CandidateRetentionSignal:
 
 
 def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
-    """Retain only bounded IDs/counts, never untrusted candidate prose."""
+    """Retain only bounded structured IDs/counts, never candidate prose."""
     raw = _json_object(text)
     if not isinstance(raw, Mapping):
+        # Malformed structured candidate payloads remain conservative, while
+        # ordinary prose containing no JSON candidate keys is non-material.
         return _CandidateRetentionSignal(
             unidentified_shapes=1 if _contains_candidate_shaped_text(text) else 0,
         )
-    if "candidate_finding_ids" not in raw and "candidate_findings" not in raw:
+    if not any(
+        key in raw for key in (
+            "candidate_finding_ids", "candidate_findings",
+            "candidate_updates", "new_candidates",
+        )
+    ):
         return _CandidateRetentionSignal(
             unidentified_shapes=1 if _contains_candidate_shaped_text(text) else 0,
         )
@@ -278,11 +309,49 @@ def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
                 candidate_id = str(value.get("candidate_id") or "").strip()
                 if candidate_id:
                     candidate_ids.append(candidate_id)
+                    if not str(value.get("claim") or "").strip():
+                        unidentified_shapes += 1
                 else:
                     unidentified_shapes += 1
             else:
                 unidentified_shapes += 1
     elif raw_candidates is not None and raw_candidates != ():
+        unidentified_shapes += 1
+    raw_new_candidates = raw.get("new_candidates")
+    if isinstance(raw_new_candidates, list):
+        if len(raw_new_candidates) > _MAX_CHECKPOINT_CANDIDATE_IDS:
+            omitted_candidate_ids = 1
+        for value in raw_new_candidates[:_MAX_CHECKPOINT_CANDIDATE_IDS + 1]:
+            if isinstance(value, Mapping):
+                candidate_id = str(value.get("candidate_id") or "").strip()
+                if candidate_id:
+                    candidate_ids.append(candidate_id)
+                    if not str(value.get("claim") or "").strip():
+                        unidentified_shapes += 1
+                else:
+                    unidentified_shapes += 1
+            else:
+                unidentified_shapes += 1
+    elif raw_new_candidates is not None and raw_new_candidates != ():
+        unidentified_shapes += 1
+    raw_updates = raw.get("candidate_updates")
+    if isinstance(raw_updates, list):
+        if len(raw_updates) > _MAX_CHECKPOINT_CANDIDATE_IDS:
+            omitted_candidate_ids = 1
+        for value in raw_updates[:_MAX_CHECKPOINT_CANDIDATE_IDS + 1]:
+            if isinstance(value, Mapping):
+                candidate_id = str(value.get("candidate_id") or "").strip()
+                if candidate_id:
+                    candidate_ids.append(candidate_id)
+                    if str(value.get("status") or "").strip().lower() not in {
+                        "active", "withdrawn", "superseded",
+                    }:
+                        unidentified_shapes += 1
+                else:
+                    unidentified_shapes += 1
+            else:
+                unidentified_shapes += 1
+    elif raw_updates is not None and raw_updates != ():
         unidentified_shapes += 1
     bounded_ids: list[str] = []
     for candidate_id in dict.fromkeys(candidate_ids):
@@ -309,10 +378,13 @@ def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
 def _candidate_retention_lost(
     signal: _CandidateRetentionSignal,
     checkpoint: SessionCheckpoint | None,
+    *,
+    accounted_candidate_ids: tuple[str, ...] = (),
 ) -> bool:
     if not signal.is_material:
         return False
     admitted = set(checkpoint.candidate_finding_ids) if checkpoint is not None else set()
+    admitted.update(accounted_candidate_ids)
     return bool(
         set(signal.candidate_ids) - admitted
         or signal.unidentified_shapes
@@ -512,6 +584,10 @@ class SpecialistSession:
         self.state = SessionState.CREATED
         self._current_gaps = self._assigned_obligation_ids()
         self.candidate_findings: tuple[CandidateFinding, ...] = ()
+        # Lifecycle state includes withdrawn/superseded IDs so a legitimate
+        # update is accounted for even though only active findings are exposed
+        # through ``candidate_findings`` and checkpoints.
+        self._candidate_statuses: dict[str, str] = {}
         self._candidate_retention_signal = _CandidateRetentionSignal()
         self.latest_checkpoint = self._project_checkpoint(())
         self.source_access_requests: tuple[SourceAccessRequest, ...] = ()
@@ -574,6 +650,24 @@ class SpecialistSession:
         all_ids = tuple(getattr(self.assignment, "obligation_ids", ()))
         independent = tuple(getattr(self.assignment, "independent_obligation_ids", ()))
         return tuple(dict.fromkeys((*primary, *all_ids, *independent)))
+
+    def _accounted_candidate_ids(self) -> tuple[str, ...]:
+        return tuple(self._candidate_statuses)
+
+    def _active_candidate_register(self) -> str:
+        if not self.candidate_findings:
+            return "Active candidates: []"
+        entries = []
+        for candidate in self.candidate_findings[:_MAX_CHECKPOINT_CANDIDATE_IDS]:
+            claim = " ".join(candidate.claim.split())[:180]
+            entries.append({
+                "candidate_id": candidate.candidate_id,
+                "claim": claim,
+                "affected_location": candidate.affected_location,
+            })
+        return "Active candidates (use these short IDs for updates): " + json.dumps(
+            entries, sort_keys=True,
+        )
 
     def _request(self, *, tools_enabled: bool, schema: dict[str, Any] | None) -> ModelTurnResult:
         estimated_input_tokens = self.conversation.approx_tokens()
@@ -728,7 +822,9 @@ class SpecialistSession:
                 if (
                     checkpoint is None
                     or _candidate_retention_lost(
-                        self._candidate_retention_signal, checkpoint,
+                        self._candidate_retention_signal,
+                        checkpoint,
+                        accounted_candidate_ids=self._accounted_candidate_ids(),
                     )
                 ):
                     return self.request_checkpoint(
@@ -1012,6 +1108,8 @@ class SpecialistSession:
         self.conversation.add_user(
             "Checkpoint requested (not a final report). Reason: "
             + str(reason)
+            + "\n"
+            + self._active_candidate_register()
             + _CHECKPOINT_RETENTION_INSTRUCTION
         )
         request_event_count = len(self._request_events)
@@ -1027,7 +1125,9 @@ class SpecialistSession:
             self.latest_checkpoint = (
                 self._checkpoint_with_retention_unknown(checkpoint)
                 if _candidate_retention_lost(
-                    self._candidate_retention_signal, checkpoint,
+                    self._candidate_retention_signal,
+                    checkpoint,
+                    accounted_candidate_ids=self._accounted_candidate_ids(),
                 )
                 else checkpoint
             )
@@ -1043,7 +1143,9 @@ class SpecialistSession:
         )
         checkpoint = self._checkpoint_from_text(turn.content)
         needs_repair = checkpoint is None or _candidate_retention_lost(
-            self._candidate_retention_signal, checkpoint,
+            self._candidate_retention_signal,
+            checkpoint,
+            accounted_candidate_ids=self._accounted_candidate_ids(),
         )
         if needs_repair:
             self.conversation.add_user(
@@ -1073,7 +1175,9 @@ class SpecialistSession:
                 )
                 checkpoint = self._checkpoint_from_text(repair.content)
         retention_unknown = _candidate_retention_lost(
-            self._candidate_retention_signal, checkpoint,
+            self._candidate_retention_signal,
+            checkpoint,
+            accounted_candidate_ids=self._accounted_candidate_ids(),
         )
         fallback_projection = checkpoint is None
         if fallback_projection:
@@ -1141,26 +1245,59 @@ class SpecialistSession:
         candidates: dict[str, CandidateFinding] = {
             item.candidate_id: item for item in self.candidate_findings
         }
+        # Legacy checkpoints may repeat full candidate objects. Treat them as
+        # additions while preserving all previously active candidates.
         raw_candidates = raw.get("candidate_findings")
+        new_candidates = raw.get("new_candidates")
+        candidate_payloads: list[object] = []
         if isinstance(raw_candidates, list):
-            for value in raw_candidates:
-                candidate = self._candidate_from_checkpoint(
-                    value,
-                    retained=retained,
-                    assigned=assigned,
-                )
-                if (
-                    candidate is not None
-                    and (
-                        not declared_candidate_ids
-                        or candidate.candidate_id in declared_candidate_ids
-                    )
-                    and candidate.candidate_id not in candidates
-                ):
-                    candidates[candidate.candidate_id] = candidate
-        self.candidate_findings = tuple(
-            candidates[key] for key in sorted(candidates)
-        )
+            candidate_payloads.extend(raw_candidates)
+        if isinstance(new_candidates, list):
+            candidate_payloads.extend(new_candidates)
+        elif new_candidates is not None:
+            return None
+        for value in candidate_payloads:
+            candidate = self._candidate_from_checkpoint(
+                value,
+                retained=retained,
+                assigned=assigned,
+            )
+            if candidate is None:
+                return None
+            if declared_candidate_ids and candidate.candidate_id not in declared_candidate_ids:
+                continue
+            existing = candidates.get(candidate.candidate_id)
+            if existing is not None and existing != candidate:
+                # A repeated ID must not silently rewrite the retained finding.
+                continue
+            candidates[candidate.candidate_id] = candidate
+            self._candidate_statuses[candidate.candidate_id] = "active"
+
+        updates = raw.get("candidate_updates", [])
+        if updates is None:
+            updates = []
+        if not isinstance(updates, list):
+            return None
+        for update in updates:
+            if not isinstance(update, Mapping):
+                return None
+            candidate_id = str(update.get("candidate_id") or "").strip()
+            status = str(update.get("status") or "").strip().lower()
+            if (
+                not candidate_id
+                or status not in {"active", "withdrawn", "superseded"}
+                or candidate_id not in self._candidate_statuses
+            ):
+                # Updates are authoritative only for controller-known IDs.
+                return None
+            if status == "active":
+                if candidate_id not in candidates:
+                    return None
+            else:
+                candidates.pop(candidate_id, None)
+            self._candidate_statuses[candidate_id] = status
+
+        self.candidate_findings = tuple(candidates[key] for key in sorted(candidates))
         self._current_gaps = self._derive_current_gaps()
         evidence_ids = list(dict.fromkeys(evidence_ids))
         return SessionCheckpoint(

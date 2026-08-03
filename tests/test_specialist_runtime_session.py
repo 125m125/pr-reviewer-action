@@ -97,6 +97,22 @@ def candidate_checkpoint_response(candidate_ids):
     )
 
 
+def candidate_update_checkpoint_response(*, updates=(), new_candidates=(), unresolved=("OB-tests",)):
+    """Build the compact lifecycle checkpoint shape used by new protocol tests."""
+    text = json.dumps({
+        "inspected": [],
+        "unresolved": list(unresolved),
+        "candidate_updates": list(updates),
+        "new_candidates": list(new_candidates),
+        "unknowns": list(unresolved),
+    })
+    return ModelTurnResult(
+        response={}, tool_calls=(), text=text, text_source="content",
+        finish_reason="stop", usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+
+
 def test_shortened_evidence_ids_are_expanded_only_when_unambiguous():
     retained = {
         "evidence:abcdef0123456789": object(),
@@ -337,6 +353,94 @@ def test_checkpoint_derives_candidate_ids_from_candidate_objects():
     result = session.explore()
 
     assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
+
+
+def test_checkpoint_carries_forward_candidates_when_update_arrays_are_empty():
+    """Unchanged candidates remain active without replaying their full objects."""
+    initial = candidate_checkpoint_response(("candidate-code",))
+    second = candidate_update_checkpoint_response(updates=(), new_candidates=())
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        second,
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    first = session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    second_result = session.explore()
+
+    assert first.checkpoint.candidate_finding_ids == ("candidate-code",)
+    assert second_result.checkpoint.candidate_finding_ids == ("candidate-code",)
+    assert second_result.degraded is False
+
+
+def test_checkpoint_withdraws_known_candidate_only_with_explicit_update():
+    """Omission does not withdraw a candidate; an explicit update does."""
+    initial = candidate_checkpoint_response(("candidate-code",))
+    withdrawn = candidate_update_checkpoint_response(updates=({
+        "candidate_id": "candidate-code",
+        "status": "withdrawn",
+        "reason": "The suspected path is unreachable.",
+        "evidence_ids": [],
+    },))
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        withdrawn,
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    result = session.explore()
+
+    assert result.checkpoint.candidate_finding_ids == ()
+    assert session.candidate_findings == ()
+    assert result.degraded is False
+
+
+def test_checkpoint_accepts_new_candidates_separately_from_updates():
+    """New candidates use the dedicated array and become active state."""
+    initial = candidate_update_checkpoint_response()
+    candidate_payload = json.loads(candidate_checkpoint_response(("candidate-new",)).text)
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        ModelTurnResult(**{
+            **initial.__dict__,
+            "text": json.dumps({
+                "inspected": ["a.py"],
+                "unresolved": ["OB-tests"],
+                "candidate_updates": [],
+                "new_candidates": candidate_payload["candidate_findings"],
+                "unknowns": ["OB-tests"],
+            }),
+        }),
+    ])
+    session = make_session(gateway, model_turns=5)
+
+    session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    result = session.explore()
+
+    assert result.checkpoint.candidate_finding_ids == ("candidate-new",)
+    assert result.degraded is False
+
+
+def test_checkpoint_prompt_contains_compact_active_candidate_register():
+    """Checkpoint requests expose short handles instead of requiring full replay."""
+    gateway = ScriptedGateway([
+        candidate_update_checkpoint_response(),
+    ])
+    session = make_session(gateway)
+
+    session.request_checkpoint("controller-request")
+
+    prompt = gateway.requests[0].messages
+    assert "candidate_updates" in prompt
+    assert "new_candidates" in prompt
+    assert "Active candidates" in prompt
 
 
 def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract():
