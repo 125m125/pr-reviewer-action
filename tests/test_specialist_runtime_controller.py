@@ -1070,6 +1070,47 @@ def test_gateway_negotiator_receives_compact_targets_and_re_evaluates_each_wave(
     assert [event.payload["round"] for event in result.events if event.kind == "negotiation_round"] == [1, 2]
 
 
+def test_record_unknown_status_change_does_not_trigger_another_negotiation_round(tmp_path):
+    calls = []
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return _ResumeSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    def record_unknown(request):
+        calls.append(request)
+        state = request.context["negotiation_state"]
+        target = next(
+            item for item in state.obligations
+            if item.mandatory and item.required_evidence_categories
+        )
+        return {"actions": [{
+            "kind": "record_unknown",
+            "obligation_ids": [target.id],
+            "expected_evidence": list(target.required_evidence_categories),
+            "estimated_turns": 0,
+            "reason": "No bounded evidence remains.",
+        }]}
+
+    result = ReviewController(
+        planner=_planner_role,
+        session_factory=factory,
+        negotiator=record_unknown,
+        critic=_critic_role,
+        finalizer=_finalizer,
+        clock=lambda: 0.0,
+        artifact_output_root=tmp_path,
+    ).run(_inputs(tmp_path))
+
+    assert len(calls) == 1
+    assert [event.payload["round"] for event in result.events if event.kind == "negotiation_round"] == [1]
+
+
 def test_malformed_change_summary_falls_back_to_bounded_facts(tmp_path):
     observed = {}
     inputs = replace(

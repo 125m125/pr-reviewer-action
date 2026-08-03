@@ -4261,7 +4261,11 @@ class ReviewController:
                 if not reconciliation.uncovered_obligation_ids:
                     break
                 before_uncovered = set(reconciliation.uncovered_obligation_ids)
-                before_statuses = tuple(reconciliation.snapshot.obligation_statuses)
+                before_covered = {
+                    obligation_id
+                    for obligation_id, status in reconciliation.snapshot.obligation_statuses
+                    if status is ObligationStatus.COVERED
+                }
                 before_evidence = frozenset(state.evidence.snapshot().evidence_ids)
                 journal.emit("negotiation_round", {
                     "round": round_index + 1,
@@ -4284,10 +4288,14 @@ class ReviewController:
                 # to emit the same action. Evidence collection itself counts as
                 # progress even when it has not yet satisfied an obligation.
                 reconciliation = next_reconciliation
-                after_statuses = tuple(reconciliation.snapshot.obligation_statuses)
+                after_covered = {
+                    obligation_id
+                    for obligation_id, status in reconciliation.snapshot.obligation_statuses
+                    if status is ObligationStatus.COVERED
+                }
                 after_evidence = frozenset(state.evidence.snapshot().evidence_ids)
                 made_progress = (
-                    before_statuses != after_statuses
+                    bool(after_covered - before_covered)
                     or before_evidence != after_evidence
                 )
                 if not made_progress:

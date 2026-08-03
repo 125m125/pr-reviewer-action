@@ -35,7 +35,11 @@ Implemented the model-facing negotiation simplification.
 153 passed in 2.58s
 
 \.venv\Scripts\python.exe -m pytest -q tests/test_specialist_runtime_negotiation.py tests/test_specialist_runtime_controller.py tests/test_specialist_runtime_cli.py
-240 passed in 4.16s
+241 passed in 3.94s
+
+Round-two regression coverage confirms that a `record_unknown` transition
+(`PENDING` to `UNRESOLVED`) does not count as coverage progress and therefore
+does not trigger another negotiator call.
 
 The controller regression test verifies that newly collected evidence counts as
 progress even while the same obligation remains unresolved, allowing a second
