@@ -272,11 +272,14 @@ class _CandidateRetentionSignal:
 def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
     """Retain only bounded structured IDs/counts, never candidate prose."""
     raw = _json_object(text)
+    structured_text = isinstance(text, str) and text.strip().startswith(("{", "[", "```"))
     if not isinstance(raw, Mapping):
         # Malformed structured candidate payloads remain conservative, while
         # ordinary prose containing no JSON candidate keys is non-material.
         return _CandidateRetentionSignal(
-            unidentified_shapes=1 if _contains_candidate_shaped_text(text) else 0,
+            unidentified_shapes=(
+                1 if structured_text and _contains_candidate_shaped_text(text) else 0
+            ),
         )
     if not any(
         key in raw for key in (
@@ -285,7 +288,9 @@ def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
         )
     ):
         return _CandidateRetentionSignal(
-            unidentified_shapes=1 if _contains_candidate_shaped_text(text) else 0,
+            unidentified_shapes=(
+                1 if structured_text and _contains_candidate_shaped_text(text) else 0
+            ),
         )
     candidate_ids: list[str] = []
     unidentified_shapes = 0
@@ -343,6 +348,11 @@ def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
                 candidate_id = str(value.get("candidate_id") or "").strip()
                 if candidate_id:
                     candidate_ids.append(candidate_id)
+                    if (
+                        str(value.get("status") or "").strip().lower() == "superseded"
+                        and not str(value.get("superseded_by") or "").strip()
+                    ):
+                        unidentified_shapes += 1
                     if str(value.get("status") or "").strip().lower() not in {
                         "active", "withdrawn", "superseded",
                     }:
@@ -665,7 +675,7 @@ class SpecialistSession:
                 "claim": claim,
                 "affected_location": candidate.affected_location,
             })
-        return "Active candidates (use these short IDs for updates): " + json.dumps(
+        return "Active candidates (use these exact IDs for updates): " + json.dumps(
             entries, sort_keys=True,
         )
 
@@ -1293,6 +1303,11 @@ class SpecialistSession:
             if status == "active":
                 if candidate_id not in candidates:
                     return None
+            elif status == "superseded":
+                replacement_id = str(update.get("superseded_by") or "").strip()
+                if not replacement_id or replacement_id not in candidates:
+                    return None
+                candidates.pop(candidate_id, None)
             else:
                 candidates.pop(candidate_id, None)
             self._candidate_statuses[candidate_id] = status

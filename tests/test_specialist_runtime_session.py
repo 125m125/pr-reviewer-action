@@ -443,6 +443,65 @@ def test_checkpoint_prompt_contains_compact_active_candidate_register():
     assert "Active candidates" in prompt
 
 
+def test_checkpoint_register_uses_exact_candidate_ids_without_unmapped_aliases():
+    """The register must not advertise aliases the controller cannot resolve."""
+    initial = candidate_checkpoint_response(("finding:long-stable-id",))
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        candidate_update_checkpoint_response(),
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    session.explore()
+
+    prompt = gateway.requests[-1].messages
+    assert "finding:long-stable-id" in prompt
+    assert "short IDs" not in prompt
+
+
+def test_superseded_update_requires_known_replacement_candidate():
+    """Superseding a candidate must identify an active replacement."""
+    initial = candidate_checkpoint_response(("candidate-code",))
+    invalid = candidate_update_checkpoint_response(updates=({
+        "candidate_id": "candidate-code",
+        "status": "superseded",
+        "reason": "Replaced by a narrower issue.",
+    },))
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        invalid,
+        candidate_update_checkpoint_response(),
+        candidate_update_checkpoint_response(),
+    ])
+    session = make_session(gateway, model_turns=6)
+
+    session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    result = session.explore()
+
+    assert result.degraded is True
+    assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
+
+
+def test_plain_prose_candidate_words_do_not_trigger_retention_unknown():
+    """Candidate vocabulary in ordinary prose is not structured candidate state."""
+    gateway = ScriptedGateway([
+        invalid_response(
+            "I reviewed candidate_findings and the candidate_id/claim wording "
+            "is not applicable to this specialist."
+        ),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    result = make_session(gateway).explore()
+
+    assert result.degraded is False
+    assert "candidate-retention-unknown" not in result.checkpoint.unknowns
+
+
 def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract():
     gateway = ScriptedGateway([
         invalid_response("plain-text material issue"),

@@ -44,3 +44,22 @@ The legacy candidate object shape is intentionally retained for older model
 providers. New prompts prefer short candidate IDs and structured updates, but
 the controller still conservatively requests repair when malformed candidate
 objects cannot be accounted for.
+
+## Fix round 1
+
+- Candidate registers now explicitly advertise and preserve exact controller
+  IDs; no unmapped short aliases are promised.
+- `superseded` updates require `superseded_by` and the replacement must be an
+  active candidate in the same checkpoint.
+- Candidate retention heuristics only treat malformed JSON/fenced candidate
+  payloads as material; ordinary prose containing candidate vocabulary is safe.
+
+Verification:
+
+```text
+$env:PYTHONPATH='.'; .\\.venv\\Scripts\\pytest.exe tests/test_specialist_runtime_session.py -q
+58 passed in 0.28s
+
+$env:PYTHONPATH='.'; .\\.venv\\Scripts\\pytest.exe tests/test_specialist_runtime_controller.py tests/test_specialist_runtime_replay.py tests/test_specialist_runtime_scheduler.py -q
+207 passed in 6.72s
+```
