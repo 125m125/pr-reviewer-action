@@ -66,7 +66,9 @@ from .negotiation import (
     NegotiationError,
     NegotiationState,
     SessionResources,
+    compact_negotiation_context,
     fallback_next_action,
+    validate_compact_negotiation,
     validate_negotiation,
 )
 from .model_gateway import ModelGateway, ModelTurnRequest
@@ -2660,10 +2662,17 @@ class ReviewController:
 
     def _negotiate(
         self, state: _RunState, reconciliation: CoverageReconciliation,
+        *, attempt: int = 1,
     ) -> tuple[NegotiationAction, ...]:
         if not reconciliation.uncovered_obligation_ids:
             return ()
-        negotiation_state = self._negotiation_state(state, reconciliation, 0)
+        followup_started = sum(
+            1 for assignment in state.assignments.values()
+            if "-followup-" in assignment.id
+        )
+        negotiation_state = self._negotiation_state(
+            state, reconciliation, followup_started,
+        )
         if not state.deadline.exploration_allowed(now=self.clock()):
             self._degrade(state, "deadline", "exploration cutoff reached before follow-up")
             try:
@@ -2672,25 +2681,50 @@ class ReviewController:
                 return ()
         if self.negotiator is not None:
             try:
+                compact_context = compact_negotiation_context(negotiation_state)
+                role_context: dict[str, object] = {
+                    "negotiation_state": compact_context,
+                    "negotiation_targets": compact_context["targets"],
+                    "pr_metadata": state.inputs.pr_metadata,
+                    "policy": state.inputs.policy,
+                    "change_overview": change_overview_orientation(
+                        state.change_overview,
+                    ),
+                }
+                # Keep the typed state available to in-process integrations for
+                # backwards compatibility.  Gateway-backed model roles receive
+                # only the compact target projection above.
+                if not isinstance(self.negotiator, GatewayRoleAdapter):
+                    role_context["negotiation_state"] = negotiation_state
                 raw = self._model_request(
                     state,
                     role="negotiator",
-                    request_id="negotiator:1",
+                    request_id=f"negotiator:{max(1, attempt)}",
                     phase=RunPhase.FOLLOWUP,
                     component=self.negotiator,
                     method="propose",
-                    context={
-                        "negotiation_state": negotiation_state,
-                        "pr_metadata": state.inputs.pr_metadata,
-                        "policy": state.inputs.policy,
-                        "change_overview": change_overview_orientation(
-                            state.change_overview,
-                        ),
-                    },
+                    context=role_context,
                 )
                 if not isinstance(raw, Mapping):
                     raise NegotiationError("negotiator result must be an object")
-                return validate_negotiation(raw, negotiation_state).actions
+                raw_kind = raw.get("kind")
+                if isinstance(raw_kind, str) and raw_kind in {"record-unknown", "new-session"}:
+                    state.journal.emit("negotiation_alias_normalized", {
+                        "from": raw_kind,
+                        "to": {"record-unknown": "record_unknown", "new-session": "new_session"}[raw_kind],
+                    })
+                if isinstance(self.negotiator, GatewayRoleAdapter):
+                    proposal = validate_compact_negotiation(raw, negotiation_state)
+                else:
+                    # Trusted in-process adapters may still return the legacy
+                    # shape, but never more than one action is executable.
+                    if "actions" in raw and isinstance(raw.get("actions"), list) \
+                            and len(raw["actions"]) != 1:
+                        raise NegotiationError(
+                            "negotiator proposal must contain exactly one action"
+                        )
+                    proposal = validate_negotiation(raw, negotiation_state)
+                return proposal.actions
             except Exception as exc:
                 # Negotiation is an optimization layer. The deterministic
                 # fallback below can still produce a bounded follow-up, so a
@@ -4211,12 +4245,42 @@ class ReviewController:
                     state, session_id, "update_lease", RunPhase.FOLLOWUP,
                     followup_lease,
                 )
-            actions = self._negotiate(state, reconciliation)
-            followups = self._followup_assignments(state, actions)
-            followup, followup_snapshot = self._run_wave(
-                state, followups, RunPhase.FOLLOWUP,
+            # Negotiation is deliberately one-action-at-a-time.  Recompute the
+            # authoritative state after each bounded wave so the next proposal
+            # cannot rely on stale obligations, leases, or coverage gains.
+            max_rounds = max(
+                1,
+                state.inputs.config.max_followup_sessions
+                + len(state.obligations),
             )
-            reconciliation = self._reconcile(state, followup, followup_snapshot)
+            for round_index in range(max_rounds):
+                if not reconciliation.uncovered_obligation_ids:
+                    break
+                before_uncovered = set(reconciliation.uncovered_obligation_ids)
+                journal.emit("negotiation_round", {
+                    "round": round_index + 1,
+                    "uncovered_count": len(before_uncovered),
+                })
+                actions = self._negotiate(
+                    state, reconciliation, attempt=round_index + 1,
+                )
+                if not actions:
+                    break
+                followups = self._followup_assignments(state, actions)
+                followup, followup_snapshot = self._run_wave(
+                    state, followups, RunPhase.FOLLOWUP,
+                )
+                next_reconciliation = self._reconcile(
+                    state, followup, followup_snapshot,
+                )
+                # record_unknown and infeasible proposals intentionally make no
+                # coverage progress; stop rather than repeatedly asking the model
+                # to emit the same action.
+                reconciliation = next_reconciliation
+                if before_uncovered.issubset(
+                    set(reconciliation.uncovered_obligation_ids)
+                ):
+                    break
             for obligation_id in reconciliation.uncovered_obligation_ids:
                 if not any(item.get("obligation_id") == obligation_id for item in state.unknowns):
                     obligation = state.coverage.obligation(obligation_id)

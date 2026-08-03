@@ -18,6 +18,10 @@ from .types import (
 
 
 _ACTION_KINDS = frozenset({"resume", "consult", "new_session", "record_unknown"})
+_ACTION_ALIASES = {
+    "record-unknown": "record_unknown",
+    "new-session": "new_session",
+}
 _ACTION_RANK = {"resume": 0, "consult": 1, "new_session": 2, "record_unknown": 3}
 _ACTION_FIELDS = frozenset({
     "kind", "session_id", "obligation_ids", "expected_evidence",
@@ -208,6 +212,53 @@ class NegotiationProposal:
     actions: tuple[NegotiationAction, ...]
 
 
+def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
+    """Project controller state into a small, model-facing target catalogue.
+
+    The model only needs to choose *which* unresolved target and *what kind* of
+    bounded action to take.  Obligation/session IDs, evidence categories and
+    budgets remain controller-owned and are deliberately omitted from this
+    projection.
+    """
+    statuses = dict(state.coverage.obligation_statuses)
+    obligations = sorted(
+        (
+            item for item in state.obligations
+            if item.mandatory
+            and item.required_evidence_categories
+            and statuses.get(item.id, ObligationStatus.PENDING)
+            is not ObligationStatus.COVERED
+        ),
+        key=lambda item: (_RISK_RANK.get(item.risk_tier, 2), item.id),
+    )
+    ownership = tuple(state.session_ownership)
+    targets: list[dict[str, object]] = []
+    for index, item in enumerate(obligations, start=1):
+        owners = tuple(
+            owner for owner in ownership if item.id in owner.obligation_ids
+        )
+        primary = any(item.id in owner.primary_obligation_ids for owner in owners)
+        actions = ["record_unknown", "new_session"]
+        if primary:
+            actions.insert(0, "resume")
+        elif owners:
+            actions.insert(0, "consult")
+        targets.append({
+            "handle": f"U{index}",
+            "risk_tier": item.risk_tier,
+            "subject": item.subject,
+            "summary": (
+                f"Investigate the {item.risk_tier}-risk obligation concerning "
+                f"{item.subject}."
+            ),
+            "allowed_actions": tuple(actions),
+        })
+    return {
+        "protocol": "choose exactly one action for one target handle",
+        "targets": tuple(targets),
+    }
+
+
 def _string_list(value: Any, field: str, errors: list[str]) -> tuple[str, ...]:
     if not isinstance(value, list):
         errors.append(f"{field} must be an array")
@@ -225,6 +276,125 @@ def _string_list(value: Any, field: str, errors: list[str]) -> tuple[str, ...]:
     return tuple(sorted(set(result)))
 
 
+def _normalise_action_kind(value: Any, *, errors: list[str]) -> str | None:
+    if not isinstance(value, str):
+        return None
+    kind = value.strip()
+    normalised = _ACTION_ALIASES.get(kind, kind)
+    if normalised != kind:
+        errors.append(f"normalized action kind alias {kind!r} to {normalised!r}")
+    if normalised not in _ACTION_KINDS:
+        return None
+    return normalised
+
+
+def _compact_target_obligations(
+    state: NegotiationState,
+) -> dict[str, CoverageObligation]:
+    statuses = dict(state.coverage.obligation_statuses)
+    obligations = sorted(
+        (
+            item for item in state.obligations
+            if item.mandatory
+            and item.required_evidence_categories
+            and statuses.get(item.id, ObligationStatus.PENDING)
+            is not ObligationStatus.COVERED
+        ),
+        key=lambda item: (_RISK_RANK.get(item.risk_tier, 2), item.id),
+    )
+    return {f"U{index}": item for index, item in enumerate(obligations, start=1)}
+
+
+def _compact_session_for(
+    kind: str,
+    obligation: CoverageObligation,
+    state: NegotiationState,
+) -> str | None:
+    owners = tuple(
+        owner for owner in state.session_ownership
+        if obligation.id in owner.obligation_ids
+    )
+    if kind == "resume":
+        owners = tuple(
+            owner for owner in owners
+            if obligation.id in owner.primary_obligation_ids
+        )
+    if not owners:
+        return None
+    resources = {item.session_id: item for item in state.session_resources}
+    # Prefer a feasible owner, then stable controller order.  Validation still
+    # rechecks ownership, budget and lease after this projection.
+    feasible = tuple(
+        owner for owner in sorted(owners, key=lambda item: item.session_id)
+        if (
+            resources.get(owner.session_id) is not None
+            and resources[owner.session_id].remaining_model_turns > 0
+            and resources[owner.session_id].remaining_tool_calls > 0
+            and resources[owner.session_id].lease_remaining_sec >= state.seconds_per_turn
+        )
+    )
+    return (feasible or tuple(sorted(owners, key=lambda item: item.session_id)))[0].session_id
+
+
+def _compact_raw_to_legacy(
+    raw: Mapping[str, Any],
+    state: NegotiationState,
+) -> dict[str, Any]:
+    fields = set(raw)
+    unsupported = sorted(fields - {"kind", "target", "reason"})
+    if unsupported:
+        raise NegotiationError(
+            "compact proposal has unsupported fields: " + ", ".join(unsupported)
+        )
+    errors: list[str] = []
+    kind = _normalise_action_kind(raw.get("kind"), errors=[])
+    if kind is None:
+        errors.append(
+            "kind must be exactly resume, consult, new_session, or record_unknown"
+        )
+    target = raw.get("target")
+    if not isinstance(target, str) or not target.strip():
+        errors.append("target must be a non-empty controller target handle")
+        target = ""
+    else:
+        target = target.strip()
+    reason = raw.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        errors.append("reason must be a non-empty string")
+        reason = ""
+    else:
+        reason = " ".join(reason.split())
+    obligation = _compact_target_obligations(state).get(target)
+    if obligation is None:
+        errors.append(f"target {target!r} is not an unresolved controller target")
+    if errors:
+        # Alias diagnostics are useful in the event journal but are not errors.
+        diagnostics = tuple(
+            item for item in errors if item.startswith("normalized action kind alias")
+        )
+        fatal = tuple(item for item in errors if item not in diagnostics)
+        if fatal:
+            raise NegotiationError(fatal)
+    assert obligation is not None
+    assert kind is not None
+    estimated_turns = 0 if kind == "record_unknown" else 1
+    action: dict[str, Any] = {
+        "kind": kind,
+        "obligation_ids": [obligation.id],
+        "expected_evidence": list(obligation.required_evidence_categories),
+        "estimated_turns": estimated_turns,
+        "reason": reason,
+    }
+    if kind in {"resume", "consult"}:
+        session_id = _compact_session_for(kind, obligation, state)
+        if session_id is None:
+            raise NegotiationError(
+                f"target {target!r} has no controller-owned session for {kind}"
+            )
+        action["session_id"] = session_id
+    return {"actions": [action]}
+
+
 def _parse_action(
     raw: Any,
     index: int,
@@ -237,8 +407,8 @@ def _parse_action(
     extra = sorted(set(raw) - _ACTION_FIELDS)
     if extra:
         errors.append(f"{label} has unsupported fields: {', '.join(extra)}")
-    kind = raw.get("kind")
-    if not isinstance(kind, str) or kind not in _ACTION_KINDS:
+    kind = _normalise_action_kind(raw.get("kind"), errors=errors)
+    if kind is None:
         errors.append(
             f"{label} kind must be exactly resume, consult, new_session, or record_unknown"
         )
@@ -422,6 +592,8 @@ def validate_negotiation(raw: Mapping[str, Any], state: NegotiationState) -> Neg
         raise TypeError("state must be a NegotiationState")
     if not isinstance(raw, Mapping):
         raise NegotiationError("proposal must be an object")
+    if "actions" not in raw and ({"kind", "target"} & set(raw)):
+        return validate_compact_negotiation(raw, state)
     extra = sorted(set(raw) - {"actions"})
     if extra:
         raise NegotiationError("proposal has unsupported fields: " + ", ".join(extra))
@@ -458,6 +630,27 @@ def validate_negotiation(raw: Mapping[str, Any], state: NegotiationState) -> Neg
     return NegotiationProposal(actions=tuple(sorted(
         actions, key=lambda action: _action_order(action, obligation_by_id)
     )))
+
+
+def validate_compact_negotiation(
+    raw: Mapping[str, Any], state: NegotiationState,
+) -> NegotiationProposal:
+    """Validate the one-action, handle-based negotiator response.
+
+    The compact response deliberately contains no controller-owned IDs, evidence
+    categories or budgets.  Those values are projected from ``state`` and then
+    passed through the same legacy validator, preserving all semantic checks.
+    """
+    if not isinstance(raw, Mapping):
+        raise NegotiationError("compact proposal must be an object")
+    if "actions" in raw:
+        actions = raw.get("actions")
+        if isinstance(actions, list) and len(actions) != 1:
+            raise NegotiationError("compact proposal must contain exactly one action")
+        raise NegotiationError(
+            "compact proposal must contain kind, target, and reason, not actions"
+        )
+    return validate_negotiation(_compact_raw_to_legacy(raw, state), state)
 
 
 def _fallback_raw(

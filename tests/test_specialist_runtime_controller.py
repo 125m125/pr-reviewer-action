@@ -1014,6 +1014,67 @@ def test_one_validated_change_overview_reaches_every_review_role(tmp_path):
     assert result.artifact["accepted_candidates"] == ()
 
 
+def test_gateway_negotiator_receives_compact_targets_and_re_evaluates_each_wave(tmp_path):
+    requests = []
+
+    class Gateway:
+        def complete(self, request):
+            payload = request.conversation.to_request_payload("openai", "m")
+            requests.append(json.loads(payload["messages"][1]["content"]))
+            return ModelTurnResult(
+                response={},
+                tool_calls=(),
+                text='{"kind":"resume","target":"U1","reason":"Run one bounded owner check."}',
+                text_source="content",
+                finish_reason="stop",
+                usage={},
+                request_diagnostics={},
+                content='{"kind":"resume","target":"U1","reason":"Run one bounded owner check."}',
+                reasoning="",
+            )
+
+    first = RecipePolicy(
+        id="delivery",
+        title="Delivery",
+        objective="Trace delivery behavior",
+        execution="coverage",
+        match={"file_roles_any": ("implementation",)},
+        expected_evidence=("implementation",),
+    )
+    second = RecipePolicy(
+        id="contract",
+        title="Contract",
+        objective="Trace contract behavior",
+        execution="coverage",
+        match={"file_roles_any": ("implementation",)},
+        expected_evidence=("tests",),
+    )
+    inputs = replace(_inputs(tmp_path), policy=ReviewPolicy.minimal(recipes=(first, second)))
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return _ResumeSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    result = ReviewController(
+        planner=_planner_role,
+        session_factory=factory,
+        negotiator=GatewayRoleAdapter(Gateway()),
+        critic=_critic_role,
+        finalizer=_finalizer,
+        clock=lambda: 0.0,
+        artifact_output_root=tmp_path,
+    ).run(inputs)
+
+    assert len(requests) == 2
+    assert all("obligation_id" not in target for target in requests[0]["negotiation_state"]["targets"])
+    assert [event.payload["round"] for event in result.events if event.kind == "negotiation_round"] == [1, 2]
+
+
 def test_malformed_change_summary_falls_back_to_bounded_facts(tmp_path):
     observed = {}
     inputs = replace(

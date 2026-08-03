@@ -88,10 +88,13 @@ _ROLE_SYSTEM = {
         "to compatible ordinary assignments."
     ),
     "negotiator": (
-        "Propose only bounded resume, consultation, follow-up, or unknown actions for the "
-        "supplied unresolved obligations. Return only {\"actions\":[...]}; each action has "
-        "kind (resume, consult, new_session, or record_unknown), obligation_ids, "
-        "expected_evidence, estimated_turns, reason, and session_id only for resume/consult."
+        "Choose exactly one bounded action for one controller-provided target handle. "
+        "Return only {\"kind\":string,\"target\":string,\"reason\":string}. "
+        "Allowed kinds are resume, consult, new_session, and record_unknown. Do not "
+        "repeat obligation IDs, session IDs, evidence categories, turn counts, leases, "
+        "budgets, or an actions array; the controller derives those values from the "
+        "selected target. Use a hyphenated spelling only when unavoidable (for example "
+        "record-unknown); arbitrary or unsupported kinds remain invalid."
     ),
     "critic": (
         "Adjudicate only evidence-backed candidates from the supplied immutable state. "

@@ -16,7 +16,9 @@ from pr_reviewer.specialist_runtime.negotiation import (
     NegotiationError,
     NegotiationState,
     SessionResources,
+    compact_negotiation_context,
     fallback_next_action,
+    validate_compact_negotiation,
     validate_negotiation,
 )
 from pr_reviewer.specialist_runtime.policy import RuntimeConfig
@@ -139,6 +141,47 @@ def resume_raw(**updates):
     }
     raw.update(updates)
     return {"actions": [raw]}
+
+
+def test_compact_negotiation_uses_controller_target_handle_and_derives_authority():
+    state = state_for()
+    context = compact_negotiation_context(state)
+
+    assert context["targets"]
+    target = next(item for item in context["targets"] if item["risk_tier"] == "critical")
+    assert target["handle"] == "U1"
+    assert "obligation_id" not in target
+    proposal = validate_compact_negotiation({
+        "kind": "resume",
+        "target": target["handle"],
+        "reason": "The durable owner needs one bounded implementation check.",
+    }, state)
+
+    assert proposal.actions[0].obligation_ids == ("OB2",)
+    assert proposal.actions[0].session_id == "S2"
+    assert proposal.actions[0].expected_evidence == ("implementation",)
+    assert proposal.actions[0].estimated_turns == 1
+
+
+def test_compact_negotiation_rejects_multi_action_payloads():
+    state = state_for()
+    with pytest.raises(NegotiationError, match="exactly one action"):
+        validate_compact_negotiation({
+            "actions": [
+                {"kind": "resume", "target": "U1", "reason": "first"},
+                {"kind": "record_unknown", "target": "U2", "reason": "second"},
+            ],
+        }, state)
+
+
+def test_compact_negotiation_normalizes_unambiguous_kind_alias():
+    proposal = validate_compact_negotiation({
+        "kind": "record-unknown",
+        "target": "U1",
+        "reason": "No bounded evidence remains.",
+    }, state_for())
+
+    assert proposal.actions[0].kind == "record_unknown"
 
 
 def test_tool_exhausted_durable_session_cannot_resume_but_new_session_can():
