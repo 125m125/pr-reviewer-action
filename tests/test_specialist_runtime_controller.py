@@ -535,6 +535,162 @@ def test_change_overview_rejects_tracked_and_unknown_path_like_tokens(
         controller_module._validated_change_overview(proposal, inputs)
 
 
+def test_change_overview_accepts_controller_supplied_context_path_without_claiming_change(
+    tmp_path,
+):
+    inputs = replace(
+        _inputs(tmp_path),
+        tracked_paths=("src/worker.py", "src/consumer.py"),
+        topology={
+            **_inputs(tmp_path).topology,
+            "context_paths": {
+                "affected_consumers": ["src/consumer.py"],
+            },
+        },
+    )
+    proposal = {
+        "overview": "Updates worker delivery and affects src/consumer.py.",
+        "key_changes": [{
+            "path": "src/worker.py",
+            "component": "worker",
+            "summary": "Adds retry orchestration.",
+        }],
+        "cross_component_effects": [],
+        "uncertainties": [],
+    }
+
+    validated = controller_module._validated_change_overview(proposal, inputs)
+
+    assert validated["overview"] == proposal["overview"]
+
+
+def test_change_overview_rejects_direct_change_claim_for_context_path(tmp_path):
+    inputs = replace(
+        _inputs(tmp_path),
+        tracked_paths=("src/worker.py", "src/consumer.py"),
+        topology={
+            **_inputs(tmp_path).topology,
+            "context_paths": {
+                "affected_consumers": ["src/consumer.py"],
+            },
+        },
+    )
+    proposal = {
+        "overview": "Changes src/consumer.py while updating worker delivery.",
+        "key_changes": [{
+            "path": "src/worker.py",
+            "component": "worker",
+            "summary": "Adds retry orchestration.",
+        }],
+        "cross_component_effects": [],
+        "uncertainties": [],
+    }
+
+    with pytest.raises(ValueError, match="unchanged path"):
+        controller_module._validated_change_overview(proposal, inputs)
+
+
+@pytest.mark.parametrize(
+    "overview",
+    (
+        "Changes in src/consumer.py while updating worker delivery.",
+        "The change to src/consumer.py affects delivery.",
+        "Adds behavior to src/consumer.py while updating worker delivery.",
+        "Refactoring of src/consumer.py affects delivery.",
+        "src/consumer.py was modified by the change.",
+        "The src/consumer.py file was changed.",
+    ),
+)
+def test_change_overview_rejects_common_direct_context_path_claims(
+    tmp_path, overview,
+):
+    inputs = replace(
+        _inputs(tmp_path),
+        tracked_paths=("src/worker.py", "src/consumer.py"),
+        topology={
+            **_inputs(tmp_path).topology,
+            "context_paths": {
+                "affected_consumers": ["src/consumer.py"],
+            },
+        },
+    )
+    proposal = {
+        "overview": overview,
+        "key_changes": [{
+            "path": "src/worker.py",
+            "component": "worker",
+            "summary": "Adds retry orchestration.",
+        }],
+        "cross_component_effects": [],
+        "uncertainties": [],
+    }
+
+    with pytest.raises(ValueError, match="unchanged path"):
+        controller_module._validated_change_overview(proposal, inputs)
+
+
+def test_handoff_rejects_direct_context_path_claim(tmp_path):
+    inputs = replace(
+        _inputs(tmp_path),
+        tracked_paths=("src/worker.py", "src/consumer.py"),
+        topology={
+            **_inputs(tmp_path).topology,
+            "context_paths": {
+                "affected_consumers": ["src/consumer.py"],
+            },
+        },
+    )
+
+    result = _controller(
+        tmp_path,
+        finalizer=lambda _request: {
+            "ai_reviewed_summary": "The change to src/consumer.py affects delivery.",
+            "human_focus": "Recheck the worker boundary.",
+            "referenced_paths": ["src/consumer.py"],
+            "referenced_component_ids": ["worker"],
+            "referenced_obligation_ids": [],
+        },
+    ).run(inputs)
+
+    assert "The change to src/consumer.py affects delivery." not in result.handoff.markdown
+    assert result.handoff.ai_reviewed != (
+        "The change to src/consumer.py affects delivery.",
+    )
+
+
+def test_handoff_accepts_topology_context_path_as_natural_language_reference(tmp_path):
+    inputs = replace(
+        _inputs(tmp_path),
+        tracked_paths=("src/worker.py", "src/consumer.py"),
+        topology={
+            **_inputs(tmp_path).topology,
+            "context_paths": {
+                "affected_consumers": ["src/consumer.py"],
+            },
+        },
+    )
+
+    def summarizer(_request):
+        return {
+            "ai_reviewed_summary": (
+                "The review traced delivery into `src/consumer.py` as an affected "
+                "consumer."
+            ),
+            "human_focus": "Recheck the worker boundary.",
+            "referenced_paths": ["src/consumer.py"],
+            "referenced_component_ids": ["worker"],
+            "referenced_obligation_ids": [],
+        }
+
+    result = _controller(tmp_path, finalizer=summarizer).run(inputs)
+
+    assert result.handoff.ai_reviewed == (
+        "The review traced delivery into `src/consumer.py` as an affected consumer.",
+    )
+    assert "src/consumer.py" in result.handoff.markdown
+    assert "referenced_paths" not in result.handoff.markdown
+
+
 @pytest.mark.parametrize(
     "url",
     [

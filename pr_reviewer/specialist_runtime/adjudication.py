@@ -168,6 +168,10 @@ class ReviewHandoffContext:
     what_changed_is_validated_overview: bool = False
     ai_reviewed: tuple[str, ...] = ()
     human_focus: tuple[str, ...] = ()
+    # Controller-supplied unchanged paths that are valid context for prose
+    # such as an affected consumer or retained evidence source.  They are not
+    # direct change locations and must never authorize findings.
+    context_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1702,18 +1706,27 @@ def project_review_handoff(
             if path
         }
     ))
+    reviewed_paths = tuple(sorted({
+        *changed_paths,
+        *(
+            _unicode(path).strip()
+            for path in context.context_paths
+            if _unicode(path).strip()
+        ),
+    }))
 
     def behavioral_summaries(
         values: Iterable[object], *, limit: int, require_path: bool,
-        max_chars: int = 160,
+        max_chars: int = 160, allowed_paths: Iterable[str] | None = None,
     ) -> tuple[str, ...]:
         selected: list[str] = []
+        path_allowlist = tuple(allowed_paths or changed_paths)
         for value in values:
             text = " ".join(_unicode(value).split())
             if not text or len(text) > max_chars or not renderable(text):
                 continue
             if require_path and not any(
-                f"`{path}`" in text for path in changed_paths
+                f"`{path}`" in text for path in path_allowlist
             ):
                 continue
             if text not in selected:
@@ -1734,6 +1747,7 @@ def project_review_handoff(
     )
     ai_reviewed = behavioral_summaries(
         context.ai_reviewed, limit=3, require_path=True,
+        allowed_paths=reviewed_paths,
     )
     human_focus = tuple(
         text

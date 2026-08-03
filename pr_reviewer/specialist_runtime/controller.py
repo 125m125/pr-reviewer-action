@@ -127,6 +127,18 @@ _HANDOFF_COMPONENT_REFERENCE = re.compile(
     r"(?i)\b(?:the\s+)?([a-z][a-z0-9_-]{1,63})\s+"
     r"(?:component|service|gateway|boundary)\b"
 )
+_DETERMINISTIC_CONTEXT_KEYS = frozenset({
+    "context_paths", "related_paths", "affected_paths", "affected_consumers",
+    "affected_producers", "affected_callees", "affected_callers",
+    "consumer_paths", "producer_paths", "callee_paths", "caller_paths",
+    "retained_evidence_paths", "evidence_paths", "dependency_paths",
+})
+_RELATION_PATH_KEYS = frozenset({
+    "path", "paths", "source_path", "target_path", "producer_path",
+    "consumer_path", "callee_path", "caller_path", "related_paths",
+    "affected_paths", "context_paths", "consumer_paths", "producer_paths",
+    "callee_paths", "caller_paths",
+})
 _SIGNAL_ORIENTATION_TOPICS = {
     "implementation": (ReviewOrientationTopic.IMPLEMENTATION,),
     "documentation": (ReviewOrientationTopic.DOCUMENTATION,),
@@ -1035,6 +1047,122 @@ def _prose_path_references(
     return tuple(references)
 
 
+def _normalize_repository_path(value: object) -> str:
+    return str(value or "").replace("\\", "/").strip("/")
+
+
+def _path_values(value: object) -> tuple[str, ...]:
+    """Extract path-shaped values from a controller-owned context field."""
+    if isinstance(value, str):
+        path = _normalize_repository_path(value)
+        return (path,) if path else ()
+    if isinstance(value, Mapping):
+        paths: list[str] = []
+        for item in value.values():
+            paths.extend(_path_values(item))
+        return tuple(dict.fromkeys(paths))
+    if isinstance(value, (tuple, list, set, frozenset)):
+        paths: list[str] = []
+        for item in value:
+            paths.extend(_path_values(item))
+        return tuple(dict.fromkeys(paths))
+    return ()
+
+
+def _deterministic_context_paths(
+    topology: Mapping[str, Any],
+    tracked_paths: Iterable[str],
+    *,
+    extra_paths: Iterable[str] = (),
+) -> frozenset[str]:
+    """Return unchanged paths explicitly supplied as deterministic context.
+
+    This intentionally does not treat every tracked path as context.  Only
+    controller-owned context fields and path-bearing topology relationships are
+    admitted, and the result is bounded to the repository paths known to the
+    controller.
+    """
+    tracked = {
+        _normalize_repository_path(path)
+        for path in tracked_paths
+        if _normalize_repository_path(path)
+    }
+    candidates: list[str] = []
+    for key in _DETERMINISTIC_CONTEXT_KEYS:
+        candidates.extend(_path_values(topology.get(key)))
+    for relationship in topology.get("relationships", ()):
+        if not isinstance(relationship, Mapping):
+            continue
+        for key in _RELATION_PATH_KEYS:
+            candidates.extend(_path_values(relationship.get(key)))
+    for component in topology.get("components", ()):
+        if not isinstance(component, Mapping):
+            continue
+        for key in _DETERMINISTIC_CONTEXT_KEYS | {"paths", "files"}:
+            candidates.extend(_path_values(component.get(key)))
+    for artifact in topology.get("generated_artifacts", ()):
+        if not isinstance(artifact, Mapping):
+            continue
+        for key in ("source_of_truth", "generator_config", "output_paths"):
+            candidates.extend(_path_values(artifact.get(key)))
+    candidates.extend(_normalize_repository_path(path) for path in extra_paths)
+    # Context must still refer to a known repository path.  This keeps an
+    # arbitrary model-invented path from becoming authoritative merely because
+    # it appeared in a topology-shaped object.
+    return frozenset(path for path in candidates if path and path in tracked)
+
+
+def _direct_change_references(
+    value: str,
+    references: Iterable[str],
+) -> frozenset[str]:
+    """Find references used as direct change claims, not contextual effects."""
+    normalized = value.replace("\\", "/")
+    direct: set[str] = set()
+    for reference in references:
+        path = _normalize_repository_path(reference)
+        if not path:
+            continue
+        start = 0
+        while True:
+            index = normalized.find(path, start)
+            if index < 0:
+                break
+            before = normalized[max(0, index - 40):index]
+            after = normalized[index + len(path):index + len(path) + 64]
+            before = before.rstrip(" `'\"(")
+            after = after.lstrip(" `'\")(")
+            before_claim = re.search(
+                r"(?:^|[\s,;])(?:"
+                r"(?:the\s+)?(?:add|change|modif(?:y|ies|ied)|update|"
+                r"remov(?:e|es|ed)|introduc(?:e|es|ed)|"
+                r"rewrit(?:e|es|ten)|refactor(?:s|ed|ing)?|renam(?:e|es|ed))"
+                r"(?:s|d)?\s+(?:in|to|of)"
+                r"|add(?:s|ed)?\s+(?:behavior|changes?)\s+(?:in|to|of)"
+                r"|(?:the\s+)?(?:add|change|modif(?:y|ies|ied)|update|"
+                r"remov(?:e|es|ed)|introduc(?:e|es|ed)|"
+                r"rewrit(?:e|es|ten)|refactor(?:s|ed|ing)?|renam(?:e|es|ed))"
+                r"(?:s|d)?"
+                r")(?:\s+(?:the|its|a|an|new|updated|changed))?$",
+                before,
+                re.IGNORECASE,
+            )
+            after_claim = re.match(
+                r"(?:(?:the\s+)?file\s+)?"
+                r"(?:is|are|was|were|has been|have been)?\s*"
+                r"(?:add(?:s|ed)?|change(?:s|d)?|modif(?:y|ies|ied)|"
+                r"update(?:s|d)?|remov(?:e|es|ed)|introduc(?:e|es|ed)|"
+                r"rewrit(?:e|es|ten)|refactor(?:s|ed)?|renam(?:e|es|ed))\b",
+                after,
+                re.IGNORECASE,
+            )
+            if before_claim or after_claim:
+                direct.add(path)
+                break
+            start = index + len(path)
+    return frozenset(direct)
+
+
 def _authoritative_change_facts(
     topology: Mapping[str, Any],
 ) -> tuple[Mapping[str, object], Mapping[str, object] | None]:
@@ -1072,20 +1200,28 @@ def _validated_change_overview(
         if str(path).strip()
     }
     tracked_paths = {
-        str(path).replace("\\", "/").strip("/")
+        _normalize_repository_path(path)
         for path in (*inputs.tracked_paths, *inputs.changed_files)
-        if str(path).strip()
+        if _normalize_repository_path(path)
     }
+    context_paths = _deterministic_context_paths(
+        inputs.topology,
+        tracked_paths,
+    )
     component_ids, path_components = _change_components(inputs)
 
     def admitted_text(raw: object, label: str, *, limit: int) -> str:
         text = _overview_text(raw, label, limit=limit)
-        for reference in _prose_path_references(text, tracked_paths):
-            path = reference.replace("\\", "/").strip("/")
-            if path not in changed_paths:
+        prose_paths = _prose_path_references(text, tracked_paths)
+        for reference in prose_paths:
+            path = _normalize_repository_path(reference)
+            if path not in changed_paths and path not in context_paths:
                 raise ValueError(
                     "change overview contains an unchanged path reference"
                 )
+        direct_context_paths = _direct_change_references(text, context_paths)
+        if direct_context_paths:
+            raise ValueError("change overview contains an unchanged path reference")
         return text
 
     overview = admitted_text(value.get("overview"), "overview", limit=1000)
@@ -3069,6 +3205,26 @@ class ReviewController:
             state.blocking_obligation_ids,
             bool(state.degradations),
         )
+        tracked_paths = tuple(dict.fromkeys((
+            *state.inputs.tracked_paths,
+            *state.inputs.changed_files,
+        )))
+        context_paths = _deterministic_context_paths(
+            state.inputs.topology,
+            tracked_paths,
+            extra_paths=(
+                *(
+                    record.source_path
+                    for record in state.evidence.snapshot().records
+                    if record.is_usable_for_coverage and record.source_path
+                ),
+                *(
+                    path
+                    for obligation in reviewed_obligations
+                    for path in (*obligation.scope, *obligation.seed_hints)
+                ),
+            ),
+        )
         return ReviewHandoffContext(
             recommendation=state.verdict,
             status=status,
@@ -3095,6 +3251,7 @@ class ReviewController:
             what_changed_is_validated_overview=bool(overview),
             ai_reviewed=ai_reviewed,
             human_focus=human_focus,
+            context_paths=tuple(sorted(context_paths)),
         )
 
     def _apply_finalizer_proposal(
@@ -3192,7 +3349,11 @@ class ReviewController:
         proposal: HandoffSummaryProposal,
     ) -> ReviewHandoffContext:
         """Admit concise prose only when every declared authority reference exists."""
-        changed_paths = set(state.inputs.changed_files)
+        changed_paths = {
+            _normalize_repository_path(path)
+            for path in state.inputs.changed_files
+            if _normalize_repository_path(path)
+        }
         component_ids = set(base.component_ids)
         assert state.coverage is not None
         coverage = state.coverage.snapshot()
@@ -3201,7 +3362,38 @@ class ReviewController:
             for obligation_id, status in coverage.obligation_statuses
             if status is ObligationStatus.COVERED
         }
-        if not set(proposal.referenced_paths) <= changed_paths:
+        tracked_paths = {
+            _normalize_repository_path(path)
+            for path in (*state.inputs.tracked_paths, *state.inputs.changed_files)
+            if _normalize_repository_path(path)
+        }
+        retained_evidence_paths = {
+            _normalize_repository_path(record.source_path)
+            for record in state.evidence.snapshot().records
+            if record.is_usable_for_coverage and record.source_path
+        }
+        covered_obligation_paths = {
+            _normalize_repository_path(path)
+            for obligation in state.obligations
+            if obligation.id in covered_ids
+            for path in (*obligation.scope, *obligation.seed_hints)
+            if _normalize_repository_path(path)
+        }
+        context_paths = _deterministic_context_paths(
+            state.inputs.topology,
+            tracked_paths,
+            extra_paths=(
+                *retained_evidence_paths,
+                *covered_obligation_paths,
+            ),
+        )
+        allowed_reference_paths = changed_paths | set(context_paths)
+        declared_paths = {
+            _normalize_repository_path(path)
+            for path in proposal.referenced_paths
+            if _normalize_repository_path(path)
+        }
+        if not declared_paths <= allowed_reference_paths:
             raise ValueError("handoff summary references an unchanged path")
         if not set(proposal.referenced_component_ids) <= component_ids:
             raise ValueError("handoff summary references an unknown component")
@@ -3212,13 +3404,14 @@ class ReviewController:
             proposal.ai_reviewed_summary + " " + proposal.human_focus
         )
         prose_paths = {
-            path.replace("\\", "/").strip("/")
-            for path in _prose_path_references(
-                combined, {*state.inputs.tracked_paths, *state.inputs.changed_files},
-            )
+            _normalize_repository_path(path)
+            for path in _prose_path_references(combined, tracked_paths)
         }
-        if not prose_paths <= set(proposal.referenced_paths):
+        if not prose_paths <= declared_paths:
             raise ValueError("handoff summary contains an undeclared path")
+        direct_context_paths = _direct_change_references(combined, context_paths)
+        if direct_context_paths:
+            raise ValueError("handoff summary contains a direct change claim for an unchanged path")
         declared_components = {
             item.casefold() for item in proposal.referenced_component_ids
         }
