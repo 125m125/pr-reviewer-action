@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import inspect
+import re
 import time
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import PurePosixPath
@@ -231,6 +232,18 @@ def _contains_candidate_shaped_text(text: str) -> bool:
     )
 
 
+def _contains_candidate_json_syntax(text: str) -> bool:
+    """Require a candidate key followed by a JSON-like value delimiter."""
+    if not isinstance(text, str):
+        return False
+    return bool(re.search(
+        r"[\"']?candidate_(?:findings|updates|new_candidates|finding_ids)"
+        r"[\"']?\s*:\s*[\[{]",
+        text,
+        flags=re.IGNORECASE,
+    ))
+
+
 @dataclass(frozen=True)
 class _CandidateRetentionSignal:
     """Bounded candidate declarations observed across checkpoint attempts."""
@@ -283,7 +296,7 @@ def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
         isinstance(text, str)
         and (
             text.strip().startswith(("{", "[", "```"))
-            or (has_candidate_key and "{" in text)
+            or (has_candidate_key and _contains_candidate_json_syntax(text))
         )
     )
     if not isinstance(raw, Mapping):

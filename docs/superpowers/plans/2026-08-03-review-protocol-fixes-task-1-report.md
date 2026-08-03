@@ -82,3 +82,20 @@ $env:PYTHONPATH='.'; .\\.venv\\Scripts\\pytest.exe tests/test_specialist_runtime
 $env:PYTHONPATH='.'; .\\.venv\\Scripts\\pytest.exe tests/test_specialist_runtime_controller.py tests/test_specialist_runtime_replay.py tests/test_specialist_runtime_scheduler.py -q
 207 passed in 6.54s
 ```
+
+## Final fix round
+
+Embedded malformed-candidate detection now requires a candidate field followed
+by JSON-like syntax (`:` and `[`/`{`). This catches truncated payloads embedded
+after prose without treating unrelated braces in ordinary prose as candidate
+state.
+
+Verification:
+
+```text
+$env:PYTHONPATH='.'; .\\.venv\\Scripts\\pytest.exe tests/test_specialist_runtime_session.py -q
+62 passed in 0.27s
+
+$env:PYTHONPATH='.'; .\\.venv\\Scripts\\pytest.exe tests/test_specialist_runtime_controller.py tests/test_specialist_runtime_replay.py tests/test_specialist_runtime_scheduler.py -q
+207 passed in 6.32s
+```

@@ -585,6 +585,20 @@ def test_embedded_malformed_candidate_json_is_retention_material():
     assert "candidate-retention-unknown" in result.checkpoint.unknowns
 
 
+def test_candidate_words_with_unrelated_braces_are_not_retention_material():
+    """Candidate vocabulary plus non-JSON braces remains ordinary prose."""
+    gateway = ScriptedGateway([
+        invalid_response(
+            "I reviewed candidate_findings and candidate_id/claim wording in {docs}."
+        ),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    result = make_session(gateway).explore()
+
+    assert result.degraded is False
+    assert "candidate-retention-unknown" not in result.checkpoint.unknowns
+
+
 def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract():
     gateway = ScriptedGateway([
         invalid_response("plain-text material issue"),
