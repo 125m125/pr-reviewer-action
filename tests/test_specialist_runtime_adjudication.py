@@ -603,7 +603,7 @@ def test_high_risk_unresolved_controller_obligation_blocks_by_policy():
         changed_files=CHANGED_FILES,
     )
 
-    assert result.verdict == "request_changes"
+    assert result.verdict == "notice"
     assert result.source == "incomplete-high-risk-coverage"
     assert result.blocking_obligation_ids == (obligation.id,)
 

@@ -330,7 +330,7 @@ def test_documented_v2_rule_forces_recipe_and_blocks_unresolved_high_risk(tmp_pa
         policy=policy.verdict_policy,
     )
 
-    assert result.verdict == "request_changes"
+    assert result.verdict == "notice"
     assert result.source == "incomplete-high-risk-coverage"
     assert set(result.blocking_obligation_ids) == {
         item.id for item in recipe_obligations

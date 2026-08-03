@@ -1167,6 +1167,17 @@ class SpecialistSession:
                 )
                 else checkpoint
             )
+            self._record_checkpoint_diagnostic(
+                reason=reason,
+                initial_parse="unavailable",
+                repair_attempted=False,
+                repair_parse="not_attempted",
+                fallback_projection=True,
+                retention_unknown=(
+                    _CANDIDATE_RETENTION_UNKNOWN
+                    in self.latest_checkpoint.unknowns
+                ),
+            )
             self.state = SessionState.CHECKPOINT
             return self._snapshot(degraded=True)
         self._candidate_retention_signal = self._candidate_retention_signal.merged(
@@ -1178,12 +1189,16 @@ class SpecialistSession:
             calls=turn.tool_calls,
         )
         checkpoint = self._checkpoint_from_text(turn.content)
+        initial_parse = "valid" if checkpoint is not None else "invalid"
         needs_repair = checkpoint is None or _candidate_retention_lost(
             self._candidate_retention_signal,
             checkpoint,
             accounted_candidate_ids=self._accounted_candidate_ids(),
         )
+        repair_attempted = False
+        repair_parse = "not_attempted"
         if needs_repair:
+            repair_attempted = True
             self.conversation.add_user(
                 "Repair the previous checkpoint as one JSON object matching the schema."
                 + _CHECKPOINT_RETENTION_INSTRUCTION
@@ -1210,6 +1225,9 @@ class SpecialistSession:
                     calls=repair.tool_calls,
                 )
                 checkpoint = self._checkpoint_from_text(repair.content)
+                repair_parse = "valid" if checkpoint is not None else "invalid"
+            else:
+                repair_parse = "unavailable"
         retention_unknown = _candidate_retention_lost(
             self._candidate_retention_signal,
             checkpoint,
@@ -1223,6 +1241,15 @@ class SpecialistSession:
             )
         elif retention_unknown:
             checkpoint = self._checkpoint_with_retention_unknown(checkpoint)
+        if needs_repair or retention_unknown or fallback_projection:
+            self._record_checkpoint_diagnostic(
+                reason=reason,
+                initial_parse=initial_parse,
+                repair_attempted=repair_attempted,
+                repair_parse=repair_parse,
+                fallback_projection=fallback_projection,
+                retention_unknown=retention_unknown,
+            )
         self.latest_checkpoint = checkpoint
         self.state = SessionState.CHECKPOINT
         return self._snapshot(degraded=fallback_projection or retention_unknown)
@@ -1575,6 +1602,31 @@ class SpecialistSession:
                 dict(item) for item in self._finalization_diagnostics
             ),
         )
+
+    def _record_checkpoint_diagnostic(
+        self,
+        *,
+        reason: str,
+        initial_parse: str,
+        repair_attempted: bool,
+        repair_parse: str,
+        fallback_projection: bool,
+        retention_unknown: bool,
+    ) -> None:
+        signal = self._candidate_retention_signal
+        self._finalization_diagnostics.append({
+            "reason": str(reason)[:120],
+            "initial_parse": initial_parse,
+            "repair_attempted": bool(repair_attempted),
+            "repair_parse": repair_parse,
+            "fallback_projection": bool(fallback_projection),
+            "retention_unknown": bool(retention_unknown),
+            "material_candidate_signal": signal.is_material,
+            "candidate_ids_seen": len(signal.candidate_ids),
+            "unidentified_candidate_shapes": signal.unidentified_shapes,
+            "omitted_candidate_ids": signal.omitted_candidate_ids,
+        })
+        del self._finalization_diagnostics[:-8]
 
     def conversation_contains_evidence_ids(self, evidence_ids: tuple[str, ...]) -> bool:
         transcript = json.dumps(self.conversation.events, sort_keys=True)

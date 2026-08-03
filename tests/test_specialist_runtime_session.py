@@ -755,6 +755,14 @@ def test_unrecoverable_candidate_text_is_reported_as_retention_unknown():
     assert result.degraded is True
     assert "candidate-retention-unknown" in result.checkpoint.unknowns
     assert result.checkpoint.candidate_finding_ids == ()
+    assert result.finalization_diagnostics
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["reason"] == "checkpoint-retention-reserve"
+    assert diagnostic["initial_parse"] == "invalid"
+    assert diagnostic["repair_attempted"] is True
+    assert diagnostic["repair_parse"] == "invalid"
+    assert diagnostic["material_candidate_signal"] is True
+    assert "response" not in diagnostic
 
 
 def test_exploration_candidate_text_survives_checkpoint_handoff_as_unknown():

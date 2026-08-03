@@ -1198,7 +1198,7 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
         "unknown_obligation_ids": unknown_obligations,
     })
     _write_json(root / "specialist-ai-output.json", {
-        "verdict": "request_changes" if result.verdict == "notice" else result.verdict,
+        "verdict": result.verdict,
         "review_markdown": handoff.markdown,
         "findings": _compatibility_findings(notes),
         "verdict_source": result.verdict_source,

@@ -674,7 +674,7 @@ def _coverage_verification_requests(
 ) -> tuple[Mapping[str, object], ...]:
     """Create explicit human checks for policy-blocking coverage gaps."""
     obligation_map = {item.id: item for item in obligations}
-    requests: list[Mapping[str, object]] = []
+    unresolved: list[tuple[CoverageObligation, str, str]] = []
     for obligation_id in sorted({str(item).strip() for item in blocking_obligation_ids}):
         obligation = obligation_map.get(obligation_id)
         if obligation is None:
@@ -684,15 +684,24 @@ def _coverage_verification_requests(
             "The specialist review did not retain enough evidence to resolve "
             "this mandatory high-risk obligation."
         )
-        requests.append({
-            "question": (
-                "Can a human verify the unresolved high-risk obligation "
-                f"'{subject}' before merging?"
-            ),
-            "reason": reason,
-            "related_obligation_ids": (obligation.id,),
-        })
-    return tuple(requests)
+        unresolved.append((obligation, subject, reason))
+    if not unresolved:
+        return ()
+    subjects = "; ".join(item[1] for item in unresolved[:6])
+    reasons = " ".join(
+        f"{subject}: {reason}"
+        for _obligation, subject, reason in unresolved[:4]
+    )
+    if len(unresolved) > 4:
+        reasons += f" (+{len(unresolved) - 4} additional coverage gaps.)"
+    return ({
+        "question": (
+            "Can a human recheck the unresolved high-risk coverage areas "
+            f"before merging? Focus areas: {subjects}."
+        ),
+        "reason": reasons,
+        "related_obligation_ids": tuple(item[0].id for item in unresolved),
+    },)
 
 
 def _deterministic_handoff_focus(
@@ -709,8 +718,8 @@ def _deterministic_handoff_focus(
     ))
     if subjects:
         return (
-            "Recheck the unresolved high-risk coverage questions in the detail "
-            "notes, especially " + "; ".join(subjects[:3]) + ".",
+            "Recheck the unresolved high-risk coverage questions in the handoff, "
+            "especially " + "; ".join(subjects[:3]) + ".",
         )
     # Without a concrete unresolved obligation, keep the legacy orientation
     # labels; there is no specific human action to summarize here.
@@ -736,6 +745,56 @@ def _deterministic_reviewed_summary(
         "The AI checked retained evidence across " + scope + " for the assigned "
         "review obligations; unresolved areas are listed in the detail notes.",
     )
+
+
+def _deterministic_handoff_change_summary(
+    change_overview: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Render bounded behavioral prose when a run cannot trust model prose."""
+    overview = " ".join(str(change_overview.get("overview") or "").split())
+    if not overview:
+        return ()
+    result = [overview[:600]]
+    key_changes = change_overview.get("key_changes", ())
+    summaries: list[str] = []
+    if isinstance(key_changes, (list, tuple)):
+        for item in key_changes:
+            if not isinstance(item, Mapping):
+                continue
+            summary = " ".join(str(item.get("summary") or "").split())
+            if summary.casefold() in {"changes", "modifies"}:
+                continue
+            if summary and summary not in summaries:
+                summaries.append(summary[:180])
+            if len(summaries) == 3:
+                break
+    if summaries:
+        result.append(
+            "The main behavioral changes include "
+            + "; ".join(summaries)
+            + "."
+        )
+    effects = change_overview.get("cross_component_effects", ())
+    effect_text: list[str] = []
+    if isinstance(effects, (list, tuple)):
+        for item in effects:
+            text = " ".join(str(item).split())
+            if text and text not in effect_text:
+                effect_text.append(text[:180])
+            if len(effect_text) == 2:
+                break
+    if effect_text and len(result) < 3:
+        result.append(
+            "Cross-component effects to recheck include "
+            + "; ".join(effect_text)
+            + "."
+        )
+    if len(result) == 1:
+        result.append(
+            "The bounded summary focuses on the behavioral areas represented by "
+            "the retained change facts."
+        )
+    return tuple(result[:3])
 
 
 def _validated_critic_result(
@@ -1984,8 +2043,10 @@ class ReviewController:
     ) -> None:
         if state.phase is None:
             raise RuntimeError("cannot complete a phase before it is entered")
-        if status not in {"complete", "degraded"}:
-            raise ValueError("completed phase status must be complete or degraded")
+        if status not in {"complete", "incomplete", "degraded"}:
+            raise ValueError(
+                "completed phase status must be complete, incomplete, or degraded"
+            )
         state.phase_outcomes[state.phase] = status
         state.journal.emit("phase_completed", {
             "phase": state.phase, "status": status,
@@ -2035,7 +2096,6 @@ class ReviewController:
             + len(state.review.verification_requests)
             + len(state.inputs.verification_requests)
             + len(state.retention_verification_requests)
-            + len(state.coverage_verification_requests)
             + len(state.source_requests)
         )
 
@@ -2094,6 +2154,14 @@ class ReviewController:
             in tuple(getattr(result.checkpoint, "unknowns", ()))
             for result in state.session_results.values()
         )
+
+    @staticmethod
+    def _review_status(state: _RunState) -> str:
+        if state.degradations:
+            return "degraded"
+        if state.blocking_obligation_ids:
+            return "incomplete"
+        return "complete"
 
     def _candidate_retention_verification_requests(
         self,
@@ -2968,11 +3036,31 @@ class ReviewController:
                 unique_candidates.append(occurrences[0][1])
                 continue
             for occurrence_ref, candidate in occurrences:
+                # Candidate IDs are model-local handles.  Independent
+                # specialists commonly emit simple IDs such as ``c1``; a
+                # collision must not discard every occurrence before the
+                # critic can compare them.  Scope only the colliding IDs so
+                # ordinary model IDs remain readable and stable.
+                scope_seed = (
+                    f"{candidate.collector_session_id}|{occurrence_ref}"
+                ).encode("utf-8", "replace")
+                scope_suffix = hashlib.sha256(scope_seed).hexdigest()[:12]
+                scoped_id = f"{candidate_id}@{scope_suffix}"
+                scoped = replace(
+                    candidate,
+                    candidate_id=scoped_id,
+                    contributor_candidate_ids=tuple(dict.fromkeys((
+                        *candidate.contributor_candidate_ids,
+                        candidate_id,
+                    ))),
+                )
+                unique_candidates.append(scoped)
                 disposition = {
-                    "candidate_id": candidate_id,
+                    "candidate_id": scoped_id,
+                    "original_candidate_id": candidate_id,
                     "occurrence_ref": occurrence_ref,
-                    "action": "reject",
-                    "reason": "duplicate-candidate-id",
+                    "action": "scope",
+                    "reason": "candidate-id-scoped",
                     "target_id": None,
                     "collector_session_id": candidate.collector_session_id,
                     "model_identity": candidate.model_identity,
@@ -3185,7 +3273,11 @@ class ReviewController:
         )
         overview = str(state.change_overview.get("overview") or "").strip()
         if overview:
-            what_changed = (overview,)
+            what_changed = (
+                _deterministic_handoff_change_summary(state.change_overview)
+                if status == "degraded"
+                else (overview,)
+            )
         component_ids = tuple(sorted(
             str(item.get("id", ""))
             for item in state.inputs.topology.get("components", ())
@@ -3239,7 +3331,9 @@ class ReviewController:
                 key=lambda value: {"info": 0, "minor": 1, "major": 2, "blocker": 3}.get(value, 0),
             ),
             review_emphasis_topics=review_emphasis_topics,
-            material_coverage_limited=bool(state.degradations),
+            material_coverage_limited=bool(
+                state.degradations or state.blocking_obligation_ids
+            ),
             candidate_retention_limited=self._candidate_retention_limited(state),
             degraded_stages=tuple(
                 str(item.get("component", ""))
@@ -3541,14 +3635,13 @@ class ReviewController:
                 verification_requests=(
                     *state.inputs.verification_requests,
                     *state.retention_verification_requests,
-                    *coverage_verification_requests,
                 ),
                 source_access_requests=state.source_requests,
             )
         except Exception as exc:
             self._degrade(state, "review_notes", _bounded_error(exc))
             state.notes = ()
-        status = "degraded" if state.degradations else "complete"
+        status = self._review_status(state)
         context = self._handoff_context(state, status)
         # Keep the controller-owned prose as the safe fallback for degraded
         # runs.  A finalizer response can be structurally valid while still
@@ -3677,7 +3770,7 @@ class ReviewController:
                     "reason": _bounded_error(exc),
                 })
                 context = self._handoff_context(
-                    state, "degraded" if state.degradations else "complete",
+                    state, self._review_status(state),
                 )
         elif self.finalizer is None:
             state.journal.emit("recovery", {
@@ -3686,7 +3779,7 @@ class ReviewController:
                 "reason": "no optional handoff summarizer configured",
             })
             context = self._handoff_context(
-                state, "degraded" if state.degradations else "complete",
+                state, self._review_status(state),
             )
         else:
             state.journal.emit("recovery", {
@@ -3695,13 +3788,13 @@ class ReviewController:
                 "reason": "handoff summarizer skipped after absolute deadline",
             })
             context = self._handoff_context(
-                state, "degraded" if state.degradations else "complete",
+                state, self._review_status(state),
             )
         # Recompute after the optional finalizer: invoking it may itself have
         # degraded the run, in which case the degraded handoff must include
         # the broader behavioral fallback and its coverage warning.
         deterministic_context = self._handoff_context(
-            state, "degraded" if state.degradations else "complete",
+            state, self._review_status(state),
         )
         if state.degradations:
             context = replace(
@@ -3937,7 +4030,7 @@ class ReviewController:
                 "adapter": _json_value(state.inputs.adapter_configuration),
             },
             "degradation": list(state.degradations),
-            "evaluation_status": "degraded" if state.degradations else "complete",
+            "evaluation_status": self._review_status(state),
             "event_references": artifacts_events,
             "events": events,
             "event_journal": {
@@ -3956,6 +4049,12 @@ class ReviewController:
                 }
                 for item in state.notes
             ],
+            "coverage_verification_requests": _json_value(
+                state.coverage_verification_requests
+            ),
+            "retention_verification_requests": _json_value(
+                state.retention_verification_requests
+            ),
             "phases": self._phase_allocations(state),
             "policy": {
                 "version": state.inputs.policy.version,
@@ -4026,6 +4125,7 @@ class ReviewController:
             "assignment_plan",
             "coverage", "recipes", "unknowns", "source_access_requests",
             "accepted_candidates", "rejected_candidates", "handoff", "notes",
+            "coverage_verification_requests", "retention_verification_requests",
             "candidate_dispositions", "candidate_unknowns",
             "verdict", "degradation", "publishing", "event_references",
             "evaluation_status", "artifact_write", "timing",
@@ -4091,7 +4191,7 @@ class ReviewController:
             for item in phases if isinstance(item, Mapping)
         }
         if set(phase_statuses) != set(_PHASES) or any(
-            status not in {"complete", "degraded", "skipped"}
+            status not in {"complete", "incomplete", "degraded", "skipped"}
             for status in phase_statuses.values()
         ):
             raise ValueError("terminal artifact phases require terminal outcomes")
@@ -4554,6 +4654,15 @@ class ReviewController:
                             )
                         ),
                     })
+                    diagnostics = tuple(getattr(
+                        result, "finalization_diagnostics", (),
+                    ))
+                    if diagnostics:
+                        journal.emit("specialist_checkpoint_diagnostics", {
+                            "assignment_id": session.assignment.id,
+                            "session_id": result.session_id,
+                            "diagnostics": _json_value(diagnostics),
+                        })
                     journal.emit("session_transition", {
                         "session_id": result.session_id,
                         "state": result.state.value,
@@ -4627,7 +4736,7 @@ class ReviewController:
             self._transition(state, "complete")
             self._complete_phase(
                 state,
-                status="degraded" if state.degradations else "complete",
+                status=self._review_status(state),
             )
         except BaseException as exc:  # terminal artifact survives every controlled failure
             self._finish_after_unexpected(state, exc)
@@ -4810,6 +4919,12 @@ class ReviewController:
                     }
                     for item in state.notes
                 ],
+                "coverage_verification_requests": _json_value(
+                    state.coverage_verification_requests
+                ),
+                "retention_verification_requests": _json_value(
+                    state.retention_verification_requests
+                ),
                 "verdict": {
                     "value": state.verdict,
                     "source": state.verdict_source,

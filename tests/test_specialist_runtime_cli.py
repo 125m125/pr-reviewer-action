@@ -90,8 +90,9 @@ def write_review_workspace(root: Path) -> None:
 
 
 class ScriptedController:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, verdict: str = "request_changes"):
         self.root = root
+        self.verdict = verdict
         self.inputs = None
 
     def run(self, inputs):
@@ -117,7 +118,7 @@ class ScriptedController:
                 },
             ],
             "publishing": {"ready": True, "mode": "review_comment", "allow_approve": False},
-            "verdict": {"value": "request_changes", "source": "runtime-policy"},
+            "verdict": {"value": self.verdict, "source": "runtime-policy"},
         }
         (self.root / "specialist-review-artifact.json").write_text(
             json.dumps(artifact), encoding="utf-8"
@@ -126,7 +127,7 @@ class ScriptedController:
             artifact=MappingProxyType(artifact),
             handoff=ReviewHandoff(
                 markdown="## AI review handoff\n\nReview the complete change.",
-                recommendation="request_changes",
+            recommendation=self.verdict,
             ),
             notes=(ReviewNote(
                 kind=ReviewNoteKind.FINDING,
@@ -136,7 +137,7 @@ class ScriptedController:
                 line=1,
                 severity="major",
             ),),
-            verdict="request_changes",
+            verdict=self.verdict,
             verdict_source="runtime-policy",
             artifact_path=self.root / "specialist-review-artifact.json",
             publishing_ready=True,
@@ -197,6 +198,23 @@ def test_cli_writes_structured_handoff_notes_artifact_and_compatibility_output(
     assert "\\!\\[image\\]\\(https://evil\\.example/x\\)" in summary
     assert "negotiator\\[details\\]\\(https://evil\\.example\\)" in summary
     assert "fallback after &lt;timeout&gt;" in summary
+
+
+def test_cli_preserves_non_blocking_notice_in_compatibility_output(monkeypatch, tmp_path):
+    write_review_workspace(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REVIEW_STRATEGY", "specialists")
+    monkeypatch.setenv("REPO", "owner/repo")
+    monkeypatch.setenv("PUBLISH_MODE", "review_comment")
+    monkeypatch.setattr(cli, "_git_changed_files", lambda *_: ("src/app.py",))
+    monkeypatch.setattr(
+        cli, "build_controller", lambda config, **_kwargs: ScriptedController(tmp_path, "notice")
+    )
+
+    assert cli.main() == 0
+
+    compatibility = json.loads((tmp_path / "specialist-ai-output.json").read_text())
+    assert compatibility["verdict"] == "notice"
 
 
 def test_degradation_summary_exposes_specialist_root_causes_without_model_dump():

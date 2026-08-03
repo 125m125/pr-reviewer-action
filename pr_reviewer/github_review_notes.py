@@ -616,10 +616,12 @@ def _native_event(
 ) -> tuple[str, str]:
     if not isinstance(policy_result, RuntimeVerdictPolicyResult):
         raise TypeError("policy_result must be a RuntimeVerdictPolicyResult")
+    if policy_result.verdict == "notice":
+        return "COMMENT", "coverage incomplete; non-verdict specialist review"
     if policy_result.verdict == "request_changes":
         return "REQUEST_CHANGES", "policy requested changes"
     if policy_result.verdict != "approve":
-        raise ValueError("policy verdict must be approve or request_changes")
+        raise ValueError("policy verdict must be approve, request_changes, or notice")
     if not approval.allow_approve:
         return "REQUEST_CHANGES", "native approval disabled"
     if approval.effective_scope == "incremental" and not approval.baseline_clean:
@@ -839,8 +841,10 @@ class GitHubReviewPublisher:
             raise ValueError("unsupported publish mode")
         if not isinstance(policy_result, RuntimeVerdictPolicyResult):
             raise TypeError("policy_result must be a RuntimeVerdictPolicyResult")
-        if policy_result.verdict not in {"approve", "request_changes"}:
-            raise ValueError("policy verdict must be approve or request_changes")
+        if policy_result.verdict not in {"approve", "request_changes", "notice"}:
+            raise ValueError(
+                "policy verdict must be approve, request_changes, or notice"
+            )
         if not isinstance(approval_policy, PublisherApprovalPolicy):
             raise TypeError("approval_policy must be a PublisherApprovalPolicy")
         if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:

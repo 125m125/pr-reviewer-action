@@ -1625,6 +1625,7 @@ def project_review_handoff(
     recommendation_map = {
         "approve": "Approve",
         "request_changes": "Request changes",
+        "notice": "Human review required",
         "human_review_required": "Human review required",
     }
     status_map = {

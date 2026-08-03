@@ -324,6 +324,23 @@ Use concrete lowercase DNS hosts, HTTPS only, and narrow path prefixes. Keep
 policy changes in the PR diff so a reviewer can audit them before a manual
 re-review label is applied.
 
+## Reliability corrections for current-runtime adopters
+
+- Candidate IDs are specialist-local handles. Do not assume that a model ID such
+  as `c1` is globally unique; the controller scopes collisions before critic
+  adjudication and retains the original ID in artifact dispositions.
+- Missing mandatory high-risk coverage is reported as an incomplete `notice`,
+  not as `request_changes`, when there is no evidence-backed finding. The
+  aggregate coverage warning belongs in the handoff; it is not emitted once per
+  obligation as a detail note.
+- A specialist run with incomplete coverage still publishes its validated
+  specialist artifacts and bypasses the generic whole-PR model path. Consumers
+  should distinguish `evaluation_status: incomplete` from `degraded` and
+  `complete`.
+- Checkpoint recovery diagnostics are bounded and structured in the artifact
+  event journal. They describe parse/repair status and candidate-retention
+  signals; raw model responses are intentionally excluded.
+
 ## What to expect
 
 | Surface | Expected behavior |

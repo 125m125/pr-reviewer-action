@@ -16,6 +16,7 @@ from pr_reviewer.conversation import Conversation
 from pr_reviewer.specialist_runtime import cli
 from pr_reviewer.specialist_runtime import controller as controller_module
 from pr_reviewer.specialist_runtime.adjudication import (
+    AdjudicatedReview,
     ReviewHandoffContext,
     ReviewOrientationTopic,
 )
@@ -62,6 +63,7 @@ from pr_reviewer.specialist_runtime.types import (
     BudgetUsage,
     CandidateFinding,
     CoverageObligation,
+    ObligationStatus,
     PhaseShares,
     ReviewNoteKind,
     RunPhase,
@@ -260,12 +262,60 @@ def test_unresolved_high_risk_coverage_becomes_an_actionable_verification_reques
 
     assert requests == ({
         "question": (
-            "Can a human verify the unresolved high-risk obligation "
-            "'durable session recovery' before merging?"
+            "Can a human recheck the unresolved high-risk coverage areas "
+            "before merging? Focus areas: durable session recovery."
         ),
-        "reason": "The specialist did not retain enough recovery evidence.",
+        "reason": (
+            "durable session recovery: The specialist did not retain enough "
+            "recovery evidence."
+        ),
         "related_obligation_ids": (obligation.id,),
     },)
+
+
+def test_multiple_unresolved_coverage_gaps_are_aggregated_for_handoff():
+    obligations = (
+        CoverageObligation(
+            obligation_id="obligation:one",
+            origin="recipe",
+            subject="durable session recovery",
+            risk_tier="high",
+            unresolved_policy="block_when_unresolved",
+            explanation="Recovery evidence is incomplete.",
+        ),
+        CoverageObligation(
+            obligation_id="obligation:two",
+            origin="recipe",
+            subject="model transport compatibility",
+            risk_tier="high",
+            unresolved_policy="block_when_unresolved",
+            explanation="Wire-format evidence is incomplete.",
+        ),
+    )
+
+    requests = _coverage_verification_requests(
+        obligations, (item.id for item in obligations),
+    )
+
+    assert len(requests) == 1
+    assert requests[0]["related_obligation_ids"] == (
+        "obligation:one", "obligation:two",
+    )
+    assert "durable session recovery" in requests[0]["question"]
+    assert "model transport compatibility" in requests[0]["question"]
+    assert "Recovery evidence is incomplete." in requests[0]["reason"]
+    assert "Wire-format evidence is incomplete." in requests[0]["reason"]
+
+
+def test_generic_coverage_warning_does_not_require_a_detail_note(tmp_path):
+    state = _RunState.__new__(_RunState)
+    state.review = AdjudicatedReview()
+    state.inputs = _inputs(tmp_path)
+    state.retention_verification_requests = ()
+    state.coverage_verification_requests = ({"question": "coverage"},)
+    state.source_requests = []
+
+    assert ReviewController._required_note_count(state) == 0
 
 
 def test_deterministic_change_overview_describes_behavioral_themes_not_hunks(tmp_path):
@@ -319,7 +369,7 @@ def test_deterministic_handoff_focus_explains_unresolved_coverage():
     focus = _deterministic_handoff_focus((obligation,), (obligation.id,), True)
 
     assert focus == (
-        "Recheck the unresolved high-risk coverage questions in the detail notes, "
+        "Recheck the unresolved high-risk coverage questions in the handoff, "
         "especially publishing hygiene.",
     )
 
@@ -1015,6 +1065,11 @@ def test_session_finalization_diagnostics_are_artifact_only(tmp_path):
     assert result.artifact["sessions"][0]["finalization_diagnostics"] == ({
         **diagnostic,
     },)
+    assert any(
+        item["kind"] == "specialist_checkpoint_diagnostics"
+        and item["payload"]["diagnostics"] == ({**diagnostic},)
+        for item in result.artifact["events"]
+    )
     assert "candidate-forged" not in result.handoff.markdown
 
 
@@ -1936,6 +1991,77 @@ def test_empty_candidate_set_skips_critic_without_degradation(tmp_path):
     )
 
 
+def test_coverage_only_incompleteness_publishes_notice_without_detail_notes(tmp_path):
+    @dataclass
+    class EmptyEvidenceSession:
+        assignment: object
+        obligations: tuple[object, ...]
+        expected_session_id: str
+
+        def __post_init__(self):
+            self.session_id = self.expected_session_id
+            self.candidate_findings = ()
+
+        def update_lease(self, lease):
+            self.lease = lease
+
+        def apply_coverage_feedback(self, gaps):
+            self.gaps = tuple(gaps)
+
+        def explore(self):
+            checkpoint = SessionCheckpoint(
+                session_id=self.session_id,
+                state=SessionState.CHECKPOINT,
+                obligation_statuses=tuple(
+                    (item.id, ObligationStatus.UNRESOLVED)
+                    for item in self.obligations
+                    if item.id in self.assignment.obligation_ids
+                ),
+            )
+            return SessionResult(
+                session_id=self.session_id,
+                state=SessionState.CHECKPOINT,
+                checkpoint=checkpoint,
+                budget=BudgetUsage(model_turns=1),
+            )
+
+        def finalize(self):
+            result = self.explore()
+            return replace(result, state=SessionState.COMPLETE)
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, evidence_store, coverage
+        return EmptyEvidenceSession(assignment, obligations, expected_session_id)
+
+    result = _controller(
+        tmp_path,
+        session_factory=factory,
+    ).run(replace(
+        _inputs(tmp_path),
+        policy=replace(
+            _policy(),
+            recipes=(replace(_policy().recipes[0], priority="high"),),
+            publishing={
+                "allowed_modes": ("review_comment",),
+                "allow_approve": True,
+            },
+        ),
+    ))
+
+    assert result.verdict == "notice"
+    assert result.verdict_source == "incomplete-high-risk-coverage"
+    assert result.notes == ()
+    assert result.publishing_ready is True
+    assert result.artifact["evaluation_status"] == "incomplete", (
+        result.artifact["degradation"]
+    )
+    assert result.artifact["coverage_verification_requests"]
+    assert result.handoff.recommendation == "Human review required"
+
+
 @pytest.mark.parametrize(
     "critic_result",
     (
@@ -2121,7 +2247,7 @@ def test_critic_degradation_emits_one_verification_request_per_controller_root(
     ]) == 1
 
 
-def test_duplicate_candidate_ids_reject_every_occurrence_without_first_wins(tmp_path):
+def test_duplicate_candidate_ids_are_scoped_per_occurrence_for_adjudication(tmp_path):
     candidates = (
         CandidateFinding(
             candidate_id="collision",
@@ -2148,16 +2274,21 @@ def test_duplicate_candidate_ids_reject_every_occurrence_without_first_wins(tmp_
         _inputs(tmp_path), candidate_findings=candidates,
     ))
 
-    collisions = [
+    scoped = [
         item for item in result.artifact["candidate_dispositions"]
-        if item["candidate_id"] == "collision"
+        if item.get("reason") == "candidate-id-scoped"
     ]
-    assert all(item.candidate_id != "collision" for item in critic_inputs)
-    assert len(collisions) == 2
-    assert {item["occurrence_ref"] for item in collisions} == {
+    collision_inputs = [
+        item for item in critic_inputs
+        if item.root_cause_fingerprint in {"first", "second"}
+    ]
+    assert len(collision_inputs) == 2
+    assert all(item.candidate_id != "collision" for item in collision_inputs)
+    assert len(scoped) == 2
+    assert {item["occurrence_ref"] for item in scoped} == {
         "input:0", "input:1",
     }
-    assert all(item["reason"] == "duplicate-candidate-id" for item in collisions)
+    assert {item["original_candidate_id"] for item in scoped} == {"collision"}
 
 
 def test_finalizer_failure_builds_useful_sparse_handoff_from_controller_state(tmp_path):
@@ -2399,9 +2530,10 @@ def test_finalizer_reuses_one_validated_whole_change_overview(tmp_path):
 
     result = _controller(tmp_path, finalizer=finalizer).run(inputs)
 
-    assert result.handoff.what_changed == (
-        result.artifact["change_overview"]["overview"],
+    assert result.handoff.what_changed[0] == (
+        result.artifact["change_overview"]["overview"]
     )
+    assert len(result.handoff.what_changed) >= 2
 
 
 def test_behavioral_handoff_candidates_prioritize_high_risk_beyond_file_prefix():
@@ -2966,9 +3098,12 @@ def test_degraded_handoff_keeps_controller_behavioral_prose_over_model_summary(
     assert result.handoff.ai_reviewed != (
         "The model reviewed a list of files and methods.",
     )
-    assert result.handoff.what_changed == (
-        result.artifact["change_overview"]["overview"],
+    assert result.handoff.what_changed[0] == (
+        result.artifact["change_overview"]["overview"]
     )
+    assert len(result.handoff.what_changed) >= 2
+    assert all("list of files and methods" not in item
+               for item in result.handoff.what_changed)
     assert any(
         item["kind"] == "handoff_summary_guarded"
         for item in result.artifact["events"]

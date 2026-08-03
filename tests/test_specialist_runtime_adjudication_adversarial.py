@@ -1620,7 +1620,7 @@ def test_invalid_high_risk_tier_configuration_uses_secure_default(configured: ob
         policy={"high_risk_tiers": configured},
     )
 
-    assert result.verdict == "request_changes"
+    assert result.verdict == "notice"
     assert result.source == "incomplete-high-risk-coverage"
 
 

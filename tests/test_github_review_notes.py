@@ -2177,6 +2177,7 @@ def test_final_sticky_refresh_uses_initial_comment_id_when_list_is_stale(tmp_pat
             "APPROVE",
         ),
         ("review_verdict", "request_changes", PublisherApprovalPolicy(), "REQUEST_CHANGES"),
+        ("review_verdict", "notice", PublisherApprovalPolicy(), "COMMENT"),
     ],
 )
 def test_submitted_specialist_review_body_uses_cleanup_compatible_marker(

@@ -92,7 +92,7 @@ PRIMARY_OK=0
 NATIVE_VERDICT_USED=0
 SPECIALIST_EVALUATION_STATUS="$(jq -r '.evaluation_status // "unknown"' specialist-run-status.json 2>/dev/null || jq -r '.evaluation_status // "unknown"' specialist-review-artifact.json 2>/dev/null || echo unknown)"
 if [[ "$REVIEW_STRATEGY" != "single" ]] && [ -s specialist-ai-output.json ] \
-  && [[ "$SPECIALIST_EVALUATION_STATUS" == "complete" || "$SPECIALIST_EVALUATION_STATUS" == "degraded" ]]; then
+  && [[ "$SPECIALIST_EVALUATION_STATUS" == "complete" || "$SPECIALIST_EVALUATION_STATUS" == "degraded" || "$SPECIALIST_EVALUATION_STATUS" == "incomplete" ]]; then
   log "Using validated specialist review output; skipping the standard whole-PR model call"
   cp specialist-ai-output.json ai-output.json
   PRIMARY_OK=1
