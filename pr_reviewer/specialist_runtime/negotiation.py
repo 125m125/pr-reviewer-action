@@ -232,17 +232,35 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
         key=lambda item: (_RISK_RANK.get(item.risk_tier, 2), item.id),
     )
     ownership = tuple(state.session_ownership)
+    resources = {item.session_id: item for item in state.session_resources}
     targets: list[dict[str, object]] = []
     for index, item in enumerate(obligations, start=1):
         owners = tuple(
             owner for owner in ownership if item.id in owner.obligation_ids
         )
         primary = any(item.id in owner.primary_obligation_ids for owner in owners)
-        actions = ["record_unknown", "new_session"]
-        if primary:
-            actions.insert(0, "resume")
-        elif owners:
-            actions.insert(0, "consult")
+        actions = ["record_unknown"]
+        if state.current_session_count < state.max_sessions and (
+            state.followup_sessions_started < state.max_followup_sessions
+            and state.new_session_turns_remaining > 0
+            and state.new_session_tool_call_cap > 0
+        ):
+            actions.append("new_session")
+        owner_actions = []
+        for owner in owners:
+            resource = resources.get(owner.session_id)
+            if resource is None or resource.remaining_model_turns <= 0:
+                continue
+            if resource.remaining_tool_calls <= 0:
+                continue
+            if resource.lease_remaining_sec < state.seconds_per_turn:
+                continue
+            owner_actions.append(
+                "resume" if item.id in owner.primary_obligation_ids else "consult"
+            )
+        for action in ("resume", "consult"):
+            if action in owner_actions:
+                actions.insert(0, action)
         targets.append({
             "handle": f"U{index}",
             "risk_tier": item.risk_tier,

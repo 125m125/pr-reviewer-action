@@ -1622,6 +1622,7 @@ class SpecialistSession:
             "fallback_projection": bool(fallback_projection),
             "retention_unknown": bool(retention_unknown),
             "material_candidate_signal": signal.is_material,
+            "candidate_ids": signal.candidate_ids,
             "candidate_ids_seen": len(signal.candidate_ids),
             "unidentified_candidate_shapes": signal.unidentified_shapes,
             "omitted_candidate_ids": signal.omitted_candidate_ids,

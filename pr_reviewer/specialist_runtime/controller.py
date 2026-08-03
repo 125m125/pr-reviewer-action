@@ -668,6 +668,46 @@ def _critic_response_diagnostics(value: object) -> dict[str, object]:
     }
 
 
+def _critic_rows(value: object) -> tuple[Mapping[str, object], ...]:
+    """Extract mapping-shaped critic rows without trusting their contents."""
+    rows: object = value
+    if isinstance(value, Mapping):
+        rows = value.get("actions", value.get("decisions"))
+    if isinstance(rows, (str, bytes)) or not isinstance(rows, Iterable):
+        return ()
+    return tuple(item for item in rows if isinstance(item, Mapping))
+
+
+def _partial_critic_result(
+    value: object,
+    candidates: Iterable[CandidateFinding],
+) -> tuple[tuple[Mapping[str, str], ...], tuple[str, ...]]:
+    """Keep valid rows and identify candidate IDs needing a bounded repair."""
+    allowed = {item.candidate_id for item in candidates}
+    seen: set[str] = set()
+    rows: list[Mapping[str, str]] = []
+    for row in _critic_rows(value):
+        candidate_id = str(row.get("candidate_id") or "").strip()
+        action = str(row.get("action") or "").strip().lower()
+        target_id = str(row.get("target_id") or "").strip()
+        if candidate_id not in allowed or candidate_id in seen:
+            continue
+        if action not in _VALID_CRITIC_ACTIONS:
+            continue
+        if action == "merge":
+            if target_id not in allowed or target_id == candidate_id:
+                continue
+        elif target_id:
+            continue
+        seen.add(candidate_id)
+        rows.append({
+            "candidate_id": candidate_id,
+            "action": action,
+            "target_id": target_id,
+        })
+    return tuple(rows), tuple(sorted(allowed - seen))
+
+
 def _coverage_verification_requests(
     obligations: Iterable[CoverageObligation],
     blocking_obligation_ids: Iterable[str],
@@ -1251,7 +1291,7 @@ def _validated_change_overview(
     fields = {
         "overview", "key_changes", "cross_component_effects", "uncertainties",
     }
-    if set(value) != fields:
+    if not set(value).issubset(fields) or "overview" not in value:
         raise ValueError("change overview fields are invalid")
     changed_paths = {
         str(path).replace("\\", "/").strip("/")
@@ -1285,7 +1325,7 @@ def _validated_change_overview(
 
     overview = admitted_text(value.get("overview"), "overview", limit=1000)
 
-    raw_changes = value.get("key_changes")
+    raw_changes = value.get("key_changes", ())
     if (
         isinstance(raw_changes, (str, bytes))
         or not isinstance(raw_changes, (tuple, list))
@@ -1318,7 +1358,7 @@ def _validated_change_overview(
         })
         seen_paths.add(path)
 
-    raw_effects = value.get("cross_component_effects")
+    raw_effects = value.get("cross_component_effects", ())
     if (
         isinstance(raw_effects, (str, bytes))
         or not isinstance(raw_effects, (tuple, list))
@@ -1352,7 +1392,7 @@ def _validated_change_overview(
             ),
         })
 
-    raw_uncertainties = value.get("uncertainties")
+    raw_uncertainties = value.get("uncertainties", ())
     if (
         isinstance(raw_uncertainties, (str, bytes))
         or not isinstance(raw_uncertainties, (tuple, list))
@@ -3142,6 +3182,17 @@ class ReviewController:
                             "contradicts": record.contradicts,
                         })
                     candidate_evidence[candidate.candidate_id] = tuple(excerpts)
+                critic_context = {
+                    "candidates": candidates,
+                    "candidate_evidence": candidate_evidence,
+                    "obligations": obligation_map,
+                    "changed_files": state.inputs.changed_files,
+                    "pr_metadata": state.inputs.pr_metadata,
+                    "policy": state.inputs.policy,
+                    "change_overview": change_overview_orientation(
+                        state.change_overview,
+                    ),
+                }
                 critic_result = self._model_request(
                     state,
                     role="critic",
@@ -3149,26 +3200,84 @@ class ReviewController:
                     phase=RunPhase.FINALIZATION,
                     component=self.critic,
                     method="adjudicate",
-                    context={
-                        "candidates": candidates,
-                        "candidate_evidence": candidate_evidence,
-                        "obligations": obligation_map,
-                        "changed_files": state.inputs.changed_files,
-                        "pr_metadata": state.inputs.pr_metadata,
-                        "policy": state.inputs.policy,
-                        "change_overview": change_overview_orientation(
-                            state.change_overview,
-                        ),
-                    },
+                    context=critic_context,
                 )
                 diagnostics = _critic_response_diagnostics(critic_result)
                 if diagnostics["ignored_fields"]:
                     state.journal.emit("critic_response_normalized", diagnostics)
-                critic_result = _validated_critic_result(
-                    critic_result, candidates,
-                )
+                try:
+                    critic_result = _validated_critic_result(
+                        critic_result, candidates,
+                    )
+                except ValueError as exc:
+                    if "omitted candidate decisions" not in str(exc):
+                        raise
+                    partial_rows, missing_ids = _partial_critic_result(
+                        critic_result, candidates,
+                    )
+                    if not missing_ids:
+                        raise
+                    missing_candidates = tuple(
+                        item for item in candidates
+                        if item.candidate_id in set(missing_ids)
+                    )
+                    state.journal.emit("critic_repair_requested", {
+                        "missing_candidate_ids": missing_ids,
+                        "accepted_decision_count": len(partial_rows),
+                    })
+                    try:
+                        repaired = self._model_request(
+                            state,
+                            role="critic",
+                            request_id="critic:repair",
+                            phase=RunPhase.FINALIZATION,
+                            component=self.critic,
+                            method="adjudicate",
+                            context={
+                                **critic_context,
+                                "critic_repair": {
+                                    "missing_candidate_ids": missing_ids,
+                                    "accepted_decisions": partial_rows,
+                                    "instruction": (
+                                        "Return decisions only for the missing candidate IDs; "
+                                        "do not repeat accepted decisions."
+                                    ),
+                                },
+                            },
+                        )
+                        repaired_rows, still_missing = _partial_critic_result(
+                            repaired, missing_candidates,
+                        )
+                        if still_missing:
+                            raise ValueError(
+                                "critic repair omitted candidate decisions"
+                            )
+                        critic_result = _validated_critic_result(
+                            {"actions": (*partial_rows, *repaired_rows)},
+                            candidates,
+                        )
+                        state.journal.emit("critic_repair_completed", {
+                            "repaired_candidate_ids": tuple(
+                                item["candidate_id"] for item in repaired_rows
+                            ),
+                        })
+                    except Exception as repair_exc:
+                        # Preserve valid initial decisions and apply the
+                        # evidence-gated fallback only to IDs still missing.
+                        self._degrade(state, "critic", _bounded_error(repair_exc))
+                        fallback = self._conservative_critic(missing_candidates)
+                        critic_result = {
+                            "actions": (
+                                *partial_rows,
+                                *fallback.get("decisions", ()),
+                            ),
+                        }
             except Exception as exc:
-                self._degrade(state, "critic", _bounded_error(exc))
+                if not any(
+                    str(item.get("component", "")) == "critic"
+                    for item in state.degradations
+                ):
+                    self._degrade(state, "critic", _bounded_error(exc))
                 critic_result = self._conservative_critic(candidates)
         try:
             state.review = adjudicate_candidates(
@@ -3501,8 +3610,13 @@ class ReviewController:
             _normalize_repository_path(path)
             for path in _prose_path_references(combined, tracked_paths)
         }
-        if not prose_paths <= declared_paths:
+        if not prose_paths <= allowed_reference_paths:
             raise ValueError("handoff summary contains an undeclared path")
+        # References in otherwise valid prose are orientation metadata.  If a
+        # model omitted the redundant reference array, retain the path after
+        # the same changed/context allowlist check instead of discarding the
+        # entire handoff.
+        declared_paths.update(prose_paths)
         direct_context_paths = _direct_change_references(combined, context_paths)
         if direct_context_paths:
             raise ValueError("handoff summary contains a direct change claim for an unchanged path")

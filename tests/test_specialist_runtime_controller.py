@@ -38,6 +38,7 @@ from pr_reviewer.specialist_runtime.controller import (
     _deterministic_change_overview,
     _directory_fsync_status,
     _handoff_summary_proposal,
+    _partial_critic_result,
     _validated_critic_result,
 )
 from pr_reviewer.specialist_runtime.callbacks import (
@@ -219,6 +220,25 @@ def test_critic_response_diagnostics_are_bounded_and_attachment_safe():
     assert diagnostics["ignored_fields"] == ("rationale",)
     assert len(diagnostics["response_digest"]) == 64
     assert "long model explanation" not in str(diagnostics)
+
+
+def test_partial_critic_result_identifies_only_missing_decisions():
+    candidates = (
+        CandidateFinding("candidate-1", "root-1", "first"),
+        CandidateFinding("candidate-2", "root-2", "second"),
+    )
+
+    rows, missing = _partial_critic_result(
+        {"actions": [{"candidate_id": "candidate-1", "action": "keep"}]},
+        candidates,
+    )
+
+    assert rows == ({
+        "candidate_id": "candidate-1",
+        "action": "keep",
+        "target_id": "",
+    },)
+    assert missing == ("candidate-2",)
 
 
 def test_handoff_summary_parser_bounds_excess_reference_ids():
@@ -2268,7 +2288,12 @@ def test_duplicate_candidate_ids_are_scoped_per_occurrence_for_adjudication(tmp_
 
     def critic(request):
         critic_inputs.extend(request.context["candidates"])
-        return {"decisions": []}
+        return {
+            "decisions": [
+                {"candidate_id": item.candidate_id, "action": "reject"}
+                for item in request.context["candidates"]
+            ],
+        }
 
     result = _controller(tmp_path, critic=critic).run(replace(
         _inputs(tmp_path), candidate_findings=candidates,
@@ -2489,6 +2514,39 @@ def test_change_overview_rejects_multi_sentence_handoff_summary(tmp_path):
 
     with pytest.raises(ValueError, match="one sentence"):
         controller_module._validated_change_overview(proposal, inputs)
+
+
+def test_change_overview_accepts_missing_optional_arrays(tmp_path):
+    validated = controller_module._validated_change_overview(
+        {"overview": "Updates worker delivery."},
+        _inputs(tmp_path),
+    )
+
+    assert validated["overview"] == "Updates worker delivery."
+    assert validated["key_changes"] == ()
+    assert validated["cross_component_effects"] == ()
+    assert validated["uncertainties"] == ()
+
+
+def test_handoff_summarizer_can_omit_redundant_path_array(tmp_path):
+    result = _controller(
+        tmp_path,
+        finalizer=lambda _request: {
+            "ai_reviewed_summary": "The review traced retry handling in `src/worker.py`.",
+            "human_focus": "Recheck the worker boundary.",
+            "referenced_paths": [],
+            "referenced_component_ids": ["worker"],
+            "referenced_obligation_ids": [],
+        },
+    ).run(_inputs(tmp_path))
+
+    assert result.handoff.ai_reviewed == (
+        "The review traced retry handling in `src/worker.py`.",
+    )
+    assert not any(
+        item["component"] == "handoff_summarizer"
+        for item in result.artifact["degradation"]
+    )
 
 
 def test_handoff_summarizer_failure_preserves_concise_coverage_warning(tmp_path):

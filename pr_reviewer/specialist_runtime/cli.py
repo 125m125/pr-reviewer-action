@@ -109,6 +109,9 @@ _ROLE_SYSTEM = {
         "and provenance metadata for each candidate's cited retained evidence; verify the claimed "
         "execution path against those excerpts independently of specialist prose. Empty or truncated "
         "evidence cannot be rescued by repeating the claim. Do not invent evidence or widen policy."
+        " If the controller supplies a critic repair request, return decisions only for "
+        "the listed missing_candidate_ids; accepted decisions are already retained and "
+        "must not be repeated."
     ),
     "finalizer": (
         "Select or reorder only exact controller-provided behavioral sentences from "
@@ -1101,9 +1104,20 @@ def _degradation_summary_rows(
                 + ": " + ", ".join(invalid_ids[:4])
             )
         elif bool(result_event.get("candidate_retention_unknown")):
+            observed_ids = tuple(dict.fromkeys(
+                str(candidate_id)
+                for diagnostic in diagnostics
+                for candidate_id in diagnostic.get("candidate_ids", ())
+                if str(candidate_id).strip()
+            ))
+            observed_text = (
+                "; observed IDs: " + ", ".join(observed_ids[:4])
+                if observed_ids else ""
+            )
             reason = (
                 "candidate retention could not be proven after checkpoint"
                 f" (checkpoint candidates: {result_event.get('candidate_count', 0)})"
+                + observed_text
             )
         elif bool(result_event.get("result_degraded")):
             reason = "specialist finalization degraded without a retained result"
@@ -1238,7 +1252,7 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
     if diagnostic_rows:
         summary_lines.extend((
             "",
-            "## Degradation diagnostics",
+            "## Runtime diagnostics",
             "",
             "| Component | Diagnostic | Budget |",
             "| --- | --- | --- |",

@@ -163,6 +163,15 @@ def test_compact_negotiation_uses_controller_target_handle_and_derives_authority
     assert proposal.actions[0].estimated_turns == 1
 
 
+def test_compact_negotiation_does_not_advertise_new_session_at_hard_capacity():
+    context = compact_negotiation_context(
+        state_for(current_session_count=3, max_sessions=3),
+    )
+
+    assert context["targets"]
+    assert all("new_session" not in item["allowed_actions"] for item in context["targets"])
+
+
 def test_compact_negotiation_rejects_multi_action_payloads():
     state = state_for()
     with pytest.raises(NegotiationError, match="exactly one action"):
