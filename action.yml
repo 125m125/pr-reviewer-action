@@ -697,7 +697,7 @@ inputs:
 outputs:
 
   verdict:
-    description: AI verdict: approve, request_changes, or notice (specialist coverage incomplete without a confirmed defect)
+    description: "AI verdict: approve, request_changes, or notice (specialist coverage incomplete without a confirmed defect)"
     value: ${{ steps.review.outputs.verdict }}
   verdict_source:
     description: Where the final verdict came from ('model' or 'findings' per verdict_policy, or 'carry_forward' when a carried-forward blocker survived an incremental review)
