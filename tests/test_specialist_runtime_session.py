@@ -502,6 +502,89 @@ def test_plain_prose_candidate_words_do_not_trigger_retention_unknown():
     assert "candidate-retention-unknown" not in result.checkpoint.unknowns
 
 
+def test_superseded_update_rejects_self_reference_and_preserves_active_state():
+    """Invalid self-supersede cannot mutate the prior candidate registry."""
+    initial = candidate_checkpoint_response(("candidate-code",))
+    invalid = candidate_update_checkpoint_response(updates=({
+        "candidate_id": "candidate-code",
+        "status": "superseded",
+        "superseded_by": "candidate-code",
+    },))
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        invalid,
+        candidate_update_checkpoint_response(),
+        candidate_update_checkpoint_response(),
+    ])
+    session = make_session(gateway, model_turns=7)
+
+    session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    result = session.explore()
+
+    assert result.degraded is False
+    assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
+    assert tuple(item.candidate_id for item in session.candidate_findings) == (
+        "candidate-code",
+    )
+
+
+def test_superseded_replacement_must_remain_active_atomically():
+    """A replacement withdrawn in the same checkpoint rejects the whole update."""
+    initial = candidate_checkpoint_response(("candidate-code",))
+    payload = json.loads(candidate_checkpoint_response(("candidate-new",)).text)
+    invalid = candidate_update_checkpoint_response(
+        updates=(
+            {
+                "candidate_id": "candidate-code",
+                "status": "superseded",
+                "superseded_by": "candidate-new",
+            },
+            {
+                "candidate_id": "candidate-new",
+                "status": "withdrawn",
+            },
+        ),
+        new_candidates=payload["candidate_findings"],
+    )
+    valid_new = candidate_update_checkpoint_response(
+        new_candidates=payload["candidate_findings"],
+    )
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        valid_new,
+    ])
+    session = make_session(gateway, model_turns=5)
+
+    session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    session.explore()
+    checkpoint = session._checkpoint_from_text(invalid.text)
+
+    assert checkpoint is None
+    assert tuple(item.candidate_id for item in session.candidate_findings) == (
+        "candidate-code", "candidate-new",
+    )
+
+
+def test_embedded_malformed_candidate_json_is_retention_material():
+    """Truncated candidate JSON after prose remains conservatively degraded."""
+    gateway = ScriptedGateway([
+        invalid_response(
+            'Here is the checkpoint draft: {"candidate_findings": '
+            '[{"candidate_id":"candidate-lost","claim":"issue"}'
+        ),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    result = make_session(gateway).explore()
+
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+
+
 def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract():
     gateway = ScriptedGateway([
         invalid_response("plain-text material issue"),

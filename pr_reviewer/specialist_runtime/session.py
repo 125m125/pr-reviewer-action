@@ -272,7 +272,20 @@ class _CandidateRetentionSignal:
 def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
     """Retain only bounded structured IDs/counts, never candidate prose."""
     raw = _json_object(text)
-    structured_text = isinstance(text, str) and text.strip().startswith(("{", "[", "```"))
+    lowered_text = text.casefold() if isinstance(text, str) else ""
+    has_candidate_key = any(
+        key in lowered_text for key in (
+            "candidate_findings", "candidate_updates", "new_candidates",
+            "candidate_finding_ids",
+        )
+    )
+    structured_text = bool(
+        isinstance(text, str)
+        and (
+            text.strip().startswith(("{", "[", "```"))
+            or (has_candidate_key and "{" in text)
+        )
+    )
     if not isinstance(raw, Mapping):
         # Malformed structured candidate payloads remain conservative, while
         # ordinary prose containing no JSON candidate keys is non-material.
@@ -1255,6 +1268,7 @@ class SpecialistSession:
         candidates: dict[str, CandidateFinding] = {
             item.candidate_id: item for item in self.candidate_findings
         }
+        candidate_statuses = dict(self._candidate_statuses)
         # Legacy checkpoints may repeat full candidate objects. Treat them as
         # additions while preserving all previously active candidates.
         raw_candidates = raw.get("candidate_findings")
@@ -1281,7 +1295,7 @@ class SpecialistSession:
                 # A repeated ID must not silently rewrite the retained finding.
                 continue
             candidates[candidate.candidate_id] = candidate
-            self._candidate_statuses[candidate.candidate_id] = "active"
+            candidate_statuses[candidate.candidate_id] = "active"
 
         updates = raw.get("candidate_updates", [])
         if updates is None:
@@ -1296,7 +1310,7 @@ class SpecialistSession:
             if (
                 not candidate_id
                 or status not in {"active", "withdrawn", "superseded"}
-                or candidate_id not in self._candidate_statuses
+                or candidate_id not in candidate_statuses
             ):
                 # Updates are authoritative only for controller-known IDs.
                 return None
@@ -1305,14 +1319,28 @@ class SpecialistSession:
                     return None
             elif status == "superseded":
                 replacement_id = str(update.get("superseded_by") or "").strip()
-                if not replacement_id or replacement_id not in candidates:
+                if (
+                    not replacement_id
+                    or replacement_id == candidate_id
+                    or replacement_id not in candidates
+                ):
                     return None
                 candidates.pop(candidate_id, None)
             else:
                 candidates.pop(candidate_id, None)
-            self._candidate_statuses[candidate_id] = status
+            candidate_statuses[candidate_id] = status
+
+        # Superseded candidates must point to a replacement that remains active
+        # after all updates in this checkpoint have been applied.
+        for update in updates:
+            if str(update.get("status") or "").strip().lower() != "superseded":
+                continue
+            replacement_id = str(update.get("superseded_by") or "").strip()
+            if replacement_id not in candidates:
+                return None
 
         self.candidate_findings = tuple(candidates[key] for key in sorted(candidates))
+        self._candidate_statuses = candidate_statuses
         self._current_gaps = self._derive_current_gaps()
         evidence_ids = list(dict.fromkeys(evidence_ids))
         return SessionCheckpoint(

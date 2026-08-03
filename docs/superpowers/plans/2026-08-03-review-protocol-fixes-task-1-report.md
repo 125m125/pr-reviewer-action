@@ -63,3 +63,22 @@ $env:PYTHONPATH='.'; .\\.venv\\Scripts\\pytest.exe tests/test_specialist_runtime
 $env:PYTHONPATH='.'; .\\.venv\\Scripts\\pytest.exe tests/test_specialist_runtime_controller.py tests/test_specialist_runtime_replay.py tests/test_specialist_runtime_scheduler.py -q
 207 passed in 6.72s
 ```
+
+## Fix round 2
+
+- Candidate updates are applied atomically. Self-supersedes are rejected, and
+  every superseded replacement must remain active after all updates in the
+  checkpoint; invalid payloads leave the prior candidate registry untouched.
+- Retention detection also catches bounded malformed candidate JSON embedded
+  after prose, while ordinary prose containing candidate vocabulary remains
+  non-material.
+
+Verification:
+
+```text
+$env:PYTHONPATH='.'; .\\.venv\\Scripts\\pytest.exe tests/test_specialist_runtime_session.py -q
+61 passed in 0.29s
+
+$env:PYTHONPATH='.'; .\\.venv\\Scripts\\pytest.exe tests/test_specialist_runtime_controller.py tests/test_specialist_runtime_replay.py tests/test_specialist_runtime_scheduler.py -q
+207 passed in 6.54s
+```
