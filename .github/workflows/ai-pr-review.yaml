@@ -80,7 +80,7 @@ jobs:
       - name: Review pull request
         # Fork of pr-reviewer-action v2.0.0 with generic, model-planned specialist
         # reviews and LM Studio reasoning-channel compatibility; pinned for safety.
-        uses: 125m125/pr-reviewer-action@a21080a2e0cfc6df9cb41970b98b71dbc5b5999a
+        uses: 125m125/pr-reviewer-action@80b384642103e99b277d62790ecadbb81c96b0af
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -96,7 +96,7 @@ jobs:
           ai_verdict_reasoning_effort: none
           ai_stream: "true"
           ai_max_tokens: "8192"
-          model_context_tokens: "262144"
+          model_context_tokens: "90112"
           ai_request_timeout_sec: "1200"
           standards_file: .github/ai-review-rules.md
           system_prompt_file: .github/ai-review-prompt.md
