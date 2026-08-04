@@ -1205,6 +1205,9 @@ def test_default_lm_studio_requests_use_role_and_session_protocols_not_legacy_ve
     assert "response_format" not in specialist_payload
     assert "tools" not in planner_payload
     assert specialist_payload["tools"]
+    assert "read_compacted_evidence" in {
+        item["function"]["name"] for item in specialist_payload["tools"]
+    }
 
 
 def test_json_schema_mode_uses_json_object_for_each_controller_role(monkeypatch, tmp_path):

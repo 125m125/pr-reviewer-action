@@ -22,6 +22,7 @@ from pr_reviewer.specialist_runtime.evidence import (
 from pr_reviewer.specialist_runtime.model_gateway import ModelTurnResult
 from pr_reviewer.specialist_runtime.request_attempts import RequestAttemptJournal
 from pr_reviewer.specialist_runtime.session import (
+    COMPACTED_EVIDENCE_TOOL_NAME,
     SpecialistSession,
     _resolve_retained_evidence_id,
     _rewrite_rationale_evidence_ids,
@@ -128,6 +129,82 @@ def test_shortened_evidence_ids_are_expanded_only_when_unambiguous():
         "consequence_support:reachable_input_path; evidence_ids=evidence:abcdef01...",
         retained,
     ).endswith("evidence_ids=evidence:abcdef0123456789")
+
+
+def test_compaction_registers_shrunk_tool_results_for_bounded_retrieval():
+    session = make_session(ScriptedGateway([]), max_context_tokens=1_000)
+    record, _collection = session.evidence_store.add_tool_result_with_collection(
+        session_id=session.session_id,
+        tool="read_file",
+        arguments={"path": "a.py"},
+        result={"status": "ok", "content": "important-tail\n" + ("x" * 5_000)},
+    )
+    session.conversation.add_assistant_tool_calls(({
+        "id": "call-old",
+        "name": "read_file",
+        "arguments": json.dumps({"path": "a.py"}),
+    },))
+    session.conversation.add_tool_result(
+        "call-old",
+        {"evidence_id": record.id, "content": record.content},
+        max_bytes=20_000,
+    )
+
+    session._compact_conversation()
+
+    assert record.id in session._compacted_evidence
+    assert any(
+        event.get("compaction_note") and record.id in event["content"]
+        for event in session.conversation.events
+    )
+
+
+def test_compacted_evidence_reader_is_strict_and_deduplicated():
+    session = make_session(ScriptedGateway([]))
+    record, _collection = session.evidence_store.add_tool_result_with_collection(
+        session_id=session.session_id,
+        tool="read_file",
+        arguments={"path": "a.py"},
+        result={"status": "ok", "content": "retained source"},
+    )
+    session._compacted_evidence[record.id] = record
+
+    first = {
+        "id": "read-1",
+        "name": COMPACTED_EVIDENCE_TOOL_NAME,
+        "arguments": json.dumps({
+            "evidence_id": record.id, "offset": 0, "limit": 100,
+        }),
+    }
+    assert session._execute_calls((first,)) is False
+    assert "retained source" in session.conversation.events[-1]["content"]
+    assert session.budget.snapshot().tool_calls == 0
+
+    repeated = {**first, "id": "read-2"}
+    session._execute_calls((repeated,))
+    assert "replayed_compacted" in session.conversation.events[-1]["content"]
+
+    rejected = {
+        "id": "read-3",
+        "name": COMPACTED_EVIDENCE_TOOL_NAME,
+        "arguments": json.dumps({"evidence_id": "evidence:not-compacted"}),
+    }
+    session._execute_calls((rejected,))
+    assert "not marked as compacted" in session.conversation.events[-1]["content"]
+
+
+def test_compaction_marks_old_assistant_analysis_instead_of_prefix_truncating():
+    session = make_session(ScriptedGateway([]), max_context_tokens=1_000)
+    session.conversation.add_assistant_text("old conclusion: " + ("x" * 5_000))
+    session.conversation.add_assistant_text("new conclusion: " + ("y" * 5_000))
+
+    session._compact_conversation()
+
+    assert any(
+        event.get("compaction_note")
+        and "Older assistant analysis was compacted" in event["content"]
+        for event in session.conversation.events
+    )
 
 
 @dataclass(frozen=True)

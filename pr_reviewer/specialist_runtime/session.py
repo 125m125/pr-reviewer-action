@@ -39,6 +39,38 @@ from .web_evidence import (
 
 ToolExecutor = Callable[..., dict[str, Any]]
 
+COMPACTED_EVIDENCE_TOOL_NAME = "read_compacted_evidence"
+COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
+    "name": COMPACTED_EVIDENCE_TOOL_NAME,
+    "description": (
+        "Read a bounded excerpt from an evidence result that the controller "
+        "explicitly marked as compacted. Only evidence IDs listed in a recent "
+        "compaction marker are valid; this tool never reads arbitrary evidence "
+        "or creates new evidence."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "evidence_id": {
+                "type": "string",
+                "description": "Exact evidence ID from a compaction marker.",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "Optional zero-based character offset (default 0).",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Optional excerpt size, capped by the controller.",
+            },
+        },
+        "required": ["evidence_id"],
+        "additionalProperties": False,
+    },
+}
+_MAX_COMPACTED_EVIDENCE_READS = 4
+_MAX_COMPACTED_EVIDENCE_READ_CHARS = 4_000
+
 _CHECKPOINT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -629,6 +661,10 @@ class SpecialistSession:
         self.source_access_requests: tuple[SourceAccessRequest, ...] = ()
         self._successful_requests: dict[str, EvidenceRecord] = {}
         self._successful_collections: dict[str, str] = {}
+        self._tool_call_evidence_ids: dict[str, str] = {}
+        self._compacted_evidence: dict[str, EvidenceRecord] = {}
+        self._compacted_evidence_read_keys: set[tuple[str, int, int]] = set()
+        self._compacted_evidence_reads = 0
         self._tool_lease_exhausted = False
         self._recovery_turn_pending = False
         self._final_result: SessionResult | None = None
@@ -890,6 +926,11 @@ class SpecialistSession:
                 self.budget.record_tool_rejection("invalid tool arguments")
                 self.conversation.add_tool_result(call_id, {"error": str(exc)}, is_error=True)
                 continue
+            if name == COMPACTED_EVIDENCE_TOOL_NAME:
+                self.conversation.add_tool_result(
+                    call_id, self._read_compacted_evidence(arguments),
+                )
+                continue
             if "evidence_category" in arguments or "obligation_id" in arguments:
                 self.budget.record_tool_rejection(
                     "model-supplied evidence authority is forbidden"
@@ -937,6 +978,7 @@ class SpecialistSession:
                     self._associate_collection(
                         collection_id, prior, requested_obligation_ids,
                     )
+                self._tool_call_evidence_ids[call_id] = prior.id
                 self.budget.record_tool_rejection("duplicate tool request")
                 self.conversation.add_tool_result(
                     call_id,
@@ -995,6 +1037,7 @@ class SpecialistSession:
             self._associate_collection(
                 collection.id, record, requested_obligation_ids,
             )
+            self._tool_call_evidence_ids[call_id] = record.id
             self.conversation.add_tool_result(
                 call_id,
                 {
@@ -1580,12 +1623,153 @@ class SpecialistSession:
         self.lease = lease
 
     def _compact_conversation(self) -> None:
-        self.conversation.truncate_oldest_tool_results(2_000)
-        self.conversation.truncate_oldest_assistant_text(1_000, keep_newest=2)
+        before = self._conversation_evidence_bodies()
+        before_assistant = self._assistant_analysis_bodies()
         if self.conversation.approx_tokens() > self.max_context_tokens:
             self.conversation.collapse_oldest_completed_history(
                 max(1_000, self.max_context_tokens * 2), keep_newest_results=2,
             )
+        if self.conversation.approx_tokens() > self.max_context_tokens:
+            self.conversation.collapse_oldest_completed_history(
+                max(256, self.max_context_tokens), keep_newest_results=0,
+            )
+        after = self._conversation_evidence_bodies()
+        after_assistant = self._assistant_analysis_bodies()
+        newly_compacted: list[str] = []
+        retained = {
+            record.id: record
+            for record in self.evidence_store.snapshot().records
+        }
+        for evidence_id, previous_body in before.items():
+            current_body = after.get(evidence_id)
+            if (
+                current_body is not None
+                and current_body == previous_body
+            ):
+                continue
+            record = retained.get(evidence_id)
+            if record is None or evidence_id in self._compacted_evidence:
+                continue
+            self._compacted_evidence[evidence_id] = record
+            newly_compacted.append(evidence_id)
+        assistant_compacted = len(after_assistant) < len(before_assistant)
+        if newly_compacted or assistant_compacted:
+            entries = []
+            for evidence_id in newly_compacted[:20]:
+                record = self._compacted_evidence[evidence_id]
+                entries.append({
+                    "evidence_id": evidence_id,
+                    "tool": record.tool,
+                    "arguments": record.arguments,
+                    "original_bytes": len(record.content.encode("utf-8")),
+                    "source_truncated": bool(record.truncated),
+                })
+            marker_lines = []
+            if newly_compacted:
+                marker_lines.append(
+                    "Older tool results were compacted and are not fully visible. "
+                    "Use read_compacted_evidence only for these exact IDs, and only "
+                    "if the omitted content is necessary:\n"
+                    + json.dumps(entries, sort_keys=True)
+                )
+            if assistant_compacted:
+                marker_lines.append(
+                    "Older assistant analysis was compacted. It is not authoritative; "
+                    "rely on retained checkpoints and evidence, and re-check source "
+                    "when the omitted reasoning matters."
+                )
+            self.conversation.events.append({
+                "kind": "user", "content": "\n".join(marker_lines),
+                "compaction_note": True,
+            })
+
+    def _conversation_evidence_bodies(self) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for event in self.conversation.events:
+            if event.get("kind") != "tool_result":
+                continue
+            evidence_id = self._tool_call_evidence_ids.get(
+                str(event.get("call_id") or ""),
+                "",
+            )
+            try:
+                payload = json.loads(str(event.get("content", "")))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = None
+            if not evidence_id and isinstance(payload, Mapping):
+                evidence_id = str(payload.get("evidence_id") or "").strip()
+            else:
+                # Conversation-level tool-result bounds can cut a one-line
+                # JSON envelope before it remains parseable. The evidence ID
+                # is deliberately emitted first and can still be recovered
+                # without trusting the truncated body.
+                match = re.search(
+                    r'"evidence_id"\s*:\s*"([^"]+)"',
+                    str(event.get("content", "")),
+                )
+                evidence_id = match.group(1).strip() if match else ""
+            if evidence_id:
+                result[evidence_id] = str(event.get("content", ""))
+        return result
+
+    def _assistant_analysis_bodies(self) -> tuple[str, ...]:
+        return tuple(
+            str(event.get("content", ""))
+            for event in self.conversation.events
+            if event.get("kind") in {"assistant_text", "assistant_reasoning"}
+        )
+
+    def _read_compacted_evidence(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        if set(arguments) - {"evidence_id", "offset", "limit"}:
+            return {"status": "error", "error": "unexpected retrieval arguments"}
+        evidence_id = str(arguments.get("evidence_id") or "").strip()
+        if not evidence_id:
+            return {"status": "error", "error": "evidence_id is required"}
+        record = self._compacted_evidence.get(evidence_id)
+        if record is None:
+            return {
+                "status": "error",
+                "error": "evidence ID is not marked as compacted",
+            }
+        raw_offset = arguments.get("offset", 0)
+        raw_limit = arguments.get("limit", _MAX_COMPACTED_EVIDENCE_READ_CHARS)
+        if (
+            isinstance(raw_offset, bool)
+            or not isinstance(raw_offset, int)
+            or raw_offset < 0
+            or isinstance(raw_limit, bool)
+            or not isinstance(raw_limit, int)
+            or raw_limit <= 0
+        ):
+            return {"status": "error", "error": "offset and limit are invalid"}
+        offset = raw_offset
+        limit = min(raw_limit, _MAX_COMPACTED_EVIDENCE_READ_CHARS)
+        key = (evidence_id, offset, limit)
+        if key in self._compacted_evidence_read_keys:
+            return {
+                "status": "ok",
+                "evidence_id": evidence_id,
+                "replayed_compacted": True,
+            }
+        if self._compacted_evidence_reads >= _MAX_COMPACTED_EVIDENCE_READS:
+            return {
+                "status": "error",
+                "error": "compacted evidence read budget exhausted",
+            }
+        self._compacted_evidence_read_keys.add(key)
+        self._compacted_evidence_reads += 1
+        content = record.content
+        excerpt = content[offset:offset + limit]
+        return {
+            "status": "ok",
+            "evidence_id": evidence_id,
+            "tool": record.tool,
+            "content": excerpt,
+            "offset": offset,
+            "limit": limit,
+            "truncated": offset + len(excerpt) < len(content),
+            "source_truncated": bool(record.truncated),
+        }
 
     def _snapshot(
         self,

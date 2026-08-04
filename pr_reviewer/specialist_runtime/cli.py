@@ -45,7 +45,11 @@ from .policy import (
     load_review_policy,
     parse_review_policy,
 )
-from .session import SpecialistSession, specialist_assignment_prompt
+from .session import (
+    COMPACTED_EVIDENCE_SCHEMA,
+    SpecialistSession,
+    specialist_assignment_prompt,
+)
 from .types import ReviewHandoff, ReviewNote, ReviewNoteKind
 from .web_evidence import SecureFetcher, SearxngSearchProvider, SourcePolicy
 
@@ -147,6 +151,8 @@ _SPECIALIST_SYSTEM = (
     "A successful tool call can still be bounded or truncated. A truncation marker, omitted range, "
     "or bounded changed_context does not prove the omitted content is absent; request a narrower "
     "diff or source range, or record the evidence limit. During exploration, use "
+    "read_compacted_evidence only for evidence IDs explicitly listed by a compaction marker; "
+    "do not invent IDs or use it to reread un-compacted results. "
     "tools or concise analysis and do not emit a whole-PR verdict. When the controller asks "
     "for a checkpoint, return only the requested checkpoint object matching its schema. "
     "The controller closes a valid checkpoint deterministically; do not emit a separate "
@@ -854,6 +860,7 @@ def build_controller(
         tools = web_tool_schemas(config.search_url, policy) if tools_allowed else []
         if tools_allowed:
             tools.append(SPECIALIST_PR_DIFF_SCHEMA)
+            tools.append(COMPACTED_EVIDENCE_SCHEMA)
         conversation = Conversation(
             system=config.system_prompt.rstrip() + "\n\n" + _SPECIALIST_SYSTEM,
             tool_schemas=tools,
