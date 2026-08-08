@@ -1439,6 +1439,23 @@ def test_planner_failure_uses_deterministic_assignment_plan(tmp_path):
     assert result.publishing_ready is True
 
 
+def test_handoff_effects_render_summary_text_not_mapping_repr():
+    summary = controller_module._deterministic_handoff_change_summary({
+        "overview": "A runtime change.",
+        "key_changes": [],
+        "cross_component_effects": [{
+            "components": ("runtime", "transport"),
+            "summary": "Runtime state now reaches the transport layer.",
+        }],
+    })
+
+    assert summary[-1] == (
+        "Cross-component effects to recheck include Runtime state now reaches "
+        "the transport layer."
+    )
+    assert "{'components'" not in " ".join(summary)
+
+
 def test_optional_planner_absence_keeps_authoritative_base_without_degradation(tmp_path):
     result = _controller(tmp_path, planner=None).run(_inputs(tmp_path))
 

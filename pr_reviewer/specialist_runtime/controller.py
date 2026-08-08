@@ -818,16 +818,20 @@ def _deterministic_handoff_change_summary(
     effect_text: list[str] = []
     if isinstance(effects, (list, tuple)):
         for item in effects:
-            text = " ".join(str(item).split())
+            if isinstance(item, Mapping):
+                text = " ".join(str(item.get("summary") or "").split())
+            else:
+                text = " ".join(str(item).split())
             if text and text not in effect_text:
                 effect_text.append(text[:180])
             if len(effect_text) == 2:
                 break
     if effect_text and len(result) < 3:
+        suffix = "" if effect_text[-1].endswith((".", "!", "?")) else "."
         result.append(
             "Cross-component effects to recheck include "
             + "; ".join(effect_text)
-            + "."
+            + suffix
         )
     if len(result) == 1:
         result.append(

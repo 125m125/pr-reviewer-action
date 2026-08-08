@@ -79,7 +79,15 @@ def test_dogfood_workflow_temporarily_allows_large_planner_preflight():
 
     assert _scalar(
         workflow, "specialist_planner_max_context_bytes", 10,
-    ) == '"400000"'
+    ) == '"180000"'
+
+
+def test_action_exposes_project_diff_priority_file():
+    action = (_ROOT / "action.yml").read_text(encoding="utf-8")
+
+    assert "review_diff_priority_file:" in action
+    assert 'default: ".github/ai-review-diff-priorities.json"' in action
+    assert "REVIEW_DIFF_PRIORITY_FILE: ${{ inputs.review_diff_priority_file }}" in action
 
 
 def test_dogfood_workflow_allows_multiple_tools_per_specialist_turn():

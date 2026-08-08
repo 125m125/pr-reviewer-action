@@ -274,6 +274,26 @@ def test_degradation_summary_exposes_specialist_root_causes_without_model_dump()
     assert rows[1] == ("change_summarizer", "ValueError: summary claims coverage", "")
 
 
+def test_degradation_summary_exposes_optional_planner_fallback():
+    rows = cli._degradation_summary_rows({
+        "degradation": [],
+        "assignment_plan": {
+            "source": "deterministic_base",
+            "ignored_transformations": [
+                "ValueError: planner context exceeds configured byte limit (316994>180000)",
+            ],
+        },
+        "events": [],
+        "sessions": [],
+    })
+
+    assert rows == ( (
+        "planner",
+        "optional planner fell back to deterministic_base: ValueError: planner context exceeds configured byte limit (316994>180000)",
+        "",
+    ), )
+
+
 def test_cli_rejects_incomplete_or_wrong_current_head_snapshot(monkeypatch, tmp_path):
     write_review_workspace(tmp_path)
     monkeypatch.chdir(tmp_path)

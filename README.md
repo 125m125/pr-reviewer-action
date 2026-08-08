@@ -364,6 +364,7 @@ for the complete schema, source-rule boundaries, and conversion checklist.
 |-------|-------------|----------|---------|
 | `context_limit_mode` | Context budget mode: `normal` (140k/70k/220k), `low` (80k/40k/120k), `minimal` (40k/20k/60k) | No | `normal` |
 | `model_context_tokens` | The model's real context window in tokens (e.g. `8192`, `32768`). When set, corpus/diff/file byte budgets are derived from it (reserving `ai_max_tokens` for output) instead of `context_limit_mode`. Recommended for local models. Empty uses `context_limit_mode` | No | `""` |
+| `review_diff_priority_file` | Optional current-branch JSON file that orders and quotas changed diff sections for large PRs | No | `.github/ai-review-diff-priorities.json` |
 | `enrichment_budget_sec` | Maximum seconds to spend on enrichment (linked source fetching, release metadata, ghcr.io lookups). Exceeding the budget stops further enrichment. | No | `60` |
 | `image_digest_budget_sec` | Maximum seconds to spend on image digest provenance lookups (registry tokens, manifests, revision compares). 0 disables the budget. | No | `60` |
 | `allowed_source_hosts` | Comma-separated allowlist for linked URL fetching | No | `github.com,api.github.com,gitlab.com,registry.terraform.io,artifacthub.io` |
@@ -1095,6 +1096,19 @@ on_model_failure: notice   # visible explanation instead of a long red check
 - By default, the action computes a stable patch fingerprint with `git patch-id --stable` and skips the LLM call when that fingerprint matches the most recent managed review comment. This avoids token spend on rebases and other history-only changes.
 - `publish_review_comment` uses `gh pr comment --edit-last --create-if-none`, so the comment is managed by the token identity used in the workflow.
 - `context_limit_mode` reduces the amount of PR data sent to the LLM. Use `minimal` for models with very small context windows. This skips nothing but truncates more aggressively.
+- Large diffs are rendered through `review_diff_priority_file` when present. The file contains `rules` with `glob` (or `globs`), `priority`, optional `category`, and optional `max_bytes`; lower priorities are selected first. Rules only reorder or quota paths already present in the authoritative PR diff and cannot grant additional repository or web access. Omitted sections are listed in the changed-file index and marked in the diff.
+
+Example `.github/ai-review-diff-priorities.json`:
+
+```json
+{
+  "rules": [
+    {"glob": "docs/**/*.md", "priority": 5, "max_bytes": 40000},
+    {"glob": "src/**/*.py", "priority": 15},
+    {"glob": "**/*_generated.*", "priority": 90, "max_bytes": 8000}
+  ]
+}
+```
 - `evidence_providers_file` accepts JSON only. It can be either an object with `providers: []` or a top-level provider array.
 - Provider `command` accepts either a shell string (executed via `bash -lc`) or an argument array (invoked directly). **Argv arrays are strongly recommended** to avoid shell injection risks. Each provider can override `timeout_sec` and `max_output_bytes`.
 - Provider output is appended to the review corpus under an `Evidence Providers` section.

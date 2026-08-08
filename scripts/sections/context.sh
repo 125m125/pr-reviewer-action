@@ -28,7 +28,6 @@ if [[ -s pr.diff ]]; then
 else
   platform_pr_diff "$REPO" "$PR_NUMBER" > pr.diff
 fi
-truncate_clean pr.diff pr.diff.truncated "$MAX_DIFF" '…[diff truncated to fit context budget]'
 
 # One bounded page instead of --paginate: 100 files is far beyond what the
 # MAX_FILES byte budget keeps anyway, and unbounded pagination on huge PRs
@@ -42,6 +41,19 @@ jq -c --argjson total "${TOTAL_CHANGED_FILES:-0}" \
   '[.[] | {filename,status,additions,deletions,changes,previous_filename}]
    + (if $total > 100 then [{note: "file list truncated to first 100 of \($total) changed files"}] else [] end)' \
   pr-files.raw.json > pr-files.json
+
+# Select bounded diff sections by semantic priority while retaining a changed-
+# file index for the supplied manifest page. The selector only receives the authoritative PR file
+# manifest, so project globs can reorder/quota changed paths but cannot expand
+# repository or revision access.
+PYTHONPATH="${SCRIPT_DIR}/.." python3 "$SCRIPT_DIR/../scripts/prioritize_diff.py" \
+  --diff pr.diff \
+  --files pr-files.raw.json \
+  --max-bytes "$MAX_DIFF" \
+  --total-changed-files "${TOTAL_CHANGED_FILES:-0}" \
+  --config "$REVIEW_DIFF_PRIORITY_FILE" \
+  --output pr.diff.truncated \
+  --index-output pr-diff-index.md
 
 # Review threads require every changed path even though the model corpus stays
 # bounded. Bind this separately collected snapshot to a post-pagination head.

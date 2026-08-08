@@ -84,6 +84,10 @@ inputs:
     description: Current-branch version-2 specialist review policy; its source and publishing restrictions are authoritative.
     required: false
     default: ".github/ai-review-policy.json"
+  review_diff_priority_file:
+    description: Optional current-branch file defining ordering and byte quotas for changed diff sections.
+    required: false
+    default: ".github/ai-review-diff-priorities.json"
   specialist_review_deadline_sec:
     description: Absolute specialist review deadline in seconds, including finalization and artifact production.
     required: false
@@ -799,6 +803,7 @@ runs:
         AI_TOKENS_PARAM: ${{ inputs.ai_tokens_param }}
         REVIEW_STRATEGY: ${{ inputs.review_strategy }}
         REVIEW_POLICY_FILE: ${{ inputs.review_policy_file }}
+        REVIEW_DIFF_PRIORITY_FILE: ${{ inputs.review_diff_priority_file }}
         SPECIALIST_REVIEW_DEADLINE_SEC: ${{ inputs.specialist_review_deadline_sec }}
         SPECIALIST_PHASE_SHARES: ${{ inputs.specialist_phase_shares }}
         SPECIALIST_CONCURRENCY: ${{ inputs.specialist_concurrency }}
@@ -924,6 +929,7 @@ runs:
         AI_TOKENS_PARAM: ${{ inputs.ai_tokens_param }}
         REVIEW_STRATEGY: ${{ inputs.review_strategy }}
         REVIEW_POLICY_FILE: ${{ inputs.review_policy_file }}
+        REVIEW_DIFF_PRIORITY_FILE: ${{ inputs.review_diff_priority_file }}
         SPECIALIST_REVIEW_DEADLINE_SEC: ${{ inputs.specialist_review_deadline_sec }}
         SPECIALIST_PHASE_SHARES: ${{ inputs.specialist_phase_shares }}
         SPECIALIST_CONCURRENCY: ${{ inputs.specialist_concurrency }}

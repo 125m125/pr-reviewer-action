@@ -1153,6 +1153,29 @@ def _degradation_summary_rows(
             continue
         listed_components.add(component)
         rows.append((component, str(payload.get("reason", "unspecified")), ""))
+
+    # Planner transformations are optional, so their failure intentionally
+    # keeps the deterministic base plan. Still expose the fallback reason in
+    # the bounded summary; otherwise a large planner request can disappear
+    # from the public diagnostics while the artifact quietly falls back.
+    assignment_plan = artifact.get("assignment_plan")
+    if (
+        isinstance(assignment_plan, Mapping)
+        and str(assignment_plan.get("source", "")) == "deterministic_base"
+        and "planner" not in listed_components
+    ):
+        ignored = tuple(
+            str(item).strip()
+            for item in assignment_plan.get("ignored_transformations", ())
+            if str(item).strip()
+        )
+        if ignored:
+            listed_components.add("planner")
+            rows.append((
+                "planner",
+                "optional planner fell back to deterministic_base: " + ignored[0][:240],
+                "",
+            ))
     return tuple(rows)
 
 
