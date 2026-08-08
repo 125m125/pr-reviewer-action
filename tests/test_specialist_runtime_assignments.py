@@ -316,6 +316,17 @@ def test_planner_can_merge_and_split_ordinary_assignments_on_existing_boundaries
     expected_ids = set(ordinary[0].obligation_ids + ordinary[1].obligation_ids)
     assert set(merged_item.obligation_ids) == expected_ids
 
+    merged_alias = apply_planner_transformations({
+        "transformations": [{
+            "kind": "merge",
+            "assignment_ids": [ordinary[0].id, ordinary[1].id],
+        }],
+    }, base, obligations, roomy, topology=topology)
+    merged_alias_item = next(
+        item for item in merged_alias.plan.assignments if item.id == ordinary[0].id
+    )
+    assert set(merged_alias_item.obligation_ids) == expected_ids
+
     split = apply_planner_transformations({
         "transformations": [{
             "kind": "split",

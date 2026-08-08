@@ -85,6 +85,28 @@ def test_runtime_event_line_reports_lifecycle_without_model_content():
     assert "tool/evidence loop" in line
 
 
+def test_runtime_event_line_reports_request_purpose_and_suppresses_duplicate_admission():
+    from pr_reviewer.specialist_runtime.events import RunEvent
+
+    event = RunEvent(1, "llm_request_completed", {
+        "session_id": "session:test",
+        "gateway_request_id": "session:test:model:4",
+        "assignment_id": "assignment-1",
+        "turn": 4,
+        "purpose": "checkpoint-repair",
+        "finish_reason": "length",
+    })
+    line = cli._runtime_event_line(event)
+
+    assert "purpose=checkpoint-repair" in line
+    assert "finish_reason=length" in line
+    assert cli._runtime_event_line(
+        RunEvent(2, "specialist_request_completed", {
+            "session_id": "session:test",
+        })
+    ) is None
+
+
 def runtime_source_paths() -> tuple[Path, ...]:
     root = Path(__file__).resolve().parent.parent
     return (

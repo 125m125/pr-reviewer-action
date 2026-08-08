@@ -2394,6 +2394,11 @@ class ReviewController:
             "max_output_tokens": attempt.max_output_tokens,
             "status": attempt.status,
             "in_flight": attempt.in_flight,
+            "purpose": attempt.purpose,
+            "finish_reason": attempt.finish_reason,
+            "text_source": attempt.text_source,
+            "tool_call_count": attempt.tool_call_count,
+            "error": attempt.error,
         }
 
     def _session_hook(

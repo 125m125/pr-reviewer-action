@@ -758,7 +758,13 @@ class SpecialistSession:
             entries, sort_keys=True,
         )
 
-    def _request(self, *, tools_enabled: bool, schema: dict[str, Any] | None) -> ModelTurnResult:
+    def _request(
+        self,
+        *,
+        tools_enabled: bool,
+        schema: dict[str, Any] | None,
+        purpose: str = "unknown",
+    ) -> ModelTurnResult:
         estimated_input_tokens = self.conversation.approx_tokens()
         remaining_input_tokens = self.budget.remaining_input_tokens()
         if (
@@ -825,6 +831,7 @@ class SpecialistSession:
                 turn=self._request_turn,
                 input_tokens=estimated_input_tokens,
                 max_output_tokens=request_max_tokens,
+                purpose=purpose,
             )
         try:
             request = ModelTurnRequest(
@@ -846,7 +853,11 @@ class SpecialistSession:
                 "timed_out" if isinstance(exc, CallbackTimedOut) else "failed"
             )
             if self._request_attempt_journal is not None:
-                self._request_attempt_journal.finish(request_id, terminal_status)
+                self._request_attempt_journal.finish(
+                    request_id,
+                    terminal_status,
+                    error=format_callback_error(exc, limit=500),
+                )
             self._request_events.append(SpecialistRequestEvent(
                 request_id,
                 terminal_status,
@@ -856,7 +867,13 @@ class SpecialistSession:
             ))
             raise
         if self._request_attempt_journal is not None:
-            self._request_attempt_journal.finish(request_id, "completed")
+            self._request_attempt_journal.finish(
+                request_id,
+                "completed",
+                finish_reason=result.finish_reason,
+                text_source=result.text_source,
+                tool_call_count=len(result.tool_calls),
+            )
         self._request_events.append(SpecialistRequestEvent(
             request_id, "completed", tools_enabled, schema_name,
             finish_reason=result.finish_reason,
@@ -895,7 +912,9 @@ class SpecialistSession:
             if self.budget.remaining_model_turns() <= _CHECKPOINT_TURN_RESERVE:
                 return self.request_checkpoint("checkpoint-retention-reserve")
             try:
-                turn = self._request(tools_enabled=True, schema=None)
+                turn = self._request(
+                    tools_enabled=True, schema=None, purpose="exploration",
+                )
             except BudgetExhausted as exc:
                 if "model context limit" not in str(exc):
                     raise
@@ -1226,7 +1245,11 @@ class SpecialistSession:
         )
         request_event_count = len(self._request_events)
         try:
-            turn = self._request(tools_enabled=False, schema=_CHECKPOINT_SCHEMA)
+            turn = self._request(
+                tools_enabled=False,
+                schema=_CHECKPOINT_SCHEMA,
+                purpose="checkpoint",
+            )
         except (BudgetExhausted, TimeoutError):
             if (
                 len(self._request_events) > request_event_count
@@ -1283,7 +1306,11 @@ class SpecialistSession:
             )
             repair_event_count = len(self._request_events)
             try:
-                repair = self._request(tools_enabled=False, schema=_CHECKPOINT_SCHEMA)
+                repair = self._request(
+                    tools_enabled=False,
+                    schema=_CHECKPOINT_SCHEMA,
+                    purpose="checkpoint-repair",
+                )
             except (BudgetExhausted, TimeoutError):
                 if (
                     len(self._request_events) > repair_event_count

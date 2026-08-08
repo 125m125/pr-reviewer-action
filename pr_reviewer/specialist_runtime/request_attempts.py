@@ -23,6 +23,11 @@ class RequestAttempt:
     status: str = "started"
     terminal_at: float | None = None
     in_flight: bool = False
+    purpose: str = "unknown"
+    finish_reason: str = ""
+    text_source: str = ""
+    tool_call_count: int = 0
+    error: str = ""
 
 
 class RequestAttemptJournal:
@@ -60,6 +65,7 @@ class RequestAttemptJournal:
         turn: int,
         input_tokens: int,
         max_output_tokens: int,
+        purpose: str = "unknown",
     ) -> RequestAttempt:
         with self._lock:
             if request_id in self._records:
@@ -75,13 +81,23 @@ class RequestAttemptJournal:
                 input_tokens=max(0, int(input_tokens)),
                 max_output_tokens=max(0, int(max_output_tokens)),
                 started_at=self._now(),
+                purpose=str(purpose or "unknown"),
             )
             self._records[request_id] = attempt
         if self._transition_sink is not None:
             self._transition_sink(attempt)
         return attempt
 
-    def finish(self, request_id: str, status: str) -> bool:
+    def finish(
+        self,
+        request_id: str,
+        status: str,
+        *,
+        finish_reason: str = "",
+        text_source: str = "",
+        tool_call_count: int = 0,
+        error: str = "",
+    ) -> bool:
         if status not in {"completed", "failed", "timed_out"}:
             raise ValueError("invalid request terminal status")
         with self._lock:
@@ -93,6 +109,10 @@ class RequestAttemptJournal:
                 status=status,
                 terminal_at=self._now(),
                 in_flight=False,
+                finish_reason=str(finish_reason or ""),
+                text_source=str(text_source or ""),
+                tool_call_count=max(0, int(tool_call_count or 0)),
+                error=str(error or ""),
             )
             self._records[request_id] = updated
         if self._transition_sink is not None:

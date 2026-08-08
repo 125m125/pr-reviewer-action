@@ -84,11 +84,18 @@ _ROLE_SYSTEM = {
         "The controller has already created the authoritative deterministic base plan. "
         "Suggest only optional bounded transformations and return "
         "{\"transformations\":[...]}. Supported kinds are reorder, merge, split, and "
-        "improve. Transformations reference existing assignment and obligation IDs; split "
+        "improve. Use these exact shapes: reorder={kind:'reorder',assignment_ids:[existing "
+        "assignment IDs]}; merge={kind:'merge',target_assignment_id:'one existing ID',"
+        "source_assignment_ids:['other existing IDs']}; split={kind:'split',"
+        "assignment_id:'one existing ID',obligation_groups:[['existing obligation IDs'],"
+        "['other existing obligation IDs']]}; improve={kind:'improve',assignment_id:"
+        "'one existing ID',objective:'...',lenses:[...]}. Transformations reference existing "
+        "assignment and obligation IDs; split "
         "IDs are derived by the controller. You cannot remove obligations, change immutable "
         "risk or recipe isolation, or use paths outside the affected obligations' immutable "
         "scope and seed hints. Do not estimate turns or capacity. Omitted assignments stay "
-        "unchanged, and each invalid transformation is ignored independently. Improve may "
+        "unchanged. Return [] when no safe transformation is justified; do not describe a "
+        "hypothetical replan in prose. Each invalid transformation is ignored independently. Improve may "
         "refine objective, lenses, seed_paths, or boundary_paths. Merge and split apply only "
         "to compatible ordinary assignments."
     ),
@@ -1047,7 +1054,7 @@ def _compact_assignment_for_planner(value: object) -> object:
     keys = (
         "id", "assignment_id", "title", "objective", "obligation_ids",
         "primary_obligation_ids", "independent_obligation_ids", "recipe_ids",
-        "lenses", "expected_evidence", "estimated_turns", "priority",
+        "lenses", "expected_evidence", "priority",
         "overlap_justification",
     )
     result = {key: value[key] for key in keys if key in value}
@@ -1241,7 +1248,15 @@ def _compact_planner_context(value: object) -> object:
     if "topology" in raw:
         projected["topology"] = _compact_topology_for_planner(raw["topology"])
     if "config" in raw:
-        projected["config"] = _compact_generic(raw["config"])
+        config = raw["config"]
+        if isinstance(config, Mapping):
+            projected["config"] = {
+                key: _compact_generic(config[key])
+                for key in ("max_sessions", "max_followup_sessions", "concurrency")
+                if key in config
+            }
+        else:
+            projected["config"] = _compact_generic(config)
     if "policy" in raw:
         projected["policy"] = _compact_policy_for_planner(raw["policy"])
     if "pr_metadata" in raw:
@@ -1346,14 +1361,11 @@ def _runtime_event_line(
                 action = "strict structured turn"
             return f"{action} {session_id} request={request_id}"
         return f"role {role} started request={request_id} phase={phase}"
-    if kind in {"specialist_request_completed", "specialist_request_failed", "specialist_request_timed_out"}:
-        status = kind.removeprefix("specialist_request_")
-        subject = f"specialist {session_id}" if session_id else f"role {role}"
-        suffix = f": {error}" if error else ""
-        finish = _compact_text(payload.get("finish_reason"), 40)
-        if finish:
-            suffix += f" finish_reason={finish}"
-        return f"{subject} request {status}{suffix}"
+    if kind.startswith("specialist_request_"):
+        # These admitted events remain in the artifact for machine consumers.
+        # The console already receives the richer immediate llm_request_* line;
+        # rendering both produced duplicate and frequently reordered messages.
+        return None
     if kind in {"model_request_started", "model_request_completed", "model_request_failed", "model_request_timed_out"}:
         status = kind.removeprefix("model_request_")
         suffix = f": {error}" if error else ""
@@ -1363,10 +1375,18 @@ def _runtime_event_line(
         subject = f"specialist {session_id}" if session_id else "specialist"
         assignment = _compact_text(payload.get("assignment_id"), 100)
         request_id = _compact_text(payload.get("gateway_request_id"), 120)
+        purpose = _compact_text(payload.get("purpose"), 40)
+        finish = _compact_text(payload.get("finish_reason"), 40)
+        error_text = _compact_text(payload.get("error"), 220)
         turn = payload.get("turn", "?")
-        suffix = f" assignment={assignment}" if assignment else ""
+        suffix = f" purpose={purpose}" if purpose else ""
+        suffix += f" assignment={assignment}" if assignment else ""
         if request_id:
             suffix += f" request={request_id}"
+        if finish:
+            suffix += f" finish_reason={finish}"
+        if error_text:
+            suffix += f": {error_text}"
         return f"{subject} llm request {status} turn={turn}{suffix}"
     if kind == "degradation":
         return f"degraded component={_compact_text(payload.get('component'), 80)}: {error}"
@@ -1375,6 +1395,25 @@ def _runtime_event_line(
         component = _compact_text(payload.get("component"), 80)
         return f"recovery component={component or 'runtime'} action={action}{(': ' + error) if error else ''}"
     if kind == "specialist_checkpoint_diagnostics":
+        diagnostics = payload.get("diagnostics")
+        latest = (
+            diagnostics[-1]
+            if isinstance(diagnostics, (list, tuple)) and diagnostics
+            else {}
+        )
+        if isinstance(latest, Mapping):
+            details = []
+            for key in (
+                "reason", "initial_parse", "repair_attempted", "repair_parse",
+                "fallback_projection", "retention_unknown", "initial_finish_reason",
+                "repair_finish_reason",
+            ):
+                if key in latest and latest[key] not in (None, "", False, ()):
+                    details.append(f"{key}={_compact_text(latest[key], 80)}")
+            return (
+                f"specialist {session_id} checkpoint diagnostics: "
+                + (" ".join(details) if details else "recorded")
+            )
         return f"specialist {session_id} checkpoint diagnostics recorded"
     if kind == "specialist_initializing":
         return (

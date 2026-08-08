@@ -589,6 +589,19 @@ def apply_planner_transformations(
             elif kind == "merge":
                 target_id = transformation.get("target_assignment_id")
                 source_ids = transformation.get("source_assignment_ids")
+                # Models commonly compress the two merge fields into the
+                # reorder-like ``assignment_ids`` shape.  This is safe to
+                # normalize because all IDs still pass the same immutable
+                # ownership and isolation checks below: first is the target,
+                # remaining IDs are the sources.
+                if (
+                    target_id is None
+                    and isinstance(transformation.get("assignment_ids"), list)
+                ):
+                    merged_ids = transformation["assignment_ids"]
+                    if merged_ids:
+                        target_id = merged_ids[0]
+                        source_ids = merged_ids[1:]
                 if not isinstance(target_id, str) or target_id not in by_id:
                     raise ValueError("merge references an unknown target assignment ID")
                 if not isinstance(source_ids, list) or not source_ids or any(
