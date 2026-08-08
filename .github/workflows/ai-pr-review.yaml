@@ -96,7 +96,7 @@ jobs:
           ai_verdict_reasoning_effort: none
           ai_stream: "true"
           ai_max_tokens: "8192"
-          model_context_tokens: "90112"
+          model_context_tokens: "80056"
           ai_request_timeout_sec: "1200"
           standards_file: .github/ai-review-rules.md
           system_prompt_file: .github/ai-review-prompt.md
@@ -122,7 +122,7 @@ jobs:
           specialist_max_recoveries_per_session: "1"
 
           specialist_planner_max_tokens: "8192"
-          specialist_planner_max_context_bytes: "400000"
+          specialist_planner_max_context_bytes: "180000"
 
           specialist_pass_timeout_sec: "1200"
           specialist_max_tokens: "8192"
