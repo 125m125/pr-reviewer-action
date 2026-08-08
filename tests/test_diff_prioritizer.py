@@ -39,6 +39,23 @@ def test_prioritizer_orders_orientation_and_contract_files_before_source() -> No
     assert result.text.index("README.md") < result.text.index("application.properties")
 
 
+def test_lockfiles_are_deprioritized_after_normal_source_files() -> None:
+    diff = "".join(
+        (
+            _diff("package-lock.json", "+\"left-pad\": \"1.0.0\""),
+            _diff("src/runtime.py", "+runtime change"),
+        )
+    )
+    files = [
+        {"filename": "package-lock.json", "status": "modified"},
+        {"filename": "src/runtime.py", "status": "modified"},
+    ]
+
+    result = prioritize_diff(diff, files, max_bytes=len(diff) + 100)
+
+    assert result.selected_paths == ("src/runtime.py", "package-lock.json")
+
+
 def test_prioritizer_respects_project_glob_priority_and_marks_omissions() -> None:
     diff = "".join(
         (

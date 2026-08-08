@@ -25,13 +25,20 @@ _DEFAULT_RULES: tuple[dict[str, Any], ...] = (
         "**/*.toml", "**/config/**",
     )},
     {"category": "build", "priority": 40, "globs": (
-        "pom.xml", "**/pom.xml", "package.json", "**/package.json", "package-lock.json",
-        "**/package-lock.json", "yarn.lock", "**/yarn.lock", "pyproject.toml", "**/pyproject.toml",
-        "go.mod", "**/go.mod", "Cargo.toml", "**/Cargo.toml", "Makefile", "**/Makefile",
+        "pom.xml", "**/pom.xml", "package.json", "**/package.json", "pyproject.toml",
+        "**/pyproject.toml", "go.mod", "**/go.mod", "Cargo.toml", "**/Cargo.toml",
+        "Makefile", "**/Makefile",
     )},
     {"category": "schema", "priority": 50, "globs": ("**/migrations/**", "**/schema/**", "**/*migration*")},
     {"category": "tests", "priority": 60, "globs": ("**/test/**", "**/tests/**", "**/*test.*", "**/*spec.*")},
     {"category": "source", "priority": 70, "globs": ("*",)},
+    {"category": "lockfiles", "priority": 90, "globs": (
+        "package-lock.json", "**/package-lock.json", "npm-shrinkwrap.json", "**/npm-shrinkwrap.json",
+        "yarn.lock", "**/yarn.lock", "pnpm-lock.yaml", "**/pnpm-lock.yaml", "Pipfile.lock",
+        "**/Pipfile.lock", "poetry.lock", "**/poetry.lock", "Cargo.lock", "**/Cargo.lock",
+        "go.sum", "**/go.sum", "composer.lock", "**/composer.lock", "Gemfile.lock",
+        "**/Gemfile.lock", "**/*.lock", "*.lock",
+    )},
 )
 
 
@@ -161,7 +168,10 @@ def _path_rule(path: str, rules: Iterable[_Rule]) -> _Rule:
     if not matches:
         return _Rule("source", 70, ("*",))
     custom_matches = [rule for rule in matches if rule.custom]
-    return min(custom_matches or matches, key=lambda item: item.priority)
+    if custom_matches:
+        return min(custom_matches, key=lambda item: item.priority)
+    lockfile_matches = [rule for rule in matches if rule.category == "lockfiles"]
+    return min(lockfile_matches or matches, key=lambda item: item.priority)
 
 
 def _clip_utf8(text: str, max_bytes: int, marker: str) -> str:
