@@ -74,34 +74,49 @@ _MAX_COMPACTED_EVIDENCE_READ_CHARS = 4_000
 _CHECKPOINT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "evidence_ids": {
+            "type": "array", "maxItems": 40,
+            "items": {"type": "string", "maxLength": 256},
+        },
         "evidence_by_obligation": {"type": "object"},
-        "inspected": {"type": "array", "items": {"type": "string"}},
-        "unresolved": {"type": "array", "items": {"type": "string"}},
-        "hypotheses": {"type": "array", "items": {"type": "string"}},
+        "inspected": {
+            "type": "array", "maxItems": 40,
+            "items": {"type": "string", "maxLength": 256},
+        },
+        "unresolved": {
+            "type": "array", "maxItems": 40,
+            "items": {"type": "string", "maxLength": 256},
+        },
+        "hypotheses": {
+            "type": "array", "maxItems": 12,
+            "items": {"type": "string", "maxLength": 500},
+        },
         "candidate_findings": {
-            "type": "array",
+            "type": "array", "maxItems": 8,
             "items": {
                 "type": "object",
                 "properties": {
-                    "candidate_id": {"type": "string"},
-                    "root_cause_fingerprint": {"type": "string"},
-                    "claim": {"type": "string"},
-                    "affected_location": {"type": "string"},
-                    "causal_chain": {"type": "string"},
-                    "severity": {"type": "string"},
-                    "category": {"type": "string"},
+                    "candidate_id": {"type": "string", "maxLength": 128},
+                    "root_cause_fingerprint": {"type": "string", "maxLength": 128},
+                    "claim": {"type": "string", "maxLength": 300},
+                    "affected_location": {"type": "string", "maxLength": 256},
+                    "causal_chain": {"type": "string", "maxLength": 600},
+                    "severity": {"type": "string", "maxLength": 32},
+                    "category": {"type": "string", "maxLength": 64},
                     "supporting_evidence_ids": {
-                        "type": "array", "items": {"type": "string"},
+                        "type": "array", "maxItems": 12,
+                        "items": {"type": "string", "maxLength": 256},
                     },
                     "contradicting_evidence_ids": {
-                        "type": "array", "items": {"type": "string"},
+                        "type": "array", "maxItems": 12,
+                        "items": {"type": "string", "maxLength": 256},
                     },
                     "related_obligation_ids": {
-                        "type": "array", "items": {"type": "string"},
+                        "type": "array", "maxItems": 12,
+                        "items": {"type": "string", "maxLength": 256},
                     },
                     "confidence_rationale": {
-                        "type": "string",
+                        "type": "string", "maxLength": 700,
                         "description": (
                             "Typed consequence support declaration. Start with "
                             "consequence_support: and one of reachable_input_path, "
@@ -110,8 +125,8 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
                             "exact retained evidence IDs and the form's required key=value details."
                         ),
                     },
-                    "user_visible_consequence": {"type": "string"},
-                    "manual_validation": {"type": "string"},
+                    "user_visible_consequence": {"type": "string", "maxLength": 300},
+                    "manual_validation": {"type": "string", "maxLength": 300},
                 },
                 "required": [
                     "candidate_id", "claim", "affected_location",
@@ -123,9 +138,18 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
             },
         },
-        "invariants_evaluated": {"type": "array", "items": {"type": "string"}},
-        "unknowns": {"type": "array", "items": {"type": "string"}},
-        "proposed_next_actions": {"type": "array", "items": {"type": "string"}},
+        "invariants_evaluated": {
+            "type": "array", "maxItems": 20,
+            "items": {"type": "string", "maxLength": 500},
+        },
+        "unknowns": {
+            "type": "array", "maxItems": 20,
+            "items": {"type": "string", "maxLength": 500},
+        },
+        "proposed_next_actions": {
+            "type": "array", "maxItems": 12,
+            "items": {"type": "string", "maxLength": 500},
+        },
     },
     "required": ["unresolved"],
     "additionalProperties": False,
@@ -144,9 +168,12 @@ _CHECKPOINT_SCHEMA["properties"]["candidate_updates"] = {
                 "type": "string",
                 "enum": ["active", "withdrawn", "superseded"],
             },
-            "reason": {"type": "string"},
-            "evidence_ids": {"type": "array", "items": {"type": "string"}},
-            "superseded_by": {"type": "string"},
+            "reason": {"type": "string", "maxLength": 300},
+            "evidence_ids": {
+                "type": "array", "maxItems": 12,
+                "items": {"type": "string", "maxLength": 256},
+            },
+            "superseded_by": {"type": "string", "maxLength": 128},
         },
         "required": ["candidate_id", "status"],
         "additionalProperties": False,
@@ -178,6 +205,10 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
     "Put full candidate objects only in new_candidates. The legacy "
     "\"candidate_findings\" array is accepted for compatibility; the "
     "controller derives internal candidate handles from admitted candidate objects. "
+    "Keep checkpoints compact: emit at most 8 new candidates, with one concise "
+    "sentence per claim/causal_chain/consequence/manual_validation field; keep "
+    "claim under 300 characters, causal_chain and confidence_rationale under 600 "
+    "characters, and consequence/manual_validation under 300 characters. "
     "Use only exact "
     "retained evidence IDs (evidence:<hash>) from successful tool results in "
     "evidence_ids and supporting_evidence_ids; repository paths are not evidence IDs."
