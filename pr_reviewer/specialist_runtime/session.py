@@ -1347,17 +1347,20 @@ class SpecialistSession:
             )
         elif retention_unknown:
             checkpoint = self._checkpoint_with_retention_unknown(checkpoint)
-        if needs_repair or retention_unknown or fallback_projection:
-            self._record_checkpoint_diagnostic(
-                reason=reason,
-                initial_parse=initial_parse,
-                repair_attempted=repair_attempted,
-                repair_parse=repair_parse,
-                fallback_projection=fallback_projection,
-                retention_unknown=retention_unknown,
-                initial_finish_reason=initial_finish_reason,
-                repair_finish_reason=repair_finish_reason,
-            )
+        # Keep one bounded diagnostic for every checkpoint request, including
+        # successful first-pass checkpoints.  This makes the lifecycle log
+        # distinguish “valid checkpoint accepted” from “repair/fallback”
+        # instead of only explaining failures.
+        self._record_checkpoint_diagnostic(
+            reason=reason,
+            initial_parse=initial_parse,
+            repair_attempted=repair_attempted,
+            repair_parse=repair_parse,
+            fallback_projection=fallback_projection,
+            retention_unknown=retention_unknown,
+            initial_finish_reason=initial_finish_reason,
+            repair_finish_reason=repair_finish_reason,
+        )
         self.latest_checkpoint = checkpoint
         self.state = SessionState.CHECKPOINT
         return self._snapshot(degraded=fallback_projection or retention_unknown)
