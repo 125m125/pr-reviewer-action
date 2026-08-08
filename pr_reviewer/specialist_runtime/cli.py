@@ -1362,8 +1362,11 @@ def _runtime_event_line(
         status = kind.removeprefix("llm_request_")
         subject = f"specialist {session_id}" if session_id else "specialist"
         assignment = _compact_text(payload.get("assignment_id"), 100)
+        request_id = _compact_text(payload.get("gateway_request_id"), 120)
         turn = payload.get("turn", "?")
         suffix = f" assignment={assignment}" if assignment else ""
+        if request_id:
+            suffix += f" request={request_id}"
         return f"{subject} llm request {status} turn={turn}{suffix}"
     if kind == "degradation":
         return f"degraded component={_compact_text(payload.get('component'), 80)}: {error}"
