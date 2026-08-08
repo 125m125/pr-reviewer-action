@@ -948,6 +948,7 @@ class GatewayRoleAdapter:
     gateway: ModelGateway
     system_prompt: str = "Return only the requested structured JSON object."
     response_format_override: str | None = None
+    attempt_logger: Callable[[str], None] | None = None
 
     def complete(self, request: RoleRequest) -> object:
         return self._complete_recoverable_structured_role(request)
@@ -971,6 +972,11 @@ class GatewayRoleAdapter:
             ensure_ascii=False,
         ))
         for attempt in range(max_attempts):
+            if self.attempt_logger is not None:
+                self.attempt_logger(
+                    f"role {request.role} attempt {attempt + 1}/{max_attempts} "
+                    f"mode={'strict-json' if finalization else 'reasoning'}"
+                )
             if before_attempt is not None:
                 before_attempt(attempt)
             finalization = (
@@ -1003,6 +1009,17 @@ class GatewayRoleAdapter:
             try:
                 return _json_object(content)
             except (TypeError, ValueError):
+                if self.attempt_logger is not None:
+                    status = (
+                        "continuation scheduled"
+                        if result.finish_reason == "length"
+                        and attempt < max_attempts - 1
+                        else "no continuation available"
+                    )
+                    self.attempt_logger(
+                        f"role {request.role} structured response invalid; "
+                        f"finish_reason={result.finish_reason or 'unknown'}; {status}"
+                    )
                 if (
                     attempt == max_attempts - 1
                     or result.finish_reason != "length"
@@ -2318,6 +2335,9 @@ class ReviewController:
                 "session_id": getattr(source, "session_id", ""),
                 "tools_enabled": bool(getattr(event, "tools_enabled", False)),
                 "response_schema_name": getattr(event, "response_schema_name", None),
+                "finish_reason": getattr(event, "finish_reason", ""),
+                "text_source": getattr(event, "text_source", ""),
+                "tool_call_count": int(getattr(event, "tool_call_count", 0) or 0),
                 **({"error": getattr(event, "error", "")} if status == "failed" else {}),
             })
 
@@ -2702,6 +2722,15 @@ class ReviewController:
             assignment.id: state.sessions.get(expected_ids[assignment.id])
             for assignment in assignment_items
         }
+        for assignment in assignment_items:
+            state.journal.emit("specialist_initializing", {
+                "assignment_id": assignment.id,
+                "session_id": expected_ids[assignment.id],
+                "phase": phase.value,
+                "resumed": isinstance(
+                    existing_handles[assignment.id], _IsolatedSessionHandle,
+                ),
+            })
         scheduler = self.scheduler_type(
             deadline=state.deadline,
             session_factory=lambda assignment, lease, snapshot: self._create_isolated_session(

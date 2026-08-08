@@ -132,7 +132,7 @@ def test_shortened_evidence_ids_are_expanded_only_when_unambiguous():
 
 
 def test_compaction_registers_shrunk_tool_results_for_bounded_retrieval():
-    session = make_session(ScriptedGateway([]), max_context_tokens=1_000)
+    session = make_session(ScriptedGateway([]), max_context_tokens=10)
     record, _collection = session.evidence_store.add_tool_result_with_collection(
         session_id=session.session_id,
         tool="read_file",
@@ -144,10 +144,11 @@ def test_compaction_registers_shrunk_tool_results_for_bounded_retrieval():
         "name": "read_file",
         "arguments": json.dumps({"path": "a.py"}),
     },))
+    session._tool_call_evidence_ids["call-old"] = record.id
     session.conversation.add_tool_result(
         "call-old",
         {"evidence_id": record.id, "content": record.content},
-        max_bytes=20_000,
+        max_bytes=100,
     )
 
     session._compact_conversation()
@@ -214,6 +215,7 @@ class RecordedRequest:
     deadline_at: float | None
     max_tokens: int
     ephemeral_user_note: str | None
+    reasoning_effort: str | None
 
     def messages_contain(self, value):
         return value in self.messages
@@ -231,6 +233,7 @@ class ScriptedGateway:
             deadline_at=request.deadline_at,
             max_tokens=request.max_tokens,
             ephemeral_user_note=request.ephemeral_user_note,
+            reasoning_effort=request.reasoning_effort,
         ))
         assert self.responses, "model called more times than scripted"
         response = self.responses.pop(0)
@@ -518,6 +521,44 @@ def test_checkpoint_prompt_contains_compact_active_candidate_register():
     assert "candidate_updates" in prompt
     assert "new_candidates" in prompt
     assert "Active candidates" in prompt
+
+
+def test_checkpoint_turn_disables_reasoning_to_reserve_output_for_json():
+    gateway = ScriptedGateway([candidate_update_checkpoint_response()])
+    session = make_session(gateway)
+
+    session.request_checkpoint("controller-request")
+
+    assert gateway.requests[0].reasoning_effort == "none"
+
+
+def test_textual_tool_markup_gets_repaired_before_checkpointing():
+    malformed = ModelTurnResult(
+        response={}, tool_calls=(),
+        text=(
+            "[read_pr_diff]\n<parameter=path>\na.py\n"
+            "</function>\n</tool_call>"
+        ),
+        text_source="content", finish_reason="stop", usage={"prompt_tokens": 3},
+        request_diagnostics={}, content=(
+            "[read_pr_diff]\n<parameter=path>\na.py\n"
+            "</function>\n</tool_call>"
+        ),
+    )
+    gateway = ScriptedGateway([
+        malformed,
+        tool_call_response("read_file", {"path": "a.py"}),
+        checkpoint_response(inspected=["a.py"], unresolved=[]),
+    ])
+    session = make_session(gateway, model_turns=5)
+
+    result = session.explore()
+
+    assert result.degraded is False
+    assert any(
+        "textual tool-call markup" in request.messages
+        for request in gateway.requests
+    )
 
 
 def test_checkpoint_register_uses_exact_candidate_ids_without_unmapped_aliases():

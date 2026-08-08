@@ -191,6 +191,20 @@ def _strings(value: object) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
 
 
+def _textual_tool_call_reason(value: object) -> str | None:
+    """Detect provider text that looks like a tool call but was not native."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.casefold()
+    if "</tool_call>" in text or "</function>" in text:
+        return "textual tool-call closing markup"
+    if "<tool_call" in text or "<parameter" in text:
+        return "textual tool-call markup"
+    if re.search(r"\[(?:read|git)_[a-z0-9_-]+\]\s*<", text):
+        return "bracketed textual tool-call markup"
+    return None
+
+
 def _resolve_retained_evidence_id(
     value: object,
     retained: Mapping[str, EvidenceRecord],
@@ -574,6 +588,9 @@ class SpecialistRequestEvent:
     tools_enabled: bool
     response_schema_name: str | None
     error: str = ""
+    finish_reason: str = ""
+    text_source: str = ""
+    tool_call_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -816,6 +833,7 @@ class SpecialistSession:
                 tools_enabled=tools_enabled, timeout_sec=timeout,
                 deadline_at=self.lease.deadline_at, stream=self.stream,
                 response_schema_name=schema_name,
+                reasoning_effort="none" if not tools_enabled else None,
                 ephemeral_user_note=exploration_budget_note,
             )
             result = CALLBACK_POOL.run(
@@ -841,6 +859,9 @@ class SpecialistSession:
             self._request_attempt_journal.finish(request_id, "completed")
         self._request_events.append(SpecialistRequestEvent(
             request_id, "completed", tools_enabled, schema_name,
+            finish_reason=result.finish_reason,
+            text_source=result.text_source,
+            tool_call_count=len(result.tool_calls),
         ))
         self.budget.record_model_usage(
             input_tokens=int(result.usage.get("prompt_tokens", 0) or 0),
@@ -890,6 +911,18 @@ class SpecialistSession:
                 calls=turn.tool_calls,
             )
             if not turn.tool_calls:
+                textual_tool_reason = _textual_tool_call_reason(turn.content)
+                if textual_tool_reason is not None:
+                    self.budget.record_tool_rejection(textual_tool_reason)
+                    self.conversation.add_user(
+                        "The previous response contained textual tool-call markup, "
+                        "which was not executed. Use the advertised native tool "
+                        "calls instead; do not emit XML, function, or parameter "
+                        "markup. Continue the investigation or return a checkpoint."
+                    )
+                    if self.budget.record_no_progress() >= self.max_no_progress_streak:
+                        return self.request_checkpoint("malformed-textual-tool-call")
+                    continue
                 checkpoint = self._checkpoint_from_text(turn.content)
                 if (
                     checkpoint is None
@@ -1240,6 +1273,8 @@ class SpecialistSession:
         )
         repair_attempted = False
         repair_parse = "not_attempted"
+        initial_finish_reason = turn.finish_reason
+        repair_finish_reason = ""
         if needs_repair:
             repair_attempted = True
             self.conversation.add_user(
@@ -1269,6 +1304,7 @@ class SpecialistSession:
                 )
                 checkpoint = self._checkpoint_from_text(repair.content)
                 repair_parse = "valid" if checkpoint is not None else "invalid"
+                repair_finish_reason = repair.finish_reason
             else:
                 repair_parse = "unavailable"
         retention_unknown = _candidate_retention_lost(
@@ -1292,6 +1328,8 @@ class SpecialistSession:
                 repair_parse=repair_parse,
                 fallback_projection=fallback_projection,
                 retention_unknown=retention_unknown,
+                initial_finish_reason=initial_finish_reason,
+                repair_finish_reason=repair_finish_reason,
             )
         self.latest_checkpoint = checkpoint
         self.state = SessionState.CHECKPOINT
@@ -1696,9 +1734,10 @@ class SpecialistSession:
                 payload = json.loads(str(event.get("content", "")))
             except (TypeError, ValueError, json.JSONDecodeError):
                 payload = None
-            if not evidence_id and isinstance(payload, Mapping):
-                evidence_id = str(payload.get("evidence_id") or "").strip()
-            else:
+            if not evidence_id:
+                if isinstance(payload, Mapping):
+                    evidence_id = str(payload.get("evidence_id") or "").strip()
+            if not evidence_id:
                 # Conversation-level tool-result bounds can cut a one-line
                 # JSON envelope before it remains parseable. The evidence ID
                 # is deliberately emitted first and can still be recovered
@@ -1796,6 +1835,8 @@ class SpecialistSession:
         repair_parse: str,
         fallback_projection: bool,
         retention_unknown: bool,
+        initial_finish_reason: str = "",
+        repair_finish_reason: str = "",
     ) -> None:
         signal = self._candidate_retention_signal
         self._finalization_diagnostics.append({
@@ -1803,6 +1844,8 @@ class SpecialistSession:
             "initial_parse": initial_parse,
             "repair_attempted": bool(repair_attempted),
             "repair_parse": repair_parse,
+            "initial_finish_reason": str(initial_finish_reason)[:40],
+            "repair_finish_reason": str(repair_finish_reason)[:40],
             "fallback_projection": bool(fallback_projection),
             "retention_unknown": bool(retention_unknown),
             "material_candidate_signal": signal.is_material,

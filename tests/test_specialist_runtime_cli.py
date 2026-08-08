@@ -35,6 +35,56 @@ def test_planner_system_prompt_declares_controller_owned_fields_and_paths():
     assert "Do not estimate turns" in prompt
 
 
+def test_planner_context_projection_is_bounded_without_losing_plan_identity():
+    context = {
+        "base_plan": {
+            "assignments": [{
+                "id": "assignment-1",
+                "obligation_ids": ["obligation-1"],
+                "objective": "Inspect the changed runtime behavior.",
+            }],
+        },
+        "obligations": [{
+            "obligation_id": f"obligation-{index}",
+            "subject": "large subject",
+            "scope": [f"src/file-{item}.py" for item in range(200)],
+            "seed_hints": [f"tests/test-{item}.py" for item in range(200)],
+            "explanation": "x" * 2_000,
+            "satisfaction_predicates": ["recorded_evidence"] * 30,
+        } for index in range(200)],
+        "topology": {
+            "changed_context": [{
+                "path": f"src/file-{index}.py",
+                "change_type": "modifies",
+                "hunk_summaries": ["hunk " + ("x" * 500)] * 20,
+            } for index in range(500)],
+            "relationships": [{"path": f"src/file-{index}.py", "summary": "x" * 500} for index in range(500)],
+        },
+    }
+
+    projected = cli._compact_planner_context(context)
+    encoded = json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+
+    assert len(encoded.encode("utf-8")) < 120_000
+    assert projected["base_plan"]["assignments"][0]["id"] == "assignment-1"
+    assert projected["obligations"][0]["obligation_id"] == "obligation-0"
+
+
+def test_runtime_event_line_reports_lifecycle_without_model_content():
+    from pr_reviewer.specialist_runtime.events import RunEvent
+
+    event = RunEvent(1, "specialist_request_started", {
+        "session_id": "session:test",
+        "request_id": "session:test:model:2",
+        "tools_enabled": True,
+    })
+
+    line = cli._runtime_event_line(event, seen_sessions={"session:test"})
+
+    assert "continuing specialist session:test" in line
+    assert "tool/evidence loop" in line
+
+
 def runtime_source_paths() -> tuple[Path, ...]:
     root = Path(__file__).resolve().parent.parent
     return (

@@ -36,6 +36,7 @@ from .controller import (
     ReviewInputs,
     ReviewResult,
 )
+from .events import RunEvent
 from .model_gateway import ModelTurnRequest, OpenAIModelGateway
 from .policy import (
     PolicyAuthorization,
@@ -422,11 +423,16 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
         response_format_override: str | None = None,
         max_context_bytes: int | None = None,
         context_projector=None,
+        runtime_logger=None,
     ):
-        super().__init__(gateway, system_prompt, response_format_override)
+        super().__init__(
+            gateway, system_prompt, response_format_override,
+            attempt_logger=runtime_logger,
+        )
         self.max_tokens = max_tokens
         self.max_context_bytes = max_context_bytes
         self.context_projector = context_projector
+        self.runtime_logger = runtime_logger
 
     def complete(self, request):
         context = (
@@ -441,7 +447,17 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
                 separators=(",", ":"),
                 ensure_ascii=False,
             ).encode("utf-8"))
+            if self.runtime_logger is not None:
+                self.runtime_logger(
+                    f"role {request.role} projected context bytes={context_bytes} "
+                    f"limit={self.max_context_bytes}"
+                )
             if context_bytes > self.max_context_bytes:
+                if self.runtime_logger is not None:
+                    self.runtime_logger(
+                        f"role {request.role} context limit exceeded; "
+                        "controller will use its deterministic fallback"
+                    )
                 raise ValueError(
                     f"{request.role} context exceeds configured byte limit "
                     f"({context_bytes}>{self.max_context_bytes})"
@@ -752,6 +768,8 @@ def build_controller(
     config: CliConfig,
     *,
     immutable_diff_range: tuple[str, str] | None = None,
+    event_sink: Any | None = None,
+    runtime_logger: Any | None = None,
 ) -> ReviewController:
     if immutable_diff_range is not None and (
         not isinstance(immutable_diff_range, tuple)
@@ -784,25 +802,30 @@ def build_controller(
         config.planner_max_tokens,
         role_response_format,
         max_context_bytes=config.planner_max_context_bytes,
+        runtime_logger=runtime_logger,
     )
     planner = _BoundedRoleAdapter(
         gateway, _role_prompt(config.system_prompt, "planner"), config.planner_max_tokens,
         role_response_format,
         max_context_bytes=config.planner_max_context_bytes,
         context_projector=_compact_planner_context,
+        runtime_logger=runtime_logger,
     )
     negotiator = _BoundedRoleAdapter(
         gateway, _role_prompt(config.system_prompt, "negotiator"), config.max_tokens,
         role_response_format,
+        runtime_logger=runtime_logger,
     )
     critic = _BoundedRoleAdapter(
         gateway, _role_prompt(config.system_prompt, "critic"), config.max_tokens,
         role_response_format,
+        runtime_logger=runtime_logger,
     )
     finalizer = _BoundedRoleAdapter(
         gateway, _role_prompt(config.system_prompt, "handoff_summarizer"),
         config.max_tokens,
         role_response_format,
+        runtime_logger=runtime_logger,
     )
 
     def session_factory(
@@ -954,6 +977,7 @@ def build_controller(
         critic=critic,
         finalizer=finalizer,
         artifact_output_root=config.artifact_root,
+        event_sink=event_sink,
     )
     controller._cli_session_factory = session_factory  # type: ignore[attr-defined]
     return controller
@@ -974,11 +998,169 @@ def _json_value(value: object) -> object:
     return value
 
 
+def _compact_text(value: object, limit: int = 240) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _compact_strings(value: object, *, limit: int, item_limit: int = 12) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    values = [str(item).replace("\\", "/") for item in value if str(item).strip()]
+    result = values[:item_limit]
+    if len(values) > item_limit:
+        result.append(f"... ({len(values) - item_limit} more)")
+    return [item[:limit] for item in result]
+
+
+def _compact_obligation_for_planner(value: object) -> object:
+    if not isinstance(value, Mapping):
+        return value
+    result: dict[str, object] = {}
+    for key in (
+        "obligation_id", "id", "subject", "origin", "risk_tier",
+        "unresolved_policy", "mandatory", "requires_independent_verification",
+    ):
+        if key in value:
+            result[key] = value[key]
+    result["required_evidence_categories"] = _compact_strings(
+        value.get("required_evidence_categories", value.get("required_evidence")),
+        limit=80, item_limit=6,
+    )
+    result["satisfaction_predicates"] = _compact_strings(
+        value.get("satisfaction_predicates"), limit=100, item_limit=3,
+    )
+    for key in ("scope", "seed_hints"):
+        paths = _compact_strings(value.get(key), limit=160, item_limit=2)
+        result[key] = paths
+        original = value.get(key)
+        if isinstance(original, (list, tuple)) and len(original) > 2:
+            result[f"{key}_count"] = len(original)
+    result["explanation"] = _compact_text(value.get("explanation"), 120)
+    if value.get("recipe_id") is not None:
+        result["recipe_id"] = str(value.get("recipe_id"))[:180]
+    return result
+
+
+def _compact_assignment_for_planner(value: object) -> object:
+    if not isinstance(value, Mapping):
+        return value
+    keys = (
+        "id", "assignment_id", "title", "objective", "obligation_ids",
+        "primary_obligation_ids", "independent_obligation_ids", "recipe_ids",
+        "lenses", "expected_evidence", "estimated_turns", "priority",
+        "overlap_justification",
+    )
+    result = {key: value[key] for key in keys if key in value}
+    for key in ("seed_paths", "boundary_paths"):
+        result[key] = _compact_strings(value.get(key), limit=180, item_limit=12)
+    briefs = value.get("obligation_briefs")
+    if isinstance(briefs, (list, tuple)):
+        result["obligation_briefs"] = [
+            {
+                key: item[key]
+                for key in (
+                    "obligation_id", "subject", "risk_tier", "required_evidence",
+                    "explanation",
+                )
+                if key in item
+            }
+            for item in briefs[:16]
+            if isinstance(item, Mapping)
+        ]
+    changed_context = value.get("changed_context")
+    if isinstance(changed_context, (list, tuple)):
+        result["changed_context"] = [
+            {
+                "path": _compact_text(item.get("path"), 180),
+                "change_type": _compact_text(item.get("change_type"), 40),
+            }
+            for item in changed_context[:24]
+            if isinstance(item, Mapping)
+        ]
+        if len(changed_context) > 24:
+            result["changed_context_omitted_paths"] = len(changed_context) - 24
+    return result
+
+
+def _compact_generic(value: object, *, depth: int = 0) -> object:
+    """Bound non-authoritative planner metadata without dropping its shape."""
+    if depth >= 3:
+        return _compact_text(value, 160)
+    if isinstance(value, Mapping):
+        items = list(value.items())
+        result = {
+            str(key): _compact_generic(item, depth=depth + 1)
+            for key, item in items[:80]
+        }
+        if len(items) > 80:
+            result["_omitted_keys"] = len(items) - 80
+        return result
+    if isinstance(value, (list, tuple)):
+        result = [_compact_generic(item, depth=depth + 1) for item in value[:80]]
+        if len(value) > 80:
+            result.append(f"... ({len(value) - 80} more)")
+        return result
+    if isinstance(value, str):
+        return _compact_text(value, 400)
+    return value
+
+
+def _compact_topology_for_planner(value: object) -> object:
+    if not isinstance(value, Mapping):
+        return _compact_generic(value)
+    result: dict[str, object] = {}
+    for key in ("components", "path_components"):
+        if key in value:
+            result[key] = _compact_generic(value[key])
+    for key in ("changed_context", "relationships"):
+        rows = value.get(key)
+        if not isinstance(rows, (list, tuple)):
+            continue
+        compacted = []
+        for item in rows[:80]:
+            if isinstance(item, Mapping):
+                compacted.append({
+                    field: _compact_text(item.get(field), 120)
+                    for field in ("path", "component", "summary", "change_type")
+                    if item.get(field) is not None
+                })
+            else:
+                compacted.append(_compact_text(item, 220))
+        result[key] = compacted
+        if len(rows) > 80:
+            result[f"{key}_omitted"] = len(rows) - 80
+    for key in ("change_facts", "changed_contract_facts"):
+        if key in value:
+            result[key] = _compact_generic(value[key])
+    for key, item in value.items():
+        if key not in result and key not in {
+            "changed_context", "relationships", "change_facts", "changed_contract_facts",
+        }:
+            result[str(key)] = _compact_generic(item)
+    return result
+
+
 def _compact_planner_context(value: object) -> object:
-    """Deduplicate repeated obligation path arrays on the model wire only."""
+    """Project planner input to bounded plan/topology facts, not the full corpus."""
     projected = _json_value(value)
     if not isinstance(projected, dict):
         return projected
+    base_plan = projected.get("base_plan")
+    if isinstance(base_plan, Mapping):
+        projected["base_plan"] = {
+            **{
+                key: base_plan[key]
+                for key in (
+                    "unassigned_obligation_ids", "unassigned_obligation_reasons",
+                )
+                if key in base_plan
+            },
+            "assignments": [
+                _compact_assignment_for_planner(item)
+                for item in base_plan.get("assignments", ())[:160]
+                if isinstance(item, Mapping)
+            ],
+        }
     obligations = projected.get("obligations")
     if isinstance(obligations, list):
         obligation_values = obligations
@@ -987,45 +1169,47 @@ def _compact_planner_context(value: object) -> object:
     else:
         return projected
 
+    projected["obligations"] = [
+        _compact_obligation_for_planner(item)
+        for item in obligation_values
+    ]
     occurrences: dict[tuple[str, ...], int] = {}
     for obligation in obligation_values:
-        if not isinstance(obligation, dict):
+        if not isinstance(obligation, Mapping):
             continue
         for field_name in ("scope", "seed_hints"):
             paths = obligation.get(field_name)
-            if (
-                isinstance(paths, list)
-                and len(paths) > 1
-                and all(isinstance(path, str) for path in paths)
+            if isinstance(paths, list) and len(paths) > 1 and all(
+                isinstance(path, str) for path in paths
             ):
                 key = tuple(paths)
                 occurrences[key] = occurrences.get(key, 0) + 1
-
-    shared = sorted(
-        (paths for paths, count in occurrences.items() if count > 1),
-    )
-    if not shared:
-        return projected
-    references = {
+    shared = {
         paths: f"path-set-{index}"
-        for index, paths in enumerate(shared, start=1)
+        for index, (paths, count) in enumerate(
+            sorted(occurrences.items()) if occurrences else (), start=1
+        )
+        if count > 1
     }
-    projected["path_sets"] = {
-        references[paths]: list(paths)
-        for paths in shared
-    }
-    for obligation in obligation_values:
-        if not isinstance(obligation, dict):
-            continue
-        for field_name in ("scope", "seed_hints"):
-            paths = obligation.get(field_name)
-            if not isinstance(paths, list):
+    if shared:
+        projected["path_sets"] = {
+            reference: list(paths)
+            for paths, reference in shared.items()
+        }
+        for original, compacted in zip(obligation_values, projected["obligations"]):
+            if not isinstance(original, Mapping) or not isinstance(compacted, dict):
                 continue
-            reference = references.get(tuple(paths))
-            if reference is None:
-                continue
-            obligation.pop(field_name)
-            obligation[f"{field_name}_ref"] = reference
+            for field_name in ("scope", "seed_hints"):
+                paths = original.get(field_name)
+                reference = shared.get(tuple(paths)) if isinstance(paths, list) else None
+                if reference is not None:
+                    compacted.pop(field_name, None)
+                    compacted[f"{field_name}_ref"] = reference
+    if "topology" in projected:
+        projected["topology"] = _compact_topology_for_planner(projected["topology"])
+    for key in ("config", "policy", "pr_metadata", "change_overview"):
+        if key in projected:
+            projected[key] = _compact_generic(projected[key])
     return projected
 
 
@@ -1043,6 +1227,88 @@ def _summary_cell(value: object, *, limit: int = 240) -> str:
         r"\\\1",
         html.escape(text),
     )
+
+
+def _runtime_event_line(
+    event: RunEvent,
+    *,
+    seen_sessions: set[str] | None = None,
+) -> str | None:
+    """Render a bounded lifecycle line without prompts, responses, or evidence."""
+    payload = event.payload if isinstance(event.payload, Mapping) else {}
+    kind = event.kind
+    role = _compact_text(payload.get("role"), 60)
+    phase = _compact_text(payload.get("phase"), 40)
+    request_id = _compact_text(payload.get("request_id"), 100)
+    session_id = _compact_text(payload.get("session_id"), 100)
+    error = _compact_text(payload.get("error") or payload.get("reason"), 260)
+    if kind == "specialist_request_started":
+        if session_id:
+            known = session_id in (seen_sessions or set())
+            if seen_sessions is not None:
+                seen_sessions.add(session_id)
+            schema = _compact_text(payload.get("response_schema_name"), 60)
+            if schema == "specialist_checkpoint":
+                action = "checkpoint"
+            elif bool(payload.get("tools_enabled")):
+                action = "continuing" if known else "initial"
+                action += " specialist"
+                action = f"{action} {session_id} (tool/evidence loop)"
+                return f"{action} request={request_id}"
+            else:
+                action = "strict structured turn"
+            return f"{action} {session_id} request={request_id}"
+        return f"role {role} started request={request_id} phase={phase}"
+    if kind in {"specialist_request_completed", "specialist_request_failed", "specialist_request_timed_out"}:
+        status = kind.removeprefix("specialist_request_")
+        subject = f"specialist {session_id}" if session_id else f"role {role}"
+        suffix = f": {error}" if error else ""
+        finish = _compact_text(payload.get("finish_reason"), 40)
+        if finish:
+            suffix += f" finish_reason={finish}"
+        return f"{subject} request {status}{suffix}"
+    if kind in {"model_request_started", "model_request_completed", "model_request_failed", "model_request_timed_out"}:
+        status = kind.removeprefix("model_request_")
+        suffix = f": {error}" if error else ""
+        return f"role {role} request {status} phase={phase}{suffix}"
+    if kind == "degradation":
+        return f"degraded component={_compact_text(payload.get('component'), 80)}: {error}"
+    if kind == "recovery":
+        action = _compact_text(payload.get("action"), 100)
+        component = _compact_text(payload.get("component"), 80)
+        return f"recovery component={component or 'runtime'} action={action}{(': ' + error) if error else ''}"
+    if kind == "specialist_checkpoint_diagnostics":
+        return f"specialist {session_id} checkpoint diagnostics recorded"
+    if kind == "specialist_initializing":
+        return (
+            f"initializing specialist {session_id} assignment="
+            f"{_compact_text(payload.get('assignment_id'), 100)} "
+            f"phase={phase} resumed={str(bool(payload.get('resumed'))).lower()}"
+        )
+    if kind == "session_transition":
+        return f"specialist {session_id} state={_compact_text(payload.get('state'), 40)}"
+    if kind == "phase_changed":
+        return f"phase {_compact_text(payload.get('phase'), 40)} started"
+    if kind == "planner_transformation_ignored":
+        return f"planner transformation ignored: {_compact_text(payload.get('reason'), 260)}"
+    if kind == "handoff_summary_guarded":
+        return "handoff summarizer output guarded by deterministic fallback"
+    return None
+
+
+def _runtime_log_line(line: str) -> None:
+    print(f"[specialist-runtime] {line}", file=sys.stderr, flush=True)
+
+
+def _runtime_event_sink() -> Any:
+    seen_sessions: set[str] = set()
+
+    def emit(event: RunEvent) -> None:
+        line = _runtime_event_line(event, seen_sessions=seen_sessions)
+        if line:
+            _runtime_log_line(line)
+
+    return emit
 
 
 def _degradation_summary_rows(
@@ -1325,6 +1591,8 @@ def main() -> int:
             workspace.inputs.base_sha,
             workspace.inputs.head_sha,
         ),
+        event_sink=_runtime_event_sink(),
+        runtime_logger=_runtime_log_line,
     )
     session_factory = getattr(controller, "_cli_session_factory", None)
     if session_factory is not None:
