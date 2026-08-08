@@ -972,6 +972,11 @@ class GatewayRoleAdapter:
             ensure_ascii=False,
         ))
         for attempt in range(max_attempts):
+            finalization = (
+                force_final(attempt)
+                if force_final is not None
+                else attempt == max_attempts - 1
+            )
             if self.attempt_logger is not None:
                 self.attempt_logger(
                     f"role {request.role} attempt {attempt + 1}/{max_attempts} "
@@ -979,11 +984,6 @@ class GatewayRoleAdapter:
                 )
             if before_attempt is not None:
                 before_attempt(attempt)
-            finalization = (
-                force_final(attempt)
-                if force_final is not None
-                else attempt == max_attempts - 1
-            )
             result = self.gateway.complete(ModelTurnRequest(
                 role=request.role,
                 conversation=conversation,
@@ -2378,6 +2378,23 @@ class ReviewController:
                     "terminal_at": attempt.terminal_at,
                     "in_flight": attempt.in_flight,
                 })
+
+    @staticmethod
+    def _request_attempt_event_payload(attempt: RequestAttempt) -> dict[str, object]:
+        return {
+            # Keep this separate from the admitted specialist_request_* event
+            # identity so older artifact consumers do not double-count the
+            # immediate gateway telemetry as another specialist transition.
+            "gateway_request_id": attempt.request_id,
+            "session_id": attempt.session_id,
+            "assignment_id": attempt.assignment_id,
+            "phase": attempt.phase,
+            "turn": attempt.turn,
+            "input_tokens": attempt.input_tokens,
+            "max_output_tokens": attempt.max_output_tokens,
+            "status": attempt.status,
+            "in_flight": attempt.in_flight,
+        }
 
     def _session_hook(
         self,
@@ -4581,12 +4598,24 @@ class ReviewController:
             initialization_error = exc
         deadline = RunDeadline(started_at, inputs.config.review_deadline_sec, inputs.config.phase_shares)
         evidence = EvidenceStore()
+        # Request-attempt transitions are emitted immediately at the gateway
+        # boundary.  The richer specialist request events are still admitted
+        # after each wave, but these bounded events make in-flight LLM work
+        # visible in the job log instead of appearing only after a wave ends.
+        def request_transition(attempt: RequestAttempt) -> None:
+            journal.emit(
+                f"llm_request_{attempt.status}",
+                self._request_attempt_event_payload(attempt),
+            )
+
         state = _RunState(
             inputs=inputs,
             journal=journal,
             deadline=deadline,
             evidence=evidence,
-            request_attempt_journal=RequestAttemptJournal(self.clock),
+            request_attempt_journal=RequestAttemptJournal(
+                self.clock, transition_sink=request_transition,
+            ),
         )
         path: Path | None = None
         path_error: str | None = None

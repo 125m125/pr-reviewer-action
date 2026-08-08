@@ -28,8 +28,13 @@ class RequestAttempt:
 class RequestAttemptJournal:
     """Own request transitions and freeze open attempts exactly once at cutoff."""
 
-    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        transition_sink: Callable[[RequestAttempt], None] | None = None,
+    ) -> None:
         self._clock = clock
+        self._transition_sink = transition_sink
         self._lock = Lock()
         self._records: dict[str, RequestAttempt] = {}
         self._sequence = 0
@@ -72,7 +77,9 @@ class RequestAttemptJournal:
                 started_at=self._now(),
             )
             self._records[request_id] = attempt
-            return attempt
+        if self._transition_sink is not None:
+            self._transition_sink(attempt)
+        return attempt
 
     def finish(self, request_id: str, status: str) -> bool:
         if status not in {"completed", "failed", "timed_out"}:
@@ -81,18 +88,22 @@ class RequestAttemptJournal:
             attempt = self._records.get(request_id)
             if attempt is None or attempt.status != "started":
                 return False
-            self._records[request_id] = replace(
+            updated = replace(
                 attempt,
                 status=status,
                 terminal_at=self._now(),
                 in_flight=False,
             )
-            return True
+            self._records[request_id] = updated
+        if self._transition_sink is not None:
+            self._transition_sink(updated)
+        return True
 
     def close_since(self, cursor: int) -> tuple[RequestAttempt, ...]:
         with self._lock:
             now = self._now()
             selected = []
+            transitioned = []
             for request_id, attempt in tuple(self._records.items()):
                 if attempt.sequence <= cursor:
                     continue
@@ -104,5 +115,10 @@ class RequestAttemptJournal:
                         in_flight=True,
                     )
                     self._records[request_id] = attempt
+                    transitioned.append(attempt)
                 selected.append(attempt)
-            return tuple(sorted(selected, key=lambda item: item.sequence))
+            selected = tuple(sorted(selected, key=lambda item: item.sequence))
+        if self._transition_sink is not None:
+            for attempt in transitioned:
+                self._transition_sink(attempt)
+        return selected

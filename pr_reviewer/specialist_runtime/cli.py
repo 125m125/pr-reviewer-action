@@ -1140,12 +1140,44 @@ def _compact_topology_for_planner(value: object) -> object:
     return result
 
 
+def _compact_policy_for_planner(value: object) -> object:
+    """Keep planner policy authority without serializing full recipe prose."""
+    if not isinstance(value, Mapping):
+        return _compact_generic(value)
+    result: dict[str, object] = {}
+    for key in ("version", "source_hosts", "allowed_source_hosts", "current_branch_only"):
+        if key in value:
+            result[key] = _compact_generic(value[key])
+    recipes = value.get("recipes")
+    if isinstance(recipes, (list, tuple)):
+        compacted = []
+        for recipe in recipes[:160]:
+            if not isinstance(recipe, Mapping):
+                continue
+            compacted.append({
+                key: _compact_text(recipe.get(key), 180)
+                for key in (
+                    "id", "recipe_id", "title", "subject", "risk_tier",
+                    "mandatory", "unresolved_policy", "required_evidence_categories",
+                )
+                if recipe.get(key) is not None
+            })
+        result["recipes"] = compacted
+        if len(recipes) > 160:
+            result["recipes_omitted"] = len(recipes) - 160
+    return result
+
+
 def _compact_planner_context(value: object) -> object:
     """Project planner input to bounded plan/topology facts, not the full corpus."""
-    projected = _json_value(value)
-    if not isinstance(projected, dict):
-        return projected
-    base_plan = projected.get("base_plan")
+    raw = _json_value(value)
+    if not isinstance(raw, dict):
+        return raw
+    # Build a positive projection.  Unknown fields are deliberately omitted:
+    # callers sometimes pass corpus/diff-shaped compatibility fields here,
+    # and retaining them defeats the planner byte guard.
+    projected: dict[str, object] = {}
+    base_plan = raw.get("base_plan")
     if isinstance(base_plan, Mapping):
         projected["base_plan"] = {
             **{
@@ -1161,18 +1193,19 @@ def _compact_planner_context(value: object) -> object:
                 if isinstance(item, Mapping)
             ],
         }
-    obligations = projected.get("obligations")
+    obligations = raw.get("obligations")
     if isinstance(obligations, list):
         obligation_values = obligations
     elif isinstance(obligations, dict):
         obligation_values = list(obligations.values())
     else:
-        return projected
+        obligation_values = ()
 
-    projected["obligations"] = [
-        _compact_obligation_for_planner(item)
-        for item in obligation_values
-    ]
+    if obligation_values:
+        projected["obligations"] = [
+            _compact_obligation_for_planner(item)
+            for item in obligation_values
+        ]
     occurrences: dict[tuple[str, ...], int] = {}
     for obligation in obligation_values:
         if not isinstance(obligation, Mapping):
@@ -1205,11 +1238,65 @@ def _compact_planner_context(value: object) -> object:
                 if reference is not None:
                     compacted.pop(field_name, None)
                     compacted[f"{field_name}_ref"] = reference
-    if "topology" in projected:
-        projected["topology"] = _compact_topology_for_planner(projected["topology"])
-    for key in ("config", "policy", "pr_metadata", "change_overview"):
-        if key in projected:
-            projected[key] = _compact_generic(projected[key])
+    if "topology" in raw:
+        projected["topology"] = _compact_topology_for_planner(raw["topology"])
+    if "config" in raw:
+        projected["config"] = _compact_generic(raw["config"])
+    if "policy" in raw:
+        projected["policy"] = _compact_policy_for_planner(raw["policy"])
+    if "pr_metadata" in raw:
+        metadata = raw["pr_metadata"]
+        projected["pr_metadata"] = {
+            key: _compact_text(metadata.get(key), 1200)
+            for key in ("title", "body")
+            if isinstance(metadata, Mapping) and metadata.get(key) is not None
+        }
+    for key in ("diff_context", "diff", "corpus"):
+        if key in raw:
+            projected[key] = _compact_text(raw[key], 24_000)
+    if "change_overview" in raw:
+        projected["change_overview"] = _compact_generic(raw["change_overview"])
+    omitted = sorted(set(raw) - set(projected))
+    if omitted:
+        projected["omitted_context_fields"] = omitted[:40]
+    # Keep a safety margin below the adapter's hard limit even when a project
+    # has unusually verbose topology or policy metadata.  IDs and assignment
+    # ownership remain structured; optional descriptive material is reduced
+    # only as a last resort.
+    def encoded_size(item: object) -> int:
+        return len(json.dumps(
+            item, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8"))
+
+    if encoded_size(projected) > 160_000:
+        topology = projected.get("topology")
+        if isinstance(topology, Mapping):
+            projected["topology"] = {
+                key: topology[key]
+                for key in ("components", "changed_context", "relationships")
+                if key in topology
+            }
+        if encoded_size(projected) > 160_000:
+            projected["change_overview"] = _compact_text(
+                json.dumps(projected.get("change_overview", {}), ensure_ascii=False),
+                8_000,
+            )
+            projected["config"] = _compact_text(
+                json.dumps(projected.get("config", {}), ensure_ascii=False), 8_000,
+            )
+        if encoded_size(projected) > 160_000:
+            projected["obligations"] = [
+                {
+                    key: item[key]
+                    for key in (
+                        "obligation_id", "id", "subject", "risk_tier", "mandatory",
+                        "required_evidence_categories",
+                    )
+                    if isinstance(item, Mapping) and key in item
+                }
+                for item in projected.get("obligations", ())
+                if isinstance(item, Mapping)
+            ]
     return projected
 
 
@@ -1271,6 +1358,13 @@ def _runtime_event_line(
         status = kind.removeprefix("model_request_")
         suffix = f": {error}" if error else ""
         return f"role {role} request {status} phase={phase}{suffix}"
+    if kind.startswith("llm_request_"):
+        status = kind.removeprefix("llm_request_")
+        subject = f"specialist {session_id}" if session_id else "specialist"
+        assignment = _compact_text(payload.get("assignment_id"), 100)
+        turn = payload.get("turn", "?")
+        suffix = f" assignment={assignment}" if assignment else ""
+        return f"{subject} llm request {status} turn={turn}{suffix}"
     if kind == "degradation":
         return f"degraded component={_compact_text(payload.get('component'), 80)}: {error}"
     if kind == "recovery":
