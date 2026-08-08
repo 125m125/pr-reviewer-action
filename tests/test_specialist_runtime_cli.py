@@ -1117,6 +1117,46 @@ def test_finalizer_continues_length_response_even_when_interim_text_is_empty(
     assert payloads[1]["reasoning_effort"] == "none"
 
 
+def test_finalizer_continues_reasoning_only_response_even_when_provider_says_stop(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    responses = iter((
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "I am still reasoning.",
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": '{"recommendation":"Review the boundary."}',
+                },
+            }],
+            "usage": {},
+        },
+    ))
+
+    def transport(_base_url, _api_format, _payload, _api_key, _timeout, **_kwargs):
+        return next(responses)
+
+    controller.finalizer.gateway.transport = transport
+
+    assert controller.finalizer.complete(
+        _role_request("finalizer", RunPhase.FINALIZATION)
+    ) == {"recommendation": "Review the boundary."}
+
+
 def test_finalizer_accepts_one_fenced_json_object_followed_by_prose(
     monkeypatch, tmp_path,
 ):

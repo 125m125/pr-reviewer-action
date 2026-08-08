@@ -1009,10 +1009,14 @@ class GatewayRoleAdapter:
             try:
                 return _json_object(content)
             except (TypeError, ValueError):
+                reasoning_only = not content.strip() and bool(result.reasoning.strip())
+                continuation_allowed = (
+                    result.finish_reason == "length" or reasoning_only
+                )
                 if self.attempt_logger is not None:
                     status = (
                         "continuation scheduled"
-                        if result.finish_reason == "length"
+                        if continuation_allowed
                         and attempt < max_attempts - 1
                         else "no continuation available"
                     )
@@ -1022,7 +1026,7 @@ class GatewayRoleAdapter:
                     )
                 if (
                     attempt == max_attempts - 1
-                    or result.finish_reason != "length"
+                    or not continuation_allowed
                 ):
                     raise
                 conversation.add_assistant_turn(
