@@ -1,7 +1,7 @@
 import json
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -244,6 +244,24 @@ class ScriptedGateway:
         return response
 
 
+class EstimatingGateway(ScriptedGateway):
+    def __init__(self, responses, *, rendered_bytes, usages=()):
+        super().__init__(responses)
+        self.rendered_bytes = rendered_bytes
+        self.usages = list(usages)
+        self.rendered_requests = []
+
+    def rendered_request_bytes(self, request):
+        self.rendered_requests.append(request)
+        return self.rendered_bytes
+
+    def complete(self, request):
+        response = super().complete(request)
+        if self.usages:
+            response = replace(response, usage=self.usages.pop(0))
+        return response
+
+
 def final_response(
     summary="reviewed", recommendation="approve", candidate_finding_ids=None,
 ):
@@ -325,6 +343,70 @@ def make_session(
         recovery_max_tokens=recovery_max_tokens or max_tokens,
         clock=clock,
     )
+
+
+def test_provider_prompt_usage_calibrates_next_same_mode_admission():
+    gateway = EstimatingGateway(
+        [
+            checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+            checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        ],
+        rendered_bytes=32_000,
+        usages=(
+            {"prompt_tokens": 12_000, "completion_tokens": 100},
+            {"prompt_tokens": 8_000, "completion_tokens": 80},
+        ),
+    )
+    session = make_session(gateway, max_context_tokens=20_000)
+
+    session.request_checkpoint("controller-request")
+    session.request_checkpoint("controller-request")
+    estimate = session._estimate_admission(
+        tools_enabled=False, max_tokens=2_048,
+    )
+
+    assert estimate.source == "provider-calibrated"
+    assert estimate.input_tokens >= 12_000
+    assert session._admission_calibration["structured"].last_completion_tokens == 80
+
+
+def test_rendered_admission_falls_back_conservatively_without_provider_usage():
+    gateway = EstimatingGateway(
+        [checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])],
+        rendered_bytes=6_001,
+        usages=({},),
+    )
+    session = make_session(gateway, max_context_tokens=20_000)
+
+    session.request_checkpoint("controller-request")
+    estimate = session._estimate_admission(
+        tools_enabled=True, max_tokens=2_048,
+    )
+
+    assert estimate.source == "rendered-fallback"
+    assert estimate.input_tokens == 2_001
+    assert estimate.admission_tokens == 2_001 + 2_048 + 256
+
+
+def test_provider_calibration_is_independent_for_tools_and_structured_modes():
+    gateway = EstimatingGateway(
+        [checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])],
+        rendered_bytes=32_000,
+        usages=({"prompt_tokens": 12_000, "completion_tokens": 100},),
+    )
+    session = make_session(gateway, max_context_tokens=20_000)
+
+    session.request_checkpoint("controller-request")
+    structured = session._estimate_admission(
+        tools_enabled=False, max_tokens=2_048,
+    )
+    tools = session._estimate_admission(
+        tools_enabled=True, max_tokens=2_048,
+    )
+
+    assert structured.source == "provider-calibrated"
+    assert tools.source == "rendered-fallback"
+    assert tools.input_tokens == 10_667
 
 
 def test_model_gateway_exception_still_charges_reserved_turn():

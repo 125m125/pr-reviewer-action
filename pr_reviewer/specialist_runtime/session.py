@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import inspect
+import math
 import re
 import time
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import PurePosixPath
 from typing import Any, Callable, Mapping
 
@@ -652,6 +653,31 @@ class SpecialistRequestEvent:
 
 
 @dataclass(frozen=True)
+class _AdmissionEstimate:
+    """Bounded request-size projection used before provider transport."""
+
+    mode: str
+    input_tokens: int
+    response_tokens: int
+    safety_tokens: int
+    admission_tokens: int
+    source: str
+    rendered_bytes: int
+    coarse_input_tokens: int
+
+
+@dataclass
+class _AdmissionCalibration:
+    """Conservative provider calibration for one rendered request mode."""
+
+    last_rendered_bytes: int = 0
+    last_prompt_tokens: int = 0
+    last_completion_tokens: int = 0
+    max_tokens_per_rendered_byte: float = 0.0
+    max_positive_offset: int = 0
+
+
+@dataclass(frozen=True)
 class SessionResult:
     """Detached projection of current or completed specialist state."""
 
@@ -746,6 +772,10 @@ class SpecialistSession:
         self._request_events: list[SpecialistRequestEvent] = []
         self._finalization_diagnostics: list[dict[str, object]] = []
         self._last_context_admission: dict[str, object] = {}
+        self._admission_calibration = {
+            "tools": _AdmissionCalibration(),
+            "structured": _AdmissionCalibration(),
+        }
         self._request_attempt_journal: RequestAttemptJournal | None = None
         self._request_assignment_id = str(getattr(
             assignment, "assignment_id", getattr(assignment, "id", ""),
@@ -817,6 +847,128 @@ class SpecialistSession:
             entries, sort_keys=True,
         )
 
+    @staticmethod
+    def _usage_tokens(usage: Mapping[str, Any], key: str) -> int:
+        value = usage.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0
+        if not math.isfinite(float(value)) or value <= 0:
+            return 0
+        return int(value)
+
+    def _request_mode(self, tools_enabled: bool) -> str:
+        return "tools" if tools_enabled else "structured"
+
+    def _request_schema_name(self, schema: dict[str, Any] | None) -> str | None:
+        return "specialist_checkpoint" if schema is _CHECKPOINT_SCHEMA else None
+
+    def _renderable_request(
+        self,
+        *,
+        tools_enabled: bool,
+        schema: dict[str, Any] | None,
+        max_tokens: int,
+    ) -> ModelTurnRequest:
+        return ModelTurnRequest(
+            role="specialist",
+            conversation=self.conversation,
+            max_tokens=max_tokens,
+            response_schema=schema,
+            tools_enabled=tools_enabled,
+            timeout_sec=self.request_timeout_sec,
+            deadline_at=self.lease.deadline_at,
+            stream=self.stream,
+            response_schema_name=self._request_schema_name(schema),
+            reasoning_effort="none" if not tools_enabled else None,
+        )
+
+    def _estimate_admission(
+        self,
+        *,
+        tools_enabled: bool,
+        max_tokens: int,
+        schema: dict[str, Any] | None = None,
+    ) -> _AdmissionEstimate:
+        mode = self._request_mode(tools_enabled)
+        coarse_tokens = max(0, int(self.conversation.approx_tokens()))
+        renderer = getattr(self.gateway, "rendered_request_bytes", None)
+        rendered_bytes = 0
+        if callable(renderer):
+            try:
+                value = renderer(self._renderable_request(
+                    tools_enabled=tools_enabled,
+                    schema=(schema if schema is not None else (
+                        None if tools_enabled else _CHECKPOINT_SCHEMA
+                    )),
+                    max_tokens=max_tokens,
+                ))
+                if not isinstance(value, bool):
+                    rendered_bytes = max(0, int(value))
+            except (TypeError, ValueError, OverflowError):
+                rendered_bytes = 0
+
+        calibration = self._admission_calibration[mode]
+        candidates = [(coarse_tokens, "coarse-conversation", 0)]
+        if rendered_bytes > 0:
+            candidates.append((
+                math.ceil(rendered_bytes / 3), "rendered-fallback", 1,
+            ))
+            if calibration.max_tokens_per_rendered_byte > 0:
+                candidates.append((
+                    math.ceil(
+                        rendered_bytes
+                        * calibration.max_tokens_per_rendered_byte
+                    ),
+                    "provider-calibrated",
+                    2,
+                ))
+            if calibration.max_positive_offset > 0:
+                candidates.append((
+                    coarse_tokens + calibration.max_positive_offset,
+                    "provider-calibrated",
+                    2,
+                ))
+        input_tokens, source, _priority = max(
+            candidates, key=lambda item: (item[0], item[2]),
+        )
+        response_tokens = max(0, int(max_tokens))
+        admission_tokens = (
+            input_tokens + response_tokens + self.wire_safety_tokens
+        )
+        return _AdmissionEstimate(
+            mode=mode,
+            input_tokens=input_tokens,
+            response_tokens=response_tokens,
+            safety_tokens=self.wire_safety_tokens,
+            admission_tokens=admission_tokens,
+            source=source,
+            rendered_bytes=rendered_bytes,
+            coarse_input_tokens=coarse_tokens,
+        )
+
+    def _record_admission_calibration(
+        self,
+        estimate: _AdmissionEstimate,
+        usage: Mapping[str, Any],
+    ) -> tuple[int, int]:
+        calibration = self._admission_calibration[estimate.mode]
+        prompt_tokens = self._usage_tokens(usage, "prompt_tokens")
+        completion_tokens = self._usage_tokens(usage, "completion_tokens")
+        calibration.last_rendered_bytes = estimate.rendered_bytes
+        calibration.last_completion_tokens = completion_tokens
+        if prompt_tokens > 0:
+            calibration.last_prompt_tokens = prompt_tokens
+            if estimate.rendered_bytes > 0:
+                calibration.max_tokens_per_rendered_byte = max(
+                    calibration.max_tokens_per_rendered_byte,
+                    prompt_tokens / estimate.rendered_bytes,
+                )
+            calibration.max_positive_offset = max(
+                calibration.max_positive_offset,
+                prompt_tokens - estimate.coarse_input_tokens,
+            )
+        return prompt_tokens, completion_tokens
+
     def _request(
         self,
         *,
@@ -824,13 +976,6 @@ class SpecialistSession:
         schema: dict[str, Any] | None,
         purpose: str = "unknown",
     ) -> ModelTurnResult:
-        estimated_input_tokens = self.conversation.approx_tokens()
-        remaining_input_tokens = self.budget.remaining_input_tokens()
-        if (
-            remaining_input_tokens is not None
-            and estimated_input_tokens > remaining_input_tokens
-        ):
-            raise BudgetExhausted("input token limit exhausted")
         remaining_output_tokens = self.budget.remaining_output_tokens()
         if remaining_output_tokens is not None and remaining_output_tokens <= 0:
             raise BudgetExhausted("output token limit exhausted")
@@ -844,27 +989,43 @@ class SpecialistSession:
             if remaining_output_tokens is None
             else min(configured_max_tokens, remaining_output_tokens)
         )
+        admission = self._estimate_admission(
+            tools_enabled=tools_enabled,
+            max_tokens=request_max_tokens,
+            schema=schema,
+        )
+        remaining_input_tokens = self.budget.remaining_input_tokens()
+        if (
+            remaining_input_tokens is not None
+            and admission.input_tokens > remaining_input_tokens
+        ):
+            raise BudgetExhausted("input token limit exhausted")
         self._last_context_admission = {
-            "context_tokens_before": estimated_input_tokens,
-            "context_tokens_after": estimated_input_tokens,
+            "context_tokens_before": admission.input_tokens,
+            "context_tokens_after": admission.input_tokens,
             "max_context_tokens": self.max_context_tokens,
             "requested_output_tokens": request_max_tokens,
             "wire_safety_tokens": self.wire_safety_tokens,
+            "rendered_request_bytes": admission.rendered_bytes,
+            "admission_tokens": admission.admission_tokens,
+            "admission_source": admission.source,
             "compacted_evidence_count": 0,
             "assistant_messages_compacted": 0,
         }
-        if (
-            estimated_input_tokens
-            + request_max_tokens
-            + self.wire_safety_tokens
-            > self.max_context_tokens
-        ):
+        if admission.admission_tokens > self.max_context_tokens:
             evidence_before = len(self._compacted_evidence)
             assistant_before = len(self._assistant_analysis_bodies())
             self._compact_conversation()
-            estimated_input_tokens = self.conversation.approx_tokens()
+            admission = self._estimate_admission(
+                tools_enabled=tools_enabled,
+                max_tokens=request_max_tokens,
+                schema=schema,
+            )
             self._last_context_admission.update({
-                "context_tokens_after": estimated_input_tokens,
+                "context_tokens_after": admission.input_tokens,
+                "rendered_request_bytes": admission.rendered_bytes,
+                "admission_tokens": admission.admission_tokens,
+                "admission_source": admission.source,
                 "compacted_evidence_count": (
                     len(self._compacted_evidence) - evidence_before
                 ),
@@ -872,12 +1033,7 @@ class SpecialistSession:
                     0, assistant_before - len(self._assistant_analysis_bodies()),
                 ),
             })
-            if (
-                estimated_input_tokens
-                + request_max_tokens
-                + self.wire_safety_tokens
-                > self.max_context_tokens
-            ):
+            if admission.admission_tokens > self.max_context_tokens:
                 raise BudgetExhausted(
                     "model context limit cannot admit input and requested output"
                 )
@@ -887,9 +1043,7 @@ class SpecialistSession:
         self.budget.reserve_model_turn()
         self._request_turn += 1
         request_id = f"{self.session_id}:model:{self._request_turn}"
-        schema_name = (
-            "specialist_checkpoint" if schema is _CHECKPOINT_SCHEMA else None
-        )
+        schema_name = self._request_schema_name(schema)
         self._request_events.append(SpecialistRequestEvent(
             request_id, "started", tools_enabled, schema_name,
         ))
@@ -900,19 +1054,19 @@ class SpecialistSession:
                 assignment_id=self._request_assignment_id,
                 phase=self.lease.phase.value,
                 turn=self._request_turn,
-                input_tokens=estimated_input_tokens,
+                input_tokens=admission.input_tokens,
                 max_output_tokens=request_max_tokens,
+                admission_tokens=admission.admission_tokens,
+                admission_source=admission.source,
                 purpose=purpose,
             )
         try:
-            request = ModelTurnRequest(
-                role="specialist", conversation=self.conversation,
-                max_tokens=request_max_tokens, response_schema=schema,
-                tools_enabled=tools_enabled, timeout_sec=timeout,
-                deadline_at=self.lease.deadline_at, stream=self.stream,
-                response_schema_name=schema_name,
-                reasoning_effort="none" if not tools_enabled else None,
+            request = self._renderable_request(
+                tools_enabled=tools_enabled,
+                schema=schema,
+                max_tokens=request_max_tokens,
             )
+            request = replace(request, timeout_sec=timeout)
             result = CALLBACK_POOL.run(
                 lambda: self.gateway.complete(request),
                 timeout_sec=timeout,
@@ -936,6 +1090,12 @@ class SpecialistSession:
                 format_callback_error(exc, limit=500),
             ))
             raise
+        actual_prompt_tokens = self._usage_tokens(
+            result.usage, "prompt_tokens",
+        )
+        actual_completion_tokens = self._usage_tokens(
+            result.usage, "completion_tokens",
+        )
         if self._request_attempt_journal is not None:
             self._request_attempt_journal.finish(
                 request_id,
@@ -943,6 +1103,8 @@ class SpecialistSession:
                 finish_reason=result.finish_reason,
                 text_source=result.text_source,
                 tool_call_count=len(result.tool_calls),
+                actual_prompt_tokens=actual_prompt_tokens,
+                actual_completion_tokens=actual_completion_tokens,
             )
         self._request_events.append(SpecialistRequestEvent(
             request_id, "completed", tools_enabled, schema_name,
@@ -950,9 +1112,12 @@ class SpecialistSession:
             text_source=result.text_source,
             tool_call_count=len(result.tool_calls),
         ))
+        prompt_tokens, completion_tokens = self._record_admission_calibration(
+            admission, result.usage,
+        )
         self.budget.record_model_usage(
-            input_tokens=int(result.usage.get("prompt_tokens", 0) or 0),
-            output_tokens=int(result.usage.get("completion_tokens", 0) or 0),
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
         )
         self._recovery_turn_pending = False
         return result

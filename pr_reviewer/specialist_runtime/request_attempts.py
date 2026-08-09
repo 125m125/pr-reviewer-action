@@ -19,6 +19,8 @@ class RequestAttempt:
     turn: int
     input_tokens: int
     max_output_tokens: int
+    admission_tokens: int
+    admission_source: str
     started_at: float
     status: str = "started"
     terminal_at: float | None = None
@@ -27,6 +29,8 @@ class RequestAttempt:
     finish_reason: str = ""
     text_source: str = ""
     tool_call_count: int = 0
+    actual_prompt_tokens: int = 0
+    actual_completion_tokens: int = 0
     error: str = ""
 
 
@@ -65,6 +69,8 @@ class RequestAttemptJournal:
         turn: int,
         input_tokens: int,
         max_output_tokens: int,
+        admission_tokens: int,
+        admission_source: str,
         purpose: str = "unknown",
     ) -> RequestAttempt:
         with self._lock:
@@ -80,6 +86,8 @@ class RequestAttemptJournal:
                 turn=turn,
                 input_tokens=max(0, int(input_tokens)),
                 max_output_tokens=max(0, int(max_output_tokens)),
+                admission_tokens=max(0, int(admission_tokens)),
+                admission_source=str(admission_source or "unknown"),
                 started_at=self._now(),
                 purpose=str(purpose or "unknown"),
             )
@@ -96,6 +104,8 @@ class RequestAttemptJournal:
         finish_reason: str = "",
         text_source: str = "",
         tool_call_count: int = 0,
+        actual_prompt_tokens: int = 0,
+        actual_completion_tokens: int = 0,
         error: str = "",
     ) -> bool:
         if status not in {"completed", "failed", "timed_out"}:
@@ -112,6 +122,10 @@ class RequestAttemptJournal:
                 finish_reason=str(finish_reason or ""),
                 text_source=str(text_source or ""),
                 tool_call_count=max(0, int(tool_call_count or 0)),
+                actual_prompt_tokens=max(0, int(actual_prompt_tokens or 0)),
+                actual_completion_tokens=max(
+                    0, int(actual_completion_tokens or 0),
+                ),
                 error=str(error or ""),
             )
             self._records[request_id] = updated

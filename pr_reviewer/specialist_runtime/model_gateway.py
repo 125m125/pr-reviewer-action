@@ -117,16 +117,10 @@ class OpenAIModelGateway:
         """Return the configured override, otherwise the deterministic default."""
         return self.role_models.get(role, self.default_model)
 
-    def complete(self, request: ModelTurnRequest) -> ModelTurnResult:
-        """Render and issue exactly one logical model turn.
-
-        Structured-output and streaming retries may cause multiple physical
-        requests, but each uses the same absolute request deadline.
-        """
+    def render_request(self, request: ModelTurnRequest) -> dict[str, Any]:
+        """Render the exact provider payload used for a model turn."""
         if request.max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
-        if request.timeout_sec <= 0:
-            raise ValueError("timeout_sec must be positive")
         response_format = (
             request.response_format_override
             if request.response_format_override is not None
@@ -134,7 +128,7 @@ class OpenAIModelGateway:
         )
         if response_format not in {"off", "json_object", "json_schema"}:
             raise ValueError("response_format_override must be off, json_object, or json_schema")
-        payload = request.conversation.to_request_payload(
+        return request.conversation.to_request_payload(
             "openai",
             self.model_for_role(request.role),
             stream=request.stream,
@@ -150,6 +144,29 @@ class OpenAIModelGateway:
             tokens_param=request.tokens_param,
             cache_prefix=request.cache_prefix,
         )
+
+    def rendered_request_bytes(self, request: ModelTurnRequest) -> int:
+        """Return the compact UTF-8 size of the exact provider payload."""
+        return len(json.dumps(
+            self.render_request(request),
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8"))
+
+    def complete(self, request: ModelTurnRequest) -> ModelTurnResult:
+        """Render and issue exactly one logical model turn.
+
+        Structured-output and streaming retries may cause multiple physical
+        requests, but each uses the same absolute request deadline.
+        """
+        if request.timeout_sec <= 0:
+            raise ValueError("timeout_sec must be positive")
+        response_format = (
+            request.response_format_override
+            if request.response_format_override is not None
+            else self.response_format
+        )
+        payload = self.render_request(request)
         response, diagnostics = self.complete_payload(
             payload,
             request.role,

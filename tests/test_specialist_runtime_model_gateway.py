@@ -26,6 +26,74 @@ def stop_response(content: str):
     }
 
 
+def turn_request(value, *, tools_enabled, response_schema=None):
+    return ModelTurnRequest(
+        role="specialist",
+        conversation=value,
+        max_tokens=512,
+        response_schema=response_schema,
+        tools_enabled=tools_enabled,
+        timeout_sec=20,
+        stream=False,
+    )
+
+
+def test_rendered_request_bytes_matches_compact_wire_payload_for_tools():
+    value = conversation("inspect the change")
+    value.tool_schemas = [{
+        "name": "read_file",
+        "description": "Read a repository file",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    }]
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1", api_key="wire-secret", default_model="main",
+    )
+    request = turn_request(value, tools_enabled=True)
+
+    payload = gateway.render_request(request)
+
+    assert payload["tools"][0]["function"]["name"] == "read_file"
+    assert "response_format" not in payload
+    assert "wire-secret" not in json.dumps(payload)
+    assert gateway.rendered_request_bytes(request) == len(json.dumps(
+        payload, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8"))
+
+
+def test_rendered_request_bytes_uses_structured_schema_without_tools():
+    value = conversation("checkpoint now")
+    value.tool_schemas = [{
+        "name": "read_file",
+        "description": "Read a repository file",
+        "parameters": {"type": "object", "properties": {}},
+    }]
+    schema = {
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "required": ["summary"],
+    }
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1", api_key="", default_model="main",
+        response_format="json_schema",
+    )
+    request = turn_request(
+        value, tools_enabled=False, response_schema=schema,
+    )
+
+    payload = gateway.render_request(request)
+
+    assert "tools" not in payload
+    assert payload["response_format"]["type"] == "json_schema"
+    assert payload["response_format"]["json_schema"]["schema"] == schema
+    assert gateway.rendered_request_bytes(request) == len(json.dumps(
+        payload, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8"))
+
+
 def test_role_model_override_and_deadline_bound_timeout():
     calls = []
     gateway = OpenAIModelGateway(
