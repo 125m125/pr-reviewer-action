@@ -1226,9 +1226,10 @@ class SpecialistSession:
         self.state = SessionState.EXPLORING
         while True:
             if self.conversation.approx_tokens() > self.max_context_tokens:
-                self._compact_conversation()
-                if self.conversation.approx_tokens() > self.max_context_tokens:
-                    return self.request_checkpoint("context-pressure")
+                return self.request_checkpoint(
+                    "context-pressure",
+                    disposition=CheckpointDisposition.COMPACT_RESUME,
+                )
             remaining_input_tokens = self.budget.remaining_input_tokens()
             if (
                 remaining_input_tokens is not None
@@ -1277,7 +1278,10 @@ class SpecialistSession:
                         "markup. Continue the investigation or return a checkpoint."
                     )
                     if self.budget.record_no_progress() >= self.max_no_progress_streak:
-                        return self.request_checkpoint("malformed-textual-tool-call")
+                        return self.request_checkpoint(
+                            "malformed-textual-tool-call",
+                            disposition=CheckpointDisposition.COMPACT_RESUME,
+                        )
                     continue
                 checkpoint = self._checkpoint_from_text(turn.content)
                 if (
@@ -1302,7 +1306,10 @@ class SpecialistSession:
             else:
                 streak = self.budget.record_no_progress()
                 if streak >= self.max_no_progress_streak:
-                    return self.request_checkpoint("no-progress-guard")
+                    return self.request_checkpoint(
+                        "no-progress-guard",
+                        disposition=CheckpointDisposition.COMPACT_RESUME,
+                    )
 
     def _execute_calls(self, calls: tuple[dict[str, Any], ...]) -> bool:
         progressed = False

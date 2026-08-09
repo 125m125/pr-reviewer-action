@@ -831,6 +831,37 @@ def test_textual_tool_markup_gets_repaired_before_checkpointing():
     )
 
 
+def test_repeated_textual_tool_markup_checkpoints_with_compact_resume():
+    malformed = ModelTurnResult(
+        response={}, tool_calls=(),
+        text="[tool]<parameter=path>a.py</parameter>[/tool]",
+        text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    gateway = ScriptedGateway([
+        malformed,
+        malformed,
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    result = session.explore()
+
+    assert result.state.value == "checkpoint"
+    assert len(gateway.requests) == 3
+    assert gateway.requests[-1].tools_enabled is False
+    assert gateway.requests[-1].messages_contain(
+        "Checkpoint reason: malformed-textual-tool-call."
+    )
+    assert gateway.requests[-1].messages_contain(
+        "Immediate compaction after validation: yes."
+    )
+    assert gateway.requests[-1].messages_contain(
+        "After validation, resume the specialist session."
+    )
+
+
 def test_checkpoint_register_uses_exact_candidate_ids_without_unmapped_aliases():
     """The register must not advertise aliases the controller cannot resolve."""
     initial = candidate_checkpoint_response(("finding:long-stable-id",))
@@ -1102,6 +1133,31 @@ def test_pressure_requests_checkpoint_before_exploration():
         "After validation, resume the specialist session."
     )
     assert attempts.close_since(0)[0].purpose == "checkpoint"
+
+
+def test_coarse_context_overflow_preserves_history_until_checkpoint_validates():
+    session = make_session(
+        ScriptedGateway([]), max_context_tokens=300, max_tokens=256,
+    )
+    retained_content = "coarse-overflow conclusion: " + ("x" * 5_000)
+    session.conversation.add_assistant_text(retained_content)
+
+    result = session.explore()
+
+    assert result.degraded is True
+    assert any(
+        event.get("kind") == "assistant_text"
+        and event.get("content") == retained_content
+        for event in session.conversation.events
+    )
+    assert not any(
+        event.get("compaction_note")
+        for event in session.conversation.events
+    )
+    checkpoint_prompt = session.conversation.events[-1]["content"]
+    assert "Checkpoint reason: context-pressure." in checkpoint_prompt
+    assert "Immediate compaction after validation: yes." in checkpoint_prompt
+    assert "After validation, resume the specialist session." in checkpoint_prompt
 
 
 def test_checkpoint_request_includes_compact_schema_contract():
@@ -1815,6 +1871,12 @@ def test_no_progress_guard_requests_checkpoint_instead_of_final_report():
     assert result.budget.model_turns == 4
     assert gateway.requests[-1].tools_enabled is False
     assert "not a final report" in gateway.requests[-1].messages.lower()
+    assert gateway.requests[-1].messages_contain(
+        "Immediate compaction after validation: yes."
+    )
+    assert gateway.requests[-1].messages_contain(
+        "After validation, resume the specialist session."
+    )
 
 
 def test_no_progress_guard_projects_checkpoint_when_no_model_turn_remains():
