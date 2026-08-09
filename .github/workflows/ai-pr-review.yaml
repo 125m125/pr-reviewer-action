@@ -80,7 +80,7 @@ jobs:
       - name: Review pull request
         # Fork of pr-reviewer-action v2.0.0 with generic, model-planned specialist
         # reviews and LM Studio reasoning-channel compatibility; pinned for safety.
-        uses: 125m125/pr-reviewer-action@40a69722e5f955610ab3bbecb17e97617d5c4369
+        uses: 125m125/pr-reviewer-action@2ae4c315d671e92f9c6db9ca793ae3bd126cae40
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
