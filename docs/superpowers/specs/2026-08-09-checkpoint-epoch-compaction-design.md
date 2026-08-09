@@ -99,6 +99,22 @@ Admission uses a conservative estimate of the exact request mode:
 - response-format/schema payload where applicable;
 - a configurable or deterministic provider/chat-template safety margin.
 
+Successful provider usage is the preferred calibration source. When a response
+contains positive `usage.prompt_tokens`, retain it together with the
+controller's rendered estimate for that exact request. Predict the next request
+from the last observed prompt usage plus the conservatively estimated rendered
+delta, and retain the largest observed underestimate/ratio for the session and
+request mode. Tool-enabled exploration and no-tools structured checkpoints are
+separate modes because their schema and chat-template overhead differs.
+
+`usage.completion_tokens` records actual output consumption and can replace the
+worst-case first-attempt allowance when admitting a repair after that response
+has completed. Before the first checkpoint request, admission must still reserve
+the configured maximum for both attempts. Missing, zero, inconsistent, or
+provider-specific usage falls back to the conservative rendered estimate and
+safety margin. Cumulative lifetime input usage is accounting data, not a prompt
+size estimate.
+
 Before context compaction, the controller projects a no-tools checkpoint turn.
 The pressure threshold reserves the worst-case second request:
 
@@ -116,6 +132,24 @@ exploration output limit. The implementation may choose values within existing
 configuration, but must reserve both attempts before the first checkpoint
 request. Context-length provider errors are classified as recoverable context
 pressure rather than generic specialist failures.
+
+Provider error classification recognizes bounded, case-insensitive context
+signals such as `context_length_exceeded`, `context size`, `maximum context`,
+`prompt too long`, and `too many tokens`. The original provider error remains in
+diagnostics after secret masking.
+
+When a tool-enabled exploration request receives such an error, make at most one
+emergency no-tools checkpoint attempt before destructive compaction. Removing
+the tool catalogue and normal exploration reserve may make this structured turn
+fit even though the rejected exploration request did not. The rejected request
+adds no assistant turn, so the checkpoint operates on the last accepted
+conversation state. It uses the bounded checkpoint output limit and the same
+cumulative checkpoint contract.
+
+If the emergency checkpoint succeeds, compact at that validated boundary and
+resume only when budget and lease permit. If it is also rejected for context,
+do not loop: fall back to the previous valid checkpoint and emergency
+reconstruction, or stop degraded when no safe model checkpoint exists.
 
 ## Repair and Failure
 
@@ -194,6 +228,8 @@ Artifact and bounded console events record:
   old exchanges, and retained full exchanges;
 - before/after rendered estimates;
 - provider context-limit recovery outcome.
+- provider-reported prompt/completion usage, calibrated estimate ratio/offset,
+  and the estimate source selected for each admission decision.
 
 Logs never include prompts, raw responses, evidence bodies, secrets, or private
 reasoning.
@@ -214,4 +250,8 @@ Tests must prove:
 - normal completion checkpoints do not compact unnecessarily;
 - context-length provider failures enter bounded recovery instead of immediate
   generic degradation;
+- successful provider prompt usage calibrates later admissions while absent or
+  invalid usage retains the conservative fallback;
+- one context-error emergency checkpoint removes tools and either establishes a
+  valid boundary or falls back without retrying indefinitely;
 - lifetime budgets and evidence retrieval restrictions remain unchanged.
