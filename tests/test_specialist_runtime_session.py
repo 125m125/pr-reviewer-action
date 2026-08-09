@@ -1248,6 +1248,32 @@ def test_resumed_pressure_pause_checkpoint_compacts_existing_boundary():
     assert len(session._checkpoint_spans) >= 1
 
 
+def test_resumed_compacted_checkpoint_does_not_bypass_unrelieved_repair_reserve():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+    assert session._checkpoint_spans[-1].compacted is True
+    request_count = len(gateway.requests)
+    continuation = session._estimate_admission(
+        tools_enabled=True,
+        max_tokens=session.max_tokens,
+    )
+    session.max_context_tokens = continuation.admission_tokens + 1
+    assert continuation.admission_tokens < session.max_context_tokens
+    assert session._checkpoint_pressure_due() is True
+
+    result = session.explore()
+
+    assert len(gateway.requests) == request_count
+    assert result.state.value == "checkpoint"
+    assert result.degraded is True
+    assert session._checkpoint_pressure_due() is True
+
+
 def test_epoch_compaction_prunes_only_noncheckpoint_events_before_prior_boundary():
     gateway = ScriptedGateway([
         checkpoint_response(
@@ -1314,16 +1340,15 @@ def test_emergency_reconstruction_keeps_checkpoint_ledger_and_newest_exchange():
         max_context_tokens=100_000,
     )
     session.explore()
-    session.conversation.add_assistant_turn(
+    filler_record = session.evidence_store.snapshot().records[0]
+    for index in range(20):
+        session._compacted_evidence[f"evidence:000-filler-{index:02d}"] = filler_record
+    omitted_record = seed_successful_tool_exchange(
+        session,
+        call_id="post-checkpoint-old",
+        path="oversized.py",
+        content="oversized result " + ("y" * 8_000),
         reasoning="oversized new epoch reasoning " + ("x" * 40_000),
-        calls=[{
-            "id": "post-checkpoint-old",
-            "name": "read_file",
-            "arguments": '{"path":"oversized.py"}',
-        }],
-    )
-    session.conversation.add_tool_result(
-        "post-checkpoint-old", "oversized result " + ("y" * 8_000),
     )
     session.conversation.add_assistant_turn(
         content="newest complete analysis",
@@ -1351,6 +1376,8 @@ def test_emergency_reconstruction_keeps_checkpoint_ledger_and_newest_exchange():
     assert "post-checkpoint-new" in rendered
     assert "newest fitting result" in rendered
     assert "post-checkpoint-old" not in rendered
+    assert omitted_record.id in session._compacted_evidence
+    assert omitted_record.id in rendered
     assert rendered.index("candidate-code") < rendered.index("post-checkpoint-new")
     assert rendered.index("post-checkpoint-new") < rendered.index(
         "Continue the same specialist assignment"
@@ -2098,6 +2125,50 @@ def test_recovery_reconstructs_context_without_resetting_lifetime_state():
     assert session.conversation_contains_evidence_ids(checkpoint.evidence_ids)
     assert "contents:a.py" in json.dumps(session.conversation.events)
     assert "OB-tests" in json.dumps(session.conversation.events)
+
+
+def test_recovery_rebases_checkpoint_span_before_later_pressure_compaction():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["a.py"],
+            unresolved=["OB-tests"],
+            working_summary="checkpoint before recovery",
+        ),
+        checkpoint_response(
+            inspected=["after.py"],
+            unresolved=["OB-tests"],
+            working_summary="checkpoint after recovery",
+        ),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.request_checkpoint("controller-request", disposition="pause")
+
+    session.recover("repetitive-transcript")
+
+    assert len(session._checkpoint_spans) == 1
+    recovered_span = session._checkpoint_spans[0]
+    assert recovered_span.response_end <= len(session.conversation.events)
+    protected = session.conversation.events[
+        recovered_span.request_start:recovered_span.response_end
+    ]
+    assert len(protected) == 1
+    assert protected[0]["kind"] == "user"
+    assert protected[0]["content"].startswith("Recovery reconstruction.")
+
+    seed_successful_tool_exchange(
+        session,
+        call_id="after-recovery",
+        path="after.py",
+        content="evidence collected after recovery",
+    )
+    session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+
+    assert len(session._checkpoint_spans) == 2
+    transcript = json.dumps(session.conversation.events, sort_keys=True)
+    assert "Recovery reconstruction." in transcript
+    assert "checkpoint after recovery" in transcript
 
 
 def test_recovery_next_turn_uses_recovery_output_ceiling():

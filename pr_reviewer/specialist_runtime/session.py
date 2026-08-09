@@ -1235,24 +1235,41 @@ class SpecialistSession:
             self.request_timeout_sec, now=self.clock(),
         )
         resuming_checkpoint = self.state is SessionState.CHECKPOINT
-        reused_checkpoint_boundary = False
         if resuming_checkpoint and self._checkpoint_spans:
             continuation_admission = self._estimate_admission(
                 tools_enabled=True,
                 max_tokens=self.max_tokens,
             )
-            if (
+            continuation_pressure = (
                 continuation_admission.admission_tokens > self.max_context_tokens
                 or self._checkpoint_pressure_due()
-            ):
+            )
+            if continuation_pressure:
                 self._compact_validated_epoch()
-                reused_checkpoint_boundary = True
                 continuation_admission = self._estimate_admission(
                     tools_enabled=True,
                     max_tokens=self.max_tokens,
                 )
-                if continuation_admission.admission_tokens > self.max_context_tokens:
-                    self._reconstruct_from_valid_checkpoint()
+                continuation_pressure = (
+                    continuation_admission.admission_tokens
+                    > self.max_context_tokens
+                    or self._checkpoint_pressure_due()
+                )
+                if continuation_pressure:
+                    reconstructed = self._reconstruct_from_valid_checkpoint()
+                    continuation_admission = self._estimate_admission(
+                        tools_enabled=True,
+                        max_tokens=self.max_tokens,
+                    )
+                    continuation_pressure = (
+                        not reconstructed
+                        or continuation_admission.admission_tokens
+                        > self.max_context_tokens
+                        or self._checkpoint_pressure_due()
+                    )
+                if continuation_pressure:
+                    self.state = SessionState.CHECKPOINT
+                    return self._snapshot(degraded=True)
         self.state = SessionState.EXPLORING
         while True:
             if self.conversation.approx_tokens() > self.max_context_tokens:
@@ -1269,12 +1286,11 @@ class SpecialistSession:
             remaining_output_tokens = self.budget.remaining_output_tokens()
             if remaining_output_tokens is not None and remaining_output_tokens <= 0:
                 raise BudgetExhausted("output token limit exhausted")
-            if self._checkpoint_pressure_due() and not reused_checkpoint_boundary:
+            if self._checkpoint_pressure_due():
                 return self.request_checkpoint(
                     "context-pressure",
                     disposition=CheckpointDisposition.COMPACT_RESUME,
                 )
-            reused_checkpoint_boundary = False
             if self.budget.remaining_model_turns() <= _CHECKPOINT_TURN_RESERVE:
                 return self.request_checkpoint("checkpoint-retention-reserve")
             try:
@@ -2152,10 +2168,22 @@ class SpecialistSession:
         return replacements
 
     def _compacted_evidence_catalogue(
-        self, *, max_bytes: int | None = None,
+        self,
+        *,
+        max_bytes: int | None = None,
+        priority_evidence_ids: tuple[str, ...] = (),
     ) -> list[dict[str, object]]:
         entries = []
-        for evidence_id, record in sorted(self._compacted_evidence.items())[:20]:
+        ordered_ids = tuple(dict.fromkeys((
+            *(
+                evidence_id
+                for evidence_id in priority_evidence_ids
+                if evidence_id in self._compacted_evidence
+            ),
+            *sorted(self._compacted_evidence),
+        )))
+        for evidence_id in ordered_ids[:20]:
+            record = self._compacted_evidence[evidence_id]
             entry = {
                 "evidence_id": evidence_id,
                 "source_path": record.source_path or record.source_identity,
@@ -2446,6 +2474,27 @@ class SpecialistSession:
                 continue
             newest_groups.append(group)
             remaining_exchange_bytes -= group_bytes
+        selected_event_ids = {
+            id(event) for group in newest_groups for event in group
+        }
+        retained_records = {
+            record.id: record for record in self.evidence_store.snapshot().records
+        }
+        newly_omitted_evidence_ids: list[str] = []
+        for group in exchange_groups:
+            if any(id(event) in selected_event_ids for event in group):
+                continue
+            for event in group:
+                if event.get("kind") != "tool_result":
+                    continue
+                evidence_id = self._tool_call_evidence_ids.get(
+                    str(event.get("call_id") or ""),
+                    "",
+                )
+                record = retained_records.get(evidence_id)
+                if record is not None and record.is_usable_for_coverage:
+                    self._compacted_evidence[evidence_id] = record
+                    newly_omitted_evidence_ids.append(evidence_id)
         checkpoint_request_start = len(rebuilt.events)
         rebuilt.add_user(
             "Emergency reconstruction from the latest validated cumulative "
@@ -2455,6 +2504,7 @@ class SpecialistSession:
             "cumulative_checkpoint": self._bounded_reconstruction_checkpoint(),
             "compacted_evidence": self._compacted_evidence_catalogue(
                 max_bytes=max(0, self.recovery_evidence_bytes // 2),
+                priority_evidence_ids=tuple(newly_omitted_evidence_ids),
             ),
         }
         rebuilt.add_assistant_turn(
@@ -2731,6 +2781,7 @@ class SpecialistSession:
                 "recoveries_used": usage.recoveries,
             },
         }
+        recovery_span_start = len(rebuilt.events)
         rebuilt.add_user(
             "Recovery reconstruction. Continue the same logical specialist session:\n"
             + json.dumps(
@@ -2740,6 +2791,12 @@ class SpecialistSession:
             )
         )
         self.conversation = rebuilt
+        self._checkpoint_spans = [_CheckpointSpan(
+            request_start=recovery_span_start,
+            response_end=len(rebuilt.events),
+            disposition=CheckpointDisposition.COMPACT_RESUME,
+            compacted=True,
+        )]
         self._recovery_turn_pending = True
         self.state = SessionState.EXPLORING
         return self._snapshot()
