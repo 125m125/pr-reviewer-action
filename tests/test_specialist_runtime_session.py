@@ -1417,6 +1417,46 @@ def test_emergency_reconstruction_bounds_retained_evidence_metadata():
     assert len(metadata) < 30
 
 
+def test_emergency_catalogue_prioritizes_newest_of_many_omitted_results():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.request_checkpoint("controller-request", disposition="pause")
+    omitted_records = [
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"omitted-{index:02d}",
+            path=f"omitted-{index:02d}.py",
+            content=f"successful omitted evidence {index}",
+            reasoning=f"oversized omitted reasoning {index} " + ("x" * 9_000),
+        )
+        for index in range(25)
+    ]
+
+    assert session._reconstruct_from_valid_checkpoint() is True
+
+    snapshot_event = next(
+        event
+        for event in session.conversation.events
+        if event.get("kind") == "assistant_text"
+        and '"compacted_evidence"' in event.get("content", "")
+    )
+    snapshot = json.loads(snapshot_event["content"])
+    catalogue_ids = [
+        item["evidence_id"] for item in snapshot["compacted_evidence"]
+    ]
+    expected_newest_first = [
+        record.id for record in reversed(omitted_records[-20:])
+    ]
+    assert catalogue_ids == expected_newest_first
+    assert len(catalogue_ids) == 20
+    assert omitted_records[-1].id in catalogue_ids
+    assert all(
+        record.id not in catalogue_ids for record in omitted_records[:5]
+    )
+
+
 def test_exploration_reserves_checkpoint_and_repair_turns():
     """Exploration cannot consume the turns reserved for structured retention."""
     gateway = ScriptedGateway([

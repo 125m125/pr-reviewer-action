@@ -2504,7 +2504,7 @@ class SpecialistSession:
             "cumulative_checkpoint": self._bounded_reconstruction_checkpoint(),
             "compacted_evidence": self._compacted_evidence_catalogue(
                 max_bytes=max(0, self.recovery_evidence_bytes // 2),
-                priority_evidence_ids=tuple(newly_omitted_evidence_ids),
+                priority_evidence_ids=tuple(reversed(newly_omitted_evidence_ids)),
             ),
         }
         rebuilt.add_assistant_turn(
