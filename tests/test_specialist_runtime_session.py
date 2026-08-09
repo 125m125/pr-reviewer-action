@@ -546,6 +546,70 @@ def test_cumulative_checkpoint_payload_materializes_omitted_candidates():
     assert "content" not in payload["evidence_metadata"][0]
 
 
+def test_sparse_checkpoint_preserves_prior_cumulative_working_state():
+    """Omitting optional working fields cannot erase continuation memory."""
+    initial = checkpoint_response(
+        inspected=[],
+        unresolved=["OB-tests"],
+        working_summary="The controller input was validated.",
+        completed_steps=["Compared action input and config fallback."],
+        hypotheses=["The fallback remains reachable."],
+        invariants_evaluated=["Lifetime budget is cumulative."],
+        proposed_next_actions=["Inspect the authorization boundary."],
+    )
+    sparse_payload = json.loads(checkpoint_response(
+        inspected=[], unresolved=["OB-tests"],
+    ).text)
+    for field in (
+        "working_summary", "completed_steps", "hypotheses",
+        "invariants_evaluated", "proposed_next_actions",
+    ):
+        sparse_payload.pop(field, None)
+    sparse = ModelTurnResult(**{
+        **initial.__dict__, "text": json.dumps(sparse_payload),
+    })
+    session = make_session(ScriptedGateway([initial, sparse]), model_turns=4)
+
+    first = session.request_checkpoint("controller-request")
+    second = session.request_checkpoint("controller-request")
+
+    assert second.checkpoint.working_summary == first.checkpoint.working_summary
+    assert second.checkpoint.completed_steps == first.checkpoint.completed_steps
+    assert second.checkpoint.hypotheses == first.checkpoint.hypotheses
+    assert second.checkpoint.invariants_evaluated == first.checkpoint.invariants_evaluated
+    assert second.checkpoint.proposed_next_actions == first.checkpoint.proposed_next_actions
+
+
+def test_invalid_checkpoint_fallback_and_recovery_preserve_prior_working_state():
+    """An invalid checkpoint keeps the prior recovery continuation state."""
+    initial = checkpoint_response(
+        inspected=[],
+        unresolved=["OB-tests"],
+        working_summary="The controller input was validated.",
+        completed_steps=["Compared action input and config fallback."],
+        hypotheses=["The fallback remains reachable."],
+        invariants_evaluated=["Lifetime budget is cumulative."],
+        proposed_next_actions=["Inspect the authorization boundary."],
+    )
+    session = make_session(ScriptedGateway([
+        initial,
+        invalid_response(),
+        invalid_response(),
+    ]), model_turns=4)
+
+    first = session.request_checkpoint("controller-request")
+    fallback = session.request_checkpoint("controller-request")
+    session.recover("repetitive-transcript")
+
+    assert fallback.degraded is True
+    assert fallback.checkpoint.working_summary == first.checkpoint.working_summary
+    assert fallback.checkpoint.completed_steps == first.checkpoint.completed_steps
+    assert fallback.checkpoint.hypotheses == first.checkpoint.hypotheses
+    assert fallback.checkpoint.invariants_evaluated == first.checkpoint.invariants_evaluated
+    assert fallback.checkpoint.proposed_next_actions == first.checkpoint.proposed_next_actions
+    assert "The controller input was validated." in json.dumps(session.conversation.events)
+
+
 def test_checkpoint_withdraws_known_candidate_only_with_explicit_update():
     """Omission does not withdraw a candidate; an explicit update does."""
     initial = candidate_checkpoint_response(("candidate-code",))

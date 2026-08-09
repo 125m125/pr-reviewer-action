@@ -1445,6 +1445,7 @@ class SpecialistSession:
         raw = _json_object(text)
         if raw is None or not isinstance(raw.get("unresolved"), list):
             return None
+        previous = self.latest_checkpoint
         retained = {record.id: record for record in self.evidence_store.snapshot().records}
         evidence_ids = list(dict.fromkeys(
             item for item in (
@@ -1574,21 +1575,33 @@ class SpecialistSession:
             session_id=self.session_id,
             state=SessionState.CHECKPOINT,
             evidence_ids=tuple(evidence_ids),
-            working_summary=_bounded_text(
-                raw.get("working_summary"), max_length=2_000,
+            imported_evidence_ids=previous.imported_evidence_ids,
+            working_summary=(
+                _bounded_text(raw.get("working_summary"), max_length=2_000)
+                if "working_summary" in raw else previous.working_summary
             ),
-            completed_steps=_bounded_strings(
-                raw.get("completed_steps"), max_items=12, max_length=500,
+            completed_steps=(
+                _bounded_strings(
+                    raw.get("completed_steps"), max_items=12, max_length=500,
+                )
+                if "completed_steps" in raw else previous.completed_steps
             ),
-            hypotheses=_bounded_strings(
-                raw.get("hypotheses"), max_items=12, max_length=500,
+            hypotheses=(
+                _bounded_strings(
+                    raw.get("hypotheses"), max_items=12, max_length=500,
+                )
+                if "hypotheses" in raw else previous.hypotheses
             ),
             candidate_finding_ids=tuple(
                 item.candidate_id for item in self.candidate_findings
             ),
             obligation_statuses=tuple(sorted(self.coverage.obligation_statuses().items())),
-            invariants_evaluated=_bounded_strings(
-                raw.get("invariants_evaluated"), max_items=20, max_length=500,
+            invariants_evaluated=(
+                _bounded_strings(
+                    raw.get("invariants_evaluated"), max_items=20, max_length=500,
+                )
+                if "invariants_evaluated" in raw
+                else previous.invariants_evaluated
             ),
             unknowns=self._current_gaps,
             proposed_next_actions=(
@@ -1598,6 +1611,8 @@ class SpecialistSession:
                     max_length=500,
                 )
                 or self._current_gaps
+                if "proposed_next_actions" in raw
+                else previous.proposed_next_actions
             ),
         )
 
@@ -1724,6 +1739,7 @@ class SpecialistSession:
         *,
         candidate_retention_unknown: bool = False,
     ) -> SessionCheckpoint:
+        previous = getattr(self, "latest_checkpoint", None)
         for obligation_id in gaps:
             try:
                 self.coverage.mark_unresolved(obligation_id)
@@ -1737,12 +1753,24 @@ class SpecialistSession:
                 record.id for record in self.evidence_store.snapshot().records
                 if record.is_usable_for_coverage
             ),
+            imported_evidence_ids=(
+                previous.imported_evidence_ids if previous is not None else ()
+            ),
+            working_summary=previous.working_summary if previous is not None else "",
+            completed_steps=previous.completed_steps if previous is not None else (),
+            hypotheses=previous.hypotheses if previous is not None else (),
             candidate_finding_ids=tuple(
                 item.candidate_id for item in self.candidate_findings
             ),
             obligation_statuses=tuple(sorted(self.coverage.obligation_statuses().items())),
+            invariants_evaluated=(
+                previous.invariants_evaluated if previous is not None else ()
+            ),
             unknowns=self._current_gaps,
-            proposed_next_actions=self._current_gaps,
+            proposed_next_actions=(
+                previous.proposed_next_actions
+                if previous is not None else self._current_gaps
+            ),
         )
         return (
             self._checkpoint_with_retention_unknown(checkpoint)
