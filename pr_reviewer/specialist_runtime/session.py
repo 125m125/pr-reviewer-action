@@ -14,9 +14,15 @@ from typing import Any, Callable, Mapping
 
 from pr_reviewer.conversation import Conversation, EpochCompactionStats
 from pr_reviewer.tool_loop import decode_native_tool_arguments, native_tool_request_key
+from pr_reviewer.transport import ModelRequestError
 
 from .budget import BudgetExhausted, BudgetLedger, SessionLease
-from .callbacks import CALLBACK_POOL, CallbackTimedOut, format_callback_error
+from .callbacks import (
+    CALLBACK_POOL,
+    CallbackTimedOut,
+    format_callback_error,
+    mask_runtime_text,
+)
 from .coverage import CoverageLedger
 from .evidence import EvidenceRecord, EvidenceStore
 from .model_gateway import ModelGateway, ModelTurnRequest, ModelTurnResult
@@ -72,6 +78,32 @@ COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
 }
 _MAX_COMPACTED_EVIDENCE_READS = 4
 _MAX_COMPACTED_EVIDENCE_READ_CHARS = 4_000
+_CONTEXT_LIMIT_SIGNALS = (
+    "context_length_exceeded",
+    "context size",
+    "maximum context",
+    "prompt too long",
+    "too many tokens",
+)
+
+
+def _is_context_limit_error(exc: BaseException) -> bool:
+    """Classify only bounded provider context-pressure signals."""
+    if isinstance(exc, (TimeoutError, KeyboardInterrupt)):
+        return False
+    if type(exc).__name__ == "CancelledError":
+        return False
+    if isinstance(exc, ModelRequestError):
+        if exc.timeout or exc.status in {401, 403}:
+            return False
+        values = (
+            format_callback_error(exc, limit=2_000),
+            mask_runtime_text(exc.body, limit=2_000),
+        )
+    else:
+        values = (format_callback_error(exc, limit=2_000),)
+    text = "\n".join(values).casefold()
+    return any(signal in text for signal in _CONTEXT_LIMIT_SIGNALS)
 
 _CHECKPOINT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -816,6 +848,7 @@ class SpecialistSession:
         self._checkpoint_spans: list[_CheckpointSpan] = []
         self._tool_lease_exhausted = False
         self._recovery_turn_pending = False
+        self._emergency_checkpoint_attempted = False
         self._final_result: SessionResult | None = None
         self._request_events: list[SpecialistRequestEvent] = []
         self._finalization_diagnostics: list[dict[str, object]] = []
@@ -1304,6 +1337,10 @@ class SpecialistSession:
                     "context-pressure",
                     disposition=CheckpointDisposition.COMPACT_RESUME,
                 )
+            except BaseException as exc:
+                if not _is_context_limit_error(exc):
+                    raise
+                return self._recover_from_provider_context_limit(exc)
             self._candidate_retention_signal = (
                 self._candidate_retention_signal.merged(
                     _candidate_retention_signal(turn.content)
@@ -1363,6 +1400,54 @@ class SpecialistSession:
                         "no-progress-guard",
                         disposition=CheckpointDisposition.COMPACT_RESUME,
                     )
+
+    def _recover_from_provider_context_limit(
+        self, provider_error: BaseException,
+    ) -> SessionResult:
+        """Attempt one no-tools checkpoint, then use only validated state."""
+        emergency_error = provider_error
+        if not self._emergency_checkpoint_attempted:
+            self._emergency_checkpoint_attempted = True
+            try:
+                return self.request_checkpoint(
+                    "provider-context-limit",
+                    disposition=CheckpointDisposition.COMPACT_RESUME,
+                )
+            except BaseException as exc:
+                if not _is_context_limit_error(exc):
+                    raise
+                emergency_error = exc
+
+        if self._reconstruct_from_valid_checkpoint():
+            self._record_checkpoint_diagnostic(
+                reason="provider-context-limit",
+                initial_parse="unavailable",
+                repair_attempted=False,
+                repair_parse="not_attempted",
+                fallback_projection=False,
+                retention_unknown=False,
+                initial_error=format_callback_error(emergency_error, limit=300),
+                context_admission=self._last_context_admission,
+            )
+            self.state = SessionState.CHECKPOINT
+            return self._snapshot()
+
+        self.latest_checkpoint = self._project_checkpoint(
+            self._current_gaps,
+            candidate_retention_unknown=True,
+        )
+        self._record_checkpoint_diagnostic(
+            reason="provider-context-limit",
+            initial_parse="unavailable",
+            repair_attempted=False,
+            repair_parse="not_attempted",
+            fallback_projection=True,
+            retention_unknown=True,
+            initial_error=format_callback_error(emergency_error, limit=300),
+            context_admission=self._last_context_admission,
+        )
+        self.state = SessionState.CHECKPOINT
+        return self._snapshot(degraded=True)
 
     def _execute_calls(self, calls: tuple[dict[str, Any], ...]) -> bool:
         progressed = False

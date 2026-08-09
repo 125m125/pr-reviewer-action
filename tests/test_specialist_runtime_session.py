@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+from concurrent.futures import CancelledError
 from dataclasses import dataclass, replace
 
 import pytest
@@ -24,6 +25,7 @@ from pr_reviewer.specialist_runtime.request_attempts import RequestAttemptJourna
 from pr_reviewer.specialist_runtime.session import (
     COMPACTED_EVIDENCE_TOOL_NAME,
     SpecialistSession,
+    _is_context_limit_error,
     _resolve_retained_evidence_id,
     _rewrite_rationale_evidence_ids,
 )
@@ -33,6 +35,48 @@ from pr_reviewer.specialist_runtime.types import (
     RunPhase,
     SpecialistAssignment,
 )
+from pr_reviewer.transport import ModelRequestError
+
+
+@pytest.mark.parametrize(
+    "message, body",
+    (
+        ("provider rejected context_length_exceeded", ""),
+        ("provider rejected request", '{"error":"Context Size is too large"}'),
+        ("Maximum Context reached", ""),
+        ("provider rejected request", '{"message":"PROMPT TOO LONG"}'),
+        ("Too Many Tokens for this model", ""),
+    ),
+)
+def test_context_limit_error_classifies_only_approved_provider_signals(
+    message, body,
+):
+    error = ModelRequestError(message, status=400, body=body)
+
+    assert _is_context_limit_error(error) is True
+
+
+def test_context_limit_error_rejects_unrelated_http_500():
+    error = ModelRequestError(
+        "model provider rejected request with HTTP 500",
+        status=500,
+        body='{"error":"internal server error"}',
+    )
+
+    assert _is_context_limit_error(error) is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        ModelRequestError("prompt too long", timeout=True),
+        ModelRequestError("prompt too long", status=401, body="too many tokens"),
+        TimeoutError("prompt too long"),
+        CancelledError("maximum context"),
+    ),
+)
+def test_context_limit_error_does_not_reclassify_timeout_auth_or_cancellation(error):
+    assert _is_context_limit_error(error) is False
 
 
 def tool_call_response(name, arguments, call_id=None):
@@ -480,6 +524,121 @@ def test_model_gateway_exception_still_charges_reserved_turn():
     assert terminal.admission_tokens > terminal.input_tokens
     assert terminal.actual_prompt_tokens == 0
     assert terminal.actual_completion_tokens == 0
+
+
+def test_emergency_checkpoint_recovers_one_exploration_context_error():
+    provider_error = ModelRequestError(
+        "provider rejected request with HTTP 400: "
+        "api_key=super-secret context_length_exceeded",
+        status=400,
+        body='{"code":"context_length_exceeded"}',
+    )
+    gateway = ScriptedGateway([
+        provider_error,
+        checkpoint_response(
+            inspected=["0.py", "1.py", "2.py"],
+            unresolved=["OB-tests"],
+            working_summary="Recovered the accepted exploration state.",
+            proposed_next_actions=["Continue with the remaining test obligation."],
+        ),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    records = [
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"accepted-{index}",
+            path=f"{index}.py",
+            content=f"accepted evidence {index}",
+        )
+        for index in range(3)
+    ]
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
+
+    result = session.explore()
+
+    assert result.state.value == "checkpoint"
+    assert result.degraded is False
+    assert len(gateway.requests) == 2
+    assert [request.tools_enabled for request in gateway.requests] == [True, False]
+    assert gateway.requests[1].max_tokens == session.checkpoint_max_tokens
+    assert gateway.requests[1].reasoning_effort == "none"
+    first_messages = json.loads(gateway.requests[0].messages)
+    emergency_messages = json.loads(gateway.requests[1].messages)
+    assert emergency_messages[:-1] == first_messages
+    assert "Checkpoint reason: provider-context-limit." in emergency_messages[-1]["content"]
+    assert session._checkpoint_spans[-1].compacted is True
+    assert records[0].id in session._compacted_evidence
+    terminal_attempts = attempts.close_since(0)
+    assert [attempt.status for attempt in terminal_attempts] == ["failed", "completed"]
+    assert "context_length_exceeded" in terminal_attempts[0].error
+    assert "super-secret" not in terminal_attempts[0].error
+    assert result.budget.model_turns == 2
+
+
+def test_emergency_checkpoint_context_error_stops_without_a_third_request():
+    gateway = ScriptedGateway([
+        ModelRequestError("prompt too long", status=400),
+        ModelRequestError("maximum context exceeded", status=400),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+
+    result = session.explore()
+
+    assert len(gateway.requests) == 2
+    assert [request.tools_enabled for request in gateway.requests] == [True, False]
+    assert result.state.value == "checkpoint"
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+    assert result.budget.model_turns == 2
+
+
+def test_failed_emergency_checkpoint_reconstructs_previous_valid_checkpoint():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["a.py"],
+            unresolved=["OB-tests"],
+            working_summary="Prior validated state.",
+        ),
+        ModelRequestError("too many tokens", status=400),
+        ModelRequestError("context size exceeded", status=400),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.request_checkpoint("controller-request", disposition="pause")
+    previous_checkpoint = session.latest_checkpoint
+
+    result = session.explore()
+
+    assert len(gateway.requests) == 3
+    assert [request.tools_enabled for request in gateway.requests] == [
+        False, True, False,
+    ]
+    assert result.state.value == "checkpoint"
+    assert result.degraded is False
+    assert result.checkpoint == previous_checkpoint
+    assert any(
+        event.get("emergency_reconstruction")
+        for event in session.conversation.events
+    )
+
+
+def test_emergency_checkpoint_guard_is_session_lifetime():
+    gateway = ScriptedGateway([
+        ModelRequestError("prompt too long", status=400),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        ModelRequestError("too many tokens", status=400),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+
+    first = session.explore()
+    second = session.explore()
+
+    assert first.degraded is False
+    assert second.state.value == "checkpoint"
+    assert len(gateway.requests) == 3
+    assert [request.tools_enabled for request in gateway.requests] == [
+        True, False, True,
+    ]
 
 
 def test_session_result_reports_each_actual_request_transition_once():
