@@ -93,9 +93,11 @@ _MAX_ARTIFACT_STRING = 16 * 1024
 _MAX_ARTIFACT_ITEMS = 2_000
 _MAX_CHANGE_OVERVIEW_ITEMS = 12
 _PROHIBITED_OVERVIEW_CLAIM = re.compile(
-    r"(?i)\b(?:approve|approval|request[_ -]?changes|verdict|findings?|"
-    r"blocker|bugs?|defects?|vulnerabilit(?:y|ies)|"
-    r"unsafe|safe\s+to\s+merge|ready\s+to\s+merge|merge[- ]safe|"
+    r"(?i)\b(?:unsafe|safe\s+to\s+merge|ready\s+to\s+merge|merge[- ]safe|"
+    r"(?:introduces?|causes?|creates?|contains?|has)\s+(?:an?\s+)?"
+    r"(?:blocker|bugs?|defects?|vulnerabilit(?:y|ies))|"
+    r"(?:verdict|recommendation|review\s+result)\s*(?:is|=|:)\s*"
+    r"(?:approve|approval|request[_ -]?changes)|"
     r"coverage\s+(?:is\s+)?(?:complete|sufficient|verified)|"
     r"(?:is|are|was|were|has\s+been|have\s+been)\s+"
     r"(?:fully\s+)?(?:verified|validated|tested|covered)|"

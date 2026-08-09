@@ -556,6 +556,40 @@ def test_change_overview_rejects_non_authoritative_claims(proposal, tmp_path):
         controller_module._validated_change_overview(proposal, inputs)
 
 
+def test_change_overview_accepts_descriptive_verdict_and_coverage_terms(tmp_path):
+    inputs = replace(
+        _inputs(tmp_path),
+        topology={
+            **_inputs(tmp_path).topology,
+            "change_facts": _change_facts_payload({
+                "src/worker.py": {
+                    "change_type": "modifies",
+                    "symbols": ["derive_verdict", "coverage_state"],
+                },
+            }),
+        },
+    )
+    proposal = {
+        "overview": "Updates worker review-state handling.",
+        "key_changes": [{
+            "path": "src/worker.py",
+            "component": "worker",
+            "summary": (
+                "Separates coverage incompleteness from defect verdicts in the "
+                "human-facing handoff."
+            ),
+        }],
+        "cross_component_effects": [],
+        "uncertainties": [],
+    }
+
+    validated = controller_module._validated_change_overview(proposal, inputs)
+
+    assert validated["key_changes"][0]["summary"] == (
+        proposal["key_changes"][0]["summary"]
+    )
+
+
 @pytest.mark.parametrize(
     "field",
     ["overview", "key_change", "cross_component_effect", "uncertainty"],

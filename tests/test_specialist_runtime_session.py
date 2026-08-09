@@ -28,6 +28,7 @@ from pr_reviewer.specialist_runtime.request_attempts import RequestAttemptJourna
 from pr_reviewer.specialist_runtime.session import (
     COMPACTED_EVIDENCE_TOOL_NAME,
     SpecialistSession,
+    _candidate_retention_signal,
     _is_context_limit_error,
     _resolve_retained_evidence_id,
     _rewrite_rationale_evidence_ids,
@@ -1518,6 +1519,12 @@ def test_initial_compact_resume_repairs_missing_working_memory_before_compaction
         if event.get("epoch_continuation")
     )
     assert "Tool access is re-enabled for exploration." in continuation
+    continuation_payload = json.loads(continuation.split("catalogued IDs:\n", 1)[1])
+    checkpoint_memory = continuation_payload["cumulative_checkpoint"]
+    assert "coverage" not in checkpoint_memory
+    assert "evidence_metadata" not in checkpoint_memory
+    assert "obligation_statuses" not in checkpoint_memory
+    assert "candidate_statuses" not in checkpoint_memory
 
 
 def test_context_pressure_checkpoint_compacts_and_resumes_same_specialist():
@@ -2249,6 +2256,25 @@ def test_checkpoint_request_includes_compact_schema_contract():
     assert '"candidate_finding_ids"' not in checkpoint_request
     assert '"candidate_findings"' in checkpoint_request
     assert "controller derives internal candidate handles" in checkpoint_request
+    assert (
+        "evidence_by_obligation"
+        not in gateway.requests[1].response_schema["properties"]
+    )
+
+
+def test_truncated_empty_candidate_checkpoint_is_not_a_material_retention_signal():
+    text = json.dumps({
+        "candidate_findings": [],
+        "candidate_updates": [],
+        "new_candidates": [],
+        "completed_steps": [
+            "Reviewed contributor_candidate_ids propagation in adjudication.py",
+        ],
+    })[:-1]
+
+    signal = _candidate_retention_signal(text)
+
+    assert signal.is_material is False
 
 
 def test_malformed_checkpoint_is_repaired_before_projection():

@@ -112,7 +112,6 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
             "type": "array", "maxItems": 40,
             "items": {"type": "string", "maxLength": 256},
         },
-        "evidence_by_obligation": {"type": "object"},
         "inspected": {
             "type": "array", "maxItems": 40,
             "items": {"type": "string", "maxLength": 256},
@@ -276,6 +275,11 @@ _CHECKPOINT_CUMULATIVE_INSTRUCTION = (
     "This checkpoint must be cumulative and self-contained because it may "
     "become a future epoch boundary."
 )
+_CHECKPOINT_CONTROLLER_STATE_INSTRUCTION = (
+    " Do not repeat controller-owned coverage, evidence_by_obligation, "
+    "evidence_metadata, obligation_statuses, recipe_statuses, or "
+    "candidate_statuses. The controller preserves and derives those fields."
+)
 _CHECKPOINT_TOOL_STATE_INSTRUCTION = (
     "Tool access is disabled for this checkpoint turn. Do not emit native "
     "tool calls or XML/function-call markup. Return exactly one JSON object "
@@ -308,6 +312,7 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
 _CHECKPOINT_REPAIR_INSTRUCTION = (
     "Repair the previous checkpoint as one JSON object matching the schema."
     + " " + _CHECKPOINT_TOOL_STATE_INSTRUCTION
+    + _CHECKPOINT_CONTROLLER_STATE_INSTRUCTION
     + _CHECKPOINT_WORKING_MEMORY_INSTRUCTION
     + _CHECKPOINT_RETENTION_INSTRUCTION
 )
@@ -421,10 +426,20 @@ def _json_object(text: str) -> dict[str, Any] | None:
 
 def _contains_candidate_shaped_text(text: str) -> bool:
     """Recognize candidate payloads without retaining untrusted model text."""
-    lowered = text.lower() if isinstance(text, str) else ""
-    return (
-        "candidate_findings" in lowered
-        and ("candidate_id" in lowered or "claim" in lowered)
+    if not isinstance(text, str):
+        return False
+    return bool(
+        re.search(
+            r"[\"']?(?:candidate_findings|candidate_updates|new_candidates)"
+            r"[\"']?\s*:\s*\[\s*\{",
+            text,
+            flags=re.IGNORECASE,
+        )
+        or re.search(
+            r"[\"']?candidate_finding_ids[\"']?\s*:\s*\[\s*[\"']",
+            text,
+            flags=re.IGNORECASE,
+        )
     )
 
 
@@ -973,6 +988,7 @@ class SpecialistSession:
             + _CHECKPOINT_CUMULATIVE_INSTRUCTION
             + "\n"
             + _CHECKPOINT_TOOL_STATE_INSTRUCTION
+            + _CHECKPOINT_CONTROLLER_STATE_INSTRUCTION
             + (
                 " For compact_resume, tool access will be re-enabled after "
                 "the checkpoint validates."
@@ -2692,7 +2708,7 @@ class SpecialistSession:
         self._checkpoint_spans = rebuilt_spans
 
         continuation = {
-            "cumulative_checkpoint": self._cumulative_checkpoint_payload(),
+            "cumulative_checkpoint": self._model_checkpoint_memory(),
             "compacted_evidence": self._compacted_evidence_catalogue(),
             "removal_summary": {
                 **asdict(stats),
@@ -3077,6 +3093,20 @@ class SpecialistSession:
                 },
             },
             "evidence_metadata": evidence_metadata,
+        }
+
+    def _model_checkpoint_memory(self) -> dict[str, object]:
+        """Return only model-owned memory needed after regular compaction."""
+        checkpoint = self.latest_checkpoint
+        return {
+            "working_summary": checkpoint.working_summary,
+            "completed_steps": list(checkpoint.completed_steps),
+            "hypotheses": list(checkpoint.hypotheses),
+            "active_candidates": [
+                asdict(candidate) for candidate in self.candidate_findings
+            ],
+            "unknowns": list(checkpoint.unknowns),
+            "proposed_next_actions": list(checkpoint.proposed_next_actions),
         }
 
     def conversation_contains_evidence_ids(self, evidence_ids: tuple[str, ...]) -> bool:
