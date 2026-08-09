@@ -45,8 +45,8 @@ def tool_call_response(name, arguments, call_id=None):
     )
 
 
-def checkpoint_response(*, inspected, unresolved):
-    text = json.dumps({
+def checkpoint_response(*, inspected, unresolved, **overrides):
+    payload = {
         "inspected": inspected,
         "unresolved": unresolved,
         "hypotheses": [],
@@ -54,7 +54,9 @@ def checkpoint_response(*, inspected, unresolved):
         "invariants_evaluated": [],
         "unknowns": unresolved,
         "proposed_next_actions": [],
-    })
+    }
+    payload.update(overrides)
+    text = json.dumps(payload)
     return ModelTurnResult(
         response={}, tool_calls=(), text=text, text_source="content",
         finish_reason="stop", usage={"prompt_tokens": 3, "completion_tokens": 2},
@@ -447,6 +449,101 @@ def test_checkpoint_carries_forward_candidates_when_update_arrays_are_empty():
     assert first.checkpoint.candidate_finding_ids == ("candidate-code",)
     assert second_result.checkpoint.candidate_finding_ids == ("candidate-code",)
     assert second_result.degraded is False
+
+
+def test_checkpoint_retains_bounded_cumulative_working_state():
+    """Recovery working state survives checkpoint parsing within hard bounds."""
+    gateway = ScriptedGateway([checkpoint_response(
+        inspected=["a.py"],
+        unresolved=["OB-tests"],
+        working_summary=(
+            "The input reaches the controller through config validation. "
+            + "x" * 2_000
+        ),
+        completed_steps=[
+            "Compared action input and config fallback; values agree.",
+            *[f"step-{index}: " + "y" * 600 for index in range(12)],
+        ],
+        hypotheses=[
+            "Recovery authorization still needs a boundary test.",
+            *[f"hypothesis-{index}" for index in range(12)],
+        ],
+        invariants_evaluated=[
+            "Lifetime budget is not reset by follow-up.",
+        ],
+        proposed_next_actions=[
+            "Inspect the recovery authorization test.",
+        ],
+    )])
+
+    result = make_session(gateway).request_checkpoint("controller-request")
+
+    assert result.checkpoint.working_summary.startswith("The input reaches")
+    assert len(result.checkpoint.working_summary) == 2_000
+    assert result.checkpoint.completed_steps == (
+        "Compared action input and config fallback; values agree.",
+        ("step-0: " + "y" * 492),
+        ("step-1: " + "y" * 492),
+        ("step-2: " + "y" * 492),
+        ("step-3: " + "y" * 492),
+        ("step-4: " + "y" * 492),
+        ("step-5: " + "y" * 492),
+        ("step-6: " + "y" * 492),
+        ("step-7: " + "y" * 492),
+        ("step-8: " + "y" * 492),
+        ("step-9: " + "y" * 492),
+        ("step-10: " + "y" * 491),
+    )
+    assert result.checkpoint.hypotheses == (
+        "Recovery authorization still needs a boundary test.",
+        *[f"hypothesis-{index}" for index in range(11)],
+    )
+    assert result.checkpoint.invariants_evaluated == (
+        "Lifetime budget is not reset by follow-up.",
+    )
+    assert result.checkpoint.proposed_next_actions == (
+        "Inspect the recovery authorization test.",
+    )
+
+
+def test_cumulative_checkpoint_payload_materializes_omitted_candidates():
+    """Reconstruction gets controller-owned state without candidate replay."""
+    initial = candidate_checkpoint_response(("candidate-code",))
+    updated = candidate_update_checkpoint_response(
+        updates=(), new_candidates=(),
+    )
+    updated_payload = json.loads(updated.text)
+    updated_payload.update({
+        "working_summary": "The retained candidate still needs a boundary test.",
+        "completed_steps": ["Collected implementation evidence for a.py."],
+        "hypotheses": ["The candidate remains reachable."],
+        "invariants_evaluated": ["Coverage evidence remains retained."],
+        "proposed_next_actions": ["Inspect the boundary test."],
+    })
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        ModelTurnResult(**{**updated.__dict__, "text": json.dumps(updated_payload)}),
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    session.request_checkpoint("controller-request")
+    payload = session._cumulative_checkpoint_payload()
+
+    assert payload["latest_checkpoint"]["working_summary"] == (
+        "The retained candidate still needs a boundary test."
+    )
+    assert payload["latest_checkpoint"]["completed_steps"] == [
+        "Collected implementation evidence for a.py.",
+    ]
+    assert payload["candidate_findings"][0]["candidate_id"] == "candidate-code"
+    assert payload["candidate_statuses"] == {"candidate-code": "active"}
+    assert payload["latest_checkpoint"]["evidence_ids"]
+    assert payload["coverage"]["obligation_statuses"]["OB-code"] == "covered"
+    assert payload["evidence_metadata"][0]["id"].startswith("evidence:")
+    assert "content" not in payload["evidence_metadata"][0]
 
 
 def test_checkpoint_withdraws_known_candidate_only_with_explicit_update():

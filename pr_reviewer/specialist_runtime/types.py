@@ -120,6 +120,8 @@ class SessionCheckpoint:
     state: SessionState
     evidence_ids: tuple[str, ...] = ()
     imported_evidence_ids: tuple[str, ...] = ()
+    working_summary: str = ""
+    completed_steps: tuple[str, ...] = ()
     hypotheses: tuple[str, ...] = ()
     candidate_finding_ids: tuple[str, ...] = ()
     obligation_statuses: tuple[tuple[str, ObligationStatus], ...] = ()

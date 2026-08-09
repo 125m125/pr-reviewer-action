@@ -91,6 +91,11 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
             "type": "array", "maxItems": 12,
             "items": {"type": "string", "maxLength": 500},
         },
+        "working_summary": {"type": "string", "maxLength": 2_000},
+        "completed_steps": {
+            "type": "array", "maxItems": 12,
+            "items": {"type": "string", "maxLength": 500},
+        },
         "candidate_findings": {
             "type": "array", "maxItems": 8,
             "items": {
@@ -220,6 +225,28 @@ def _strings(value: object) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple, set)):
         return ()
     return tuple(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
+
+
+def _bounded_text(value: object, *, max_length: int) -> str:
+    return str(value).strip()[:max_length] if value is not None else ""
+
+
+def _bounded_strings(
+    value: object,
+    *,
+    max_items: int,
+    max_length: int,
+) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple, set)):
+        return ()
+    items: list[str] = []
+    for item in value:
+        text = _bounded_text(item, max_length=max_length)
+        if text and text not in items:
+            items.append(text)
+        if len(items) == max_items:
+            break
+    return tuple(items)
 
 
 def _textual_tool_call_reason(value: object) -> str | None:
@@ -1547,14 +1574,31 @@ class SpecialistSession:
             session_id=self.session_id,
             state=SessionState.CHECKPOINT,
             evidence_ids=tuple(evidence_ids),
-            hypotheses=_strings(raw.get("hypotheses")),
+            working_summary=_bounded_text(
+                raw.get("working_summary"), max_length=2_000,
+            ),
+            completed_steps=_bounded_strings(
+                raw.get("completed_steps"), max_items=12, max_length=500,
+            ),
+            hypotheses=_bounded_strings(
+                raw.get("hypotheses"), max_items=12, max_length=500,
+            ),
             candidate_finding_ids=tuple(
                 item.candidate_id for item in self.candidate_findings
             ),
             obligation_statuses=tuple(sorted(self.coverage.obligation_statuses().items())),
-            invariants_evaluated=_strings(raw.get("invariants_evaluated")),
+            invariants_evaluated=_bounded_strings(
+                raw.get("invariants_evaluated"), max_items=20, max_length=500,
+            ),
             unknowns=self._current_gaps,
-            proposed_next_actions=self._current_gaps,
+            proposed_next_actions=(
+                _bounded_strings(
+                    raw.get("proposed_next_actions"),
+                    max_items=12,
+                    max_length=500,
+                )
+                or self._current_gaps
+            ),
         )
 
     def _candidate_from_checkpoint(
@@ -1942,6 +1986,57 @@ class SpecialistSession:
         self._finalization_diagnostics.append(diagnostic)
         del self._finalization_diagnostics[:-8]
 
+    def _cumulative_checkpoint_payload(self) -> dict[str, object]:
+        """Materialize controller-owned state needed to reconstruct a session."""
+        checkpoint = self.latest_checkpoint
+        coverage = self.coverage.snapshot()
+        retained_evidence = self.evidence_store.snapshot().records
+        cumulative_evidence_ids = tuple(dict.fromkeys((
+            *checkpoint.evidence_ids,
+            *(record.id for record in retained_evidence),
+        )))
+        checkpoint_payload: dict[str, object] = {
+            "session_id": checkpoint.session_id,
+            "state": checkpoint.state.value,
+            "evidence_ids": list(cumulative_evidence_ids),
+            "imported_evidence_ids": list(checkpoint.imported_evidence_ids),
+            "working_summary": checkpoint.working_summary,
+            "completed_steps": list(checkpoint.completed_steps),
+            "hypotheses": list(checkpoint.hypotheses),
+            "candidate_finding_ids": list(checkpoint.candidate_finding_ids),
+            "obligation_statuses": {
+                obligation_id: status.value
+                for obligation_id, status in checkpoint.obligation_statuses
+            },
+            "invariants_evaluated": list(checkpoint.invariants_evaluated),
+            "unknowns": list(checkpoint.unknowns),
+            "proposed_next_actions": list(checkpoint.proposed_next_actions),
+        }
+        evidence_metadata: list[dict[str, object]] = []
+        for record in retained_evidence:
+            metadata = asdict(record)
+            metadata.pop("content", None)
+            evidence_metadata.append(metadata)
+        return {
+            "latest_checkpoint": checkpoint_payload,
+            "candidate_findings": [
+                asdict(candidate) for candidate in self.candidate_findings
+            ],
+            "candidate_statuses": dict(sorted(self._candidate_statuses.items())),
+            "coverage": {
+                "obligation_statuses": {
+                    obligation_id: status.value
+                    for obligation_id, status in coverage.obligation_statuses
+                },
+                "recipe_statuses": dict(coverage.recipe_statuses),
+                "evidence_by_obligation": {
+                    obligation_id: list(evidence_ids)
+                    for obligation_id, evidence_ids in coverage.evidence_by_obligation
+                },
+            },
+            "evidence_metadata": evidence_metadata,
+        }
+
     def conversation_contains_evidence_ids(self, evidence_ids: tuple[str, ...]) -> bool:
         transcript = json.dumps(self.conversation.events, sort_keys=True)
         return all(evidence_id in transcript for evidence_id in evidence_ids)
@@ -1985,7 +2080,7 @@ class SpecialistSession:
         usage = self.budget.snapshot()
         recovery_payload = {
             "recovery_reason": normalized,
-            "latest_checkpoint": asdict(self.latest_checkpoint),
+            **self._cumulative_checkpoint_payload(),
             "evidence": evidence,
             "current_gaps": list(self._current_gaps),
             "source_access_requests": [
