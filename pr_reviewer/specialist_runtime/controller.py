@@ -1814,6 +1814,70 @@ def _artifact_value(value: object, *, depth: int = 0) -> object:
         return "[unserializable]"
 
 
+_CHECKPOINT_DIAGNOSTIC_SCALARS = frozenset({
+    "code", "attempt", "reason", "disposition", "initial_parse",
+    "repair_attempted", "repair_parse", "initial_finish_reason",
+    "repair_finish_reason", "fallback_projection", "retention_unknown",
+    "material_candidate_signal", "candidate_ids_seen",
+    "unidentified_candidate_shapes", "omitted_count", "initial_error",
+    "repair_error", "context_tokens_before", "context_tokens_after",
+    "estimated_input_tokens", "coarse_input_tokens",
+    "provider_calibrated_input_tokens", "max_context_tokens",
+    "requested_output_tokens", "response_reserve_tokens",
+    "repair_response_reserve_tokens", "wire_safety_tokens",
+    "rendered_request_bytes", "admission_tokens", "admission_source",
+    "actual_prompt_tokens", "actual_completion_tokens",
+    "compacted_evidence_count", "assistant_messages_compacted",
+    "compaction_level", "compaction_input_tokens_before",
+    "compaction_input_tokens_after", "removed_reasoning_messages",
+    "placeholder_replaced_results", "removed_old_exchanges",
+    "retained_full_results", "emergency_outcome",
+})
+_CHECKPOINT_DIAGNOSTIC_TUPLES = frozenset({
+    "candidate_ids", "omitted_candidate_ids", "candidate_finding_ids",
+})
+
+
+def _checkpoint_diagnostic_projection(value: object) -> dict[str, object]:
+    """Allowlist bounded scalar/tuple lifecycle telemetry only."""
+    if not isinstance(value, Mapping):
+        return {}
+    projected: dict[str, object] = {}
+    for key in sorted(_CHECKPOINT_DIAGNOSTIC_SCALARS):
+        item = value.get(key)
+        if item is None or isinstance(item, bool):
+            if key in value:
+                projected[key] = item
+        elif isinstance(item, int):
+            projected[key] = max(-1_000_000_000_000, min(item, 1_000_000_000_000))
+        elif isinstance(item, float) and isfinite(item):
+            projected[key] = max(-1_000_000_000_000.0, min(item, 1_000_000_000_000.0))
+        elif isinstance(item, (str, Enum)):
+            projected[key] = _mask_runtime_text(str(
+                item.value if isinstance(item, Enum) else item
+            ))[:300]
+    for key in sorted(_CHECKPOINT_DIAGNOSTIC_TUPLES):
+        item = value.get(key)
+        if not isinstance(item, (tuple, list)):
+            continue
+        projected[key] = tuple(
+            _mask_runtime_text(str(member))[:120]
+            for member in item[:16]
+            if isinstance(member, (bool, int, float, str, Enum))
+        )
+    return projected
+
+
+def _checkpoint_diagnostics_projection(value: object) -> tuple[dict[str, object], ...]:
+    if not isinstance(value, (tuple, list)):
+        return ()
+    return tuple(
+        projected
+        for item in value[:8]
+        if (projected := _checkpoint_diagnostic_projection(item))
+    )
+
+
 def _checkpoint_projection(checkpoint: object) -> dict[str, object]:
     statuses = getattr(checkpoint, "obligation_statuses", ())
     return {
@@ -4103,7 +4167,9 @@ class ReviewController:
                 "budget": _budget_projection(result.budget) if result else _budget_projection(BudgetUsage()),
                 "degraded": bool(result.degraded) if result else True,
                 "finalization_diagnostics": (
-                    _json_value(getattr(result, "finalization_diagnostics", ()))
+                    _checkpoint_diagnostics_projection(getattr(
+                        result, "finalization_diagnostics", (),
+                    ))
                     if result else []
                 ),
             })
@@ -4901,7 +4967,9 @@ class ReviewController:
                         journal.emit("specialist_checkpoint_diagnostics", {
                             "assignment_id": session.assignment.id,
                             "session_id": result.session_id,
-                            "diagnostics": _json_value(diagnostics),
+                            "diagnostics": _checkpoint_diagnostics_projection(
+                                diagnostics,
+                            ),
                         })
                     journal.emit("session_transition", {
                         "session_id": result.session_id,
@@ -5022,11 +5090,13 @@ class ReviewController:
                     ),
                     "budget": _budget_projection(emergency_results[session_id].budget),
                     "degraded": bool(emergency_results[session_id].degraded),
-                    "finalization_diagnostics": _json_value(getattr(
-                        emergency_results[session_id],
-                        "finalization_diagnostics",
-                        (),
-                    )),
+                    "finalization_diagnostics": _checkpoint_diagnostics_projection(
+                        getattr(
+                            emergency_results[session_id],
+                            "finalization_diagnostics",
+                            (),
+                        ),
+                    ),
                 }
                 for session_id in sorted(emergency_results)
             ]

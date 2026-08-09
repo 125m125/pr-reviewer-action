@@ -1384,6 +1384,23 @@ def _runtime_event_line(
         suffix += f" assignment={assignment}" if assignment else ""
         if request_id:
             suffix += f" request={request_id}"
+        for key, label in (
+            ("input_tokens", "input"),
+            ("max_output_tokens", "response_reserve"),
+            ("admission_tokens", "admission"),
+            ("admission_source", "source"),
+        ):
+            value = payload.get(key)
+            if isinstance(value, (bool, int, float, str)) and value not in ("", None):
+                suffix += f" {label}={_compact_text(value, 60)}"
+        if status != "started":
+            for key, label in (
+                ("actual_prompt_tokens", "actual_prompt"),
+                ("actual_completion_tokens", "actual_completion"),
+            ):
+                value = payload.get(key)
+                if isinstance(value, (bool, int, float, str)):
+                    suffix += f" {label}={_compact_text(value, 60)}"
         if finish:
             suffix += f" finish_reason={finish}"
         if error_text:
@@ -1403,23 +1420,47 @@ def _runtime_event_line(
             else {}
         )
         if isinstance(latest, Mapping):
-            details = []
-            for key in (
-                "reason", "initial_parse", "repair_attempted", "repair_parse",
-                "fallback_projection", "retention_unknown", "initial_finish_reason",
-                "repair_finish_reason",
-                "initial_error", "repair_error", "context_tokens_before",
-                "context_tokens_after", "max_context_tokens",
-                "requested_output_tokens", "wire_safety_tokens",
-                "compacted_evidence_count", "assistant_messages_compacted",
+            def field(key: str, label: str | None = None) -> str:
+                value = latest.get(key)
+                if not isinstance(value, (bool, int, float, str)):
+                    return ""
+                return f"{label or key}={_compact_text(value, 80)}"
+
+            details = [
+                field("reason"),
+                field("disposition"),
+                field("estimated_input_tokens", "estimated_input"),
+                field("provider_calibrated_input_tokens", "calibrated_input"),
+            ]
+            first_reserve = latest.get("response_reserve_tokens")
+            repair_reserve = latest.get("repair_response_reserve_tokens")
+            if isinstance(first_reserve, (int, float)) and isinstance(
+                repair_reserve, (int, float)
             ):
-                if key in latest and latest[key] not in (None, "", False, ()):
-                    details.append(f"{key}={_compact_text(latest[key], 80)}")
+                details.append(
+                    f"response_reserves={first_reserve}+{repair_reserve}"
+                )
+            details.extend((
+                field("admission_source", "source"),
+                field("compaction_level", "compaction"),
+                field("compaction_input_tokens_before", "before"),
+                field("compaction_input_tokens_after", "after"),
+                field("removed_reasoning_messages", "removed_reasoning"),
+                field("placeholder_replaced_results", "replaced_results"),
+                field("removed_old_exchanges", "removed_exchanges"),
+                field("retained_full_results", "retained_results"),
+                field("emergency_outcome", "emergency"),
+                field("initial_parse"),
+                field("repair_parse"),
+                field("fallback_projection"),
+                field("retention_unknown"),
+            ))
+            details = [item for item in details if item]
             return (
-                f"specialist {session_id} checkpoint diagnostics: "
+                f"specialist {session_id} checkpoint lifecycle: "
                 + (" ".join(details) if details else "recorded")
             )
-        return f"specialist {session_id} checkpoint diagnostics recorded"
+        return f"specialist {session_id} checkpoint lifecycle: recorded"
     if kind == "specialist_initializing":
         return (
             f"initializing specialist {session_id} assignment="

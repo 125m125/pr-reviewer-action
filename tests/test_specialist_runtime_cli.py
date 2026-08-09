@@ -106,6 +106,87 @@ def test_runtime_event_line_reports_request_purpose_and_suppresses_duplicate_adm
     ) is None
 
 
+def test_runtime_event_line_reports_bounded_admission_and_actual_usage():
+    from pr_reviewer.specialist_runtime.events import RunEvent
+
+    line = cli._runtime_event_line(RunEvent(2, "llm_request_completed", {
+        "session_id": "session:test",
+        "gateway_request_id": "session:test:model:4",
+        "turn": 4,
+        "purpose": "checkpoint",
+        "input_tokens": 12_000,
+        "max_output_tokens": 2_048,
+        "admission_tokens": 14_304,
+        "admission_source": "provider-calibrated",
+        "actual_prompt_tokens": 11_900,
+        "actual_completion_tokens": 317,
+        "prompt": "must never be logged",
+        "raw_response": "must never be logged",
+    }))
+
+    assert "input=12000" in line
+    assert "response_reserve=2048" in line
+    assert "admission=14304" in line
+    assert "source=provider-calibrated" in line
+    assert "actual_prompt=11900" in line
+    assert "actual_completion=317" in line
+    assert "must never be logged" not in line
+
+
+def test_runtime_checkpoint_diagnostic_is_one_bounded_compaction_lifecycle_line():
+    from pr_reviewer.specialist_runtime.events import RunEvent
+
+    line = cli._runtime_event_line(RunEvent(
+        3,
+        "specialist_checkpoint_diagnostics",
+        {
+            "session_id": "session:test",
+            "diagnostics": ({
+                "reason": "provider-context-limit",
+                "disposition": "compact_resume",
+                "estimated_input_tokens": 12_000,
+                "provider_calibrated_input_tokens": 12_500,
+                "response_reserve_tokens": 2_048,
+                "repair_response_reserve_tokens": 2_048,
+                "admission_source": "provider-calibrated",
+                "compaction_level": "emergency",
+                "compaction_input_tokens_before": 15_000,
+                "compaction_input_tokens_after": 8_000,
+                "removed_reasoning_messages": 4,
+                "placeholder_replaced_results": 3,
+                "removed_old_exchanges": 2,
+                "retained_full_results": 2,
+                "emergency_outcome": "checkpoint_succeeded",
+                "prompt": "secret prompt",
+                "raw_response": "secret response",
+                "evidence_body": "secret evidence",
+                "reasoning": "secret reasoning",
+            },),
+        },
+    ))
+
+    assert line.count("checkpoint lifecycle:") == 1
+    for fragment in (
+        "reason=provider-context-limit",
+        "disposition=compact_resume",
+        "estimated_input=12000",
+        "calibrated_input=12500",
+        "response_reserves=2048+2048",
+        "source=provider-calibrated",
+        "compaction=emergency",
+        "before=15000",
+        "after=8000",
+        "removed_reasoning=4",
+        "replaced_results=3",
+        "removed_exchanges=2",
+        "retained_results=2",
+        "emergency=checkpoint_succeeded",
+    ):
+        assert fragment in line
+    for secret in ("secret prompt", "secret response", "secret evidence", "secret reasoning"):
+        assert secret not in line
+
+
 def test_runtime_event_line_explains_record_unknown_negotiation_action():
     from pr_reviewer.specialist_runtime.events import RunEvent
 

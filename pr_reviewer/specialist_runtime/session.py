@@ -729,6 +729,7 @@ class _AdmissionEstimate:
     source: str
     rendered_bytes: int
     coarse_input_tokens: int
+    provider_calibrated_input_tokens: int
 
 
 @dataclass
@@ -1016,25 +1017,26 @@ class SpecialistSession:
 
         calibration = self._admission_calibration[mode]
         candidates = [(coarse_tokens, "coarse-conversation", 0)]
+        calibrated_candidates: list[int] = []
         if rendered_bytes > 0:
             candidates.append((
                 math.ceil(rendered_bytes / 3), "rendered-fallback", 1,
             ))
             if calibration.max_tokens_per_rendered_byte > 0:
-                candidates.append((
-                    math.ceil(
-                        rendered_bytes
-                        * calibration.max_tokens_per_rendered_byte
-                    ),
-                    "provider-calibrated",
-                    2,
+                calibrated_candidates.append(math.ceil(
+                    rendered_bytes * calibration.max_tokens_per_rendered_byte
                 ))
             if calibration.max_positive_offset > 0:
-                candidates.append((
-                    coarse_tokens + calibration.max_positive_offset,
-                    "provider-calibrated",
-                    2,
-                ))
+                calibrated_candidates.append(
+                    coarse_tokens + calibration.max_positive_offset
+                )
+        provider_calibrated_input_tokens = max(calibrated_candidates, default=0)
+        if provider_calibrated_input_tokens:
+            candidates.append((
+                provider_calibrated_input_tokens,
+                "provider-calibrated",
+                2,
+            ))
         input_tokens, source, _priority = max(
             candidates, key=lambda item: (item[0], item[2]),
         )
@@ -1051,6 +1053,7 @@ class SpecialistSession:
             source=source,
             rendered_bytes=rendered_bytes,
             coarse_input_tokens=coarse_tokens,
+            provider_calibrated_input_tokens=provider_calibrated_input_tokens,
         )
 
     def _record_admission_calibration(
@@ -1143,8 +1146,17 @@ class SpecialistSession:
         self._last_context_admission = {
             "context_tokens_before": admission.input_tokens,
             "context_tokens_after": admission.input_tokens,
+            "estimated_input_tokens": admission.input_tokens,
+            "coarse_input_tokens": admission.coarse_input_tokens,
+            "provider_calibrated_input_tokens": (
+                admission.provider_calibrated_input_tokens
+            ),
             "max_context_tokens": self.max_context_tokens,
             "requested_output_tokens": request_max_tokens,
+            "response_reserve_tokens": request_max_tokens,
+            "repair_response_reserve_tokens": (
+                self.checkpoint_max_tokens if purpose == "checkpoint" else 0
+            ),
             "wire_safety_tokens": self.wire_safety_tokens,
             "rendered_request_bytes": admission.rendered_bytes,
             "admission_tokens": admission.admission_tokens,
@@ -1164,6 +1176,11 @@ class SpecialistSession:
                 )
                 self._last_context_admission.update({
                     "context_tokens_after": admission.input_tokens,
+                    "estimated_input_tokens": admission.input_tokens,
+                    "coarse_input_tokens": admission.coarse_input_tokens,
+                    "provider_calibrated_input_tokens": (
+                        admission.provider_calibrated_input_tokens
+                    ),
                     "rendered_request_bytes": admission.rendered_bytes,
                     "admission_tokens": admission.admission_tokens,
                     "admission_source": admission.source,
@@ -1238,6 +1255,10 @@ class SpecialistSession:
         actual_completion_tokens = self._usage_tokens(
             result.usage, "completion_tokens",
         )
+        self._last_context_admission.update({
+            "actual_prompt_tokens": actual_prompt_tokens,
+            "actual_completion_tokens": actual_completion_tokens,
+        })
         if self._request_attempt_journal is not None:
             self._request_attempt_journal.finish(
                 request_id,
@@ -1466,13 +1487,20 @@ class SpecialistSession:
         *,
         diagnostic_recorded: bool = False,
     ) -> SessionResult:
+        before = self._estimate_admission(
+            tools_enabled=True, max_tokens=self.max_tokens,
+        )
         if self._reconstruct_from_valid_checkpoint():
+            after = self._estimate_admission(
+                tools_enabled=True, max_tokens=self.max_tokens,
+            )
             if diagnostic_recorded and self._finalization_diagnostics:
                 self._finalization_diagnostics[-1]["fallback_projection"] = False
                 self._finalization_diagnostics[-1]["retention_unknown"] = False
             else:
                 self._record_checkpoint_diagnostic(
                     reason="provider-context-limit",
+                    disposition=CheckpointDisposition.COMPACT_RESUME,
                     initial_parse="unavailable",
                     repair_attempted=False,
                     repair_parse="not_attempted",
@@ -1481,6 +1509,12 @@ class SpecialistSession:
                     initial_error=format_callback_error(emergency_error, limit=300),
                     context_admission=self._last_context_admission,
                 )
+            self._finalization_diagnostics[-1].update({
+                "compaction_level": "emergency_reconstruction",
+                "compaction_input_tokens_before": before.input_tokens,
+                "compaction_input_tokens_after": after.input_tokens,
+                "emergency_outcome": "fallback_reconstructed",
+            })
             self.state = SessionState.CHECKPOINT
             return self._snapshot()
 
@@ -1494,6 +1528,7 @@ class SpecialistSession:
         else:
             self._record_checkpoint_diagnostic(
                 reason="provider-context-limit",
+                disposition=CheckpointDisposition.COMPACT_RESUME,
                 initial_parse="unavailable",
                 repair_attempted=False,
                 repair_parse="not_attempted",
@@ -1502,6 +1537,10 @@ class SpecialistSession:
                 initial_error=format_callback_error(emergency_error, limit=300),
                 context_admission=self._last_context_admission,
             )
+        self._finalization_diagnostics[-1].update({
+            "compaction_level": "none",
+            "emergency_outcome": "failed_no_checkpoint",
+        })
         self.state = SessionState.CHECKPOINT
         return self._snapshot(degraded=True)
 
@@ -1781,6 +1820,7 @@ class SpecialistSession:
         checkpoint_request_start = len(self.conversation.events)
         self.conversation.add_user(self._checkpoint_prompt(reason, disposition))
         request_event_count = len(self._request_events)
+        checkpoint_context_admission: dict[str, object] = {}
         try:
             turn = self._request(
                 tools_enabled=False,
@@ -1791,6 +1831,7 @@ class SpecialistSession:
                 allow_gateway_fallbacks=allow_gateway_fallbacks,
             )
         except (BudgetExhausted, TimeoutError) as exc:
+            checkpoint_context_admission = dict(self._last_context_admission)
             if (
                 len(self._request_events) > request_event_count
                 and self._request_events[-1].status == "completed"
@@ -1808,6 +1849,7 @@ class SpecialistSession:
             )
             self._record_checkpoint_diagnostic(
                 reason=reason,
+                disposition=disposition,
                 initial_parse="unavailable",
                 repair_attempted=False,
                 repair_parse="not_attempted",
@@ -1817,10 +1859,11 @@ class SpecialistSession:
                     in self.latest_checkpoint.unknowns
                 ),
                 initial_error=f"{type(exc).__name__}: {exc}",
-                context_admission=self._last_context_admission,
+                context_admission=checkpoint_context_admission,
             )
             self.state = SessionState.CHECKPOINT
             return self._snapshot(degraded=True)
+        checkpoint_context_admission = dict(self._last_context_admission)
         self._candidate_retention_signal = self._candidate_retention_signal.merged(
             _candidate_retention_signal(turn.content)
         )
@@ -1897,6 +1940,7 @@ class SpecialistSession:
         # instead of only explaining failures.
         self._record_checkpoint_diagnostic(
             reason=reason,
+            disposition=disposition,
             initial_parse=initial_parse,
             repair_attempted=repair_attempted,
             repair_parse=repair_parse,
@@ -1905,7 +1949,7 @@ class SpecialistSession:
             initial_finish_reason=initial_finish_reason,
             repair_finish_reason=repair_finish_reason,
             repair_error=repair_error,
-            context_admission=self._last_context_admission,
+            context_admission=checkpoint_context_admission,
         )
         self.latest_checkpoint = checkpoint
         if not fallback_projection and not retention_unknown:
@@ -1915,7 +1959,11 @@ class SpecialistSession:
                 disposition=disposition,
             ))
             if disposition is CheckpointDisposition.COMPACT_RESUME:
-                self._compact_validated_epoch()
+                self._compact_validated_epoch(compaction_level=(
+                    "emergency"
+                    if reason == "provider-context-limit"
+                    else "regular"
+                ))
         self.state = SessionState.CHECKPOINT
         return self._snapshot(degraded=fallback_projection or retention_unknown)
 
@@ -2405,7 +2453,9 @@ class SpecialistSession:
         payload["evidence_metadata"] = bounded_metadata
         return payload
 
-    def _compact_validated_epoch(self) -> EpochCompactionStats:
+    def _compact_validated_epoch(
+        self, *, compaction_level: str = "regular",
+    ) -> EpochCompactionStats:
         """Compact only history closed by the latest validated checkpoint."""
         if not self._checkpoint_spans:
             return EpochCompactionStats()
@@ -2413,6 +2463,9 @@ class SpecialistSession:
         if latest.compacted:
             return EpochCompactionStats()
 
+        before = self._estimate_admission(
+            tools_enabled=True, max_tokens=self.max_tokens,
+        )
         old_events = list(self.conversation.events)
         span_markers = [
             (old_events[span.request_start], old_events[span.response_end - 1])
@@ -2431,6 +2484,8 @@ class SpecialistSession:
             else 0
         )
         removed_old_events = 0
+        removed_old_exchanges = 0
+        removed_pruned_reasoning = 0
         pruned_evidence_ids: set[str] = set()
         working: list[dict[str, Any]] = []
         for index, event in enumerate(old_events):
@@ -2440,6 +2495,10 @@ class SpecialistSession:
                 and id(event) not in protected_ids
             ):
                 removed_old_events += 1
+                if event.get("kind") == "assistant_turn_boundary":
+                    removed_old_exchanges += 1
+                if event.get("kind") == "assistant_reasoning":
+                    removed_pruned_reasoning += 1
                 if event.get("kind") == "tool_result":
                     evidence_id = self._tool_call_evidence_ids.get(
                         str(event.get("call_id") or ""),
@@ -2544,6 +2603,21 @@ class SpecialistSession:
             ),
             "epoch_continuation": True,
         })
+        after = self._estimate_admission(
+            tools_enabled=True, max_tokens=self.max_tokens,
+        )
+        if self._finalization_diagnostics:
+            self._finalization_diagnostics[-1].update({
+                "compaction_level": str(compaction_level)[:40],
+                "compaction_input_tokens_before": before.input_tokens,
+                "compaction_input_tokens_after": after.input_tokens,
+                "removed_reasoning_messages": (
+                    removed_pruned_reasoning + stats.removed_reasoning
+                ),
+                "placeholder_replaced_results": stats.replaced_results,
+                "removed_old_exchanges": removed_old_exchanges,
+                "retained_full_results": stats.retained_full_results,
+            })
         return stats
 
     def _compact_conversation(self) -> None:
@@ -2786,6 +2860,7 @@ class SpecialistSession:
         self,
         *,
         reason: str,
+        disposition: CheckpointDisposition | str,
         initial_parse: str,
         repair_attempted: bool,
         repair_parse: str,
@@ -2798,8 +2873,10 @@ class SpecialistSession:
         context_admission: Mapping[str, object] | None = None,
     ) -> None:
         signal = self._candidate_retention_signal
+        disposition = CheckpointDisposition(disposition)
         diagnostic: dict[str, object] = {
             "reason": str(reason)[:120],
+            "disposition": disposition.value,
             "initial_parse": initial_parse,
             "repair_attempted": bool(repair_attempted),
             "repair_parse": repair_parse,
@@ -2814,6 +2891,22 @@ class SpecialistSession:
             "omitted_candidate_ids": signal.omitted_candidate_ids,
             "initial_error": str(initial_error)[:300],
             "repair_error": str(repair_error)[:300],
+            "compaction_level": "none",
+            "compaction_input_tokens_before": 0,
+            "compaction_input_tokens_after": 0,
+            "removed_reasoning_messages": 0,
+            "placeholder_replaced_results": 0,
+            "removed_old_exchanges": 0,
+            "retained_full_results": 0,
+            "emergency_outcome": (
+                "checkpoint_degraded"
+                if reason == "provider-context-limit" and fallback_projection
+                else (
+                    "checkpoint_succeeded"
+                    if reason == "provider-context-limit"
+                    else "not_attempted"
+                )
+            ),
         }
         diagnostic.update(dict(context_admission or {}))
         self._finalization_diagnostics.append(diagnostic)

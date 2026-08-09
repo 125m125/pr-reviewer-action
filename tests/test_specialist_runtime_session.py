@@ -577,6 +577,10 @@ def test_emergency_checkpoint_recovers_one_exploration_context_error():
     assert "context_length_exceeded" in terminal_attempts[0].error
     assert "super-secret" not in terminal_attempts[0].error
     assert result.budget.model_turns == 2
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["disposition"] == "compact_resume"
+    assert diagnostic["compaction_level"] == "emergency"
+    assert diagnostic["emergency_outcome"] == "checkpoint_succeeded"
 
 
 def test_emergency_checkpoint_context_error_stops_without_a_third_request():
@@ -594,6 +598,9 @@ def test_emergency_checkpoint_context_error_stops_without_a_third_request():
     assert result.degraded is True
     assert "candidate-retention-unknown" in result.checkpoint.unknowns
     assert result.budget.model_turns == 2
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["compaction_level"] == "none"
+    assert diagnostic["emergency_outcome"] == "failed_no_checkpoint"
 
 
 def test_emergency_checkpoint_context_error_uses_two_physical_provider_calls():
@@ -756,6 +763,11 @@ def test_failed_emergency_checkpoint_reconstructs_previous_valid_checkpoint():
         event.get("emergency_reconstruction")
         for event in session.conversation.events
     )
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["compaction_level"] == "emergency_reconstruction"
+    assert diagnostic["emergency_outcome"] == "fallback_reconstructed"
+    assert diagnostic["compaction_input_tokens_before"] > 0
+    assert diagnostic["compaction_input_tokens_after"] > 0
 
 
 def test_emergency_checkpoint_guard_is_session_lifetime():
@@ -1459,6 +1471,79 @@ def test_epoch_compaction_runs_only_after_compact_resume_checkpoint_validates():
     assert len(continuation) == 1
     assert records[0].id in continuation[0]["content"]
     assert '"proposed_next_actions"' in continuation[0]["content"]
+
+
+def test_checkpoint_diagnostic_projects_admission_and_regular_compaction_counts():
+    gateway = EstimatingGateway(
+        [
+            checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+            checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+        ],
+        rendered_bytes=24_000,
+        usages=(
+            {"prompt_tokens": 9_000, "completion_tokens": 200},
+            {"prompt_tokens": 8_500, "completion_tokens": 180},
+        ),
+    )
+    session = make_session(gateway, max_context_tokens=100_000)
+    seed_successful_tool_exchange(
+        session,
+        call_id="diagnostic-prior-epoch",
+        path="prior.py",
+        content="prior diagnostic evidence",
+        reasoning="prior private diagnostic reasoning",
+    )
+    session.request_checkpoint("controller-request", disposition="pause")
+    for index in range(4):
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"diagnostic-{index}",
+            path=f"{index}.py",
+            content=f"diagnostic evidence {index}",
+            reasoning=f"private diagnostic reasoning {index}",
+        )
+
+    result = session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+    diagnostic = result.finalization_diagnostics[-1]
+
+    assert diagnostic["reason"] == "context-pressure"
+    assert diagnostic["disposition"] == "compact_resume"
+    assert diagnostic["estimated_input_tokens"] >= 9_000
+    assert diagnostic["provider_calibrated_input_tokens"] >= 9_000
+    assert diagnostic["response_reserve_tokens"] == session.checkpoint_max_tokens
+    assert diagnostic["repair_response_reserve_tokens"] == session.checkpoint_max_tokens
+    assert diagnostic["admission_source"] == "provider-calibrated"
+    assert diagnostic["compaction_level"] == "regular"
+    assert diagnostic["compaction_input_tokens_before"] > 0
+    assert diagnostic["compaction_input_tokens_after"] > 0
+    assert diagnostic["removed_reasoning_messages"] == 5
+    assert diagnostic["placeholder_replaced_results"] == 2
+    assert diagnostic["removed_old_exchanges"] >= 1
+    assert diagnostic["retained_full_results"] == 2
+    assert diagnostic["emergency_outcome"] == "not_attempted"
+    serialized = json.dumps(diagnostic, sort_keys=True)
+    assert "private diagnostic reasoning" not in serialized
+    assert "diagnostic evidence" not in serialized
+
+
+def test_checkpoint_diagnostic_admission_keeps_initial_and_repair_reserves():
+    gateway = EstimatingGateway(
+        [
+            invalid_response("invalid initial checkpoint"),
+            checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+        ],
+        rendered_bytes=12_000,
+    )
+    session = make_session(gateway, max_context_tokens=100_000)
+
+    result = session.request_checkpoint("controller-request")
+    diagnostic = result.finalization_diagnostics[-1]
+
+    assert diagnostic["repair_attempted"] is True
+    assert diagnostic["response_reserve_tokens"] == session.checkpoint_max_tokens
+    assert diagnostic["repair_response_reserve_tokens"] == session.checkpoint_max_tokens
 
 
 def test_epoch_compaction_rejects_invalid_checkpoint_and_failed_repair():

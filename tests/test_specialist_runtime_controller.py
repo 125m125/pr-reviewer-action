@@ -1133,6 +1133,76 @@ def test_session_finalization_diagnostics_are_artifact_only(tmp_path):
     assert "candidate-forged" not in result.handoff.markdown
 
 
+def test_checkpoint_diagnostic_projection_allowlists_bounded_lifecycle_fields(tmp_path):
+    diagnostic = {
+        "reason": "context-pressure",
+        "disposition": "compact_resume",
+        "estimated_input_tokens": 12_000,
+        "provider_calibrated_input_tokens": 12_500,
+        "response_reserve_tokens": 2_048,
+        "repair_response_reserve_tokens": 2_048,
+        "admission_tokens": 16_852,
+        "admission_source": "provider-calibrated",
+        "actual_prompt_tokens": 11_900,
+        "actual_completion_tokens": 317,
+        "compaction_level": "regular",
+        "compaction_input_tokens_before": 15_000,
+        "compaction_input_tokens_after": 8_000,
+        "removed_reasoning_messages": 4,
+        "placeholder_replaced_results": 3,
+        "removed_old_exchanges": 2,
+        "retained_full_results": 2,
+        "emergency_outcome": "not_attempted",
+        "prompt": "secret prompt",
+        "raw_response": "secret response",
+        "evidence_body": "secret evidence",
+        "reasoning": "secret reasoning",
+        "nested": {"secret": "model material"},
+    }
+
+    class DiagnosedSession(_SuccessfulSession):
+        def finalize(self):
+            return replace(
+                super().finalize(),
+                finalization_diagnostics=(diagnostic,),
+            )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return DiagnosedSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    result = _controller(tmp_path, session_factory=factory).run(_inputs(tmp_path))
+    projected = result.artifact["sessions"][0]["finalization_diagnostics"][0]
+    event_projection = next(
+        item["payload"]["diagnostics"][0]
+        for item in result.artifact["events"]
+        if item["kind"] == "specialist_checkpoint_diagnostics"
+    )
+
+    assert projected == event_projection
+    assert projected["reason"] == "context-pressure"
+    assert projected["disposition"] == "compact_resume"
+    assert projected["provider_calibrated_input_tokens"] == 12_500
+    assert projected["actual_prompt_tokens"] == 11_900
+    assert projected["compaction_level"] == "regular"
+    assert projected["emergency_outcome"] == "not_attempted"
+    assert all(
+        value is None or isinstance(value, (bool, int, float, str, tuple))
+        for value in projected.values()
+    )
+    serialized = json.dumps(projected, sort_keys=True)
+    for secret in (
+        "secret prompt", "secret response", "secret evidence",
+        "secret reasoning", "model material",
+    ):
+        assert secret not in serialized
+
+
 def _factory(
     assignment, lease, snapshot, evidence_store, coverage, obligations,
     expected_session_id,
