@@ -1417,24 +1417,16 @@ class SpecialistSession:
             previous_candidate_statuses = dict(self._candidate_statuses)
             previous_gaps = self._current_gaps
             previous_coverage = self.coverage.snapshot()
-            try:
-                emergency_result = self.request_checkpoint(
-                    "provider-context-limit",
-                    disposition=CheckpointDisposition.COMPACT_RESUME,
-                    allow_gateway_fallbacks=False,
-                    allow_repair=False,
-                )
-            except BaseException as exc:
-                if not _is_context_limit_error(exc):
-                    raise
-                emergency_error = exc
-            else:
-                if not emergency_result.degraded:
-                    return emergency_result
+            previous_retention_signal = self._candidate_retention_signal
+            previous_event_count = len(self.conversation.events)
+
+            def rollback_tentative_checkpoint() -> None:
                 self.latest_checkpoint = previous_checkpoint
                 self.candidate_findings = previous_candidates
                 self._candidate_statuses = previous_candidate_statuses
                 self._current_gaps = previous_gaps
+                self._candidate_retention_signal = previous_retention_signal
+                del self.conversation.events[previous_event_count:]
                 self.coverage.replace_reconciled_state(
                     dict(previous_coverage.evidence_by_obligation),
                     (
@@ -1444,6 +1436,23 @@ class SpecialistSession:
                         if status is ObligationStatus.UNRESOLVED
                     ),
                 )
+
+            try:
+                emergency_result = self.request_checkpoint(
+                    "provider-context-limit",
+                    disposition=CheckpointDisposition.COMPACT_RESUME,
+                    allow_gateway_fallbacks=False,
+                    allow_repair=False,
+                )
+            except BaseException as exc:
+                rollback_tentative_checkpoint()
+                if not _is_context_limit_error(exc):
+                    raise
+                emergency_error = exc
+            else:
+                if not emergency_result.degraded:
+                    return emergency_result
+                rollback_tentative_checkpoint()
                 return self._fallback_after_emergency_checkpoint(
                     emergency_error,
                     diagnostic_recorded=True,
@@ -1458,7 +1467,10 @@ class SpecialistSession:
         diagnostic_recorded: bool = False,
     ) -> SessionResult:
         if self._reconstruct_from_valid_checkpoint():
-            if not diagnostic_recorded:
+            if diagnostic_recorded and self._finalization_diagnostics:
+                self._finalization_diagnostics[-1]["fallback_projection"] = False
+                self._finalization_diagnostics[-1]["retention_unknown"] = False
+            else:
                 self._record_checkpoint_diagnostic(
                     reason="provider-context-limit",
                     initial_parse="unavailable",

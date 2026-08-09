@@ -648,6 +648,53 @@ def test_invalid_emergency_checkpoint_does_not_request_repair():
     assert result.budget.model_turns == 2
 
 
+def test_rejected_emergency_checkpoint_rolls_back_all_tentative_state():
+    rejected_candidate = (
+        '{"candidate_findings":[{"candidate_id":"phantom-candidate",'
+        '"claim":"rejected emergency output"}]}'
+    )
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["a.py"],
+            unresolved=["OB-tests"],
+            working_summary="Prior validated state.",
+        ),
+        ModelRequestError("prompt too long", status=400),
+        invalid_response(rejected_candidate),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
+    session.request_checkpoint("controller-request", disposition="pause")
+    prior_signal = session._candidate_retention_signal
+
+    emergency_result = session.explore()
+
+    assert session._candidate_retention_signal == prior_signal
+    transcript = json.dumps(session.conversation.events, sort_keys=True)
+    assert "phantom-candidate" not in transcript
+    assert "rejected emergency output" not in transcript
+    assert "Checkpoint reason: provider-context-limit." not in transcript
+    emergency_diagnostic = emergency_result.finalization_diagnostics[-1]
+    assert emergency_diagnostic["initial_parse"] == "invalid"
+    assert emergency_diagnostic["fallback_projection"] is False
+    assert emergency_diagnostic["retention_unknown"] is False
+    failed_exploration = attempts.close_since(0)[1]
+    assert failed_exploration.purpose == "exploration"
+    assert failed_exploration.status == "failed"
+    assert "prompt too long" in failed_exploration.error
+
+    later_result = session.request_checkpoint("controller-request")
+
+    assert later_result.degraded is False
+    assert len(gateway.requests) == 4
+    assert [attempt.purpose for attempt in attempts.close_since(0)] == [
+        "checkpoint", "exploration", "checkpoint", "checkpoint",
+    ]
+
+
 def test_failed_emergency_checkpoint_reconstructs_previous_valid_checkpoint():
     gateway = ScriptedGateway([
         checkpoint_response(
