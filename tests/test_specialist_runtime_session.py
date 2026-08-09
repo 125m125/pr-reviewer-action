@@ -480,7 +480,7 @@ def test_rendered_admission_falls_back_without_valid_provider_usage(usage):
     assert estimate.admission_tokens == 2_001 + 2_048 + 256
 
 
-def test_provider_calibration_is_independent_for_tools_and_structured_modes():
+def test_provider_calibration_carries_from_structured_to_tools_mode():
     gateway = EstimatingGateway(
         [checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])],
         rendered_bytes=32_000,
@@ -497,8 +497,29 @@ def test_provider_calibration_is_independent_for_tools_and_structured_modes():
     )
 
     assert structured.source == "provider-calibrated"
-    assert tools.source == "rendered-fallback"
-    assert tools.input_tokens == 10_667
+    assert tools.source == "provider-calibrated"
+    assert tools.input_tokens >= 12_000
+
+
+def test_actual_tool_prompt_usage_replaces_full_history_byte_fallback_for_checkpoint():
+    gateway = EstimatingGateway(
+        [checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])],
+        rendered_bytes=190_000,
+        usages=({"prompt_tokens": 46_459, "completion_tokens": 58},),
+    )
+    session = make_session(gateway, max_context_tokens=80_056)
+
+    session._request(
+        tools_enabled=True, schema=None, purpose="exploration",
+    )
+    gateway.rendered_bytes = 194_161
+    estimate = session._estimate_admission(
+        tools_enabled=False, max_tokens=8_192,
+    )
+
+    assert estimate.source == "provider-calibrated"
+    assert estimate.input_tokens < 52_000
+    assert estimate.input_tokens < 64_721
 
 
 def test_fractional_provider_usage_is_rounded_up_for_calibration():
@@ -776,6 +797,25 @@ def test_failed_emergency_checkpoint_reconstructs_previous_valid_checkpoint():
     assert diagnostic["emergency_outcome"] == "fallback_reconstructed"
     assert diagnostic["compaction_input_tokens_before"] > 0
     assert diagnostic["compaction_input_tokens_after"] > 0
+    assert session.finalize().degraded is False
+
+
+def test_rejected_emergency_projection_does_not_poison_prior_checkpoint_finalization():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["a.py"], unresolved=["OB-tests"],
+            working_summary="Prior validated state.",
+        ),
+        ModelRequestError("too many tokens", status=400),
+        invalid_response("not a checkpoint"),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.request_checkpoint("controller-request", disposition="pause")
+
+    recovered = session.explore()
+
+    assert recovered.degraded is False
+    assert session.finalize().degraded is False
 
 
 def test_emergency_checkpoint_guard_is_session_lifetime():
@@ -1183,21 +1223,22 @@ def test_repeated_textual_tool_markup_checkpoints_with_compact_resume():
         malformed,
         malformed,
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
     ])
     session = make_session(gateway, model_turns=4)
 
     result = session.explore()
 
     assert result.state.value == "checkpoint"
-    assert len(gateway.requests) == 3
-    assert gateway.requests[-1].tools_enabled is False
-    assert gateway.requests[-1].messages_contain(
+    assert len(gateway.requests) == 4
+    assert gateway.requests[2].tools_enabled is False
+    assert gateway.requests[2].messages_contain(
         "Checkpoint reason: malformed-textual-tool-call."
     )
-    assert gateway.requests[-1].messages_contain(
+    assert gateway.requests[2].messages_contain(
         "Immediate compaction after validation: yes."
     )
-    assert gateway.requests[-1].messages_contain(
+    assert gateway.requests[2].messages_contain(
         "After validation, resume the specialist session."
     )
 
@@ -1415,6 +1456,10 @@ def test_checkpoint_disposition_is_explicit_in_cumulative_prompt(
         "become a future epoch boundary."
     ) in prompt
     assert "remaining budget" not in prompt.lower()
+    assert "Tool access is disabled for this checkpoint turn." in prompt
+    assert "Do not emit native tool calls or XML/function-call markup." in prompt
+    if disposition == "compact_resume":
+        assert "tool access will be re-enabled" in prompt
     required = set(gateway.requests[0].response_schema["required"])
     if disposition == "compact_resume":
         assert required >= {"unresolved", "working_summary", "completed_steps"}
@@ -1468,6 +1513,81 @@ def test_initial_compact_resume_repairs_missing_working_memory_before_compaction
         event.get("epoch_continuation")
         for event in session.conversation.events
     )
+    continuation = next(
+        event["content"] for event in session.conversation.events
+        if event.get("epoch_continuation")
+    )
+    assert "Tool access is re-enabled for exploration." in continuation
+
+
+def test_context_pressure_checkpoint_compacts_and_resumes_same_specialist():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["old.py"], unresolved=["OB-tests"],
+            proposed_next_actions=["Inspect the remaining behavioral test."],
+        ),
+        checkpoint_response(inspected=["old.py"], unresolved=[]),
+    ])
+    session = make_session(
+        gateway, max_context_tokens=100_000, max_tokens=1_024,
+        model_turns=8, tool_calls=8,
+    )
+    pressure_checks = iter((True, False, False))
+    session._checkpoint_pressure_due = lambda: next(pressure_checks, False)
+
+    result = session.explore()
+
+    assert result.degraded is False
+    assert result.state.value == "checkpoint"
+    assert [request.tools_enabled for request in gateway.requests] == [False, True]
+    assert gateway.requests[1].messages_contain(
+        "Tool access is re-enabled for exploration."
+    )
+
+
+def test_checkpoint_wrapper_is_accepted_without_repair():
+    nested = json.loads(checkpoint_response(
+        inspected=["a.py"], unresolved=["OB-tests"],
+    ).text)
+    gateway = ScriptedGateway([
+        invalid_response(json.dumps({"checkpoint": nested})),
+    ])
+    session = make_session(gateway)
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert len(gateway.requests) == 1
+    assert "OB-tests" in result.checkpoint.unknowns
+
+
+def test_no_tools_checkpoint_reports_model_emitted_tool_call():
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway)
+
+    result = session.request_checkpoint("context-pressure")
+
+    assert [request.tools_enabled for request in gateway.requests] == [False, False]
+    assert "tool calls returned while checkpoint tools were disabled" in (
+        result.finalization_diagnostics[-1]["initial_error"]
+    )
+
+
+def test_checkpoint_projection_degradation_survives_finalization():
+    gateway = ScriptedGateway([
+        invalid_response("not-json"),
+        invalid_response("still-not-json"),
+    ])
+    session = make_session(gateway)
+
+    checkpoint = session.request_checkpoint("context-pressure")
+    finalized = session.finalize()
+
+    assert checkpoint.degraded is True
+    assert finalized.degraded is True
 
 
 def test_initial_compact_resume_without_working_memory_never_compacts():
@@ -2046,7 +2166,10 @@ def test_exploration_reserves_checkpoint_and_repair_turns():
 
 def test_pressure_requests_checkpoint_before_exploration():
     gateway = EstimatingGateway(
-        [checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])],
+        [
+            checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+            checkpoint_response(inspected=[], unresolved=[]),
+        ],
         rendered_bytes=12_000,
     )
     session = make_session(
@@ -2072,14 +2195,17 @@ def test_pressure_requests_checkpoint_before_exploration():
     result = session.explore()
 
     assert result.state.value == "checkpoint"
-    assert len(gateway.requests) == 1
+    assert len(gateway.requests) == 2
     assert gateway.requests[0].tools_enabled is False
+    assert gateway.requests[1].tools_enabled is True
     assert gateway.requests[0].max_tokens == 2_048
     assert gateway.requests[0].reasoning_effort == "none"
     assert gateway.requests[0].messages_contain(
         "After validation, resume the specialist session."
     )
-    assert attempts.close_since(0)[0].purpose == "checkpoint"
+    assert [item.purpose for item in attempts.close_since(0)] == [
+        "checkpoint", "exploration",
+    ]
 
 
 def test_coarse_context_overflow_preserves_history_until_checkpoint_validates():
@@ -2852,6 +2978,7 @@ def test_no_progress_guard_requests_checkpoint_instead_of_final_report():
         repeated,
         repeated,
         checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+        checkpoint_response(inspected=["a.py"], unresolved=[]),
     ])
     session = make_session(gateway, tool_calls=4, model_turns=8)
 
@@ -2859,13 +2986,13 @@ def test_no_progress_guard_requests_checkpoint_instead_of_final_report():
 
     assert result.state.value == "checkpoint"
     assert result.budget.tool_calls == 1
-    assert result.budget.model_turns == 4
-    assert gateway.requests[-1].tools_enabled is False
-    assert "not a final report" in gateway.requests[-1].messages.lower()
-    assert gateway.requests[-1].messages_contain(
+    assert result.budget.model_turns == 5
+    assert gateway.requests[3].tools_enabled is False
+    assert "not a final report" in gateway.requests[3].messages.lower()
+    assert gateway.requests[3].messages_contain(
         "Immediate compaction after validation: yes."
     )
-    assert gateway.requests[-1].messages_contain(
+    assert gateway.requests[3].messages_contain(
         "After validation, resume the specialist session."
     )
 

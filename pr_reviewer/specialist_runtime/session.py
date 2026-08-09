@@ -276,6 +276,11 @@ _CHECKPOINT_CUMULATIVE_INSTRUCTION = (
     "This checkpoint must be cumulative and self-contained because it may "
     "become a future epoch boundary."
 )
+_CHECKPOINT_TOOL_STATE_INSTRUCTION = (
+    "Tool access is disabled for this checkpoint turn. Do not emit native "
+    "tool calls or XML/function-call markup. Return exactly one JSON object "
+    "matching the supplied schema."
+)
 _CHECKPOINT_WORKING_MEMORY_INSTRUCTION = (
     " For compact_resume, provide a non-empty working_summary describing the "
     "current understanding and a non-empty completed_steps array describing "
@@ -302,6 +307,7 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
 )
 _CHECKPOINT_REPAIR_INSTRUCTION = (
     "Repair the previous checkpoint as one JSON object matching the schema."
+    + " " + _CHECKPOINT_TOOL_STATE_INSTRUCTION
     + _CHECKPOINT_WORKING_MEMORY_INSTRUCTION
     + _CHECKPOINT_RETENTION_INSTRUCTION
 )
@@ -754,7 +760,7 @@ class _AdmissionEstimate:
 
 @dataclass
 class _AdmissionCalibration:
-    """Conservative provider calibration for one rendered request mode."""
+    """Provider calibration for one request mode or the whole session."""
 
     last_rendered_bytes: int = 0
     last_prompt_tokens: int = 0
@@ -874,10 +880,12 @@ class SpecialistSession:
         self._final_result: SessionResult | None = None
         self._request_events: list[SpecialistRequestEvent] = []
         self._finalization_diagnostics: list[dict[str, object]] = []
+        self._checkpoint_state_degraded = False
         self._last_context_admission: dict[str, object] = {}
         self._admission_calibration = {
             "tools": _AdmissionCalibration(),
             "structured": _AdmissionCalibration(),
+            "global": _AdmissionCalibration(),
         }
         self._request_attempt_journal: RequestAttemptJournal | None = None
         self._request_assignment_id = str(getattr(
@@ -964,6 +972,13 @@ class SpecialistSession:
             + "\n"
             + _CHECKPOINT_CUMULATIVE_INSTRUCTION
             + "\n"
+            + _CHECKPOINT_TOOL_STATE_INSTRUCTION
+            + (
+                " For compact_resume, tool access will be re-enabled after "
+                "the checkpoint validates."
+                if disposition is CheckpointDisposition.COMPACT_RESUME else ""
+            )
+            + "\n"
             + self._active_candidate_register()
             + _CHECKPOINT_WORKING_MEMORY_INSTRUCTION
             + _CHECKPOINT_RETENTION_INSTRUCTION
@@ -1043,20 +1058,25 @@ class SpecialistSession:
                 rendered_bytes = 0
 
         calibration = self._admission_calibration[mode]
+        global_calibration = self._admission_calibration["global"]
         candidates = [(coarse_tokens, "coarse-conversation", 0)]
         calibrated_candidates: list[int] = []
         if rendered_bytes > 0:
-            candidates.append((
-                math.ceil(rendered_bytes / 3), "rendered-fallback", 1,
-            ))
-            if calibration.max_tokens_per_rendered_byte > 0:
-                calibrated_candidates.append(math.ceil(
-                    rendered_bytes * calibration.max_tokens_per_rendered_byte
+            for item in (calibration, global_calibration):
+                if item.max_tokens_per_rendered_byte > 0:
+                    calibrated_candidates.append(math.ceil(
+                        rendered_bytes
+                        * item.max_tokens_per_rendered_byte
+                        * 1.05
+                    ))
+                if item.max_positive_offset > 0:
+                    calibrated_candidates.append(
+                        coarse_tokens + item.max_positive_offset
+                    )
+            if not calibrated_candidates:
+                candidates.append((
+                    math.ceil(rendered_bytes / 3), "rendered-fallback", 1,
                 ))
-            if calibration.max_positive_offset > 0:
-                calibrated_candidates.append(
-                    coarse_tokens + calibration.max_positive_offset
-                )
         provider_calibrated_input_tokens = max(calibrated_candidates, default=0)
         if provider_calibrated_input_tokens:
             candidates.append((
@@ -1089,21 +1109,23 @@ class SpecialistSession:
         usage: Mapping[str, Any],
     ) -> tuple[int, int]:
         calibration = self._admission_calibration[estimate.mode]
+        global_calibration = self._admission_calibration["global"]
         prompt_tokens = self._usage_tokens(usage, "prompt_tokens")
         completion_tokens = self._usage_tokens(usage, "completion_tokens")
-        calibration.last_rendered_bytes = estimate.rendered_bytes
-        calibration.last_completion_tokens = completion_tokens
-        if prompt_tokens > 0:
-            calibration.last_prompt_tokens = prompt_tokens
-            if estimate.rendered_bytes > 0:
-                calibration.max_tokens_per_rendered_byte = max(
-                    calibration.max_tokens_per_rendered_byte,
-                    prompt_tokens / estimate.rendered_bytes,
+        for item in (calibration, global_calibration):
+            item.last_rendered_bytes = estimate.rendered_bytes
+            item.last_completion_tokens = completion_tokens
+            if prompt_tokens > 0:
+                item.last_prompt_tokens = prompt_tokens
+                if estimate.rendered_bytes > 0:
+                    item.max_tokens_per_rendered_byte = max(
+                        item.max_tokens_per_rendered_byte,
+                        prompt_tokens / estimate.rendered_bytes,
+                    )
+                item.max_positive_offset = max(
+                    item.max_positive_offset,
+                    prompt_tokens - estimate.coarse_input_tokens,
                 )
-            calibration.max_positive_offset = max(
-                calibration.max_positive_offset,
-                prompt_tokens - estimate.coarse_input_tokens,
-            )
         return prompt_tokens, completion_tokens
 
     def _checkpoint_pressure_due(self) -> bool:
@@ -1312,6 +1334,15 @@ class SpecialistSession:
         self._recovery_turn_pending = False
         return result
 
+    def _checkpoint_and_resume(self, reason: str) -> SessionResult:
+        """Compact at a validated boundary and keep the same specialist active."""
+        result = self.request_checkpoint(
+            reason, disposition=CheckpointDisposition.COMPACT_RESUME,
+        )
+        if result.degraded:
+            return result
+        return self.explore()
+
     def explore(self) -> SessionResult:
         """Explore until the specialist emits or is forced to a checkpoint."""
         if self._final_result is not None:
@@ -1358,10 +1389,7 @@ class SpecialistSession:
         self.state = SessionState.EXPLORING
         while True:
             if self.conversation.approx_tokens() > self.max_context_tokens:
-                return self.request_checkpoint(
-                    "context-pressure",
-                    disposition=CheckpointDisposition.COMPACT_RESUME,
-                )
+                return self._checkpoint_and_resume("context-pressure")
             remaining_input_tokens = self.budget.remaining_input_tokens()
             if (
                 remaining_input_tokens is not None
@@ -1372,10 +1400,7 @@ class SpecialistSession:
             if remaining_output_tokens is not None and remaining_output_tokens <= 0:
                 raise BudgetExhausted("output token limit exhausted")
             if self._checkpoint_pressure_due():
-                return self.request_checkpoint(
-                    "context-pressure",
-                    disposition=CheckpointDisposition.COMPACT_RESUME,
-                )
+                return self._checkpoint_and_resume("context-pressure")
             if self.budget.remaining_model_turns() <= _CHECKPOINT_TURN_RESERVE:
                 return self.request_checkpoint("checkpoint-retention-reserve")
             try:
@@ -1385,10 +1410,7 @@ class SpecialistSession:
             except BudgetExhausted as exc:
                 if "model context limit" not in str(exc):
                     raise
-                return self.request_checkpoint(
-                    "context-pressure",
-                    disposition=CheckpointDisposition.COMPACT_RESUME,
-                )
+                return self._checkpoint_and_resume("context-pressure")
             except BaseException as exc:
                 if not _is_context_limit_error(exc):
                     raise
@@ -1415,9 +1437,8 @@ class SpecialistSession:
                         "markup. Continue the investigation or return a checkpoint."
                     )
                     if self.budget.record_no_progress() >= self.max_no_progress_streak:
-                        return self.request_checkpoint(
+                        return self._checkpoint_and_resume(
                             "malformed-textual-tool-call",
-                            disposition=CheckpointDisposition.COMPACT_RESUME,
                         )
                     continue
                 checkpoint = self._checkpoint_from_text(turn.content)
@@ -1433,6 +1454,7 @@ class SpecialistSession:
                         "model-stopped-without-valid-checkpoint",
                     )
                 self.latest_checkpoint = checkpoint
+                self._checkpoint_state_degraded = False
                 diagnostic = self._record_checkpoint_diagnostic(
                     reason="normal-completion",
                     disposition=CheckpointDisposition.PAUSE,
@@ -1460,10 +1482,7 @@ class SpecialistSession:
             else:
                 streak = self.budget.record_no_progress()
                 if streak >= self.max_no_progress_streak:
-                    return self.request_checkpoint(
-                        "no-progress-guard",
-                        disposition=CheckpointDisposition.COMPACT_RESUME,
-                    )
+                    return self._checkpoint_and_resume("no-progress-guard")
 
     def _recover_from_provider_context_limit(
         self, provider_error: BaseException,
@@ -1478,6 +1497,7 @@ class SpecialistSession:
             previous_gaps = self._current_gaps
             previous_coverage = self.coverage.snapshot()
             previous_retention_signal = self._candidate_retention_signal
+            previous_checkpoint_state_degraded = self._checkpoint_state_degraded
             previous_event_count = len(self.conversation.events)
 
             def rollback_tentative_checkpoint() -> None:
@@ -1486,6 +1506,7 @@ class SpecialistSession:
                 self._candidate_statuses = previous_candidate_statuses
                 self._current_gaps = previous_gaps
                 self._candidate_retention_signal = previous_retention_signal
+                self._checkpoint_state_degraded = previous_checkpoint_state_degraded
                 del self.conversation.events[previous_event_count:]
                 self.coverage.replace_reconciled_state(
                     dict(previous_coverage.evidence_by_obligation),
@@ -1891,6 +1912,7 @@ class SpecialistSession:
                 )
                 else checkpoint
             )
+            self._checkpoint_state_degraded = True
             self._record_checkpoint_diagnostic(
                 reason=reason,
                 disposition=disposition,
@@ -1916,7 +1938,11 @@ class SpecialistSession:
             content=turn.content,
             calls=turn.tool_calls,
         )
-        checkpoint = self._checkpoint_from_text(
+        initial_error = (
+            "tool calls returned while checkpoint tools were disabled"
+            if turn.tool_calls else ""
+        )
+        checkpoint = None if turn.tool_calls else self._checkpoint_from_text(
             turn.content,
             require_working_memory=(
                 disposition is CheckpointDisposition.COMPACT_RESUME
@@ -1965,12 +1991,18 @@ class SpecialistSession:
                     content=repair.content,
                     calls=repair.tool_calls,
                 )
-                checkpoint = self._checkpoint_from_text(
-                    repair.content,
-                    require_working_memory=(
-                        disposition is CheckpointDisposition.COMPACT_RESUME
-                    ),
-                )
+                if repair.tool_calls:
+                    repair_error = (
+                        "tool calls returned while checkpoint tools were disabled"
+                    )
+                    checkpoint = None
+                else:
+                    checkpoint = self._checkpoint_from_text(
+                        repair.content,
+                        require_working_memory=(
+                            disposition is CheckpointDisposition.COMPACT_RESUME
+                        ),
+                    )
                 repair_parse = "valid" if checkpoint is not None else "invalid"
                 repair_finish_reason = repair.finish_reason
             else:
@@ -1988,6 +2020,7 @@ class SpecialistSession:
             )
         elif retention_unknown:
             checkpoint = self._checkpoint_with_retention_unknown(checkpoint)
+        self._checkpoint_state_degraded = fallback_projection or retention_unknown
         # Keep one bounded diagnostic for every checkpoint request, including
         # successful first-pass checkpoints.  This makes the lifecycle log
         # distinguish “valid checkpoint accepted” from “repair/fallback”
@@ -2000,6 +2033,7 @@ class SpecialistSession:
             repair_parse=repair_parse,
             fallback_projection=fallback_projection,
             retention_unknown=retention_unknown,
+            initial_error=initial_error,
             initial_finish_reason=initial_finish_reason,
             repair_finish_reason=repair_finish_reason,
             repair_error=repair_error,
@@ -2029,6 +2063,12 @@ class SpecialistSession:
         require_working_memory: bool = False,
     ) -> SessionCheckpoint | None:
         raw = _json_object(text)
+        if (
+            isinstance(raw, Mapping)
+            and not isinstance(raw.get("unresolved"), list)
+            and isinstance(raw.get("checkpoint"), Mapping)
+        ):
+            raw = raw["checkpoint"]
         if raw is None or not isinstance(raw.get("unresolved"), list):
             return None
         previous = self.latest_checkpoint
@@ -2665,7 +2705,8 @@ class SpecialistSession:
         self.conversation.events.append({
             "kind": "user",
             "content": (
-                "Validated checkpoint epoch compacted. Continue from the "
+                "Validated checkpoint epoch compacted. Tool access is re-enabled "
+                "for exploration. Continue from the "
                 "proposed next actions; use read_compacted_evidence only for "
                 "catalogued IDs:\n"
                 + json.dumps(continuation, sort_keys=True)
@@ -2808,7 +2849,8 @@ class SpecialistSession:
         rebuilt.events.append({
             "kind": "user",
             "content": (
-                "Continue the same specialist assignment from proposed_next_actions. "
+                "Tool access is re-enabled for exploration. Continue the same "
+                "specialist assignment from proposed_next_actions. "
                 "Treat the cumulative checkpoint as continuation memory and use only "
                 "the bounded compacted-evidence catalogue for retrieval."
             ),
@@ -3126,7 +3168,7 @@ class SpecialistSession:
         self.state = SessionState.COMPLETE
         self._final_result = self._snapshot(
             report=report,
-            degraded=retention_unknown,
+            degraded=(retention_unknown or self._checkpoint_state_degraded),
         )
         return self._final_result
 
