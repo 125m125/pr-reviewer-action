@@ -49,8 +49,10 @@ def test_rendered_request_bytes_matches_compact_wire_payload_for_tools():
             "required": ["path"],
         },
     }]
+    calls = []
     gateway = OpenAIModelGateway(
         base_url="http://model/v1", api_key="wire-secret", default_model="main",
+        transport=lambda *args, **kwargs: calls.append((args, kwargs)) or stop_response("{}"),
     )
     request = turn_request(value, tools_enabled=True)
 
@@ -62,6 +64,8 @@ def test_rendered_request_bytes_matches_compact_wire_payload_for_tools():
     assert gateway.rendered_request_bytes(request) == len(json.dumps(
         payload, separators=(",", ":"), ensure_ascii=False,
     ).encode("utf-8"))
+    gateway.complete(request)
+    assert calls[0][0][2] == payload
 
 
 def test_rendered_request_bytes_uses_structured_schema_without_tools():

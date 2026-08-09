@@ -358,6 +358,8 @@ def test_provider_prompt_usage_calibrates_next_same_mode_admission():
         ),
     )
     session = make_session(gateway, max_context_tokens=20_000)
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
 
     session.request_checkpoint("controller-request")
     session.request_checkpoint("controller-request")
@@ -368,6 +370,10 @@ def test_provider_prompt_usage_calibrates_next_same_mode_admission():
     assert estimate.source == "provider-calibrated"
     assert estimate.input_tokens >= 12_000
     assert session._admission_calibration["structured"].last_completion_tokens == 80
+    terminal = attempts.close_since(0)[-1]
+    assert terminal.admission_source == "provider-calibrated"
+    assert terminal.actual_prompt_tokens == 8_000
+    assert terminal.actual_completion_tokens == 80
 
 
 def test_rendered_admission_falls_back_conservatively_without_provider_usage():
@@ -412,6 +418,8 @@ def test_provider_calibration_is_independent_for_tools_and_structured_modes():
 def test_model_gateway_exception_still_charges_reserved_turn():
     gateway = ScriptedGateway([RuntimeError("provider unavailable")])
     session = make_session(gateway)
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
 
     with pytest.raises(RuntimeError, match="provider unavailable"):
         session.explore()
@@ -422,6 +430,10 @@ def test_model_gateway_exception_still_charges_reserved_turn():
         "started", "failed",
     )
     assert session._request_events[0].request_id == session._request_events[1].request_id
+    terminal = attempts.close_since(0)[0]
+    assert terminal.admission_tokens > terminal.input_tokens
+    assert terminal.actual_prompt_tokens == 0
+    assert terminal.actual_completion_tokens == 0
 
 
 def test_session_result_reports_each_actual_request_transition_once():
