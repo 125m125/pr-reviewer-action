@@ -695,6 +695,40 @@ def test_rejected_emergency_checkpoint_rolls_back_all_tentative_state():
     ]
 
 
+def test_retention_losing_emergency_without_prior_reports_projected_fallback():
+    candidate_turn = tool_call_response(
+        "read_file", {"path": "a.py"}, call_id="candidate-before-pressure",
+    )
+    candidate_turn = ModelTurnResult(**{
+        **candidate_turn.__dict__,
+        "text": (
+            '{"candidate_finding_ids":["candidate-unretained"],'
+            '"candidate_findings":[{"candidate_id":"candidate-unretained",'
+            '"claim":"material candidate before context pressure"}]}'
+        ),
+        "text_source": "content",
+    })
+    gateway = ScriptedGateway([
+        candidate_turn,
+        ModelRequestError("maximum context exceeded", status=400),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+
+    result = session.explore()
+
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+    assert len(gateway.requests) == 3
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["reason"] == "provider-context-limit"
+    assert diagnostic["initial_parse"] == "valid"
+    assert diagnostic["repair_attempted"] is False
+    assert diagnostic["repair_parse"] == "not_attempted"
+    assert diagnostic["fallback_projection"] is True
+    assert diagnostic["retention_unknown"] is True
+
+
 def test_failed_emergency_checkpoint_reconstructs_previous_valid_checkpoint():
     gateway = ScriptedGateway([
         checkpoint_response(

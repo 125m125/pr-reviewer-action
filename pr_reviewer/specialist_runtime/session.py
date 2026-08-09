@@ -1489,6 +1489,7 @@ class SpecialistSession:
             candidate_retention_unknown=True,
         )
         if diagnostic_recorded and self._finalization_diagnostics:
+            self._finalization_diagnostics[-1]["fallback_projection"] = True
             self._finalization_diagnostics[-1]["retention_unknown"] = True
         else:
             self._record_checkpoint_diagnostic(
