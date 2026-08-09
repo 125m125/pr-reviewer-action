@@ -187,6 +187,43 @@ def test_runtime_checkpoint_diagnostic_is_one_bounded_compaction_lifecycle_line(
         assert secret not in line
 
 
+def test_runtime_sink_renders_each_batched_checkpoint_diagnostic_once(capsys):
+    from pr_reviewer.specialist_runtime.events import RunEvent
+
+    sink = cli._runtime_event_sink()
+    sink(RunEvent(4, "specialist_checkpoint_diagnostics", {
+        "session_id": "session:test",
+        "diagnostics": (
+            {
+                "reason": "context-pressure",
+                "disposition": "compact_resume",
+                "compaction_level": "regular",
+                "compaction_input_tokens_before": 15_000,
+                "compaction_input_tokens_after": 8_000,
+                "placeholder_replaced_results": 3,
+                "prompt": "secret first prompt",
+            },
+            {
+                "reason": "normal-completion",
+                "disposition": "pause",
+                "compaction_level": "none",
+                "emergency_outcome": "not_attempted",
+                "raw_response": "secret final response",
+            },
+        ),
+    }))
+
+    lines = capsys.readouterr().err.splitlines()
+    lifecycle = [line for line in lines if "checkpoint lifecycle:" in line]
+    assert len(lifecycle) == 2
+    assert sum("reason=context-pressure" in line for line in lifecycle) == 1
+    assert sum("reason=normal-completion" in line for line in lifecycle) == 1
+    assert sum("compaction=regular" in line for line in lifecycle) == 1
+    assert sum("disposition=pause" in line for line in lifecycle) == 1
+    assert "secret first prompt" not in "\n".join(lines)
+    assert "secret final response" not in "\n".join(lines)
+
+
 def test_runtime_event_line_explains_record_unknown_negotiation_action():
     from pr_reviewer.specialist_runtime.events import RunEvent
 

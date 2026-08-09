@@ -1482,12 +1482,41 @@ def _runtime_log_line(line: str) -> None:
     print(f"[specialist-runtime] {line}", file=sys.stderr, flush=True)
 
 
+def _runtime_event_lines(
+    event: RunEvent,
+    *,
+    seen_sessions: set[str] | None = None,
+) -> tuple[str, ...]:
+    """Expand a bounded checkpoint batch into one console line per decision."""
+    payload = event.payload if isinstance(event.payload, Mapping) else {}
+    diagnostics = payload.get("diagnostics")
+    if (
+        event.kind == "specialist_checkpoint_diagnostics"
+        and isinstance(diagnostics, (list, tuple))
+        and diagnostics
+    ):
+        lines: list[str] = []
+        for diagnostic in diagnostics:
+            if not isinstance(diagnostic, Mapping):
+                continue
+            item_payload = dict(payload)
+            item_payload["diagnostics"] = (diagnostic,)
+            line = _runtime_event_line(
+                RunEvent(event.sequence, event.kind, item_payload),
+                seen_sessions=seen_sessions,
+            )
+            if line:
+                lines.append(line)
+        return tuple(lines)
+    line = _runtime_event_line(event, seen_sessions=seen_sessions)
+    return (line,) if line else ()
+
+
 def _runtime_event_sink() -> Any:
     seen_sessions: set[str] = set()
 
     def emit(event: RunEvent) -> None:
-        line = _runtime_event_line(event, seen_sessions=seen_sessions)
-        if line:
+        for line in _runtime_event_lines(event, seen_sessions=seen_sessions):
             _runtime_log_line(line)
 
     return emit
