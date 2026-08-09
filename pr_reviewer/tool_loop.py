@@ -464,26 +464,17 @@ def drive_tool_loop(
                 outcome.compaction_runs += 1
                 outcome.compaction_tokens_removed += removed
 
-        remaining_calls = max(0, budgets.max_tool_calls - calls_executed)
-        remaining_turns = max(0, budgets.max_rounds - outcome.planning_rounds)
-        budget_note = (
-            f"Exploration budget before this turn: {remaining_calls} tool calls "
-            f"and {remaining_turns} planning turns remain. Prioritize unresolved "
-            "correctness risks. Do not repeat completed checks. Stop requesting "
-            "tools when the evidence is sufficient so you can synthesize it."
-        )
-        if consecutive_no_progress:
-            allowance = max(0, budgets.max_consecutive_no_progress_rounds - consecutive_no_progress)
-            budget_note += (
-                f" No-progress allowance remaining: {allowance} round(s); another "
-                "duplicate cycle may end exploration."
-            )
+        # Budget values remain controller-owned state and are enforced below;
+        # do not inject them as an unsolicited user turn.  Some chat templates
+        # use the latest user turn to reconstruct reasoning state, so a
+        # transient status note can discard or distort prior reasoning.
+        repair_note = None
         if (
             textual_repair_pending
             and consecutive_textual_tool_repairs < budgets.max_textual_tool_repairs
             and outcome.textual_tool_repair_attempts < budgets.max_total_textual_tool_repairs
         ):
-            budget_note = _TEXTUAL_TOOL_REPAIR_NOTE + "\n\n" + budget_note
+            repair_note = _TEXTUAL_TOOL_REPAIR_NOTE
             outcome.textual_tool_repair_attempts += 1
             consecutive_textual_tool_repairs += 1
             outcome.consecutive_textual_tool_repair_attempts = consecutive_textual_tool_repairs
@@ -497,7 +488,7 @@ def drive_tool_loop(
             reasoning_effort=reasoning_effort,
             tokens_param=tokens_param,
             cache_prefix=cache_prefix,
-            ephemeral_user_note=budget_note,
+            ephemeral_user_note=repair_note,
         )
         try:
             response = post_fn(payload)

@@ -364,7 +364,7 @@ def test_session_result_reports_each_actual_request_transition_once():
     assert tuple(request_pairs.values()) == (["started", "completed"],)
 
 
-def test_exploration_budget_note_is_ephemeral_and_updates_per_turn():
+def test_exploration_budget_is_enforced_without_wire_budget_notes():
     gateway = ScriptedGateway([
         tool_call_response("read_file", {"path": "a.py"}),
         checkpoint_response(inspected=["a.py"], unresolved=[]),
@@ -374,14 +374,8 @@ def test_exploration_budget_note_is_ephemeral_and_updates_per_turn():
     session.explore()
 
     first, second = gateway.requests
-    assert first.ephemeral_user_note == (
-        "Exploration budget before this turn: 4 model turns and 4 tool calls remain. "
-        "Prioritize unresolved correctness risks. Do not repeat completed checks."
-    )
-    assert second.ephemeral_user_note == (
-        "Exploration budget before this turn: 3 model turns and 3 tool calls remain. "
-        "Prioritize unresolved correctness risks. Do not repeat completed checks."
-    )
+    assert first.ephemeral_user_note is None
+    assert second.ephemeral_user_note is None
     assert "Exploration budget before this turn" not in json.dumps(session.conversation.events)
 
 
