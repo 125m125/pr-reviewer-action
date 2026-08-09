@@ -20,7 +20,10 @@ from pr_reviewer.specialist_runtime.evidence import (
     EvidenceStore,
     canonical_evidence_key,
 )
-from pr_reviewer.specialist_runtime.model_gateway import ModelTurnResult
+from pr_reviewer.specialist_runtime.model_gateway import (
+    ModelTurnResult,
+    OpenAIModelGateway,
+)
 from pr_reviewer.specialist_runtime.request_attempts import RequestAttemptJournal
 from pr_reviewer.specialist_runtime.session import (
     COMPACTED_EVIDENCE_TOOL_NAME,
@@ -580,6 +583,58 @@ def test_emergency_checkpoint_context_error_stops_without_a_third_request():
     gateway = ScriptedGateway([
         ModelRequestError("prompt too long", status=400),
         ModelRequestError("maximum context exceeded", status=400),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+
+    result = session.explore()
+
+    assert len(gateway.requests) == 2
+    assert [request.tools_enabled for request in gateway.requests] == [True, False]
+    assert result.state.value == "checkpoint"
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+    assert result.budget.model_turns == 2
+
+
+def test_emergency_checkpoint_context_error_uses_two_physical_provider_calls():
+    physical_payloads = []
+
+    def counting_transport(base_url, api_format, payload, api_key, timeout_sec):
+        physical_payloads.append(payload)
+        raise ModelRequestError(
+            "model provider rejected request: context_length_exceeded",
+            status=400,
+            body='{"code":"context_length_exceeded"}',
+        )
+
+    gateway = OpenAIModelGateway(
+        base_url="http://provider.test/v1",
+        api_key="test-key",
+        default_model="test-model",
+        transport=counting_transport,
+    )
+    session = make_session(gateway, max_context_tokens=100_000)
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
+
+    result = session.explore()
+
+    assert len(physical_payloads) == 2
+    assert "tools" in physical_payloads[0]
+    assert "tools" not in physical_payloads[1]
+    assert "response_format" in physical_payloads[1]
+    assert result.degraded is True
+    assert result.budget.model_turns == 2
+    assert [attempt.status for attempt in attempts.close_since(0)] == [
+        "failed", "failed",
+    ]
+
+
+def test_invalid_emergency_checkpoint_does_not_request_repair():
+    gateway = ScriptedGateway([
+        ModelRequestError("prompt too long", status=400),
+        invalid_response("not a valid checkpoint"),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
     ])
     session = make_session(gateway, max_context_tokens=100_000)
 

@@ -968,6 +968,7 @@ class SpecialistSession:
         schema: dict[str, Any] | None,
         max_tokens: int,
         conversation: Conversation | None = None,
+        allow_fallbacks: bool = True,
     ) -> ModelTurnRequest:
         return ModelTurnRequest(
             role="specialist",
@@ -980,6 +981,7 @@ class SpecialistSession:
             stream=self.stream,
             response_schema_name=self._request_schema_name(schema),
             reasoning_effort="none" if not tools_enabled else None,
+            allow_fallbacks=allow_fallbacks,
         )
 
     def _estimate_admission(
@@ -1108,6 +1110,7 @@ class SpecialistSession:
         purpose: str = "unknown",
         max_output_tokens: int | None = None,
         allow_compaction: bool = True,
+        allow_gateway_fallbacks: bool = True,
     ) -> ModelTurnResult:
         remaining_output_tokens = self.budget.remaining_output_tokens()
         if remaining_output_tokens is not None and remaining_output_tokens <= 0:
@@ -1203,6 +1206,7 @@ class SpecialistSession:
                 tools_enabled=tools_enabled,
                 schema=schema,
                 max_tokens=request_max_tokens,
+                allow_fallbacks=allow_gateway_fallbacks,
             )
             request = replace(request, timeout_sec=timeout)
             result = CALLBACK_POOL.run(
@@ -1408,27 +1412,63 @@ class SpecialistSession:
         emergency_error = provider_error
         if not self._emergency_checkpoint_attempted:
             self._emergency_checkpoint_attempted = True
+            previous_checkpoint = self.latest_checkpoint
+            previous_candidates = self.candidate_findings
+            previous_candidate_statuses = dict(self._candidate_statuses)
+            previous_gaps = self._current_gaps
+            previous_coverage = self.coverage.snapshot()
             try:
-                return self.request_checkpoint(
+                emergency_result = self.request_checkpoint(
                     "provider-context-limit",
                     disposition=CheckpointDisposition.COMPACT_RESUME,
+                    allow_gateway_fallbacks=False,
+                    allow_repair=False,
                 )
             except BaseException as exc:
                 if not _is_context_limit_error(exc):
                     raise
                 emergency_error = exc
+            else:
+                if not emergency_result.degraded:
+                    return emergency_result
+                self.latest_checkpoint = previous_checkpoint
+                self.candidate_findings = previous_candidates
+                self._candidate_statuses = previous_candidate_statuses
+                self._current_gaps = previous_gaps
+                self.coverage.replace_reconciled_state(
+                    dict(previous_coverage.evidence_by_obligation),
+                    (
+                        obligation_id
+                        for obligation_id, status
+                        in previous_coverage.obligation_statuses
+                        if status is ObligationStatus.UNRESOLVED
+                    ),
+                )
+                return self._fallback_after_emergency_checkpoint(
+                    emergency_error,
+                    diagnostic_recorded=True,
+                )
 
+        return self._fallback_after_emergency_checkpoint(emergency_error)
+
+    def _fallback_after_emergency_checkpoint(
+        self,
+        emergency_error: BaseException,
+        *,
+        diagnostic_recorded: bool = False,
+    ) -> SessionResult:
         if self._reconstruct_from_valid_checkpoint():
-            self._record_checkpoint_diagnostic(
-                reason="provider-context-limit",
-                initial_parse="unavailable",
-                repair_attempted=False,
-                repair_parse="not_attempted",
-                fallback_projection=False,
-                retention_unknown=False,
-                initial_error=format_callback_error(emergency_error, limit=300),
-                context_admission=self._last_context_admission,
-            )
+            if not diagnostic_recorded:
+                self._record_checkpoint_diagnostic(
+                    reason="provider-context-limit",
+                    initial_parse="unavailable",
+                    repair_attempted=False,
+                    repair_parse="not_attempted",
+                    fallback_projection=False,
+                    retention_unknown=False,
+                    initial_error=format_callback_error(emergency_error, limit=300),
+                    context_admission=self._last_context_admission,
+                )
             self.state = SessionState.CHECKPOINT
             return self._snapshot()
 
@@ -1436,16 +1476,19 @@ class SpecialistSession:
             self._current_gaps,
             candidate_retention_unknown=True,
         )
-        self._record_checkpoint_diagnostic(
-            reason="provider-context-limit",
-            initial_parse="unavailable",
-            repair_attempted=False,
-            repair_parse="not_attempted",
-            fallback_projection=True,
-            retention_unknown=True,
-            initial_error=format_callback_error(emergency_error, limit=300),
-            context_admission=self._last_context_admission,
-        )
+        if diagnostic_recorded and self._finalization_diagnostics:
+            self._finalization_diagnostics[-1]["retention_unknown"] = True
+        else:
+            self._record_checkpoint_diagnostic(
+                reason="provider-context-limit",
+                initial_parse="unavailable",
+                repair_attempted=False,
+                repair_parse="not_attempted",
+                fallback_projection=True,
+                retention_unknown=True,
+                initial_error=format_callback_error(emergency_error, limit=300),
+                context_admission=self._last_context_admission,
+            )
         self.state = SessionState.CHECKPOINT
         return self._snapshot(degraded=True)
 
@@ -1713,6 +1756,8 @@ class SpecialistSession:
         *,
         disposition: CheckpointDisposition | str = CheckpointDisposition.PAUSE,
         candidate_signal: _CandidateRetentionSignal | None = None,
+        allow_gateway_fallbacks: bool = True,
+        allow_repair: bool = True,
     ) -> SessionResult:
         """Request a structured checkpoint; never force a final report."""
         disposition = CheckpointDisposition(disposition)
@@ -1730,6 +1775,7 @@ class SpecialistSession:
                 purpose="checkpoint",
                 max_output_tokens=self.checkpoint_max_tokens,
                 allow_compaction=False,
+                allow_gateway_fallbacks=allow_gateway_fallbacks,
             )
         except (BudgetExhausted, TimeoutError) as exc:
             if (
@@ -1782,7 +1828,7 @@ class SpecialistSession:
         initial_finish_reason = turn.finish_reason
         repair_finish_reason = ""
         repair_error = ""
-        if needs_repair:
+        if needs_repair and allow_repair:
             repair_attempted = True
             self.conversation.add_user(_CHECKPOINT_REPAIR_INSTRUCTION)
             repair_event_count = len(self._request_events)
@@ -1793,6 +1839,7 @@ class SpecialistSession:
                     purpose="checkpoint-repair",
                     max_output_tokens=self.checkpoint_max_tokens,
                     allow_compaction=False,
+                    allow_gateway_fallbacks=allow_gateway_fallbacks,
                 )
             except (BudgetExhausted, TimeoutError) as exc:
                 if (

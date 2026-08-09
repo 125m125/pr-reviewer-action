@@ -50,6 +50,7 @@ class ModelTurnRequest:
     keep_full_history_on_verdict: bool = True
     response_format_override: str | None = None
     ephemeral_user_note: str | None = None
+    allow_fallbacks: bool = True
 
 
 @dataclass(frozen=True)
@@ -174,6 +175,7 @@ class OpenAIModelGateway:
             deadline_at=request.deadline_at,
             requested_response_format=response_format,
             stream_watchdog=(StreamWatchdog("openai") if request.stream and self.stream_watchdog else None),
+            allow_fallbacks=request.allow_fallbacks,
         )
         calls, content, reasoning, finish_reason = extract_intermediate_turn_parts(
             response, "openai"
@@ -207,6 +209,7 @@ class OpenAIModelGateway:
         requested_response_format: str | None = None,
         compact_fallback_payload: dict[str, Any] | None = None,
         stream_watchdog: StreamWatchdog | None = None,
+        allow_fallbacks: bool = True,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Send an already-rendered OpenAI payload with hardened fallbacks.
 
@@ -266,6 +269,8 @@ class OpenAIModelGateway:
         except Exception as exc:
             usable = False
             original_error = mask_secrets(str(exc))[:1000]
+            if not allow_fallbacks:
+                raise
             provider_rejected = bool(getattr(exc, "provider_rejected", False))
             if not payload.get("stream") or provider_rejected:
                 if "response_format" not in payload:
@@ -274,6 +279,11 @@ class OpenAIModelGateway:
                 usable = True
 
         if not usable:
+            if not allow_fallbacks:
+                raise RuntimeError(
+                    "model provider returned an unusable response: "
+                    + original_error
+                )
             fallback = {key: value for key, value in payload.items() if key != "stream_options"}
             fallback["stream"] = False
             try:
