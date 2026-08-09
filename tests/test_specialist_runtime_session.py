@@ -101,6 +101,8 @@ def checkpoint_response(*, inspected, unresolved, **overrides):
         "invariants_evaluated": [],
         "unknowns": unresolved,
         "proposed_next_actions": [],
+        "working_summary": "The checkpoint retains the current working state.",
+        "completed_steps": ["Reviewed the assigned checkpoint scope."],
     }
     payload.update(overrides)
     text = json.dumps(payload)
@@ -139,6 +141,8 @@ def candidate_checkpoint_response(candidate_ids):
             "manual_validation": "Run the state transition test.",
         } for candidate_id in candidate_ids],
         "unknowns": ["OB-tests"],
+        "working_summary": "The candidate checkpoint retains the working state.",
+        "completed_steps": ["Collected and assessed the candidate evidence."],
     })
     return ModelTurnResult(
         response={}, tool_calls=(), text=text, text_source="content",
@@ -155,6 +159,8 @@ def candidate_update_checkpoint_response(*, updates=(), new_candidates=(), unres
         "candidate_updates": list(updates),
         "new_candidates": list(new_candidates),
         "unknowns": list(unresolved),
+        "working_summary": "The candidate lifecycle state remains cumulative.",
+        "completed_steps": ["Reviewed the active candidate lifecycle updates."],
     })
     return ModelTurnResult(
         response={}, tool_calls=(), text=text, text_source="content",
@@ -260,6 +266,7 @@ class RecordedRequest:
     max_tokens: int
     ephemeral_user_note: str | None
     reasoning_effort: str | None
+    response_schema: dict | None
 
     def messages_contain(self, value):
         return value in self.messages
@@ -278,6 +285,7 @@ class ScriptedGateway:
             max_tokens=request.max_tokens,
             ephemeral_user_note=request.ephemeral_user_note,
             reasoning_effort=request.reasoning_effort,
+            response_schema=request.response_schema,
         ))
         assert self.responses, "model called more times than scripted"
         response = self.responses.pop(0)
@@ -1407,6 +1415,127 @@ def test_checkpoint_disposition_is_explicit_in_cumulative_prompt(
         "become a future epoch boundary."
     ) in prompt
     assert "remaining budget" not in prompt.lower()
+    required = set(gateway.requests[0].response_schema["required"])
+    if disposition == "compact_resume":
+        assert required >= {"unresolved", "working_summary", "completed_steps"}
+    else:
+        assert required == {"unresolved"}
+
+
+def test_initial_compact_resume_repairs_missing_working_memory_before_compaction():
+    sparse = checkpoint_response(
+        inspected=["old.py"], unresolved=["OB-tests"],
+        working_summary="", completed_steps=[],
+    )
+    repaired = checkpoint_response(
+        inspected=["old.py"],
+        unresolved=["OB-tests"],
+        working_summary="The prior epoch established the controller data flow.",
+        completed_steps=["Read old.py and confirmed the reachable branch."],
+    )
+    gateway = ScriptedGateway([sparse, repaired])
+    session = make_session(gateway, max_context_tokens=100_000)
+    seed_successful_tool_exchange(
+        session,
+        call_id="working-memory-repair",
+        path="old.py",
+        content="full evidence retained until repair validates",
+        reasoning="material conclusion retained until repair validates",
+    )
+
+    result = session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+
+    assert len(gateway.requests) == 2
+    initial_prompt = json.loads(gateway.requests[0].messages)[-1]["content"]
+    repair_prompt = json.loads(gateway.requests[1].messages)[-1]["content"]
+    for prompt in (initial_prompt, repair_prompt):
+        assert "non-empty working_summary" in prompt
+        assert "non-empty completed_steps" in prompt
+    assert set(gateway.requests[0].response_schema["required"]) >= {
+        "unresolved", "working_summary", "completed_steps",
+    }
+    compact_properties = gateway.requests[0].response_schema["properties"]
+    assert compact_properties["working_summary"]["minLength"] == 1
+    assert compact_properties["completed_steps"]["minItems"] == 1
+    assert result.degraded is False
+    assert result.checkpoint.working_summary.startswith("The prior epoch")
+    assert result.checkpoint.completed_steps == (
+        "Read old.py and confirmed the reachable branch.",
+    )
+    assert any(
+        event.get("epoch_continuation")
+        for event in session.conversation.events
+    )
+
+
+def test_initial_compact_resume_without_working_memory_never_compacts():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["old.py"], unresolved=["OB-tests"],
+            working_summary="", completed_steps=[],
+        ),
+        checkpoint_response(
+            inspected=["old.py"], unresolved=["OB-tests"],
+            working_summary="", completed_steps=[],
+        ),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    seed_successful_tool_exchange(
+        session,
+        call_id="missing-working-memory",
+        path="old.py",
+        content="irreplaceable evidence before invalid checkpoint",
+        reasoning="irreplaceable working conclusion before invalid checkpoint",
+    )
+
+    result = session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+
+    transcript = json.dumps(session.conversation.events, sort_keys=True)
+    assert len(gateway.requests) == 2
+    assert result.degraded is True
+    assert "irreplaceable evidence before invalid checkpoint" in transcript
+    assert "irreplaceable working conclusion before invalid checkpoint" in transcript
+    assert session._checkpoint_spans == []
+    assert not any(
+        event.get("epoch_continuation")
+        for event in session.conversation.events
+    )
+
+
+def test_sparse_pause_checkpoint_cannot_be_reused_for_destructive_compaction():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["0.py", "1.py", "2.py"],
+            unresolved=["OB-tests"],
+            working_summary="",
+            completed_steps=[],
+        ),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    for index in range(3):
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"sparse-pause-{index}",
+            path=f"{index}.py",
+            content=f"full sparse-pause evidence {index}",
+            reasoning=f"unexternalized sparse-pause reasoning {index}",
+        )
+    paused = session.explore()
+    before = json.loads(json.dumps(session.conversation.events))
+
+    stats = session._compact_validated_epoch()
+
+    assert paused.degraded is False
+    assert stats.removed_reasoning == 0
+    assert stats.replaced_results == 0
+    assert session.conversation.events == before
+    assert session._checkpoint_spans[-1].compacted is False
+    assert paused.finalization_diagnostics[-1]["reason"] == "normal-completion"
+    assert paused.finalization_diagnostics[-1]["compaction_level"] == "none"
 
 
 def test_pause_checkpoint_retains_full_epoch_after_validation():
@@ -1526,6 +1655,64 @@ def test_checkpoint_diagnostic_projects_admission_and_regular_compaction_counts(
     serialized = json.dumps(diagnostic, sort_keys=True)
     assert "private diagnostic reasoning" not in serialized
     assert "diagnostic evidence" not in serialized
+
+
+def test_direct_completion_diagnostic_owns_later_pressure_compaction():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=[],
+            unresolved=["OB-tests"],
+            working_summary="The initial controller checkpoint is complete.",
+            completed_steps=["Recorded the initial controller boundary."],
+        ),
+        checkpoint_response(
+            inspected=["0.py", "1.py", "2.py", "3.py"],
+            unresolved=["OB-tests"],
+            working_summary="The direct model completion retained the new epoch.",
+            completed_steps=["Read four implementation paths and compared them."],
+        ),
+        checkpoint_response(
+            inspected=["0.py", "1.py", "2.py", "3.py"],
+            unresolved=["OB-tests"],
+            working_summary="The resumed model completion retained the compacted epoch.",
+            completed_steps=["Resumed from the compacted checkpoint boundary."],
+        ),
+    ])
+    session = make_session(
+        gateway, max_context_tokens=100_000, model_turns=8, tool_calls=8,
+    )
+    session.request_checkpoint("controller-request", disposition="pause")
+    for index in range(4):
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"direct-diagnostic-{index}",
+            path=f"{index}.py",
+            content="large direct-completion evidence " + (str(index) * 2_000),
+            reasoning=f"large direct-completion reasoning {index} " + ("r" * 2_000),
+        )
+
+    first_completion = session.explore()
+
+    assert [item["reason"] for item in first_completion.finalization_diagnostics] == [
+        "controller-request", "normal-completion",
+    ]
+    assert first_completion.finalization_diagnostics[0]["compaction_level"] == "none"
+    assert first_completion.finalization_diagnostics[1]["disposition"] == "pause"
+
+    session.max_context_tokens = 8_000
+    resumed = session.explore()
+    diagnostics = resumed.finalization_diagnostics
+
+    assert [item["reason"] for item in diagnostics] == [
+        "controller-request", "normal-completion", "normal-completion",
+    ]
+    assert diagnostics[0]["compaction_level"] == "none"
+    assert diagnostics[1]["disposition"] == "pause"
+    assert diagnostics[1]["compaction_level"] == "regular"
+    assert diagnostics[1]["compaction_input_tokens_before"] > 0
+    assert diagnostics[1]["compaction_input_tokens_after"] > 0
+    assert diagnostics[2]["disposition"] == "pause"
+    assert diagnostics[2]["compaction_level"] == "none"
 
 
 def test_checkpoint_diagnostic_admission_keeps_initial_and_repair_reserves():

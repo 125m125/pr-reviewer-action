@@ -193,7 +193,6 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
     "required": ["unresolved"],
     "additionalProperties": False,
 }
-
 # Candidate lifecycle fields are additive so older providers can still emit the
 # legacy ``candidate_findings`` array.  New checkpoints use compact updates and
 # a separate array for genuinely new candidate objects.
@@ -221,6 +220,21 @@ _CHECKPOINT_SCHEMA["properties"]["candidate_updates"] = {
 _CHECKPOINT_SCHEMA["properties"]["new_candidates"] = {
     "type": "array",
     "items": _CHECKPOINT_SCHEMA["properties"]["candidate_findings"]["items"],
+}
+_COMPACTING_CHECKPOINT_SCHEMA: dict[str, Any] = {
+    **_CHECKPOINT_SCHEMA,
+    "properties": {
+        **_CHECKPOINT_SCHEMA["properties"],
+        "working_summary": {
+            **_CHECKPOINT_SCHEMA["properties"]["working_summary"],
+            "minLength": 1,
+        },
+        "completed_steps": {
+            **_CHECKPOINT_SCHEMA["properties"]["completed_steps"],
+            "minItems": 1,
+        },
+    },
+    "required": ["unresolved", "working_summary", "completed_steps"],
 }
 
 _RECOVERY_REASONS = frozenset({
@@ -262,6 +276,11 @@ _CHECKPOINT_CUMULATIVE_INSTRUCTION = (
     "This checkpoint must be cumulative and self-contained because it may "
     "become a future epoch boundary."
 )
+_CHECKPOINT_WORKING_MEMORY_INSTRUCTION = (
+    " For compact_resume, provide a non-empty working_summary describing the "
+    "current understanding and a non-empty completed_steps array describing "
+    "what was checked and concluded."
+)
 _CHECKPOINT_RETENTION_INSTRUCTION = (
     " Required keys: unresolved, candidate_updates, new_candidates, and unknowns. "
     "Empty candidate_updates and new_candidates arrays are valid and mean no "
@@ -283,6 +302,7 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
 )
 _CHECKPOINT_REPAIR_INSTRUCTION = (
     "Repair the previous checkpoint as one JSON object matching the schema."
+    + _CHECKPOINT_WORKING_MEMORY_INSTRUCTION
     + _CHECKPOINT_RETENTION_INSTRUCTION
 )
 
@@ -751,6 +771,7 @@ class _CheckpointSpan:
     response_end: int
     disposition: CheckpointDisposition
     compacted: bool = False
+    diagnostic: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -944,6 +965,7 @@ class SpecialistSession:
             + _CHECKPOINT_CUMULATIVE_INSTRUCTION
             + "\n"
             + self._active_candidate_register()
+            + _CHECKPOINT_WORKING_MEMORY_INSTRUCTION
             + _CHECKPOINT_RETENTION_INSTRUCTION
         )
 
@@ -960,7 +982,12 @@ class SpecialistSession:
         return "tools" if tools_enabled else "structured"
 
     def _request_schema_name(self, schema: dict[str, Any] | None) -> str | None:
-        return "specialist_checkpoint" if schema is _CHECKPOINT_SCHEMA else None
+        return (
+            "specialist_checkpoint"
+            if schema is _CHECKPOINT_SCHEMA
+            or schema is _COMPACTING_CHECKPOINT_SCHEMA
+            else None
+        )
 
     def _renderable_request(
         self,
@@ -1091,7 +1118,7 @@ class SpecialistSession:
         checkpoint = self._estimate_admission(
             tools_enabled=False,
             max_tokens=self.checkpoint_max_tokens,
-            schema=_CHECKPOINT_SCHEMA,
+            schema=_COMPACTING_CHECKPOINT_SCHEMA,
             conversation=projected,
         )
         repair_instruction_tokens = math.ceil(
@@ -1406,10 +1433,22 @@ class SpecialistSession:
                         "model-stopped-without-valid-checkpoint",
                     )
                 self.latest_checkpoint = checkpoint
+                diagnostic = self._record_checkpoint_diagnostic(
+                    reason="normal-completion",
+                    disposition=CheckpointDisposition.PAUSE,
+                    initial_parse="valid",
+                    repair_attempted=False,
+                    repair_parse="not_attempted",
+                    fallback_projection=False,
+                    retention_unknown=False,
+                    initial_finish_reason=turn.finish_reason,
+                    context_admission=self._last_context_admission,
+                )
                 self._checkpoint_spans.append(_CheckpointSpan(
                     request_start=assistant_start,
                     response_end=len(self.conversation.events),
                     disposition=CheckpointDisposition.PAUSE,
+                    diagnostic=diagnostic,
                 ))
                 self.state = SessionState.CHECKPOINT
                 return self._snapshot()
@@ -1819,12 +1858,17 @@ class SpecialistSession:
             )
         checkpoint_request_start = len(self.conversation.events)
         self.conversation.add_user(self._checkpoint_prompt(reason, disposition))
+        checkpoint_schema = (
+            _COMPACTING_CHECKPOINT_SCHEMA
+            if disposition is CheckpointDisposition.COMPACT_RESUME
+            else _CHECKPOINT_SCHEMA
+        )
         request_event_count = len(self._request_events)
         checkpoint_context_admission: dict[str, object] = {}
         try:
             turn = self._request(
                 tools_enabled=False,
-                schema=_CHECKPOINT_SCHEMA,
+                schema=checkpoint_schema,
                 purpose="checkpoint",
                 max_output_tokens=self.checkpoint_max_tokens,
                 allow_compaction=False,
@@ -1872,7 +1916,12 @@ class SpecialistSession:
             content=turn.content,
             calls=turn.tool_calls,
         )
-        checkpoint = self._checkpoint_from_text(turn.content)
+        checkpoint = self._checkpoint_from_text(
+            turn.content,
+            require_working_memory=(
+                disposition is CheckpointDisposition.COMPACT_RESUME
+            ),
+        )
         initial_parse = "valid" if checkpoint is not None else "invalid"
         needs_repair = checkpoint is None or _candidate_retention_lost(
             self._candidate_retention_signal,
@@ -1891,7 +1940,7 @@ class SpecialistSession:
             try:
                 repair = self._request(
                     tools_enabled=False,
-                    schema=_CHECKPOINT_SCHEMA,
+                    schema=checkpoint_schema,
                     purpose="checkpoint-repair",
                     max_output_tokens=self.checkpoint_max_tokens,
                     allow_compaction=False,
@@ -1916,7 +1965,12 @@ class SpecialistSession:
                     content=repair.content,
                     calls=repair.tool_calls,
                 )
-                checkpoint = self._checkpoint_from_text(repair.content)
+                checkpoint = self._checkpoint_from_text(
+                    repair.content,
+                    require_working_memory=(
+                        disposition is CheckpointDisposition.COMPACT_RESUME
+                    ),
+                )
                 repair_parse = "valid" if checkpoint is not None else "invalid"
                 repair_finish_reason = repair.finish_reason
             else:
@@ -1938,7 +1992,7 @@ class SpecialistSession:
         # successful first-pass checkpoints.  This makes the lifecycle log
         # distinguish “valid checkpoint accepted” from “repair/fallback”
         # instead of only explaining failures.
-        self._record_checkpoint_diagnostic(
+        checkpoint_diagnostic = self._record_checkpoint_diagnostic(
             reason=reason,
             disposition=disposition,
             initial_parse=initial_parse,
@@ -1957,6 +2011,7 @@ class SpecialistSession:
                 request_start=checkpoint_request_start,
                 response_end=len(self.conversation.events),
                 disposition=disposition,
+                diagnostic=checkpoint_diagnostic,
             ))
             if disposition is CheckpointDisposition.COMPACT_RESUME:
                 self._compact_validated_epoch(compaction_level=(
@@ -1967,11 +2022,28 @@ class SpecialistSession:
         self.state = SessionState.CHECKPOINT
         return self._snapshot(degraded=fallback_projection or retention_unknown)
 
-    def _checkpoint_from_text(self, text: str) -> SessionCheckpoint | None:
+    def _checkpoint_from_text(
+        self,
+        text: str,
+        *,
+        require_working_memory: bool = False,
+    ) -> SessionCheckpoint | None:
         raw = _json_object(text)
         if raw is None or not isinstance(raw.get("unresolved"), list):
             return None
         previous = self.latest_checkpoint
+        working_summary = (
+            _bounded_text(raw.get("working_summary"), max_length=2_000)
+            if "working_summary" in raw else previous.working_summary
+        )
+        completed_steps = (
+            _bounded_strings(
+                raw.get("completed_steps"), max_items=12, max_length=500,
+            )
+            if "completed_steps" in raw else previous.completed_steps
+        )
+        if require_working_memory and not (working_summary and completed_steps):
+            return None
         retained = {record.id: record for record in self.evidence_store.snapshot().records}
         evidence_ids = list(dict.fromkeys(
             item for item in (
@@ -2102,16 +2174,8 @@ class SpecialistSession:
             state=SessionState.CHECKPOINT,
             evidence_ids=tuple(evidence_ids),
             imported_evidence_ids=previous.imported_evidence_ids,
-            working_summary=(
-                _bounded_text(raw.get("working_summary"), max_length=2_000)
-                if "working_summary" in raw else previous.working_summary
-            ),
-            completed_steps=(
-                _bounded_strings(
-                    raw.get("completed_steps"), max_items=12, max_length=500,
-                )
-                if "completed_steps" in raw else previous.completed_steps
-            ),
+            working_summary=working_summary,
+            completed_steps=completed_steps,
             hypotheses=(
                 _bounded_strings(
                     raw.get("hypotheses"), max_items=12, max_length=500,
@@ -2460,7 +2524,11 @@ class SpecialistSession:
         if not self._checkpoint_spans:
             return EpochCompactionStats()
         latest = self._checkpoint_spans[-1]
-        if latest.compacted:
+        if (
+            latest.compacted
+            or not self.latest_checkpoint.working_summary
+            or not self.latest_checkpoint.completed_steps
+        ):
             return EpochCompactionStats()
 
         before = self._estimate_admission(
@@ -2578,6 +2646,7 @@ class SpecialistSession:
                 response_end=end,
                 disposition=span.disposition,
                 compacted=span.compacted,
+                diagnostic=span.diagnostic,
             ))
         rebuilt_spans[-1] = replace(rebuilt_spans[-1], compacted=True)
         self._checkpoint_spans = rebuilt_spans
@@ -2606,8 +2675,8 @@ class SpecialistSession:
         after = self._estimate_admission(
             tools_enabled=True, max_tokens=self.max_tokens,
         )
-        if self._finalization_diagnostics:
-            self._finalization_diagnostics[-1].update({
+        if latest.diagnostic is not None:
+            latest.diagnostic.update({
                 "compaction_level": str(compaction_level)[:40],
                 "compaction_input_tokens_before": before.input_tokens,
                 "compaction_input_tokens_after": after.input_tokens,
@@ -2626,7 +2695,11 @@ class SpecialistSession:
 
     def _reconstruct_from_valid_checkpoint(self) -> bool:
         """Emergency rebuild from controller-owned cumulative checkpoint state."""
-        if not self._checkpoint_spans:
+        if (
+            not self._checkpoint_spans
+            or not self.latest_checkpoint.working_summary
+            or not self.latest_checkpoint.completed_steps
+        ):
             return False
         previous = self.conversation
         rebuilt = Conversation(
@@ -2871,7 +2944,7 @@ class SpecialistSession:
         initial_error: str = "",
         repair_error: str = "",
         context_admission: Mapping[str, object] | None = None,
-    ) -> None:
+    ) -> dict[str, object]:
         signal = self._candidate_retention_signal
         disposition = CheckpointDisposition(disposition)
         diagnostic: dict[str, object] = {
@@ -2911,6 +2984,7 @@ class SpecialistSession:
         diagnostic.update(dict(context_admission or {}))
         self._finalization_diagnostics.append(diagnostic)
         del self._finalization_diagnostics[:-8]
+        return diagnostic
 
     def _cumulative_checkpoint_payload(self) -> dict[str, object]:
         """Materialize controller-owned state needed to reconstruct a session."""
