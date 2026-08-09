@@ -122,9 +122,13 @@ class RequestAttemptJournal:
                 finish_reason=str(finish_reason or ""),
                 text_source=str(text_source or ""),
                 tool_call_count=max(0, int(tool_call_count or 0)),
-                actual_prompt_tokens=max(0, int(actual_prompt_tokens or 0)),
-                actual_completion_tokens=max(
-                    0, int(actual_completion_tokens or 0),
+                actual_prompt_tokens=(
+                    max(0, int(actual_prompt_tokens or 0))
+                    if status == "completed" else 0
+                ),
+                actual_completion_tokens=(
+                    max(0, int(actual_completion_tokens or 0))
+                    if status == "completed" else 0
                 ),
                 error=str(error or ""),
             )

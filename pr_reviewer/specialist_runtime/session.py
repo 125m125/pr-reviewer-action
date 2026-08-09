@@ -854,7 +854,7 @@ class SpecialistSession:
             return 0
         if not math.isfinite(float(value)) or value <= 0:
             return 0
-        return int(value)
+        return math.ceil(value)
 
     def _request_mode(self, tools_enabled: bool) -> str:
         return "tools" if tools_enabled else "structured"

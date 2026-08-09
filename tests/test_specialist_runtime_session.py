@@ -376,11 +376,17 @@ def test_provider_prompt_usage_calibrates_next_same_mode_admission():
     assert terminal.actual_completion_tokens == 80
 
 
-def test_rendered_admission_falls_back_conservatively_without_provider_usage():
+@pytest.mark.parametrize("usage", (
+    {},
+    {"prompt_tokens": 0, "completion_tokens": 0},
+    {"prompt_tokens": -10, "completion_tokens": -2},
+    {"prompt_tokens": "12000", "completion_tokens": "100"},
+))
+def test_rendered_admission_falls_back_without_valid_provider_usage(usage):
     gateway = EstimatingGateway(
         [checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])],
         rendered_bytes=6_001,
-        usages=({},),
+        usages=(usage,),
     )
     session = make_session(gateway, max_context_tokens=20_000)
 
@@ -413,6 +419,21 @@ def test_provider_calibration_is_independent_for_tools_and_structured_modes():
     assert structured.source == "provider-calibrated"
     assert tools.source == "rendered-fallback"
     assert tools.input_tokens == 10_667
+
+
+def test_fractional_provider_usage_is_rounded_up_for_calibration():
+    gateway = EstimatingGateway(
+        [checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])],
+        rendered_bytes=32_000,
+        usages=({"prompt_tokens": 12_000.5, "completion_tokens": 100.25},),
+    )
+    session = make_session(gateway, max_context_tokens=20_000)
+
+    session.request_checkpoint("controller-request")
+
+    calibration = session._admission_calibration["structured"]
+    assert calibration.last_prompt_tokens == 12_001
+    assert calibration.last_completion_tokens == 101
 
 
 def test_model_gateway_exception_still_charges_reserved_turn():

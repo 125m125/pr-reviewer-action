@@ -58,7 +58,11 @@ def test_failed_attempt_retains_admission_and_has_zero_actual_usage():
     )
 
     assert journal.finish(
-        "S1:model:1", "failed", error="provider unavailable",
+        "S1:model:1",
+        "failed",
+        actual_prompt_tokens=9_999,
+        actual_completion_tokens=999,
+        error="provider unavailable",
     ) is True
 
     attempt = journal.close_since(0)[0]
