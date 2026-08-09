@@ -8,6 +8,7 @@ import math
 import re
 import time
 from dataclasses import asdict, dataclass, is_dataclass, replace
+from enum import Enum
 from pathlib import PurePosixPath
 from typing import Any, Callable, Mapping
 
@@ -201,6 +202,34 @@ _CHECKPOINT_TURN_RESERVE = 2
 _CANDIDATE_RETENTION_UNKNOWN = "candidate-retention-unknown"
 _MAX_CHECKPOINT_CANDIDATE_IDS = 20
 _MAX_CHECKPOINT_CANDIDATE_ID_CHARS = 256
+
+
+class CheckpointDisposition(str, Enum):
+    """Declared lifecycle action after a checkpoint validates."""
+
+    COMPACT_RESUME = "compact_resume"
+    PAUSE = "pause"
+    FINALIZE = "finalize"
+
+
+_CHECKPOINT_LIFECYCLE_INSTRUCTIONS = {
+    CheckpointDisposition.COMPACT_RESUME: (
+        "Immediate compaction after validation: yes. "
+        "After validation, resume the specialist session."
+    ),
+    CheckpointDisposition.PAUSE: (
+        "Immediate compaction after validation: no. "
+        "After validation, pause for controller evaluation."
+    ),
+    CheckpointDisposition.FINALIZE: (
+        "Immediate compaction after validation: no. "
+        "After validation, finalize without resuming the specialist session."
+    ),
+}
+_CHECKPOINT_CUMULATIVE_INSTRUCTION = (
+    "This checkpoint must be cumulative and self-contained because it may "
+    "become a future epoch boundary."
+)
 _CHECKPOINT_RETENTION_INSTRUCTION = (
     " Required keys: unresolved, candidate_updates, new_candidates, and unknowns. "
     "Empty candidate_updates and new_candidates arrays are valid and mean no "
@@ -219,6 +248,10 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
     "retained evidence IDs (evidence:<hash>) from successful tool results in "
     "evidence_ids and supporting_evidence_ids; repository paths are not evidence IDs."
     " JSON shape starts with {\"unresolved\":[\"OB-id\"],\"candidate_updates\":[]}."
+)
+_CHECKPOINT_REPAIR_INSTRUCTION = (
+    "Repair the previous checkpoint as one JSON object matching the schema."
+    + _CHECKPOINT_RETENTION_INSTRUCTION
 )
 
 
@@ -747,6 +780,10 @@ class SpecialistSession:
             max_tokens,
             max_tokens if recovery_max_tokens is None else recovery_max_tokens,
         )
+        self.checkpoint_max_tokens = min(
+            max_tokens,
+            max(2_048, self.recovery_max_tokens * 2),
+        )
         self.recovery_evidence_bytes = recovery_evidence_bytes
         self.clock = clock
         self.wire_safety_tokens = max(0, int(wire_safety_tokens))
@@ -847,6 +884,24 @@ class SpecialistSession:
             entries, sort_keys=True,
         )
 
+    def _checkpoint_prompt(
+        self,
+        reason: str,
+        disposition: CheckpointDisposition | str,
+    ) -> str:
+        disposition = CheckpointDisposition(disposition)
+        return (
+            "Checkpoint requested (not a final report). Checkpoint reason: "
+            + str(reason)
+            + ".\n"
+            + _CHECKPOINT_LIFECYCLE_INSTRUCTIONS[disposition]
+            + "\n"
+            + _CHECKPOINT_CUMULATIVE_INSTRUCTION
+            + "\n"
+            + self._active_candidate_register()
+            + _CHECKPOINT_RETENTION_INSTRUCTION
+        )
+
     @staticmethod
     def _usage_tokens(usage: Mapping[str, Any], key: str) -> int:
         value = usage.get(key)
@@ -868,10 +923,11 @@ class SpecialistSession:
         tools_enabled: bool,
         schema: dict[str, Any] | None,
         max_tokens: int,
+        conversation: Conversation | None = None,
     ) -> ModelTurnRequest:
         return ModelTurnRequest(
             role="specialist",
-            conversation=self.conversation,
+            conversation=self.conversation if conversation is None else conversation,
             max_tokens=max_tokens,
             response_schema=schema,
             tools_enabled=tools_enabled,
@@ -888,9 +944,13 @@ class SpecialistSession:
         tools_enabled: bool,
         max_tokens: int,
         schema: dict[str, Any] | None = None,
+        conversation: Conversation | None = None,
     ) -> _AdmissionEstimate:
         mode = self._request_mode(tools_enabled)
-        coarse_tokens = max(0, int(self.conversation.approx_tokens()))
+        rendered_conversation = (
+            self.conversation if conversation is None else conversation
+        )
+        coarse_tokens = max(0, int(rendered_conversation.approx_tokens()))
         renderer = getattr(self.gateway, "rendered_request_bytes", None)
         rendered_bytes = 0
         if callable(renderer):
@@ -901,6 +961,7 @@ class SpecialistSession:
                         None if tools_enabled else _CHECKPOINT_SCHEMA
                     )),
                     max_tokens=max_tokens,
+                    conversation=rendered_conversation,
                 ))
                 if not isinstance(value, bool):
                     rendered_bytes = max(0, int(value))
@@ -969,20 +1030,52 @@ class SpecialistSession:
             )
         return prompt_tokens, completion_tokens
 
+    def _checkpoint_pressure_due(self) -> bool:
+        projected = Conversation(
+            system=self.conversation.system,
+            events=list(self.conversation.events),
+            tool_schemas=list(self.conversation.tool_schemas),
+        )
+        projected.add_user(self._checkpoint_prompt(
+            "context-pressure", CheckpointDisposition.COMPACT_RESUME,
+        ))
+        checkpoint = self._estimate_admission(
+            tools_enabled=False,
+            max_tokens=self.checkpoint_max_tokens,
+            schema=_CHECKPOINT_SCHEMA,
+            conversation=projected,
+        )
+        repair_instruction_tokens = math.ceil(
+            len(_CHECKPOINT_REPAIR_INSTRUCTION.encode("utf-8")) / 3
+        )
+        reserved_tokens = (
+            checkpoint.input_tokens
+            + (self.checkpoint_max_tokens * 2)
+            + repair_instruction_tokens
+            + self.wire_safety_tokens
+        )
+        return reserved_tokens >= self.max_context_tokens
+
     def _request(
         self,
         *,
         tools_enabled: bool,
         schema: dict[str, Any] | None,
         purpose: str = "unknown",
+        max_output_tokens: int | None = None,
+        allow_compaction: bool = True,
     ) -> ModelTurnResult:
         remaining_output_tokens = self.budget.remaining_output_tokens()
         if remaining_output_tokens is not None and remaining_output_tokens <= 0:
             raise BudgetExhausted("output token limit exhausted")
         configured_max_tokens = (
-            self.recovery_max_tokens
-            if self._recovery_turn_pending
-            else self.max_tokens
+            max_output_tokens
+            if max_output_tokens is not None
+            else (
+                self.recovery_max_tokens
+                if self._recovery_turn_pending
+                else self.max_tokens
+            )
         )
         request_max_tokens = (
             configured_max_tokens
@@ -1013,26 +1106,27 @@ class SpecialistSession:
             "assistant_messages_compacted": 0,
         }
         if admission.admission_tokens > self.max_context_tokens:
-            evidence_before = len(self._compacted_evidence)
-            assistant_before = len(self._assistant_analysis_bodies())
-            self._compact_conversation()
-            admission = self._estimate_admission(
-                tools_enabled=tools_enabled,
-                max_tokens=request_max_tokens,
-                schema=schema,
-            )
-            self._last_context_admission.update({
-                "context_tokens_after": admission.input_tokens,
-                "rendered_request_bytes": admission.rendered_bytes,
-                "admission_tokens": admission.admission_tokens,
-                "admission_source": admission.source,
-                "compacted_evidence_count": (
-                    len(self._compacted_evidence) - evidence_before
-                ),
-                "assistant_messages_compacted": max(
-                    0, assistant_before - len(self._assistant_analysis_bodies()),
-                ),
-            })
+            if allow_compaction:
+                evidence_before = len(self._compacted_evidence)
+                assistant_before = len(self._assistant_analysis_bodies())
+                self._compact_conversation()
+                admission = self._estimate_admission(
+                    tools_enabled=tools_enabled,
+                    max_tokens=request_max_tokens,
+                    schema=schema,
+                )
+                self._last_context_admission.update({
+                    "context_tokens_after": admission.input_tokens,
+                    "rendered_request_bytes": admission.rendered_bytes,
+                    "admission_tokens": admission.admission_tokens,
+                    "admission_source": admission.source,
+                    "compacted_evidence_count": (
+                        len(self._compacted_evidence) - evidence_before
+                    ),
+                    "assistant_messages_compacted": max(
+                        0, assistant_before - len(self._assistant_analysis_bodies()),
+                    ),
+                })
             if admission.admission_tokens > self.max_context_tokens:
                 raise BudgetExhausted(
                     "model context limit cannot admit input and requested output"
@@ -1144,6 +1238,11 @@ class SpecialistSession:
             remaining_output_tokens = self.budget.remaining_output_tokens()
             if remaining_output_tokens is not None and remaining_output_tokens <= 0:
                 raise BudgetExhausted("output token limit exhausted")
+            if self._checkpoint_pressure_due():
+                return self.request_checkpoint(
+                    "context-pressure",
+                    disposition=CheckpointDisposition.COMPACT_RESUME,
+                )
             if self.budget.remaining_model_turns() <= _CHECKPOINT_TURN_RESERVE:
                 return self.request_checkpoint("checkpoint-retention-reserve")
             try:
@@ -1153,7 +1252,10 @@ class SpecialistSession:
             except BudgetExhausted as exc:
                 if "model context limit" not in str(exc):
                     raise
-                return self.request_checkpoint("context-pressure")
+                return self.request_checkpoint(
+                    "context-pressure",
+                    disposition=CheckpointDisposition.COMPACT_RESUME,
+                )
             self._candidate_retention_signal = (
                 self._candidate_retention_signal.merged(
                     _candidate_retention_signal(turn.content)
@@ -1464,26 +1566,24 @@ class SpecialistSession:
         self,
         reason: str = "controller-request",
         *,
+        disposition: CheckpointDisposition | str = CheckpointDisposition.PAUSE,
         candidate_signal: _CandidateRetentionSignal | None = None,
     ) -> SessionResult:
         """Request a structured checkpoint; never force a final report."""
+        disposition = CheckpointDisposition(disposition)
         if candidate_signal is not None:
             self._candidate_retention_signal = (
                 self._candidate_retention_signal.merged(candidate_signal)
             )
-        self.conversation.add_user(
-            "Checkpoint requested (not a final report). Reason: "
-            + str(reason)
-            + "\n"
-            + self._active_candidate_register()
-            + _CHECKPOINT_RETENTION_INSTRUCTION
-        )
+        self.conversation.add_user(self._checkpoint_prompt(reason, disposition))
         request_event_count = len(self._request_events)
         try:
             turn = self._request(
                 tools_enabled=False,
                 schema=_CHECKPOINT_SCHEMA,
                 purpose="checkpoint",
+                max_output_tokens=self.checkpoint_max_tokens,
+                allow_compaction=False,
             )
         except (BudgetExhausted, TimeoutError) as exc:
             if (
@@ -1538,16 +1638,15 @@ class SpecialistSession:
         repair_error = ""
         if needs_repair:
             repair_attempted = True
-            self.conversation.add_user(
-                "Repair the previous checkpoint as one JSON object matching the schema."
-                + _CHECKPOINT_RETENTION_INSTRUCTION
-            )
+            self.conversation.add_user(_CHECKPOINT_REPAIR_INSTRUCTION)
             repair_event_count = len(self._request_events)
             try:
                 repair = self._request(
                     tools_enabled=False,
                     schema=_CHECKPOINT_SCHEMA,
                     purpose="checkpoint-repair",
+                    max_output_tokens=self.checkpoint_max_tokens,
+                    allow_compaction=False,
                 )
             except (BudgetExhausted, TimeoutError) as exc:
                 if (

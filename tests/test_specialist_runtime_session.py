@@ -1006,6 +1006,46 @@ def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract()
         assert "repository paths are not evidence IDs" in prompt
 
 
+@pytest.mark.parametrize(("disposition", "compaction", "lifecycle"), (
+    (
+        "compact_resume",
+        "Immediate compaction after validation: yes.",
+        "After validation, resume the specialist session.",
+    ),
+    (
+        "pause",
+        "Immediate compaction after validation: no.",
+        "After validation, pause for controller evaluation.",
+    ),
+    (
+        "finalize",
+        "Immediate compaction after validation: no.",
+        "After validation, finalize without resuming the specialist session.",
+    ),
+))
+def test_checkpoint_disposition_is_explicit_in_cumulative_prompt(
+    disposition, compaction, lifecycle,
+):
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    session = make_session(gateway)
+
+    session.request_checkpoint(
+        "rendered request pressure", disposition=disposition,
+    )
+
+    prompt = json.loads(gateway.requests[0].messages)[-1]["content"]
+    assert "Checkpoint reason: rendered request pressure." in prompt
+    assert compaction in prompt
+    assert lifecycle in prompt
+    assert (
+        "This checkpoint must be cumulative and self-contained because it may "
+        "become a future epoch boundary."
+    ) in prompt
+    assert "remaining budget" not in prompt.lower()
+
+
 def test_exploration_reserves_checkpoint_and_repair_turns():
     """Exploration cannot consume the turns reserved for structured retention."""
     gateway = ScriptedGateway([
@@ -1024,6 +1064,44 @@ def test_exploration_reserves_checkpoint_and_repair_turns():
         True, True, False, False,
     ]
     assert result.budget.model_turns == 4
+
+
+def test_pressure_requests_checkpoint_before_exploration():
+    gateway = EstimatingGateway(
+        [checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])],
+        rendered_bytes=12_000,
+    )
+    session = make_session(
+        gateway,
+        max_tokens=2_048,
+        recovery_max_tokens=1_024,
+        max_context_tokens=7_000,
+    )
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
+
+    old_coarse_admission = (
+        session.conversation.approx_tokens()
+        + session.max_tokens
+        + session.wire_safety_tokens
+    )
+    exploration_admission = session._estimate_admission(
+        tools_enabled=True, max_tokens=session.max_tokens,
+    )
+    assert old_coarse_admission < session.max_context_tokens
+    assert exploration_admission.admission_tokens < session.max_context_tokens
+
+    result = session.explore()
+
+    assert result.state.value == "checkpoint"
+    assert len(gateway.requests) == 1
+    assert gateway.requests[0].tools_enabled is False
+    assert gateway.requests[0].max_tokens == 2_048
+    assert gateway.requests[0].reasoning_effort == "none"
+    assert gateway.requests[0].messages_contain(
+        "After validation, resume the specialist session."
+    )
+    assert attempts.close_since(0)[0].purpose == "checkpoint"
 
 
 def test_checkpoint_request_includes_compact_schema_contract():
