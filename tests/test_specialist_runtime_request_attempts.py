@@ -66,4 +66,3 @@ def test_failed_attempt_retains_admission_and_has_zero_actual_usage():
     assert attempt.admission_source == "provider-calibrated"
     assert attempt.actual_prompt_tokens == 0
     assert attempt.actual_completion_tokens == 0
-
