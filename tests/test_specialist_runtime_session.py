@@ -851,6 +851,22 @@ def test_checkpoint_reasoning_only_repair_degrades_to_projection():
     assert set(result.checkpoint.unknowns) == {"OB-code", "OB-tests"}
 
 
+def test_checkpoint_context_admission_failure_records_actionable_diagnostics():
+    session = make_session(
+        ScriptedGateway([]), max_context_tokens=300, max_tokens=256,
+    )
+
+    result = session.request_checkpoint("context-pressure")
+
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["initial_error"].startswith(
+        "BudgetExhausted: model context limit"
+    )
+    assert diagnostic["context_tokens_before"] >= diagnostic["context_tokens_after"]
+    assert diagnostic["max_context_tokens"] == 300
+    assert diagnostic["requested_output_tokens"] == 256
+
+
 def test_unrecoverable_candidate_text_is_reported_as_retention_unknown():
     """Fallback state cannot look like a trustworthy zero-findings checkpoint."""
     gateway = ScriptedGateway([

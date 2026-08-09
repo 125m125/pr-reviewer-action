@@ -1341,31 +1341,32 @@ def _runtime_event_line(
     kind = event.kind
     role = _compact_text(payload.get("role"), 60)
     phase = _compact_text(payload.get("phase"), 40)
-    request_id = _compact_text(payload.get("request_id"), 100)
     session_id = _compact_text(payload.get("session_id"), 100)
     error = _compact_text(payload.get("error") or payload.get("reason"), 260)
-    if kind == "specialist_request_started":
-        if session_id:
-            known = session_id in (seen_sessions or set())
-            if seen_sessions is not None:
-                seen_sessions.add(session_id)
-            schema = _compact_text(payload.get("response_schema_name"), 60)
-            if schema == "specialist_checkpoint":
-                action = "checkpoint"
-            elif bool(payload.get("tools_enabled")):
-                action = "continuing" if known else "initial"
-                action += " specialist"
-                action = f"{action} {session_id} (tool/evidence loop)"
-                return f"{action} request={request_id}"
-            else:
-                action = "strict structured turn"
-            return f"{action} {session_id} request={request_id}"
-        return f"role {role} started request={request_id} phase={phase}"
     if kind.startswith("specialist_request_"):
         # These admitted events remain in the artifact for machine consumers.
         # The console already receives the richer immediate llm_request_* line;
         # rendering both produced duplicate and frequently reordered messages.
         return None
+    if kind == "negotiation_action":
+        action = _compact_text(payload.get("kind"), 40)
+        obligations = payload.get("obligation_ids")
+        obligation_text = ",".join(
+            _compact_text(item, 90) for item in obligations[:4]
+        ) if isinstance(obligations, (list, tuple)) else ""
+        target = _compact_text(payload.get("session_id"), 100)
+        suffix = f" target={target}" if target else ""
+        suffix += f" obligations={obligation_text}" if obligation_text else ""
+        suffix += f" reason={error}" if error else ""
+        return f"negotiation proposed kind={action}{suffix}"
+    if kind == "negotiation_action_applied":
+        action = _compact_text(payload.get("kind"), 40)
+        outcome = _compact_text(payload.get("outcome"), 80)
+        target = _compact_text(
+            payload.get("session_id") or payload.get("assignment_id"), 100,
+        )
+        suffix = f" target={target}" if target else ""
+        return f"negotiation applied kind={action} outcome={outcome}{suffix}"
     if kind in {"model_request_started", "model_request_completed", "model_request_failed", "model_request_timed_out"}:
         status = kind.removeprefix("model_request_")
         suffix = f": {error}" if error else ""
@@ -1407,6 +1408,10 @@ def _runtime_event_line(
                 "reason", "initial_parse", "repair_attempted", "repair_parse",
                 "fallback_projection", "retention_unknown", "initial_finish_reason",
                 "repair_finish_reason",
+                "initial_error", "repair_error", "context_tokens_before",
+                "context_tokens_after", "max_context_tokens",
+                "requested_output_tokens", "wire_safety_tokens",
+                "compacted_evidence_count", "assistant_messages_compacted",
             ):
                 if key in latest and latest[key] not in (None, "", False, ()):
                     details.append(f"{key}={_compact_text(latest[key], 80)}")

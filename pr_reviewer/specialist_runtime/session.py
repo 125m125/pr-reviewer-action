@@ -718,6 +718,7 @@ class SpecialistSession:
         self._final_result: SessionResult | None = None
         self._request_events: list[SpecialistRequestEvent] = []
         self._finalization_diagnostics: list[dict[str, object]] = []
+        self._last_context_admission: dict[str, object] = {}
         self._request_attempt_journal: RequestAttemptJournal | None = None
         self._request_assignment_id = str(getattr(
             assignment, "assignment_id", getattr(assignment, "id", ""),
@@ -816,14 +817,34 @@ class SpecialistSession:
             if remaining_output_tokens is None
             else min(configured_max_tokens, remaining_output_tokens)
         )
+        self._last_context_admission = {
+            "context_tokens_before": estimated_input_tokens,
+            "context_tokens_after": estimated_input_tokens,
+            "max_context_tokens": self.max_context_tokens,
+            "requested_output_tokens": request_max_tokens,
+            "wire_safety_tokens": self.wire_safety_tokens,
+            "compacted_evidence_count": 0,
+            "assistant_messages_compacted": 0,
+        }
         if (
             estimated_input_tokens
             + request_max_tokens
             + self.wire_safety_tokens
             > self.max_context_tokens
         ):
+            evidence_before = len(self._compacted_evidence)
+            assistant_before = len(self._assistant_analysis_bodies())
             self._compact_conversation()
             estimated_input_tokens = self.conversation.approx_tokens()
+            self._last_context_admission.update({
+                "context_tokens_after": estimated_input_tokens,
+                "compacted_evidence_count": (
+                    len(self._compacted_evidence) - evidence_before
+                ),
+                "assistant_messages_compacted": max(
+                    0, assistant_before - len(self._assistant_analysis_bodies()),
+                ),
+            })
             if (
                 estimated_input_tokens
                 + request_max_tokens
@@ -1272,7 +1293,7 @@ class SpecialistSession:
                 schema=_CHECKPOINT_SCHEMA,
                 purpose="checkpoint",
             )
-        except (BudgetExhausted, TimeoutError):
+        except (BudgetExhausted, TimeoutError) as exc:
             if (
                 len(self._request_events) > request_event_count
                 and self._request_events[-1].status == "completed"
@@ -1298,6 +1319,8 @@ class SpecialistSession:
                     _CANDIDATE_RETENTION_UNKNOWN
                     in self.latest_checkpoint.unknowns
                 ),
+                initial_error=f"{type(exc).__name__}: {exc}",
+                context_admission=self._last_context_admission,
             )
             self.state = SessionState.CHECKPOINT
             return self._snapshot(degraded=True)
@@ -1320,6 +1343,7 @@ class SpecialistSession:
         repair_parse = "not_attempted"
         initial_finish_reason = turn.finish_reason
         repair_finish_reason = ""
+        repair_error = ""
         if needs_repair:
             repair_attempted = True
             self.conversation.add_user(
@@ -1333,13 +1357,14 @@ class SpecialistSession:
                     schema=_CHECKPOINT_SCHEMA,
                     purpose="checkpoint-repair",
                 )
-            except (BudgetExhausted, TimeoutError):
+            except (BudgetExhausted, TimeoutError) as exc:
                 if (
                     len(self._request_events) > repair_event_count
                     and self._request_events[-1].status == "completed"
                 ):
                     raise
                 repair = None
+                repair_error = f"{type(exc).__name__}: {exc}"
             if repair is not None:
                 self._candidate_retention_signal = (
                     self._candidate_retention_signal.merged(
@@ -1382,6 +1407,8 @@ class SpecialistSession:
             retention_unknown=retention_unknown,
             initial_finish_reason=initial_finish_reason,
             repair_finish_reason=repair_finish_reason,
+            repair_error=repair_error,
+            context_admission=self._last_context_admission,
         )
         self.latest_checkpoint = checkpoint
         self.state = SessionState.CHECKPOINT
@@ -1889,9 +1916,12 @@ class SpecialistSession:
         retention_unknown: bool,
         initial_finish_reason: str = "",
         repair_finish_reason: str = "",
+        initial_error: str = "",
+        repair_error: str = "",
+        context_admission: Mapping[str, object] | None = None,
     ) -> None:
         signal = self._candidate_retention_signal
-        self._finalization_diagnostics.append({
+        diagnostic: dict[str, object] = {
             "reason": str(reason)[:120],
             "initial_parse": initial_parse,
             "repair_attempted": bool(repair_attempted),
@@ -1905,7 +1935,11 @@ class SpecialistSession:
             "candidate_ids_seen": len(signal.candidate_ids),
             "unidentified_candidate_shapes": signal.unidentified_shapes,
             "omitted_candidate_ids": signal.omitted_candidate_ids,
-        })
+            "initial_error": str(initial_error)[:300],
+            "repair_error": str(repair_error)[:300],
+        }
+        diagnostic.update(dict(context_admission or {}))
+        self._finalization_diagnostics.append(diagnostic)
         del self._finalization_diagnostics[:-8]
 
     def conversation_contains_evidence_ids(self, evidence_ids: tuple[str, ...]) -> bool:

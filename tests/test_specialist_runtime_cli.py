@@ -70,7 +70,7 @@ def test_planner_context_projection_is_bounded_without_losing_plan_identity():
     assert projected["obligations"][0]["obligation_id"] == "obligation-0"
 
 
-def test_runtime_event_line_reports_lifecycle_without_model_content():
+def test_runtime_event_line_suppresses_delayed_specialist_admission_duplicate():
     from pr_reviewer.specialist_runtime.events import RunEvent
 
     event = RunEvent(1, "specialist_request_started", {
@@ -79,10 +79,9 @@ def test_runtime_event_line_reports_lifecycle_without_model_content():
         "tools_enabled": True,
     })
 
-    line = cli._runtime_event_line(event, seen_sessions={"session:test"})
-
-    assert "continuing specialist session:test" in line
-    assert "tool/evidence loop" in line
+    assert cli._runtime_event_line(
+        event, seen_sessions={"session:test"},
+    ) is None
 
 
 def test_runtime_event_line_reports_request_purpose_and_suppresses_duplicate_admission():
@@ -105,6 +104,21 @@ def test_runtime_event_line_reports_request_purpose_and_suppresses_duplicate_adm
             "session_id": "session:test",
         })
     ) is None
+
+
+def test_runtime_event_line_explains_record_unknown_negotiation_action():
+    from pr_reviewer.specialist_runtime.events import RunEvent
+
+    line = cli._runtime_event_line(RunEvent(3, "negotiation_action", {
+        "kind": "record_unknown",
+        "obligation_ids": ("obligation:auth",),
+        "reason": "Trust-boundary evidence was not available.",
+        "estimated_turns": 0,
+    }))
+
+    assert "record_unknown" in line
+    assert "obligation:auth" in line
+    assert "Trust-boundary evidence was not available" in line
 
 
 def runtime_source_paths() -> tuple[Path, ...]:

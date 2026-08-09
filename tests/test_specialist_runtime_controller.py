@@ -169,6 +169,46 @@ def test_gateway_role_repair_continues_from_retained_reasoning_and_content():
     assert payloads[1]["reasoning_effort"] == "none"
 
 
+def test_gateway_role_repairs_malformed_structured_stop_response():
+    calls = []
+
+    class Gateway:
+        def __init__(self):
+            self.responses = iter((
+                ModelTurnResult(
+                    response={}, tool_calls=(), text='{"summary":"cut off',
+                    text_source="content", finish_reason="stop", usage={},
+                    request_diagnostics={}, content='{"summary":"cut off',
+                    reasoning="long private analysis",
+                ),
+                ModelTurnResult(
+                    response={}, tool_calls=(), text='{"summary":"complete"}',
+                    text_source="content", finish_reason="stop", usage={},
+                    request_diagnostics={}, content='{"summary":"complete"}',
+                    reasoning="",
+                ),
+            ))
+
+        def complete(self, request):
+            calls.append(request)
+            return next(self.responses)
+
+    adapter = GatewayRoleAdapter(Gateway())
+    result = adapter.complete(RoleRequest(
+        role="handoff_summarizer",
+        request_id="handoff_summarizer:malformed-stop",
+        phase=RunPhase.FINALIZATION,
+        lease=controller_module.SessionLease(RunPhase.FINALIZATION, 10**20),
+        timeout_sec=30,
+        max_tokens=512,
+        context={"facts": ["src/app.py"]},
+    ))
+
+    assert result == {"summary": "complete"}
+    assert len(calls) == 2
+    assert calls[1].reasoning_effort == "none"
+
+
 def test_critic_schema_ignores_prose_instead_of_rewriting_consequence_support():
     candidate = CandidateFinding("candidate-1", "root", "claim")
     rationale = "consequence_support:reachable_input_path; evidence_ids=evidence:1"
@@ -1870,6 +1910,15 @@ def test_negotiator_failure_uses_live_budget_fallback_resume(tmp_path):
     assert result.artifact["recipes"]["delivery"]["status"] == "covered"
     assert any(
         event.kind == "negotiation_action" and event.payload["kind"] == "resume"
+        for event in result.events
+    )
+    action_event = next(
+        event for event in result.events if event.kind == "negotiation_action"
+    )
+    assert action_event.payload["reason"]
+    assert any(
+        event.kind == "negotiation_action_applied"
+        and event.payload["outcome"] == "scheduled"
         for event in result.events
     )
     assert result.handoff.coverage_warning is None

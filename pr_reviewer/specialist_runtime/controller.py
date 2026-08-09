@@ -1008,11 +1008,13 @@ class GatewayRoleAdapter:
                 content = result.text
             try:
                 return _json_object(content)
-            except (TypeError, ValueError):
-                reasoning_only = not content.strip() and bool(result.reasoning.strip())
-                continuation_allowed = (
-                    result.finish_reason == "length" or reasoning_only
-                )
+            except (TypeError, ValueError) as exc:
+                # Provider finish reasons are not trustworthy enough to decide
+                # whether malformed structured output deserves its one bounded
+                # repair.  In particular, local endpoints can report ``stop``
+                # after filling the output budget with reasoning and cutting the
+                # JSON content mid-object.
+                continuation_allowed = attempt < max_attempts - 1
                 if self.attempt_logger is not None:
                     status = (
                         "continuation scheduled"
@@ -1022,7 +1024,12 @@ class GatewayRoleAdapter:
                     )
                     self.attempt_logger(
                         f"role {request.role} structured response invalid; "
-                        f"finish_reason={result.finish_reason or 'unknown'}; {status}"
+                        f"attempt={attempt + 1}/{max_attempts}; "
+                        f"finish_reason={result.finish_reason or 'unknown'}; "
+                        f"content_chars={len(content)}; "
+                        f"reasoning_chars={len(result.reasoning)}; "
+                        f"parse_error={type(exc).__name__}: {str(exc)[:160]}; "
+                        f"{status}"
                     )
                 if (
                     attempt == max_attempts - 1
@@ -3064,6 +3071,7 @@ class ReviewController:
                 "session_id": action.session_id,
                 "obligation_ids": action.obligation_ids,
                 "estimated_turns": action.estimated_turns,
+                "reason": action.reason,
             })
             if action.kind == "record_unknown":
                 for obligation_id in action.obligation_ids:
@@ -3074,14 +3082,29 @@ class ReviewController:
                         "reason": "bounded investigation recorded no further feasible evidence",
                         "resolution_policy": dict(action.resolution_policies).get(obligation_id),
                     })
+                state.journal.emit("negotiation_action_applied", {
+                    "kind": action.kind,
+                    "obligation_ids": action.obligation_ids,
+                    "outcome": "recorded_unresolved",
+                })
                 continue
             if action.kind in {"resume", "consult"} and action.session_id:
                 ownership = state.ownership.get(action.session_id)
                 if ownership is None:
+                    state.journal.emit("negotiation_action_applied", {
+                        "kind": action.kind,
+                        "session_id": action.session_id,
+                        "outcome": "skipped_unknown_session",
+                    })
                     continue
                 assignment = state.assignments[ownership.assignment_id]
                 session = state.sessions.get(action.session_id)
                 if session is None:
+                    state.journal.emit("negotiation_action_applied", {
+                        "kind": action.kind,
+                        "session_id": action.session_id,
+                        "outcome": "skipped_missing_session",
+                    })
                     continue
                 succeeded, _ = self._session_hook(
                     state,
@@ -3092,6 +3115,15 @@ class ReviewController:
                 )
                 if succeeded:
                     result.append(assignment)
+                    outcome = "scheduled"
+                else:
+                    outcome = "skipped_feedback_failed"
+                state.journal.emit("negotiation_action_applied", {
+                    "kind": action.kind,
+                    "session_id": action.session_id,
+                    "obligation_ids": action.obligation_ids,
+                    "outcome": outcome,
+                })
                 continue
             selected = tuple(
                 obligation_by_id[item] for item in action.obligation_ids
@@ -3107,6 +3139,11 @@ class ReviewController:
                     })
                     assert state.coverage is not None
                     state.coverage.mark_unresolved(obligation.id)
+                state.journal.emit("negotiation_action_applied", {
+                    "kind": action.kind,
+                    "obligation_ids": action.obligation_ids,
+                    "outcome": "recorded_infeasible",
+                })
                 continue
             assignment = replace(
                 plan.assignments[0],
@@ -3116,6 +3153,12 @@ class ReviewController:
             )
             state.assignments[assignment.id] = assignment
             result.append(assignment)
+            state.journal.emit("negotiation_action_applied", {
+                "kind": action.kind,
+                "obligation_ids": action.obligation_ids,
+                "assignment_id": assignment.id,
+                "outcome": "scheduled",
+            })
         return tuple(result)
 
     def _collect_candidates(self, state: _RunState) -> tuple[CandidateFinding, ...]:
