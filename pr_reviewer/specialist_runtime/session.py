@@ -12,7 +12,7 @@ from enum import Enum
 from pathlib import PurePosixPath
 from typing import Any, Callable, Mapping
 
-from pr_reviewer.conversation import Conversation
+from pr_reviewer.conversation import Conversation, EpochCompactionStats
 from pr_reviewer.tool_loop import decode_native_tool_arguments, native_tool_request_key
 
 from .budget import BudgetExhausted, BudgetLedger, SessionLease
@@ -711,6 +711,16 @@ class _AdmissionCalibration:
 
 
 @dataclass(frozen=True)
+class _CheckpointSpan:
+    """Controller-owned event span for one validated model checkpoint."""
+
+    request_start: int
+    response_end: int
+    disposition: CheckpointDisposition
+    compacted: bool = False
+
+
+@dataclass(frozen=True)
 class SessionResult:
     """Detached projection of current or completed specialist state."""
 
@@ -803,6 +813,7 @@ class SpecialistSession:
         self._compacted_evidence: dict[str, EvidenceRecord] = {}
         self._compacted_evidence_read_keys: set[tuple[str, int, int]] = set()
         self._compacted_evidence_reads = 0
+        self._checkpoint_spans: list[_CheckpointSpan] = []
         self._tool_lease_exhausted = False
         self._recovery_turn_pending = False
         self._final_result: SessionResult | None = None
@@ -1223,6 +1234,25 @@ class SpecialistSession:
         self.lease.request_timeout(
             self.request_timeout_sec, now=self.clock(),
         )
+        resuming_checkpoint = self.state is SessionState.CHECKPOINT
+        reused_checkpoint_boundary = False
+        if resuming_checkpoint and self._checkpoint_spans:
+            continuation_admission = self._estimate_admission(
+                tools_enabled=True,
+                max_tokens=self.max_tokens,
+            )
+            if (
+                continuation_admission.admission_tokens > self.max_context_tokens
+                or self._checkpoint_pressure_due()
+            ):
+                self._compact_validated_epoch()
+                reused_checkpoint_boundary = True
+                continuation_admission = self._estimate_admission(
+                    tools_enabled=True,
+                    max_tokens=self.max_tokens,
+                )
+                if continuation_admission.admission_tokens > self.max_context_tokens:
+                    self._reconstruct_from_valid_checkpoint()
         self.state = SessionState.EXPLORING
         while True:
             if self.conversation.approx_tokens() > self.max_context_tokens:
@@ -1239,11 +1269,12 @@ class SpecialistSession:
             remaining_output_tokens = self.budget.remaining_output_tokens()
             if remaining_output_tokens is not None and remaining_output_tokens <= 0:
                 raise BudgetExhausted("output token limit exhausted")
-            if self._checkpoint_pressure_due():
+            if self._checkpoint_pressure_due() and not reused_checkpoint_boundary:
                 return self.request_checkpoint(
                     "context-pressure",
                     disposition=CheckpointDisposition.COMPACT_RESUME,
                 )
+            reused_checkpoint_boundary = False
             if self.budget.remaining_model_turns() <= _CHECKPOINT_TURN_RESERVE:
                 return self.request_checkpoint("checkpoint-retention-reserve")
             try:
@@ -1262,6 +1293,7 @@ class SpecialistSession:
                     _candidate_retention_signal(turn.content)
                 )
             )
+            assistant_start = len(self.conversation.events)
             self.conversation.add_assistant_turn(
                 reasoning=turn.reasoning,
                 content=turn.content,
@@ -1296,6 +1328,11 @@ class SpecialistSession:
                         "model-stopped-without-valid-checkpoint",
                     )
                 self.latest_checkpoint = checkpoint
+                self._checkpoint_spans.append(_CheckpointSpan(
+                    request_start=assistant_start,
+                    response_end=len(self.conversation.events),
+                    disposition=CheckpointDisposition.PAUSE,
+                ))
                 self.state = SessionState.CHECKPOINT
                 return self._snapshot()
             progressed = self._execute_calls(turn.tool_calls)
@@ -1582,6 +1619,7 @@ class SpecialistSession:
             self._candidate_retention_signal = (
                 self._candidate_retention_signal.merged(candidate_signal)
             )
+        checkpoint_request_start = len(self.conversation.events)
         self.conversation.add_user(self._checkpoint_prompt(reason, disposition))
         request_event_count = len(self._request_events)
         try:
@@ -1709,6 +1747,14 @@ class SpecialistSession:
             context_admission=self._last_context_admission,
         )
         self.latest_checkpoint = checkpoint
+        if not fallback_projection and not retention_unknown:
+            self._checkpoint_spans.append(_CheckpointSpan(
+                request_start=checkpoint_request_start,
+                response_end=len(self.conversation.events),
+                disposition=disposition,
+            ))
+            if disposition is CheckpointDisposition.COMPACT_RESUME:
+                self._compact_validated_epoch()
         self.state = SessionState.CHECKPOINT
         return self._snapshot(degraded=fallback_projection or retention_unknown)
 
@@ -2082,66 +2128,359 @@ class SpecialistSession:
             raise ValueError("session lease phase cannot move backward")
         self.lease = lease
 
-    def _compact_conversation(self) -> None:
-        before = self._conversation_evidence_bodies()
-        before_assistant = self._assistant_analysis_bodies()
-        if self.conversation.approx_tokens() > self.max_context_tokens:
-            self.conversation.collapse_oldest_completed_history(
-                max(1_000, self.max_context_tokens * 2), keep_newest_results=2,
-            )
-        if self.conversation.approx_tokens() > self.max_context_tokens:
-            self.conversation.collapse_oldest_completed_history(
-                max(256, self.max_context_tokens), keep_newest_results=0,
-            )
-        after = self._conversation_evidence_bodies()
-        after_assistant = self._assistant_analysis_bodies()
-        newly_compacted: list[str] = []
+    def _compaction_replacements(self, end_index: int) -> dict[str, dict[str, object]]:
         retained = {
             record.id: record
             for record in self.evidence_store.snapshot().records
+            if record.is_usable_for_coverage
         }
-        for evidence_id, previous_body in before.items():
-            current_body = after.get(evidence_id)
-            if (
-                current_body is not None
-                and current_body == previous_body
-            ):
+        replacements: dict[str, dict[str, object]] = {}
+        for event in self.conversation.events[:end_index]:
+            if event.get("kind") != "tool_result":
                 continue
+            call_id = str(event.get("call_id") or "")
+            evidence_id = self._tool_call_evidence_ids.get(call_id, "")
             record = retained.get(evidence_id)
-            if record is None or evidence_id in self._compacted_evidence:
+            if record is None:
                 continue
-            self._compacted_evidence[evidence_id] = record
-            newly_compacted.append(evidence_id)
-        assistant_compacted = len(after_assistant) < len(before_assistant)
-        if newly_compacted or assistant_compacted:
-            entries = []
-            for evidence_id in newly_compacted[:20]:
-                record = self._compacted_evidence[evidence_id]
-                entries.append({
-                    "evidence_id": evidence_id,
-                    "tool": record.tool,
-                    "arguments": record.arguments,
-                    "original_bytes": len(record.content.encode("utf-8")),
-                    "source_truncated": bool(record.truncated),
-                })
-            marker_lines = []
-            if newly_compacted:
-                marker_lines.append(
-                    "Older tool results were compacted and are not fully visible. "
-                    "Use read_compacted_evidence only for these exact IDs, and only "
-                    "if the omitted content is necessary:\n"
-                    + json.dumps(entries, sort_keys=True)
+            replacements[call_id] = {
+                "status": "compacted",
+                "evidence_id": record.id,
+                "source_path": record.source_path or record.source_identity,
+                "original_bytes": len(record.content.encode("utf-8")),
+            }
+        return replacements
+
+    def _compacted_evidence_catalogue(
+        self, *, max_bytes: int | None = None,
+    ) -> list[dict[str, object]]:
+        entries = []
+        for evidence_id, record in sorted(self._compacted_evidence.items())[:20]:
+            entry = {
+                "evidence_id": evidence_id,
+                "source_path": record.source_path or record.source_identity,
+                "original_bytes": len(record.content.encode("utf-8")),
+            }
+            candidate = [*entries, entry]
+            if (
+                max_bytes is not None
+                and len(json.dumps(candidate, sort_keys=True).encode("utf-8"))
+                > max(0, max_bytes)
+            ):
+                break
+            entries.append(entry)
+        return entries
+
+    def _bounded_reconstruction_checkpoint(self) -> dict[str, object]:
+        """Project cumulative state with a fixed-size evidence ledger."""
+        payload = self._cumulative_checkpoint_payload()
+        active_evidence_ids = tuple(dict.fromkeys((
+            *(
+                evidence_id
+                for candidate in self.candidate_findings
+                for evidence_id in (
+                    *candidate.supporting_evidence_ids,
+                    *candidate.contradicting_evidence_ids,
                 )
-            if assistant_compacted:
-                marker_lines.append(
-                    "Older assistant analysis was compacted. It is not authoritative; "
-                    "rely on retained checkpoints and evidence, and re-check source "
-                    "when the omitted reasoning matters."
-                )
-            self.conversation.events.append({
-                "kind": "user", "content": "\n".join(marker_lines),
-                "compaction_note": True,
-            })
+            ),
+            *self.latest_checkpoint.evidence_ids,
+        )))[:40]
+        active_evidence_set = set(active_evidence_ids)
+        checkpoint = payload.get("latest_checkpoint")
+        if isinstance(checkpoint, dict):
+            checkpoint["evidence_ids"] = list(active_evidence_ids)
+            checkpoint["imported_evidence_ids"] = list(
+                self.latest_checkpoint.imported_evidence_ids[:40]
+            )
+        coverage = payload.get("coverage")
+        if isinstance(coverage, dict):
+            by_obligation = coverage.get("evidence_by_obligation")
+            if isinstance(by_obligation, dict):
+                coverage["evidence_by_obligation"] = {
+                    obligation_id: [
+                        evidence_id
+                        for evidence_id in evidence_ids
+                        if evidence_id in active_evidence_set
+                    ][:40]
+                    for obligation_id, evidence_ids in by_obligation.items()
+                }
+        active_candidate_ids = {
+            candidate.candidate_id for candidate in self.candidate_findings
+        }
+        statuses = payload.get("candidate_statuses")
+        if isinstance(statuses, dict):
+            payload["candidate_statuses"] = {
+                candidate_id: status
+                for candidate_id, status in statuses.items()
+                if candidate_id in active_candidate_ids
+            }
+
+        metadata_budget = max(0, self.recovery_evidence_bytes // 2)
+        bounded_metadata: list[object] = []
+        for item in payload.get("evidence_metadata", ()):
+            if not isinstance(item, dict):
+                continue
+            if active_evidence_set and item.get("id") not in active_evidence_set:
+                continue
+            candidate = [*bounded_metadata, item]
+            if (
+                len(json.dumps(candidate, sort_keys=True).encode("utf-8"))
+                > metadata_budget
+            ):
+                break
+            bounded_metadata.append(item)
+        payload["evidence_metadata"] = bounded_metadata
+        return payload
+
+    def _compact_validated_epoch(self) -> EpochCompactionStats:
+        """Compact only history closed by the latest validated checkpoint."""
+        if not self._checkpoint_spans:
+            return EpochCompactionStats()
+        latest = self._checkpoint_spans[-1]
+        if latest.compacted:
+            return EpochCompactionStats()
+
+        old_events = list(self.conversation.events)
+        span_markers = [
+            (old_events[span.request_start], old_events[span.response_end - 1])
+            for span in self._checkpoint_spans
+        ]
+        protected_ids = {id(old_events[0])} if old_events else set()
+        for span in self._checkpoint_spans:
+            protected_ids.update(
+                id(event)
+                for event in old_events[span.request_start:span.response_end]
+            )
+
+        prune_before = (
+            self._checkpoint_spans[-2].request_start
+            if len(self._checkpoint_spans) >= 2
+            else 0
+        )
+        removed_old_events = 0
+        pruned_evidence_ids: set[str] = set()
+        working: list[dict[str, Any]] = []
+        for index, event in enumerate(old_events):
+            if (
+                prune_before
+                and index < prune_before
+                and id(event) not in protected_ids
+            ):
+                removed_old_events += 1
+                if event.get("kind") == "tool_result":
+                    evidence_id = self._tool_call_evidence_ids.get(
+                        str(event.get("call_id") or ""),
+                        "",
+                    )
+                    if evidence_id:
+                        pruned_evidence_ids.add(evidence_id)
+                continue
+            if id(event) in protected_ids:
+                working.append({"kind": "checkpoint_protected", "event": event})
+            else:
+                working.append(event)
+
+        latest_start_event = old_events[latest.request_start]
+        boundary = next(
+            index
+            for index, event in enumerate(working)
+            if event.get("kind") == "checkpoint_protected"
+            and event.get("event") is latest_start_event
+        )
+        replacements = self._compaction_replacements(latest.request_start)
+        before_results = {
+            str(event.get("call_id") or ""): str(event.get("content", ""))
+            for event in working[:boundary]
+            if event.get("kind") == "tool_result"
+        }
+        projected = Conversation(
+            system=self.conversation.system,
+            events=working,
+            tool_schemas=list(self.conversation.tool_schemas),
+        )
+        stats = projected.compact_tool_epoch(
+            boundary,
+            replacements,
+            keep_newest_results=2,
+        )
+        self.conversation.events = [
+            event["event"]
+            if event.get("kind") == "checkpoint_protected"
+            else event
+            for event in projected.events
+        ]
+        after_results = {
+            str(event.get("call_id") or ""): str(event.get("content", ""))
+            for event in self.conversation.events
+            if event.get("kind") == "tool_result"
+        }
+        retained = {
+            record.id: record for record in self.evidence_store.snapshot().records
+        }
+        for evidence_id in pruned_evidence_ids:
+            record = retained.get(evidence_id)
+            if record is not None and record.is_usable_for_coverage:
+                self._compacted_evidence[evidence_id] = record
+        for call_id, old_content in before_results.items():
+            if after_results.get(call_id) == old_content:
+                continue
+            evidence_id = self._tool_call_evidence_ids.get(call_id, "")
+            record = retained.get(evidence_id)
+            if record is not None and record.is_usable_for_coverage:
+                self._compacted_evidence[evidence_id] = record
+
+        rebuilt_spans: list[_CheckpointSpan] = []
+        for span, (start_event, end_event) in zip(
+            self._checkpoint_spans, span_markers,
+        ):
+            start = next(
+                index for index, event in enumerate(self.conversation.events)
+                if event is start_event
+            )
+            end = next(
+                index for index, event in enumerate(self.conversation.events)
+                if event is end_event
+            ) + 1
+            rebuilt_spans.append(_CheckpointSpan(
+                request_start=start,
+                response_end=end,
+                disposition=span.disposition,
+                compacted=span.compacted,
+            ))
+        rebuilt_spans[-1] = replace(rebuilt_spans[-1], compacted=True)
+        self._checkpoint_spans = rebuilt_spans
+
+        continuation = {
+            "cumulative_checkpoint": self._cumulative_checkpoint_payload(),
+            "compacted_evidence": self._compacted_evidence_catalogue(),
+            "removal_summary": {
+                **asdict(stats),
+                "removed_old_events": removed_old_events,
+            },
+            "proposed_next_actions": list(
+                self.latest_checkpoint.proposed_next_actions
+            ),
+        }
+        self.conversation.events.append({
+            "kind": "user",
+            "content": (
+                "Validated checkpoint epoch compacted. Continue from the "
+                "proposed next actions; use read_compacted_evidence only for "
+                "catalogued IDs:\n"
+                + json.dumps(continuation, sort_keys=True)
+            ),
+            "epoch_continuation": True,
+        })
+        return stats
+
+    def _compact_conversation(self) -> None:
+        """Compatibility entry point; never compact without a valid boundary."""
+        self._compact_validated_epoch()
+
+    def _reconstruct_from_valid_checkpoint(self) -> bool:
+        """Emergency rebuild from controller-owned cumulative checkpoint state."""
+        if not self._checkpoint_spans:
+            return False
+        previous = self.conversation
+        rebuilt = Conversation(
+            system=previous.system,
+            tool_schemas=list(previous.tool_schemas),
+        )
+        rebuilt.add_user(self._assignment_prompt())
+        latest = self._checkpoint_spans[-1]
+        exchange_groups: list[list[dict[str, Any]]] = []
+        tail = previous.events[latest.response_end:]
+        index = 0
+        assistant_kinds = {
+            "assistant_reasoning",
+            "assistant_text",
+            "assistant_tool_calls",
+        }
+        while index < len(tail):
+            event = tail[index]
+            if event.get("epoch_continuation"):
+                index += 1
+                continue
+            if event.get("kind") == "user":
+                exchange_groups.append([event])
+                index += 1
+                continue
+            if event.get("kind") not in assistant_kinds:
+                index += 1
+                continue
+            group: list[dict[str, Any]] = []
+            call_ids: list[str] = []
+            while index < len(tail):
+                item = tail[index]
+                if item.get("kind") in assistant_kinds:
+                    group.append(item)
+                    if item.get("kind") == "assistant_tool_calls":
+                        call_ids.extend(
+                            str(call.get("id") or "")
+                            for call in item.get("calls", ())
+                        )
+                    index += 1
+                    continue
+                if item.get("kind") == "assistant_turn_boundary":
+                    group.append(item)
+                    index += 1
+                break
+            result_ids: list[str] = []
+            while index < len(tail) and tail[index].get("kind") == "tool_result":
+                group.append(tail[index])
+                result_ids.append(str(tail[index].get("call_id") or ""))
+                index += 1
+            if not call_ids or sorted(call_ids) == sorted(result_ids):
+                exchange_groups.append(group)
+
+        remaining_exchange_bytes = max(
+            1_000,
+            min(self.recovery_evidence_bytes, self.max_context_tokens * 2),
+        )
+        newest_groups: list[list[dict[str, Any]]] = []
+        for group in reversed(exchange_groups):
+            group_bytes = len(
+                json.dumps(group, sort_keys=True).encode("utf-8")
+            )
+            if group_bytes > remaining_exchange_bytes:
+                continue
+            newest_groups.append(group)
+            remaining_exchange_bytes -= group_bytes
+        checkpoint_request_start = len(rebuilt.events)
+        rebuilt.add_user(
+            "Emergency reconstruction from the latest validated cumulative "
+            "checkpoint. The controller-owned snapshot follows."
+        )
+        snapshot = {
+            "cumulative_checkpoint": self._bounded_reconstruction_checkpoint(),
+            "compacted_evidence": self._compacted_evidence_catalogue(
+                max_bytes=max(0, self.recovery_evidence_bytes // 2),
+            ),
+        }
+        rebuilt.add_assistant_turn(
+            content=json.dumps(snapshot, sort_keys=True),
+        )
+        checkpoint_response_end = len(rebuilt.events)
+        for group in reversed(newest_groups):
+            rebuilt.events.extend(group)
+        rebuilt.events.append({
+            "kind": "user",
+            "content": (
+                "Continue the same specialist assignment from proposed_next_actions. "
+                "Treat the cumulative checkpoint as continuation memory and use only "
+                "the bounded compacted-evidence catalogue for retrieval."
+            ),
+            "epoch_continuation": True,
+            "emergency_reconstruction": True,
+        })
+        self.conversation = rebuilt
+        self._checkpoint_spans = [_CheckpointSpan(
+            request_start=checkpoint_request_start,
+            response_end=checkpoint_response_end,
+            disposition=CheckpointDisposition.COMPACT_RESUME,
+            compacted=True,
+        )]
+        return True
 
     def _conversation_evidence_bodies(self) -> dict[str, str]:
         result: dict[str, str] = {}

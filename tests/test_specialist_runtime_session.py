@@ -133,31 +133,29 @@ def test_shortened_evidence_ids_are_expanded_only_when_unambiguous():
     ).endswith("evidence_ids=evidence:abcdef0123456789")
 
 
-def test_compaction_registers_shrunk_tool_results_for_bounded_retrieval():
-    session = make_session(ScriptedGateway([]), max_context_tokens=10)
-    record, _collection = session.evidence_store.add_tool_result_with_collection(
-        session_id=session.session_id,
-        tool="read_file",
-        arguments={"path": "a.py"},
-        result={"status": "ok", "content": "important-tail\n" + ("x" * 5_000)},
+def test_validated_compaction_registers_replaced_results_for_bounded_retrieval():
+    session = make_session(
+        ScriptedGateway([
+            checkpoint_response(inspected=["0.py"], unresolved=["OB-tests"]),
+        ]),
+        max_context_tokens=100_000,
     )
-    session.conversation.add_assistant_tool_calls(({
-        "id": "call-old",
-        "name": "read_file",
-        "arguments": json.dumps({"path": "a.py"}),
-    },))
-    session._tool_call_evidence_ids["call-old"] = record.id
-    session.conversation.add_tool_result(
-        "call-old",
-        {"evidence_id": record.id, "content": record.content},
-        max_bytes=100,
-    )
+    records = [
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"call-{index}",
+            path=f"{index}.py",
+            content="important-tail\n" + (str(index) * 5_000),
+        )
+        for index in range(3)
+    ]
 
-    session._compact_conversation()
+    session.request_checkpoint("context-pressure", disposition="compact_resume")
 
+    record = records[0]
     assert record.id in session._compacted_evidence
     assert any(
-        event.get("compaction_note") and record.id in event["content"]
+        event.get("epoch_continuation") and record.id in event["content"]
         for event in session.conversation.events
     )
 
@@ -196,18 +194,15 @@ def test_compacted_evidence_reader_is_strict_and_deduplicated():
     assert "not marked as compacted" in session.conversation.events[-1]["content"]
 
 
-def test_compaction_marks_old_assistant_analysis_instead_of_prefix_truncating():
+def test_compaction_without_valid_checkpoint_keeps_assistant_analysis():
     session = make_session(ScriptedGateway([]), max_context_tokens=1_000)
     session.conversation.add_assistant_text("old conclusion: " + ("x" * 5_000))
     session.conversation.add_assistant_text("new conclusion: " + ("y" * 5_000))
+    before = json.loads(json.dumps(session.conversation.events))
 
     session._compact_conversation()
 
-    assert any(
-        event.get("compaction_note")
-        and "Older assistant analysis was compacted" in event["content"]
-        for event in session.conversation.events
-    )
+    assert session.conversation.events == before
 
 
 @dataclass(frozen=True)
@@ -343,6 +338,36 @@ def make_session(
         recovery_max_tokens=recovery_max_tokens or max_tokens,
         clock=clock,
     )
+
+
+def seed_successful_tool_exchange(
+    session, *, call_id, path, content, reasoning="private analysis",
+):
+    result = {"status": "ok", "content": content}
+    record, _collection = session.evidence_store.add_tool_result_with_collection(
+        session_id=session.session_id,
+        tool="read_file",
+        arguments={"path": path},
+        result=result,
+    )
+    session._tool_call_evidence_ids[call_id] = record.id
+    session.conversation.add_assistant_turn(
+        reasoning=reasoning,
+        calls=[{
+            "id": call_id,
+            "name": "read_file",
+            "arguments": json.dumps({"path": path}),
+        }],
+    )
+    session.conversation.add_tool_result(
+        call_id,
+        {
+            "evidence_id": record.id,
+            "status": record.status,
+            "content": record.content,
+        },
+    )
+    return record
 
 
 def test_provider_prompt_usage_calibrates_next_same_mode_admission():
@@ -1075,6 +1100,294 @@ def test_checkpoint_disposition_is_explicit_in_cumulative_prompt(
         "become a future epoch boundary."
     ) in prompt
     assert "remaining budget" not in prompt.lower()
+
+
+def test_pause_checkpoint_retains_full_epoch_after_validation():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=["old.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    record = seed_successful_tool_exchange(
+        session,
+        call_id="call-old",
+        path="old.py",
+        content="full prior evidence",
+    )
+
+    result = session.request_checkpoint("normal-completion", disposition="pause")
+
+    transcript = json.dumps(session.conversation.events, sort_keys=True)
+    assert result.degraded is False
+    assert "private analysis" in transcript
+    assert "full prior evidence" in transcript
+    assert '"status": "compacted"' not in transcript
+    assert record.id not in session._compacted_evidence
+    assert len(session._checkpoint_spans) == 1
+
+
+def test_epoch_compaction_runs_only_after_compact_resume_checkpoint_validates():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=["0.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    records = [
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"call-{index}",
+            path=f"{index}.py",
+            content=f"complete evidence {index}",
+            reasoning=f"private analysis {index}",
+        )
+        for index in range(4)
+    ]
+
+    session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+
+    request_messages = gateway.requests[0].messages
+    assert "private analysis 0" in request_messages
+    assert "complete evidence 0" in request_messages
+    transcript = json.dumps(session.conversation.events, sort_keys=True)
+    assert "private analysis 0" not in transcript
+    assert "complete evidence 0" not in transcript
+    assert "complete evidence 2" in transcript
+    assert "complete evidence 3" in transcript
+    assert records[0].id in session._compacted_evidence
+    assert records[1].id in session._compacted_evidence
+    assert records[2].id not in session._compacted_evidence
+    assert records[3].id not in session._compacted_evidence
+    continuation = [
+        event for event in session.conversation.events
+        if event.get("epoch_continuation")
+    ]
+    assert len(continuation) == 1
+    assert records[0].id in continuation[0]["content"]
+    assert '"proposed_next_actions"' in continuation[0]["content"]
+
+
+def test_epoch_compaction_rejects_invalid_checkpoint_and_failed_repair():
+    gateway = ScriptedGateway([
+        invalid_response("invalid checkpoint"),
+        invalid_response("invalid repair"),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    seed_successful_tool_exchange(
+        session,
+        call_id="call-old",
+        path="old.py",
+        content="irreplaceable full evidence",
+    )
+    epoch_before = json.loads(json.dumps(session.conversation.events))
+
+    result = session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+
+    assert result.degraded is True
+    assert session.conversation.events[:len(epoch_before)] == epoch_before
+    assert "irreplaceable full evidence" in json.dumps(session.conversation.events)
+    assert session._checkpoint_spans == []
+    assert not any(
+        event.get("epoch_continuation")
+        for event in session.conversation.events
+    )
+
+
+def test_resumed_safe_pause_checkpoint_keeps_full_prior_epoch():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=["old.py"], unresolved=["OB-tests"]),
+        checkpoint_response(inspected=["old.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    seed_successful_tool_exchange(
+        session,
+        call_id="call-old",
+        path="old.py",
+        content="full paused evidence",
+    )
+    session.request_checkpoint("controller-request", disposition="pause")
+
+    session.explore()
+
+    assert len(gateway.requests) == 2
+    assert gateway.requests[1].tools_enabled is True
+    assert "full paused evidence" in json.dumps(session.conversation.events)
+    assert not any(
+        event.get("epoch_continuation")
+        for event in session.conversation.events
+    )
+
+
+def test_resumed_pressure_pause_checkpoint_compacts_existing_boundary():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=["0.py"], unresolved=["OB-tests"]),
+        checkpoint_response(inspected=["0.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    for index in range(4):
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"call-{index}",
+            path=f"{index}.py",
+            content="large paused evidence " + (str(index) * 2_000),
+            reasoning=f"large private analysis {index} " + ("r" * 2_000),
+        )
+    session.request_checkpoint("controller-request", disposition="pause")
+    request_count = len(gateway.requests)
+    session.max_context_tokens = 8_000
+
+    session.explore()
+
+    assert len(gateway.requests) == request_count + 1
+    assert gateway.requests[-1].tools_enabled is True
+    assert any(
+        event.get("epoch_continuation")
+        for event in session.conversation.events
+    )
+    assert len(session._checkpoint_spans) >= 1
+
+
+def test_epoch_compaction_prunes_only_noncheckpoint_events_before_prior_boundary():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["first.py"],
+            unresolved=["OB-tests"],
+            working_summary="first cumulative checkpoint",
+        ),
+        checkpoint_response(
+            inspected=["second.py"],
+            unresolved=["OB-tests"],
+            working_summary="second cumulative checkpoint",
+        ),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.conversation.add_user("discardable epoch-zero note")
+    removed_record = seed_successful_tool_exchange(
+        session,
+        call_id="call-epoch-zero",
+        path="epoch-zero.py",
+        content="evidence removed with the oldest epoch",
+    )
+    session.request_checkpoint("first-boundary", disposition="pause")
+    session.conversation.add_user("previous epoch investigation")
+    seed_successful_tool_exchange(
+        session,
+        call_id="call-between",
+        path="between.py",
+        content="previous epoch full evidence",
+    )
+
+    session.request_checkpoint("second-boundary", disposition="compact_resume")
+
+    transcript = json.dumps(session.conversation.events, sort_keys=True)
+    assert "discardable epoch-zero note" not in transcript
+    assert "Immutable specialist assignment" in transcript
+    assert "Checkpoint reason: first-boundary." in transcript
+    assert "first cumulative checkpoint" in transcript
+    assert "Checkpoint reason: second-boundary." in transcript
+    assert "second cumulative checkpoint" in transcript
+    assert removed_record.id in session._compacted_evidence
+    assert session.conversation.open_tool_call_ids() == set()
+    assert len(session._checkpoint_spans) == 2
+    for span in session._checkpoint_spans:
+        protected = session.conversation.events[
+            span.request_start:span.response_end
+        ]
+        assert protected[0]["kind"] == "user"
+        assert protected[-1]["kind"] == "assistant_turn_boundary"
+
+
+def test_emergency_reconstruction_keeps_checkpoint_ledger_and_newest_exchange():
+    seed_paths = ("a.py", "1.py", "2.py", "3.py")
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": path}, call_id=f"seed-{index}")
+        for index, path in enumerate(seed_paths)
+    ] + [
+        candidate_checkpoint_response(("candidate-code",)),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(
+        gateway,
+        tool_calls=8,
+        model_turns=10,
+        max_context_tokens=100_000,
+    )
+    session.explore()
+    session.conversation.add_assistant_turn(
+        reasoning="oversized new epoch reasoning " + ("x" * 40_000),
+        calls=[{
+            "id": "post-checkpoint-old",
+            "name": "read_file",
+            "arguments": '{"path":"oversized.py"}',
+        }],
+    )
+    session.conversation.add_tool_result(
+        "post-checkpoint-old", "oversized result " + ("y" * 8_000),
+    )
+    session.conversation.add_assistant_turn(
+        content="newest complete analysis",
+        calls=[{
+            "id": "post-checkpoint-new",
+            "name": "git_grep",
+            "arguments": '{"pattern":"latest"}',
+        }],
+    )
+    session.conversation.add_tool_result(
+        "post-checkpoint-new", "newest fitting result",
+    )
+    session.max_context_tokens = 8_000
+
+    session.explore()
+
+    rendered = gateway.requests[-1].messages
+    assert gateway.requests[-1].tools_enabled is True
+    assert "Gather evidence and checkpoint progress." == session.conversation.system
+    assert "Immutable specialist assignment" in rendered
+    assert "candidate-code" in rendered
+    assert "The changed branch exposes issue candidate-code." in rendered
+    assert "compacted_evidence" in rendered
+    assert "evidence:" in rendered
+    assert "post-checkpoint-new" in rendered
+    assert "newest fitting result" in rendered
+    assert "post-checkpoint-old" not in rendered
+    assert rendered.index("candidate-code") < rendered.index("post-checkpoint-new")
+    assert rendered.index("post-checkpoint-new") < rendered.index(
+        "Continue the same specialist assignment"
+    )
+    assert sum(
+        bool(event.get("emergency_reconstruction"))
+        for event in session.conversation.events
+    ) == 1
+
+
+def test_emergency_reconstruction_bounds_retained_evidence_metadata():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.request_checkpoint("controller-request", disposition="pause")
+    for index in range(30):
+        session.evidence_store.add_tool_result_with_collection(
+            session_id=session.session_id,
+            tool="read_file",
+            arguments={"path": f"retained-{index}.py"},
+            result={"status": "ok", "content": f"retained metadata {index}"},
+        )
+    session.recovery_evidence_bytes = 500
+
+    assert session._reconstruct_from_valid_checkpoint() is True
+
+    snapshot_event = next(
+        event
+        for event in session.conversation.events
+        if event.get("kind") == "assistant_text"
+        and '"cumulative_checkpoint"' in event.get("content", "")
+    )
+    snapshot = json.loads(snapshot_event["content"])
+    metadata = snapshot["cumulative_checkpoint"]["evidence_metadata"]
+    assert len(json.dumps(metadata, sort_keys=True).encode("utf-8")) <= 500
+    assert len(metadata) < 30
 
 
 def test_exploration_reserves_checkpoint_and_repair_turns():

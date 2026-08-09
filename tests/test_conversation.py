@@ -329,6 +329,180 @@ def test_completed_history_collapse_removes_all_fields_from_old_adjacent_turn():
     )
 
 
+def test_compact_tool_epoch_preserves_calls_and_replaces_only_old_results():
+    conv = Conversation(system="system")
+    conv.add_user("assignment")
+    conv.events.append({"kind": "assistant_text", "content": ""})
+    replacements = {}
+    original_calls = []
+    original_results = {}
+    for index in range(4):
+        call = {
+            "id": f"call-{index}",
+            "name": "read_file",
+            "arguments": json.dumps({"path": f"src/{index}.py"}),
+        }
+        result = json.dumps({
+            "evidence_id": f"evidence:{index}",
+            "status": "ok",
+            "content": f"complete-result-{index}",
+        }, sort_keys=True)
+        conv.add_assistant_turn(
+            reasoning=f"private-reasoning-{index}",
+            content="" if index == 0 else f"visible-{index}",
+            calls=[call],
+        )
+        conv.add_tool_result(call["id"], result)
+        original_calls.append(call)
+        original_results[call["id"]] = result
+        replacements[call["id"]] = {
+            "status": "compacted",
+            "evidence_id": f"evidence:{index}",
+            "source_path": f"src/{index}.py",
+            "original_bytes": 8192 + index,
+        }
+
+    boundary = len(conv.events)
+    later = [
+        {"kind": "user", "content": "checkpoint request"},
+        {"kind": "assistant_text", "content": "checkpoint response"},
+        {"kind": "assistant_turn_boundary"},
+    ]
+    conv.events.extend(later)
+
+    stats = conv.compact_tool_epoch(
+        boundary, replacements, keep_newest_results=2,
+    )
+
+    assert stats.removed_reasoning == 4
+    assert stats.replaced_results == 2
+    assert stats.retained_full_results == 2
+    assert stats.removed_empty_assistant_text == 1
+    assert not any(
+        event["kind"] == "assistant_reasoning"
+        for event in conv.events[:boundary]
+    )
+    assert [
+        call
+        for event in conv.events
+        if event["kind"] == "assistant_tool_calls"
+        for call in event["calls"]
+    ] == original_calls
+
+    results = {
+        event["call_id"]: event["content"]
+        for event in conv.events
+        if event["kind"] == "tool_result"
+    }
+    assert results["call-0"] == (
+        '{"evidence_id":"evidence:0","original_bytes":8192,'
+        '"source_path":"src/0.py","status":"compacted"}'
+    )
+    assert results["call-1"] == (
+        '{"evidence_id":"evidence:1","original_bytes":8193,'
+        '"source_path":"src/1.py","status":"compacted"}'
+    )
+    assert results["call-2"] == original_results["call-2"]
+    assert results["call-3"] == original_results["call-3"]
+    assert conv.events[-len(later):] == later
+
+
+def test_compact_tool_epoch_renders_no_orphan_openai_calls_or_results():
+    conv = Conversation(system="system")
+    conv.add_assistant_turn(
+        reasoning="old reasoning",
+        calls=[{
+            "id": "call-old",
+            "name": "git_grep",
+            "arguments": '{"pattern":"needle"}',
+        }],
+    )
+    conv.add_tool_result("call-old", "old full result")
+    conv.add_assistant_turn(
+        calls=[{
+            "id": "call-new",
+            "name": "read_file",
+            "arguments": '{"path":"new.py"}',
+        }],
+    )
+    conv.add_tool_result("call-new", "new full result")
+
+    conv.compact_tool_epoch(
+        len(conv.events),
+        {
+            "call-old": {
+                "status": "compacted",
+                "evidence_id": "evidence:old",
+                "source_path": "src/old.py",
+                "original_bytes": 4096,
+            },
+        },
+        keep_newest_results=1,
+    )
+
+    payload = conv.to_request_payload("openai", "model", max_tokens=64)
+    calls = [
+        call["id"]
+        for message in payload["messages"]
+        for call in message.get("tool_calls", [])
+    ]
+    results = [
+        message["tool_call_id"]
+        for message in payload["messages"]
+        if message["role"] == "tool"
+    ]
+    assert calls == ["call-old", "call-new"]
+    assert results == ["call-old", "call-new"]
+    assert conv.open_tool_call_ids() == set()
+
+
+def test_compact_tool_epoch_retains_newest_parallel_call_exchanges_atomically():
+    conv = Conversation(system="system")
+    replacements = {}
+    original_results = {}
+    for turn in range(3):
+        calls = [
+            {
+                "id": f"turn-{turn}-call-{call}",
+                "name": "read_file",
+                "arguments": json.dumps({"path": f"{turn}-{call}.py"}),
+            }
+            for call in range(2)
+        ]
+        conv.add_assistant_turn(
+            reasoning=f"reasoning-{turn}",
+            calls=calls,
+        )
+        for call in calls:
+            body = f"full-result-{call['id']}"
+            conv.add_tool_result(call["id"], body)
+            original_results[call["id"]] = body
+            replacements[call["id"]] = {
+                "status": "compacted",
+                "evidence_id": f"evidence:{call['id']}",
+                "source_path": f"src/{call['id']}.py",
+                "original_bytes": len(body),
+            }
+
+    stats = conv.compact_tool_epoch(
+        len(conv.events), replacements, keep_newest_results=2,
+    )
+
+    results = {
+        event["call_id"]: event["content"]
+        for event in conv.events
+        if event["kind"] == "tool_result"
+    }
+    assert stats.replaced_results == 2
+    assert stats.retained_full_results == 4
+    assert results["turn-0-call-0"] != original_results["turn-0-call-0"]
+    assert results["turn-0-call-1"] != original_results["turn-0-call-1"]
+    for turn in (1, 2):
+        for call in range(2):
+            call_id = f"turn-{turn}-call-{call}"
+            assert results[call_id] == original_results[call_id]
+
+
 class TestAnthropicCachePrefix:
     """Anthropic prompt caching is opt-in (#263 Part 2): cache_control markers
     on the stable prefix (system + tools). Default off — unchanged wire shape."""

@@ -45,7 +45,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 # Per the executor catalogue in scripts/run_tool_harness.py (the
 # normalize_tool_request repair logic and the per-tool arg shapes). Keep these
@@ -468,6 +468,16 @@ def normalize_assistant_tool_calls_openai(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class EpochCompactionStats:
+    """Bounded counts from one structurally safe epoch compaction."""
+
+    removed_reasoning: int = 0
+    replaced_results: int = 0
+    retained_full_results: int = 0
+    removed_empty_assistant_text: int = 0
+
+
 @dataclass
 class Conversation:
     """Append-only multi-turn conversation state for native tool calling.
@@ -671,6 +681,86 @@ class Conversation:
         return (total_bytes + APPROX_BYTES_PER_TOKEN - 1) // APPROX_BYTES_PER_TOKEN
 
     # ---- overflow handling ----------------------------------------------
+
+    def compact_tool_epoch(
+        self,
+        end_index: int,
+        replacements: Mapping[str, Mapping[str, Any]],
+        *,
+        keep_newest_results: int = 2,
+    ) -> EpochCompactionStats:
+        """Compact completed exploration before an exclusive event boundary.
+
+        Assistant tool calls stay native and unchanged so every original call
+        ID, name, and argument string still matches its result.  Only old
+        result bodies with a controller-supplied evidence replacement are
+        rewritten; the newest results and events at or after ``end_index``
+        remain complete.
+        """
+        boundary = min(max(int(end_index), 0), len(self.events))
+        result_index_by_call = {
+            str(event.get("call_id", "")): index
+            for index, event in enumerate(self.events[:boundary])
+            if event.get("kind") == "tool_result"
+        }
+        completed_exchanges: list[set[int]] = []
+        for event in self.events[:boundary]:
+            if event.get("kind") != "assistant_tool_calls":
+                continue
+            call_ids = [str(call.get("id", "")) for call in event.get("calls", ())]
+            if call_ids and all(call_id in result_index_by_call for call_id in call_ids):
+                completed_exchanges.append({
+                    result_index_by_call[call_id] for call_id in call_ids
+                })
+        keep = max(int(keep_newest_results), 0)
+        retained_indices = set().union(
+            *(completed_exchanges[-keep:] if keep else ()),
+        )
+        removed_reasoning = 0
+        replaced_results = 0
+        retained_full_results = 0
+        removed_empty_assistant_text = 0
+        compacted_prefix: list[dict[str, Any]] = []
+        for index, event in enumerate(self.events[:boundary]):
+            kind = event.get("kind")
+            if kind == "assistant_reasoning":
+                removed_reasoning += 1
+                continue
+            if kind == "assistant_text" and not str(event.get("content", "")):
+                removed_empty_assistant_text += 1
+                continue
+            if kind != "tool_result":
+                compacted_prefix.append(event)
+                continue
+            call_id = str(event.get("call_id", ""))
+            replacement = replacements.get(call_id)
+            if index in retained_indices or replacement is None:
+                retained_full_results += 1
+                compacted_prefix.append(event)
+                continue
+            payload = {
+                "status": "compacted",
+                "evidence_id": str(replacement.get("evidence_id", "")),
+                "source_path": str(replacement.get("source_path", "")),
+                "original_bytes": int(replacement.get("original_bytes", 0)),
+            }
+            compacted_prefix.append({
+                **event,
+                "content": json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            })
+            replaced_results += 1
+        self.events = compacted_prefix + self.events[boundary:]
+        return EpochCompactionStats(
+            removed_reasoning=removed_reasoning,
+            replaced_results=replaced_results,
+            retained_full_results=retained_full_results,
+            removed_empty_assistant_text=removed_empty_assistant_text,
+        )
 
     def truncate_oldest_tool_results(self, max_bytes_per_result: int) -> int:
         """Shrink the oldest tool results so each fits within ``max_bytes_per_result``.
