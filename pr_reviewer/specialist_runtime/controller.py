@@ -2369,6 +2369,8 @@ class ReviewController:
                 "turn": attempt.turn,
                 "input_tokens": attempt.input_tokens,
                 "max_output_tokens": attempt.max_output_tokens,
+                "admission_tokens": attempt.admission_tokens,
+                "admission_source": attempt.admission_source,
                 "started_at": attempt.started_at,
             }
             if start_key not in state.admitted_specialist_request_events:
@@ -2384,11 +2386,13 @@ class ReviewController:
                     **payload,
                     "terminal_at": attempt.terminal_at,
                     "in_flight": attempt.in_flight,
+                    "actual_prompt_tokens": attempt.actual_prompt_tokens,
+                    "actual_completion_tokens": attempt.actual_completion_tokens,
                 })
 
     @staticmethod
     def _request_attempt_event_payload(attempt: RequestAttempt) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             # Keep this separate from the admitted specialist_request_* event
             # identity so older artifact consumers do not double-count the
             # immediate gateway telemetry as another specialist transition.
@@ -2399,6 +2403,8 @@ class ReviewController:
             "turn": attempt.turn,
             "input_tokens": attempt.input_tokens,
             "max_output_tokens": attempt.max_output_tokens,
+            "admission_tokens": attempt.admission_tokens,
+            "admission_source": attempt.admission_source,
             "status": attempt.status,
             "in_flight": attempt.in_flight,
             "purpose": attempt.purpose,
@@ -2407,6 +2413,12 @@ class ReviewController:
             "tool_call_count": attempt.tool_call_count,
             "error": attempt.error,
         }
+        if attempt.status != "started":
+            payload.update({
+                "actual_prompt_tokens": attempt.actual_prompt_tokens,
+                "actual_completion_tokens": attempt.actual_completion_tokens,
+            })
+        return payload
 
     def _session_hook(
         self,

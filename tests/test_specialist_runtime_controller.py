@@ -3483,6 +3483,10 @@ def test_phase_cutoff_freezes_in_flight_request_once_before_late_completion(tmp_
             event for event in result.artifact["events"]
             if event["payload"].get("request_id") == request_id
         )
+        gateway_events = tuple(
+            event for event in result.artifact["events"]
+            if event["payload"].get("gateway_request_id") == request_id
+        )
         frozen_artifact = json.dumps(result.artifact, sort_keys=True)
 
         assert len(attempts) == 1
@@ -3492,6 +3496,20 @@ def test_phase_cutoff_freezes_in_flight_request_once_before_late_completion(tmp_
             "specialist_request_started",
             "specialist_request_timed_out_at_phase_cutoff",
         )
+        assert tuple(event["kind"] for event in gateway_events) == (
+            "llm_request_started",
+            "llm_request_timed_out_at_phase_cutoff",
+        )
+        for event in (request_events[0], gateway_events[0]):
+            assert event["payload"]["admission_tokens"] == attempts[0][
+                "admission_tokens"
+            ]
+            assert event["payload"]["admission_source"] == attempts[0][
+                "admission_source"
+            ]
+        for event in (request_events[-1], gateway_events[-1]):
+            assert event["payload"]["actual_prompt_tokens"] == 0
+            assert event["payload"]["actual_completion_tokens"] == 0
         assert result.artifact["budgets"]["totals"]["model_turns"] == 1
         assert result.artifact["budgets"]["totals"]["specialist_model_cutoff"] == 1
         assert any(
@@ -3594,6 +3612,38 @@ def test_exhausted_schema_repair_cannot_inflate_artifact_model_turns(tmp_path):
     assert len(gateway.requests) == 1, result.artifact["degradation"]
     assert len(attempts) == 1
     assert all(item["status"] == "completed" for item in attempts)
+    request_id = attempts[0]["request_id"]
+    request_events = tuple(
+        event for event in result.artifact["events"]
+        if event["payload"].get("request_id") == request_id
+        and event["kind"].startswith("specialist_request_")
+    )
+    gateway_events = tuple(
+        event for event in result.artifact["events"]
+        if event["payload"].get("gateway_request_id") == request_id
+    )
+    assert tuple(event["kind"] for event in request_events) == (
+        "specialist_request_started",
+        "specialist_request_completed",
+    )
+    assert tuple(event["kind"] for event in gateway_events) == (
+        "llm_request_started",
+        "llm_request_completed",
+    )
+    for event in (request_events[0], gateway_events[0]):
+        assert event["payload"]["admission_tokens"] == attempts[0][
+            "admission_tokens"
+        ]
+        assert event["payload"]["admission_source"] == attempts[0][
+            "admission_source"
+        ]
+    for event in (request_events[-1], gateway_events[-1]):
+        assert event["payload"]["actual_prompt_tokens"] == 3
+        assert event["payload"]["actual_completion_tokens"] == 2
+        assert all(
+            value is None or isinstance(value, (bool, int, float, str))
+            for value in event["payload"].values()
+        )
     assert max(item["model_turns"] for item in session_budgets.values()) == 1
     assert all(
         item["model_turns"] <= inputs.config.session_limits.model_turns
