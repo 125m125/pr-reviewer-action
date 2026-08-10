@@ -590,8 +590,8 @@ def run_failure_injections(
     """Run recorded failures through public sessions and controllers."""
     no_progress_turns = scenarios["no_progress_resume"].get("responses")
     reconstruction_turns = scenarios["reconstruction"].get("responses")
-    if not isinstance(no_progress_turns, list) or len(no_progress_turns) != 6:
-        raise ValueError("no_progress_resume must record six OpenAI responses")
+    if not isinstance(no_progress_turns, list) or len(no_progress_turns) != 7:
+        raise ValueError("no_progress_resume must record seven OpenAI responses")
     if not isinstance(reconstruction_turns, list) or len(reconstruction_turns) != 2:
         raise ValueError("reconstruction must record two OpenAI responses")
 
