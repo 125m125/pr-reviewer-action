@@ -82,6 +82,10 @@ _ROLE_SYSTEM = {
     ),
     "planner": (
         "The controller has already created the authoritative deterministic base plan. "
+        "This is assignment planning, not code review. Tools are unavailable for this "
+        "role. Do not inspect or request files, and never emit textual tool-call markup. "
+        "Generic review instructions about exploration and tool use do not apply to this "
+        "planner turn. Operate only on the supplied base plan and controller facts. "
         "Suggest only optional bounded transformations and return "
         "{\"transformations\":[...]}. Supported kinds are reorder, merge, split, and "
         "improve. Use these exact shapes: reorder={kind:'reorder',assignment_ids:[existing "
@@ -431,10 +435,12 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
         max_context_bytes: int | None = None,
         context_projector=None,
         runtime_logger=None,
+        stream: bool = False,
     ):
         super().__init__(
             gateway, system_prompt, response_format_override,
             attempt_logger=runtime_logger,
+            stream=stream,
         )
         self.max_tokens = max_tokens
         self.max_context_bytes = max_context_bytes
@@ -443,10 +449,57 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
 
     def complete(self, request):
         context = (
-            self.context_projector(request.context)
+            self.context_projector(request.context, self.max_context_bytes)
             if self.context_projector is not None
             else request.context
         )
+        if (
+            request.role == "planner"
+            and self.runtime_logger is not None
+            and isinstance(context, Mapping)
+        ):
+            base_plan = context.get("base_plan")
+            topology = context.get("topology")
+            assignments = (
+                base_plan.get("assignments", ())
+                if isinstance(base_plan, Mapping) else ()
+            )
+            obligations = context.get("obligations", ())
+            changed_paths = (
+                topology.get("changed_files", ())
+                if isinstance(topology, Mapping) else ()
+            )
+            relationships = (
+                topology.get("relationships", ())
+                if isinstance(topology, Mapping) else ()
+            )
+            capabilities = (
+                topology.get("role_availability", {})
+                if isinstance(topology, Mapping) else {}
+            )
+            self.runtime_logger(
+                "planner projection counts "
+                f"changed_paths={len(changed_paths) if isinstance(changed_paths, (list, tuple)) else 0} "
+                f"assignments={len(assignments) if isinstance(assignments, (list, tuple)) else 0} "
+                f"obligations={len(obligations) if isinstance(obligations, (list, tuple)) else 0} "
+                f"active_relationships={len(relationships) if isinstance(relationships, (list, tuple)) else 0} "
+                f"capability_roles={len(capabilities) if isinstance(capabilities, Mapping) else 0}"
+            )
+            original_topology = (
+                request.context.get("topology")
+                if isinstance(request.context, Mapping) else None
+            )
+            omitted_topology = (
+                sorted(set(original_topology) - set(topology))
+                if isinstance(original_topology, Mapping)
+                and isinstance(topology, Mapping)
+                else []
+            )
+            if omitted_topology:
+                self.runtime_logger(
+                    "planner projection omitted_topology_fields="
+                    + ",".join(omitted_topology[:20])
+                )
         if self.max_context_bytes is not None:
             context_bytes = len(json.dumps(
                 _json_value(context),
@@ -817,6 +870,7 @@ def build_controller(
         max_context_bytes=config.planner_max_context_bytes,
         context_projector=_compact_planner_context,
         runtime_logger=runtime_logger,
+        stream=config.stream,
     )
     negotiator = _BoundedRoleAdapter(
         gateway, _role_prompt(config.system_prompt, "negotiator"), config.max_tokens,
@@ -1116,38 +1170,68 @@ def _compact_topology_for_planner(value: object) -> object:
     if not isinstance(value, Mapping):
         return _compact_generic(value)
     result: dict[str, object] = {}
-    for key in ("components", "path_components"):
+    for key in (
+        "changed_files", "path_components", "file_roles", "languages",
+        "risk_flags", "pr_kind", "role_availability",
+    ):
         if key in value:
             result[key] = _compact_generic(value[key])
-    for key in ("changed_context", "relationships"):
-        rows = value.get(key)
-        if not isinstance(rows, (list, tuple)):
-            continue
-        compacted = []
-        for item in rows[:80]:
-            if isinstance(item, Mapping):
-                compacted.append({
-                    field: _compact_text(item.get(field), 120)
-                    for field in ("path", "component", "summary", "change_type")
-                    if item.get(field) is not None
-                })
-            else:
-                compacted.append(_compact_text(item, 220))
-        result[key] = compacted
-        if len(rows) > 80:
-            result[f"{key}_omitted"] = len(rows) - 80
+    components = value.get("components")
+    if isinstance(components, (list, tuple)):
+        result["components"] = [
+            {
+                field: _compact_generic(item[field])
+                for field in (
+                    "id", "root", "changed_files", "path_patterns", "file_roles",
+                    "languages", "responsibilities", "contracts", "invariants",
+                )
+                if field in item
+            }
+            for item in components[:80]
+            if isinstance(item, Mapping)
+        ]
+        if len(components) > 80:
+            result["components_omitted"] = len(components) - 80
+    changed_context = value.get("changed_context")
+    if isinstance(changed_context, (list, tuple)):
+        result["changed_context"] = [
+            {
+                field: _compact_text(item.get(field), 160)
+                for field in ("path", "component", "summary", "change_type")
+                if item.get(field) is not None
+            }
+            for item in changed_context[:80]
+            if isinstance(item, Mapping)
+        ]
+    relationships = value.get("relationships")
+    if isinstance(relationships, (list, tuple)):
+        active = [
+            item for item in relationships
+            if isinstance(item, Mapping) and item.get("active") is True
+        ]
+        result["relationships"] = [
+            {
+                field: _compact_generic(item[field])
+                for field in (
+                    "source", "target", "reason", "active", "activation_reason",
+                )
+                if field in item
+            }
+            for item in active[:80]
+        ]
+        if len(active) > 80:
+            result["relationships_omitted"] = len(active) - 80
     for key in ("change_facts", "changed_contract_facts"):
         if key in value:
             result[key] = _compact_generic(value[key])
-    for key, item in value.items():
-        if key not in result and key not in {
-            "changed_context", "relationships", "change_facts", "changed_contract_facts",
-        }:
-            result[str(key)] = _compact_generic(item)
     return result
 
 
-def _compact_policy_for_planner(value: object) -> object:
+def _compact_policy_for_planner(
+    value: object,
+    *,
+    active_recipe_ids: set[str] | None = None,
+) -> object:
     """Keep planner policy authority without serializing full recipe prose."""
     if not isinstance(value, Mapping):
         return _compact_generic(value)
@@ -1161,11 +1245,19 @@ def _compact_policy_for_planner(value: object) -> object:
         for recipe in recipes[:160]:
             if not isinstance(recipe, Mapping):
                 continue
+            recipe_id = str(recipe.get("id") or recipe.get("recipe_id") or "")
+            if active_recipe_ids is not None and recipe_id not in active_recipe_ids:
+                continue
             compacted.append({
-                key: _compact_text(recipe.get(key), 180)
+                key: (
+                    _compact_strings(recipe.get(key), limit=180, item_limit=16)
+                    if key in {"seed_paths", "related_paths"}
+                    else _compact_text(recipe.get(key), 180)
+                )
                 for key in (
-                    "id", "recipe_id", "title", "subject", "risk_tier",
+                    "id", "recipe_id", "title", "subject", "execution", "risk_tier",
                     "mandatory", "unresolved_policy", "required_evidence_categories",
+                    "seed_paths", "related_paths",
                 )
                 if recipe.get(key) is not None
             })
@@ -1175,7 +1267,10 @@ def _compact_policy_for_planner(value: object) -> object:
     return result
 
 
-def _compact_planner_context(value: object) -> object:
+def _compact_planner_context(
+    value: object,
+    max_context_bytes: int | None = None,
+) -> object:
     """Project planner input to bounded plan/topology facts, not the full corpus."""
     raw = _json_value(value)
     if not isinstance(raw, dict):
@@ -1258,7 +1353,14 @@ def _compact_planner_context(value: object) -> object:
         else:
             projected["config"] = _compact_generic(config)
     if "policy" in raw:
-        projected["policy"] = _compact_policy_for_planner(raw["policy"])
+        active_recipe_ids = {
+            str(item.get("recipe_id"))
+            for item in obligation_values
+            if isinstance(item, Mapping) and item.get("recipe_id")
+        }
+        projected["policy"] = _compact_policy_for_planner(
+            raw["policy"], active_recipe_ids=active_recipe_ids,
+        )
     if "pr_metadata" in raw:
         metadata = raw["pr_metadata"]
         projected["pr_metadata"] = {
@@ -1283,7 +1385,11 @@ def _compact_planner_context(value: object) -> object:
             item, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         ).encode("utf-8"))
 
-    if encoded_size(projected) > 160_000:
+    target_bytes = max(
+        1_000,
+        int((max_context_bytes if max_context_bytes is not None else 160_000) * 0.95),
+    )
+    if encoded_size(projected) > target_bytes:
         topology = projected.get("topology")
         if isinstance(topology, Mapping):
             projected["topology"] = {
@@ -1291,7 +1397,7 @@ def _compact_planner_context(value: object) -> object:
                 for key in ("components", "changed_context", "relationships")
                 if key in topology
             }
-        if encoded_size(projected) > 160_000:
+        if encoded_size(projected) > target_bytes:
             projected["change_overview"] = _compact_text(
                 json.dumps(projected.get("change_overview", {}), ensure_ascii=False),
                 8_000,
@@ -1299,7 +1405,7 @@ def _compact_planner_context(value: object) -> object:
             projected["config"] = _compact_text(
                 json.dumps(projected.get("config", {}), ensure_ascii=False), 8_000,
             )
-        if encoded_size(projected) > 160_000:
+        if encoded_size(projected) > target_bytes:
             projected["obligations"] = [
                 {
                     key: item[key]
@@ -1307,6 +1413,16 @@ def _compact_planner_context(value: object) -> object:
                         "obligation_id", "id", "subject", "risk_tier", "mandatory",
                         "required_evidence_categories",
                     )
+                    if isinstance(item, Mapping) and key in item
+                }
+                for item in projected.get("obligations", ())
+                if isinstance(item, Mapping)
+            ]
+        if encoded_size(projected) > target_bytes:
+            projected["obligations"] = [
+                {
+                    key: item[key]
+                    for key in ("obligation_id", "id", "risk_tier", "mandatory")
                     if isinstance(item, Mapping) and key in item
                 }
                 for item in projected.get("obligations", ())

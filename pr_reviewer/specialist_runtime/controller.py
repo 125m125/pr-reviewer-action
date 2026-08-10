@@ -943,6 +943,38 @@ def _json_object(text: str) -> Mapping[str, object]:
     return objects[0]
 
 
+_TEXTUAL_TOOL_MARKER_RE = re.compile(
+    r"</?(?:tool_call|function|parameter)(?:=[^>]*)?>",
+    re.IGNORECASE,
+)
+
+
+def _structured_repetition_reason(text: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if len(_TEXTUAL_TOOL_MARKER_RE.findall(normalized)) >= 3:
+        return "repeated-textual-tool-marker"
+    paragraphs = [
+        re.sub(r"\s+", " ", part).strip().lower()
+        for part in re.split(r"\n\s*\n", str(text or ""))
+        if len(re.sub(r"\s+", " ", part).strip()) >= 80
+    ]
+    if any(paragraphs.count(item) >= 3 for item in set(paragraphs)):
+        return "repeated-paragraph"
+    words = normalized.split()
+    block_size = 18
+    positions: dict[tuple[str, ...], list[int]] = {}
+    for start in range(max(0, len(words) - block_size + 1)):
+        block = tuple(words[start:start + block_size])
+        if len(set(block)) < max(3, block_size // 4):
+            continue
+        occurrences = positions.setdefault(block, [])
+        if not occurrences or start - occurrences[-1] >= block_size:
+            occurrences.append(start)
+        if len(occurrences) >= 3:
+            return "repeated-block"
+    return None
+
+
 @dataclass(frozen=True)
 class GatewayRoleAdapter:
     """Force a controller role through Task 7's leased gateway contract."""
@@ -951,6 +983,7 @@ class GatewayRoleAdapter:
     system_prompt: str = "Return only the requested structured JSON object."
     response_format_override: str | None = None
     attempt_logger: Callable[[str], None] | None = None
+    stream: bool = False
 
     def complete(self, request: RoleRequest) -> object:
         return self._complete_recoverable_structured_role(request)
@@ -973,11 +1006,14 @@ class GatewayRoleAdapter:
             separators=(",", ":"),
             ensure_ascii=False,
         ))
+        repetition_pending = False
         for attempt in range(max_attempts):
+            repetition_retry = repetition_pending
             finalization = (
-                force_final(attempt)
+                repetition_retry
+                or force_final(attempt)
                 if force_final is not None
-                else attempt == max_attempts - 1
+                else repetition_retry or attempt == max_attempts - 1
             )
             if self.attempt_logger is not None:
                 self.attempt_logger(
@@ -989,18 +1025,29 @@ class GatewayRoleAdapter:
             result = self.gateway.complete(ModelTurnRequest(
                 role=request.role,
                 conversation=conversation,
-                max_tokens=request.max_tokens,
+                max_tokens=(
+                    min(request.max_tokens, 2_048)
+                    if repetition_retry else request.max_tokens
+                ),
                 response_schema=None,
                 tools_enabled=False,
                 timeout_sec=request.timeout_sec,
                 deadline_at=request.lease.deadline_at,
-                stream=False,
+                stream=self.stream,
                 response_schema_name=f"specialist_{request.role}",
                 response_format_override=self.response_format_override,
                 reasoning_effort="none" if finalization else None,
                 ephemeral_user_note=(
-                    "Return only the required JSON object."
-                    if finalization else None
+                    (
+                        "The previous output was rejected for repeated textual "
+                        "tool-call markup. Tools are unavailable. Return only the "
+                        "required JSON object."
+                    )
+                    if repetition_retry
+                    else (
+                        "Return only the required JSON object."
+                        if finalization else None
+                    )
                 ),
             ))
             content = result.content
@@ -1008,6 +1055,27 @@ class GatewayRoleAdapter:
                 # Compatibility for test/provider adapters built before
                 # ModelTurnResult gained explicit ordinary-content state.
                 content = result.text
+            repetition_reason = (
+                result.stream_watchdog_reason
+                if result.stream_watchdog_triggered
+                else _structured_repetition_reason(
+                    content + "\n" + str(result.reasoning or "")
+                )
+            )
+            if request.role == "planner" and repetition_reason:
+                if self.attempt_logger is not None:
+                    self.attempt_logger(
+                        f"role planner repetitive response rejected; "
+                        f"attempt={attempt + 1}/{max_attempts}; "
+                        f"reason={repetition_reason}; content_chars={len(content)}; "
+                        "malformed_content_retained=false"
+                    )
+                if repetition_retry or attempt == max_attempts - 1:
+                    raise ValueError(
+                        f"planner response rejected: {repetition_reason}"
+                    )
+                repetition_pending = True
+                continue
             try:
                 return _json_object(content)
             except (TypeError, ValueError) as exc:
@@ -1034,13 +1102,21 @@ class GatewayRoleAdapter:
                         f"{status}"
                     )
                 if (
+                    repetition_retry
+                    or
                     attempt == max_attempts - 1
                     or not continuation_allowed
                 ):
                     raise
                 conversation.add_assistant_turn(
-                    reasoning=result.reasoning,
-                    content=content,
+                    reasoning=(
+                        result.reasoning[:8_000]
+                        if request.role == "planner" else result.reasoning
+                    ),
+                    content=(
+                        content[:8_000]
+                        if request.role == "planner" else content
+                    ),
                     calls=result.tool_calls,
                 )
         raise AssertionError("structured-role continuation loop exhausted")

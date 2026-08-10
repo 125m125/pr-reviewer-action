@@ -500,7 +500,144 @@ def test_configured_topology_preserves_component_metadata():
         "contracts": ["events"],
         "invariants": ["delivery is idempotent"],
         "configured": True,
+        "path_patterns": ["worker/**"],
     }
+
+
+def test_topology_summarizes_roles_and_selects_relevant_tests_only():
+    config = {
+        "components": [{
+            "id": "worker",
+            "paths": ["worker/**"],
+            "related_components": ["contracts"],
+        }],
+    }
+    topology = build_topology(
+        files("worker/src/delivery.py"),
+        {},
+        [
+            "worker/src/delivery.py",
+            "worker/tests/test_delivery.py",
+            "other/tests/test_unrelated.py",
+            "contracts/events.proto",
+        ],
+        config,
+    )
+
+    assert topology["role_availability"]["test"] == {
+        "count": 2,
+        "component_ids": ["other", "worker"],
+    }
+    assert topology["available_role_paths"] == {
+        "test": ["worker/tests/test_delivery.py"],
+    }
+    assert topology["relationships"] == [{
+        "source": "worker",
+        "target": "contracts",
+        "reason": "configured",
+        "active": False,
+        "activation_reason": "orientation-only",
+    }]
+
+
+def test_topology_activates_configured_relationship_when_both_components_change():
+    config = {"components": [
+        {
+            "id": "worker", "paths": ["worker/**"],
+            "related_components": ["contracts"],
+        },
+        {"id": "contracts", "paths": ["contracts/**"]},
+    ]}
+
+    topology = build_topology(
+        files("worker/src/delivery.py", "contracts/events.proto"),
+        {},
+        ["worker/src/delivery.py", "contracts/events.proto"],
+        config,
+    )
+
+    assert any(
+        relationship["source"] == "worker"
+        and relationship["target"] == "contracts"
+        and relationship["active"] is True
+        and relationship["activation_reason"] == "both-components-changed"
+        for relationship in topology["relationships"]
+    )
+
+
+def test_topology_selects_tests_from_an_active_recipe_related_glob():
+    config = {
+        "components": [
+            {
+                "id": "worker", "paths": ["worker/**"],
+                "related_components": ["integration"],
+            },
+            {"id": "integration", "paths": ["integration/**"]},
+        ],
+        "recipes": [{
+            "id": "delivery",
+            "related_paths": ["integration/tests/**"],
+        }],
+        "coverage_rules": [{
+            "paths_any": ["worker/**"],
+            "required_recipe_ids": ["delivery"],
+        }],
+    }
+
+    topology = build_topology(
+        files("worker/messaging/consumer.py"),
+        {},
+        [
+            "worker/messaging/consumer.py",
+            "integration/tests/test_delivery.py",
+            "unrelated/tests/test_other.py",
+        ],
+        config,
+    )
+
+    assert topology["available_role_paths"] == {
+        "test": ["integration/tests/test_delivery.py"],
+    }
+    assert topology["relationships"] == [{
+        "source": "worker",
+        "target": "integration",
+        "reason": "configured",
+        "active": True,
+        "activation_reason": "active-recipe-path",
+    }]
+
+
+def test_broad_recipe_seed_glob_does_not_activate_component_relationship():
+    config = {
+        "components": [
+            {
+                "id": "worker", "paths": ["worker/**"],
+                "related_components": ["contracts"],
+            },
+            {"id": "contracts", "paths": ["contracts/**"]},
+        ],
+        "recipes": [{
+            "id": "build",
+            "match": {"file_roles_any": ["implementation"]},
+            "seed_paths": ["**/pom.xml"],
+            "related_paths": [],
+        }],
+    }
+
+    topology = build_topology(
+        files("worker/src/delivery.py"),
+        {},
+        ["worker/src/delivery.py", "contracts/pom.xml"],
+        config,
+    )
+
+    assert topology["relationships"] == [{
+        "source": "worker",
+        "target": "contracts",
+        "reason": "configured",
+        "active": False,
+        "activation_reason": "orientation-only",
+    }]
 
 
 def test_generated_artifact_availability_accounts_for_workspace_outputs():

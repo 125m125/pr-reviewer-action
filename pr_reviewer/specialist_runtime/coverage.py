@@ -414,12 +414,15 @@ def derive_obligations(
     relationships = tuple(
         relationship for relationship in topology.get("relationships", []) if isinstance(relationship, Mapping)
     )
-    if len(components) > 1 and not relationships:
-        relationships = tuple({"source": left.get("id"), "target": right.get("id")}
-                              for left, right in zip(components, components[1:]))
     for relationship in sorted(relationships, key=lambda item: (_slug(item.get("source")), _slug(item.get("target")))):
         source, target = _slug(relationship.get("source")), _slug(relationship.get("target"))
-        if source and target:
+        active = (
+            bool(relationship.get("active"))
+            if "active" in relationship
+            else source in {_slug(item.get("id")) for item in components}
+            and target in {_slug(item.get("id")) for item in components}
+        )
+        if source and target and active:
             _add_obligation(
                 obligations, origin="topology", subject=f"{source}-to-{target}",
                 evidence_category="interaction", scope=changed_files,

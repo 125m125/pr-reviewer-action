@@ -73,6 +73,152 @@ def _match(path: str, patterns: Iterable[str]) -> bool:
     return any(fnmatch.fnmatchcase(path, _posix(pattern)) for pattern in patterns)
 
 
+def _configured_component_for(
+    path: str, configured: Iterable[dict[str, Any]],
+) -> dict[str, Any] | None:
+    return next(
+        (item for item in configured if _match(path, item.get("paths", []))),
+        None,
+    )
+
+
+_TEST_NAME_NOISE = {
+    "src", "source", "test", "tests", "testing", "spec", "specs",
+    "main", "index", "impl", "implementation",
+}
+
+
+def _name_tokens(path: str) -> set[str]:
+    stem = PurePosixPath(path).stem.lower()
+    return {
+        token for token in re.split(r"[^a-z0-9]+", stem)
+        if len(token) > 1 and token not in _TEST_NAME_NOISE
+    }
+
+
+def _relevant_test_paths(
+    changed: list[str],
+    tracked: list[str],
+    configured: list[dict[str, Any]],
+    roots: list[str],
+    recipe_patterns: Iterable[str] = (),
+    *,
+    limit: int = 25,
+) -> list[str]:
+    """Select stable test evidence related to the changed surface."""
+
+    changed_tests = [
+        path for path in changed if "test" in classify_file_roles(path)
+    ]
+    changed_sources = [path for path in changed if path not in changed_tests]
+
+    def component_id(path: str) -> str:
+        configured_component = _configured_component_for(path, configured)
+        if configured_component is not None:
+            return _slug(configured_component.get("id"), "repository")
+        return _slug(_component_for(path, roots) or "repository", "repository")
+
+    changed_components = {component_id(path) for path in changed_sources}
+    changed_tokens = set().union(*(_name_tokens(path) for path in changed_sources)) \
+        if changed_sources else set()
+    changed_first_segments = {
+        path.split("/", 1)[0] for path in changed_sources if "/" in path
+    }
+    ranked: list[tuple[int, str]] = []
+    for path in tracked:
+        if "test" not in classify_file_roles(path):
+            continue
+        if path in changed_tests:
+            rank = 0
+        elif component_id(path) in changed_components:
+            rank = 1
+        elif _match(path, recipe_patterns):
+            rank = 2
+        elif _name_tokens(path).intersection(changed_tokens):
+            rank = 3
+        elif (
+            "/" in path
+            and path.split("/", 1)[0] in changed_first_segments
+        ):
+            rank = 4
+        else:
+            continue
+        ranked.append((rank, path))
+    return [path for _rank, path in sorted(set(ranked))[:limit]]
+
+
+def _change_match(
+    match: object,
+    *,
+    changed: list[str],
+    component_ids: set[str],
+    roles: set[str],
+    risk_flags: set[str],
+) -> bool:
+    if not isinstance(match, dict):
+        return False
+    checks = {
+        "paths_any": lambda values: any(
+            _match(path, values) for path in changed
+        ),
+        "component_ids_any": lambda values: bool(
+            component_ids.intersection(_slug(item) for item in values)
+        ),
+        "file_roles_any": lambda values: bool(roles.intersection(values)),
+        "risk_flags_any": lambda values: bool(risk_flags.intersection(values)),
+    }
+    populated = False
+    for key, check in checks.items():
+        if key not in match:
+            continue
+        populated = True
+        values = match[key] if isinstance(match[key], list) else []
+        if not check(values):
+            return False
+    return populated
+
+
+def _active_recipe_patterns(
+    config: dict[str, Any],
+    *,
+    changed: list[str],
+    component_ids: set[str],
+    roles: set[str],
+    risk_flags: set[str],
+    fields: tuple[str, ...] = ("seed_paths", "related_paths"),
+) -> list[str]:
+    recipes = [
+        item for item in config.get("recipes", []) if isinstance(item, dict)
+    ]
+    active_ids = {
+        str(item.get("id") or "")
+        for item in recipes
+        if _change_match(
+            item.get("match"), changed=changed, component_ids=component_ids,
+            roles=roles, risk_flags=risk_flags,
+        )
+    }
+    for rule in config.get("coverage_rules", []):
+        if not isinstance(rule, dict) or not _change_match(
+            rule, changed=changed, component_ids=component_ids,
+            roles=roles, risk_flags=risk_flags,
+        ):
+            continue
+        active_ids.update(
+            str(item) for item in rule.get("required_recipe_ids", [])
+        )
+    patterns: list[str] = []
+    for recipe in recipes:
+        if str(recipe.get("id") or "") not in active_ids:
+            continue
+        for key in fields:
+            for pattern in recipe.get(key, []):
+                normalized = _posix(pattern)
+                if normalized and normalized not in patterns:
+                    patterns.append(normalized)
+    return patterns
+
+
 def classify_file_roles(path: str) -> list[str]:
     """Return generic, composable roles inferred from a repository path."""
     value = _posix(path)
@@ -428,9 +574,7 @@ def build_topology(
     path_component: dict[str, str] = {}
 
     for path in changed:
-        configured_component = next(
-            (item for item in configured if _match(path, item.get("paths", []))), None
-        )
+        configured_component = _configured_component_for(path, configured)
         root = _component_for(path, roots)
         component_id = (
             configured_component["id"] if configured_component else _slug(root or "repository", "repository")
@@ -447,6 +591,11 @@ def build_topology(
             "contracts": [],
             "invariants": [],
             "configured": bool(configured_component),
+            "path_patterns": (
+                [_posix(item) for item in configured_component.get("paths", [])]
+                if configured_component
+                else ([f"{root}/**"] if root else ["**"])
+            ),
         })
         entry["changed_files"].append(path)
         suffix = PurePosixPath(path).suffix.lower()
@@ -460,13 +609,60 @@ def build_topology(
             for field in ("responsibilities", "related_components", "contracts", "invariants"):
                 entry[field] = _strings(configured_component.get(field))
 
+    changed_roles = {
+        role for component in components.values() for role in component["file_roles"]
+    }
+    active_recipe_patterns = _active_recipe_patterns(
+        config,
+        changed=changed,
+        component_ids=set(components),
+        roles=changed_roles,
+        risk_flags=set(_strings(classification.get("risk_flags"))),
+    )
+    active_recipe_related_patterns = _active_recipe_patterns(
+        config,
+        changed=changed,
+        component_ids=set(components),
+        roles=changed_roles,
+        risk_flags=set(_strings(classification.get("risk_flags"))),
+        fields=("related_paths",),
+    )
+    configured_by_id = {
+        str(item.get("id") or ""): item for item in configured
+    }
+
+    def recipe_activates_target(target: str) -> bool:
+        target_component = configured_by_id.get(target)
+        if target_component is None or not active_recipe_related_patterns:
+            return False
+        target_paths = target_component.get("paths", [])
+        return any(
+            _match(path, target_paths)
+            and _match(path, active_recipe_related_patterns)
+            for path in tracked
+        )
+
     relationships: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for component in components.values():
         for target in component["related_components"]:
             key = (component["id"], target, "configured")
             if key not in seen:
-                relationships.append({"source": key[0], "target": key[1], "reason": key[2]})
+                both_changed = target in components
+                recipe_active = recipe_activates_target(target)
+                active = both_changed or recipe_active
+                relationships.append({
+                    "source": key[0], "target": key[1], "reason": key[2],
+                    "active": active,
+                    "activation_reason": (
+                        "both-components-changed"
+                        if both_changed
+                        else (
+                            "active-recipe-path" if recipe_active
+                            else "orientation-only"
+                        )
+                    ),
+                })
                 seen.add(key)
 
     contract_components = [
@@ -486,16 +682,40 @@ def build_topology(
                 reason = "shared contract identity" if shared_identity else "changed contract consumer/producer"
                 key = (contract["id"], target_id, reason)
                 if key not in seen:
-                    relationships.append({"source": key[0], "target": key[1], "reason": key[2]})
+                    relationships.append({
+                        "source": key[0], "target": key[1], "reason": key[2],
+                        "active": True,
+                        "activation_reason": "both-components-changed",
+                    })
                     seen.add(key)
 
     all_roles = sorted({role for item in components.values() for role in item["file_roles"]})
     all_languages = sorted({lang for item in components.values() for lang in item["languages"]})
-    available_role_paths: dict[str, list[str]] = defaultdict(list)
+    role_counts: dict[str, int] = defaultdict(int)
+    role_components: dict[str, set[str]] = defaultdict(set)
     for path in tracked:
         for role in classify_file_roles(path):
-            if len(available_role_paths[role]) < 25:
-                available_role_paths[role].append(path)
+            role_counts[role] += 1
+            configured_component = _configured_component_for(path, configured)
+            component_id = _slug(
+                configured_component.get("id")
+                if configured_component is not None
+                else (_component_for(path, roots) or "repository"),
+                "repository",
+            )
+            role_components[role].add(component_id)
+    relevant_tests = _relevant_test_paths(
+        changed, tracked, configured, roots,
+        active_recipe_patterns,
+    )
+    available_role_paths = {"test": relevant_tests} if relevant_tests else {}
+    role_availability = {
+        role: {
+            "count": role_counts[role],
+            "component_ids": sorted(role_components[role]),
+        }
+        for role in sorted(role_counts)
+    }
     generated_artifacts = []
     configured_artifacts = config.get("generated_artifacts", [])
     if configured_artifacts:
@@ -550,6 +770,7 @@ def build_topology(
         "languages": all_languages,
         "relationships": relationships,
         "available_role_paths": dict(available_role_paths),
+        "role_availability": role_availability,
         "risk_flags": _strings(classification.get("risk_flags")),
         "pr_kind": str(classification.get("pr_kind") or "unknown"),
         "generated_artifacts": generated_artifacts,

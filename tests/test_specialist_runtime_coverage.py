@@ -47,6 +47,25 @@ def test_coverage_obligation_exposes_legacy_friendly_evidence_aliases():
     assert obligation.mandatory is True
 
 
+def test_changed_components_without_configured_relationship_create_no_interaction():
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.policy import ReviewPolicy
+
+    obligations = derive_obligations({
+        "changed_files": ["api/main.py", "worker/main.py"],
+        "components": [
+            {"id": "api", "changed_files": ["api/main.py"]},
+            {"id": "worker", "changed_files": ["worker/main.py"]},
+        ],
+        "relationships": [],
+    }, {}, ReviewPolicy.minimal())
+
+    assert not any(
+        item.subject == "api-to-worker" and "interaction" in item.required_evidence
+        for item in obligations
+    )
+
+
 def test_matching_recipe_becomes_named_mandatory_obligations():
     from pr_reviewer.specialist_runtime.coverage import derive_obligations
     from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy
@@ -136,6 +155,42 @@ def test_topology_rules_include_artifacts_risks_and_component_interactions():
     assert any(item.subject == "event-client" and item.required_evidence == ("deployment-artifact",)
                for item in obligations)
     assert any(item.origin == "risk-rule" and item.subject == "auth_changes" for item in obligations)
+
+
+def test_static_one_sided_relationship_does_not_create_interaction_coverage():
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.policy import ReviewPolicy
+
+    obligations = derive_obligations({
+        "changed_files": [".github/workflows/ai-review.yml"],
+        "file_roles": ["deployment", "implementation"],
+        "components": [{
+            "id": "deployment",
+            "changed_files": [".github/workflows/ai-review.yml"],
+        }],
+        "relationships": [{
+            "source": "deployment", "target": "database",
+            "active": False, "activation_reason": "orientation-only",
+        }],
+    }, {}, ReviewPolicy.minimal())
+
+    assert not any(
+        item.required_evidence == ("interaction",) for item in obligations
+    )
+
+
+def test_unrelated_repository_test_sample_does_not_create_test_coverage():
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.policy import ReviewPolicy
+
+    obligations = derive_obligations({
+        "changed_files": ["src/payment.py"],
+        "file_roles": ["implementation"],
+        "available_role_paths": {},
+        "role_availability": {"test": {"count": 500}},
+    }, {}, ReviewPolicy.minimal())
+
+    assert not any(item.required_evidence == ("tests",) for item in obligations)
 
 
 def test_recipe_accounting_preserves_suppressed_and_not_applicable_statuses():

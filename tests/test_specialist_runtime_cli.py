@@ -35,6 +35,15 @@ def test_planner_system_prompt_declares_controller_owned_fields_and_paths():
     assert "Do not estimate turns" in prompt
 
 
+def test_planner_system_prompt_explicitly_disables_review_exploration_and_tools():
+    prompt = cli._ROLE_SYSTEM["planner"]
+
+    assert "assignment planning, not code review" in prompt
+    assert "Tools are unavailable" in prompt
+    assert "Do not inspect or request files" in prompt
+    assert "textual tool-call" in prompt
+
+
 def test_planner_context_projection_is_bounded_without_losing_plan_identity():
     context = {
         "base_plan": {
@@ -68,6 +77,137 @@ def test_planner_context_projection_is_bounded_without_losing_plan_identity():
     assert len(encoded.encode("utf-8")) < 120_000
     assert projected["base_plan"]["assignments"][0]["id"] == "assignment-1"
     assert projected["obligations"][0]["obligation_id"] == "obligation-0"
+
+
+def test_planner_projection_uses_capabilities_without_repository_path_inventory():
+    context = {
+        "base_plan": {"assignments": []},
+        "obligations": [{
+            "obligation_id": "obligation:changed",
+            "subject": "src/changed.py",
+            "scope": ["src/changed.py"],
+            "seed_hints": ["tests/test_changed.py"],
+        }],
+        "topology": {
+            "changed_files": ["src/changed.py"],
+            "available_role_paths": {
+                "test": ["tests/unrelated/test_everything.py"],
+                "implementation": ["src/unrelated.py"],
+            },
+            "role_availability": {
+                "test": {"count": 842, "component_ids": ["backend"]},
+            },
+            "generated_artifacts": [{
+                "id": "unrelated-client",
+                "source_of_truth": ["contracts/unrelated.yaml"],
+            }],
+            "components": [{
+                "id": "backend",
+                "changed_files": ["src/changed.py"],
+                "path_patterns": ["src/**"],
+            }],
+            "relationships": [
+                {"source": "backend", "target": "database", "active": False},
+                {
+                    "source": "backend", "target": "contracts", "active": True,
+                    "activation_reason": "both-components-changed",
+                },
+            ],
+        },
+    }
+
+    projected = cli._compact_planner_context(context)
+    serialized = json.dumps(projected, sort_keys=True)
+
+    assert "tests/unrelated/test_everything.py" not in serialized
+    assert "src/unrelated.py" not in serialized
+    assert "contracts/unrelated.yaml" not in serialized
+    assert projected["topology"]["role_availability"]["test"] == {
+        "count": 842,
+        "component_ids": ["backend"],
+    }
+    assert projected["topology"]["components"][0]["path_patterns"] == ["src/**"]
+    assert projected["topology"]["relationships"] == [{
+        "source": "backend",
+        "target": "contracts",
+        "active": True,
+        "activation_reason": "both-components-changed",
+    }]
+    assert projected["obligations"][0]["scope"] == ["src/changed.py"]
+    assert projected["obligations"][0]["seed_hints"] == ["tests/test_changed.py"]
+
+
+def test_planner_projection_keeps_only_active_recipe_globs():
+    projected = cli._compact_planner_context({
+        "base_plan": {"assignments": []},
+        "obligations": [{
+            "obligation_id": "obligation:recipe:delivery:tests",
+            "recipe_id": "delivery",
+        }],
+        "policy": {
+            "version": 2,
+            "recipes": [
+                {
+                    "id": "delivery",
+                    "execution": "dedicated",
+                    "seed_paths": ["worker/**"],
+                    "related_paths": ["contracts/**", "tests/**"],
+                },
+                {
+                    "id": "unrelated",
+                    "seed_paths": ["analytics/**"],
+                },
+            ],
+        },
+    })
+
+    assert projected["policy"]["recipes"] == [{
+        "id": "delivery",
+        "execution": "dedicated",
+        "seed_paths": ["worker/**"],
+        "related_paths": ["contracts/**", "tests/**"],
+    }]
+
+
+def test_planner_logs_bounded_projection_shape_counts(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    lines = []
+    controller = cli.build_controller(
+        cli.CliConfig.from_env(workspace=tmp_path),
+        runtime_logger=lines.append,
+    )
+    controller.planner.gateway.transport = _successful_transport([])
+
+    controller.planner.complete(RoleRequest(
+        role="planner",
+        request_id="planner:shape-counts",
+        phase=RunPhase.PLANNING,
+        lease=SessionLease(RunPhase.PLANNING, 10**20),
+        timeout_sec=30,
+        max_tokens=512,
+        context={
+            "base_plan": {"assignments": [{"id": "assignment-1"}]},
+            "obligations": [{"obligation_id": "obligation-1"}],
+            "topology": {
+                "changed_files": ["src/changed.py"],
+                "available_role_paths": {"test": ["tests/test_changed.py"]},
+                "role_availability": {"test": {"count": 4}},
+                "relationships": [{
+                    "source": "app", "target": "contract", "active": True,
+                }],
+            },
+        },
+    ))
+
+    assert any(
+        "planner projection counts changed_paths=1 assignments=1 obligations=1 "
+        "active_relationships=1 capability_roles=1" in line
+        for line in lines
+    )
+    assert any(
+        "omitted_topology_fields=available_role_paths" in line for line in lines
+    )
 
 
 def test_runtime_event_line_suppresses_delayed_specialist_admission_duplicate():
@@ -1416,6 +1556,127 @@ def test_planner_uses_its_configured_output_limit_over_session_limit(monkeypatch
     ))
 
     assert captured[0]["max_tokens"] == 8192
+
+
+def test_planner_rejects_repeated_textual_tools_without_retaining_them(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    monkeypatch.setenv("AI_STREAM", "true")
+    monkeypatch.setenv("SPECIALIST_PLANNER_MAX_TOKENS", "8192")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    payloads = []
+    responses = iter((
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": "<tool_call>\n" * 1000,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": '{"transformations":[]}',
+                },
+            }],
+            "usage": {},
+        },
+    ))
+
+    def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
+        payloads.append(payload)
+        return next(responses)
+
+    controller.planner.gateway.transport = transport
+
+    assert controller.planner.complete(
+        _role_request("planner", RunPhase.PLANNING)
+    ) == {"transformations": []}
+    assert len(payloads) == 2
+    assert payloads[0]["stream"] is True
+    assert payloads[1]["max_tokens"] == 2048
+    assert payloads[1]["reasoning_effort"] == "none"
+    retry_history = json.dumps(payloads[1]["messages"])
+    assert "<tool_call>" not in retry_history
+    assert "Tools are unavailable" in retry_history
+
+
+def test_planner_rejects_repeated_reasoning_tools_without_retaining_them(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    payloads = []
+    responses = iter((
+        {
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant", "content": "",
+                    "reasoning_content": "<tool_call>\n" * 1000,
+                },
+            }],
+            "usage": {},
+        },
+        {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": '{"transformations":[]}',
+                },
+            }],
+            "usage": {},
+        },
+    ))
+
+    def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
+        payloads.append(payload)
+        return next(responses)
+
+    controller.planner.gateway.transport = transport
+
+    assert controller.planner.complete(
+        _role_request("planner", RunPhase.PLANNING)
+    ) == {"transformations": []}
+    retry_history = json.dumps(payloads[1]["messages"])
+    assert "<tool_call>" not in retry_history
+
+
+def test_planner_projection_trims_to_configured_context_limit(monkeypatch, tmp_path):
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+    monkeypatch.setenv("SPECIALIST_PLANNER_MAX_CONTEXT_BYTES", "60000")
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    captured = []
+    controller.planner.gateway.transport = _successful_transport(captured)
+    obligations = [{
+        "obligation_id": f"obligation-{index}",
+        "subject": "x" * 400,
+        "explanation": "y" * 1200,
+        "scope": [f"src/file-{index}.py"],
+    } for index in range(200)]
+
+    controller.planner.complete(RoleRequest(
+        role="planner", request_id="planner:configured-limit",
+        phase=RunPhase.PLANNING,
+        lease=SessionLease(RunPhase.PLANNING, 10**20),
+        timeout_sec=30, max_tokens=512,
+        context={"base_plan": {"assignments": []}, "obligations": obligations},
+    ))
+
+    user_context = json.loads(captured[0]["messages"][1]["content"])
+    assert len(json.dumps(
+        user_context, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")) <= 60000
 
 
 def test_default_lm_studio_requests_use_role_and_session_protocols_not_legacy_verdict_prompt(

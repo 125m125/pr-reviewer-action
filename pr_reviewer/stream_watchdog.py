@@ -11,6 +11,10 @@ from typing import Any
 _DATA_PREFIX = "data:"
 _PARAGRAPH_RE = re.compile(r"\n\s*\n")
 _WORD_RE = re.compile(r"\S+")
+_TEXTUAL_TOOL_MARKER_RE = re.compile(
+    r"</?(?:tool_call|function|parameter)(?:=[^>]*)?>",
+    re.IGNORECASE,
+)
 
 
 def _normalise(value: str) -> str:
@@ -72,7 +76,9 @@ class StreamWatchdog:
 
         self._text = (self._text + text)[-self.window_chars:]
         self.text_words_seen = len(_WORD_RE.findall(_normalise(self._text)))
-        self._check_paragraphs()
+        self._check_textual_tool_markers()
+        if not self.triggered:
+            self._check_paragraphs()
         if not self.triggered:
             self._check_blocks()
         return self.triggered
@@ -127,6 +133,11 @@ class StreamWatchdog:
                 self.triggered = True
                 self.reason = "repeated-paragraph"
                 return
+
+    def _check_textual_tool_markers(self) -> None:
+        if len(_TEXTUAL_TOOL_MARKER_RE.findall(self._text)) >= self.min_repetitions:
+            self.triggered = True
+            self.reason = "repeated-textual-tool-marker"
 
     def _check_blocks(self) -> None:
         words = _WORD_RE.findall(_normalise(self._text))

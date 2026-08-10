@@ -50,6 +50,36 @@ def test_v2_recipe_accepts_each_supported_execution_mode(tmp_path, execution):
     assert load_review_policy(path).recipes[0].execution == execution
 
 
+def test_topology_projection_retains_coverage_rules_for_relevant_seed_selection(
+    tmp_path,
+):
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({
+        "version": 2,
+        "recipes": [{
+            "id": "delivery", "title": "Delivery", "objective": "Trace",
+            "related_paths": ["integration/tests/**"],
+        }],
+        "coverage_rules": [{
+            "id": "delivery-risk",
+            "paths_any": ["worker/**"],
+            "required_recipe_ids": ["delivery"],
+            "risk_tier": "high",
+            "unresolved_policy": "block_when_unresolved",
+        }],
+    }), encoding="utf-8")
+
+    projection = load_review_policy(path).legacy_projection()
+
+    assert projection["coverage_rules"] == [{
+        "id": "delivery-risk",
+        "paths_any": ["worker/**"],
+        "required_recipe_ids": ["delivery"],
+        "risk_tier": "high",
+        "unresolved_policy": "block_when_unresolved",
+    }]
+
+
 def test_v2_policy_rejects_unknown_top_level_key(tmp_path):
     path = tmp_path / "policy.json"
     path.write_text(json.dumps({"version": 2, "sources": [], "unsafe": True}), encoding="utf-8")

@@ -202,6 +202,7 @@ class ReviewPolicy:
             "version": 1,
             "components": [_thaw(item) for item in self.components],
             "recipes": recipes,
+            "coverage_rules": [_thaw(item) for item in self.coverage_rules],
             "generated_artifacts": [_thaw(item) for item in self.generated_artifacts],
             "exclude": {key: list(value) for key, value in self.exclude.items()},
         }
