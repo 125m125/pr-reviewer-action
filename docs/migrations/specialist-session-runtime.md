@@ -12,6 +12,12 @@ provider capacity are understood.
 - A specialist is now a continuous, bounded session. It retains only the
   review state needed across planning, investigation, bounded follow-up, and
   finalization instead of restarting an unrelated whole-PR review.
+- Near the provider context limit, the runtime requests a compact working-memory
+  checkpoint and then resumes the same specialist. Tool access is disabled for
+  checkpoint and repair turns. It is explicitly re-enabled for exploration.
+  Model checkpoints carry working memory and candidate deltas; controller-owned
+  coverage and evidence metadata remain authoritative and are not repeated by
+  the model.
 - The current-head version-2 policy derives deterministic coverage obligations.
   Recipes record whether work is `coverage`, `dedicated`, or `independent`, so
   the runtime can account for every selected and omitted obligation.
@@ -39,6 +45,8 @@ replay and provider capacity have been demonstrated.
 |---|---|---|---|---|
 | `review_strategy` | added | `single` | Begin with `specialists_evaluate`, then use `specialists` with `publish_review_comment: "true"` | Evaluate without publishing before enabling the handoff; the strategy alone never publishes. |
 | `review_policy_file` | added | `.github/ai-review-policy.json` | Keep the default and commit a version-2 policy | The validated current-head policy selects work and limits sources/publishing. |
+| `review_diff_priority_file` | added | `.github/ai-review-diff-priorities.json` | Keep the default; add the file only when project-specific ordering or quotas improve large-diff orientation | Rules only reorder or quota paths already present in the immutable changed-file manifest. Missing or invalid files safely use built-in priorities. |
+| `ai_max_tokens` | retained | `8192` | `8192` for the tested local Qwen baseline | Leaves enough room for reasoning-heavy structured roles and checkpoint repair. |
 | `specialist_review_deadline_sec` | added | `7200` | `7200` initially; raise only after measured runs need it | This is the absolute run deadline, including finalization and artifact production. |
 | `specialist_phase_shares` | added | `{"planning":10,"initial":60,"followup":20,"finalization":10}` | Keep the default before tuning from artifacts | The four percentages must total 100 and prevent one phase consuming the run. |
 | `specialist_concurrency` | added | `1` | `1` | Sequential execution is the reproducible baseline; raise only after confirming provider capacity and deterministic replay behavior. |
@@ -53,17 +61,17 @@ replay and provider capacity have been demonstrated.
 | `specialist_max_tool_calls_per_pass` | deprecated | `128` | Replace with `specialist_max_tool_calls_per_session: "128"` | Legacy alias; the new limit is lifetime-per-session. |
 | `specialist_tool_mode` | retained | `native_loop` | `native_loop` | Uses durable read-only specialist sessions; `packet` is deprecated. |
 | `specialist_planner_max_tool_calls` | deprecated | `2` | Remove it; use `specialist_max_tool_calls_per_session` for evidence gathering | The planner role does not expose tools, so this compatibility input is a no-op and warns when customized. |
-| `specialist_planner_max_tokens` | retained | `2048` | `2048` | Keeps the planning scout concise before specialist work begins. |
+| `specialist_planner_max_tokens` | retained | `2048` | `8192` for reasoning-heavy local models | The smaller default is suitable for concise hosted models; Qwen may otherwise spend the response entirely on reasoning before emitting JSON. |
 | `specialist_planner_model` | retained |  | Leave blank to inherit `ai_model` initially | A separate planner model is an optional capacity/quality tuning point. |
 | `specialist_model` | retained |  | Leave blank to inherit `ai_model` initially | A separate worker model is optional after the baseline is stable. |
 | `specialist_critic_model` | retained |  | Leave blank to inherit `specialist_model`, then `ai_model` | Avoids introducing a second provider variable during migration. |
 | `specialist_aggregator_model` | retained |  | Leave blank to inherit `ai_model` | Candidate ranking is bounded; tune only from artifacts. |
 | `specialist_pass_timeout_sec` | retained | `600` | `600` | Bounds an individual model request within the global deadline. |
-| `specialist_max_tokens` | retained | `4096` | `4096` | Bounds specialist, critic, and aggregation output. |
+| `specialist_max_tokens` | retained | `4096` | `8192` for the tested local Qwen baseline | Provides room for bounded structured checkpoints and repairs without changing the lifetime turn limit. |
 | `specialist_recovery_max_tokens` | retained | `2048` | `2048` | Bounds the first reconstructed specialist model turn after a recovery. |
 | `specialist_max_conversation_tokens` | retained | `96000` | `96000` | Bounds each session transcript separately from model context. |
 | `specialist_temperature` | retained | `0.0` | `0.0` | Keeps exploration deterministic while replay behavior is established. |
-| `model_context_tokens` | retained |  | Set the provider's actual window, for example `262144` | Derives corpus/diff budgets from the real context window; blank uses the action's context-limit mode. |
+| `model_context_tokens` | retained |  | Set the provider's actual served window; use `80056` for the tested local Qwen configuration | Derives corpus/diff and admission budgets from the real context window. Never copy a model's advertised maximum when the server is configured lower. |
 | `system_prompt_file` | retained |  | `.github/ai-review-prompt.md` | Stores repository conventions alongside the code being reviewed. |
 | `system_prompt_mode` | changed | `replace` | `append` | Preserves the action-owned specialist protocol and appends repository conventions. |
 | `specialist_stream_watchdog` | retained | `true` | `true` | Stops repeated streamed blocks and permits one compact recovery. |
@@ -109,24 +117,46 @@ replacement.
 Create or review these files in the consuming repository before enabling
 `review_strategy: specialists`:
 
-1. `.github/workflows/ai-review.yml`: use a reviewed action pin (the snippets
-   use `misospace/pr-reviewer-action@v1`; production repositories may pin the
-   same reviewed release to its immutable commit SHA). Grant `contents: read`
+1. `.github/workflows/ai-review.yml`: use a reviewed immutable action pin. The
+   tested local baseline below pins
+   `125m125/pr-reviewer-action@899b89b7bdfad251d841f97f300d8bb62e9bdcf9`.
+   Grant `contents: read`
    and `pull-requests: write` for `review_comment`; native modes need the same
    PR-write permission. Check out the PR head with `fetch-depth: 0`.
 2. `.github/ai-review-rules.md`: repository-visible standards and constraints.
    It is suitable for conventions, but does not grant web access or replace the
    version-2 policy.
-3. `.github/ai-review-specialists.json`: the existing version-1 migration input.
-   Preserve it while translating components/recipes, then remove it only after
-   version-2 output is established. It is a compatibility fallback, not the
-   authoritative version-2 source.
+3. `.github/ai-review-specialists.json`: migration-only compatibility input.
+   Preserve an existing version-1 file while translating components/recipes,
+   then remove it after version-2 output is established. Fresh version-2
+   adopters should not create this file.
 4. `.github/ai-review-policy.json`: the version-2 current-head policy. It owns
    component/recipe obligations, allowed documentation sources, generated
    artifacts, and any narrowing publishing/risk policy.
 5. `.github/ai-review-prompt.md`: concise repository addendum. Set
    `system_prompt_file` to this path and `system_prompt_mode: append`; do not
    copy the bundled specialist protocol into it.
+6. `.github/ai-review-diff-priorities.json`: optional project-specific ordering
+   for large diffs. Omit it for a small initial test and use built-in ordering,
+   or add narrow glob rules when documentation, contracts, configuration, or
+   language-specific entry points should be read before normal source. It never
+   expands the changed-file boundary.
+
+Example optional priority file:
+
+```json
+{
+  "rules": [
+    {"glob": "docs/**/*.md", "priority": 5, "max_bytes": 40000},
+    {"glob": "src/**/*.py", "priority": 15},
+    {"glob": "**/*_generated.*", "priority": 90, "max_bytes": 8000}
+  ]
+}
+```
+
+Lower numbers are selected first. Replace the example source glob with the
+project's actual source roots. Do not add lockfiles merely to mention them: the
+built-in rules already place common lockfiles after normal files.
 
 ### Manual re-review safety
 
@@ -168,13 +198,14 @@ jobs:
           publish_mode: comment
 ```
 
-### After: version-2 specialist runtime
+### After: tested local-Qwen version-2 baseline
 
 ```yaml
 name: AI PR Review
 on:
   pull_request:
-    types: [opened, reopened, synchronize, ready_for_review, labeled]
+    # A maintainer explicitly requests a review with the ai-review label.
+    types: [labeled]
 
 permissions:
   contents: read
@@ -182,33 +213,94 @@ permissions:
 
 jobs:
   review:
-    if: ${{ !github.event.pull_request.draft }}
+    if: >-
+      github.event.label.name == 'ai-review' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
-      - uses: misospace/pr-reviewer-action@v1
+      - uses: 125m125/pr-reviewer-action@899b89b7bdfad251d841f97f300d8bb62e9bdcf9
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          ai_base_url: https://api.openai.com/v1
-          ai_model: gpt-4.1-mini
-          ai_api_key: ${{ secrets.OPENAI_API_KEY }}
-          review_strategy: specialists
+          ai_base_url: ${{ vars.LM_STUDIO_BASE_URL }}
+          ai_api_format: openai
+          ai_model: qwen/qwen3.6-35b-a3b
+          ai_api_key: ${{ secrets.LM_STUDIO_API_KEY }}
+          ai_response_format: json_schema
+          ai_reasoning_effort: ""
+          ai_verdict_reasoning_effort: none
+          ai_stream: "true"
+          ai_max_tokens: "8192"
+          ai_request_timeout_sec: "1200"
+
+          # First run without publishing; switch to specialists after inspecting
+          # the structured artifact and model-server logs.
+          review_strategy: specialists_evaluate
           review_policy_file: .github/ai-review-policy.json
-          model_context_tokens: "262144"
-          specialist_review_deadline_sec: "7200"
-          specialist_concurrency: "1"
+          review_diff_priority_file: .github/ai-review-diff-priorities.json
+          standards_file: .github/ai-review-rules.md
           system_prompt_file: .github/ai-review-prompt.md
           system_prompt_mode: append
-          publish_review_comment: "true"
+          review_scope: full
+          model_context_tokens: "80056"
+          specialist_review_deadline_sec: "7200"
+          specialist_concurrency: "1"
+          specialist_max_sessions: "8"
+          specialist_max_followup_sessions: "2"
+          specialist_max_model_turns_per_session: "64"
+          specialist_max_tool_calls_per_session: "128"
+          specialist_max_recoveries_per_session: "1"
+          specialist_planner_max_tokens: "8192"
+          specialist_max_tokens: "8192"
+          specialist_pass_timeout_sec: "1200"
+          specialist_recovery_max_tokens: "4096"
+          publish_review_comment: "false"
           publish_mode: review_comment
 ```
 
-Use `specialists_evaluate` for the first rollout and inspect the artifacts
-before changing it to `specialists`. Raise `specialist_concurrency` only after
-confirming provider capacity and deterministic replay behavior.
+The `80056` context value is the served window of the tested local Qwen setup,
+not a universal constant. Replace it with the other provider's real configured
+window. After a successful evaluation, change `review_strategy` to `specialists`
+and `publish_review_comment` to `"true"`. Raise `specialist_concurrency` only
+after confirming provider capacity and deterministic replay behavior.
+
+## Downstream adaptation checklist
+
+Change these repository-specific values:
+
+1. Select a runner that can reach the configured LM Studio endpoint, and map
+   `LM_STUDIO_BASE_URL` and `LM_STUDIO_API_KEY` to that project's trusted
+   repository variables/secrets.
+2. Replace `model_context_tokens` only when the served model/window differs.
+   Use the server's configured value, not the model card maximum.
+3. Rewrite `.github/ai-review-policy.json` components, relationships, recipes,
+   generated artifacts, and official-documentation `sources` for the project.
+   Unknown authors or domains require human review before allowlisting.
+4. Rewrite `.github/ai-review-rules.md` and `.github/ai-review-prompt.md` with
+   the project's architecture, generated-code boundaries, tests, and review
+   priorities. Keep the prompt short and repository-specific.
+5. Either omit `.github/ai-review-diff-priorities.json` for the first small PR,
+   or replace its example globs with real documentation, configuration, build,
+   schema, test, source, generated, and lockfile paths.
+
+Keep these values initially:
+
+- the immutable action SHA, `system_prompt_mode: append`, `review_scope: full`,
+  sequential specialist execution, 64 lifetime turns, 128 lifetime tool calls,
+  one recovery, and the 8,192-token local-Qwen output ceilings;
+- `specialists_evaluate` plus disabled publication for the first run, followed
+  by artifact/log inspection before enabling `specialists` publication;
+- the manual `ai-review` label gate, current-branch policy review, read-only
+  `contents` permission, narrowly scoped `pull-requests: write`, and fork
+  exclusion until the trust boundaries have been reviewed for that project.
+
+Do not copy `.github/ai-review-specialists.json` into a fresh version-2 project,
+do not broaden source hosts merely because search returned them, and do not
+replace the bundled specialist prompt with the repository addendum.
 
 ## Complete version-2 policy example
 
@@ -340,6 +432,12 @@ re-review label is applied.
 - Checkpoint recovery diagnostics are bounded and structured in the artifact
   event journal. They describe parse/repair status and candidate-retention
   signals; raw model responses are intentionally excluded.
+- Context-pressure checkpoints are compact model-owned deltas. The model emits
+  working summary, completed steps, candidate updates/new candidates, unknowns,
+  and next actions; it must not reproduce the controller's coverage ledger,
+  obligation statuses, or evidence metadata. Empty candidate arrays are valid
+  and do not imply degradation. A malformed response is repaired once before a
+  bounded deterministic projection is used.
 
 ## What to expect
 
