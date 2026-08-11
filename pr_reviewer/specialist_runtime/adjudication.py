@@ -2247,11 +2247,68 @@ def build_source_access_request_notes(
     obligations: Mapping[str, CoverageObligation],
 ) -> tuple[ReviewNote, ...]:
     """Project valid source requests using the production authorization rules."""
-    notes = {
-        note.fingerprint: note
-        for value in values
-        if (note := _source_note(value, obligations=obligations)) is not None
-    }
+    notes: dict[str, ReviewNote] = {}
+    repositories: dict[tuple[str, str, str], list[RepositoryAccessRequest]] = {}
+    for value in values:
+        request = _source_request(value)
+        if request is None or request.obligation_id not in obligations:
+            continue
+        if isinstance(request, RepositoryAccessRequest):
+            key = (request.repository, request.revision or "", request.endpoint)
+            repositories.setdefault(key, []).append(request)
+            continue
+        note = _source_note(request, obligations=obligations)
+        if note is not None:
+            notes[note.fingerprint] = note
+
+    for (repository, revision, endpoint), requests in repositories.items():
+        obligation_ids = tuple(dict.fromkeys(
+            request.obligation_id for request in requests
+        ))
+        purposes = tuple(dict.fromkeys(request.purpose for request in requests))[:8]
+        contexts = tuple(dict.fromkeys(
+            request.model_purpose for request in requests if request.model_purpose
+        ))[:8]
+        reasons = tuple(dict.fromkeys(
+            request.authority_reason for request in requests
+            if request.authority_reason
+        ))
+        reason = reasons[0] if reasons else (
+            "The repository is not in the current-branch GitHub API allowlist."
+        )
+        markdown = (
+            "### Repository access request\n\n"
+            "**Repository:** " + _quoted(repository, limit=200)
+            + "\n\n**GitHub API endpoint:** " + _quoted(endpoint)
+            + (
+                "\n\n**Exact revision:** " + _quoted(revision, limit=80)
+                if revision else ""
+            )
+            + "\n\n**Purposes:**\n"
+            + "\n".join("- " + _quoted(item) for item in purposes)
+            + (
+                "\n\n**Specialist-provided context:**\n"
+                + "\n".join("- " + _quoted(item, limit=300) for item in contexts)
+                if contexts else ""
+            )
+            + "\n\n**Why human input is needed:** " + _quoted(reason)
+            + "\n\nNo repository content was retrieved; access remains pending "
+            "current-branch human authorization."
+        )
+        note = ReviewNote(
+            kind=ReviewNoteKind.SOURCE_ACCESS_REQUEST,
+            fingerprint=_request_fingerprint(
+                ReviewNoteKind.SOURCE_ACCESS_REQUEST,
+                repository + ":" + endpoint,
+                obligation_ids,
+                None,
+                (repository, revision, endpoint),
+            ),
+            markdown=markdown,
+            related_obligation_ids=obligation_ids,
+            evidence_ids=(),
+        )
+        notes[note.fingerprint] = note
     return tuple(notes[key] for key in sorted(notes))
 
 
@@ -2349,9 +2406,9 @@ def build_review_notes(
         )
         if note is not None:
             notes.append(note)
-    for value in source_access_requests:
-        note = _source_note(value, obligations=obligation_map)
-        if note is not None:
-            notes.append(note)
+    notes.extend(build_source_access_request_notes(
+        source_access_requests,
+        obligations=obligation_map,
+    ))
     unique = {(note.kind.value, note.fingerprint): note for note in notes}
     return tuple(unique[key] for key in sorted(unique))

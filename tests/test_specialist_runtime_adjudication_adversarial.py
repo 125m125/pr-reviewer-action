@@ -13,6 +13,7 @@ from pr_reviewer.specialist_runtime.adjudication import (
     apply_runtime_verdict_policy,
     build_review_handoff,
     build_review_notes,
+    build_source_access_request_notes,
     consolidate_candidates,
 )
 from pr_reviewer.specialist_runtime.evidence import (
@@ -61,6 +62,39 @@ def _obligation(
 def _controller_obligations(*items: CoverageObligation) -> dict[str, CoverageObligation]:
     values = items or (_obligation(),)
     return {item.id: item for item in values}
+
+
+def test_repository_access_notes_consolidate_revision_and_retain_obligations():
+    first = _obligation("OB-workflow")
+    second = _obligation("OB-deployment")
+    revision = "a" * 40
+    endpoint = "repos/125m125/pr-reviewer-action/commits/" + revision
+    requests = (
+        repository_access_request(
+            endpoint,
+            first.id,
+            "Verify the workflow action pin.",
+            "Inspect the pinned revision.",
+            "Repo not allowed",
+        ),
+        repository_access_request(
+            endpoint,
+            second.id,
+            "Verify deployment provenance.",
+            "Confirm the deployment input.",
+            "Repo not allowed",
+        ),
+    )
+
+    notes = build_source_access_request_notes(
+        requests,
+        obligations=_controller_obligations(first, second),
+    )
+
+    assert len(notes) == 1
+    assert notes[0].related_obligation_ids == (first.id, second.id)
+    assert "Verify the workflow action pin." in notes[0].markdown
+    assert "Verify deployment provenance." in notes[0].markdown
 
 
 def _store(

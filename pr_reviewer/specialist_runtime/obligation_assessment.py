@@ -107,6 +107,10 @@ class ObligationAssessmentLedger:
             f"O{index}": obligation_id
             for index, obligation_id in enumerate(owned, start=1)
         }
+        self._id_to_handle = {
+            obligation_id: target
+            for target, obligation_id in self._handle_to_id.items()
+        }
         self._assessments = {
             target: ObligationAssessment(target, obligation_id)
             for target, obligation_id in self._handle_to_id.items()
@@ -116,11 +120,20 @@ class ObligationAssessmentLedger:
         return tuple(self._handle_to_id)
 
     def obligation_id(self, target: str) -> str | None:
-        return self._handle_to_id.get(str(target))
+        canonical = self.canonical_target(target)
+        return self._handle_to_id.get(canonical) if canonical else None
+
+    def canonical_target(self, target: object) -> str | None:
+        """Resolve a short handle or an exact obligation ID owned by this session."""
+        value = str(target or "").strip()
+        if value in self._handle_to_id:
+            return value
+        return self._id_to_handle.get(value)
 
     def assessment(self, target: str) -> ObligationAssessment:
+        canonical = self.canonical_target(target)
         try:
-            return self._assessments[str(target)]
+            return self._assessments[str(canonical)]
         except KeyError as exc:
             raise KeyError(f"unknown obligation target: {target}") from exc
 
@@ -156,6 +169,7 @@ class ObligationAssessmentLedger:
 
     def explain(self, target: str) -> dict[str, object]:
         assessment = self.assessment(target)
+        target = assessment.target
         obligation = self._obligations[assessment.obligation_id]
         return {
             "target": target,
@@ -182,7 +196,7 @@ class ObligationAssessmentLedger:
         evidence: EvidenceSnapshot,
         eligible: Callable[[EvidenceRecord, CoverageObligation], bool],
     ) -> AssessmentProposalResult:
-        target = str(target).strip()
+        target = self.canonical_target(target) or str(target).strip()
         assessment = self._assessments.get(target)
         if assessment is None:
             return AssessmentProposalResult(False, target, None, "unknown or unowned target")

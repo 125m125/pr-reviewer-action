@@ -56,14 +56,20 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
         "name": "explain_obligation",
         "description": "Explain one assigned obligation and its prior attempts.",
         "parameters": {"type": "object", "properties": {
-            "target": {"type": "string"},
+            "target": {
+                "type": "string",
+                "description": "Short assigned handle from obligation_targets, such as O1.",
+            },
         }, "required": ["target"], "additionalProperties": False},
     },
     {
         "name": "get_obligation_status",
         "description": "Return controller-owned status for one obligation target.",
         "parameters": {"type": "object", "properties": {
-            "target": {"type": "string"},
+            "target": {
+                "type": "string",
+                "description": "Short assigned handle from obligation_targets, such as O1.",
+            },
         }, "required": ["target"], "additionalProperties": False},
     },
     {
@@ -73,7 +79,10 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "the controller validates it immediately."
         ),
         "parameters": {"type": "object", "properties": {
-            "target": {"type": "string"},
+            "target": {
+                "type": "string",
+                "description": "Short assigned handle from obligation_targets, such as O1.",
+            },
             "disposition": {"type": "string", "enum": [
                 "covered", "not_applicable", "exhausted", "blocked", "unresolved",
             ]},
@@ -345,6 +354,9 @@ _CHECKPOINT_CONTROLLER_STATE_INSTRUCTION = (
 )
 _OBLIGATION_PROTOCOL_INSTRUCTION = (
     " Coverage is not a request to find supporting evidence at all costs. "
+    "Use the short target handles from obligation_targets when calling "
+    "obligation tools; exact assigned obligation IDs are accepted only as a "
+    "compatibility fallback. "
     "Use the obligation tools during exploration to record covered, "
     "not_applicable, exhausted, blocked, or unresolved conclusions. "
     "Unchanged sources may explain a contract without proving changed behavior. "
@@ -393,6 +405,16 @@ def _strings(value: object) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple, set)):
         return ()
     return tuple(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
+
+
+def _tool_string_list(value: object) -> tuple[str, ...]:
+    """Accept a native string array or the equivalent JSON-encoded near miss."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return ()
+    return _strings(value)
 
 
 def _bounded_text(value: object, *, max_length: int) -> str:
@@ -742,6 +764,12 @@ def specialist_assignment_prompt(
         "title": getattr(assignment, "title", ""),
         "objective": getattr(assignment, "objective", ""),
         "obligation_ids": list(dict.fromkeys((*primary, *all_ids, *independent))),
+        "obligation_targets": [
+            {"target": f"O{index}", "obligation_id": obligation_id}
+            for index, obligation_id in enumerate(
+                dict.fromkeys((*primary, *all_ids, *independent)), start=1,
+            )
+        ],
         "independent_obligation_ids": list(independent),
         "analytical_lens": lenses,
         "seed_paths": list(getattr(assignment, "seed_paths", ())),
@@ -970,6 +998,8 @@ class SpecialistSession:
         self._compacted_evidence_read_keys: set[tuple[str, int, int]] = set()
         self._compacted_evidence_reads = 0
         self._obligation_local_tool_calls = 0
+        self._obligation_rejection_counts: dict[tuple[str, str, int], int] = {}
+        self._repeated_obligation_rejection = False
         self._legacy_obligation_authority_used = False
         self._checkpoint_spans: list[_CheckpointSpan] = []
         self._tool_lease_exhausted = False
@@ -1580,6 +1610,12 @@ class SpecialistSession:
                 self.state = SessionState.CHECKPOINT
                 return self._snapshot()
             progressed = self._execute_calls(turn.tool_calls)
+            if self._repeated_obligation_rejection:
+                self._repeated_obligation_rejection = False
+                return self.request_checkpoint(
+                    "repeated-obligation-rejection",
+                    disposition=CheckpointDisposition.PAUSE,
+                )
             if self._tool_lease_exhausted:
                 return self.request_checkpoint("tool-lease-expired")
             if progressed:
@@ -1741,14 +1777,8 @@ class SpecialistSession:
                     target=target,
                     disposition=str(arguments.get("disposition") or ""),
                     reason=arguments.get("reason"),
-                    evidence_ids=(
-                        arguments.get("evidence_ids")
-                        if isinstance(arguments.get("evidence_ids"), list) else ()
-                    ),
-                    next_actions=(
-                        arguments.get("next_actions")
-                        if isinstance(arguments.get("next_actions"), list) else ()
-                    ),
+                    evidence_ids=_tool_string_list(arguments.get("evidence_ids")),
+                    next_actions=_tool_string_list(arguments.get("next_actions")),
                     evidence=self.evidence_store.snapshot(),
                     eligible=self._record_matches_obligation,
                 )
@@ -1763,6 +1793,23 @@ class SpecialistSession:
                 accepted = result.accepted
                 if accepted:
                     self._current_gaps = self._derive_current_gaps()
+                    self._obligation_rejection_counts = {
+                        key: count
+                        for key, count in self._obligation_rejection_counts.items()
+                        if key[0] != result.target
+                    }
+                else:
+                    rejection_key = (
+                        result.target,
+                        result.reason,
+                        len(self.evidence_store.snapshot().records),
+                    )
+                    rejection_count = (
+                        self._obligation_rejection_counts.get(rejection_key, 0) + 1
+                    )
+                    self._obligation_rejection_counts[rejection_key] = rejection_count
+                    if rejection_count >= 2:
+                        self._repeated_obligation_rejection = True
         except KeyError:
             payload = {"accepted": False, "target": target, "reason": "unknown target"}
             accepted = False

@@ -32,6 +32,7 @@ from pr_reviewer.specialist_runtime.session import (
     _is_context_limit_error,
     _resolve_retained_evidence_id,
     _rewrite_rationale_evidence_ids,
+    specialist_assignment_prompt,
 )
 from pr_reviewer.specialist_runtime.types import (
     BudgetLimits,
@@ -444,6 +445,86 @@ def test_obligation_state_tools_use_short_handles_without_repository_budget():
     assert session.budget.snapshot().tool_calls == before
     assert '"target": "O1"' in session.conversation.events[-1]["content"]
     assert "OB-code" not in session.conversation.events[-1]["content"]
+
+
+def test_specialist_assignment_exposes_controller_obligation_handles():
+    assignment = SpecialistAssignment(
+        assignment_id="assignment-1",
+        objective="Review the assigned behavior",
+        primary_obligation_ids=("OB-code", "OB-tests"),
+        seed_paths=("a.py",),
+    )
+
+    prompt = specialist_assignment_prompt(assignment)
+    payload = json.loads(prompt.split("\n", 1)[1])
+
+    assert payload["obligation_targets"] == [
+        {"target": "O1", "obligation_id": "OB-code"},
+        {"target": "O2", "obligation_id": "OB-tests"},
+    ]
+    assert "Use the short target handles" in payload["obligation_protocol"]
+
+
+def test_resolution_accepts_owned_full_id_and_stringified_array_arguments():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-1", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    read_result = json.loads(session.conversation.events[-1]["content"])
+
+    session._execute_calls(({
+        "id": "resolve-1", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "OB-code",
+            "disposition": "covered",
+            "reason": "The changed implementation preserves the contract.",
+            "evidence_ids": json.dumps([read_result["evidence_id"]]),
+            "next_actions": "[]",
+        }),
+    },))
+
+    proposal = json.loads(session.conversation.events[-1]["content"])
+    assert proposal == {
+        "accepted": True,
+        "target": "O1",
+        "disposition": "covered",
+        "reason": "accepted",
+    }
+
+
+def test_repeated_identical_obligation_rejection_pauses_instead_of_compacting():
+    rejected = tool_call_response(
+        "propose_obligation_resolution",
+        {
+            "target": "not-assigned",
+            "disposition": "covered",
+            "reason": "The implementation was inspected.",
+            "evidence_ids": [],
+            "next_actions": [],
+        },
+        call_id="reject-1",
+    )
+    rejected_again = replace(
+        rejected,
+        tool_calls=({**rejected.tool_calls[0], "id": "reject-2"},),
+    )
+    gateway = ScriptedGateway([
+        rejected,
+        rejected_again,
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway, model_turns=6)
+
+    result = session.explore()
+
+    assert len(gateway.requests) == 3
+    assert result.state.value == "checkpoint"
+    assert session._finalization_diagnostics[-1]["reason"] == (
+        "repeated-obligation-rejection"
+    )
+    assert session._finalization_diagnostics[-1]["disposition"] == "pause"
 
 
 def test_targeted_read_retains_neutral_evidence_until_resolution_is_accepted():
