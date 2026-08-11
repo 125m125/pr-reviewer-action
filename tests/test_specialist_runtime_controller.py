@@ -4806,6 +4806,33 @@ def test_terminal_artifact_contains_complete_sanitized_event_journal_digest(tmp_
     ) == result.artifact["event_references"]
 
 
+def test_terminal_artifact_preserves_event_journal_beyond_generic_item_cap(
+    tmp_path, monkeypatch,
+):
+    original_journal = controller_module.EventJournal
+
+    class LargeEventJournal(original_journal):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            for index in range(2_001):
+                self.emit("diagnostic", {"index": index})
+
+    monkeypatch.setattr(controller_module, "EventJournal", LargeEventJournal)
+
+    result = _controller(tmp_path).run(_inputs(tmp_path))
+    events = result.artifact["events"]
+
+    assert len(events) > 2_000
+    assert result.artifact["event_journal"] == {
+        "count": len(events),
+        "digest": hashlib.sha256(json.dumps(
+            events, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")).hexdigest(),
+    }
+    assert len(result.artifact["event_references"]) == len(events)
+    assert result.artifact_write_error is None
+
+
 def test_result_artifact_is_recursively_immutable(tmp_path):
     result = _controller(tmp_path, ).run(_inputs(tmp_path))
 

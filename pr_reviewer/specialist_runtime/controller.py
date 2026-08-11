@@ -1892,6 +1892,29 @@ def _artifact_value(value: object, *, depth: int = 0) -> object:
         return "[unserializable]"
 
 
+def _project_complete_event_journal(events: object) -> dict[str, object]:
+    """Sanitize every journal event without applying the generic list cap."""
+    if not isinstance(events, (list, tuple)):
+        raise TypeError("artifact event journal must be an array")
+    projected_events: list[dict[str, object]] = []
+    for event in events:
+        projected = _artifact_value(event)
+        if not isinstance(projected, dict):
+            raise TypeError("artifact event journal entries must be objects")
+        projected_events.append(projected)
+    return {
+        "events": projected_events,
+        "event_references": [
+            {"sequence": item.get("sequence"), "kind": item.get("kind")}
+            for item in projected_events
+        ],
+        "event_journal": {
+            "count": len(projected_events),
+            "digest": _digest(projected_events),
+        },
+    }
+
+
 _CHECKPOINT_DIAGNOSTIC_SCALARS = frozenset({
     "code", "attempt", "reason", "disposition", "initial_parse",
     "repair_attempted", "repair_parse", "initial_finish_reason",
@@ -4484,9 +4507,11 @@ class ReviewController:
                 "blocking_obligation_ids": list(state.blocking_obligation_ids),
             },
         }
+        complete_event_journal = _project_complete_event_journal(events)
         projected = _artifact_value(artifact)
         if not isinstance(projected, dict):
             raise TypeError("artifact projection must be an object")
+        projected.update(complete_event_journal)
         return projected
 
     @staticmethod
@@ -5350,9 +5375,13 @@ class ReviewController:
                 },
                 "timing": {"deadline_seconds": inputs.config.review_deadline_sec, "phase_shares": _json_value(inputs.config.phase_shares), "finalization_reserve_seconds": inputs.config.review_deadline_sec * inputs.config.phase_shares.finalization / 100},
             }
+            complete_event_journal = _project_complete_event_journal(
+                artifact.get("events", ()),
+            )
             projected = _artifact_value(artifact)
             if not isinstance(projected, dict):
                 raise TypeError("emergency artifact projection must be an object")
+            projected.update(complete_event_journal)
             artifact = projected
             self._validate_artifact(artifact)
         if path is None:
