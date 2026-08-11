@@ -53,6 +53,8 @@ class ObligationStatus(str, Enum):
     PARTIALLY_COVERED = "partially_covered"
     UNRESOLVED = "unresolved"
     NOT_APPLICABLE = "not_applicable"
+    EXHAUSTED = "exhausted"
+    BLOCKED = "blocked"
     SUPPRESSED_BY_POLICY = "suppressed_by_policy"
 
 
@@ -86,6 +88,8 @@ class CoverageObligation:
     explanation: str = ""
     recipe_id: str | None = None
     recipe_execution: str | None = None
+    requirement_id: str | None = None
+    requirement_mode: str = "required"
     mandatory: bool = True
 
     @property
@@ -128,6 +132,7 @@ class SessionCheckpoint:
     invariants_evaluated: tuple[str, ...] = ()
     unknowns: tuple[str, ...] = ()
     proposed_next_actions: tuple[str, ...] = ()
+    obligation_assessments: tuple[object, ...] = ()
 
 
 @dataclass(frozen=True)

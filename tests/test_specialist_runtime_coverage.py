@@ -48,7 +48,7 @@ def test_coverage_obligation_exposes_legacy_friendly_evidence_aliases():
 
 
 def test_changed_components_without_configured_relationship_create_no_interaction():
-    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger, derive_obligations
     from pr_reviewer.specialist_runtime.policy import ReviewPolicy
 
     obligations = derive_obligations({
@@ -82,13 +82,98 @@ def test_matching_recipe_becomes_named_mandatory_obligations():
     }
 
     obligations = derive_obligations(topology, {}, policy)
-    recipe_items = [item for item in obligations if item.recipe_id == "delivery"]
+    recipe_items = [
+        item for item in obligations
+        if item.recipe_id == "delivery" and item.required_evidence_categories
+    ]
 
     assert {item.required_evidence for item in recipe_items} == {
         ("producer",), ("consumer",), ("tests",)
     }
     assert all(item.mandatory for item in recipe_items)
     assert [item.id for item in recipe_items] == sorted(item.id for item in recipe_items)
+
+
+def test_forced_recipe_activates_only_matching_evidence_requirements():
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger, derive_obligations
+    from pr_reviewer.specialist_runtime.policy import (
+        EvidenceRequirementPolicy, RecipePolicy, ReviewPolicy,
+    )
+
+    policy = ReviewPolicy(
+        recipes=(RecipePolicy(
+            id="delivery", title="Delivery", objective="Trace runtime delivery",
+            evidence_requirements=(
+                EvidenceRequirementPolicy(
+                    id="workflow", category="workflow or deployment",
+                    when={"paths_any": (".github/workflows/**",)},
+                ),
+                EvidenceRequirementPolicy(
+                    id="manifest", category="build manifest",
+                    when={"paths_any": ("pom.xml", "**/pom.xml")},
+                ),
+            ),
+        ),),
+        coverage_rules=({
+            "id": "delivery-risk", "paths_any": (".github/workflows/**",),
+            "required_recipe_ids": ("delivery",), "risk_tier": "high",
+            "unresolved_policy": "block_when_unresolved",
+        },),
+    )
+    topology = {
+        "changed_files": [".github/workflows/review.yml"],
+        "file_roles": ["configuration"], "components": [],
+    }
+
+    obligations = derive_obligations(topology, {}, policy)
+    recipe_items = [
+        item for item in obligations
+        if item.recipe_id == "delivery" and item.required_evidence_categories
+    ]
+
+    assert [item.requirement_id for item in recipe_items] == ["workflow"]
+    assert recipe_items[0].risk_tier == "high"
+    assert recipe_items[0].unresolved_policy == "block_when_unresolved"
+    accounting = next(
+        item for item in obligations
+        if item.requirement_id == "manifest" and not item.required_evidence_categories
+    )
+    ledger = CoverageLedger(obligations)
+    assert accounting.mandatory is False
+    assert ledger.obligation_statuses()[accounting.id] is ObligationStatus.NOT_APPLICABLE
+
+
+def test_optional_and_one_of_requirements_have_bounded_mandatory_shape():
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger, derive_obligations
+    from pr_reviewer.specialist_runtime.policy import (
+        EvidenceRequirementPolicy, RecipePolicy, ReviewPolicy,
+    )
+
+    policy = ReviewPolicy.minimal(recipes=(RecipePolicy(
+        id="delivery", title="Delivery", objective="Trace",
+        match={"file_roles_any": ("configuration",)},
+        evidence_requirements=(
+            EvidenceRequirementPolicy("optional-doc", "documentation", {}, mode="optional"),
+            EvidenceRequirementPolicy("artifact", "generated output", {}, mode="one_of:proof"),
+            EvidenceRequirementPolicy("test", "behavioral test", {}, mode="one_of:proof"),
+        ),
+    ),))
+
+    obligations = derive_obligations({
+        "changed_files": ["config.yml"], "file_roles": ["configuration"],
+        "components": [],
+    }, {}, policy)
+    recipe_items = [item for item in obligations if item.recipe_id == "delivery"]
+
+    optional = next(item for item in recipe_items if item.requirement_id == "optional-doc")
+    group = next(item for item in recipe_items if item.requirement_id == "one_of:proof")
+    assert optional.mandatory is False
+    assert group.mandatory is True
+    assert group.required_evidence == ("behavioral test", "generated output")
+
+    ledger = CoverageLedger(obligations)
+    ledger.attach_evidence(group.id, "E-proof")
+    assert ledger.recipe_statuses()["delivery"] == "covered"
 
 
 def test_recipe_is_partial_until_every_obligation_has_evidence():

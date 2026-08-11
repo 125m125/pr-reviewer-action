@@ -426,6 +426,153 @@ def seed_successful_tool_exchange(
     return record
 
 
+def test_obligation_state_tools_use_short_handles_without_repository_budget():
+    session = make_session(ScriptedGateway([]))
+    tool_names = {item["name"] for item in session.conversation.tool_schemas}
+    before = session.budget.snapshot().tool_calls
+
+    progressed = session._execute_calls(({
+        "id": "explain-1", "name": "explain_obligation",
+        "arguments": json.dumps({"target": "O1"}),
+    },))
+
+    assert {
+        "explain_obligation", "get_obligation_status",
+        "propose_obligation_resolution",
+    }.issubset(tool_names)
+    assert progressed is True
+    assert session.budget.snapshot().tool_calls == before
+    assert '"target": "O1"' in session.conversation.events[-1]["content"]
+    assert "OB-code" not in session.conversation.events[-1]["content"]
+
+
+def test_targeted_read_retains_neutral_evidence_until_resolution_is_accepted():
+    session = make_session(ScriptedGateway([]))
+    read = {
+        "id": "read-1", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    }
+
+    session._execute_calls((read,))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["coverage_effect"] == "neutral_evidence_retained"
+    assert result["eligible_targets"] == ["O1"]
+    assert session.coverage.obligation_statuses()["OB-code"].value == "pending"
+
+    session._execute_calls(({
+        "id": "resolve-1", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O1", "disposition": "covered",
+            "reason": "The changed implementation preserves the contract.",
+            "evidence_ids": [result["evidence_id"]], "next_actions": [],
+        }),
+    },))
+
+    proposal = json.loads(session.conversation.events[-1]["content"])
+    assert proposal["accepted"] is True
+    assert session.coverage.obligation_statuses()["OB-code"].value == "pending"
+    assert session.obligation_assessments.assessment("O1").disposition.value == "covered"
+
+
+def test_untargeted_read_is_not_associated_with_every_current_gap():
+    session = make_session(ScriptedGateway([]))
+
+    session._execute_calls(({
+        "id": "read-1", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py"}),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["eligible_targets"] == []
+    assert session.evidence_store.snapshot().associations == ()
+
+
+def test_duplicate_targeted_read_reports_target_metadata_without_new_budget():
+    session = make_session(ScriptedGateway([]))
+    before = session.budget.snapshot().tool_calls
+    session._execute_calls(({
+        "id": "read-1", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py"}),
+    },))
+    session._execute_calls(({
+        "id": "read-2", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["replayed_duplicate"] is True
+    assert result["eligible_targets"] == ["O1"]
+    assert result["coverage_effect"] == "neutral_evidence_retained"
+    assert session.budget.snapshot().tool_calls == before + 1
+
+
+def test_obligation_state_tools_have_a_separate_bounded_allowance():
+    session = make_session(ScriptedGateway([]))
+
+    for index in range(session.OBLIGATION_LOCAL_TOOL_CALL_LIMIT + 1):
+        session._execute_calls(({
+            "id": f"explain-{index}", "name": "explain_obligation",
+            "arguments": json.dumps({"target": "O1"}),
+        },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["accepted"] is False
+    assert "allowance exhausted" in result["reason"]
+
+
+def test_checkpoint_obligation_update_uses_same_resolution_validator():
+    executor_result = {
+        "tool": "read_file", "status": "ok",
+        "result": {"content": "contents:a.py"},
+    }
+    evidence_id = canonical_evidence_key(
+        "read_file", {"path": "a.py"}, executor_result,
+    )
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py", "targets": ["O1"]}),
+        checkpoint_response(
+            inspected=["a.py"], unresolved=["OB-tests"],
+            obligation_updates=[{
+                "target": "O1", "disposition": "covered",
+                "reason": "The changed implementation preserves the contract.",
+                "evidence_ids": [evidence_id], "next_actions": [],
+            }],
+        ),
+    ])
+    session = make_session(gateway)
+
+    result = session.explore()
+
+    assessment = result.checkpoint.obligation_assessments[0]
+    assert assessment.disposition.value == "covered"
+    assert "OB-code" not in result.checkpoint.unknowns
+
+
+def test_invalid_checkpoint_obligation_batch_rolls_back_earlier_updates():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-1", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    payload = {
+        "unresolved": ["OB-tests"],
+        "obligation_updates": [{
+            "target": "O1", "disposition": "covered", "reason": "Covered.",
+            "evidence_ids": [evidence_id], "next_actions": [],
+        }, {
+            "target": "O99", "disposition": "blocked", "reason": "Unknown.",
+            "evidence_ids": [], "next_actions": [],
+        }],
+    }
+
+    checkpoint = session._checkpoint_from_text(json.dumps(payload))
+
+    assert checkpoint is None
+    assert session.obligation_assessments.assessment("O1").disposition.value == "pending"
+
+
 def test_provider_prompt_usage_calibrates_next_same_mode_admission():
     gateway = EstimatingGateway(
         [
@@ -1037,7 +1184,7 @@ def test_cumulative_checkpoint_payload_materializes_omitted_candidates():
     assert payload["candidate_findings"][0]["candidate_id"] == "candidate-code"
     assert payload["candidate_statuses"] == {"candidate-code": "active"}
     assert payload["latest_checkpoint"]["evidence_ids"]
-    assert payload["coverage"]["obligation_statuses"]["OB-code"] == "covered"
+    assert payload["coverage"]["obligation_statuses"]["OB-code"] == "pending"
     assert payload["evidence_metadata"][0]["id"].startswith("evidence:")
     assert "content" not in payload["evidence_metadata"][0]
 
@@ -3174,7 +3321,7 @@ def test_tool_deduplication_retains_only_sanitized_evidence_records():
     assert secret not in repr(retained)
 
 
-def test_inspected_path_cannot_cover_an_unrelated_obligation_scope():
+def test_inspected_path_alone_cannot_cover_any_obligation_scope():
     gateway = ScriptedGateway([
         tool_call_response("read_file", {"path": "a.py"}),
         checkpoint_response(inspected=["a.py"], unresolved=[]),
@@ -3184,7 +3331,7 @@ def test_inspected_path_cannot_cover_an_unrelated_obligation_scope():
     result = session.explore()
     statuses = dict(result.checkpoint.obligation_statuses)
 
-    assert statuses["OB-code"].value == "covered"
+    assert statuses["OB-code"].value == "pending"
     assert statuses["OB-tests"].value == "pending"
 
 

@@ -12,6 +12,10 @@ from pr_reviewer.specialist_runtime.coverage import (
     reconcile_wave,
 )
 from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+from pr_reviewer.specialist_runtime.obligation_assessment import (
+    ObligationAssessment,
+    ObligationDisposition,
+)
 from pr_reviewer.specialist_runtime.negotiation import (
     NegotiationError,
     NegotiationState,
@@ -88,6 +92,7 @@ def state_for(
     remaining_deadline_sec: float = 100.0,
     assignments: tuple[Assignment | SpecialistAssignment, ...] | None = None,
     session_ownership: tuple[SessionOwnership, ...] | None = None,
+    checkpoints: tuple[SessionCheckpoint, ...] = (),
 ) -> NegotiationState:
     obligations = (
         obligation("OB1", risk="high"),
@@ -102,7 +107,7 @@ def state_for(
         assignments=assignments or (
             assignment("A1", ("OB1",)), assignment("A2", ("OB2",)),
         ),
-        checkpoints=(),
+        checkpoints=checkpoints,
         session_ownership=session_ownership or (
             SessionOwnership("S1", "A1", primary_obligation_ids=("OB1",)),
             SessionOwnership("S2", "A2", primary_obligation_ids=("OB2",)),
@@ -161,6 +166,58 @@ def test_compact_negotiation_uses_controller_target_handle_and_derives_authority
     assert proposal.actions[0].session_id == "S2"
     assert proposal.actions[0].expected_evidence == ("implementation",)
     assert proposal.actions[0].estimated_turns == 1
+
+
+def test_compact_negotiation_offers_resume_only_for_novel_checkpoint_action():
+    assessment = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.UNRESOLVED,
+        reason="The downstream consumer remains unchecked.",
+        next_actions=("read src/consumer.py diff",),
+    )
+    state = state_for(checkpoints=(SessionCheckpoint(
+        session_id="S2", state=SessionState.CHECKPOINT,
+        obligation_assessments=(assessment,),
+    ),))
+
+    target = compact_negotiation_context(state)["targets"][0]
+
+    assert target["last_conclusion"] == "The downstream consumer remains unchecked."
+    assert target["next_actions"] == ("read src/consumer.py diff",)
+    assert target["attempt_count"] == 0
+    assert "resume" in target["allowed_actions"]
+
+
+def test_compact_negotiation_omits_closed_assessment():
+    assessment = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.EXHAUSTED,
+        reason="All bounded sources were inspected.",
+    )
+    state = state_for(checkpoints=(SessionCheckpoint(
+        session_id="S2", state=SessionState.CHECKPOINT,
+        obligation_assessments=(assessment,),
+    ),))
+
+    targets = compact_negotiation_context(state)["targets"]
+
+    assert all(item["subject"] != "src/a.py" for item in targets)
+
+
+def test_compact_negotiation_rejects_resume_without_novel_action():
+    assessment = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.PENDING,
+    )
+    state = state_for(checkpoints=(SessionCheckpoint(
+        session_id="S2", state=SessionState.CHECKPOINT,
+        obligation_assessments=(assessment,),
+    ),))
+
+    with pytest.raises(NegotiationError, match="not allowed"):
+        validate_compact_negotiation({
+            "kind": "resume", "target": "U1", "reason": "Keep reading.",
+        }, state)
 
 
 def test_compact_negotiation_does_not_advertise_new_session_at_hard_capacity():
@@ -260,7 +317,7 @@ def test_tool_exhausted_session_can_record_unknown_when_no_new_session_is_availa
     assert action.kind == "record_unknown"
 
 
-def test_reconcile_wave_uses_evidence_predicates_not_declared_coverage():
+def test_reconcile_wave_requires_accepted_semantic_assessment_for_coverage():
     obligations = (
         obligation("OB1"),
         obligation("OB2", category="implementation", path="src/a.py"),
@@ -279,6 +336,10 @@ def test_reconcile_wave_uses_evidence_predicates_not_declared_coverage():
         state=SessionState.CHECKPOINT,
         evidence_ids=(evidence.id,),
         obligation_statuses=(("OB2", ObligationStatus.COVERED),),
+        obligation_assessments=(
+            ObligationAssessment("O1", "OB1"),
+            ObligationAssessment("O2", "OB2"),
+        ),
     )
 
     result = reconcile_wave(
@@ -295,11 +356,79 @@ def test_reconcile_wave_uses_evidence_predicates_not_declared_coverage():
     )
 
     assert result.snapshot.obligation_statuses == (
-        ("OB1", ObligationStatus.COVERED),
+        ("OB1", ObligationStatus.PENDING),
         ("OB2", ObligationStatus.PENDING),
     )
-    assert result.newly_covered_obligation_ids == ("OB1",)
-    assert result.uncovered_obligation_ids == ("OB2",)
+    assert result.newly_covered_obligation_ids == ()
+    assert result.uncovered_obligation_ids == ("OB1", "OB2")
+
+
+def test_reconcile_wave_accepts_covered_assessment_with_eligible_evidence():
+    required = obligation("OB1")
+    ledger = CoverageLedger((required,))
+    store = EvidenceStore()
+    evidence = store.add_tool_result(
+        session_id="S1", tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "assert behavior"},
+        category="tests",
+    )
+    checkpoint = SessionCheckpoint(
+        session_id="S1", state=SessionState.CHECKPOINT,
+        evidence_ids=(evidence.id,),
+        obligation_assessments=(ObligationAssessment(
+            target="O1", obligation_id="OB1",
+            disposition=ObligationDisposition.COVERED,
+            reason="The changed behavior is exercised by the retained test.",
+            evidence_ids=(evidence.id,),
+        ),),
+    )
+
+    result = reconcile_wave(
+        ledger, wave_start_coverage=ledger.snapshot(),
+        checkpoints=(checkpoint,), evidence=store.snapshot(),
+        assignments=(assignment("S1", ("OB1",)),),
+        session_ownership=(SessionOwnership(
+            session_id="S1", assignment_id="S1",
+            primary_obligation_ids=("OB1",),
+        ),),
+    )
+
+    assert result.snapshot.obligation_statuses == (
+        ("OB1", ObligationStatus.COVERED),
+    )
+
+
+@pytest.mark.parametrize("disposition, expected", [
+    (ObligationDisposition.NOT_APPLICABLE, ObligationStatus.NOT_APPLICABLE),
+    (ObligationDisposition.EXHAUSTED, ObligationStatus.EXHAUSTED),
+    (ObligationDisposition.BLOCKED, ObligationStatus.BLOCKED),
+])
+def test_reconcile_wave_preserves_non_negotiable_closure_status(
+    disposition, expected,
+):
+    required = obligation("OB1", risk="high")
+    ledger = CoverageLedger((required,))
+    checkpoint = SessionCheckpoint(
+        session_id="S1", state=SessionState.CHECKPOINT,
+        obligation_assessments=(ObligationAssessment(
+            target="O1", obligation_id="OB1", disposition=disposition,
+            reason="Bounded review reached a terminal coverage conclusion.",
+        ),),
+    )
+
+    result = reconcile_wave(
+        ledger, wave_start_coverage=ledger.snapshot(),
+        checkpoints=(checkpoint,), evidence=EvidenceStore().snapshot(),
+        assignments=(assignment("S1", ("OB1",)),),
+        session_ownership=(SessionOwnership(
+            session_id="S1", assignment_id="S1",
+            primary_obligation_ids=("OB1",),
+        ),),
+    )
+
+    assert result.snapshot.obligation_statuses == (("OB1", expected),)
+    assert result.uncovered_obligation_ids == ()
 
 
 def test_shared_path_with_wrong_evidence_category_does_not_satisfy_obligation():

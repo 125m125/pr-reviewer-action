@@ -14,6 +14,7 @@ from pr_reviewer.specialists import classify_file_roles
 
 from .assignments import Assignment
 from .evidence import EvidenceRecord, EvidenceSnapshot
+from .obligation_assessment import ObligationAssessment, ObligationDisposition
 from .policy import RecipePolicy, ReviewPolicy
 from .types import (
     CoverageObligation,
@@ -201,6 +202,8 @@ def _add_obligation(
     risk_tier: str = "normal",
     recipe_id: str | None = None,
     recipe_execution: str | None = None,
+    requirement_id: str | None = None,
+    requirement_mode: str = "required",
     requires_independent_verification: bool = False,
     unresolved_policy: str = "record_unknown",
     required_evidence_categories: tuple[str, ...] | None = None,
@@ -226,6 +229,8 @@ def _add_obligation(
         explanation=explanation,
         recipe_id=recipe_id,
         recipe_execution=recipe_execution,
+        requirement_id=requirement_id,
+        requirement_mode=requirement_mode,
         mandatory=mandatory,
     ))
 
@@ -466,7 +471,6 @@ def derive_obligations(
             recipe_states[recipe.id] = RecipeStatus.NOT_APPLICABLE
             continue
         recipe_states[recipe.id] = RecipeStatus.ASSIGNED
-        categories = recipe.expected_evidence or ("review",)
         forced = forced_recipes.get(recipe.id)
         risk_tier = forced[0] if forced else recipe.priority
         unresolved_policy = (
@@ -478,15 +482,91 @@ def derive_obligations(
                 else "record_unknown"
             )
         )
-        for category in categories:
+        requirements = tuple(
+            item for item in recipe.evidence_requirements
+            if not item.when or _rule_matches(item.when, effective_topology, risk_flags)
+        )
+        matched_requirement_ids = {item.id for item in requirements}
+        for requirement in recipe.evidence_requirements:
+            if requirement.id in matched_requirement_ids:
+                continue
+            obligation_id = _obligation_id(
+                "requirement-accounting",
+                f"{recipe.id}:{requirement.id}",
+                "not-applicable",
+            )
+            obligations.setdefault(obligation_id, CoverageObligation(
+                obligation_id=obligation_id,
+                origin="requirement-accounting",
+                subject=f"{recipe.id}:{requirement.id}",
+                satisfaction_predicates=("requirement_status:not_applicable",),
+                risk_tier=risk_tier,
+                unresolved_policy=unresolved_policy,
+                explanation=(
+                    f"Repository recipe '{recipe.id}' requirement "
+                    f"'{requirement.id}' did not match the immutable change."
+                ),
+                recipe_id=recipe.id,
+                recipe_execution=recipe.execution,
+                requirement_id=requirement.id,
+                requirement_mode=requirement.mode,
+                mandatory=False,
+            ))
+        entries: list[tuple[str, tuple[str, ...], str, tuple[str, ...], bool]] = []
+        for category in recipe.expected_evidence:
+            entries.append((category, (category,), "required", (), True))
+        for requirement in requirements:
+            if requirement.mode.startswith("one_of:"):
+                continue
+            entries.append((
+                requirement.id,
+                (requirement.category,),
+                requirement.mode,
+                tuple(dict.fromkeys((*requirement.seed_paths, *requirement.related_paths))),
+                requirement.mode != "optional",
+            ))
+        groups = sorted({
+            item.mode for item in requirements if item.mode.startswith("one_of:")
+        })
+        for group in groups:
+            members = tuple(item for item in requirements if item.mode == group)
+            entries.append((
+                group,
+                tuple(sorted({item.category for item in members})),
+                group,
+                tuple(dict.fromkeys(
+                    path for item in members
+                    for path in (*item.seed_paths, *item.related_paths)
+                )),
+                True,
+            ))
+        if not recipe.expected_evidence and not recipe.evidence_requirements:
+            entries.append(("review", ("review",), "required", (), True))
+        for requirement_id, categories, mode, requirement_paths, mandatory in entries:
             _add_obligation(
-                obligations, origin="recipe", subject=recipe.id, evidence_category=category,
+                obligations, origin="recipe",
+                subject=(
+                    recipe.id if requirement_id in recipe.expected_evidence
+                    else f"{recipe.id}:{requirement_id}"
+                ),
+                evidence_category=categories[0],
+                required_evidence_categories=categories,
                 risk_tier=risk_tier, recipe_id=recipe.id,
                 recipe_execution=recipe.execution,
+                requirement_id=requirement_id,
+                requirement_mode=mode,
                 requires_independent_verification=recipe.execution == "independent",
                 unresolved_policy=unresolved_policy,
-                scope=changed_files, seed_hints=recipe.seed_paths or changed_files,
-                explanation=f"Repository recipe '{recipe.id}' requires {category} evidence.",
+                scope=changed_files,
+                seed_hints=(
+                    tuple(dict.fromkeys((*recipe.seed_paths, *requirement_paths)))
+                    or changed_files
+                ),
+                mandatory=mandatory,
+                explanation=(
+                    f"Repository recipe '{recipe.id}' requires "
+                    f"{' or '.join(categories)} evidence."
+                ),
             )
 
     for recipe_id, status in recipe_states.items():
@@ -514,6 +594,11 @@ class CoverageLedger:
             self._obligations[item.obligation_id] = item
         self._evidence: dict[str, set[str]] = {item_id: set() for item_id in self._obligations}
         self._unresolved: set[str] = set()
+        self._closures: dict[str, ObligationStatus] = {
+            obligation_id: ObligationStatus.NOT_APPLICABLE
+            for obligation_id, obligation in self._obligations.items()
+            if obligation.origin == "requirement-accounting"
+        }
         for obligation in self._obligations.values():
             if obligation.recipe_id:
                 self._recipe_states.setdefault(obligation.recipe_id, RecipeStatus.ASSIGNED)
@@ -525,6 +610,7 @@ class CoverageLedger:
             raise ValueError("evidence_id must be non-empty")
         self._evidence[obligation_id].add(str(evidence_id))
         self._unresolved.discard(obligation_id)
+        self._closures.pop(obligation_id, None)
 
     def obligation(self, obligation_id: str) -> CoverageObligation:
         """Return immutable obligation metadata for deterministic association."""
@@ -541,12 +627,29 @@ class CoverageLedger:
         if obligation_id not in self._obligations:
             raise KeyError(f"unknown coverage obligation: {obligation_id}")
         if not self._evidence[obligation_id]:
+            self._closures.pop(obligation_id, None)
             self._unresolved.add(obligation_id)
+
+    def close_obligation(
+        self, obligation_id: str, status: ObligationStatus,
+    ) -> None:
+        if obligation_id not in self._obligations:
+            raise KeyError(f"unknown coverage obligation: {obligation_id}")
+        if status not in {
+            ObligationStatus.NOT_APPLICABLE,
+            ObligationStatus.EXHAUSTED,
+            ObligationStatus.BLOCKED,
+        }:
+            raise ValueError("unsupported obligation closure status")
+        if not self._evidence[obligation_id]:
+            self._unresolved.discard(obligation_id)
+            self._closures[obligation_id] = status
 
     def replace_reconciled_state(
         self,
         evidence_by_obligation: Mapping[str, Iterable[str]],
         unresolved_obligation_ids: Iterable[str],
+        closed_statuses: Mapping[str, ObligationStatus] | None = None,
     ) -> None:
         """Replace optimistic session accounting with controller-validated state."""
         unresolved_ids = tuple(unresolved_obligation_ids)
@@ -569,12 +672,15 @@ class CoverageLedger:
             obligation_id for obligation_id in unresolved_ids
             if not reconciled[obligation_id]
         }
+        self._closures = dict(closed_statuses or {})
 
     def obligation_statuses(self) -> dict[str, ObligationStatus]:
         statuses: dict[str, ObligationStatus] = {}
         for obligation_id in sorted(self._obligations):
             if self._evidence[obligation_id]:
                 statuses[obligation_id] = ObligationStatus.COVERED
+            elif obligation_id in self._closures:
+                statuses[obligation_id] = self._closures[obligation_id]
             elif obligation_id in self._unresolved:
                 statuses[obligation_id] = ObligationStatus.UNRESOLVED
             else:
@@ -586,15 +692,21 @@ class CoverageLedger:
         obligation_statuses = self.obligation_statuses()
         recipe_obligations: dict[str, list[str]] = {}
         for obligation in self._obligations.values():
-            if obligation.recipe_id:
+            if obligation.recipe_id and obligation.mandatory:
                 recipe_obligations.setdefault(obligation.recipe_id, []).append(obligation.obligation_id)
         for recipe_id, obligation_ids in recipe_obligations.items():
             values = [obligation_statuses[obligation_id] for obligation_id in obligation_ids]
             if all(value is ObligationStatus.COVERED for value in values):
                 statuses[recipe_id] = RecipeStatus.COVERED
+            elif all(value is ObligationStatus.NOT_APPLICABLE for value in values):
+                statuses[recipe_id] = RecipeStatus.NOT_APPLICABLE
             elif any(value is ObligationStatus.COVERED for value in values):
                 statuses[recipe_id] = RecipeStatus.PARTIALLY_COVERED
-            elif any(value is ObligationStatus.UNRESOLVED for value in values):
+            elif any(value in {
+                ObligationStatus.UNRESOLVED,
+                ObligationStatus.EXHAUSTED,
+                ObligationStatus.BLOCKED,
+            } for value in values):
                 statuses[recipe_id] = RecipeStatus.UNRESOLVED
             else:
                 statuses[recipe_id] = RecipeStatus.ASSIGNED
@@ -676,6 +788,7 @@ def _validated_wave_start(
     dict[str, ObligationStatus],
     dict[str, set[str]],
     set[str],
+    dict[str, ObligationStatus],
 ]:
     if not isinstance(snapshot, CoverageSnapshot):
         raise TypeError("wave_start_coverage must be a CoverageSnapshot")
@@ -717,6 +830,9 @@ def _validated_wave_start(
         ObligationStatus.PENDING,
         ObligationStatus.COVERED,
         ObligationStatus.UNRESOLVED,
+        ObligationStatus.NOT_APPLICABLE,
+        ObligationStatus.EXHAUSTED,
+        ObligationStatus.BLOCKED,
     }
     for obligation_id, status in statuses.items():
         if status not in allowed_statuses:
@@ -730,7 +846,15 @@ def _validated_wave_start(
         obligation_id for obligation_id, status in statuses.items()
         if status is ObligationStatus.UNRESOLVED
     }
-    return statuses, seeded_evidence, unresolved
+    closures = {
+        obligation_id: status for obligation_id, status in statuses.items()
+        if status in {
+            ObligationStatus.NOT_APPLICABLE,
+            ObligationStatus.EXHAUSTED,
+            ObligationStatus.BLOCKED,
+        }
+    }
+    return statuses, seeded_evidence, unresolved, closures
 
 
 def reconcile_wave(
@@ -750,7 +874,10 @@ def reconcile_wave(
 
     obligation_by_id = {item.id: item for item in ledger.obligations()}
     records = {record.id: record for record in evidence.records}
-    before, reconciled_evidence, reconciled_unresolved = _validated_wave_start(
+    (
+        before, reconciled_evidence, reconciled_unresolved,
+        reconciled_closures,
+    ) = _validated_wave_start(
         wave_start_coverage, obligation_by_id, evidence
     )
     assignment_by_id: dict[str, Assignment | SpecialistAssignment] = {}
@@ -793,10 +920,45 @@ def reconcile_wave(
                 f"checkpoint references unknown durable session: {checkpoint.session_id}"
             )
         owned_ids = ownership.obligation_ids
-        referenced_ids = tuple(sorted(set(
-            checkpoint.evidence_ids + checkpoint.imported_evidence_ids
-        )))
-        for obligation_id in owned_ids:
+        assessments = tuple(
+            item for item in checkpoint.obligation_assessments
+            if isinstance(item, ObligationAssessment)
+        )
+        if not assessments:
+            legacy_ids = tuple(sorted(set(
+                checkpoint.evidence_ids + checkpoint.imported_evidence_ids
+            )))
+            assessments = tuple(
+                ObligationAssessment(
+                    target=f"legacy:{index}", obligation_id=obligation_id,
+                    disposition=ObligationDisposition.COVERED,
+                    reason="Legacy checkpoint evidence projection.",
+                    evidence_ids=legacy_ids,
+                )
+                for index, obligation_id in enumerate(owned_ids, start=1)
+            )
+        for assessment in assessments:
+            obligation_id = assessment.obligation_id
+            if obligation_id not in owned_ids:
+                raise ValueError(
+                    "checkpoint assessment references an unowned obligation"
+                )
+            if assessment.disposition is ObligationDisposition.NOT_APPLICABLE:
+                reconciled_closures[obligation_id] = ObligationStatus.NOT_APPLICABLE
+                continue
+            if assessment.disposition is ObligationDisposition.EXHAUSTED:
+                reconciled_closures[obligation_id] = ObligationStatus.EXHAUSTED
+                continue
+            if assessment.disposition is ObligationDisposition.BLOCKED:
+                reconciled_closures[obligation_id] = ObligationStatus.BLOCKED
+                continue
+            if assessment.disposition is ObligationDisposition.UNRESOLVED:
+                reconciled_unresolved.add(obligation_id)
+                continue
+            if assessment.disposition is not ObligationDisposition.COVERED:
+                continue
+            obligation = obligation_by_id[obligation_id]
+            referenced_ids = assessment.evidence_ids
             obligation = obligation_by_id[obligation_id]
             for evidence_id in referenced_ids:
                 record = records.get(evidence_id)
@@ -844,7 +1006,9 @@ def reconcile_wave(
         for obligation_id in sorted(declared_unresolved.intersection(owned_ids)):
             reconciled_unresolved.add(obligation_id)
 
-    ledger.replace_reconciled_state(reconciled_evidence, reconciled_unresolved)
+    ledger.replace_reconciled_state(
+        reconciled_evidence, reconciled_unresolved, reconciled_closures,
+    )
     snapshot = ledger.snapshot()
     after = dict(snapshot.obligation_statuses)
     newly_covered = tuple(sorted(
@@ -855,7 +1019,7 @@ def reconcile_wave(
     uncovered = tuple(sorted(
         obligation_id for obligation_id, status in after.items()
         if obligation_by_id[obligation_id].mandatory
-        and status is not ObligationStatus.COVERED
+        and status in {ObligationStatus.PENDING, ObligationStatus.UNRESOLVED}
     ))
     attempted = tuple(sorted(
         obligation_id for obligation_id in uncovered

@@ -250,7 +250,9 @@ def _controller_topology() -> dict[str, Any]:
                 "file_roles": ["implementation"],
             },
         ],
-        "relationships": [],
+        # The interaction obligation is backed by an explicit topology edge;
+        # changed-component adjacency is intentionally no longer synthesized.
+        "relationships": [{"source": "a", "target": "b"}],
         "available_role_paths": {},
     }
 

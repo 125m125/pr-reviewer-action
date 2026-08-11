@@ -26,6 +26,7 @@ from .callbacks import (
 from .coverage import CoverageLedger
 from .evidence import EvidenceRecord, EvidenceStore
 from .model_gateway import ModelGateway, ModelTurnRequest, ModelTurnResult
+from .obligation_assessment import ObligationAssessmentLedger
 from .request_attempts import RequestAttemptJournal
 from .types import (
     BudgetUsage,
@@ -46,6 +47,44 @@ from .web_evidence import (
 
 
 ToolExecutor = Callable[..., dict[str, Any]]
+
+_OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "explain_obligation",
+        "description": "Explain one assigned obligation and its prior attempts.",
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string"},
+        }, "required": ["target"], "additionalProperties": False},
+    },
+    {
+        "name": "get_obligation_status",
+        "description": "Return controller-owned status for one obligation target.",
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string"},
+        }, "required": ["target"], "additionalProperties": False},
+    },
+    {
+        "name": "propose_obligation_resolution",
+        "description": (
+            "Propose covered, not_applicable, exhausted, blocked, or unresolved; "
+            "the controller validates it immediately."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string"},
+            "disposition": {"type": "string", "enum": [
+                "covered", "not_applicable", "exhausted", "blocked", "unresolved",
+            ]},
+            "reason": {"type": "string"},
+            "evidence_ids": {"type": "array", "items": {"type": "string"}},
+            "next_actions": {"type": "array", "items": {"type": "string"}},
+        }, "required": [
+            "target", "disposition", "reason", "evidence_ids", "next_actions",
+        ], "additionalProperties": False},
+    },
+)
+_OBLIGATION_LOCAL_TOOL_NAMES = frozenset(
+    str(item["name"]) for item in _OBLIGATION_LOCAL_TOOL_SCHEMAS
+)
 
 COMPACTED_EVIDENCE_TOOL_NAME = "read_compacted_evidence"
 COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
@@ -188,6 +227,27 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
             "type": "array", "maxItems": 12,
             "items": {"type": "string", "maxLength": 500},
         },
+        "obligation_updates": {
+            "type": "array", "maxItems": 12,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "maxLength": 16},
+                    "disposition": {"type": "string", "enum": [
+                        "covered", "not_applicable", "exhausted", "blocked", "unresolved",
+                    ]},
+                    "reason": {"type": "string", "maxLength": 600},
+                    "evidence_ids": {"type": "array", "maxItems": 20,
+                        "items": {"type": "string", "maxLength": 256}},
+                    "next_actions": {"type": "array", "maxItems": 8,
+                        "items": {"type": "string", "maxLength": 300}},
+                },
+                "required": [
+                    "target", "disposition", "reason", "evidence_ids", "next_actions",
+                ],
+                "additionalProperties": False,
+            },
+        },
     },
     "required": ["unresolved"],
     "additionalProperties": False,
@@ -279,6 +339,14 @@ _CHECKPOINT_CONTROLLER_STATE_INSTRUCTION = (
     " Do not repeat controller-owned coverage, evidence_by_obligation, "
     "evidence_metadata, obligation_statuses, recipe_statuses, or "
     "candidate_statuses. The controller preserves and derives those fields."
+)
+_OBLIGATION_PROTOCOL_INSTRUCTION = (
+    " Coverage is not a request to find supporting evidence at all costs. "
+    "Use the obligation tools during exploration to record covered, "
+    "not_applicable, exhausted, blocked, or unresolved conclusions. "
+    "Unchanged sources may explain a contract without proving changed behavior. "
+    "Unresolved work must name a concrete novel next action. Accepted obligation "
+    "state is controller-owned and need not be repeated in checkpoints."
 )
 _CHECKPOINT_TOOL_STATE_INSTRUCTION = (
     "Tool access is disabled for this checkpoint turn. Do not emit native "
@@ -699,6 +767,7 @@ def specialist_assignment_prompt(
             "predicates. Bounded, truncated, or omitted context does not prove "
             "that other content is absent."
         ),
+        "obligation_protocol": _OBLIGATION_PROTOCOL_INSTRUCTION.strip(),
         "change_overview": _assignment_json_value(
             change_overview_orientation(change_overview),
         ),
@@ -812,6 +881,8 @@ class SessionResult:
 class SpecialistSession:
     """Own exactly one conversation and lifetime ledger across follow-ups."""
 
+    OBLIGATION_LOCAL_TOOL_CALL_LIMIT = 32
+
     def __init__(
         self,
         *,
@@ -874,6 +945,11 @@ class SpecialistSession:
         self.wire_safety_tokens = max(0, int(wire_safety_tokens))
         self.state = SessionState.CREATED
         self._current_gaps = self._assigned_obligation_ids()
+        self.obligation_assessments = ObligationAssessmentLedger(
+            session_id=self.session_id,
+            obligations=self.coverage.obligations(),
+            obligation_ids=self._current_gaps,
+        )
         self.candidate_findings: tuple[CandidateFinding, ...] = ()
         # Lifecycle state includes withdrawn/superseded IDs so a legitimate
         # update is accounted for even though only active findings are exposed
@@ -888,6 +964,8 @@ class SpecialistSession:
         self._compacted_evidence: dict[str, EvidenceRecord] = {}
         self._compacted_evidence_read_keys: set[tuple[str, int, int]] = set()
         self._compacted_evidence_reads = 0
+        self._obligation_local_tool_calls = 0
+        self._legacy_obligation_authority_used = False
         self._checkpoint_spans: list[_CheckpointSpan] = []
         self._tool_lease_exhausted = False
         self._recovery_turn_pending = False
@@ -921,14 +999,19 @@ class SpecialistSession:
             properties = parameters.get("properties")
             if not isinstance(properties, dict):
                 continue
-            properties["obligation_ids"] = {
+            properties["targets"] = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Optional assigned obligation IDs this collection is meant "
-                    "to support. Evidence categories are derived by the runtime."
+                    "Optional short obligation targets this neutral evidence "
+                    "collection is meant to inform."
                 ),
             }
+        # A controller that deliberately supplied no tools (notably for an
+        # untrusted fork) must remain tool-free. Local bookkeeping is exposed
+        # only alongside an already-authorized specialist tool catalogue.
+        if schemas:
+            schemas.extend(json.loads(json.dumps(_OBLIGATION_LOCAL_TOOL_SCHEMAS)))
         self.conversation.tool_schemas = schemas
 
     def _assignment_prompt(self) -> str:
@@ -989,6 +1072,7 @@ class SpecialistSession:
             + "\n"
             + _CHECKPOINT_TOOL_STATE_INSTRUCTION
             + _CHECKPOINT_CONTROLLER_STATE_INSTRUCTION
+            + _OBLIGATION_PROTOCOL_INSTRUCTION
             + (
                 " For compact_resume, tool access will be re-enabled after "
                 "the checkpoint validates."
@@ -1620,6 +1704,66 @@ class SpecialistSession:
         self.state = SessionState.CHECKPOINT
         return self._snapshot(degraded=True)
 
+    def _execute_obligation_tool(
+        self, call_id: str, name: str, arguments: Mapping[str, Any],
+    ) -> bool:
+        target = str(arguments.get("target") or "").strip()
+        if self._obligation_local_tool_calls >= self.OBLIGATION_LOCAL_TOOL_CALL_LIMIT:
+            self.conversation.add_tool_result(call_id, {
+                "accepted": False,
+                "target": target,
+                "reason": "obligation bookkeeping allowance exhausted",
+            })
+            return False
+        self._obligation_local_tool_calls += 1
+        try:
+            if name == "explain_obligation":
+                payload = self.obligation_assessments.explain(target)
+                accepted = True
+            elif name == "get_obligation_status":
+                assessment = self.obligation_assessments.assessment(target)
+                payload = {
+                    "target": target,
+                    "disposition": assessment.disposition.value,
+                    "last_conclusion": assessment.reason,
+                    "evidence_ids": list(assessment.evidence_ids),
+                    "next_actions": list(assessment.next_actions),
+                    "attempt_count": len(assessment.attempts),
+                }
+                accepted = True
+            else:
+                result = self.obligation_assessments.propose(
+                    target=target,
+                    disposition=str(arguments.get("disposition") or ""),
+                    reason=arguments.get("reason"),
+                    evidence_ids=(
+                        arguments.get("evidence_ids")
+                        if isinstance(arguments.get("evidence_ids"), list) else ()
+                    ),
+                    next_actions=(
+                        arguments.get("next_actions")
+                        if isinstance(arguments.get("next_actions"), list) else ()
+                    ),
+                    evidence=self.evidence_store.snapshot(),
+                    eligible=self._record_matches_obligation,
+                )
+                payload = {
+                    "accepted": result.accepted,
+                    "target": result.target,
+                    "disposition": (
+                        result.disposition.value if result.disposition else None
+                    ),
+                    "reason": result.reason,
+                }
+                accepted = result.accepted
+                if accepted:
+                    self._current_gaps = self._derive_current_gaps()
+        except KeyError:
+            payload = {"accepted": False, "target": target, "reason": "unknown target"}
+            accepted = False
+        self.conversation.add_tool_result(call_id, payload, is_error=False)
+        return accepted
+
     def _execute_calls(self, calls: tuple[dict[str, Any], ...]) -> bool:
         progressed = False
         for call in calls:
@@ -1636,6 +1780,12 @@ class SpecialistSession:
                     call_id, self._read_compacted_evidence(arguments),
                 )
                 continue
+            if name in _OBLIGATION_LOCAL_TOOL_NAMES:
+                progressed = (
+                    self._execute_obligation_tool(call_id, name, arguments)
+                    or progressed
+                )
+                continue
             if "evidence_category" in arguments or "obligation_id" in arguments:
                 self.budget.record_tool_rejection(
                     "model-supplied evidence authority is forbidden"
@@ -1646,9 +1796,38 @@ class SpecialistSession:
                     is_error=True,
                 )
                 continue
+            raw_targets = arguments.pop("targets", ())
+            requested_targets: tuple[str, ...] = ()
+            requested_obligation_ids: tuple[str, ...] = ()
+            if raw_targets not in (None, ()):
+                if not (
+                    isinstance(raw_targets, list)
+                    and all(isinstance(item, str) and item.strip() for item in raw_targets)
+                ):
+                    self.budget.record_tool_rejection("invalid obligation targets")
+                    self.conversation.add_tool_result(
+                        call_id, {"error": "targets must be an array of short handles"},
+                        is_error=True,
+                    )
+                    continue
+                requested_targets = tuple(dict.fromkeys(
+                    item.strip() for item in raw_targets
+                ))
+                resolved = tuple(
+                    self.obligation_assessments.obligation_id(item)
+                    for item in requested_targets
+                )
+                if any(item is None for item in resolved):
+                    self.budget.record_tool_rejection("unassigned obligation targets")
+                    self.conversation.add_tool_result(
+                        call_id, {"error": "targets contain an unassigned handle"},
+                        is_error=True,
+                    )
+                    continue
+                requested_obligation_ids = tuple(str(item) for item in resolved)
             raw_obligation_ids = arguments.pop("obligation_ids", ())
             if raw_obligation_ids in (None, ()):
-                requested_obligation_ids: tuple[str, ...] = ()
+                legacy_obligation_ids: tuple[str, ...] = ()
             elif (
                 isinstance(raw_obligation_ids, list)
                 and all(
@@ -1656,7 +1835,7 @@ class SpecialistSession:
                     for item in raw_obligation_ids
                 )
             ):
-                requested_obligation_ids = tuple(dict.fromkeys(
+                legacy_obligation_ids = tuple(dict.fromkeys(
                     item.strip() for item in raw_obligation_ids
                 ))
             else:
@@ -1666,7 +1845,7 @@ class SpecialistSession:
                     is_error=True,
                 )
                 continue
-            if set(requested_obligation_ids) - set(
+            if set(legacy_obligation_ids) - set(
                 self._assigned_obligation_ids()
             ):
                 self.budget.record_tool_rejection("unassigned obligation_ids")
@@ -1675,6 +1854,14 @@ class SpecialistSession:
                     is_error=True,
                 )
                 continue
+            if legacy_obligation_ids:
+                self._legacy_obligation_authority_used = True
+                requested_obligation_ids = legacy_obligation_ids
+                requested_targets = tuple(
+                    target for target in self.obligation_assessments.handles()
+                    if self.obligation_assessments.obligation_id(target)
+                    in requested_obligation_ids
+                )
             key = native_tool_request_key(name, arguments)
             prior = self._successful_requests.get(key)
             if prior is not None:
@@ -1687,7 +1874,19 @@ class SpecialistSession:
                 self.budget.record_tool_rejection("duplicate tool request")
                 self.conversation.add_tool_result(
                     call_id,
-                    {"evidence_id": prior.id, "replayed_duplicate": True},
+                    {
+                        "evidence_id": prior.id,
+                        "replayed_duplicate": True,
+                        "changed": bool(
+                            prior.source_path
+                            and any(
+                                prior.source_path in obligation.scope
+                                for obligation in self.coverage.obligations()
+                            )
+                        ),
+                        "eligible_targets": list(requested_targets),
+                        "coverage_effect": "neutral_evidence_retained",
+                    },
                 )
                 continue
             try:
@@ -1749,6 +1948,15 @@ class SpecialistSession:
                     "evidence_id": record.id,
                     "status": record.status,
                     "content": record.content,
+                    "changed": bool(
+                        record.source_path
+                        and any(
+                            record.source_path in obligation.scope
+                            for obligation in self.coverage.obligations()
+                        )
+                    ),
+                    "eligible_targets": list(requested_targets),
+                    "coverage_effect": "neutral_evidence_retained",
                 },
                 is_error=is_error,
             )
@@ -1829,10 +2037,7 @@ class SpecialistSession:
             return
         candidates = requested_obligation_ids
         if not candidates:
-            candidates = tuple(
-                obligation_id for obligation_id in self._assigned_obligation_ids()
-                if self.coverage.obligation(obligation_id).scope
-            )
+            return
         for obligation_id in candidates:
             obligation = self.coverage.obligation(obligation_id)
             if not obligation.required_evidence_categories:
@@ -2117,6 +2322,18 @@ class SpecialistSession:
                 evidence_ids.append(record.id)
         evidence_ids = list(dict.fromkeys(evidence_ids))
         unresolved = _strings(raw.get("unresolved"))
+        obligation_updates = raw.get("obligation_updates", [])
+        if not isinstance(obligation_updates, list):
+            return None
+        prepared_obligation_updates: list[tuple[Mapping[str, Any], tuple[str, ...]]] = []
+        for update in obligation_updates:
+            if not isinstance(update, Mapping):
+                return None
+            resolved_evidence_ids = tuple(
+                item for value in _strings(update.get("evidence_ids"))
+                if (item := _resolve_retained_evidence_id(value, retained)) is not None
+            )
+            prepared_obligation_updates.append((update, resolved_evidence_ids))
         assigned = set(self._assigned_obligation_ids())
         declared = raw.get("evidence_by_obligation")
         if isinstance(declared, Mapping):
@@ -2221,6 +2438,20 @@ class SpecialistSession:
             if replacement_id not in candidates:
                 return None
 
+        assessment_before = self.obligation_assessments.assessments()
+        for update, resolved_evidence_ids in prepared_obligation_updates:
+            proposal = self.obligation_assessments.propose(
+                target=str(update.get("target") or ""),
+                disposition=str(update.get("disposition") or ""),
+                reason=update.get("reason"),
+                evidence_ids=resolved_evidence_ids,
+                next_actions=_strings(update.get("next_actions")),
+                evidence=self.evidence_store.snapshot(),
+                eligible=self._record_matches_obligation,
+            )
+            if not proposal.accepted:
+                self.obligation_assessments.restore(assessment_before)
+                return None
         self.candidate_findings = tuple(candidates[key] for key in sorted(candidates))
         self._candidate_statuses = candidate_statuses
         self._current_gaps = self._derive_current_gaps()
@@ -2259,6 +2490,12 @@ class SpecialistSession:
                 or self._current_gaps
                 if "proposed_next_actions" in raw
                 else previous.proposed_next_actions
+            ),
+            obligation_assessments=(
+                ()
+                if self._legacy_obligation_authority_used
+                and not prepared_obligation_updates
+                else self.obligation_assessments.assessments()
             ),
         )
 
@@ -2354,9 +2591,17 @@ class SpecialistSession:
                 obligation = self.coverage.obligation(obligation_id)
             except KeyError:
                 continue
+            target = next((
+                item for item in self.obligation_assessments.handles()
+                if self.obligation_assessments.obligation_id(item) == obligation_id
+            ), None)
+            assessment_open = (
+                target is None or target in self.obligation_assessments.open_targets()
+            )
             if (
                 obligation.mandatory
                 and statuses.get(obligation_id) is not ObligationStatus.COVERED
+                and assessment_open
             ):
                 gaps.append(obligation_id)
         return tuple(gaps)
@@ -2417,6 +2662,7 @@ class SpecialistSession:
                 previous.proposed_next_actions
                 if previous is not None else self._current_gaps
             ),
+            obligation_assessments=self.obligation_assessments.assessments(),
         )
         return (
             self._checkpoint_with_retention_unknown(checkpoint)
@@ -2431,10 +2677,23 @@ class SpecialistSession:
         normalized = _strings(gaps)
         self.state = SessionState.COVERAGE_EVALUATION
         if normalized:
+            next_actions = tuple(
+                action
+                for target in self.obligation_assessments.handles()
+                if self.obligation_assessments.obligation_id(target) in normalized
+                for action in self.obligation_assessments.assessment(target).next_actions
+            )
             self.conversation.add_user(
                 "Coverage feedback; continue the same investigation for these gaps: "
                 + json.dumps(normalized)
+                + (
+                    ". Complete one of these controller-accepted novel actions: "
+                    + json.dumps(next_actions)
+                    if next_actions else
+                    ". No novel action was accepted; conclude rather than repeat reads."
+                )
             )
+            self.obligation_assessments.consume_next_actions(normalized)
             self.budget.reset_no_progress_streak("material controller feedback")
             for obligation_id in normalized:
                 if obligation_id in self._assigned_obligation_ids():

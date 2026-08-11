@@ -416,6 +416,71 @@ Use concrete lowercase DNS hosts, HTTPS only, and narrow path prefixes. Keep
 policy changes in the PR diff so a reviewer can audit them before a manual
 re-review label is applied.
 
+## Make evidence requirements conditional
+
+`expected_evidence` remains supported, but every entry is unconditional once its
+recipe runs. Use it only when every matched change genuinely requires every
+listed category. For broad components or risk rules, prefer
+`evidence_requirements`:
+
+```json
+{
+  "id": "runtime-delivery",
+  "title": "Runtime delivery",
+  "objective": "Trace changed build and delivery behavior.",
+  "execution": "dedicated",
+  "match": {"component_ids_any": ["review-infrastructure"]},
+  "evidence_requirements": [
+    {
+      "id": "workflow",
+      "category": "workflow or deployment",
+      "when": {"paths_any": [".github/workflows/**", "ci/**"]},
+      "mode": "required"
+    },
+    {
+      "id": "build-manifest",
+      "category": "build manifest",
+      "when": {
+        "paths_any": [
+          "pom.xml", "**/pom.xml", "package.json", "**/package.json",
+          "build.gradle", "**/build.gradle", "build.gradle.kts",
+          "**/build.gradle.kts"
+        ]
+      },
+      "seed_paths": ["pom.xml", "**/pom.xml", "package.json", "**/package.json"],
+      "mode": "required"
+    },
+    {
+      "id": "artifact-proof",
+      "category": "generated output",
+      "when": {"file_roles_any": ["generated-artifact"]},
+      "mode": "optional"
+    }
+  ]
+}
+```
+
+Every populated `when` group must match; values within one group use `any`
+semantics. A coverage rule may force the recipe and raise its risk tier, but it
+does not bypass a requirement's `when`. Modes are `required`, `optional`, and
+`one_of:<group>`; one matching evidence category satisfies a `one_of` group.
+
+During exploration, specialists receive short handles such as `O1` rather than
+internal obligation hashes. The controller-local tools
+`explain_obligation`, `get_obligation_status`, and
+`propose_obligation_resolution` do not consume repository/web tool-call budget.
+They use a separate per-session allowance of 32 bookkeeping calls, so a malformed
+or repetitive local-tool loop is still bounded.
+Repository reads can be targeted with `targets: ["O1"]`; the result remains
+neutral evidence until the controller accepts a semantic conclusion.
+
+Valid dispositions are `covered`, `not_applicable`, `exhausted`, `blocked`, and
+`unresolved`. Only `unresolved` names concrete novel next actions. Once an action
+has been attempted, the controller does not offer the same resume again. Tools
+are disabled during checkpoint turns, so `obligation_updates` is retained only
+as a compact compatibility/emergency fallback; accepted interactive state does
+not need to be repeated in checkpoints.
+
 ## Reliability corrections for current-runtime adopters
 
 - Candidate IDs are specialist-local handles. Do not assume that a model ID such
@@ -438,6 +503,11 @@ re-review label is applied.
   obligation statuses, or evidence metadata. Empty candidate arrays are valid
   and do not imply degradation. A malformed response is repaired once before a
   bounded deterministic projection is used.
+- Coverage is not evidence-seeking at all costs. An unchanged seed file can
+  explain a contract but does not automatically cover changed behavior. Closed
+  not-applicable/exhausted/blocked obligations remain auditable in the artifact;
+  they do not create detail comments or a request-changes verdict without a
+  concrete accepted finding.
 
 ## What to expect
 

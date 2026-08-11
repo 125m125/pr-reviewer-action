@@ -4327,7 +4327,7 @@ def test_artifact_projection_omits_private_checkpoint_working_state(tmp_path):
     assert "private-action" not in encoded
     assert set(result.artifact["sessions"][0]["checkpoint"]) == {
         "candidate_finding_ids", "evidence_ids", "imported_evidence_ids",
-        "obligation_statuses", "session_id", "state",
+        "obligation_assessments", "obligation_statuses", "session_id", "state",
     }
 
 

@@ -50,6 +50,75 @@ def test_v2_recipe_accepts_each_supported_execution_mode(tmp_path, execution):
     assert load_review_policy(path).recipes[0].execution == execution
 
 
+def test_v2_recipe_normalizes_conditional_evidence_requirements(tmp_path):
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({
+        "version": 2,
+        "recipes": [{
+            "id": "delivery", "title": "Delivery", "objective": "Trace",
+            "evidence_requirements": [{
+                "id": "build-manifest",
+                "category": "build manifest",
+                "when": {"paths_any": ["pom.xml", "**/pom.xml"]},
+                "seed_paths": ["pom.xml", "**/pom.xml"],
+                "mode": "required",
+            }, {
+                "id": "runtime-artifact",
+                "category": "generated output",
+                "when": {"file_roles_any": ["generated-artifact"]},
+                "mode": "one_of:artifact-proof",
+            }],
+        }],
+    }), encoding="utf-8")
+
+    recipe = load_review_policy(path).recipes[0]
+
+    assert tuple(item.id for item in recipe.evidence_requirements) == (
+        "build-manifest", "runtime-artifact",
+    )
+    assert recipe.evidence_requirements[0].when == {
+        "paths_any": ("pom.xml", "**/pom.xml"),
+    }
+    assert recipe.evidence_requirements[1].mode == "one_of:artifact-proof"
+
+
+@pytest.mark.parametrize("mutation, message", [
+    ({"unknown": True}, "unknown"),
+    ({"mode": "sometimes"}, "mode"),
+    ({"seed_paths": ["../pom.xml"]}, "repository-relative"),
+])
+def test_v2_recipe_rejects_invalid_evidence_requirement(tmp_path, mutation, message):
+    requirement = {"id": "manifest", "category": "build manifest", **mutation}
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({
+        "version": 2,
+        "recipes": [{
+            "id": "delivery", "title": "Delivery", "objective": "Trace",
+            "evidence_requirements": [requirement],
+        }],
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_review_policy(path)
+
+
+def test_v2_recipe_rejects_duplicate_evidence_requirement_ids(tmp_path):
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({
+        "version": 2,
+        "recipes": [{
+            "id": "delivery", "title": "Delivery", "objective": "Trace",
+            "evidence_requirements": [
+                {"id": "manifest", "category": "build manifest"},
+                {"id": "manifest", "category": "workflow"},
+            ],
+        }],
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate"):
+        load_review_policy(path)
+
+
 def test_topology_projection_retains_coverage_rules_for_relevant_seed_selection(
     tmp_path,
 ):

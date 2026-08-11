@@ -1991,6 +1991,10 @@ def _checkpoint_projection(checkpoint: object) -> dict[str, object]:
             [str(obligation_id), getattr(status, "value", str(status))]
             for obligation_id, status in statuses
         ],
+        "obligation_assessments": [
+            _json_value(item)
+            for item in getattr(checkpoint, "obligation_assessments", ())
+        ],
     }
 
 
@@ -3253,16 +3257,18 @@ class ReviewController:
             if action.kind == "record_unknown":
                 for obligation_id in action.obligation_ids:
                     assert state.coverage is not None
-                    state.coverage.mark_unresolved(obligation_id)
+                    state.coverage.close_obligation(
+                        obligation_id, ObligationStatus.EXHAUSTED,
+                    )
                     state.unknowns.append({
                         "obligation_id": obligation_id,
-                        "reason": "bounded investigation recorded no further feasible evidence",
+                        "reason": "bounded investigation exhausted all concrete novel actions",
                         "resolution_policy": dict(action.resolution_policies).get(obligation_id),
                     })
                 state.journal.emit("negotiation_action_applied", {
                     "kind": action.kind,
                     "obligation_ids": action.obligation_ids,
-                    "outcome": "recorded_unresolved",
+                    "outcome": "recorded_exhausted",
                 })
                 continue
             if action.kind in {"resume", "consult"} and action.session_id:
@@ -3615,7 +3621,12 @@ class ReviewController:
         unresolved_obligations = tuple(
             item for item in state.obligations
             if item.mandatory
-            and obligation_statuses.get(item.id) is not ObligationStatus.COVERED
+            and obligation_statuses.get(item.id) in {
+                ObligationStatus.PENDING,
+                ObligationStatus.UNRESOLVED,
+                ObligationStatus.EXHAUSTED,
+                ObligationStatus.BLOCKED,
+            }
         )
         finding_topics = _orientation_topics(
             item.category for item in state.review.accepted
@@ -3991,7 +4002,12 @@ class ReviewController:
         statuses = state.coverage.obligation_statuses()
         unresolved = tuple(
             item for item in state.obligations
-            if item.mandatory and statuses.get(item.id) is not ObligationStatus.COVERED
+            if item.mandatory and statuses.get(item.id) in {
+                ObligationStatus.PENDING,
+                ObligationStatus.UNRESOLVED,
+                ObligationStatus.EXHAUSTED,
+                ObligationStatus.BLOCKED,
+            }
         )
         policy_result = apply_runtime_verdict_policy(
             model_verdict=state.inputs.model_verdict,
@@ -4544,9 +4560,12 @@ class ReviewController:
         recipes = artifact.get("recipes")
         terminal_obligation_statuses = {
             "covered", "partially_covered", "unresolved", "not_applicable",
+            "exhausted", "blocked", "suppressed_by_policy",
+        }
+        terminal_recipe_statuses = {
+            "covered", "partially_covered", "unresolved", "not_applicable",
             "suppressed_by_policy",
         }
-        terminal_recipe_statuses = terminal_obligation_statuses
         if not isinstance(coverage, Mapping) or any(
             not isinstance(value, Mapping)
             or value.get("status") not in terminal_obligation_statuses

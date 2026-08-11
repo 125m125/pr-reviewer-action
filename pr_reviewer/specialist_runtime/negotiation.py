@@ -9,6 +9,7 @@ from typing import Any
 
 from .assignments import Assignment
 from .coverage import CoverageSnapshot, SessionOwnership
+from .obligation_assessment import ObligationAssessment, ObligationDisposition
 from .types import (
     CoverageObligation,
     ObligationStatus,
@@ -220,34 +221,33 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
     budgets remain controller-owned and are deliberately omitted from this
     projection.
     """
-    statuses = dict(state.coverage.obligation_statuses)
-    obligations = sorted(
-        (
-            item for item in state.obligations
-            if item.mandatory
-            and item.required_evidence_categories
-            and statuses.get(item.id, ObligationStatus.PENDING)
-            is not ObligationStatus.COVERED
-        ),
-        key=lambda item: (_RISK_RANK.get(item.risk_tier, 2), item.id),
-    )
+    obligations = _negotiable_obligations(state)
+    assessments = _assessment_by_obligation(state)
     ownership = tuple(state.session_ownership)
     resources = {item.session_id: item for item in state.session_resources}
     targets: list[dict[str, object]] = []
     for index, item in enumerate(obligations, start=1):
+        assessment = assessments.get(item.id)
+        has_novel_action = (
+            assessment is None
+            or (
+                assessment.disposition is ObligationDisposition.UNRESOLVED
+                and bool(assessment.next_actions)
+            )
+        )
         owners = tuple(
             owner for owner in ownership if item.id in owner.obligation_ids
         )
         primary = any(item.id in owner.primary_obligation_ids for owner in owners)
         actions = ["record_unknown"]
-        if state.current_session_count < state.max_sessions and (
+        if has_novel_action and state.current_session_count < state.max_sessions and (
             state.followup_sessions_started < state.max_followup_sessions
             and state.new_session_turns_remaining > 0
             and state.new_session_tool_call_cap > 0
         ):
             actions.append("new_session")
         owner_actions = []
-        for owner in owners:
+        for owner in owners if has_novel_action else ():
             resource = resources.get(owner.session_id)
             if resource is None or resource.remaining_model_turns <= 0:
                 continue
@@ -266,15 +266,61 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             "risk_tier": item.risk_tier,
             "subject": item.subject,
             "summary": (
-                f"Investigate the {item.risk_tier}-risk obligation concerning "
-                f"{item.subject}."
+                assessment.reason if assessment is not None else
+                f"Investigate the {item.risk_tier}-risk obligation concerning {item.subject}."
             ),
             "allowed_actions": tuple(actions),
+            "last_conclusion": assessment.reason if assessment is not None else "",
+            "attempt_count": len(assessment.attempts) if assessment is not None else 0,
+            "evidence_delta": (
+                assessment.attempts[-1].evidence_delta
+                if assessment is not None and assessment.attempts else 0
+            ),
+            "next_actions": assessment.next_actions if assessment is not None else (),
         })
     return {
         "protocol": "choose exactly one action for one target handle",
         "targets": tuple(targets),
     }
+
+
+def _assessment_by_obligation(
+    state: NegotiationState,
+) -> dict[str, ObligationAssessment]:
+    result: dict[str, ObligationAssessment] = {}
+    for checkpoint in state.checkpoints:
+        for item in checkpoint.obligation_assessments:
+            if isinstance(item, ObligationAssessment):
+                result[item.obligation_id] = item
+    return result
+
+
+def _negotiable_obligations(
+    state: NegotiationState,
+) -> tuple[CoverageObligation, ...]:
+    statuses = dict(state.coverage.obligation_statuses)
+    assessments = _assessment_by_obligation(state)
+    terminal = {
+        ObligationDisposition.COVERED,
+        ObligationDisposition.NOT_APPLICABLE,
+        ObligationDisposition.EXHAUSTED,
+        ObligationDisposition.BLOCKED,
+    }
+    return tuple(sorted(
+        (
+            item for item in state.obligations
+            if item.mandatory
+            and item.required_evidence_categories
+            and statuses.get(item.id, ObligationStatus.PENDING) in {
+                ObligationStatus.PENDING, ObligationStatus.UNRESOLVED,
+            }
+            and (
+                item.id not in assessments
+                or assessments[item.id].disposition not in terminal
+            )
+        ),
+        key=lambda item: (_RISK_RANK.get(item.risk_tier, 2), item.id),
+    ))
 
 
 def _string_list(value: Any, field: str, errors: list[str]) -> tuple[str, ...]:
@@ -309,17 +355,7 @@ def _normalise_action_kind(value: Any, *, errors: list[str]) -> str | None:
 def _compact_target_obligations(
     state: NegotiationState,
 ) -> dict[str, CoverageObligation]:
-    statuses = dict(state.coverage.obligation_statuses)
-    obligations = sorted(
-        (
-            item for item in state.obligations
-            if item.mandatory
-            and item.required_evidence_categories
-            and statuses.get(item.id, ObligationStatus.PENDING)
-            is not ObligationStatus.COVERED
-        ),
-        key=lambda item: (_RISK_RANK.get(item.risk_tier, 2), item.id),
-    )
+    obligations = _negotiable_obligations(state)
     return {f"U{index}": item for index, item in enumerate(obligations, start=1)}
 
 
@@ -385,6 +421,16 @@ def _compact_raw_to_legacy(
     obligation = _compact_target_obligations(state).get(target)
     if obligation is None:
         errors.append(f"target {target!r} is not an unresolved controller target")
+    projected_target = next((
+        item for item in compact_negotiation_context(state)["targets"]
+        if item["handle"] == target
+    ), None)
+    if (
+        kind is not None
+        and projected_target is not None
+        and kind not in projected_target["allowed_actions"]
+    ):
+        errors.append(f"kind {kind!r} is not allowed for target {target!r}")
     if errors:
         # Alias diagnostics are useful in the event journal but are not errors.
         diagnostics = tuple(
@@ -698,19 +744,18 @@ def _fallback_raw(
 
 def fallback_next_action(state: NegotiationState) -> NegotiationAction:
     """Choose one stable, narrow next action for the highest-risk uncovered work."""
-    statuses = dict(state.coverage.obligation_statuses)
-    uncovered = tuple(sorted(
-        (
-            item for item in state.obligations
-            if item.mandatory
-            and item.required_evidence_categories
-            and statuses.get(item.id, ObligationStatus.PENDING) is not ObligationStatus.COVERED
-        ),
-        key=lambda item: (_RISK_RANK.get(item.risk_tier, 2), item.id),
-    ))
+    uncovered = _negotiable_obligations(state)
     if not uncovered:
         raise NegotiationError("no uncovered mandatory obligations remain")
     obligation = uncovered[0]
+    assessment = _assessment_by_obligation(state).get(obligation.id)
+    if assessment is not None and not (
+        assessment.disposition is ObligationDisposition.UNRESOLVED
+        and assessment.next_actions
+    ):
+        return validate_negotiation(
+            _fallback_raw("record_unknown", obligation), state,
+        ).actions[0]
 
     primary_owners = sorted(
         item.session_id for item in state.session_ownership
