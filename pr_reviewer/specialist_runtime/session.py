@@ -1773,11 +1773,15 @@ class SpecialistSession:
                 }
                 accepted = True
             else:
+                disposition = str(arguments.get("disposition") or "")
+                evidence_ids = _tool_string_list(arguments.get("evidence_ids"))
+                if disposition.strip().casefold() == "covered":
+                    self._associate_proposed_evidence(target, evidence_ids)
                 result = self.obligation_assessments.propose(
                     target=target,
-                    disposition=str(arguments.get("disposition") or ""),
+                    disposition=disposition,
                     reason=arguments.get("reason"),
-                    evidence_ids=_tool_string_list(arguments.get("evidence_ids")),
+                    evidence_ids=evidence_ids,
                     next_actions=_tool_string_list(arguments.get("next_actions")),
                     evidence=self.evidence_store.snapshot(),
                     eligible=self._record_matches_obligation,
@@ -2154,6 +2158,45 @@ class SpecialistSession:
                 obligation_id=obligation_id,
                 categories=obligation.required_evidence_categories,
             )
+
+    def _associate_proposed_evidence(
+        self, target: str, evidence_ids: tuple[str, ...],
+    ) -> None:
+        """Bind neutral retained reads only through controller-owned authority."""
+        try:
+            obligation_id = self.obligation_assessments.obligation_id(target)
+            obligation = self.coverage.obligation(obligation_id)
+        except KeyError:
+            # Preserve the proposal ledger's normal rejection and repetition
+            # accounting for unknown handles.
+            return
+        scoped = tuple(dict.fromkeys((*obligation.scope, *obligation.seed_hints)))
+        normalized_scope = tuple(
+            path for item in scoped if (path := _normalized_path(item))
+        )
+        if not normalized_scope or not obligation.required_evidence_categories:
+            return
+        snapshot = self.evidence_store.snapshot()
+        for evidence_id in evidence_ids:
+            record = snapshot.get(evidence_id)
+            source_path = _normalized_path(record.source_path or "") if record else ""
+            if (
+                record is None
+                or not record.is_usable_for_coverage
+                or not source_path
+                or not any(
+                    source_path == path or source_path.startswith(path + "/")
+                    for path in normalized_scope
+                )
+            ):
+                continue
+            collections = snapshot.collections_for(record.id)
+            if collections:
+                self.evidence_store.associate_collection(
+                    collections[0].id,
+                    obligation_id=obligation_id,
+                    categories=obligation.required_evidence_categories,
+                )
 
     def _record_matches_obligation(
         self, record: EvidenceRecord, obligation: CoverageObligation,

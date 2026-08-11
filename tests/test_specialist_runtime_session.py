@@ -569,6 +569,62 @@ def test_untargeted_read_is_not_associated_with_every_current_gap():
     assert session.evidence_store.snapshot().associations == ()
 
 
+def test_resolution_can_bind_untargeted_retained_evidence_when_scope_matches():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-1", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py"}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])[
+        "evidence_id"
+    ]
+
+    session._execute_calls(({
+        "id": "resolve-1", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O1", "disposition": "covered",
+            "reason": "The retained implementation matches the assigned scope.",
+            "evidence_ids": [evidence_id], "next_actions": [],
+        }),
+    },))
+
+    proposal = json.loads(session.conversation.events[-1]["content"])
+    assert proposal["accepted"] is True
+    assert session.obligation_assessments.assessment("O1").disposition.value == (
+        "covered"
+    )
+    assert session.evidence_store.snapshot().associations_for(
+        evidence_id, "OB-code",
+    )
+
+
+def test_resolution_does_not_bind_untargeted_evidence_outside_scope():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-1", "name": "read_file",
+        "arguments": json.dumps({"path": "tests/test_a.py"}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])[
+        "evidence_id"
+    ]
+
+    session._execute_calls(({
+        "id": "resolve-1", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O1", "disposition": "covered",
+            "reason": "Unrelated retained evidence should not prove the implementation.",
+            "evidence_ids": [evidence_id], "next_actions": [],
+        }),
+    },))
+
+    proposal = json.loads(session.conversation.events[-1]["content"])
+    assert proposal["accepted"] is False
+    assert proposal["reason"] == "covered requires eligible retained evidence"
+    assert not session.evidence_store.snapshot().associations_for(
+        evidence_id, "OB-code",
+    )
+
+
 def test_duplicate_targeted_read_reports_target_metadata_without_new_budget():
     session = make_session(ScriptedGateway([]))
     before = session.budget.snapshot().tool_calls

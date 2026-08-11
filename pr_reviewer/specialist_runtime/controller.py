@@ -598,8 +598,8 @@ def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
         "ai_reviewed_summary", "human_focus", "referenced_paths",
         "referenced_component_ids", "referenced_obligation_ids",
     }
-    if set(value) != expected:
-        raise ValueError("handoff summarizer fields are invalid")
+    if not expected <= set(value):
+        raise ValueError("handoff summarizer required fields are missing")
 
     def text(key: str) -> str:
         item = " ".join(str(value.get(key) or "").split())
@@ -3896,12 +3896,14 @@ class ReviewController:
             for path in proposal.referenced_paths
             if _normalize_repository_path(path)
         }
-        if not declared_paths <= allowed_reference_paths:
-            raise ValueError("handoff summary references an unchanged path")
-        if not set(proposal.referenced_component_ids) <= component_ids:
-            raise ValueError("handoff summary references an unknown component")
-        if not set(proposal.referenced_obligation_ids) <= covered_ids:
-            raise ValueError("handoff summary claims unsupported obligation coverage")
+        # These arrays are orientation metadata rather than authority. Keep
+        # controller-backed values and silently discard compatible-model
+        # overproduction; claims in the actual prose remain strictly checked.
+        declared_paths.intersection_update(allowed_reference_paths)
+        declared_component_ids = {
+            item for item in proposal.referenced_component_ids
+            if item in component_ids
+        }
 
         combined = (
             proposal.ai_reviewed_summary + " " + proposal.human_focus
@@ -3921,7 +3923,7 @@ class ReviewController:
         if direct_context_paths:
             raise ValueError("handoff summary contains a direct change claim for an unchanged path")
         declared_components = {
-            item.casefold() for item in proposal.referenced_component_ids
+            item.casefold() for item in declared_component_ids
         }
         allowed_components = {item.casefold() for item in component_ids}
         concrete_component_refs = {
@@ -4125,6 +4127,29 @@ class ReviewController:
                     "ai_reviewed_summary", "human_focus",
                 } <= set(proposed):
                     summary = _handoff_summary_proposal(proposed)
+                    allowed_summary_paths = {
+                        _normalize_repository_path(path)
+                        for path in (
+                            *state.inputs.changed_files, *context.context_paths,
+                        )
+                        if _normalize_repository_path(path)
+                    }
+                    summary = replace(
+                        summary,
+                        referenced_paths=tuple(
+                            path for path in summary.referenced_paths
+                            if _normalize_repository_path(path)
+                            in allowed_summary_paths
+                        ),
+                        referenced_component_ids=tuple(
+                            item for item in summary.referenced_component_ids
+                            if item in context.component_ids
+                        ),
+                        referenced_obligation_ids=tuple(
+                            item for item in summary.referenced_obligation_ids
+                            if item in covered_obligation_ids
+                        ),
+                    )
                     context = self._apply_handoff_summary_proposal(
                         state, context, summary,
                     )

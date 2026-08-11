@@ -2722,6 +2722,49 @@ def test_handoff_summarizer_can_omit_redundant_path_array(tmp_path):
     )
 
 
+def test_handoff_summarizer_sanitizes_extra_fields_and_unknown_references(
+    tmp_path,
+):
+    inputs = replace(
+        _inputs(tmp_path),
+        topology={
+            **_inputs(tmp_path).topology,
+            "components": [{"id": "worker", "paths": ["src/worker.py"]}],
+        },
+    )
+
+    result = _controller(
+        tmp_path,
+        finalizer=lambda request: {
+            "ai_reviewed_summary": (
+                "The review traced retry handling in `src/worker.py`."
+            ),
+            "human_focus": "Recheck the worker boundary.",
+            "referenced_paths": ["src/worker.py", "src/invented.py"],
+            "referenced_component_ids": ["worker", "invented"],
+            "referenced_obligation_ids": [
+                request.context["successful_review_facts"][
+                    "covered_obligation_ids"
+                ][0],
+                "obligation:invented",
+            ],
+            "review_markdown": "This unsupported extra field must be ignored.",
+        },
+    ).run(inputs)
+
+    assert result.handoff.ai_reviewed == (
+        "The review traced retry handling in `src/worker.py`.",
+    )
+    assert result.handoff.human_focus == ("Recheck the worker boundary.",)
+    assert "invented" not in result.handoff.markdown
+    assert "unsupported extra field" not in result.handoff.markdown
+    assert result.publishing_ready is True
+    assert not any(
+        item["component"] == "handoff_summarizer"
+        for item in result.artifact["degradation"]
+    )
+
+
 def test_handoff_summarizer_failure_preserves_concise_coverage_warning(tmp_path):
     result = _controller(
         tmp_path,
