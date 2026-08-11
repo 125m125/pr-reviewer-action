@@ -85,7 +85,11 @@ from .types import (
     ReviewNote,
     RunPhase,
 )
-from .web_evidence import SourceAccessRequest
+from .web_evidence import (
+    RepositoryAccessRequest,
+    SourceAccessRequest,
+    access_request_identity,
+)
 
 
 _SCHEMA_VERSION = 2
@@ -1139,7 +1143,9 @@ class ReviewInputs:
     publishing_mode: str = "review_comment"
     model_verdict: str = "approve"
     candidate_findings: tuple[CandidateFinding, ...] = ()
-    source_access_requests: tuple[SourceAccessRequest, ...] = ()
+    source_access_requests: tuple[
+        SourceAccessRequest | RepositoryAccessRequest, ...
+    ] = ()
     verification_requests: tuple[Mapping[str, Any], ...] = ()
     pr_metadata: Mapping[str, Any] = field(default_factory=dict)
     configuration_warnings: tuple[str, ...] = ()
@@ -1710,7 +1716,9 @@ class _RunState:
     candidates: dict[str, CandidateFinding] = field(default_factory=dict)
     candidate_occurrences: dict[str, CandidateFinding] = field(default_factory=dict)
     collision_dispositions: list[dict[str, object]] = field(default_factory=list)
-    source_requests: list[SourceAccessRequest] = field(default_factory=list)
+    source_requests: list[
+        SourceAccessRequest | RepositoryAccessRequest
+    ] = field(default_factory=list)
     retention_verification_requests: tuple[Mapping[str, object], ...] = ()
     coverage_verification_requests: tuple[Mapping[str, object], ...] = ()
     unknowns: list[dict[str, object]] = field(default_factory=list)
@@ -1754,12 +1762,14 @@ class _IsolatedSessionHandle:
         return tuple(getattr(self.session, "request_events", ()))
 
     @property
-    def source_access_requests(self) -> tuple[SourceAccessRequest, ...]:
+    def source_access_requests(self) -> tuple[
+        SourceAccessRequest | RepositoryAccessRequest, ...
+    ]:
         return tuple(
             item for item in getattr(
                 self.session, "source_access_requests", (),
             )
-            if isinstance(item, SourceAccessRequest)
+            if isinstance(item, (SourceAccessRequest, RepositoryAccessRequest))
         )
 
     def explore(self) -> object:
@@ -4502,7 +4512,9 @@ class ReviewController:
             "repository": state.inputs.repository,
             "schema_version": _SCHEMA_VERSION,
             "sessions": sessions,
-            "source_access_requests": [_json_value(item) for item in state.source_requests],
+            "source_access_requests": [
+                _json_value(item.as_dict()) for item in state.source_requests
+            ],
             "timing": {
                 "deadline_seconds": state.inputs.config.review_deadline_sec,
                 "phase_shares": _json_value(state.inputs.config.phase_shares),
@@ -5120,24 +5132,19 @@ class ReviewController:
             self._adjudicate(state, candidates)
             state.source_requests.extend(inputs.source_access_requests)
             state.source_requests = list({
-                (
-                    item.obligation_id,
-                    item.host,
-                    item.candidate_url,
-                    item.purpose,
-                    item.authority_reason,
-                ): item
+                access_request_identity(item): item
                 for item in state.source_requests
             }.values())
             state.source_requests.sort(
-                key=lambda item: (
-                    item.obligation_id, item.host, item.candidate_url, item.purpose,
-                ),
+                key=access_request_identity,
             )
             for request in state.source_requests:
+                request_payload = request.as_dict()
                 journal.emit("source_access_request", {
-                    "fingerprint": _digest(request.as_dict())[:32],
-                    "host": request.host,
+                    "fingerprint": _digest(request_payload)[:32],
+                    "request_kind": request_payload["kind"],
+                    "host": request_payload.get("host", "github.com"),
+                    "repository": request_payload.get("repository", ""),
                     "obligation_id": request.obligation_id,
                 })
             self._finalize_products(state)
@@ -5327,7 +5334,7 @@ class ReviewController:
                 },
                 "unknowns": list(state.unknowns),
                 "source_access_requests": [
-                    _json_value(item) for item in state.source_requests
+                    _json_value(item.as_dict()) for item in state.source_requests
                 ],
                 "accepted_candidates": [
                     _json_value(item) for item in state.review.accepted

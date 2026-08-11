@@ -23,7 +23,11 @@ from pr_reviewer.enforcement import RuntimeVerdictPolicyResult, derive_runtime_v
 from .coverage import evidence_satisfies_obligation
 from .evidence import EvidenceRecord, EvidenceSnapshot, EvidenceStore
 from .types import CandidateFinding, CoverageObligation, ReviewHandoff, ReviewNote, ReviewNoteKind
-from .web_evidence import SourceAccessRequest
+from .web_evidence import (
+    RepositoryAccessRequest,
+    SourceAccessRequest,
+    repository_access_request,
+)
 
 
 _CRITIC_ACTIONS = frozenset({
@@ -162,7 +166,9 @@ class ReviewHandoffContext:
     candidate_retention_limited: bool = False
     degraded_stages: tuple[str, ...] = ()
     diagnostics_url: str | None = None
-    source_access_requests: tuple[SourceAccessRequest, ...] = ()
+    source_access_requests: tuple[
+        SourceAccessRequest | RepositoryAccessRequest, ...
+    ] = ()
     access_request_url: str | None = None
     what_changed: tuple[str, ...] = ()
     what_changed_is_validated_overview: bool = False
@@ -2053,17 +2059,79 @@ def _mapping_verification(
     )
 
 
-def _source_request(value: object) -> SourceAccessRequest | None:
+def _source_request(
+    value: object,
+) -> SourceAccessRequest | RepositoryAccessRequest | None:
+    if isinstance(value, RepositoryAccessRequest):
+        value = value.as_dict()
     if isinstance(value, SourceAccessRequest):
         return value
     if not isinstance(value, Mapping):
         return None
-    allowed = {"kind", "host", "candidate_url", "obligation_id", "purpose", "authority_reason"}
-    if set(value) - allowed or value.get("kind", "source_access_request") != "source_access_request":
+    kind = value.get("kind", "source_access_request")
+    if kind == "repository_access_request":
+        allowed = {
+            "kind", "repository", "endpoint", "revision", "obligation_id",
+            "purpose", "model_purpose", "authority_reason",
+        }
+        if set(value) - allowed:
+            return None
+        fields = {
+            key: _unicode(value.get(key, "")).strip()
+            for key in (
+                "repository", "endpoint", "revision", "obligation_id",
+                "purpose", "model_purpose", "authority_reason",
+            )
+        }
+        if not all(fields[key] for key in (
+            "repository", "endpoint", "obligation_id", "purpose",
+        )) or any(len(fields[key]) > limit for key, limit in {
+            "repository": 200, "endpoint": 1000, "revision": 40,
+            "obligation_id": 160, "purpose": 1000,
+            "model_purpose": 300, "authority_reason": 500,
+        }.items()):
+            return None
+        try:
+            validated = repository_access_request(
+                fields["endpoint"], fields["obligation_id"],
+                "Validate the retained repository request.",
+                fields["model_purpose"], fields["authority_reason"],
+            )
+        except ValueError:
+            return None
+        if (
+            validated.repository != fields["repository"]
+            or (validated.revision or "") != fields["revision"]
+        ):
+            return None
+        expected_prefix = (
+            "Verify existence, provenance, metadata, and bounded changed-file "
+            f"information for the exact pinned repository revision {fields['revision']} "
+            f"in {fields['repository']} for this assignment:"
+            if fields["revision"] else
+            f"Retrieve bounded read-only GitHub API metadata from {fields['repository']} "
+            "for this assignment:"
+        )
+        if not fields["purpose"].startswith(expected_prefix):
+            return None
+        return RepositoryAccessRequest(
+            repository=fields["repository"], endpoint=validated.endpoint,
+            revision=validated.revision, obligation_id=fields["obligation_id"],
+            purpose=fields["purpose"], model_purpose=fields["model_purpose"],
+            authority_reason=fields["authority_reason"],
+        )
+    allowed = {
+        "kind", "host", "candidate_url", "obligation_id", "purpose",
+        "authority_reason", "model_purpose",
+    }
+    if set(value) - allowed or kind != "source_access_request":
         return None
     fields = {
         key: _unicode(value.get(key, "")).strip()
-        for key in ("host", "candidate_url", "obligation_id", "purpose", "authority_reason")
+        for key in (
+            "host", "candidate_url", "obligation_id", "purpose",
+            "authority_reason", "model_purpose",
+        )
     }
     if not all(fields[key] for key in ("host", "candidate_url", "obligation_id", "purpose")):
         return None
@@ -2102,6 +2170,41 @@ def _source_note(
     request = _source_request(value)
     if request is None or request.obligation_id not in obligations:
         return None
+    if isinstance(request, RepositoryAccessRequest):
+        reason = request.authority_reason or (
+            "The repository is not in the current-branch GitHub API allowlist."
+        )
+        markdown = (
+            "### Repository access request\n\n"
+            "**Repository:** " + _quoted(request.repository, limit=200)
+            + "\n\n**GitHub API endpoint:** " + _quoted(request.endpoint)
+            + (
+                "\n\n**Exact revision:** " + _quoted(request.revision, limit=80)
+                if request.revision else ""
+            )
+            + "\n\n**Purpose:** " + _quoted(request.purpose)
+            + (
+                "\n\n**Specialist-provided context:** "
+                + _quoted(request.model_purpose, limit=300)
+                if request.model_purpose else ""
+            )
+            + "\n\n**Why human input is needed:** " + _quoted(reason)
+            + "\n\nNo repository content was retrieved; access remains pending "
+            "current-branch human authorization."
+        )
+        return ReviewNote(
+            kind=ReviewNoteKind.SOURCE_ACCESS_REQUEST,
+            fingerprint=_request_fingerprint(
+                ReviewNoteKind.SOURCE_ACCESS_REQUEST,
+                request.purpose,
+                (request.obligation_id,),
+                None,
+                (request.repository, request.endpoint),
+            ),
+            markdown=markdown,
+            related_obligation_ids=(request.obligation_id,),
+            evidence_ids=(),
+        )
     canonical = _canonical_request_url(request.candidate_url)
     if canonical is None:
         return None
@@ -2115,6 +2218,11 @@ def _source_note(
         "**Host:** " + _quoted(host, limit=253)
         + "\n\n**Candidate URL:** " + _quoted(url)
         + "\n\n**Purpose:** " + _quoted(request.purpose)
+        + (
+            "\n\n**Specialist-provided context:** "
+            + _quoted(request.model_purpose, limit=300)
+            if request.model_purpose else ""
+        )
         + "\n\n**Why human input is needed:** " + _quoted(reason)
         + "\n\nDiscovery metadata is not review evidence; retrieval remains pending approval."
     )

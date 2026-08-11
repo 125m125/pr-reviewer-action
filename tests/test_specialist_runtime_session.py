@@ -2956,6 +2956,66 @@ def test_denied_discovery_creates_durable_source_access_request():
     assert request.obligation_id == "OB-code"
 
 
+def test_denied_gh_api_repo_creates_durable_repository_access_request():
+    seen = []
+    revision = "a" * 40
+
+    def execute_tool(name, arguments, **kwargs):
+        seen.append((name, arguments, kwargs))
+        return {
+            "tool": name,
+            "status": "error",
+            "result": {"error": "Repo not allowed: 125m125/pr-reviewer-action"},
+        }
+
+    session = make_session(ScriptedGateway([]), execute_tool=execute_tool)
+    call = lambda call_id: {
+        "id": call_id,
+        "name": "gh_api",
+        "arguments": json.dumps({
+            "endpoint": (
+                f"repos/125m125/pr-reviewer-action/commits/{revision}"
+            ),
+            "purpose": "Verify token ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+            "targets": ["O1"],
+        }),
+    }
+
+    session._execute_calls((call("gh-1"),))
+    session._execute_calls((call("gh-2"),))
+
+    assert len(seen) == 2
+    assert all("purpose" not in arguments for _name, arguments, _kw in seen)
+    assert len(session.source_access_requests) == 1
+    request = session.source_access_requests[0]
+    assert request.repository == "125m125/pr-reviewer-action"
+    assert request.revision == revision
+    assert request.obligation_id == "OB-code"
+    assert "ghp_" not in request.model_purpose
+
+
+@pytest.mark.parametrize("error", (
+    "Missing GH_TOKEN",
+    "Endpoint prefix not allowed: /repos/a/b/actions",
+    "HTTP 404: not found",
+))
+def test_non_allowlist_gh_api_errors_do_not_create_access_requests(error):
+    def execute_tool(name, arguments, **kwargs):
+        return {"tool": name, "status": "error", "result": {"error": error}}
+
+    session = make_session(ScriptedGateway([]), execute_tool=execute_tool)
+    session._execute_calls(({
+        "id": "gh-1",
+        "name": "gh_api",
+        "arguments": json.dumps({
+            "endpoint": "repos/a/b/commits/" + "a" * 40,
+            "targets": ["O1"],
+        }),
+    },))
+
+    assert session.source_access_requests == ()
+
+
 def test_tool_timeout_is_recomputed_from_absolute_lease_before_each_call():
     now = [10.0]
     observed = []

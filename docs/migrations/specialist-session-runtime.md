@@ -416,6 +416,33 @@ Use concrete lowercase DNS hosts, HTTPS only, and narrow path prefixes. Keep
 policy changes in the PR diff so a reviewer can audit them before a manual
 re-review label is applied.
 
+### Authorize external GitHub repositories separately
+
+The review policy `sources` list controls ordinary HTTPS discovery and fetches;
+it does not authorize the `gh_api` tool. GitHub API access defaults to the
+repository under review. If a changed workflow pins an action or other dependency
+from another repository, explicitly list only the reviewed repositories:
+
+```yaml
+tool_allowed_gh_api_repos: "125m125/pr-reviewer-action"
+```
+
+Do not use `*` unless unrestricted repository discovery is an intentional trust
+decision. A repository entry still permits only the action's globally safe,
+read-only endpoint prefixes and denied path segments; response byte caps,
+deadlines, and session tool-call budgets remain enforced. Granting an entry does
+not preload that repository, its history, or its full diff into model context.
+
+When a specialist requests a repository that is not listed, the runtime does not
+fetch it. Instead it records a typed repository-access request containing the
+repository, exact API endpoint and revision when available, related obligation,
+controller-derived purpose, optional bounded specialist context, and the denial
+reason. The sticky handoff shows only the number of open requests; the detailed
+request lives in the structured artifact and, for review publishing modes, a
+resolvable general note. A human can then review the repository/authors and add
+the narrow allowlist entry on the current branch before manually rerunning the
+review.
+
 ## Make evidence requirements conditional
 
 `expected_evidence` remains supported, but every entry is unconditional once its

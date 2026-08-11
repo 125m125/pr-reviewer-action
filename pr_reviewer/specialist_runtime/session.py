@@ -41,7 +41,10 @@ from .types import (
 )
 from .web_evidence import (
     SearchCandidate,
+    RepositoryAccessRequest,
     SourceAccessRequest,
+    access_request_identity,
+    repository_access_request,
     source_access_request,
 )
 
@@ -957,7 +960,9 @@ class SpecialistSession:
         self._candidate_statuses: dict[str, str] = {}
         self._candidate_retention_signal = _CandidateRetentionSignal()
         self.latest_checkpoint = self._project_checkpoint(())
-        self.source_access_requests: tuple[SourceAccessRequest, ...] = ()
+        self.source_access_requests: tuple[
+            SourceAccessRequest | RepositoryAccessRequest, ...
+        ] = ()
         self._successful_requests: dict[str, EvidenceRecord] = {}
         self._successful_collections: dict[str, str] = {}
         self._tool_call_evidence_ids: dict[str, str] = {}
@@ -1796,6 +1801,17 @@ class SpecialistSession:
                     is_error=True,
                 )
                 continue
+            model_purpose = ""
+            if name in {"gh_api", "web_fetch", "web_search"}:
+                raw_purpose = arguments.pop("purpose", "")
+                if not isinstance(raw_purpose, str):
+                    self.budget.record_tool_rejection("invalid tool purpose")
+                    self.conversation.add_tool_result(
+                        call_id, {"error": "purpose must be a string"},
+                        is_error=True,
+                    )
+                    continue
+                model_purpose = raw_purpose
             raw_targets = arguments.pop("targets", ())
             requested_targets: tuple[str, ...] = ()
             requested_obligation_ids: tuple[str, ...] = ()
@@ -1933,7 +1949,8 @@ class SpecialistSession:
                 result = {"tool": name, "status": "error", "error": "invalid executor result"}
             is_error = str(result.get("status", "")).lower() not in {"ok", "success", "completed"}
             self._record_source_access_requests(
-                name, result, requested_obligation_ids,
+                name, arguments, result, requested_obligation_ids,
+                model_purpose=model_purpose,
             )
             record, collection = self.evidence_store.add_tool_result_with_collection(
                 session_id=self.session_id, tool=name, arguments=arguments, result=result,
@@ -1972,29 +1989,57 @@ class SpecialistSession:
     def _record_source_access_requests(
         self,
         tool_name: str,
+        arguments: Mapping[str, Any],
         result: Mapping[str, Any],
         requested_obligation_ids: tuple[str, ...],
+        *,
+        model_purpose: str = "",
     ) -> None:
+        obligation_ids = requested_obligation_ids or self._current_gaps
+        retained = {
+            self._source_access_request_key(item): item
+            for item in self.source_access_requests
+        }
+        payload = result.get("result")
+        if not isinstance(payload, Mapping):
+            return
+        if tool_name == "gh_api":
+            error = str(payload.get("error") or "").strip()
+            denied = re.fullmatch(
+                r"Repo not allowed: ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)",
+                error,
+            )
+            if denied is None:
+                return
+            endpoint = str(arguments.get("endpoint") or arguments.get("path") or "")
+            for obligation_id in obligation_ids:
+                try:
+                    request = repository_access_request(
+                        endpoint,
+                        obligation_id,
+                        (
+                            self.coverage.obligation(obligation_id).explanation
+                            or str(getattr(self.assignment, "objective", ""))
+                        ),
+                        model_purpose,
+                        error,
+                    )
+                except ValueError:
+                    continue
+                if request.repository != denied.group(1):
+                    continue
+                retained[self._source_access_request_key(request)] = request
+            self.source_access_requests = tuple(
+                retained[key] for key in sorted(retained)
+            )
+            return
         if tool_name != "web_search" or str(
             result.get("status", "")
         ).lower() not in {"ok", "success", "completed"}:
             return
-        payload = result.get("result")
-        if not isinstance(payload, Mapping):
-            return
         unapproved = payload.get("unapproved")
         if not isinstance(unapproved, list):
             return
-        obligation_ids = requested_obligation_ids or self._current_gaps
-        retained = {
-            (
-                item.obligation_id,
-                item.host,
-                item.candidate_url,
-                item.purpose,
-            ): item
-            for item in self.source_access_requests
-        }
         for raw in unapproved:
             if not isinstance(raw, Mapping):
                 continue
@@ -2014,18 +2059,20 @@ class SpecialistSession:
                         "Retrieve the discovered source to verify the assigned "
                         "review obligation.",
                         candidate.denial_reason or "source policy did not approve it",
+                        model_purpose,
                     )
                 except ValueError:
                     continue
-                retained[(
-                    request.obligation_id,
-                    request.host,
-                    request.candidate_url,
-                    request.purpose,
-                )] = request
+                retained[self._source_access_request_key(request)] = request
         self.source_access_requests = tuple(
             retained[key] for key in sorted(retained)
         )
+
+    @staticmethod
+    def _source_access_request_key(
+        item: SourceAccessRequest | RepositoryAccessRequest,
+    ) -> tuple[str, ...]:
+        return access_request_identity(item)
 
     def _associate_collection(
         self,

@@ -23,6 +23,7 @@ from pr_reviewer.specialist_runtime.web_evidence import (
     SourcePolicy,
     StdlibHttpTransport,
     discover,
+    repository_access_request,
     source_access_request,
 )
 
@@ -141,6 +142,44 @@ def test_source_access_request_preserves_case_normalized_https_scheme():
     )
 
     assert request.candidate_url == "https://docs.example.com:8443/schema/v1"
+
+
+def test_repository_access_request_derives_exact_revision_and_safe_purpose():
+    revision = "a" * 40
+
+    request = repository_access_request(
+        f"repos/125m125/pr-reviewer-action/commits/{revision}",
+        "OB-workflow",
+        "Verify changed workflow dependencies.",
+        "Check token ghp_abcdefghijklmnopqrstuvwxyz1234567890 and pinned behavior.",
+        "Repo not allowed: 125m125/pr-reviewer-action",
+    )
+
+    assert request.repository == "125m125/pr-reviewer-action"
+    assert request.endpoint == (
+        f"repos/125m125/pr-reviewer-action/commits/{revision}"
+    )
+    assert request.revision == revision
+    assert request.obligation_id == "OB-workflow"
+    assert "exact pinned repository revision" in request.purpose
+    assert "Verify changed workflow dependencies" in request.purpose
+    assert "ghp_" not in request.model_purpose
+    assert "[REDACTED]" in request.model_purpose
+    assert request.as_dict()["kind"] == "repository_access_request"
+
+
+@pytest.mark.parametrize("endpoint", (
+    "https://api.github.com/repos/a/b/commits/" + "a" * 40,
+    "repos/a/../b/commits/" + "a" * 40,
+    "repos/a/b/actions/secrets",
+    "search/code?q=repo:a/b",
+    "repos/a/b/commits/" + "a" * 40 + "#fragment",
+))
+def test_repository_access_request_rejects_noncanonical_or_unsafe_endpoint(endpoint):
+    with pytest.raises(ValueError, match="repository API endpoint"):
+        repository_access_request(
+            endpoint, "OB-workflow", "Verify dependency.", "", "Repo not allowed",
+        )
 
 
 def test_discovery_scans_bounded_results_and_caps_approved_output():

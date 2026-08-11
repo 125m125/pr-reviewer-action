@@ -284,6 +284,7 @@ class SourceAccessRequest:
     obligation_id: str
     purpose: str
     authority_reason: str = ""
+    model_purpose: str = ""
 
     def as_dict(self) -> dict[str, str]:
         return {
@@ -293,7 +294,46 @@ class SourceAccessRequest:
             "obligation_id": self.obligation_id,
             "purpose": self.purpose,
             "authority_reason": self.authority_reason,
+            "model_purpose": self.model_purpose,
         }
+
+
+@dataclass(frozen=True)
+class RepositoryAccessRequest:
+    repository: str
+    endpoint: str
+    obligation_id: str
+    purpose: str
+    authority_reason: str
+    revision: str | None = None
+    model_purpose: str = ""
+
+    def as_dict(self) -> dict[str, str | None]:
+        return {
+            "kind": "repository_access_request",
+            "repository": self.repository,
+            "endpoint": self.endpoint,
+            "revision": self.revision,
+            "obligation_id": self.obligation_id,
+            "purpose": self.purpose,
+            "model_purpose": self.model_purpose,
+            "authority_reason": self.authority_reason,
+        }
+
+
+def access_request_identity(
+    request: SourceAccessRequest | RepositoryAccessRequest,
+) -> tuple[str, ...]:
+    """Return the authorization-neutral identity used for deduplication."""
+    if isinstance(request, RepositoryAccessRequest):
+        return (
+            "repository", request.obligation_id, request.repository,
+            request.endpoint, request.purpose,
+        )
+    return (
+        "source", request.obligation_id, request.host,
+        request.candidate_url, request.purpose,
+    )
 
 
 class SourcePolicy:
@@ -622,6 +662,7 @@ def source_access_request(
     obligation_id: str,
     purpose: str,
     authority_reason: str = "",
+    model_purpose: str = "",
 ) -> SourceAccessRequest:
     safe_url, safe_host, _ = _safe_discovery_url(candidate.url)
     if not safe_host:
@@ -634,6 +675,68 @@ def source_access_request(
         obligation_id=mask_secrets(str(obligation_id).strip())[:160],
         purpose=mask_secrets(str(purpose).strip())[:1000],
         authority_reason=mask_secrets(str(authority_reason).strip())[:1000],
+        model_purpose=_bounded_request_text(model_purpose, 300),
+    )
+
+
+_REPOSITORY_ENDPOINT = re.compile(
+    r"^repos/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:/.*)?$"
+)
+_COMMIT_ENDPOINT = re.compile(
+    r"^repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/commits/([0-9a-fA-F]{40})$"
+)
+
+
+def _bounded_request_text(value: object, limit: int) -> str:
+    return " ".join(mask_secrets(str(value or "")).split())[:limit]
+
+
+def repository_access_request(
+    endpoint: str,
+    obligation_id: str,
+    assignment_objective: str,
+    model_purpose: str = "",
+    authority_reason: str = "",
+) -> RepositoryAccessRequest:
+    """Describe a denied repository lookup without authorizing or fetching it."""
+    normalized = str(endpoint or "").strip().strip("/")
+    match = _REPOSITORY_ENDPOINT.fullmatch(normalized)
+    if match is None:
+        raise ValueError("repository API endpoint must identify repos/owner/repo")
+    repository = f"{match.group(1)}/{match.group(2)}"
+    # Reuse the actual gh_api security boundary so request projection cannot
+    # legitimize an endpoint that execution would reject for another reason.
+    from pr_reviewer.platform import _validate_endpoint
+
+    validated = _validate_endpoint(normalized, {repository}, "")
+    if "error" in validated:
+        raise ValueError("repository API endpoint is not safely requestable")
+    canonical = str(validated["full_path"]).strip("/")
+    obligation = _bounded_request_text(obligation_id, 160)
+    objective = _bounded_request_text(assignment_objective, 300)
+    if not obligation or not objective:
+        raise ValueError("repository access request requires obligation and objective")
+    revision_match = _COMMIT_ENDPOINT.fullmatch(canonical)
+    revision = revision_match.group(1).lower() if revision_match else None
+    if revision:
+        purpose = (
+            f"Verify existence, provenance, metadata, and bounded changed-file "
+            f"information for the exact pinned repository revision {revision} "
+            f"in {repository} for this assignment: {objective}"
+        )
+    else:
+        purpose = (
+            f"Retrieve bounded read-only GitHub API metadata from {repository} "
+            f"for this assignment: {objective}"
+        )
+    return RepositoryAccessRequest(
+        repository=repository,
+        endpoint=canonical,
+        revision=revision,
+        obligation_id=obligation,
+        purpose=purpose[:1000],
+        model_purpose=_bounded_request_text(model_purpose, 300),
+        authority_reason=_bounded_request_text(authority_reason, 500),
     )
 
 

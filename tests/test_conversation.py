@@ -62,6 +62,17 @@ class TestToolSchemas:
         assert "gh_api" in desc["web_fetch"]
         assert "/api/v1" in desc["web_fetch"]
 
+    def test_external_access_tools_accept_optional_bounded_purpose(self):
+        schemas = {
+            item["name"]: item for item in (*TOOL_SCHEMAS, WEB_SEARCH_SCHEMA)
+        }
+
+        for name in ("gh_api", "web_fetch", "web_search"):
+            purpose = schemas[name]["parameters"]["properties"]["purpose"]
+            assert purpose["type"] == "string"
+            assert purpose["maxLength"] == 300
+            assert "purpose" not in schemas[name]["parameters"]["required"]
+
 
 class TestWebSearchGating:
     """web_search is opt-in: advertised only when the conversation carries it."""

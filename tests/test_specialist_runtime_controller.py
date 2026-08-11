@@ -71,7 +71,10 @@ from pr_reviewer.specialist_runtime.types import (
     SessionCheckpoint,
     SessionState,
 )
-from pr_reviewer.specialist_runtime.web_evidence import SourceAccessRequest
+from pr_reviewer.specialist_runtime.web_evidence import (
+    SourceAccessRequest,
+    repository_access_request,
+)
 
 
 def _change_facts_payload(facts, *, status="ok", failures=()):
@@ -4006,6 +4009,50 @@ def test_controller_retains_and_emits_typed_source_access_requests(tmp_path):
 
     assert result.artifact["source_access_requests"][0]["host"] == "docs.example.com"
     assert any(event.kind == "source_access_request" for event in result.events)
+
+
+def test_controller_retains_repository_access_request_in_artifact_and_event(tmp_path):
+    inputs = _inputs(tmp_path)
+    obligation = derive_obligations(
+        inputs.topology, inputs.classification, inputs.policy,
+    )[0]
+    request = repository_access_request(
+        "repos/125m125/pr-reviewer-action/commits/" + "a" * 40,
+        obligation.id,
+        "Verify the changed action pin.",
+        "Inspect the dependency.",
+        "Repo not allowed: 125m125/pr-reviewer-action",
+    )
+
+    result = _controller(tmp_path).run(replace(
+        inputs, source_access_requests=(request,),
+    ))
+
+    projected = result.artifact["source_access_requests"][0]
+    assert projected["kind"] == "repository_access_request"
+    assert projected["repository"] == "125m125/pr-reviewer-action"
+    assert any(event.kind == "source_access_request" for event in result.events)
+
+
+def test_repository_request_identity_ignores_optional_model_context(tmp_path):
+    inputs = _inputs(tmp_path)
+    obligation = derive_obligations(
+        inputs.topology, inputs.classification, inputs.policy,
+    )[0]
+    request = repository_access_request(
+        "repos/125m125/pr-reviewer-action/commits/" + "a" * 40,
+        obligation.id, "Verify the changed action pin.", "First context.",
+        "Repo not allowed: 125m125/pr-reviewer-action",
+    )
+
+    result = _controller(tmp_path).run(replace(
+        inputs,
+        source_access_requests=(
+            request, replace(request, model_purpose="Different context."),
+        ),
+    ))
+
+    assert len(result.artifact["source_access_requests"]) == 1
 
 
 def test_unexpected_controller_failure_returns_notice_without_fabricated_blocker(tmp_path):

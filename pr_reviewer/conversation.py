@@ -76,6 +76,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Alias for endpoint.",
                 },
+                "purpose": {
+                    "type": "string",
+                    "maxLength": 300,
+                    "description": (
+                        "Optional concise reason for the lookup. This is "
+                        "untrusted explanatory context, not authorization."
+                    ),
+                },
             },
             "required": ["endpoint"],
             "additionalProperties": False,
@@ -180,6 +188,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Absolute https URL on an allowlisted host.",
                 },
+                "purpose": {
+                    "type": "string",
+                    "maxLength": 300,
+                    "description": (
+                        "Optional concise reason for the lookup. This is "
+                        "untrusted explanatory context, not authorization."
+                    ),
+                },
             },
             "required": ["url"],
             "additionalProperties": False,
@@ -279,6 +295,14 @@ WEB_SEARCH_SCHEMA: dict[str, Any] = {
             "query": {
                 "type": "string",
                 "description": "Free-text search query.",
+            },
+            "purpose": {
+                "type": "string",
+                "maxLength": 300,
+                "description": (
+                    "Optional concise reason for the lookup. This is untrusted "
+                    "explanatory context, not authorization."
+                ),
             },
         },
         "required": ["query"],

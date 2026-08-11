@@ -26,8 +26,10 @@ from pr_reviewer.specialist_runtime.types import (
     ReviewNoteKind,
 )
 from pr_reviewer.specialist_runtime.web_evidence import (
+    RepositoryAccessRequest,
     SearchCandidate,
     SourceAccessRequest,
+    repository_access_request,
     source_access_request,
 )
 
@@ -1003,6 +1005,55 @@ def test_handoff_counts_only_controller_valid_source_access_requests():
 
     assert handoff.access_request_count == 1
     assert "[1 open](https://github.example.test/artifacts/source-access)" in handoff.markdown
+
+
+def test_repository_access_request_has_detailed_note_but_sparse_handoff():
+    store, _ = _store()
+    request = repository_access_request(
+        "repos/125m125/pr-reviewer-action/commits/" + "a" * 40,
+        "obligation-store",
+        "Verify the changed workflow dependency.",
+        "Inspect <script>alert(1)</script> before relying on the pin.",
+        "Repo not allowed: 125m125/pr-reviewer-action",
+    )
+
+    notes = build_review_notes(
+        AdjudicatedReview(), store, "review_comment",
+        obligations=_controller_obligations(), changed_files=CHANGED_FILES,
+        source_access_requests=(request,),
+    )
+    handoff = build_review_handoff(
+        ReviewHandoffContext(source_access_requests=(request,)),
+        review=AdjudicatedReview(), evidence=store,
+        obligations=_controller_obligations(), changed_files=CHANGED_FILES,
+    )
+
+    assert len(notes) == 1
+    assert "125m125/pr-reviewer-action" in notes[0].markdown
+    assert "a" * 40 in notes[0].markdown
+    assert "exact pinned repository revision" in notes[0].markdown
+    assert "&lt;script&gt;" in notes[0].markdown
+    assert "No repository content was retrieved" in notes[0].markdown
+    assert handoff.access_request_count == 1
+    assert "Source access requests:** 1 open" in handoff.markdown
+    assert "125m125/pr-reviewer-action" not in handoff.markdown
+
+
+def test_hostile_repository_access_mapping_is_rejected():
+    store, _ = _store()
+    request = repository_access_request(
+        "repos/125m125/pr-reviewer-action/commits/" + "a" * 40,
+        "obligation-store", "Verify dependency.", "", "Repo not allowed",
+    ).as_dict()
+    request["repository"] = "attacker/other"
+
+    notes = build_review_notes(
+        AdjudicatedReview(), store, "review_comment",
+        obligations=_controller_obligations(), changed_files=CHANGED_FILES,
+        source_access_requests=(request,),
+    )
+
+    assert notes == ()
 
 
 def test_sparse_handoff_rejects_multiline_markdown_and_detail_injection():
