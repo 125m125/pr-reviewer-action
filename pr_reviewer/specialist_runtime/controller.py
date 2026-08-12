@@ -33,6 +33,7 @@ from .adjudication import (
     apply_runtime_verdict_policy,
     build_review_handoff,
     build_review_notes,
+    build_source_access_request_notes,
     consolidate_candidates,
     review_orientation_label,
 )
@@ -1003,21 +1004,28 @@ class GatewayRoleAdapter:
         """Continue one bounded structured role without losing private state."""
         if max_attempts <= 0:
             raise ValueError("max_attempts must be positive")
-        conversation = Conversation(system=self.system_prompt)
-        conversation.add_user(json.dumps(
+        serialized_context = json.dumps(
             _json_value(request.context),
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
-        ))
-        repetition_pending = False
+        )
+
+        def fresh_conversation() -> Conversation:
+            value = Conversation(system=self.system_prompt)
+            value.add_user(serialized_context)
+            return value
+
+        conversation = fresh_conversation()
+        clean_retry_pending: str | None = None
         for attempt in range(max_attempts):
-            repetition_retry = repetition_pending
+            clean_retry_reason = clean_retry_pending
+            clean_retry = clean_retry_reason is not None
             finalization = (
-                repetition_retry
+                clean_retry
                 or force_final(attempt)
                 if force_final is not None
-                else repetition_retry or attempt == max_attempts - 1
+                else clean_retry or attempt == max_attempts - 1
             )
             if self.attempt_logger is not None:
                 self.attempt_logger(
@@ -1031,7 +1039,7 @@ class GatewayRoleAdapter:
                 conversation=conversation,
                 max_tokens=(
                     min(request.max_tokens, 2_048)
-                    if repetition_retry else request.max_tokens
+                    if clean_retry else request.max_tokens
                 ),
                 response_schema=None,
                 tools_enabled=False,
@@ -1043,11 +1051,11 @@ class GatewayRoleAdapter:
                 reasoning_effort="none" if finalization else None,
                 ephemeral_user_note=(
                     (
-                        "The previous output was rejected for repeated textual "
-                        "tool-call markup. Tools are unavailable. Return only the "
-                        "required JSON object."
+                        "The previous output was rejected for a controller-role "
+                        f"mode violation ({clean_retry_reason}). Tools are unavailable. "
+                        "Return only the required JSON object."
                     )
-                    if repetition_retry
+                    if clean_retry
                     else (
                         "Return only the required JSON object."
                         if finalization else None
@@ -1066,6 +1074,30 @@ class GatewayRoleAdapter:
                     content + "\n" + str(result.reasoning or "")
                 )
             )
+            mode_violation_reason = None
+            if result.tool_calls:
+                mode_violation_reason = "native-tool-call"
+            elif _TEXTUAL_TOOL_MARKER_RE.search(
+                content + "\n" + str(result.reasoning or "")
+            ):
+                mode_violation_reason = "textual-tool-markup"
+            elif content.strip() and "{" not in content:
+                mode_violation_reason = "non-json-prose"
+            if mode_violation_reason:
+                if self.attempt_logger is not None:
+                    self.attempt_logger(
+                        f"role {request.role} mode violation rejected; "
+                        f"attempt={attempt + 1}/{max_attempts}; "
+                        f"reason={mode_violation_reason}; content_chars={len(content)}; "
+                        "malformed_content_retained=false"
+                    )
+                if clean_retry or attempt == max_attempts - 1:
+                    raise ValueError(
+                        f"{request.role} response rejected: {mode_violation_reason}"
+                    )
+                conversation = fresh_conversation()
+                clean_retry_pending = mode_violation_reason
+                continue
             if request.role == "planner" and repetition_reason:
                 if self.attempt_logger is not None:
                     self.attempt_logger(
@@ -1074,11 +1106,12 @@ class GatewayRoleAdapter:
                         f"reason={repetition_reason}; content_chars={len(content)}; "
                         "malformed_content_retained=false"
                     )
-                if repetition_retry or attempt == max_attempts - 1:
+                if clean_retry or attempt == max_attempts - 1:
                     raise ValueError(
                         f"planner response rejected: {repetition_reason}"
                     )
-                repetition_pending = True
+                conversation = fresh_conversation()
+                clean_retry_pending = repetition_reason
                 continue
             try:
                 return _json_object(content)
@@ -1106,7 +1139,7 @@ class GatewayRoleAdapter:
                         f"{status}"
                     )
                 if (
-                    repetition_retry
+                    clean_retry
                     or
                     attempt == max_attempts - 1
                     or not continuation_allowed
@@ -2342,12 +2375,21 @@ class ReviewController:
 
     @staticmethod
     def _required_note_count(state: _RunState) -> int:
+        source_note_count = 0
+        if state.source_requests:
+            obligation_map = {
+                obligation.id: obligation
+                for obligation in getattr(state, "obligations", ())
+            }
+            source_note_count = len(build_source_access_request_notes(
+                state.source_requests, obligations=obligation_map,
+            ))
         return (
             len(state.review.accepted)
             + len(state.review.verification_requests)
             + len(state.inputs.verification_requests)
             + len(state.retention_verification_requests)
-            + len(state.source_requests)
+            + source_note_count
         )
 
     @staticmethod
@@ -4088,20 +4130,11 @@ class ReviewController:
                     component=self.finalizer,
                     method="finalize",
                     context={
-                        "review": state.review,
-                        "coverage": state.coverage.snapshot(),
-                        "verdict": state.verdict,
-                        "verdict_source": state.verdict_source,
-                        "unknowns": tuple(state.unknowns),
-                        "policy": state.inputs.policy,
-                        "pr_metadata": state.inputs.pr_metadata,
-                        "handoff_summary_candidates": {
-                            "what_changed": context.what_changed,
-                            "ai_reviewed": context.ai_reviewed,
+                        "change_overview": {
+                            "overview": str(
+                                state.change_overview.get("overview") or ""
+                            ).strip(),
                         },
-                        "change_overview": change_overview_orientation(
-                            state.change_overview,
-                        ),
                         "successful_review_facts": {
                             "covered_obligation_ids": covered_obligation_ids,
                             "evidence_paths": tuple(sorted({
@@ -4120,6 +4153,14 @@ class ReviewController:
                                 if note.severity
                             })),
                             "degraded_stages": context.degraded_stages,
+                            "component_ids": context.component_ids,
+                        },
+                        "prepared_notes": {
+                            "count": len(state.notes),
+                            "themes": tuple(sorted({
+                                note.severity or note.kind.value
+                                for note in state.notes
+                            })),
                         },
                     },
                 )

@@ -44,6 +44,68 @@ def test_planner_system_prompt_explicitly_disables_review_exploration_and_tools(
     assert "textual tool-call" in prompt
 
 
+def test_controller_role_prompts_do_not_inherit_repository_review_instructions():
+    repository_prompt = "Inspect files with tools and publish a repository review."
+
+    for role in (
+        "change_summarizer", "planner", "negotiator", "critic",
+        "handoff_summarizer",
+    ):
+        prompt = cli._role_prompt(repository_prompt, role)
+        assert repository_prompt not in prompt
+        assert "controller role" in prompt
+        assert "Tools are unavailable" in prompt
+
+
+def test_planner_projection_declares_controller_owned_transform_permissions():
+    projected = cli._compact_planner_context({
+        "base_plan": {"assignments": [
+            {
+                "id": "isolated-recipe",
+                "obligation_ids": ["recipe-obligation"],
+                "recipe_ids": ["build"],
+            },
+            {
+                "id": "ordinary-combined",
+                "obligation_ids": ["ordinary-one", "ordinary-two"],
+                "recipe_ids": [],
+            },
+            {
+                "id": "ordinary-single",
+                "obligation_ids": ["ordinary-three"],
+                "recipe_ids": [],
+            },
+        ]},
+        "obligations": [
+            {
+                "obligation_id": "recipe-obligation",
+                "recipe_id": "build",
+                "recipe_execution": "independent",
+            },
+            {"obligation_id": "ordinary-one"},
+            {"obligation_id": "ordinary-two"},
+            {"obligation_id": "ordinary-three"},
+        ],
+    })
+
+    assignments = {
+        item["id"]: item for item in projected["base_plan"]["assignments"]
+    }
+    assert assignments["isolated-recipe"]["transformation_permissions"] == {
+        "allowed_operations": ["reorder", "improve"],
+        "merge_peer_ids": [],
+        "isolation_reason": "independent_recipe",
+    }
+    assert assignments["ordinary-combined"]["transformation_permissions"] == {
+        "allowed_operations": ["reorder", "improve", "merge", "split"],
+        "merge_peer_ids": ["ordinary-single"],
+    }
+    assert assignments["ordinary-single"]["transformation_permissions"] == {
+        "allowed_operations": ["reorder", "improve", "merge"],
+        "merge_peer_ids": ["ordinary-combined"],
+    }
+
+
 def test_planner_context_projection_is_bounded_without_losing_plan_identity():
     context = {
         "base_plan": {

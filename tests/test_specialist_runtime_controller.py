@@ -212,6 +212,104 @@ def test_gateway_role_repairs_malformed_structured_stop_response():
     assert calls[1].reasoning_effort == "none"
 
 
+def test_gateway_role_restarts_cleanly_after_tool_markup_mode_violation():
+    payloads = []
+
+    class Gateway:
+        def __init__(self):
+            self.responses = iter((
+                ModelTurnResult(
+                    response={}, tool_calls=(),
+                    text='<tool_call>{"name":"read_file"}</tool_call>',
+                    text_source="content", finish_reason="stop", usage={},
+                    request_diagnostics={},
+                    content='<tool_call>{"name":"read_file"}</tool_call>',
+                    reasoning="I should inspect the changed files.",
+                ),
+                ModelTurnResult(
+                    response={}, tool_calls=(), text='{"summary":"complete"}',
+                    text_source="content", finish_reason="stop", usage={},
+                    request_diagnostics={}, content='{"summary":"complete"}',
+                    reasoning="",
+                ),
+            ))
+
+        def complete(self, request):
+            payloads.append(request.conversation.to_request_payload(
+                "openai", "m", verdict_turn=True,
+                keep_full_history_on_verdict=True,
+                ephemeral_user_note=request.ephemeral_user_note,
+                reasoning_effort=request.reasoning_effort,
+            ))
+            return next(self.responses)
+
+    adapter = GatewayRoleAdapter(Gateway())
+    result = adapter.complete(RoleRequest(
+        role="handoff_summarizer", request_id="handoff:mode-violation",
+        phase=RunPhase.FINALIZATION,
+        lease=controller_module.SessionLease(RunPhase.FINALIZATION, 10**20),
+        timeout_sec=30, max_tokens=512, context={"facts": ["worker"]},
+    ))
+
+    assert result == {"summary": "complete"}
+    assert payloads[1]["messages"][:2] == [
+        {
+            "role": "system",
+            "content": "Return only the requested structured JSON object.",
+        },
+        {"role": "user", "content": '{"facts":["worker"]}'},
+    ]
+    assert not any(
+        message["role"] == "assistant" for message in payloads[1]["messages"]
+    )
+    assert "mode violation" in payloads[1]["messages"][-1]["content"]
+
+
+def test_gateway_role_restarts_cleanly_after_review_prose_mode_violation():
+    payloads = []
+
+    class Gateway:
+        def __init__(self):
+            self.responses = iter((
+                ModelTurnResult(
+                    response={}, tool_calls=(),
+                    text="I will inspect the changed files before summarizing them.",
+                    text_source="content", finish_reason="stop", usage={},
+                    request_diagnostics={},
+                    content="I will inspect the changed files before summarizing them.",
+                    reasoning="",
+                ),
+                ModelTurnResult(
+                    response={}, tool_calls=(), text='{"summary":"complete"}',
+                    text_source="content", finish_reason="stop", usage={},
+                    request_diagnostics={}, content='{"summary":"complete"}',
+                    reasoning="",
+                ),
+            ))
+
+        def complete(self, request):
+            payloads.append(request.conversation.to_request_payload(
+                "openai", "m", verdict_turn=True,
+                keep_full_history_on_verdict=True,
+                ephemeral_user_note=request.ephemeral_user_note,
+                reasoning_effort=request.reasoning_effort,
+            ))
+            return next(self.responses)
+
+    result = GatewayRoleAdapter(Gateway()).complete(RoleRequest(
+        role="handoff_summarizer", request_id="handoff:review-prose",
+        phase=RunPhase.FINALIZATION,
+        lease=controller_module.SessionLease(RunPhase.FINALIZATION, 10**20),
+        timeout_sec=30, max_tokens=512, context={"facts": ["worker"]},
+    ))
+
+    assert result == {"summary": "complete"}
+    assert not any(
+        message["role"] == "assistant" for message in payloads[1]["messages"]
+    )
+    assert "non-json-prose" in payloads[1]["messages"][-1]["content"]
+
+
 def test_critic_schema_ignores_prose_instead_of_rewriting_consequence_support():
     candidate = CandidateFinding("candidate-1", "root", "claim")
     rationale = "consequence_support:reachable_input_path; evidence_ids=evidence:1"
@@ -1382,7 +1480,7 @@ def test_one_validated_change_overview_reaches_every_review_role(tmp_path):
     assert observed["specialist"] == controller_module._json_value(expected)
     assert observed["negotiator"] == expected
     assert observed["critic"] == expected
-    assert observed["finalizer"] == expected
+    assert observed["finalizer"] == {"overview": proposal["overview"]}
     assert controller_module._json_value(
         observed["change_summarizer"]["change_facts"]
     ) == inputs.topology["change_facts"]
@@ -2566,8 +2664,15 @@ def test_handoff_summarizer_writes_behavioral_review_handoff_from_validated_stat
     def summarizer(request):
         # The recorded wire-role name remains stable for offline replay.
         assert request.role == "finalizer"
-        assert request.context["change_overview"]["content"]["overview"]
+        assert request.context["change_overview"]["overview"]
         assert request.context["successful_review_facts"]["covered_obligation_ids"]
+        assert set(request.context) == {
+            "change_overview", "successful_review_facts", "prepared_notes",
+        }
+        assert "policy" not in request.context
+        assert "coverage" not in request.context
+        assert "review" not in request.context
+        assert "unknowns" not in request.context
         return {
             "ai_reviewed_summary": (
                 "The review traced retry handling in `src/worker.py` through the "
@@ -4077,6 +4182,36 @@ def test_controller_retains_repository_access_request_in_artifact_and_event(tmp_
     assert any(event.kind == "source_access_request" for event in result.events)
 
 
+def test_consolidated_repository_requests_count_as_one_required_note(tmp_path):
+    inputs = _inputs(tmp_path)
+    obligations = derive_obligations(
+        inputs.topology, inputs.classification, inputs.policy,
+    )
+    endpoint = "repos/125m125/pr-reviewer-action/commits/" + "a" * 40
+    requests = tuple(
+        repository_access_request(
+            endpoint, obligation.id, "Verify the changed action pin.",
+            f"Inspect {obligation.subject}.",
+            "Repo not allowed: 125m125/pr-reviewer-action",
+        )
+        for obligation in obligations[:2]
+    )
+
+    result = _controller(tmp_path).run(replace(
+        inputs, source_access_requests=requests,
+    ))
+
+    source_notes = [
+        note for note in result.notes
+        if note.kind is ReviewNoteKind.SOURCE_ACCESS_REQUEST
+    ]
+    assert len(source_notes) == 1
+    assert result.artifact["publishing"]["required_note_count"] == len(
+        result.notes
+    )
+    assert result.publishing_ready is True
+
+
 def test_repository_request_identity_ignores_optional_model_context(tmp_path):
     inputs = _inputs(tmp_path)
     obligation = derive_obligations(
@@ -4445,8 +4580,12 @@ def test_finalizer_cannot_override_controller_owned_handoff_facts(tmp_path):
 
 def test_finalizer_proposal_selects_only_authorized_orientation(tmp_path):
     def finalizer(request):
-        assert request.context["pr_metadata"] == {}
-        assert request.context["policy"].version == 2
+        assert "pr_metadata" not in request.context
+        assert "policy" not in request.context
+        assert request.context["change_overview"]["overview"]
+        assert request.context["successful_review_facts"]["component_ids"] == (
+            "worker",
+        )
         return FinalizerProposal(
             component_ids=("worker", "invented"),
             recipe_ids=("delivery", "invented"),
