@@ -4,6 +4,14 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import sys
+
+
+SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from redact import mask_source_secrets  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -54,3 +62,12 @@ def test_dogfood_fixture_has_no_committed_companion_artifacts():
     assert sorted(path.name for path in CANARY_DIRECTORY.iterdir()) == [
         "repository_access.py",
     ]
+
+
+def test_dogfood_diagnostic_survives_model_facing_source_redaction():
+    source = FIXTURE.read_text(encoding="utf-8")
+
+    redacted, count = mask_source_secrets(source)
+
+    assert "api_token={api_token}" in redacted
+    assert count == 0

@@ -18,7 +18,7 @@ _SCRIPTS_DIR = str(Path(__file__).parents[2] / "scripts")
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from redact import mask_and_truncate, mask_secrets  # noqa: E402
+from redact import mask_and_truncate, mask_secrets, mask_source_secrets  # noqa: E402
 
 
 _SUCCESS_STATUSES = frozenset({"ok", "success", "completed"})
@@ -163,6 +163,27 @@ def _bounded_content(content: str, max_content_bytes: int) -> tuple[str, bool, b
     return bounded, redacted_content != content, truncated
 
 
+_REPOSITORY_SOURCE_TOOLS = frozenset({
+    "read_file", "read_pr_diff", "git_grep", "git_blame",
+})
+
+
+def _bounded_tool_content(
+    tool: str, content: str, max_content_bytes: int,
+) -> tuple[str, bool, bool, tuple[str, ...]]:
+    if tool not in _REPOSITORY_SOURCE_TOOLS:
+        bounded, redacted, truncated = _bounded_content(content, max_content_bytes)
+        return bounded, redacted, truncated, (("controller-generic",) if redacted else ())
+    if max_content_bytes <= 0:
+        raise ValueError("max_content_bytes must be positive")
+    masked, count = mask_source_secrets(content)
+    raw = masked.encode("utf-8", errors="replace")
+    truncated = len(raw) > max_content_bytes
+    if truncated:
+        masked = raw[:max_content_bytes].decode("utf-8", errors="replace") + "\n[truncated]"
+    return masked, bool(count), truncated, (("controller-source-value",) if count else ())
+
+
 @dataclass(frozen=True)
 class EvidenceProvenance:
     """Immutable source and policy context needed to judge evidence reuse."""
@@ -237,7 +258,9 @@ def canonical_evidence_key(
     max_content_bytes: int = 64 * 1024,
 ) -> str:
     """Return a deterministic identity for a bounded, safely stored result."""
-    content, _, _ = _bounded_content(_result_content(result), max_content_bytes)
+    content, _, _, _ = _bounded_tool_content(
+        str(tool).strip(), _result_content(result), max_content_bytes,
+    )
     sanitized_provenance, _ = _sanitize_provenance(provenance)
     sanitized_source, _ = _sanitize_source(source)
     identity = {
@@ -273,6 +296,7 @@ class EvidenceRecord:
     truncated: bool
     redacted: bool
     imported_by: tuple[str, ...]
+    redaction_types: tuple[str, ...] = ()
     supersedes: tuple[str, ...] = ()
     contradicts: tuple[str, ...] = ()
 
@@ -571,8 +595,8 @@ class EvidenceStore:
         sanitized_source, source_redacted = _sanitize_source(source)
         canonical_supersedes = self._canonical_relationship_ids(supersedes)
         canonical_contradicts = self._canonical_relationship_ids(contradicts)
-        content, redacted, truncated = _bounded_content(
-            _result_content(result), self._max_content_bytes
+        content, redacted, truncated, redaction_types = _bounded_tool_content(
+            str(tool).strip(), _result_content(result), self._max_content_bytes,
         )
         canonical_key = canonical_evidence_key(
             tool, sanitized_arguments, result, source=sanitized_source, provenance=sanitized_provenance,
@@ -620,6 +644,7 @@ class EvidenceStore:
             truncated=truncated,
             redacted=redacted or arguments_redacted or provenance_redacted or source_redacted,
             imported_by=(session_id,),
+            redaction_types=redaction_types,
             supersedes=canonical_supersedes,
             contradicts=canonical_contradicts,
         )

@@ -99,6 +99,39 @@ def test_evidence_retains_redaction_and_truncation_state():
     assert "supersecretvalue" not in record.content
 
 
+def test_repository_evidence_preserves_dynamic_secret_reference_semantics():
+    store = EvidenceStore()
+    source = 'return f"Webhook failed; api_token={api_token}"'
+
+    record = store.add_tool_result(
+        session_id="S1",
+        tool="read_pr_diff",
+        arguments={"path": "evals/dogfood_canaries/repository_access.py"},
+        result={"status": "ok", "result": {"content": source}},
+    )
+
+    assert record.content == source
+    assert record.redacted is False
+
+
+def test_repository_evidence_marks_controller_source_redaction():
+    store = EvidenceStore()
+
+    record = store.add_tool_result(
+        session_id="S1",
+        tool="read_file",
+        arguments={"path": "config.py"},
+        result={
+            "status": "ok",
+            "result": {"content": 'api_token="super_secret_literal_value_12345"'},
+        },
+    )
+
+    assert record.content == 'api_token="[REDACTED_VALUE]"'
+    assert record.redacted is True
+    assert record.redaction_types == ("controller-source-value",)
+
+
 def test_wave_snapshot_does_not_change_when_store_grows():
     store = EvidenceStore()
     store.add_tool_result(
