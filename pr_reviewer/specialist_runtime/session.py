@@ -2003,6 +2003,73 @@ class SpecialistSession:
                 name, arguments, result, requested_obligation_ids,
                 model_purpose=model_purpose,
             )
+            payload = result.get("result")
+            batch_patches = (
+                payload.get("patches")
+                if name == "read_pr_diff"
+                and isinstance(arguments.get("paths"), list)
+                and isinstance(payload, Mapping)
+                else None
+            )
+            if isinstance(batch_patches, list):
+                slices: list[dict[str, object]] = []
+                representative = None
+                representative_collection = None
+                for patch_item in batch_patches:
+                    if not isinstance(patch_item, Mapping):
+                        continue
+                    path = str(patch_item.get("path", "")).strip()
+                    slice_result = {
+                        "status": patch_item.get("status", "error"),
+                        "result": {
+                            "path": path,
+                            "patch": patch_item.get("patch", ""),
+                            "range": patch_item.get("range"),
+                            "error": patch_item.get("error"),
+                        },
+                    }
+                    slice_arguments = {
+                        key: value for key, value in arguments.items() if key != "paths"
+                    } | {"path": path}
+                    slice_record, slice_collection = (
+                        self.evidence_store.add_tool_result_with_collection(
+                            session_id=self.session_id, tool=name,
+                            arguments=slice_arguments, result=slice_result,
+                        )
+                    )
+                    self._associate_collection(
+                        slice_collection.id, slice_record, requested_obligation_ids,
+                    )
+                    if representative is None:
+                        representative = slice_record
+                        representative_collection = slice_collection
+                    slices.append({
+                        "path": path,
+                        "evidence_id": slice_record.id,
+                        "status": slice_record.status,
+                        "content": slice_record.content,
+                    })
+                if representative is None or representative_collection is None:
+                    self.conversation.add_tool_result(
+                        call_id, {"error": "batch diff returned no path slices"},
+                        is_error=True,
+                    )
+                    continue
+                self._tool_call_evidence_ids[call_id] = representative.id
+                self.conversation.add_tool_result(
+                    call_id,
+                    {
+                        "evidence_slices": slices,
+                        "coverage_effect": "neutral_evidence_retained",
+                        "eligible_targets": list(requested_targets),
+                    },
+                    is_error=is_error,
+                )
+                if not is_error:
+                    self._successful_requests[key] = representative
+                    self._successful_collections[key] = representative_collection.id
+                    progressed = True
+                continue
             record, collection = self.evidence_store.add_tool_result_with_collection(
                 session_id=self.session_id, tool=name, arguments=arguments, result=result,
             )

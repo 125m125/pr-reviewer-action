@@ -113,6 +113,8 @@ _ROLE_SYSTEM = {
         "and for merge use only IDs listed in merge_peer_ids. An independent_recipe "
         "assignment can only be reordered or improved; it can never be a merge target, "
         "merge source, or split candidate."
+        " When an overloaded ordinary assignment needs splitting, first merge compatible "
+        "small ordinary assignments when permitted to free capacity under the hard session cap."
     ),
     "negotiator": (
         "Choose exactly one bounded action for one controller-provided target handle. "
@@ -1136,7 +1138,7 @@ def _compact_assignment_for_planner(value: object) -> object:
         "id", "assignment_id", "title", "objective", "obligation_ids",
         "primary_obligation_ids", "independent_obligation_ids", "recipe_ids",
         "lenses", "expected_evidence", "priority",
-        "overlap_justification",
+        "overlap_justification", "model_turn_limit", "tool_call_limit",
     )
     result = {key: value[key] for key in keys if key in value}
     for key in ("seed_paths", "boundary_paths"):
@@ -1153,6 +1155,20 @@ def _compact_assignment_for_planner(value: object) -> object:
                 if key in item
             }
             for item in briefs[:16]
+            if isinstance(item, Mapping)
+        ]
+    families = value.get("families")
+    if isinstance(families, (list, tuple)):
+        result["families"] = [
+            {
+                key: item[key]
+                for key in (
+                    "family_id", "obligation_ids", "changed_paths", "risk_tier",
+                    "evidence_categories",
+                )
+                if key in item
+            }
+            for item in families[:32]
             if isinstance(item, Mapping)
         ]
     changed_context = value.get("changed_context")
@@ -1423,6 +1439,25 @@ def _compact_planner_context(
                     compacted[f"{field_name}_ref"] = reference
     if "topology" in raw:
         projected["topology"] = _compact_topology_for_planner(raw["topology"])
+        topology_value = raw["topology"]
+        if isinstance(topology_value, Mapping):
+            changed_paths = tuple(
+                str(path).replace("\\", "/")
+                for path in topology_value.get("changed_files", ())
+                if isinstance(path, str) and path.strip()
+            )
+            selected_paths = changed_paths[:80]
+            components = topology_value.get("components", ())
+            projected["manifest_summary"] = {
+                "changed_path_count": len(changed_paths),
+                "selected_path_count": len(selected_paths),
+                "omitted_path_count": max(0, len(changed_paths) - len(selected_paths)),
+                "selected_paths": list(selected_paths),
+                "component_count": len(components) if isinstance(components, (list, tuple)) else 0,
+                "file_roles": _compact_strings(
+                    topology_value.get("file_roles"), limit=80, item_limit=24,
+                ),
+            }
     if "config" in raw:
         config = raw["config"]
         if isinstance(config, Mapping):

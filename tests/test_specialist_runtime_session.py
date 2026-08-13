@@ -3491,7 +3491,34 @@ def test_tool_result_enters_conversation_only_after_evidence_redaction():
 
     retained = json.dumps(session.conversation.events) + repr(session.evidence_store.snapshot())
     assert secret not in retained
-    assert "[REDACTED]" in retained
+    assert "[REDACTED_VALUE]" in retained
+
+
+def test_multi_path_diff_retains_separate_path_evidence_slices():
+    def execute_tool(name, arguments):
+        return {
+            "tool": name,
+            "status": "ok",
+            "result": {"patches": [
+                {"path": path, "status": "ok", "patch": f"+changed {path}"}
+                for path in arguments["paths"]
+            ]},
+        }
+
+    gateway = ScriptedGateway([
+        tool_call_response("read_pr_diff", {"paths": ["a.py", "tests/test_a.py"]}),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, execute_tool=execute_tool)
+
+    session.explore()
+
+    records = session.evidence_store.snapshot().records
+    assert {record.source_path for record in records} == {"a.py", "tests/test_a.py"}
+    tool_events = [
+        item for item in session.conversation.events if item.get("kind") == "tool_result"
+    ]
+    assert len(json.loads(tool_events[-1]["content"])["evidence_slices"]) == 2
 
 
 def test_tool_deduplication_retains_only_sanitized_evidence_records():

@@ -33,6 +33,8 @@ def test_planner_system_prompt_declares_controller_owned_fields_and_paths():
     assert all(kind in prompt for kind in ("reorder", "merge", "split", "improve"))
     assert "cannot remove obligations" in prompt
     assert "Do not estimate turns" in prompt
+    assert "merge compatible small ordinary assignments" in prompt
+    assert "free capacity" in prompt
 
 
 def test_planner_system_prompt_explicitly_disables_review_exploration_and_tools():
@@ -139,6 +141,29 @@ def test_planner_context_projection_is_bounded_without_losing_plan_identity():
     assert len(encoded.encode("utf-8")) < 120_000
     assert projected["base_plan"]["assignments"][0]["id"] == "assignment-1"
     assert projected["obligations"][0]["obligation_id"] == "obligation-0"
+
+
+def test_planner_projection_always_retains_nonempty_manifest_summary():
+    projected = cli._compact_planner_context({
+        "base_plan": {"assignments": [{
+            "id": "assignment-1", "obligation_ids": ["o1"],
+            "families": [{
+                "family_id": "family:1", "obligation_ids": ["o1"],
+                "changed_paths": ["src/a.py"], "risk_tier": "high",
+            }],
+        }]},
+        "obligations": [{"obligation_id": "o1"}],
+        "topology": {
+            "changed_files": [f"src/file-{index}.py" for index in range(500)],
+            "file_roles": ["implementation", "test"],
+            "components": [{"id": "runtime", "changed_files": ["src/file-1.py"]}],
+        },
+    }, max_context_bytes=20_000)
+
+    assert projected["manifest_summary"]["changed_path_count"] == 500
+    assert projected["manifest_summary"]["selected_path_count"] > 0
+    assert projected["manifest_summary"]["omitted_path_count"] > 0
+    assert projected["base_plan"]["assignments"][0]["families"][0]["family_id"] == "family:1"
 
 
 def test_planner_projection_uses_capabilities_without_repository_path_inventory():

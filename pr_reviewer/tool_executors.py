@@ -466,6 +466,62 @@ def execute_tool_request(
             tool_result["result"] = result_payload
 
         elif tool_name == "read_pr_diff":
+            raw_paths = args.get("paths")
+            if raw_paths is not None:
+                if args.get("path"):
+                    raise ValueError("Use either 'path' or 'paths', not both")
+                if (
+                    not isinstance(raw_paths, list)
+                    or not raw_paths
+                    or any(not isinstance(item, str) or not item.strip() for item in raw_paths)
+                ):
+                    raise ValueError("'paths' must be a non-empty array of paths")
+                if len(raw_paths) > 8:
+                    raise ValueError("'paths' may contain at most 8 paths")
+                allowed = {
+                    candidate.replace("\\", "/").strip("/")
+                    for candidate in allowed_diff_paths
+                    if isinstance(candidate, str) and candidate
+                }
+                normalized = [item.replace("\\", "/").strip("/") for item in raw_paths]
+                if len(set(normalized)) != len(normalized):
+                    raise ValueError("'paths' must not contain duplicates")
+                if any(item not in allowed for item in normalized):
+                    raise ValueError("Path is outside this specialist assignment")
+                per_path_bytes = max(1, max_response_bytes // len(normalized))
+                patches = []
+                for item in normalized:
+                    nested = execute_tool_request(
+                        "read_pr_diff",
+                        {
+                            key: value for key, value in args.items()
+                            if key not in {"paths", "path"}
+                        } | {"path": item},
+                        workspace_root, allowed_gh_repos, current_repo, allowed_hosts,
+                        per_path_bytes, request_timeout, search_url, max_search_results,
+                        source_policy=source_policy, search_provider=search_provider,
+                        secure_fetcher=secure_fetcher, evidence_store=evidence_store,
+                        session_id=session_id, model_identity=model_identity,
+                        search_scan_limit=search_scan_limit, deadline_at=deadline_at,
+                        base_sha=base_sha, head_sha=head_sha,
+                        allowed_diff_paths=allowed_diff_paths,
+                    )
+                    nested_result = nested.get("result", {})
+                    patches.append({
+                        "path": item,
+                        "status": nested.get("status", "error"),
+                        "patch": nested_result.get("patch", ""),
+                        "range": nested_result.get("range"),
+                        "error": nested_result.get("error"),
+                    })
+                tool_result["result"] = {
+                    "patches": patches,
+                    "shared_max_bytes": max_response_bytes,
+                }
+                tool_result["status"] = (
+                    "ok" if all(item["status"] == "ok" for item in patches) else "error"
+                )
+                return tool_result
             path = args.get("path", "")
             if not path:
                 raise ValueError("Missing 'path' argument")

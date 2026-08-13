@@ -247,7 +247,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 SPECIALIST_PR_DIFF_SCHEMA: dict[str, Any] = {
     "name": "read_pr_diff",
     "description": (
-        "Read a bounded patch for one file in this specialist's assignment. "
+        "Read bounded patches for one or up to eight related files in this "
+        "specialist's assignment. Prefer batching related production and test paths. "
         "The controller compares the immutable pull-request base merge-base "
         "to the immutable head (base...head); revisions cannot be supplied by "
         "the model. Paths outside the assignment boundaries are rejected."
@@ -258,6 +259,13 @@ SPECIALIST_PR_DIFF_SCHEMA: dict[str, Any] = {
             "path": {
                 "type": "string",
                 "description": "Repository-relative assigned file path.",
+            },
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 8,
+                "description": "Related repository-relative assigned paths.",
             },
             "context_lines": {
                 "type": "integer",
@@ -272,7 +280,10 @@ SPECIALIST_PR_DIFF_SCHEMA: dict[str, Any] = {
                 "description": "Optional patch-line limit (1-400, default 400).",
             },
         },
-        "required": ["path"],
+        "oneOf": [
+            {"required": ["path"]},
+            {"required": ["paths"]},
+        ],
         "additionalProperties": False,
     },
 }

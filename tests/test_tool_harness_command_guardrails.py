@@ -165,6 +165,63 @@ def test_read_pr_diff_uses_bounded_file_scoped_merge_base_argv(
     ]
 
 
+def test_read_pr_diff_batches_authorized_paths_under_one_shared_cap(
+    monkeypatch, tmp_path,
+):
+    base_sha = "1" * 40
+    head_sha = "2" * 40
+    for path in ("src/a.py", "tests/test_a.py"):
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("head\n", encoding="utf-8")
+
+    class FakeProcess:
+        def __init__(self, args, **_kwargs):
+            path = args[-1]
+            self.stdout = io.BytesIO((f"diff --git a/{path} b/{path}\n-old\n+new\n").encode())
+            self.returncode = 0
+
+        def wait(self, timeout):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(tool_executors.subprocess, "Popen", FakeProcess)
+
+    result = tool_executors.execute_tool_request(
+        "read_pr_diff", {"paths": ["src/a.py", "tests/test_a.py"]},
+        str(tmp_path), set(), "", (), 180, 15,
+        base_sha=base_sha, head_sha=head_sha,
+        allowed_diff_paths=("src/a.py", "tests/test_a.py"),
+    )
+
+    assert result["status"] == "ok"
+    assert [item["path"] for item in result["result"]["patches"]] == [
+        "src/a.py", "tests/test_a.py",
+    ]
+    assert sum(len(item["patch"].encode()) for item in result["result"]["patches"]) <= 180
+
+
+def test_read_pr_diff_rejects_oversized_or_unauthorized_batches(tmp_path):
+    common = dict(
+        workspace_root=str(tmp_path), allowed_gh_repos=set(), current_repo="",
+        allowed_hosts=(), max_response_bytes=100, request_timeout=15,
+        base_sha="1" * 40, head_sha="2" * 40, allowed_diff_paths=("a.py",),
+    )
+    too_many = tool_executors.execute_tool_request(
+        "read_pr_diff", {"paths": [f"{index}.py" for index in range(9)]}, **common,
+    )
+    outside = tool_executors.execute_tool_request(
+        "read_pr_diff", {"paths": ["a.py", "outside.py"]}, **common,
+    )
+
+    assert too_many["status"] == "error"
+    assert "at most 8" in too_many["result"]["error"]
+    assert outside["status"] == "error"
+    assert "assignment" in outside["result"]["error"]
+
+
 def test_read_pr_diff_treats_magic_looking_assigned_filename_literally(
     monkeypatch, tmp_path,
 ):
