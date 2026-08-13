@@ -119,7 +119,10 @@ production symbols, and discounted test/documentation/generated volume.
 
 All sessions share controller-owned global limits in addition to per-session
 limits. New optional inputs `specialist_max_total_model_turns` and
-`specialist_max_total_tool_calls` default to 320 and 256 respectively. They
+`specialist_max_total_tool_calls` default to 320 and 640 respectively. This
+preserves the existing recommended two-tool-calls-per-model-turn ratio: one
+native model turn may emit multiple read-only calls, and tool availability is
+the primary signal that evidence exploration can continue. The global limits
 target a predictable review ceiling rather than
 `max_sessions * per_session_limit`. Critical families receive larger leases,
 normal families receive smaller leases, and global deadline/finalization reserve
