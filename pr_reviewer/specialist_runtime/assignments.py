@@ -56,6 +56,17 @@ class ChangedPathContext:
 
 
 @dataclass(frozen=True)
+class ReviewFamilyBrief:
+    """Controller-owned coherent view over atomic obligations."""
+
+    family_id: str
+    obligation_ids: tuple[str, ...]
+    changed_paths: tuple[str, ...]
+    risk_tier: str
+    evidence_categories: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Assignment:
     id: str
     title: str
@@ -73,6 +84,9 @@ class Assignment:
     obligation_briefs: tuple[ObligationBrief, ...] = ()
     changed_context: tuple[ChangedPathContext, ...] = ()
     changed_context_omitted_paths: int = 0
+    families: tuple[ReviewFamilyBrief, ...] = ()
+    model_turn_limit: int = 0
+    tool_call_limit: int = 0
 
     @property
     def assignment_id(self) -> str:
@@ -308,9 +322,49 @@ def _with_scheduling_weights(
 ) -> tuple[Assignment, ...]:
     """Derive a coarse ordering hint without treating it as runtime capacity."""
     limit = max(1, config.session_limits.model_turns)
-    return tuple(
-        replace(item, estimated_turns=min(limit, max(1, len(item.obligation_ids))))
+    weights = tuple(
+        {"critical": 4, "high": 3, "normal": 2, "low": 1}.get(item.priority, 2)
         for item in assignments
+    )
+
+    def leases(total: int, per_session: int) -> tuple[int, ...]:
+        if not assignments:
+            return ()
+        remaining = max(0, total)
+        result = [0] * len(assignments)
+        for index in sorted(range(len(assignments)), key=lambda i: (-weights[i], assignments[i].id)):
+            if remaining <= 0:
+                break
+            result[index] = 1
+            remaining -= 1
+        while remaining > 0:
+            eligible = [
+                index for index in range(len(assignments))
+                if result[index] < per_session
+            ]
+            if not eligible:
+                break
+            index = min(
+                eligible,
+                key=lambda i: (result[i] / weights[i], -weights[i], assignments[i].id),
+            )
+            result[index] += 1
+            remaining -= 1
+        return tuple(result)
+
+    turn_limits = leases(config.max_total_model_turns, limit)
+    tool_limits = leases(
+        config.max_total_tool_calls,
+        max(1, config.session_limits.tool_calls),
+    )
+    return tuple(
+        replace(
+            item,
+            estimated_turns=min(limit, max(1, len(item.obligation_ids))),
+            model_turn_limit=turn_limits[index],
+            tool_call_limit=tool_limits[index],
+        )
+        for index, item in enumerate(assignments)
     )
 
 
@@ -815,6 +869,63 @@ def _with_semantic_brief(
         obligation_briefs=_obligation_briefs(obligations),
         changed_context=changed_context,
         changed_context_omitted_paths=omitted,
+        families=_review_families(obligations, topology),
+    )
+
+
+def _review_families(
+    obligations: Iterable[CoverageObligation], topology: Mapping[str, Any],
+) -> tuple[ReviewFamilyBrief, ...]:
+    component_paths = _component_paths(topology)
+    grouped: dict[tuple[object, ...], list[CoverageObligation]] = defaultdict(list)
+    for obligation in sorted(obligations, key=lambda item: item.id):
+        scope = set(obligation.scope).union(obligation.seed_hints)
+        components = tuple(sorted(
+            component for component, paths in component_paths.items()
+            if scope.intersection(paths)
+        ))
+        isolated = bool(
+            obligation.requires_independent_verification
+            or _recipe_execution(obligation) in {"dedicated", "independent"}
+        )
+        key = (
+            "isolated:" + obligation.id if isolated else "ordinary",
+            obligation.risk_tier,
+            obligation.unresolved_policy,
+            components,
+            obligation.recipe_id or "",
+            tuple(sorted(obligation.required_evidence_categories)),
+        )
+        grouped[key].append(obligation)
+
+    families: list[ReviewFamilyBrief] = []
+    for key, items in sorted(grouped.items(), key=lambda item: repr(item[0])):
+        batch: list[CoverageObligation] = []
+        paths: set[str] = set()
+        for obligation in items:
+            item_paths = set((*obligation.scope, *obligation.seed_hints))
+            if batch and (len(batch) >= 10 or len(paths.union(item_paths)) > 8):
+                families.append(_family_brief(len(families) + 1, batch))
+                batch, paths = [], set()
+            batch.append(obligation)
+            paths.update(item_paths)
+        if batch:
+            families.append(_family_brief(len(families) + 1, batch))
+    return tuple(families)
+
+
+def _family_brief(index: int, items: Iterable[CoverageObligation]) -> ReviewFamilyBrief:
+    obligations = tuple(items)
+    return ReviewFamilyBrief(
+        family_id=f"family:{index}",
+        obligation_ids=tuple(item.id for item in obligations),
+        changed_paths=tuple(sorted({
+            path for item in obligations for path in (*item.scope, *item.seed_hints)
+        })),
+        risk_tier=_priority(obligations),
+        evidence_categories=tuple(sorted({
+            category for item in obligations for category in item.required_evidence_categories
+        })),
     )
 
 
@@ -928,11 +1039,22 @@ def fallback_assignment_plan(
         # Preserve room for isolated candidates while always creating at least
         # one ordinary contender so immutable risk, not isolation kind, decides
         # who receives the final hard session slot.
-        ordinary_slots = max(
+        ordinary_items = [item for _, group in ordinary_groups for item in group]
+        ordinary_paths = {
+            path for item in ordinary_items for path in (*item.scope, *item.seed_hints)
+        }
+        workload_slots = max(
+            min(len(ordinary_groups), 6),
+            len({_priority(group) for _, group in ordinary_groups}),
+            (len(ordinary_items) + 9) // 10,
+            (len(ordinary_paths) + 7) // 8,
+        )
+        available_slots = max(
             1,
             runtime_config.max_sessions
             - min(len(isolated_candidates), runtime_config.max_sessions - 1),
         )
+        ordinary_slots = min(available_slots, max(1, workload_slots))
         bucket_count = min(ordinary_slots, len(ordinary_groups))
         buckets: list[list[CoverageObligation]] = [[] for _ in range(bucket_count)]
         for index, (_, items) in enumerate(ordinary_groups):

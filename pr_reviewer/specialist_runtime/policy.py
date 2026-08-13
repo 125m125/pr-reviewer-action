@@ -255,6 +255,8 @@ class RuntimeConfig:
     concurrency: int = 1
     max_sessions: int = 8
     max_followup_sessions: int = 2
+    max_total_model_turns: int = 320
+    max_total_tool_calls: int = 640
     session_limits: BudgetLimits = field(
         default_factory=lambda: BudgetLimits(model_turns=64, tool_calls=128, recoveries=1)
     )
@@ -303,6 +305,12 @@ class RuntimeConfig:
             ),
             max_followup_sessions=setting(
                 "SPECIALIST_MAX_FOLLOWUP_SESSIONS", 2, alias="SPECIALIST_MAX_FOLLOWUP_PASSES"
+            ),
+            max_total_model_turns=setting(
+                "SPECIALIST_MAX_TOTAL_MODEL_TURNS", 320,
+            ),
+            max_total_tool_calls=setting(
+                "SPECIALIST_MAX_TOTAL_TOOL_CALLS", 640,
             ),
             session_limits=BudgetLimits(
                 model_turns=setting("SPECIALIST_MAX_MODEL_TURNS_PER_SESSION", 64),

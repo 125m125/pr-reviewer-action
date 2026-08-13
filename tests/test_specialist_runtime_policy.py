@@ -411,7 +411,19 @@ def test_runtime_config_uses_direct_defaults_and_legacy_aliases():
     assert config.concurrency == 1
     assert config.model_request_timeout_sec == 42
     assert config.session_limits.tool_calls == 17
+    assert config.max_total_model_turns == 320
+    assert config.max_total_tool_calls == 640
     assert config.deprecation_warnings == ("specialist_max_tool_calls_per_pass",)
+
+
+def test_runtime_config_accepts_controller_owned_global_leases():
+    config = RuntimeConfig.from_env({
+        "SPECIALIST_MAX_TOTAL_MODEL_TURNS": "111",
+        "SPECIALIST_MAX_TOTAL_TOOL_CALLS": "333",
+    })
+
+    assert config.max_total_model_turns == 111
+    assert config.max_total_tool_calls == 333
 
 
 def load_review_policy_from_value(value):

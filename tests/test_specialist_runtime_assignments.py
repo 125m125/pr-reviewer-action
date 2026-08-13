@@ -778,6 +778,41 @@ def test_dogfood_shape_assigns_all_topology_obligations_without_estimated_turn_a
     assert assigned == {item.id for item in obligations}
     assert len(plan.assignments) <= dogfood.max_sessions
     assert plan.unassigned_obligation_ids == ()
+    assert sum(item.model_turn_limit for item in plan.assignments) <= 320
+    assert sum(item.tool_call_limit for item in plan.assignments) <= 640
+    assert all(item.families for item in plan.assignments)
+    assert all(
+        len(family.obligation_ids) <= 10
+        and len(family.changed_paths) <= 8
+        for assignment in plan.assignments
+        for family in assignment.families
+    )
+
+
+def test_independent_and_ordinary_obligations_never_share_a_review_family():
+    obligations = (
+        CoverageObligation(
+            obligation_id="ordinary", origin="topology", subject="worker",
+            required_evidence_categories=("implementation",), scope=("worker.py",),
+        ),
+        CoverageObligation(
+            obligation_id="independent", origin="recipe", subject="worker",
+            required_evidence_categories=("implementation",), scope=("worker.py",),
+            recipe_id="security", recipe_execution="independent",
+            requires_independent_verification=True, risk_tier="critical",
+        ),
+    )
+    topology = {
+        "changed_files": ["worker.py"],
+        "components": [{"id": "worker", "changed_files": ["worker.py"]}],
+    }
+
+    plan = fallback_assignment_plan(obligations, topology, RuntimeConfig(max_sessions=4))
+
+    families = [family for item in plan.assignments for family in item.families]
+    assert {family.obligation_ids for family in families} == {
+        ("ordinary",), ("independent",),
+    }
 
 
 def test_planner_prompt_includes_immutable_obligation_ids_only(obligations, topology, runtime_config):

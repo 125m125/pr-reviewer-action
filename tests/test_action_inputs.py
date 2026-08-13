@@ -215,6 +215,8 @@ def test_specialist_session_runtime_inputs_have_exact_defaults_and_wiring():
         "specialist_max_followup_sessions": "2",
         "specialist_max_model_turns_per_session": "64",
         "specialist_max_tool_calls_per_session": "128",
+        "specialist_max_total_model_turns": "320",
+        "specialist_max_total_tool_calls": "640",
         "specialist_max_recoveries_per_session": "1",
     }
     content = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")

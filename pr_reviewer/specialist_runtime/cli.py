@@ -51,7 +51,7 @@ from .session import (
     SpecialistSession,
     specialist_assignment_prompt,
 )
-from .types import ReviewHandoff, ReviewNote, ReviewNoteKind
+from .types import BudgetLimits, ReviewHandoff, ReviewNote, ReviewNoteKind
 from .web_evidence import SecureFetcher, SearxngSearchProvider, SourcePolicy
 
 
@@ -1029,7 +1029,19 @@ def build_controller(
             execute_tool=execute,
             evidence_store=evidence,
             coverage=coverage,
-            budget=BudgetLedger(config.runtime.session_limits),
+            budget=BudgetLedger(BudgetLimits(
+                model_turns=max(1, int(
+                    getattr(assignment, "model_turn_limit", 0)
+                    or config.runtime.session_limits.model_turns
+                )),
+                tool_calls=max(1, int(
+                    getattr(assignment, "tool_call_limit", 0)
+                    or config.runtime.session_limits.tool_calls
+                )),
+                recoveries=config.runtime.session_limits.recoveries,
+                input_tokens=config.runtime.session_limits.input_tokens,
+                output_tokens=config.runtime.session_limits.output_tokens,
+            )),
             lease=lease,
             request_timeout_sec=config.request_timeout_sec,
             max_tokens=config.max_tokens,
