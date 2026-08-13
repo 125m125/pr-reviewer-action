@@ -14,6 +14,7 @@ from pr_reviewer.specialist_runtime.adjudication import (
     build_review_handoff,
     build_review_notes,
     consolidate_candidates,
+    project_review_handoff,
 )
 from pr_reviewer.specialist_runtime.evidence import EvidenceStore
 from pr_reviewer.specialist_runtime.types import (
@@ -1069,7 +1070,23 @@ def test_runtime_supported_severity_policy_and_approval_gate():
     assert default_result.verdict == "request_changes"
     assert default_result.source == "supported-findings"
     assert configured_result.verdict == "approve"
+    assert disabled_result.verdict == "notice"
     assert disabled_result.source == "approval-disabled"
+
+
+def test_clean_approval_disabled_handoff_is_not_a_negative_recommendation():
+    handoff = project_review_handoff(
+        ReviewHandoffContext(
+            recommendation="no_blocking_findings", status="complete",
+            ai_reviewed=("The AI examined runtime behavior in `src/worker.py`.",),
+            context_paths=("src/worker.py",),
+        ),
+        finding_categories=(), forbidden_detail_roots=(), obligations={},
+        changed_files=("src/worker.py",),
+    )
+
+    assert handoff.recommendation == "No blocking findings identified"
+    assert "Request changes" not in handoff.markdown
 
 
 def test_set_inputs_are_canonicalized_for_deterministic_output():

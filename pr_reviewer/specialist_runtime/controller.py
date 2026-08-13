@@ -779,7 +779,6 @@ def _deterministic_reviewed_summary(
     component_ids: Iterable[str],
     reviewed_obligations: Iterable[CoverageObligation],
 ) -> tuple[str, ...]:
-    del changed_files
     if not tuple(reviewed_obligations):
         return ()
     components = tuple(dict.fromkeys(
@@ -788,9 +787,24 @@ def _deterministic_reviewed_summary(
         if str(item).strip()
     ))
     scope = " and ".join(components[:4]) or "the affected components"
+    paths = tuple(dict.fromkeys(
+        str(path).replace("\\", "/")
+        for path in (
+            *changed_files,
+            *(
+                path
+                for obligation in reviewed_obligations
+                for path in (*obligation.scope, *obligation.seed_hints)
+            ),
+        )
+        if str(path).strip()
+    ))
+    if not paths:
+        return ()
+    path_text = ", ".join(f"`{path}`" for path in paths[:3])
     return (
-        "The AI checked retained evidence across " + scope + " for the assigned "
-        "review obligations; unresolved areas are listed in the detail notes.",
+        "The AI examined assigned behavior across " + scope
+        + " using retained changed evidence from " + path_text + ".",
     )
 
 
@@ -3769,7 +3783,13 @@ class ReviewController:
             ),
         )
         return ReviewHandoffContext(
-            recommendation=state.verdict,
+            recommendation=(
+                "no_blocking_findings"
+                if state.verdict_source == "approval-disabled"
+                and not state.blocking_finding_ids
+                and not state.blocking_obligation_ids
+                else state.verdict
+            ),
             status=status,
             change_topics=change_topics,
             component_ids=component_ids,

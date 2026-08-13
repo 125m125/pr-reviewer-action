@@ -549,8 +549,8 @@ def test_deterministic_reviewed_summary_describes_scope_not_methods():
     )
 
     assert summary == (
-        "The AI checked retained evidence across model-transport and tests for the "
-        "assigned review obligations; unresolved areas are listed in the detail notes.",
+        "The AI examined assigned behavior across model-transport and tests using retained "
+        "changed evidence from `pr_reviewer/conversation.py`, `tests/test_runtime.py`.",
     )
 
 
@@ -1178,7 +1178,7 @@ def test_controller_runs_obligations_assignments_sessions_and_finalizer(tmp_path
     assert result.artifact["recipes"]["delivery"]["status"] == "covered"
     assert result.handoff.markdown.startswith("## AI Review Handoff")
     assert result.notes[0].evidence_ids
-    assert result.verdict in {"approve", "request_changes"}
+    assert result.verdict in {"approve", "request_changes", "notice"}
     assert result.artifact_path == tmp_path / "specialist-review-artifact.json"
     assert result.artifact_path.read_bytes().startswith(b'{"accepted_candidates"')
     assert [event.payload["phase"] for event in result.events if event.kind == "phase_changed"] == [
@@ -3633,7 +3633,7 @@ def test_hanging_specialist_gateway_is_bounded_and_accounted_in_artifact(tmp_pat
         assert totals["specialist_model_requests"] == 2
         assert totals["specialist_model_timed_out"] == 2
         assert totals["model_turns"] == 2
-        assert result.publishing_ready is False or result.verdict == "request_changes"
+        assert result.publishing_ready is False or result.verdict == "notice"
     finally:
         release.set()
         deadline = time.monotonic() + 1
@@ -4602,7 +4602,9 @@ def test_finalizer_proposal_selects_only_authorized_orientation(tmp_path):
     assert "invented" not in result.handoff.markdown
     assert "Failure recovery" in result.handoff.markdown
     assert "Security" not in result.handoff.markdown
-    assert result.handoff.recommendation in {"Approve", "Request changes"}
+    assert result.handoff.recommendation in {
+        "Approve", "Request changes", "No blocking findings identified",
+    }
     assert result.handoff.review_emphasis == ("Failure recovery",)
     assert result.artifact["handoff"]["status"] == "AI review complete"
     assert result.artifact["handoff"]["recipe_focuses"] == (
@@ -4656,7 +4658,7 @@ def test_repository_publishing_policy_prevents_caller_broadening(tmp_path):
 
     assert result.artifact["publishing"]["mode"] == "comment"
     assert result.artifact["publishing"]["allow_approve"] is False
-    assert result.verdict == "request_changes"
+    assert result.verdict == "notice"
     assert result.notes == ()
 
 
@@ -4669,7 +4671,7 @@ def test_missing_repository_publishing_policy_never_grants_approval(tmp_path):
     ))
 
     assert result.artifact["publishing"]["allow_approve"] is False
-    assert result.verdict == "request_changes"
+    assert result.verdict == "notice"
 
 
 def test_repository_publishing_mode_without_allow_flag_never_grants_approval(tmp_path):
@@ -4683,7 +4685,7 @@ def test_repository_publishing_mode_without_allow_flag_never_grants_approval(tmp
     ))
 
     assert result.artifact["publishing"]["allow_approve"] is False
-    assert result.verdict == "request_changes"
+    assert result.verdict == "notice"
 
 
 def test_caller_can_narrow_repository_publishing_policy(tmp_path):

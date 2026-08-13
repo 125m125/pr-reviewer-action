@@ -1633,6 +1633,7 @@ def project_review_handoff(
         "request_changes": "Request changes",
         "notice": "Human review required",
         "human_review_required": "Human review required",
+        "no_blocking_findings": "No blocking findings identified",
     }
     status_map = {
         "complete": "AI review complete",

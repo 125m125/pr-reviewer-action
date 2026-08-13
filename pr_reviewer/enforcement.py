@@ -139,7 +139,7 @@ def derive_runtime_verdict(
         )
     if not allow_approve:
         return RuntimeVerdictPolicyResult(
-            verdict="request_changes",
+            verdict="notice",
             source="approval-disabled",
             unknown_obligation_ids=tuple(sorted(set(unknown_obligations))),
         )

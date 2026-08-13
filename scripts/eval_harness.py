@@ -475,8 +475,25 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
     prepared_note_count = sum(
         1 for item in prepared_notes if isinstance(item, Mapping)
     )
+    verdict_projection = artifact.get("verdict", {})
+    verdict_source = (
+        str(verdict_projection.get("source") or "")
+        if isinstance(verdict_projection, Mapping) else ""
+    )
     context = ReviewHandoffContext(
-        recommendation=verdict_value,
+        recommendation=(
+            "no_blocking_findings"
+            if verdict_source == "approval-disabled"
+            and not tuple(
+                verdict_projection.get("blocking_finding_ids", ())
+                if isinstance(verdict_projection, Mapping) else ()
+            )
+            and not tuple(
+                verdict_projection.get("blocking_obligation_ids", ())
+                if isinstance(verdict_projection, Mapping) else ()
+            )
+            else verdict_value
+        ),
         status=str(artifact.get("evaluation_status") or ""),
         change_topics=topics("change_topics"),
         component_ids=values("component_ids"),
