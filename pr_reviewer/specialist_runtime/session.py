@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import inspect
 import math
 import re
@@ -122,8 +123,18 @@ COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
                 "type": "integer",
                 "description": "Optional excerpt size, capped by the controller.",
             },
+            "target": {
+                "type": "string",
+                "description": "Controller-owned obligation, family, or candidate handle.",
+            },
+            "purpose": {
+                "type": "string",
+                "enum": [
+                    "candidate_support", "obligation_resolution", "contradiction_check",
+                ],
+            },
         },
-        "required": ["evidence_id"],
+        "required": ["evidence_id", "target", "purpose"],
         "additionalProperties": False,
     },
 }
@@ -508,10 +519,20 @@ def _json_object(text: str) -> dict[str, Any] | None:
             if character != "{":
                 continue
             try:
-                value, _ = decoder.raw_decode(candidate[index:])
+                value, end = decoder.raw_decode(candidate[index:])
             except json.JSONDecodeError:
                 continue
             if isinstance(value, dict):
+                remainder = candidate[index + end:]
+                for tail_index, tail_character in enumerate(remainder):
+                    if tail_character != "{":
+                        continue
+                    try:
+                        trailing, _ = decoder.raw_decode(remainder[tail_index:])
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(trailing, dict):
+                        return None
                 return value
         return None
     return value if isinstance(value, dict) else None
@@ -995,8 +1016,12 @@ class SpecialistSession:
         self._successful_collections: dict[str, str] = {}
         self._tool_call_evidence_ids: dict[str, str] = {}
         self._compacted_evidence: dict[str, EvidenceRecord] = {}
-        self._compacted_evidence_read_keys: set[tuple[str, int, int]] = set()
+        self._compacted_evidence_read_keys: set[tuple[str, str, str, int, int, int]] = set()
         self._compacted_evidence_reads = 0
+        self._compacted_evidence_generation = 0
+        self._last_compact_progress_fingerprint = ""
+        self._last_checkpoint_should_resume = True
+        self._last_checkpoint_dropped_keys: tuple[str, ...] = ()
         self._obligation_local_tool_calls = 0
         self._obligation_rejection_counts: dict[tuple[str, str, int], int] = {}
         self._repeated_obligation_rejection = False
@@ -1475,6 +1500,8 @@ class SpecialistSession:
             reason, disposition=CheckpointDisposition.COMPACT_RESUME,
         )
         if result.degraded:
+            return result
+        if not self._last_checkpoint_should_resume:
             return result
         return self.explore()
 
@@ -2466,13 +2493,31 @@ class SpecialistSession:
         )
         self.latest_checkpoint = checkpoint
         if not fallback_projection and not retention_unknown:
+            progress_fingerprint = self._checkpoint_progress_fingerprint(checkpoint)
+            checkpoint_diagnostic.update({
+                "progress_fingerprint": progress_fingerprint[:16],
+                "dropped_checkpoint_keys": self._last_checkpoint_dropped_keys,
+            })
+            repeated_no_progress = bool(
+                disposition is CheckpointDisposition.COMPACT_RESUME
+                and self._last_compact_progress_fingerprint
+                and progress_fingerprint == self._last_compact_progress_fingerprint
+            )
+            if repeated_no_progress:
+                self.budget.record_no_progress()
+                self._last_checkpoint_should_resume = False
+            else:
+                self.budget.reset_no_progress_streak("checkpoint semantic progress")
+                self._compacted_evidence_generation += 1
+                self._last_checkpoint_should_resume = True
             self._checkpoint_spans.append(_CheckpointSpan(
                 request_start=checkpoint_request_start,
                 response_end=len(self.conversation.events),
                 disposition=disposition,
                 diagnostic=checkpoint_diagnostic,
             ))
-            if disposition is CheckpointDisposition.COMPACT_RESUME:
+            if disposition is CheckpointDisposition.COMPACT_RESUME and not repeated_no_progress:
+                self._last_compact_progress_fingerprint = progress_fingerprint
                 self._compact_validated_epoch(compaction_level=(
                     "emergency"
                     if reason == "provider-context-limit"
@@ -2480,6 +2525,21 @@ class SpecialistSession:
                 ))
         self.state = SessionState.CHECKPOINT
         return self._snapshot(degraded=fallback_projection or retention_unknown)
+
+    def _checkpoint_progress_fingerprint(self, checkpoint: SessionCheckpoint) -> str:
+        """Fingerprint controller-visible progress, excluding reworded memory prose."""
+        payload = {
+            "candidate_statuses": sorted(self._candidate_statuses.items()),
+            "candidate_ids": sorted(checkpoint.candidate_finding_ids),
+            "assessments": [
+                str(item) for item in self.obligation_assessments.assessments()
+            ],
+            "evidence_ids": sorted(checkpoint.evidence_ids),
+            "next_actions": sorted(checkpoint.proposed_next_actions),
+        }
+        return hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), default=str,
+        ).encode("utf-8")).hexdigest()
 
     def _checkpoint_from_text(
         self,
@@ -2496,6 +2556,8 @@ class SpecialistSession:
             raw = raw["checkpoint"]
         if raw is None or not isinstance(raw.get("unresolved"), list):
             return None
+        recognized_keys = set(_CHECKPOINT_SCHEMA["properties"])
+        self._last_checkpoint_dropped_keys = tuple(sorted(set(raw) - recognized_keys))
         previous = self.latest_checkpoint
         working_summary = (
             _bounded_text(raw.get("working_summary"), max_length=2_000)
@@ -2539,32 +2601,6 @@ class SpecialistSession:
             )
             prepared_obligation_updates.append((update, resolved_evidence_ids))
         assigned = set(self._assigned_obligation_ids())
-        declared = raw.get("evidence_by_obligation")
-        if isinstance(declared, Mapping):
-            for obligation_id, ids in declared.items():
-                if obligation_id not in assigned:
-                    continue
-                for raw_evidence_id in _strings(ids):
-                    evidence_id = _resolve_retained_evidence_id(
-                        raw_evidence_id, retained,
-                    )
-                    record = retained.get(evidence_id) if evidence_id else None
-                    obligation = self.coverage.obligation(obligation_id)
-                    if (
-                        evidence_id is not None
-                        and record is not None
-                        and self._record_matches_obligation(record, obligation)
-                    ):
-                        self.coverage.attach_evidence(obligation_id, evidence_id)
-                        evidence_ids.append(evidence_id)
-        # The compact `inspected` checkpoint form associates retained inspected
-        # evidence with covered assignment obligations; arbitrary IDs never do.
-        for obligation_id in assigned:
-            obligation = self.coverage.obligation(obligation_id)
-            for evidence_id in evidence_ids:
-                record = retained[evidence_id]
-                if self._record_matches_obligation(record, obligation):
-                    self.coverage.attach_evidence(obligation_id, evidence_id)
         for obligation_id in assigned.intersection(unresolved):
             self.coverage.mark_unresolved(obligation_id)
         declared_candidate_ids = set(_strings(raw.get("candidate_finding_ids")))
@@ -3383,11 +3419,29 @@ class SpecialistSession:
         )
 
     def _read_compacted_evidence(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        if set(arguments) - {"evidence_id", "offset", "limit"}:
+        if set(arguments) - {"evidence_id", "target", "purpose", "offset", "limit"}:
             return {"status": "error", "error": "unexpected retrieval arguments"}
         evidence_id = str(arguments.get("evidence_id") or "").strip()
         if not evidence_id:
             return {"status": "error", "error": "evidence_id is required"}
+        target = str(arguments.get("target") or "").strip()
+        purpose = str(arguments.get("purpose") or "").strip()
+        if not target or purpose not in {
+            "candidate_support", "obligation_resolution", "contradiction_check",
+        }:
+            return {
+                "status": "error",
+                "error": "authorized target and retrieval purpose are required",
+            }
+        authorized_targets = set(self._assigned_obligation_ids())
+        authorized_targets.update(self.obligation_assessments.handles())
+        authorized_targets.update(self._candidate_statuses)
+        authorized_targets.update(
+            str(getattr(item, "family_id", ""))
+            for item in getattr(self.assignment, "families", ())
+        )
+        if target not in authorized_targets:
+            return {"status": "error", "error": "target is not controller-authorized"}
         record = self._compacted_evidence.get(evidence_id)
         if record is None:
             return {
@@ -3407,12 +3461,18 @@ class SpecialistSession:
             return {"status": "error", "error": "offset and limit are invalid"}
         offset = raw_offset
         limit = min(raw_limit, _MAX_COMPACTED_EVIDENCE_READ_CHARS)
-        key = (evidence_id, offset, limit)
+        key = (
+            evidence_id, target, purpose, self._compacted_evidence_generation,
+            offset, limit,
+        )
         if key in self._compacted_evidence_read_keys:
+            self.budget.record_no_progress()
             return {
                 "status": "ok",
                 "evidence_id": evidence_id,
                 "replayed_compacted": True,
+                "target": target,
+                "purpose": purpose,
             }
         if self._compacted_evidence_reads >= _MAX_COMPACTED_EVIDENCE_READS:
             return {
@@ -3426,6 +3486,8 @@ class SpecialistSession:
         return {
             "status": "ok",
             "evidence_id": evidence_id,
+            "target": target,
+            "purpose": purpose,
             "tool": record.tool,
             "content": excerpt,
             "offset": offset,

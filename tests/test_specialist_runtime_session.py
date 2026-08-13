@@ -38,6 +38,8 @@ from pr_reviewer.specialist_runtime.types import (
     BudgetLimits,
     CoverageObligation,
     RunPhase,
+    SessionCheckpoint,
+    SessionState,
     SpecialistAssignment,
 )
 from pr_reviewer.transport import ModelRequestError
@@ -229,7 +231,8 @@ def test_compacted_evidence_reader_is_strict_and_deduplicated():
         "id": "read-1",
         "name": COMPACTED_EVIDENCE_TOOL_NAME,
         "arguments": json.dumps({
-            "evidence_id": record.id, "offset": 0, "limit": 100,
+            "evidence_id": record.id, "target": "OB-code",
+            "purpose": "obligation_resolution", "offset": 0, "limit": 100,
         }),
     }
     assert session._execute_calls((first,)) is False
@@ -243,10 +246,48 @@ def test_compacted_evidence_reader_is_strict_and_deduplicated():
     rejected = {
         "id": "read-3",
         "name": COMPACTED_EVIDENCE_TOOL_NAME,
-        "arguments": json.dumps({"evidence_id": "evidence:not-compacted"}),
+        "arguments": json.dumps({
+            "evidence_id": "evidence:not-compacted", "target": "OB-code",
+            "purpose": "obligation_resolution",
+        }),
     }
     session._execute_calls((rejected,))
     assert "not marked as compacted" in session.conversation.events[-1]["content"]
+
+
+def test_compacted_evidence_requires_authorized_target_and_purpose():
+    session = make_session(ScriptedGateway([]))
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "content": "retained"},
+    )
+    session._compacted_evidence[record.id] = record
+
+    missing = session._read_compacted_evidence({"evidence_id": record.id})
+    unknown = session._read_compacted_evidence({
+        "evidence_id": record.id, "target": "invented",
+        "purpose": "candidate_support",
+    })
+
+    assert missing["status"] == "error"
+    assert unknown["status"] == "error"
+
+
+def test_reworded_checkpoint_does_not_count_as_semantic_progress():
+    session = make_session(ScriptedGateway([]))
+    first = SessionCheckpoint(
+        session_id=session.session_id, state=SessionState.CHECKPOINT,
+        working_summary="Checked delivery behavior.", completed_steps=("Read a.py",),
+        proposed_next_actions=("Inspect the consumer",),
+    )
+    second = replace(
+        first, working_summary="Delivery behavior was checked in detail.",
+        completed_steps=("Inspected a.py",),
+    )
+
+    assert session._checkpoint_progress_fingerprint(first) == (
+        session._checkpoint_progress_fingerprint(second)
+    )
 
 
 def test_compaction_without_valid_checkpoint_keeps_assistant_analysis():
@@ -3017,18 +3058,29 @@ def test_controller_derived_tool_association_covers_typed_obligation():
             "result": {"content": "implementation"},
         }
 
+    evidence_id = canonical_evidence_key(
+        "read_file", {"path": "a.py"},
+        {"tool": "read_file", "status": "ok", "result": {"content": "implementation"}},
+    )
     gateway = ScriptedGateway([
         tool_call_response(
             "read_file",
             {"path": "a.py", "obligation_ids": ["OB-code"]},
         ),
-        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+        checkpoint_response(
+            inspected=["a.py"], unresolved=["OB-tests"],
+            obligation_updates=[{
+                "target": "O1", "disposition": "covered", "reason": "Verified.",
+                "evidence_ids": [evidence_id], "next_actions": [],
+            }],
+        ),
     ])
 
     result = make_session(gateway, execute_tool=execute_tool).explore()
 
     assert seen[0][1] == {"path": "a.py"}
-    assert dict(result.checkpoint.obligation_statuses)["OB-code"].value == "covered"
+    assert dict(result.checkpoint.obligation_statuses)["OB-code"].value == "pending"
+    assert result.checkpoint.obligation_assessments[0].disposition.value == "covered"
     assert result.checkpoint.evidence_ids
 
 
@@ -3611,7 +3663,10 @@ def test_unscoped_obligation_requires_matching_evidence_category():
     )
     checkpoint = checkpoint_response(inspected=[], unresolved=[])
     raw = json.loads(checkpoint.text)
-    raw["evidence_by_obligation"] = {"OB-unscoped": [evidence_id]}
+    raw["obligation_updates"] = [{
+        "target": "O1", "disposition": "covered", "reason": "Verified.",
+        "evidence_ids": [evidence_id], "next_actions": [],
+    }]
     checkpoint = ModelTurnResult(**{**checkpoint.__dict__, "text": json.dumps(raw)})
     gateway = ScriptedGateway([
         tool_call_response(
@@ -3624,8 +3679,8 @@ def test_unscoped_obligation_requires_matching_evidence_category():
         gateway, obligations=(obligation,), assignment=assignment,
     ).explore()
 
-    assert dict(result.checkpoint.obligation_statuses)["OB-unscoped"].value == "covered"
-    assert result.checkpoint.unknowns == ()
+    assert dict(result.checkpoint.obligation_statuses)["OB-unscoped"].value == "pending"
+    assert result.checkpoint.obligation_assessments[0].disposition.value == "covered"
 
 
 def test_session_consumes_task_three_assignment_contract():
