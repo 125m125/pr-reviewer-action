@@ -225,7 +225,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
-      - uses: 125m125/pr-reviewer-action@899b89b7bdfad251d841f97f300d8bb62e9bdcf9
+      - uses: 125m125/pr-reviewer-action@453eb33012a8790bfa159571c3404e2e5a3a0655
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           ai_base_url: ${{ vars.LM_STUDIO_BASE_URL }}
