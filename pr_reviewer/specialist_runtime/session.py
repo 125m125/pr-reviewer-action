@@ -1016,7 +1016,7 @@ class SpecialistSession:
         self._successful_collections: dict[str, str] = {}
         self._tool_call_evidence_ids: dict[str, str] = {}
         self._compacted_evidence: dict[str, EvidenceRecord] = {}
-        self._compacted_evidence_read_keys: set[tuple[str, str, str, int, int, int]] = set()
+        self._compacted_evidence_read_keys: set[tuple[str, str, str, int]] = set()
         self._compacted_evidence_reads = 0
         self._compacted_evidence_generation = 0
         self._last_compact_progress_fingerprint = ""
@@ -1859,8 +1859,21 @@ class SpecialistSession:
                 self.conversation.add_tool_result(call_id, {"error": str(exc)}, is_error=True)
                 continue
             if name == COMPACTED_EVIDENCE_TOOL_NAME:
+                recovered = self._read_compacted_evidence(arguments)
+                recovered_evidence_id = str(
+                    recovered.get("evidence_id") or ""
+                ).strip()
+                if (
+                    recovered.get("status") == "ok"
+                    and recovered_evidence_id in self._compacted_evidence
+                ):
+                    # Make this a normal compaction replacement candidate. The
+                    # epoch compactor still retains the newest two complete
+                    # exchanges, pinning a justified recovery through the next
+                    # boundary without retaining it forever.
+                    self._tool_call_evidence_ids[call_id] = recovered_evidence_id
                 self.conversation.add_tool_result(
-                    call_id, self._read_compacted_evidence(arguments),
+                    call_id, recovered,
                 )
                 continue
             if name in _OBLIGATION_LOCAL_TOOL_NAMES:
@@ -3463,7 +3476,6 @@ class SpecialistSession:
         limit = min(raw_limit, _MAX_COMPACTED_EVIDENCE_READ_CHARS)
         key = (
             evidence_id, target, purpose, self._compacted_evidence_generation,
-            offset, limit,
         )
         if key in self._compacted_evidence_read_keys:
             self.budget.record_no_progress()

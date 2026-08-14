@@ -312,6 +312,26 @@ def test_stable_ids_do_not_merge_distinct_subjects_with_the_same_slug():
     assert len(set(implementation_ids)) == 2
 
 
+def test_non_production_files_do_not_gain_generic_implementation_obligations():
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.policy import ReviewPolicy
+
+    paths = (
+        "tests/test_worker.py", "generated/client.py", "migrations/001_seed.py",
+        "deploy/render.py", "fixtures/sample.py",
+    )
+    obligations = derive_obligations(
+        {"changed_files": list(paths), "file_roles": ["implementation", "test"]},
+        {}, ReviewPolicy.minimal(),
+    )
+    implementation_scopes = {
+        item.scope[0] for item in obligations
+        if item.required_evidence == ("implementation",) and len(item.scope) == 1
+    }
+
+    assert implementation_scopes.isdisjoint(paths)
+
+
 def test_independent_recipe_requires_independent_verification():
     from pr_reviewer.specialist_runtime.coverage import derive_obligations
     from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy

@@ -775,7 +775,7 @@ def _deterministic_handoff_focus(
 
 def _deterministic_reviewed_summary(
     *,
-    changed_files: Iterable[str],
+    evidence_paths: Iterable[str],
     component_ids: Iterable[str],
     reviewed_obligations: Iterable[CoverageObligation],
 ) -> tuple[str, ...]:
@@ -789,14 +789,7 @@ def _deterministic_reviewed_summary(
     scope = " and ".join(components[:4]) or "the affected components"
     paths = tuple(dict.fromkeys(
         str(path).replace("\\", "/")
-        for path in (
-            *changed_files,
-            *(
-                path
-                for obligation in reviewed_obligations
-                for path in (*obligation.scope, *obligation.seed_hints)
-            ),
-        )
+        for path in evidence_paths
         if str(path).strip()
     ))
     if not paths:
@@ -2079,6 +2072,7 @@ def _evidence_projection(record: object) -> dict[str, object]:
         "mime_type": getattr(record, "mime_type"),
         "truncated": getattr(record, "truncated"),
         "redacted": getattr(record, "redacted"),
+        "redaction_types": list(getattr(record, "redaction_types", ())),
         "imported_by": list(getattr(record, "imported_by")),
         "supersedes": list(getattr(record, "supersedes")),
         "contradicts": list(getattr(record, "contradicts")),
@@ -3394,11 +3388,54 @@ class ReviewController:
                     "outcome": "recorded_infeasible",
                 })
                 continue
+            latest_usage: dict[str, BudgetUsage] = {}
+            for session_result in state.session_results.values():
+                usage = getattr(session_result, "budget", BudgetUsage())
+                existing = latest_usage.get(session_result.session_id, BudgetUsage())
+                latest_usage[session_result.session_id] = BudgetUsage(
+                    model_turns=max(existing.model_turns, usage.model_turns),
+                    tool_calls=max(existing.tool_calls, usage.tool_calls),
+                    recoveries=max(existing.recoveries, usage.recoveries),
+                )
+            for session_id, usage in state.failed_session_budgets.items():
+                existing = latest_usage.get(session_id, BudgetUsage())
+                latest_usage[session_id] = BudgetUsage(
+                    model_turns=max(existing.model_turns, usage.model_turns),
+                    tool_calls=max(existing.tool_calls, usage.tool_calls),
+                    recoveries=max(existing.recoveries, usage.recoveries),
+                )
+            remaining_turns = max(
+                0,
+                state.inputs.config.max_total_model_turns
+                - sum(item.model_turns for item in latest_usage.values()),
+            )
+            remaining_tools = max(
+                0,
+                state.inputs.config.max_total_tool_calls
+                - sum(item.tool_calls for item in latest_usage.values()),
+            )
+            if remaining_turns <= 0 or remaining_tools <= 0:
+                for obligation in selected:
+                    state.unknowns.append({
+                        "obligation_id": obligation.id,
+                        "reason": "global specialist lease exhausted before follow-up admission",
+                        "resolution_policy": obligation.unresolved_policy,
+                    })
+                    assert state.coverage is not None
+                    state.coverage.mark_unresolved(obligation.id)
+                state.journal.emit("negotiation_action_applied", {
+                    "kind": action.kind,
+                    "obligation_ids": action.obligation_ids,
+                    "outcome": "global_lease_exhausted",
+                })
+                continue
             assignment = replace(
                 plan.assignments[0],
                 id=f"{plan.assignments[0].id}-followup-{index}",
                 title=f"{plan.assignments[0].title} follow-up {index}",
                 estimated_turns=min(action.estimated_turns, plan.assignments[0].estimated_turns),
+                model_turn_limit=min(plan.assignments[0].model_turn_limit, remaining_turns),
+                tool_call_limit=min(plan.assignments[0].tool_call_limit, remaining_tools),
             )
             state.assignments[assignment.id] = assignment
             result.append(assignment)
@@ -3749,11 +3786,15 @@ class ReviewController:
             if isinstance(item, Mapping) and str(item.get("id", "")).strip()
         ))
         summarized_review = _deterministic_reviewed_summary(
-            changed_files=state.inputs.changed_files,
+            evidence_paths=(
+                record.source_path
+                for record in state.evidence.snapshot().records
+                if record.is_usable_for_coverage and record.source_path
+            ),
             component_ids=component_ids,
             reviewed_obligations=reviewed_obligations,
         )
-        if summarized_review and status == "degraded":
+        if summarized_review and not ai_reviewed:
             ai_reviewed = summarized_review
         else:
             ai_reviewed = ai_reviewed[:3]
@@ -4451,6 +4492,22 @@ class ReviewController:
             "base_sha": state.inputs.base_sha,
             "budgets": {
                 "sessions": session_budgets,
+                "global_limits": {
+                    "model_turns": state.inputs.config.max_total_model_turns,
+                    "tool_calls": state.inputs.config.max_total_tool_calls,
+                },
+                "global_remaining": {
+                    "model_turns": max(
+                        0,
+                        state.inputs.config.max_total_model_turns
+                        - sum(item["model_turns"] for item in session_budgets.values()),
+                    ),
+                    "tool_calls": max(
+                        0,
+                        state.inputs.config.max_total_tool_calls
+                        - sum(item["tool_calls"] for item in session_budgets.values()),
+                    ),
+                },
                 "request_attempts": [
                     _json_value(state.request_attempts[key])
                     for key in sorted(state.request_attempts)

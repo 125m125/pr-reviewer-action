@@ -251,10 +251,12 @@ jobs:
           model_context_tokens: "80056"
           specialist_review_deadline_sec: "7200"
           specialist_concurrency: "1"
-          specialist_max_sessions: "8"
+          specialist_max_sessions: "12"
           specialist_max_followup_sessions: "2"
           specialist_max_model_turns_per_session: "64"
           specialist_max_tool_calls_per_session: "128"
+          specialist_max_total_model_turns: "320"
+          specialist_max_total_tool_calls: "640"
           specialist_max_recoveries_per_session: "1"
           specialist_planner_max_tokens: "8192"
           specialist_max_tokens: "8192"
@@ -269,6 +271,27 @@ not a universal constant. Replace it with the other provider's real configured
 window. After a successful evaluation, change `review_strategy` to `specialists`
 and `publish_review_comment` to `"true"`. Raise `specialist_concurrency` only
 after confirming provider capacity and deterministic replay behavior.
+
+For large reviews, `specialist_max_sessions: "12"` is a focus ceiling, not a
+budget multiplier. The controller groups compatible atomic obligations into
+bounded review families and distributes the shared 320-turn/640-tool-call lease
+by risk. Keep tool calls above model turns because one native model response can
+request multiple related reads. Lower the global pair together when review time
+must be reduced; do not reduce only the tool lease or specialists may lose their
+main continuation signal.
+
+Specialists can batch up to eight related changed paths with
+`read_pr_diff(paths=[...])`; the old single `path` form remains valid. Each path
+is retained as separate evidence under one shared response cap. Compacted
+evidence recovery now requires an exact controller-provided `target` plus one of
+`candidate_support`, `obligation_resolution`, or `contradiction_check`. It is
+not a general evidence browsing tool, and repeating the same recovery without a
+candidate or obligation state change is rejected as no progress.
+
+Repository source redaction preserves dynamic expressions such as
+`{api_token}`, `$TOKEN`, `${TOKEN}`, and `%TOKEN%`. Literal credentials are
+still replaced with `[REDACTED_VALUE]`, and artifact metadata labels that as a
+controller-applied source redaction rather than application behavior.
 
 ## Downstream adaptation checklist
 

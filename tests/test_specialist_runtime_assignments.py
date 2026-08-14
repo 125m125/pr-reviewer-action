@@ -815,6 +815,28 @@ def test_independent_and_ordinary_obligations_never_share_a_review_family():
     }
 
 
+def test_global_lease_never_admits_zero_budget_sessions(topology):
+    obligations = tuple(
+        CoverageObligation(
+            obligation_id=f"independent-{index}", origin="recipe", subject=str(index),
+            required_evidence_categories=("implementation",),
+            recipe_id=f"recipe-{index}", recipe_execution="independent",
+            requires_independent_verification=True,
+        )
+        for index in range(3)
+    )
+    config = RuntimeConfig(
+        max_sessions=8, max_total_model_turns=1, max_total_tool_calls=1,
+    )
+
+    plan = fallback_assignment_plan(obligations, topology, config)
+
+    assert len(plan.assignments) == 1
+    assert plan.assignments[0].model_turn_limit == 1
+    assert plan.assignments[0].tool_call_limit == 1
+    assert len(plan.unassigned_obligation_ids) == 2
+
+
 def test_planner_prompt_includes_immutable_obligation_ids_only(obligations, topology, runtime_config):
     prompt = planner_prompt(obligations, topology, runtime_config)
 

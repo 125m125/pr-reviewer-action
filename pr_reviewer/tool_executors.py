@@ -21,7 +21,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from redact import mask_and_truncate, mask_secrets  # noqa: E402
+from redact import mask_and_truncate, mask_secrets, mask_source_secrets  # noqa: E402
 
 # The gh_api allowlist + denied path segments live on the platform seam (single
 # source of truth); _resolve_workspace_path reuses GH_DENY_SUBSTRINGS to block
@@ -50,6 +50,47 @@ ALLOWED_COMMANDS = {
     "git_diff_name_only": ["git", "diff", "--name-only", "HEAD"],
 }
 _GIT_OBJECT_ID_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
+
+
+def _truncate_utf8(text, max_bytes, marker="\n[truncated]"):
+    raw = str(text or "").encode("utf-8", errors="replace")
+    if len(raw) <= max_bytes:
+        return raw.decode("utf-8", errors="replace"), False
+    marker_bytes = marker.encode("utf-8")
+    if max_bytes <= len(marker_bytes):
+        return marker_bytes[:max_bytes].decode("utf-8", errors="ignore"), True
+    clipped = raw[:max_bytes - len(marker_bytes)].decode("utf-8", errors="ignore")
+    return clipped + marker, True
+
+
+def _source_text(text, max_bytes):
+    masked, _count = mask_source_secrets(text)
+    return _truncate_utf8(masked, max_bytes)[0]
+
+
+def _bound_batched_diff_result(patches, max_bytes):
+    compact = [{
+        "path": item["path"],
+        "status": item["status"],
+        "patch": item.get("patch", ""),
+        "truncated": bool((item.get("range") or {}).get("truncated")),
+    } for item in patches]
+    result = {"patches": compact, "shared_max_bytes": max_bytes}
+    encode = lambda: json.dumps(result, separators=(",", ":")).encode("utf-8")
+    while len(encode()) > max_bytes:
+        candidates = [item for item in compact if item["patch"]]
+        if not candidates:
+            break
+        largest = max(candidates, key=lambda item: len(item["patch"].encode("utf-8")))
+        excess = len(encode()) - max_bytes
+        current = len(largest["patch"].encode("utf-8"))
+        largest["patch"], _ = _truncate_utf8(
+            largest["patch"], max(0, current - max(excess, 1)), "",
+        )
+        largest["truncated"] = True
+    if len(encode()) > max_bytes:
+        return {"truncated": True}
+    return result
 
 def command_catalog_markdown():
     return ", ".join(sorted(ALLOWED_COMMANDS))
@@ -458,8 +499,7 @@ def execute_tool_request(
             )
             if res.get("error"):
                 raise ValueError(res["error"])
-            text = mask_secrets(res.get("content", ""))
-            text, _ = mask_and_truncate(text, max_response_bytes)
+            text = _source_text(res.get("content", ""), max_response_bytes)
             result_payload = {"content": text}
             if res.get("range"):
                 result_payload["range"] = res["range"]
@@ -514,10 +554,9 @@ def execute_tool_request(
                         "range": nested_result.get("range"),
                         "error": nested_result.get("error"),
                     })
-                tool_result["result"] = {
-                    "patches": patches,
-                    "shared_max_bytes": max_response_bytes,
-                }
+                tool_result["result"] = _bound_batched_diff_result(
+                    patches, max_response_bytes,
+                )
                 tool_result["status"] = (
                     "ok" if all(item["status"] == "ok" for item in patches) else "error"
                 )
@@ -597,7 +636,7 @@ def execute_tool_request(
                 raise ValueError(
                     f"git diff failed: {mask_secrets(output.strip())}"
                 )
-            masked_patch = mask_secrets(output)
+            masked_patch, _redaction_count = mask_source_secrets(output)
             encoded_patch = masked_patch.encode("utf-8", errors="replace")
             if len(encoded_patch) > max_response_bytes:
                 marker = b"\n[truncated]"
@@ -642,7 +681,7 @@ def execute_tool_request(
             )
             if res.get("error"):
                 raise ValueError(res["error"])
-            text, _ = mask_and_truncate(res.get("blame", ""), max_response_bytes)
+            text = _source_text(res.get("blame", ""), max_response_bytes)
             tool_result["result"] = {"blame": text}
 
         elif tool_name == "git_grep":
@@ -653,7 +692,7 @@ def execute_tool_request(
             if res.get("error"):
                 raise ValueError(res["error"])
             matches = res.get("matches", [])
-            text = mask_secrets("\n".join(matches))
+            text, _redaction_count = mask_source_secrets("\n".join(matches))
             encoded = text.encode("utf-8", errors="replace")
             if len(encoded) > max_response_bytes:
                 marker = b"\n[truncated]"

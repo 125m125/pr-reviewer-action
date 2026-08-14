@@ -657,7 +657,7 @@ def test_eval_harness_runs_offline_specialist_corpus_and_returns_acceptance_stat
     replay = report["offline_specialist_replays"][0]
     assert replay["id"] == "multilingual-specialist-runtime"
     assert replay["passed"] is True
-    assert replay["metrics"]["obligation_accounting"]["observed"] == 27
+    assert replay["metrics"]["obligation_accounting"]["observed"] == 22
     assert replay["metrics"]["review_note_anchor_types"]["line"] == 1
     assert replay["metrics"]["finalization_reserve_seconds"] == 30
     web = report["offline_specialist_replays"][1]

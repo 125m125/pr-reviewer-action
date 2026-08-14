@@ -1,10 +1,30 @@
 import io
+import json
 import subprocess
 import threading
 from pathlib import Path
 
 from pr_reviewer import tool_executors
 from scripts import run_tool_harness
+
+
+def test_source_tools_preserve_dynamic_secret_references(tmp_path):
+    path = "src/config.py"
+    (tmp_path / "src").mkdir()
+    (tmp_path / path).write_text(
+        "api_token={api_token}\npassword=settings.api_token\n"
+        "secret=abcdefghijklmnopqrstuvwxyz\n",
+        encoding="utf-8",
+    )
+
+    result = tool_executors.execute_tool_request(
+        "read_file", {"path": path}, str(tmp_path), set(), "", (), 12000, 15,
+    )
+
+    assert result["status"] == "ok"
+    assert "api_token={api_token}" in result["result"]["content"]
+    assert "password=settings.api_token" in result["result"]["content"]
+    assert "secret=[REDACTED_VALUE]" in result["result"]["content"]
 
 
 def test_run_command_rejects_raw_shell_text(tmp_path):
@@ -200,7 +220,7 @@ def test_read_pr_diff_batches_authorized_paths_under_one_shared_cap(
     assert [item["path"] for item in result["result"]["patches"]] == [
         "src/a.py", "tests/test_a.py",
     ]
-    assert sum(len(item["patch"].encode()) for item in result["result"]["patches"]) <= 180
+    assert len(json.dumps(result["result"], separators=(",", ":")).encode()) <= 180
 
 
 def test_read_pr_diff_rejects_oversized_or_unauthorized_batches(tmp_path):
@@ -220,6 +240,33 @@ def test_read_pr_diff_rejects_oversized_or_unauthorized_batches(tmp_path):
     assert "at most 8" in too_many["result"]["error"]
     assert outside["status"] == "error"
     assert "assignment" in outside["result"]["error"]
+
+
+def test_read_pr_diff_batch_uses_minimal_marker_when_metadata_cannot_fit(
+    monkeypatch, tmp_path,
+):
+    path = "src/" + "very-long-" * 20 + "file.py"
+    target = tmp_path / path
+    target.parent.mkdir(parents=True)
+    target.write_text("head\n", encoding="utf-8")
+
+    class FakeProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.stdout = io.BytesIO(b"+changed\n")
+            self.returncode = 0
+        def kill(self):
+            self.returncode = -9
+        def wait(self, timeout):
+            return self.returncode
+
+    monkeypatch.setattr(tool_executors.subprocess, "Popen", FakeProcess)
+    result = tool_executors.execute_tool_request(
+        "read_pr_diff", {"paths": [path]}, str(tmp_path), set(), "", (), 50, 15,
+        base_sha="1" * 40, head_sha="2" * 40, allowed_diff_paths=(path,),
+    )
+
+    assert len(json.dumps(result["result"], separators=(",", ":")).encode()) <= 50
+    assert result["result"] == {"truncated": True}
 
 
 def test_read_pr_diff_treats_magic_looking_assigned_filename_literally(

@@ -145,5 +145,5 @@ def test_git_grep_returns_only_redacted_bounded_matches(git_repo):
     retained = "\n".join(result["result"]["matches"])
     assert result["status"] == "ok"
     assert secret not in retained
-    assert "[REDACTED]" in retained
+    assert "[REDACTED_VALUE]" in retained
     assert len(retained.encode("utf-8")) <= 96

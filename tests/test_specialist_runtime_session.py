@@ -238,8 +238,16 @@ def test_compacted_evidence_reader_is_strict_and_deduplicated():
     assert session._execute_calls((first,)) is False
     assert "retained source" in session.conversation.events[-1]["content"]
     assert session.budget.snapshot().tool_calls == 0
+    assert session._tool_call_evidence_ids["read-1"] == record.id
 
-    repeated = {**first, "id": "read-2"}
+    repeated = {
+        **first,
+        "id": "read-2",
+        "arguments": json.dumps({
+            "evidence_id": record.id, "target": "OB-code",
+            "purpose": "obligation_resolution", "offset": 5, "limit": 10,
+        }),
+    }
     session._execute_calls((repeated,))
     assert "replayed_compacted" in session.conversation.events[-1]["content"]
 

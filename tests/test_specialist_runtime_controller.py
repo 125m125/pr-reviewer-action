@@ -537,7 +537,7 @@ def test_deterministic_handoff_focus_explains_unresolved_coverage():
 
 def test_deterministic_reviewed_summary_describes_scope_not_methods():
     summary = _deterministic_reviewed_summary(
-        changed_files=("pr_reviewer/conversation.py", "tests/test_runtime.py"),
+        evidence_paths=("pr_reviewer/conversation.py", "tests/test_runtime.py"),
         component_ids=("model-transport", "tests"),
         reviewed_obligations=(
             CoverageObligation(
@@ -552,6 +552,18 @@ def test_deterministic_reviewed_summary_describes_scope_not_methods():
         "The AI examined assigned behavior across model-transport and tests using retained "
         "changed evidence from `pr_reviewer/conversation.py`, `tests/test_runtime.py`.",
     )
+
+
+def test_deterministic_reviewed_summary_does_not_claim_unretained_changed_paths():
+    summary = _deterministic_reviewed_summary(
+        evidence_paths=(),
+        component_ids=("runtime",),
+        reviewed_obligations=(CoverageObligation(
+            obligation_id="obligation:one", origin="recipe", subject="runtime",
+        ),),
+    )
+
+    assert summary == ()
 
 
 @pytest.mark.parametrize(
@@ -1179,6 +1191,11 @@ def test_controller_runs_obligations_assignments_sessions_and_finalizer(tmp_path
     assert result.handoff.markdown.startswith("## AI Review Handoff")
     assert result.notes[0].evidence_ids
     assert result.verdict in {"approve", "request_changes", "notice"}
+    assert result.artifact["budgets"]["global_limits"] == {
+        "model_turns": 320, "tool_calls": 640,
+    }
+    assert result.artifact["budgets"]["global_remaining"]["model_turns"] >= 0
+    assert result.artifact["assignments"][0]["families"]
     assert result.artifact_path == tmp_path / "specialist-review-artifact.json"
     assert result.artifact_path.read_bytes().startswith(b'{"accepted_candidates"')
     assert [event.payload["phase"] for event in result.events if event.kind == "phase_changed"] == [

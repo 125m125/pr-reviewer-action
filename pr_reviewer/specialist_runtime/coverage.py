@@ -339,7 +339,17 @@ def derive_obligations(
     obligations: dict[str, CoverageObligation] = {}
 
     for path in changed_files:
-        if "implementation" in classify_file_roles(path):
+        path_roles = set(classify_file_roles(path))
+        non_production_roles = {
+            "test", "documentation", "generated", "migration",
+            "build-manifest", "deployment",
+        }
+        fixture_path = re.search(r"(^|/)(fixtures?|testdata|samples?)(/|$)", path.lower())
+        if (
+            "implementation" in path_roles
+            and not path_roles.intersection(non_production_roles)
+            and not fixture_path
+        ):
             _add_obligation(
                 obligations, origin="topology", subject=path, evidence_category="implementation",
                 scope=(path,), seed_hints=(path,),

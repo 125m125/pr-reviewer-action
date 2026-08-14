@@ -112,6 +112,7 @@ class TestMaskSecrets:
 class TestMaskSourceSecrets:
     @pytest.mark.parametrize("reference", (
         "{api_token}", "$TOKEN", "${TOKEN}", "%TOKEN%", "api_token",
+        "settings.auth.api_token",
     ))
     def test_dynamic_secret_references_preserve_source_semantics(self, reference):
         source = f'return f"delivery failed; api_token={reference}"'
@@ -127,6 +128,14 @@ class TestMaskSourceSecrets:
         result, redaction_count = mask_source_secrets(source)
 
         assert result == 'api_token="[REDACTED_VALUE]"'
+        assert redaction_count == 1
+
+    def test_dotted_literal_credential_is_not_treated_as_a_reference(self):
+        source = "token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.signature"
+
+        result, redaction_count = mask_source_secrets(source)
+
+        assert result == "token=[REDACTED_VALUE]"
         assert redaction_count == 1
 
 

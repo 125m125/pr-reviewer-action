@@ -314,6 +314,15 @@ def _validate_budget(assignments: tuple[Assignment, ...], config: RuntimeConfig)
     errors: list[str] = []
     if len(assignments) > config.max_sessions:
         errors.append(f"session cap exceeded: {len(assignments)} assignments > {config.max_sessions}")
+    global_session_cap = min(
+        config.max_sessions,
+        config.max_total_model_turns,
+        config.max_total_tool_calls,
+    )
+    if len(assignments) > global_session_cap:
+        errors.append(
+            f"global lease cannot admit {len(assignments)} positive-budget sessions"
+        )
     return errors
 
 
@@ -1021,6 +1030,11 @@ def fallback_assignment_plan(
 ) -> AssignmentPlan:
     """Create complete controller-owned coverage within the hard session cap."""
     groups: dict[str, list[CoverageObligation]] = defaultdict(list)
+    session_cap = min(
+        runtime_config.max_sessions,
+        runtime_config.max_total_model_turns,
+        runtime_config.max_total_tool_calls,
+    )
     components = _component_paths(topology)
     for obligation in _validated_assignable_obligations(obligations):
         groups[_fallback_group(obligation, components)].append(obligation)
@@ -1035,7 +1049,7 @@ def fallback_assignment_plan(
             ordinary_groups.append((key, items))
 
     ordinary_candidates: list[tuple[str, list[CoverageObligation]]] = []
-    if ordinary_groups and runtime_config.max_sessions > 0:
+    if ordinary_groups and session_cap > 0:
         # Preserve room for isolated candidates while always creating at least
         # one ordinary contender so immutable risk, not isolation kind, decides
         # who receives the final hard session slot.
@@ -1051,8 +1065,8 @@ def fallback_assignment_plan(
         )
         available_slots = max(
             1,
-            runtime_config.max_sessions
-            - min(len(isolated_candidates), runtime_config.max_sessions - 1),
+            session_cap
+            - min(len(isolated_candidates), session_cap - 1),
         )
         ordinary_slots = min(available_slots, max(1, workload_slots))
         bucket_count = min(ordinary_slots, len(ordinary_groups))
@@ -1069,8 +1083,8 @@ def fallback_assignment_plan(
         (*isolated_candidates, *ordinary_candidates),
         key=lambda item: (_PRIORITY_RANK[_priority(item[1])], item[0]),
     )
-    admitted = candidates[:runtime_config.max_sessions]
-    overflow_groups = candidates[runtime_config.max_sessions:]
+    admitted = candidates[:session_cap]
+    overflow_groups = candidates[session_cap:]
     assignments = [
         _fallback_assignment(
             key,

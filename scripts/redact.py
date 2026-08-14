@@ -44,7 +44,9 @@ _RE_SOURCE_KV_SECRET = re.compile(
 )
 _RE_DYNAMIC_REFERENCE = re.compile(
     r"^(?:\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|"
-    r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|%[A-Za-z_][A-Za-z0-9_]*%)$"
+    r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|%[A-Za-z_][A-Za-z0-9_]*%|"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*\.)+(?:api[_-]?key|api[_-]?token|auth[_-]?token|"
+    r"access[_-]?key|token|password|secret))$"
 )
 
 
