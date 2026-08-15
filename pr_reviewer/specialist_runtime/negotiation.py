@@ -24,6 +24,7 @@ _ACTION_ALIASES = {
     "new-session": "new_session",
 }
 _ACTION_RANK = {"resume": 0, "consult": 1, "new_session": 2, "record_unknown": 3}
+_CHECKPOINT_TURN_RESERVE = 2
 _ACTION_FIELDS = frozenset({
     "kind", "session_id", "obligation_ids", "expected_evidence",
     "estimated_turns", "reason",
@@ -249,7 +250,10 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
         owner_actions = []
         for owner in owners if has_novel_action else ():
             resource = resources.get(owner.session_id)
-            if resource is None or resource.remaining_model_turns <= 0:
+            if (
+                resource is None
+                or resource.remaining_model_turns <= _CHECKPOINT_TURN_RESERVE
+            ):
                 continue
             if resource.remaining_tool_calls <= 0:
                 continue
@@ -382,7 +386,7 @@ def _compact_session_for(
         owner for owner in sorted(owners, key=lambda item: item.session_id)
         if (
             resources.get(owner.session_id) is not None
-            and resources[owner.session_id].remaining_model_turns > 0
+            and resources[owner.session_id].remaining_model_turns > _CHECKPOINT_TURN_RESERVE
             and resources[owner.session_id].remaining_tool_calls > 0
             and resources[owner.session_id].lease_remaining_sec >= state.seconds_per_turn
         )
@@ -607,8 +611,18 @@ def _validate_feasibility(
         if resource is None:
             errors.append(f"session '{session_id}' has no remaining budget/lease projection")
             continue
+        usable_turns = max(
+            0, resource.remaining_model_turns - _CHECKPOINT_TURN_RESERVE,
+        )
         if turns > resource.remaining_model_turns:
-            errors.append(f"session '{session_id}' exceeds its remaining model-turn budget")
+            errors.append(
+                f"session '{session_id}' exceeds its remaining model-turn budget"
+            )
+        elif turns > usable_turns:
+            errors.append(
+                f"session '{session_id}' exceeds exploration turns available "
+                "after checkpoint reserve"
+            )
         if resource.remaining_tool_calls == 0:
             errors.append(f"session '{session_id}' has no remaining tool-call budget")
         if turns * state.seconds_per_turn > resource.lease_remaining_sec:
@@ -749,9 +763,18 @@ def fallback_next_action(state: NegotiationState) -> NegotiationAction:
         raise NegotiationError("no uncovered mandatory obligations remain")
     obligation = uncovered[0]
     assessment = _assessment_by_obligation(state).get(obligation.id)
-    if assessment is not None and not (
-        assessment.disposition is ObligationDisposition.UNRESOLVED
-        and assessment.next_actions
+    if (
+        assessment is not None
+        and (
+            (
+                assessment.disposition is ObligationDisposition.UNRESOLVED
+                and not assessment.next_actions
+            )
+            or (
+                assessment.disposition is ObligationDisposition.PENDING
+                and obligation.risk_tier not in {"high", "critical"}
+            )
+        )
     ):
         return validate_negotiation(
             _fallback_raw("record_unknown", obligation), state,
@@ -761,7 +784,14 @@ def fallback_next_action(state: NegotiationState) -> NegotiationAction:
         item.session_id for item in state.session_ownership
         if obligation.id in item.primary_obligation_ids
     )
+    resources = {item.session_id: item for item in state.session_resources}
     for session_id in primary_owners:
+        resource = resources.get(session_id)
+        if (
+            resource is None
+            or resource.remaining_model_turns <= _CHECKPOINT_TURN_RESERVE
+        ):
+            continue
         try:
             return validate_negotiation(
                 _fallback_raw("resume", obligation, session_id=session_id), state

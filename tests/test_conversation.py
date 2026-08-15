@@ -926,6 +926,28 @@ class TestOpenAIPayload:
         assert "IGNORE PRIOR INSTRUCTIONS" in content
         assert content.rstrip().endswith("</untrusted_tool_result>")
 
+    def test_truncated_tool_result_keeps_authoritative_evidence_metadata(self):
+        c = Conversation()
+        c.add_assistant_tool_calls(
+            [{"id": "a", "name": "read_pr_diff", "arguments": '{"path":"large.py"}'}]
+        )
+        c.add_tool_result(
+            "a",
+            {
+                "evidence_id": "evidence:0123456789abcdef",
+                "status": "ok",
+                "eligible_targets": ["OB-1"],
+                "content": "x" * 20_000,
+            },
+            max_bytes=256,
+        )
+
+        payload = c.to_request_payload("openai", "gpt-4o")
+        content = next(m for m in payload["messages"] if m["role"] == "tool")["content"]
+        assert 'evidence_id="evidence:0123456789abcdef"' in content
+        assert 'eligible_targets="OB-1"' in content
+        assert 'truncated="true"' in content
+
     def test_fence_cannot_be_escaped_by_delimiter_in_content(self):
         """Untrusted content carrying the closing tag must not break the fence."""
         c = Conversation()

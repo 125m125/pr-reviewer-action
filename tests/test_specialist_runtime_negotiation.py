@@ -114,11 +114,11 @@ def state_for(
         ),
         session_resources=resources or (
             SessionResources(
-                "S1", remaining_model_turns=3, remaining_tool_calls=3,
+                "S1", remaining_model_turns=4, remaining_tool_calls=3,
                 lease_remaining_sec=100.0,
             ),
             SessionResources(
-                "S2", remaining_model_turns=3, remaining_tool_calls=3,
+                "S2", remaining_model_turns=4, remaining_tool_calls=3,
                 lease_remaining_sec=100.0,
             ),
         ),
@@ -882,7 +882,7 @@ def test_valid_resume_preserves_owner_and_returns_immutable_typed_proposal():
     [
         (resume_raw(obligation_ids=["OB2"]), "primary owner"),
         (resume_raw(expected_evidence=["implementation"]), "expected new evidence"),
-        (resume_raw(estimated_turns=4), "remaining model-turn budget"),
+        (resume_raw(estimated_turns=4), "checkpoint reserve"),
     ],
 )
 def test_resume_requires_ownership_evidence_gain_and_budget(raw, message):
@@ -967,7 +967,7 @@ def test_negotiation_uses_explicit_session_to_specialist_assignment_ownership():
             primary_obligation_ids=("OB1",),
         ),),
         resources=(SessionResources(
-            "durable-session-9", remaining_model_turns=3, lease_remaining_sec=100.0,
+            "durable-session-9", remaining_model_turns=4, lease_remaining_sec=100.0,
             remaining_tool_calls=3,
         ),),
     )
@@ -1091,6 +1091,35 @@ def test_fallback_creates_one_narrow_session_when_primary_owner_is_infeasible():
     assert action.kind == "new_session"
     assert action.session_id is None
     assert action.obligation_ids == ("OB2",)
+
+
+def test_fallback_does_not_resume_owner_with_only_checkpoint_reserve():
+    resources = (
+        SessionResources("S1", remaining_model_turns=3,
+                         remaining_tool_calls=3, lease_remaining_sec=100.0),
+        SessionResources("S2", remaining_model_turns=2,
+                         remaining_tool_calls=3, lease_remaining_sec=100.0),
+    )
+
+    action = fallback_next_action(state_for(resources=resources))
+
+    assert action.kind == "new_session"
+    assert action.obligation_ids == ("OB2",)
+
+
+def test_trusted_resume_cannot_spend_checkpoint_reserve_turns():
+    resources = (
+        SessionResources("S1", remaining_model_turns=2,
+                         remaining_tool_calls=3, lease_remaining_sec=100.0),
+        SessionResources("S2", remaining_model_turns=3,
+                         remaining_tool_calls=3, lease_remaining_sec=100.0),
+    )
+
+    with pytest.raises(NegotiationError, match="checkpoint reserve"):
+        validate_negotiation(
+            resume_raw(estimated_turns=1),
+            state_for(resources=resources),
+        )
 
 
 def test_fallback_records_policy_governed_unknown_when_no_work_is_feasible():

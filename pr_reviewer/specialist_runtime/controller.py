@@ -1472,11 +1472,17 @@ def _validated_change_overview(
             path = _normalize_repository_path(reference)
             if path not in changed_paths and path not in context_paths:
                 raise ValueError(
-                    "change overview contains an unchanged path reference"
+                    "change overview contains an unchanged path reference "
+                    f"in {label}: {path}"
                 )
-        direct_context_paths = _direct_change_references(text, context_paths)
+        direct_context_paths = _direct_change_references(
+            text, context_paths - changed_paths,
+        )
         if direct_context_paths:
-            raise ValueError("change overview contains an unchanged path reference")
+            raise ValueError(
+                "change overview contains an unchanged path reference "
+                f"in {label}: {sorted(direct_context_paths)[0]}"
+            )
         return text
 
     overview = admitted_text(value.get("overview"), "overview", limit=1000)
@@ -3196,7 +3202,12 @@ class ReviewController:
             remaining_deadline_sec=state.deadline.remaining_for_exploration(now=self.clock()),
             seconds_per_turn=float(state.inputs.config.model_request_timeout_sec),
             current_session_count=len(state.assignments),
-            max_sessions=state.inputs.config.max_sessions,
+            # Follow-up sessions run after the initial wave and have their own
+            # explicit cap, so include those bounded slots in lifetime capacity.
+            max_sessions=(
+                state.inputs.config.max_sessions
+                + state.inputs.config.max_followup_sessions
+            ),
             followup_sessions_started=followup_started,
             max_followup_sessions=state.inputs.config.max_followup_sessions,
             new_session_turns_remaining=max(
@@ -3279,7 +3290,29 @@ class ReviewController:
                             "negotiator proposal must contain exactly one action"
                         )
                     proposal = validate_negotiation(raw, negotiation_state)
-                return proposal.actions
+                actions = proposal.actions
+                if (
+                    len(actions) == 1
+                    and actions[0].kind == "record_unknown"
+                    and any(
+                        item.id in actions[0].obligation_ids
+                        and item.risk_tier in {"high", "critical"}
+                        for item in negotiation_state.obligations
+                    )
+                ):
+                    alternative = fallback_next_action(negotiation_state)
+                    if alternative.kind != "record_unknown":
+                        state.journal.emit("recovery", {
+                            "component": "negotiator",
+                            "action": alternative.kind,
+                            "reason": (
+                                "high-risk target retained a feasible bounded "
+                                "investigation"
+                            ),
+                            "obligation_ids": alternative.obligation_ids,
+                        })
+                        return (alternative,)
+                return actions
             except Exception as exc:
                 # Negotiation is an optimization layer. The deterministic
                 # fallback below can still produce a bounded follow-up, so a
@@ -4336,24 +4369,22 @@ class ReviewController:
             context = self._handoff_context(
                 state, self._review_status(state),
             )
-        # Recompute after the optional finalizer: invoking it may itself have
-        # degraded the run, in which case the degraded handoff must include
-        # the broader behavioral fallback and its coverage warning.
+        # Recompute after the optional finalizer so a degraded run can append
+        # controller-owned coverage warnings without discarding prose that has
+        # already passed the handoff validator.
         deterministic_context = self._handoff_context(
             state, self._review_status(state),
         )
         if state.degradations:
             context = replace(
                 context,
-                what_changed=deterministic_context.what_changed,
-                what_changed_is_validated_overview=(
-                    deterministic_context.what_changed_is_validated_overview
-                ),
-                ai_reviewed=deterministic_context.ai_reviewed,
-                human_focus=deterministic_context.human_focus,
+                human_focus=tuple(dict.fromkeys((
+                    *context.human_focus,
+                    *deterministic_context.human_focus,
+                ))),
             )
             state.journal.emit("handoff_summary_guarded", {
-                "reason": "degraded-run-uses-controller-behavioral-prose",
+                "reason": "degraded-run-appends-controller-coverage-focus",
             })
         try:
             state.handoff = build_review_handoff(

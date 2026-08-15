@@ -514,6 +514,54 @@ def test_specialist_assignment_exposes_controller_obligation_handles():
     assert "Use the short target handles" in payload["obligation_protocol"]
 
 
+def test_checkpoint_repairs_only_missing_obligation_dispositions():
+    session = make_session(ScriptedGateway([
+        checkpoint_response(
+            inspected=[], unresolved=[],
+            obligation_updates=[], candidate_updates=[], new_candidates=[],
+        ),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ]))
+
+    result = session.request_checkpoint("checkpoint-retention-reserve")
+
+    assert result.degraded is False
+    repair_prompt = next(
+        event["content"] for event in session.conversation.events
+        if event.get("kind") == "user" and "Repair the previous checkpoint" in event["content"]
+    )
+    assert "Missing obligation decisions: O1, O2" in repair_prompt
+
+
+def test_checkpoint_schema_can_account_for_large_combined_assignment():
+    obligations = tuple(
+        CoverageObligation(
+            obligation_id=f"OB-{index}", origin="test", subject=f"src/{index}.py",
+            required_evidence_categories=("implementation",),
+            scope=(f"src/{index}.py",),
+        )
+        for index in range(16)
+    )
+    assignment = SpecialistAssignment(
+        assignment_id="large-assignment",
+        objective="Review the combined behavior",
+        primary_obligation_ids=tuple(item.id for item in obligations),
+    )
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=[], unresolved=[item.id for item in obligations],
+        ),
+    ])
+    session = make_session(
+        gateway, assignment=assignment, obligations=obligations,
+    )
+
+    session.request_checkpoint("checkpoint-retention-reserve")
+
+    schema = gateway.requests[0].response_schema
+    assert schema["properties"]["obligation_updates"]["maxItems"] >= 16
+
+
 def test_resolution_accepts_owned_full_id_and_stringified_array_arguments():
     session = make_session(ScriptedGateway([]))
     session._execute_calls(({
@@ -1798,7 +1846,10 @@ def test_checkpoint_disposition_is_explicit_in_cumulative_prompt(
     if disposition == "compact_resume":
         assert required >= {"unresolved", "working_summary", "completed_steps"}
     else:
-        assert required == {"unresolved"}
+        assert required == {
+            "unresolved", "obligation_updates", "candidate_updates",
+            "new_candidates", "unknowns",
+        }
 
 
 def test_initial_compact_resume_repairs_missing_working_memory_before_compaction():

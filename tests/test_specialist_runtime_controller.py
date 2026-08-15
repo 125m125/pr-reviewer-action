@@ -821,6 +821,30 @@ def test_change_overview_accepts_controller_supplied_context_path_without_claimi
     assert validated["overview"] == proposal["overview"]
 
 
+def test_change_overview_allows_direct_claim_when_context_path_is_also_changed(tmp_path):
+    inputs = replace(
+        _inputs(tmp_path),
+        topology={
+            **_inputs(tmp_path).topology,
+            "context_paths": {"affected_consumers": ["src/worker.py"]},
+        },
+    )
+    proposal = {
+        "overview": "Changes src/worker.py retry handling.",
+        "key_changes": [{
+            "path": "src/worker.py",
+            "component": "worker",
+            "summary": "Updates src/worker.py retry orchestration.",
+        }],
+        "cross_component_effects": [],
+        "uncertainties": [],
+    }
+
+    validated = controller_module._validated_change_overview(proposal, inputs)
+
+    assert validated["overview"] == proposal["overview"]
+
+
 def test_change_overview_rejects_direct_change_claim_for_context_path(tmp_path):
     inputs = replace(
         _inputs(tmp_path),
@@ -3461,7 +3485,7 @@ def test_degraded_handoff_rejects_focus_from_failed_planned_assignment(tmp_path)
     assert "Security-sensitive behavior" not in result.handoff.markdown
 
 
-def test_degraded_handoff_keeps_controller_behavioral_prose_over_model_summary(
+def test_degraded_handoff_keeps_valid_model_prose_and_adds_controller_focus(
     tmp_path,
 ):
     def planner(request):
@@ -3475,10 +3499,10 @@ def test_degraded_handoff_keeps_controller_behavioral_prose_over_model_summary(
     def finalizer(_request):
         return {
             "ai_reviewed_summary": (
-                "The model reviewed a list of files and methods."
+                "The model reviewed retry behavior in `src/worker.py`."
             ),
             "human_focus": "Recheck the model's file list.",
-            "referenced_paths": [],
+            "referenced_paths": ["src/worker.py"],
             "referenced_component_ids": [],
             "referenced_obligation_ids": [],
         }
@@ -3491,18 +3515,60 @@ def test_degraded_handoff_keeps_controller_behavioral_prose_over_model_summary(
     ).run(_inputs(tmp_path))
 
     assert result.artifact["evaluation_status"] == "degraded"
-    assert result.handoff.ai_reviewed != (
-        "The model reviewed a list of files and methods.",
+    assert result.handoff.ai_reviewed == (
+        "The model reviewed retry behavior in `src/worker.py`.",
     )
     assert result.handoff.what_changed[0] == (
         result.artifact["change_overview"]["overview"]
     )
-    assert len(result.handoff.what_changed) >= 2
-    assert all("list of files and methods" not in item
-               for item in result.handoff.what_changed)
+    assert all("retry behavior" not in item for item in result.handoff.what_changed)
+    assert result.handoff.human_focus[0] == "Recheck the model's file list."
+
+
+def test_followup_wave_can_replace_completed_initial_session_at_capacity(tmp_path):
+    inputs = _inputs(tmp_path)
+    recipe = RecipePolicy(
+        id="delivery",
+        title="Delivery",
+        objective="Trace delivery behavior",
+        execution="coverage",
+        match={"file_roles_any": ("implementation",)},
+        expected_evidence=("implementation",),
+        priority="high",
+    )
+    inputs = replace(
+        inputs,
+        policy=ReviewPolicy.minimal(recipes=(recipe,)),
+        config=replace(
+            inputs.config,
+            max_sessions=1,
+            max_followup_sessions=1,
+        ),
+    )
+
+    def broken_factory(*_args):
+        raise RuntimeError("specialist unavailable")
+
+    def prematurely_record_unknown(request):
+        state = request.context["negotiation_state"]
+        target = next(item for item in state.obligations if item.risk_tier == "high")
+        return {"actions": [{
+            "kind": "record_unknown",
+            "obligation_ids": [target.id],
+            "expected_evidence": list(target.required_evidence_categories),
+            "estimated_turns": 0,
+            "reason": "Stop despite remaining bounded capacity.",
+        }]}
+
+    result = _controller(
+        tmp_path,
+        session_factory=broken_factory,
+        negotiator=prematurely_record_unknown,
+    ).run(inputs)
+
     assert any(
-        item["kind"] == "handoff_summary_guarded"
-        for item in result.artifact["events"]
+        "-followup-" in item["id"]
+        for item in result.artifact["assignments"]
     )
 
 

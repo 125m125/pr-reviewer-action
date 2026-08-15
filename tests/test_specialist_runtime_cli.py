@@ -143,6 +143,39 @@ def test_planner_context_projection_is_bounded_without_losing_plan_identity():
     assert projected["obligations"][0]["obligation_id"] == "obligation-0"
 
 
+def test_planner_projection_hard_bounds_duplicated_assignment_context():
+    assignments = [{
+        "id": f"assignment-{index}",
+        "obligation_ids": [
+            f"obligation-{index}-{item}-" + ("identity" * 8)
+            for item in range(40)
+        ],
+        "obligation_briefs": [{
+            "obligation_id": f"obligation-{index}-{item}",
+            "subject": "subject " + ("x" * 400),
+            "explanation": "explanation " + ("y" * 800),
+        } for item in range(8)],
+        "changed_context": [{"path": f"src/{item}.py", "change_type": "modified"}
+                            for item in range(40)],
+    } for index in range(24)]
+    obligations = [{
+        "obligation_id": f"obligation-{index}-{item}-" + ("identity" * 8),
+        "subject": "subject " + ("z" * 400),
+        "explanation": "explanation " + ("q" * 800),
+    } for index in range(24) for item in range(40)]
+
+    projected = cli._compact_planner_context(
+        {"base_plan": {"assignments": assignments}, "obligations": obligations},
+        max_context_bytes=20_000,
+    )
+    encoded = json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+
+    assert len(encoded.encode("utf-8")) <= 19_000
+    assert [item["id"] for item in projected["base_plan"]["assignments"]] == [
+        f"assignment-{index}" for index in range(24)
+    ]
+
+
 def test_planner_projection_always_retains_nonempty_manifest_summary():
     projected = cli._compact_planner_context({
         "base_plan": {"assignments": [{

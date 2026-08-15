@@ -251,7 +251,7 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
             "items": {"type": "string", "maxLength": 500},
         },
         "obligation_updates": {
-            "type": "array", "maxItems": 12,
+            "type": "array", "maxItems": 40,
             "items": {
                 "type": "object",
                 "properties": {
@@ -272,7 +272,10 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
             },
         },
     },
-    "required": ["unresolved"],
+    "required": [
+        "unresolved", "obligation_updates", "candidate_updates",
+        "new_candidates", "unknowns",
+    ],
     "additionalProperties": False,
 }
 # Candidate lifecycle fields are additive so older providers can still emit the
@@ -316,7 +319,10 @@ _COMPACTING_CHECKPOINT_SCHEMA: dict[str, Any] = {
             "minItems": 1,
         },
     },
-    "required": ["unresolved", "working_summary", "completed_steps"],
+    "required": [
+        "unresolved", "obligation_updates", "candidate_updates",
+        "new_candidates", "unknowns", "working_summary", "completed_steps",
+    ],
 }
 
 _RECOVERY_REASONS = frozenset({
@@ -385,7 +391,10 @@ _CHECKPOINT_WORKING_MEMORY_INSTRUCTION = (
     "what was checked and concluded."
 )
 _CHECKPOINT_RETENTION_INSTRUCTION = (
-    " Required keys: unresolved, candidate_updates, new_candidates, and unknowns. "
+    " Required keys: unresolved, obligation_updates, candidate_updates, "
+    "new_candidates, and unknowns. Every still-pending obligation target must "
+    "appear either in obligation_updates or unresolved; do not repeat targets "
+    "whose controller-owned disposition was already accepted. "
     "Empty candidate_updates and new_candidates arrays are valid and mean no "
     "candidate state changed. Existing candidates remain active unless explicitly "
     "updated with status withdrawn or superseded; omission never withdraws one. "
@@ -401,7 +410,8 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
     "Use only exact "
     "retained evidence IDs (evidence:<hash>) from successful tool results in "
     "evidence_ids and supporting_evidence_ids; repository paths are not evidence IDs."
-    " JSON shape starts with {\"unresolved\":[\"OB-id\"],\"candidate_updates\":[]}."
+    " JSON shape starts with {\"unresolved\":[\"O1\"],"
+    "\"obligation_updates\":[],\"candidate_updates\":[]}."
 )
 _CHECKPOINT_REPAIR_INSTRUCTION = (
     "Repair the previous checkpoint as one JSON object matching the schema."
@@ -1022,6 +1032,7 @@ class SpecialistSession:
         self._last_compact_progress_fingerprint = ""
         self._last_checkpoint_should_resume = True
         self._last_checkpoint_dropped_keys: tuple[str, ...] = ()
+        self._last_checkpoint_validation_error = ""
         self._obligation_local_tool_calls = 0
         self._obligation_rejection_counts: dict[tuple[str, str, int], int] = {}
         self._repeated_obligation_rejection = False
@@ -2426,7 +2437,10 @@ class SpecialistSession:
         repair_error = ""
         if needs_repair and allow_repair:
             repair_attempted = True
-            self.conversation.add_user(_CHECKPOINT_REPAIR_INSTRUCTION)
+            repair_instruction = _CHECKPOINT_REPAIR_INSTRUCTION
+            if self._last_checkpoint_validation_error:
+                repair_instruction += " " + self._last_checkpoint_validation_error
+            self.conversation.add_user(repair_instruction)
             repair_event_count = len(self._request_events)
             try:
                 repair = self._request(
@@ -2560,6 +2574,7 @@ class SpecialistSession:
         *,
         require_working_memory: bool = False,
     ) -> SessionCheckpoint | None:
+        self._last_checkpoint_validation_error = ""
         raw = _json_object(text)
         if (
             isinstance(raw, Mapping)
@@ -2614,8 +2629,36 @@ class SpecialistSession:
             )
             prepared_obligation_updates.append((update, resolved_evidence_ids))
         assigned = set(self._assigned_obligation_ids())
-        for obligation_id in assigned.intersection(unresolved):
-            self.coverage.mark_unresolved(obligation_id)
+        pending_targets = {
+            item.target for item in self.obligation_assessments.assessments()
+            if item.disposition.value == "pending"
+        }
+        unresolved_targets = {
+            target for value in unresolved
+            if (target := self.obligation_assessments.canonical_target(value))
+        }
+        update_targets = {
+            target for update, _evidence_ids in prepared_obligation_updates
+            if (target := self.obligation_assessments.canonical_target(
+                update.get("target"),
+            ))
+        }
+        missing_targets = sorted(
+            pending_targets - unresolved_targets - update_targets,
+            key=lambda value: int(value[1:]) if value[1:].isdigit() else value,
+        )
+        modern_checkpoint = "obligation_updates" in raw
+        if modern_checkpoint and not unresolved and missing_targets:
+            self._last_checkpoint_validation_error = (
+                "Missing obligation decisions: " + ", ".join(missing_targets)
+                + ". Add each target to obligation_updates or unresolved; "
+                "do not repeat already accepted targets."
+            )
+            return None
+        for target in unresolved_targets:
+            obligation_id = self.obligation_assessments.obligation_id(target)
+            if obligation_id in assigned:
+                self.coverage.mark_unresolved(obligation_id)
         declared_candidate_ids = set(_strings(raw.get("candidate_finding_ids")))
         candidates: dict[str, CandidateFinding] = {
             item.candidate_id: item for item in self.candidate_findings

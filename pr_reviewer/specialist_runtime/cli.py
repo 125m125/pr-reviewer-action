@@ -1544,6 +1544,82 @@ def _compact_planner_context(
                 for item in projected.get("obligations", ())
                 if isinstance(item, Mapping)
             ]
+        if encoded_size(projected) > target_bytes:
+            base = projected.get("base_plan")
+            if isinstance(base, Mapping):
+                base["assignments"] = [
+                    {
+                        key: item[key]
+                        for key in (
+                            "id", "assignment_id", "obligation_ids",
+                            "primary_obligation_ids", "independent_obligation_ids",
+                            "recipe_ids", "model_turn_limit", "tool_call_limit",
+                            "transformation_permissions",
+                        )
+                        if key in item
+                    }
+                    for item in base.get("assignments", ())
+                    if isinstance(item, Mapping)
+                ]
+        if encoded_size(projected) > target_bytes:
+            projected["obligation_count"] = len(projected.get("obligations", ()))
+            projected.pop("obligations", None)
+            projected.pop("path_sets", None)
+            projected.pop("policy", None)
+            projected.pop("change_overview", None)
+            projected.pop("config", None)
+        if encoded_size(projected) > target_bytes:
+            base = projected.get("base_plan")
+            if isinstance(base, Mapping):
+                for item in base.get("assignments", ()):
+                    if not isinstance(item, dict):
+                        continue
+                    permissions = item.get("transformation_permissions")
+                    if isinstance(permissions, dict):
+                        permissions["merge_peer_ids"] = []
+                        permissions["allowed_operations"] = [
+                            operation for operation in permissions.get(
+                                "allowed_operations", (),
+                            )
+                            if operation != "merge"
+                        ]
+        if encoded_size(projected) > target_bytes:
+            base = projected.get("base_plan")
+            assignments = (
+                base.get("assignments", ()) if isinstance(base, Mapping) else ()
+            )
+            identity_assignments = []
+            for item in assignments:
+                if not isinstance(item, Mapping):
+                    continue
+                obligation_ids = tuple(str(value) for value in item.get(
+                    "obligation_ids", (),
+                ))
+                identity_assignments.append({
+                    "id": item.get("id", item.get("assignment_id", "")),
+                    "obligation_count": len(obligation_ids),
+                    "obligation_identity": hashlib.sha256(
+                        json.dumps(obligation_ids, separators=(",", ":")).encode()
+                    ).hexdigest()[:16],
+                    "transformation_permissions": {
+                        "allowed_operations": ["reorder", "improve"],
+                        "merge_peer_ids": [],
+                    },
+                })
+            projected = {
+                "base_plan": {"assignments": identity_assignments},
+                "obligation_count": projected.get("obligation_count", 0),
+                "manifest_summary": projected.get("manifest_summary", {}),
+                "projection_mode": "identity_only",
+            }
+        if encoded_size(projected) > target_bytes:
+            assignments = projected["base_plan"]["assignments"]
+            projected = {
+                "assignment_ids": [item["id"] for item in assignments],
+                "assignment_count": len(assignments),
+                "obligation_count": projected.get("obligation_count", 0),
+                "projection_mode": "assignment_ids_only",
+            }
     return projected
 
 
