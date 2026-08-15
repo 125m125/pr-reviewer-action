@@ -654,17 +654,19 @@ def test_checkpoint_normalizes_safe_obligation_update_aliases_and_defaults():
     assert assessments[0].next_actions == ()
 
 
-def test_checkpoint_records_precise_validation_error_for_invalid_update():
+def test_checkpoint_records_precise_rejection_for_invalid_update():
     session = make_session(ScriptedGateway([]))
     payload = {
-        "unresolved": [],
+        "unresolved": ["O2"],
         "obligation_updates": [{"target": "O1", "status": "maybe"}],
         "candidate_updates": [], "new_candidates": [], "unknowns": [],
     }
 
-    assert session._checkpoint_from_text(json.dumps(payload)) is None
-    assert "O1" in session._last_checkpoint_validation_error
-    assert "disposition" in session._last_checkpoint_validation_error
+    assert session._checkpoint_from_text(json.dumps(payload)) is not None
+    assert tuple(
+        (item.target, item.reason)
+        for item in session._last_checkpoint_rejections
+    ) == (("O1", "invalid or missing disposition"),)
 
 
 def test_checkpoint_schema_can_account_for_large_combined_assignment():
@@ -1747,6 +1749,166 @@ def test_checkpoint_parser_silently_accepts_legacy_candidate_findings():
     assert "candidate_findings" not in session._last_checkpoint_dropped_keys
 
 
+def test_checkpoint_partially_accepts_obligations_and_repairs_only_rejections():
+    initial = checkpoint_response(
+        inspected=[], unresolved=[],
+        obligation_updates=[
+            {
+                "target": "O1", "disposition": "covered",
+                "reason": "Claimed without eligible evidence.",
+                "evidence_ids": [], "next_actions": [],
+            },
+            {
+                "target": "O2", "disposition": "blocked",
+                "reason": "The required external fixture is unavailable.",
+                "evidence_ids": [], "next_actions": [],
+            },
+        ],
+        candidate_updates=[], new_candidates=[], unknowns=[],
+        working_summary="The implementation and tests were inspected.",
+        completed_steps=["Inspected both assigned paths."],
+    )
+    correction = ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "unresolved": ["O1"],
+            "obligation_updates": [],
+            "candidate_updates": [],
+            "new_candidates": [],
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    gateway = ScriptedGateway([initial, correction])
+    session = make_session(gateway)
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert result.checkpoint.working_summary == "The implementation and tests were inspected."
+    assessments = session.obligation_assessments.assessments()
+    assert assessments[0].disposition.value == "pending"
+    assert assessments[1].disposition.value == "blocked"
+    assert len(gateway.requests) == 2
+    correction_request = gateway.requests[1]
+    assert set(correction_request.response_schema["properties"]) == {
+        "unresolved", "obligation_updates", "candidate_updates", "new_candidates",
+    }
+    correction_prompt = json.loads(correction_request.messages)[-1]["content"]
+    assert "Checkpoint memory accepted" in correction_prompt
+    assert "O1 rejected: covered requires retained evidence" in correction_prompt
+    assert "O2 rejected" not in correction_prompt
+    receipt = session.conversation.events[-1]["content"]
+    assert "Correction result" in receipt
+    assert "O1 remains unresolved" in receipt
+    assert "O2" in receipt and "blocked" in receipt
+
+
+def test_checkpoint_partially_accepts_candidates_and_repairs_only_rejected_draft():
+    session = make_session(ScriptedGateway([]))
+    record = seed_successful_tool_exchange(
+        session, call_id="candidate-evidence", path="a.py",
+        content="The changed branch returns the wrong state.",
+    )
+    base_candidate = {
+        "candidate_id": "candidate-good",
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed input reaches the invalid return branch.",
+        "supporting_evidence_ids": [record.id],
+        "related_obligation_ids": ["OB-code"],
+        "confidence_rationale": "consequence_support:affected_consumer; evidence_ids=" + record.id,
+        "user_visible_consequence": "The caller receives the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    }
+    rejected_candidate = {**base_candidate, "candidate_id": "candidate-bad"}
+    rejected_candidate.pop("user_visible_consequence")
+    initial = checkpoint_response(
+        inspected=[], unresolved=["OB-code", "OB-tests"],
+        obligation_updates=[], candidate_updates=[],
+        new_candidates=[base_candidate, rejected_candidate], unknowns=[],
+    )
+    correction = ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "unresolved": [], "obligation_updates": [],
+            "candidate_updates": [], "new_candidates": [],
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    gateway = ScriptedGateway([initial, correction])
+    session.gateway = gateway
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert tuple(item.candidate_id for item in session.candidate_findings) == (
+        "candidate-good",
+    )
+    assert len(gateway.requests) == 2
+    correction_prompt = json.loads(gateway.requests[1].messages)[-1]["content"]
+    assert "candidate-bad rejected" in correction_prompt
+    assert "candidate-good rejected" not in correction_prompt
+    assert "candidate-bad" in session.conversation.events[-1]["content"]
+
+
+def test_rejected_candidate_update_preserves_and_reports_current_state():
+    session = make_session(ScriptedGateway([]))
+    record = seed_successful_tool_exchange(
+        session, call_id="candidate-update-evidence", path="a.py",
+        content="The changed branch returns the wrong state.",
+    )
+    candidate = {
+        "candidate_id": "candidate-good",
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed input reaches the invalid return branch.",
+        "supporting_evidence_ids": [record.id],
+        "related_obligation_ids": ["OB-code"],
+        "confidence_rationale": (
+            "consequence_support:affected_consumer; evidence_ids=" + record.id
+        ),
+        "user_visible_consequence": "The caller receives the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    }
+    established = session._checkpoint_from_text(json.dumps({
+        "unresolved": ["OB-code", "OB-tests"],
+        "obligation_updates": [], "candidate_updates": [],
+        "new_candidates": [candidate],
+    }))
+    assert established is not None
+    session.latest_checkpoint = established
+    initial = checkpoint_response(
+        inspected=[], unresolved=["OB-code", "OB-tests"],
+        obligation_updates=[],
+        candidate_updates=[{
+            "candidate_id": "candidate-good",
+            "status": "superseded",
+        }],
+        new_candidates=[], unknowns=[],
+    )
+    correction = ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "unresolved": [], "obligation_updates": [],
+            "candidate_updates": [], "new_candidates": [],
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    gateway = ScriptedGateway([initial, correction])
+    session.gateway = gateway
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False, result.finalization_diagnostics
+    assert tuple(item.candidate_id for item in session.candidate_findings) == (
+        "candidate-good",
+    )
+    receipt = session.conversation.events[-1]["content"]
+    assert "candidate-good update rejected" in receipt
+    assert "remains active" in receipt
+    assert "candidate-good remains rejected and inactive" not in receipt
+
+
 def test_checkpoint_turn_disables_reasoning_to_reserve_output_for_json():
     gateway = ScriptedGateway([candidate_update_checkpoint_response()])
     session = make_session(gateway)
@@ -1857,7 +2019,7 @@ def test_superseded_update_requires_known_replacement_candidate():
     session.apply_coverage_feedback(["OB-tests"])
     result = session.explore()
 
-    assert result.degraded is True
+    assert result.degraded is False
     assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
 
 
@@ -1904,8 +2066,8 @@ def test_superseded_update_rejects_self_reference_and_preserves_active_state():
     )
 
 
-def test_superseded_replacement_must_remain_active_atomically():
-    """A replacement withdrawn in the same checkpoint rejects the whole update."""
+def test_invalid_supersession_preserves_source_but_accepts_valid_withdrawal():
+    """Reject one invalid update without rolling back its valid sibling."""
     initial = candidate_checkpoint_response(("candidate-code",))
     payload = json.loads(candidate_checkpoint_response(("candidate-new",)).text)
     invalid = candidate_update_checkpoint_response(
@@ -1937,9 +2099,12 @@ def test_superseded_replacement_must_remain_active_atomically():
     session.explore()
     checkpoint = session._checkpoint_from_text(invalid.text)
 
-    assert checkpoint is None
+    assert checkpoint is not None
     assert tuple(item.candidate_id for item in session.candidate_findings) == (
-        "candidate-code", "candidate-new",
+        "candidate-code",
+    )
+    assert tuple(item.target for item in session._last_checkpoint_rejections) == (
+        "candidate-code",
     )
 
 
@@ -3114,8 +3279,8 @@ def test_checkpoint_admission_failure_preserves_exploration_candidate_unknown():
     assert len(gateway.requests) == 2
 
 
-def test_partial_candidate_retention_is_reported_when_one_candidate_survives():
-    """One admitted candidate cannot mask a separately dropped declaration."""
+def test_partial_candidate_retention_repairs_only_the_rejected_candidate():
+    """One invalid candidate does not discard its admitted sibling."""
     executor_result = {
         "tool": "read_file", "status": "ok",
         "result": {"content": "contents:a.py"},
@@ -3165,9 +3330,16 @@ def test_partial_candidate_retention_is_reported_when_one_candidate_survives():
     result = session.explore()
 
     assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
-    assert result.degraded is True
-    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+    assert result.degraded is False
+    assert "candidate-retention-unknown" not in result.checkpoint.unknowns
     assert len(gateway.requests) == 4
+    assert any(
+        request.response_schema is not None
+        and set(request.response_schema["properties"]) == {
+            "unresolved", "obligation_updates", "candidate_updates", "new_candidates",
+        }
+        for request in gateway.requests
+    )
 
 
 def test_hanging_specialist_gateways_share_global_orphan_cap():
@@ -3773,7 +3945,8 @@ def test_checkpoint_collects_only_evidence_backed_candidate_objects():
     assert candidate.supporting_evidence_ids == (evidence_id,)
     assert candidate.related_obligation_ids == ("OB-code",)
     assert candidate.collector_session_id == "S1"
-    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+    assert "candidate-retention-unknown" not in result.checkpoint.unknowns
+    assert result.degraded is False
 
 
 def test_tool_result_enters_conversation_only_after_evidence_redaction():

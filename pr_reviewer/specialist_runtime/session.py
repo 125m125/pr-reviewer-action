@@ -395,6 +395,14 @@ class CheckpointDisposition(str, Enum):
     FINALIZE = "finalize"
 
 
+@dataclass(frozen=True)
+class _CheckpointChangeRejection:
+    kind: str
+    target: str
+    reason: str
+    payload: Mapping[str, Any]
+
+
 _CHECKPOINT_LIFECYCLE_INSTRUCTIONS = {
     CheckpointDisposition.COMPACT_RESUME: (
         "Immediate compaction after validation: yes. "
@@ -757,15 +765,6 @@ def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
                 candidate_id = str(value.get("candidate_id") or "").strip()
                 if candidate_id:
                     candidate_ids.append(candidate_id)
-                    if (
-                        str(value.get("status") or "").strip().lower() == "superseded"
-                        and not str(value.get("superseded_by") or "").strip()
-                    ):
-                        unidentified_shapes += 1
-                    if str(value.get("status") or "").strip().lower() not in {
-                        "active", "withdrawn", "superseded",
-                    }:
-                        unidentified_shapes += 1
                 else:
                     unidentified_shapes += 1
             else:
@@ -1065,6 +1064,7 @@ class SpecialistSession:
         # update is accounted for even though only active findings are exposed
         # through ``candidate_findings`` and checkpoints.
         self._candidate_statuses: dict[str, str] = {}
+        self._rejected_candidate_ids: set[str] = set()
         self._candidate_targets: dict[str, str] = {}
         self._candidate_withdrawals: dict[str, dict[str, object]] = {}
         self._candidate_retention_signal = _CandidateRetentionSignal()
@@ -1083,6 +1083,7 @@ class SpecialistSession:
         self._last_checkpoint_should_resume = True
         self._last_checkpoint_dropped_keys: tuple[str, ...] = ()
         self._last_checkpoint_validation_error = ""
+        self._last_checkpoint_rejections: tuple[_CheckpointChangeRejection, ...] = ()
         self._obligation_local_tool_calls = 0
         self._obligation_rejection_counts: dict[tuple[str, str, int], int] = {}
         self._repeated_obligation_rejection = False
@@ -1160,7 +1161,10 @@ class SpecialistSession:
         return tuple(dict.fromkeys((*primary, *all_ids, *independent)))
 
     def _accounted_candidate_ids(self) -> tuple[str, ...]:
-        return tuple(self._candidate_statuses)
+        return tuple(dict.fromkeys((
+            *self._candidate_statuses,
+            *sorted(self._rejected_candidate_ids),
+        )))
 
     def _active_candidate_register(self) -> str:
         if not self.candidate_findings:
@@ -1216,6 +1220,124 @@ class SpecialistSession:
             }, separators=(",", ":"))
             + "."
         )
+
+    def _checkpoint_correction_schema(
+        self, rejections: tuple[_CheckpointChangeRejection, ...],
+    ) -> dict[str, Any]:
+        obligation_item = json.loads(json.dumps(
+            _CHECKPOINT_SCHEMA["properties"]["obligation_updates"]["items"],
+        ))
+        obligation_targets = sorted({
+            item.target for item in rejections if item.kind == "obligation"
+        })
+        if obligation_targets:
+            obligation_item["properties"]["target"]["enum"] = obligation_targets
+        unresolved_items: dict[str, Any] = {"type": "string"}
+        if obligation_targets:
+            unresolved_items["enum"] = obligation_targets
+        return {
+            "type": "object",
+            "properties": {
+                "unresolved": {
+                    "type": "array", "uniqueItems": True,
+                    "items": unresolved_items,
+                },
+                "obligation_updates": {
+                    "type": "array", "items": obligation_item,
+                },
+                "candidate_updates": _CHECKPOINT_SCHEMA["properties"]["candidate_updates"],
+                "new_candidates": _CHECKPOINT_SCHEMA["properties"]["new_candidates"],
+            },
+            "required": [
+                "unresolved", "obligation_updates", "candidate_updates",
+                "new_candidates",
+            ],
+            "additionalProperties": False,
+        }
+
+    def _checkpoint_correction_prompt(
+        self, rejections: tuple[_CheckpointChangeRejection, ...],
+    ) -> str:
+        lines = [
+            "Checkpoint memory accepted. Only the following proposed state "
+            "changes were rejected:",
+        ]
+        for item in rejections:
+            lines.append(f"- {item.target} rejected: {item.reason}")
+        lines.extend((
+            "Return only corrections for these rejected changes. For each "
+            "rejected obligation, revise its obligation_updates entry or list "
+            "its target in unresolved. A rejected new candidate may be revised "
+            "in new_candidates or omitted; omission leaves it inactive. A "
+            "rejected candidate update may be revised in candidate_updates or "
+            "omitted; omission preserves the current candidate state.",
+            _CHECKPOINT_TOOL_STATE_INSTRUCTION,
+        ))
+        return "\n".join(lines)
+
+    def _checkpoint_correction_receipt(
+        self,
+        rejections: tuple[_CheckpointChangeRejection, ...],
+        *,
+        disposition: CheckpointDisposition,
+        accepted_corrections: set[tuple[str, str]] | None = None,
+    ) -> str:
+        accepted_corrections = accepted_corrections or set()
+        lines = [
+            "Correction result (controller-authoritative; supersedes proposed "
+            "checkpoint state changes):",
+        ]
+        for item in rejections:
+            if item.kind != "obligation":
+                continue
+            assessment = self.obligation_assessments.assessment(item.target)
+            if assessment.disposition.value == "pending":
+                lines.append(f"- {item.target} remains unresolved.")
+            else:
+                lines.append(
+                    f"- {item.target} accepted as {assessment.disposition.value}."
+                )
+        for assessment in self.obligation_assessments.assessments():
+            if assessment.disposition.value != "pending" and not any(
+                item.kind == "obligation" and item.target == assessment.target
+                for item in rejections
+            ):
+                lines.append(
+                    f"- {assessment.target} accepted as {assessment.disposition.value}."
+                )
+        for item in sorted(
+            (item for item in rejections if item.kind.startswith("candidate")),
+            key=lambda value: (value.target, value.kind),
+        ):
+            if item.kind == "candidate-update":
+                state = self._candidate_statuses.get(item.target, "inactive")
+                if (item.kind, item.target) in accepted_corrections:
+                    lines.append(
+                        f"- {item.target} correction accepted; current state is {state}."
+                    )
+                else:
+                    lines.append(
+                        f"- {item.target} update rejected or omitted; "
+                        f"current state remains {state}."
+                    )
+            else:
+                if (item.kind, item.target) in accepted_corrections:
+                    lines.append(f"- {item.target} correction accepted as active.")
+                else:
+                    lines.append(f"- {item.target} remains rejected and inactive.")
+        pending = [
+            item.target for item in self.obligation_assessments.assessments()
+            if item.disposition.value == "pending"
+        ]
+        active = [self._candidate_target(item.candidate_id) for item in self.candidate_findings]
+        lines.append("Current pending obligations: " + (", ".join(pending) or "none") + ".")
+        lines.append("Current active candidates: " + (", ".join(active) or "none") + ".")
+        lines.append(
+            "Tools will be re-enabled when this specialist continues."
+            if disposition is CheckpointDisposition.COMPACT_RESUME
+            else "The specialist is paused with this controller-owned state."
+        )
+        return "\n".join(lines)
 
     def _candidate_target(self, candidate_id: str) -> str:
         for target, known_id in self._candidate_targets.items():
@@ -2645,6 +2767,10 @@ class SpecialistSession:
         initial_finish_reason = turn.finish_reason
         repair_finish_reason = ""
         repair_error = ""
+        correction_attempted = False
+        correction_parse = "not_attempted"
+        correction_error = ""
+        accepted_corrections: set[tuple[str, str]] = set()
         if needs_repair and allow_repair:
             repair_attempted = True
             repair_instruction = (
@@ -2704,6 +2830,91 @@ class SpecialistSession:
                 repair_finish_reason = repair.finish_reason
             else:
                 repair_parse = "unavailable"
+        change_rejections = self._last_checkpoint_rejections
+        if checkpoint is not None and change_rejections and allow_repair:
+            correction_attempted = True
+            # The durable memory and accepted sibling changes are authoritative
+            # before asking only for rejected state-change corrections.
+            self.latest_checkpoint = checkpoint
+            self.conversation.add_user(
+                self._checkpoint_correction_prompt(change_rejections)
+            )
+            correction_event_count = len(self._request_events)
+            try:
+                correction = self._request(
+                    tools_enabled=False,
+                    schema=self._checkpoint_correction_schema(change_rejections),
+                    purpose="checkpoint-change-correction",
+                    max_output_tokens=min(self.checkpoint_max_tokens, 2_048),
+                    allow_compaction=False,
+                    allow_gateway_fallbacks=allow_gateway_fallbacks,
+                )
+            except (BudgetExhausted, TimeoutError) as exc:
+                if (
+                    len(self._request_events) > correction_event_count
+                    and self._request_events[-1].status == "completed"
+                ):
+                    raise
+                correction = None
+                correction_error = f"{type(exc).__name__}: {exc}"
+            if correction is not None:
+                self.conversation.add_assistant_turn(
+                    reasoning=correction.reasoning,
+                    content=correction.content,
+                    calls=correction.tool_calls,
+                )
+                if correction.tool_calls:
+                    correction_error = (
+                        "tool calls returned while correction tools were disabled"
+                    )
+                    correction_parse = "invalid"
+                else:
+                    correction_raw = _json_object(correction.content)
+                    proposed_corrections: set[tuple[str, str]] = set()
+                    if isinstance(correction_raw, Mapping):
+                        for kind, key in (
+                            ("candidate-update", "candidate_updates"),
+                            ("candidate-new", "new_candidates"),
+                        ):
+                            values = correction_raw.get(key, [])
+                            if isinstance(values, list):
+                                proposed_corrections.update(
+                                    (kind, candidate_id)
+                                    for value in values if isinstance(value, Mapping)
+                                    if (candidate_id := str(
+                                        value.get("candidate_id") or ""
+                                    ).strip())
+                                )
+                    corrected = self._checkpoint_from_text(
+                        correction.content,
+                        require_complete_pending=False,
+                        allowed_obligation_targets={
+                            item.target for item in change_rejections
+                            if item.kind == "obligation"
+                        },
+                    )
+                    if corrected is not None:
+                        checkpoint = corrected
+                        correction_parse = "valid"
+                        rejected_corrections = {
+                            (item.kind, item.target)
+                            for item in self._last_checkpoint_rejections
+                        }
+                        accepted_corrections = (
+                            proposed_corrections - rejected_corrections
+                        )
+                    else:
+                        correction_parse = "invalid"
+                        correction_error = self._last_checkpoint_validation_error or (
+                            "checkpoint correction was not a valid correction object"
+                        )
+            else:
+                correction_parse = "unavailable"
+            self.conversation.add_user(self._checkpoint_correction_receipt(
+                change_rejections,
+                disposition=disposition,
+                accepted_corrections=accepted_corrections,
+            ))
         retention_unknown = _candidate_retention_lost(
             self._candidate_retention_signal,
             checkpoint,
@@ -2736,6 +2947,15 @@ class SpecialistSession:
             repair_error=repair_error,
             context_admission=checkpoint_context_admission,
         )
+        checkpoint_diagnostic.update({
+            "change_correction_attempted": correction_attempted,
+            "change_correction_parse": correction_parse,
+            "change_correction_error": correction_error[:300],
+            "rejected_checkpoint_changes": tuple(
+                f"{item.target}:{item.reason}"[:300]
+                for item in change_rejections
+            ),
+        })
         self.latest_checkpoint = checkpoint
         if not fallback_projection and not retention_unknown:
             progress_fingerprint = self._checkpoint_progress_fingerprint(checkpoint)
@@ -2791,8 +3011,12 @@ class SpecialistSession:
         text: str,
         *,
         require_working_memory: bool = False,
+        require_complete_pending: bool = True,
+        allowed_obligation_targets: set[str] | None = None,
     ) -> SessionCheckpoint | None:
         self._last_checkpoint_validation_error = ""
+        self._last_checkpoint_rejections = ()
+        rejections: list[_CheckpointChangeRejection] = []
         raw = _json_object(text)
         if (
             isinstance(raw, Mapping)
@@ -2838,6 +3062,7 @@ class SpecialistSession:
         if not isinstance(obligation_updates, list):
             return None
         prepared_obligation_updates: list[tuple[Mapping[str, Any], tuple[str, ...]]] = []
+        declared_update_targets: set[str] = set()
         for update in obligation_updates:
             if not isinstance(update, Mapping):
                 self._last_checkpoint_validation_error = (
@@ -2858,18 +3083,40 @@ class SpecialistSession:
             normalized_update.setdefault("evidence_ids", [])
             normalized_update.setdefault("next_actions", [])
             target_label = str(normalized_update.get("target") or "<missing>")
+            canonical_target = self.obligation_assessments.canonical_target(
+                normalized_update.get("target"),
+            )
+            if canonical_target is None:
+                self._last_checkpoint_validation_error = (
+                    f"Obligation update {target_label} has an unknown target"
+                )
+                return None
+            if (
+                allowed_obligation_targets is not None
+                and canonical_target not in allowed_obligation_targets
+            ):
+                rejections.append(_CheckpointChangeRejection(
+                    "obligation", canonical_target,
+                    "target was not part of the rejected change set",
+                    normalized_update,
+                ))
+                declared_update_targets.add(canonical_target)
+                continue
+            declared_update_targets.add(canonical_target)
             if str(normalized_update.get("disposition") or "") not in {
                 "covered", "not_applicable", "exhausted", "blocked", "unresolved",
             }:
-                self._last_checkpoint_validation_error = (
-                    f"Obligation update {target_label} has an invalid or missing disposition"
-                )
-                return None
+                rejections.append(_CheckpointChangeRejection(
+                    "obligation", canonical_target,
+                    "invalid or missing disposition", normalized_update,
+                ))
+                continue
             if not str(normalized_update.get("reason") or "").strip():
-                self._last_checkpoint_validation_error = (
-                    f"Obligation update {target_label} is missing reason"
-                )
-                return None
+                rejections.append(_CheckpointChangeRejection(
+                    "obligation", canonical_target,
+                    "a concise reason is required", normalized_update,
+                ))
+                continue
             resolved_evidence_ids = tuple(
                 item for value in _strings(normalized_update.get("evidence_ids"))
                 if (item := _resolve_retained_evidence_id(value, retained)) is not None
@@ -2890,12 +3137,13 @@ class SpecialistSession:
                 update.get("target"),
             ))
         }
+        update_targets.update(declared_update_targets)
         missing_targets = sorted(
             pending_targets - unresolved_targets - update_targets,
             key=lambda value: int(value[1:]) if value[1:].isdigit() else value,
         )
         modern_checkpoint = "obligation_updates" in raw
-        if modern_checkpoint and missing_targets:
+        if modern_checkpoint and require_complete_pending and missing_targets:
             self._last_checkpoint_validation_error = (
                 "Missing obligation decisions: " + ", ".join(missing_targets)
                 + ". Add each target to obligation_updates or unresolved; "
@@ -2922,29 +3170,48 @@ class SpecialistSession:
             candidate_payloads.extend(new_candidates)
         elif new_candidates is not None:
             return None
-        for value in candidate_payloads:
+        for index, value in enumerate(candidate_payloads, start=1):
+            candidate_label = (
+                str(value.get("candidate_id") or "").strip()
+                if isinstance(value, Mapping) else ""
+            ) or f"N{index}"
             candidate = self._candidate_from_checkpoint(
                 value,
                 retained=retained,
                 assigned=assigned,
             )
             if candidate is None:
-                return None
+                rejections.append(_CheckpointChangeRejection(
+                    "candidate-new", candidate_label,
+                    "candidate payload failed evidence or shape validation",
+                    dict(value) if isinstance(value, Mapping) else {},
+                ))
+                self._rejected_candidate_ids.add(candidate_label)
+                continue
             if declared_candidate_ids and candidate.candidate_id not in declared_candidate_ids:
                 continue
             existing = candidates.get(candidate.candidate_id)
             if existing is not None and existing != candidate:
                 # A repeated ID must not silently rewrite the retained finding.
+                rejections.append(_CheckpointChangeRejection(
+                    "candidate-new", candidate.candidate_id,
+                    "candidate ID conflicts with an admitted candidate",
+                    dict(value),
+                ))
+                self._rejected_candidate_ids.add(candidate.candidate_id)
                 continue
             candidates[candidate.candidate_id] = candidate
             candidate_statuses[candidate.candidate_id] = "active"
+            self._rejected_candidate_ids.discard(candidate.candidate_id)
 
         updates = raw.get("candidate_updates", [])
         if updates is None:
             updates = []
         if not isinstance(updates, list):
             return None
-        for update in updates:
+        prepared_candidate_updates: list[tuple[Mapping[str, Any], str, str]] = []
+        proposed_statuses = dict(candidate_statuses)
+        for index, update in enumerate(updates, start=1):
             if not isinstance(update, Mapping):
                 return None
             candidate_id = str(update.get("candidate_id") or "").strip()
@@ -2954,11 +3221,23 @@ class SpecialistSession:
                 or status not in {"active", "withdrawn", "superseded"}
                 or candidate_id not in candidate_statuses
             ):
-                # Updates are authoritative only for controller-known IDs.
-                return None
+                target = candidate_id or f"candidate-update-{index}"
+                rejections.append(_CheckpointChangeRejection(
+                    "candidate-update", target,
+                    "candidate update references an unknown ID or invalid status",
+                    dict(update),
+                ))
+                self._rejected_candidate_ids.add(target)
+                continue
             if status == "active":
                 if candidate_id not in candidates:
-                    return None
+                    rejections.append(_CheckpointChangeRejection(
+                        "candidate-update", candidate_id,
+                        "active update references a candidate that is not active",
+                        dict(update),
+                    ))
+                    self._rejected_candidate_ids.add(candidate_id)
+                    continue
             elif status == "superseded":
                 replacement_id = str(update.get("superseded_by") or "").strip()
                 if (
@@ -2966,22 +3245,40 @@ class SpecialistSession:
                     or replacement_id == candidate_id
                     or replacement_id not in candidates
                 ):
-                    return None
-                candidates.pop(candidate_id, None)
-            else:
-                candidates.pop(candidate_id, None)
-            candidate_statuses[candidate_id] = status
+                    rejections.append(_CheckpointChangeRejection(
+                        "candidate-update", candidate_id,
+                        "supersession requires a different active replacement",
+                        dict(update),
+                    ))
+                    self._rejected_candidate_ids.add(candidate_id)
+                    continue
+            proposed_statuses[candidate_id] = status
+            prepared_candidate_updates.append((update, candidate_id, status))
 
         # Superseded candidates must point to a replacement that remains active
         # after all updates in this checkpoint have been applied.
-        for update in updates:
-            if str(update.get("status") or "").strip().lower() != "superseded":
+        accepted_candidate_updates: list[tuple[Mapping[str, Any], str, str]] = []
+        for update, candidate_id, status in prepared_candidate_updates:
+            if status != "superseded":
+                accepted_candidate_updates.append((update, candidate_id, status))
                 continue
             replacement_id = str(update.get("superseded_by") or "").strip()
-            if replacement_id not in candidates:
-                return None
+            if proposed_statuses.get(replacement_id) != "active":
+                rejections.append(_CheckpointChangeRejection(
+                    "candidate-update", candidate_id,
+                    "superseding replacement did not remain active",
+                    dict(update),
+                ))
+                self._rejected_candidate_ids.add(candidate_id)
+                continue
+            accepted_candidate_updates.append((update, candidate_id, status))
 
-        assessment_before = self.obligation_assessments.assessments()
+        for _update, candidate_id, status in accepted_candidate_updates:
+            if status != "active":
+                candidates.pop(candidate_id, None)
+            candidate_statuses[candidate_id] = status
+            self._rejected_candidate_ids.discard(candidate_id)
+
         for update, resolved_evidence_ids in prepared_obligation_updates:
             proposal = self.obligation_assessments.propose(
                 target=str(update.get("target") or ""),
@@ -2993,15 +3290,17 @@ class SpecialistSession:
                 eligible=self._record_matches_obligation,
             )
             if not proposal.accepted:
-                self.obligation_assessments.restore(assessment_before)
-                self._last_checkpoint_validation_error = (
-                    f"Obligation update {update.get('target') or '<missing>'} "
-                    f"was rejected: {proposal.reason}"
-                )
-                return None
+                target = self.obligation_assessments.canonical_target(
+                    update.get("target"),
+                ) or str(update.get("target") or "<missing>")
+                rejections.append(_CheckpointChangeRejection(
+                    "obligation", target, proposal.reason, dict(update),
+                ))
+                continue
         self.candidate_findings = tuple(candidates[key] for key in sorted(candidates))
         self._candidate_statuses = candidate_statuses
         self._current_gaps = self._derive_current_gaps()
+        self._last_checkpoint_rejections = tuple(rejections)
         evidence_ids = list(dict.fromkeys(evidence_ids))
         return SessionCheckpoint(
             session_id=self.session_id,
