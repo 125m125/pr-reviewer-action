@@ -52,6 +52,84 @@ from .web_evidence import (
 
 ToolExecutor = Callable[..., dict[str, Any]]
 
+_CANDIDATE_DRAFT_PROPERTIES: dict[str, Any] = {
+    "claim": {"type": "string"},
+    "affected_location": {"type": "string"},
+    "causal_chain": {"type": "string"},
+    "severity": {"type": "string"},
+    "category": {"type": "string"},
+    "supporting_evidence_ids": {
+        "type": "array", "items": {"type": "string"},
+    },
+    "contradicting_evidence_ids": {
+        "type": "array", "items": {"type": "string"},
+    },
+    "related_targets": {
+        "type": "array", "items": {"type": "string"},
+        "description": "Assigned obligation handles such as O1.",
+    },
+    "confidence_rationale": {"type": "string"},
+    "user_visible_consequence": {"type": "string"},
+    "manual_validation": {"type": "string"},
+}
+_CANDIDATE_DRAFT_REQUIRED = tuple(_CANDIDATE_DRAFT_PROPERTIES)
+_CANDIDATE_DRAFT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": _CANDIDATE_DRAFT_PROPERTIES,
+    "required": list(_CANDIDATE_DRAFT_REQUIRED),
+    "additionalProperties": False,
+}
+_DEFECT_ASSESSMENT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Assess whether the evidence reviewed for this obligation reveals a "
+        "concrete defect. Use candidates with one candidate_drafts item per "
+        "defect, needs_followup for a specific unresolved defect lead, or "
+        "none_observed when no defect indicator was found."
+    ),
+    "properties": {
+        "result": {
+            "type": "string",
+            "enum": ["none_observed", "candidates", "needs_followup"],
+        },
+        "summary": {"type": "string", "minLength": 1, "maxLength": 300},
+        "candidate_drafts": {
+            "type": "array", "maxItems": 3,
+            "description": (
+                "Zero to three concrete defect candidates discovered while "
+                "investigating this obligation. Each draft is validated "
+                "independently from the obligation decision and other drafts."
+            ),
+            "items": _CANDIDATE_DRAFT_SCHEMA,
+        },
+    },
+    "required": ["result", "summary", "candidate_drafts"],
+    "additionalProperties": False,
+}
+_DEFECT_SYNTHESIS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "candidate_drafts": {
+            "type": "array", "maxItems": 3,
+            "items": _CANDIDATE_DRAFT_SCHEMA,
+        },
+        "dismissed_leads": {
+            "type": "array", "maxItems": 8,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "lead": {"type": "string"},
+                    "reason": {"type": "string", "maxLength": 300},
+                },
+                "required": ["lead", "reason"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["candidate_drafts", "dismissed_leads"],
+    "additionalProperties": False,
+}
+
 _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     {
         "name": "explain_obligation",
@@ -77,7 +155,9 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
         "name": "propose_obligation_resolution",
         "description": (
             "Propose covered, not_applicable, exhausted, blocked, or unresolved; "
-            "the controller validates it immediately."
+            "the controller validates it immediately. Also assess concrete "
+            "defects while the obligation evidence is fresh; candidate drafts "
+            "are admitted independently even if this resolution is rejected."
         ),
         "parameters": {"type": "object", "properties": {
             "target": {
@@ -90,8 +170,10 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "reason": {"type": "string"},
             "evidence_ids": {"type": "array", "items": {"type": "string"}},
             "next_actions": {"type": "array", "items": {"type": "string"}},
+            "defect_assessment": _DEFECT_ASSESSMENT_SCHEMA,
         }, "required": [
             "target", "disposition", "reason", "evidence_ids", "next_actions",
+            "defect_assessment",
         ], "additionalProperties": False},
     },
     {
@@ -100,31 +182,7 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "Immediately retain one concrete defect candidate. The controller "
             "returns a short session-local C# handle for later withdrawal."
         ),
-        "parameters": {"type": "object", "properties": {
-            "claim": {"type": "string"},
-            "affected_location": {"type": "string"},
-            "causal_chain": {"type": "string"},
-            "severity": {"type": "string"},
-            "category": {"type": "string"},
-            "supporting_evidence_ids": {
-                "type": "array", "items": {"type": "string"},
-            },
-            "contradicting_evidence_ids": {
-                "type": "array", "items": {"type": "string"},
-            },
-            "related_targets": {
-                "type": "array", "items": {"type": "string"},
-                "description": "Assigned obligation handles such as O1.",
-            },
-            "confidence_rationale": {"type": "string"},
-            "user_visible_consequence": {"type": "string"},
-            "manual_validation": {"type": "string"},
-        }, "required": [
-            "claim", "affected_location", "causal_chain", "severity",
-            "category", "supporting_evidence_ids", "contradicting_evidence_ids",
-            "related_targets", "confidence_rationale",
-            "user_visible_consequence", "manual_validation",
-        ], "additionalProperties": False},
+        "parameters": _CANDIDATE_DRAFT_SCHEMA,
     },
     {
         "name": "withdraw_candidate",
@@ -433,6 +491,10 @@ _OBLIGATION_PROTOCOL_INSTRUCTION = (
     "compatibility fallback. "
     "Use the obligation tools during exploration to record covered, "
     "not_applicable, exhausted, blocked, or unresolved conclusions. "
+    "Whenever proposing a resolution, explicitly assess whether the evidence "
+    "reveals concrete defects: submit up to three candidate drafts while the "
+    "evidence is fresh, retain a specific needs_followup lead, or state that "
+    "none was observed. "
     "Unchanged sources may explain a contract without proving changed behavior. "
     "Unresolved work must name a concrete novel next action. Accepted obligation "
     "state is controller-owned and need not be repeated in checkpoints."
@@ -1067,6 +1129,11 @@ class SpecialistSession:
         self._rejected_candidate_ids: set[str] = set()
         self._candidate_targets: dict[str, str] = {}
         self._candidate_withdrawals: dict[str, dict[str, object]] = {}
+        self._defect_leads: list[dict[str, object]] = []
+        self._next_defect_lead = 1
+        self._defect_synthesis_diagnostic: dict[str, object] = {
+            "attempted": False, "status": "not_needed",
+        }
         self._candidate_retention_signal = _CandidateRetentionSignal()
         self.latest_checkpoint = self._project_checkpoint(())
         self.source_access_requests: tuple[
@@ -2035,6 +2102,27 @@ class SpecialistSession:
                 }
                 accepted = True
             else:
+                defect_assessment = arguments.get("defect_assessment")
+                assessment_result = (
+                    str(defect_assessment.get("result") or "").strip()
+                    if isinstance(defect_assessment, Mapping) else ""
+                )
+                if (
+                    not isinstance(defect_assessment, Mapping)
+                    or assessment_result not in {
+                        "none_observed", "candidates", "needs_followup",
+                    }
+                    or not _bounded_text(
+                        defect_assessment.get("summary"), max_length=300,
+                    )
+                    or not isinstance(defect_assessment.get("candidate_drafts"), list)
+                ):
+                    self.conversation.add_tool_result(call_id, {
+                        "accepted": False,
+                        "target": target,
+                        "reason": "missing or invalid defect_assessment",
+                    })
+                    return False
                 disposition = str(arguments.get("disposition") or "")
                 evidence_ids = _tool_string_list(arguments.get("evidence_ids"))
                 if disposition.strip().casefold() == "covered":
@@ -2076,11 +2164,90 @@ class SpecialistSession:
                     self._obligation_rejection_counts[rejection_key] = rejection_count
                     if rejection_count >= 2:
                         self._repeated_obligation_rejection = True
+                assessment_payload, candidate_progress = self._process_defect_assessment(
+                    target=result.target,
+                    arguments=arguments,
+                    evidence_ids=evidence_ids,
+                )
+                if assessment_payload is not None:
+                    payload.update(assessment_payload)
+                    accepted = accepted or candidate_progress
         except KeyError:
             payload = {"accepted": False, "target": target, "reason": "unknown target"}
             accepted = False
         self.conversation.add_tool_result(call_id, payload, is_error=False)
         return accepted
+
+    def _process_defect_assessment(
+        self,
+        *,
+        target: str,
+        arguments: Mapping[str, Any],
+        evidence_ids: tuple[str, ...],
+    ) -> tuple[dict[str, object] | None, bool]:
+        assessment = arguments.get("defect_assessment")
+        if not isinstance(assessment, Mapping):
+            return None, False
+        result = str(assessment.get("result") or "").strip()
+        summary = _bounded_text(assessment.get("summary"), max_length=300)
+        raw_drafts = assessment.get("candidate_drafts", [])
+        drafts = raw_drafts if isinstance(raw_drafts, list) else []
+        candidate_results: list[dict[str, object]] = []
+        progressed = False
+        accepted_targets: set[str] = set()
+        for draft in drafts[:3]:
+            candidate_result, admitted = self._admit_candidate(
+                draft if isinstance(draft, Mapping) else {},
+            )
+            candidate_results.append(candidate_result)
+            progressed = progressed or admitted
+            if admitted and isinstance(draft, Mapping):
+                accepted_targets.update(_tool_string_list(draft.get("related_targets")))
+        if len(drafts) > 3:
+            candidate_results.append({
+                "accepted": False,
+                "reason": "candidate draft limit exceeded",
+            })
+        if result == "none_observed" or target in accepted_targets:
+            self._defect_leads = [
+                lead for lead in self._defect_leads
+                if str(lead.get("target") or "") != target
+            ]
+        lead_retained = False
+        should_retain_lead = (
+            result == "needs_followup"
+            or (result == "candidates" and not any(
+                item.get("accepted") is True for item in candidate_results
+            ))
+        )
+        if should_retain_lead and summary:
+            retained = {
+                record.id for record in self.evidence_store.snapshot().records
+            }
+            resolved_evidence = tuple(dict.fromkeys(
+                evidence_id for evidence_id in evidence_ids
+                if evidence_id in retained
+            ))[:8]
+            self._defect_leads = [
+                lead for lead in self._defect_leads
+                if str(lead.get("target") or "") != target
+            ]
+            self._defect_leads.append({
+                "lead": f"L{self._next_defect_lead}",
+                "target": target,
+                "summary": summary,
+                "evidence_ids": list(resolved_evidence),
+            })
+            self._next_defect_lead += 1
+            del self._defect_leads[:-8]
+            lead_retained = True
+        return ({
+            "candidate_results": candidate_results,
+            "defect_assessment": {
+                "result": result,
+                "lead_retained": lead_retained,
+            },
+        }, progressed)
 
     def _execute_candidate_tool(
         self, call_id: str, name: str, arguments: Mapping[str, Any],
@@ -2131,6 +2298,13 @@ class SpecialistSession:
             })
             return True
 
+        payload, accepted = self._admit_candidate(arguments)
+        self.conversation.add_tool_result(call_id, payload)
+        return accepted
+
+    def _admit_candidate(
+        self, arguments: Mapping[str, Any],
+    ) -> tuple[dict[str, object], bool]:
         retained = {
             record.id: record for record in self.evidence_store.snapshot().records
         }
@@ -2141,11 +2315,10 @@ class SpecialistSession:
                     self.obligation_assessments.obligation_id(target)
                 )
             except KeyError:
-                self.conversation.add_tool_result(call_id, {
+                return ({
                     "accepted": False,
                     "reason": f"unknown obligation target: {target}",
-                })
-                return False
+                }, False)
         next_target = f"C{len(self._candidate_targets) + 1}"
         digest = hashlib.sha256(
             f"{self.session_id}\0{next_target}".encode("utf-8")
@@ -2167,11 +2340,10 @@ class SpecialistSession:
             assigned=set(self._assigned_obligation_ids()),
         )
         if candidate is None:
-            self.conversation.add_tool_result(call_id, {
+            return ({
                 "accepted": False,
                 "reason": "candidate lacks valid evidence, obligation, or required detail",
-            })
-            return False
+            }, False)
         self.candidate_findings = (*self.candidate_findings, candidate)
         self._candidate_statuses[candidate_id] = "active"
         self._candidate_targets[next_target] = candidate_id
@@ -2181,10 +2353,7 @@ class SpecialistSession:
                 item.candidate_id for item in self.candidate_findings
             ),
         )
-        self.conversation.add_tool_result(call_id, {
-            "accepted": True, "target": next_target,
-        })
-        return True
+        return ({"accepted": True, "target": next_target}, True)
 
     def _execute_calls(self, calls: tuple[dict[str, Any], ...]) -> bool:
         progressed = False
@@ -4212,6 +4381,7 @@ class SpecialistSession:
             ],
             "candidate_statuses": dict(sorted(self._candidate_statuses.items())),
             "candidate_withdrawals": dict(sorted(self._candidate_withdrawals.items())),
+            "defect_leads": [dict(item) for item in self._defect_leads],
             "coverage": {
                 "obligation_statuses": {
                     obligation_id: status.value
@@ -4236,6 +4406,7 @@ class SpecialistSession:
             "active_candidates": [
                 asdict(candidate) for candidate in self.candidate_findings
             ],
+            "defect_leads": [dict(item) for item in self._defect_leads],
             "unknowns": list(checkpoint.unknowns),
             "proposed_next_actions": list(checkpoint.proposed_next_actions),
         }
@@ -4243,6 +4414,97 @@ class SpecialistSession:
     def conversation_contains_evidence_ids(self, evidence_ids: tuple[str, ...]) -> bool:
         transcript = json.dumps(self.conversation.events, sort_keys=True)
         return all(evidence_id in transcript for evidence_id in evidence_ids)
+
+    def _synthesize_defect_leads(self) -> None:
+        if not self._defect_leads:
+            return
+        retained = {
+            record.id: record for record in self.evidence_store.snapshot().records
+        }
+        excerpt_budget = 6_000
+        evidence: list[dict[str, str]] = []
+        seen_evidence: set[str] = set()
+        for lead in self._defect_leads:
+            for evidence_id in _tool_string_list(lead.get("evidence_ids")):
+                if evidence_id in seen_evidence or evidence_id not in retained:
+                    continue
+                record = retained[evidence_id]
+                excerpt = record.content[:min(1_000, excerpt_budget)]
+                if not excerpt:
+                    continue
+                evidence.append({
+                    "evidence_id": evidence_id,
+                    "source": record.source_path or record.source_identity,
+                    "content": excerpt,
+                })
+                seen_evidence.add(evidence_id)
+                excerpt_budget -= len(excerpt)
+                if excerpt_budget <= 0:
+                    break
+            if excerpt_budget <= 0:
+                break
+        self.conversation.add_user(
+            "Final defect-lead synthesis. Tools are disabled. Review only the "
+            "controller-retained leads and bounded evidence below. Return up to "
+            "three concrete candidate drafts supported by that evidence. Dismiss "
+            "a lead only when the supplied evidence disproves or resolves it; "
+            "omitted leads remain retained. Return exactly the required JSON object.\n"
+            + json.dumps({
+                "defect_leads": self._defect_leads,
+                "evidence": evidence,
+            }, sort_keys=True)
+        )
+        self._defect_synthesis_diagnostic = {
+            "attempted": True, "status": "started",
+            "lead_count": len(self._defect_leads),
+        }
+        try:
+            turn = self._request(
+                tools_enabled=False,
+                schema=_DEFECT_SYNTHESIS_SCHEMA,
+                purpose="defect-lead-synthesis",
+                max_output_tokens=min(self.max_tokens, 4_096),
+            )
+        except Exception as exc:
+            self._defect_synthesis_diagnostic.update({
+                "status": "unavailable",
+                "error": format_callback_error(exc, limit=300),
+            })
+            return
+        self.conversation.add_assistant_turn(
+            reasoning=turn.reasoning,
+            content=turn.content,
+            calls=turn.tool_calls,
+        )
+        raw = None if turn.tool_calls else _json_object(turn.content)
+        if not isinstance(raw, Mapping):
+            self._defect_synthesis_diagnostic["status"] = "invalid"
+            return
+        drafts = raw.get("candidate_drafts")
+        dismissed = raw.get("dismissed_leads")
+        if not isinstance(drafts, list) or not isinstance(dismissed, list):
+            self._defect_synthesis_diagnostic["status"] = "invalid"
+            return
+        candidate_results: list[dict[str, object]] = []
+        for draft in drafts[:3]:
+            candidate_result, _accepted = self._admit_candidate(
+                draft if isinstance(draft, Mapping) else {},
+            )
+            candidate_results.append(candidate_result)
+        dismissed_handles = {
+            str(item.get("lead") or "").strip()
+            for item in dismissed if isinstance(item, Mapping)
+            if str(item.get("reason") or "").strip()
+        }
+        self._defect_leads = [
+            lead for lead in self._defect_leads
+            if str(lead.get("lead") or "") not in dismissed_handles
+        ]
+        self._defect_synthesis_diagnostic.update({
+            "status": "valid",
+            "candidate_results": candidate_results,
+            "remaining_leads": len(self._defect_leads),
+        })
 
     def recover(self, reason: str) -> SessionResult:
         """Reconstruct a clean transcript for one of the recorded reasons."""
@@ -4324,6 +4586,7 @@ class SpecialistSession:
             self.request_timeout_sec, now=self.clock(),
         )
         self.state = SessionState.FINALIZING
+        self._synthesize_defect_leads()
         retention_unknown = _CANDIDATE_RETENTION_UNKNOWN in self.latest_checkpoint.unknowns
         report = self._checkpoint_finalization_report()
         self.state = SessionState.COMPLETE
@@ -4354,6 +4617,8 @@ class SpecialistSession:
             "covered_obligation_ids": covered,
             "unknowns": list(checkpoint.unknowns),
             "source": "checkpoint-finalization",
+            "defect_leads": [dict(item) for item in self._defect_leads],
+            "defect_synthesis": dict(self._defect_synthesis_diagnostic),
         }
 
     def _checkpoint_fallback_report(self) -> dict[str, Any]:
@@ -4370,4 +4635,6 @@ class SpecialistSession:
             "covered_obligation_ids": covered,
             "unknowns": list(checkpoint.unknowns),
             "source": "checkpoint-fallback",
+            "defect_leads": [dict(item) for item in self._defect_leads],
+            "defect_synthesis": dict(self._defect_synthesis_diagnostic),
         }

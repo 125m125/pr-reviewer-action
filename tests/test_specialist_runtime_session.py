@@ -496,6 +496,212 @@ def test_obligation_state_tools_use_short_handles_without_repository_budget():
     assert "OB-code" not in session.conversation.events[-1]["content"]
 
 
+def test_obligation_resolution_schema_requires_bounded_candidate_assessment():
+    session = make_session(ScriptedGateway([]))
+    schema = next(
+        item["parameters"] for item in session.conversation.tool_schemas
+        if item["name"] == "propose_obligation_resolution"
+    )
+
+    assessment = schema["properties"]["defect_assessment"]
+
+    assert "defect_assessment" in schema["required"]
+    assert assessment["properties"]["result"]["enum"] == [
+        "none_observed", "candidates", "needs_followup",
+    ]
+    assert assessment["properties"]["candidate_drafts"]["maxItems"] == 3
+
+
+def test_missing_defect_assessment_cannot_resolve_obligation():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-before-unassessed-resolution", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+
+    session._execute_calls(({
+        "id": "unassessed-resolution", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O1", "disposition": "covered",
+            "reason": "The changed implementation was inspected.",
+            "evidence_ids": [evidence_id], "next_actions": [],
+        }),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["accepted"] is False
+    assert result["reason"] == "missing or invalid defect_assessment"
+    assert session.obligation_assessments.assessment("O1").disposition.value == "pending"
+
+
+def test_later_assessment_supersedes_one_lead_without_reusing_its_handle():
+    session = make_session(ScriptedGateway([]))
+    base = {"candidate_drafts": [], "summary": "Inspect the changed consequence."}
+
+    session._process_defect_assessment(
+        target="O1", arguments={"defect_assessment": {
+            **base, "result": "needs_followup",
+        }}, evidence_ids=(),
+    )
+    assert [item["lead"] for item in session._defect_leads] == ["L1"]
+
+    session._process_defect_assessment(
+        target="O1", arguments={"defect_assessment": {
+            **base, "result": "none_observed",
+        }}, evidence_ids=(),
+    )
+    assert session._defect_leads == []
+
+    session._process_defect_assessment(
+        target="O1", arguments={"defect_assessment": {
+            **base, "result": "needs_followup",
+        }}, evidence_ids=(),
+    )
+    assert [item["lead"] for item in session._defect_leads] == ["L2"]
+
+
+def test_obligation_resolution_accepts_valid_candidate_siblings_independently():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-candidate-drafts", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    valid = {
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed input reaches the invalid return branch.",
+        "severity": "major", "category": "correctness",
+        "supporting_evidence_ids": [evidence_id],
+        "contradicting_evidence_ids": [], "related_targets": ["O1"],
+        "confidence_rationale": "Direct retained implementation evidence.",
+        "user_visible_consequence": "The operation returns the wrong state.",
+        "manual_validation": "Run the changed state-transition test.",
+    }
+    invalid = dict(valid)
+    invalid.pop("user_visible_consequence")
+
+    session._execute_calls(({
+        "id": "resolve-with-drafts", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O1", "disposition": "covered",
+            "reason": "The assigned implementation was inspected.",
+            "evidence_ids": [evidence_id], "next_actions": [],
+            "defect_assessment": {
+                "result": "candidates", "summary": "One concrete defect found.",
+                "candidate_drafts": [valid, invalid],
+            },
+        }),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["accepted"] is True
+    assert [item["accepted"] for item in result["candidate_results"]] == [True, False]
+    assert len(session.candidate_findings) == 1
+
+
+def test_candidate_draft_survives_rejected_obligation_resolution():
+    session = make_session(ScriptedGateway([]))
+    session._process_defect_assessment(
+        target="O2", arguments={"defect_assessment": {
+            "result": "needs_followup",
+            "summary": "A separate O2 defect lead still needs investigation.",
+            "candidate_drafts": [],
+        }}, evidence_ids=(),
+    )
+    session._execute_calls(({
+        "id": "read-independent-candidate", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    draft = {
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed input reaches the invalid return branch.",
+        "severity": "major", "category": "correctness",
+        "supporting_evidence_ids": [evidence_id],
+        "contradicting_evidence_ids": [], "related_targets": ["O1"],
+        "confidence_rationale": "Direct retained implementation evidence.",
+        "user_visible_consequence": "The operation returns the wrong state.",
+        "manual_validation": "Run the changed state-transition test.",
+    }
+
+    session._execute_calls(({
+        "id": "reject-obligation-keep-candidate",
+        "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O2", "disposition": "covered",
+            "reason": "The tests were allegedly covered.",
+            "evidence_ids": [evidence_id], "next_actions": [],
+            "defect_assessment": {
+                "result": "candidates", "summary": "A separate defect was found.",
+                "candidate_drafts": [draft],
+            },
+        }),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["accepted"] is False
+    assert result["candidate_results"] == [{"accepted": True, "target": "C1"}]
+    assert tuple(item.claim for item in session.candidate_findings) == (
+        "The changed branch returns the wrong state.",
+    )
+    assert [item["target"] for item in session._defect_leads] == ["O2"]
+
+
+def test_followup_defect_lead_survives_memory_and_gets_one_final_synthesis_turn():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-defect-lead", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    final_candidate = {
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed input reaches the invalid return branch.",
+        "severity": "major", "category": "correctness",
+        "supporting_evidence_ids": [evidence_id],
+        "contradicting_evidence_ids": [], "related_targets": ["O1"],
+        "confidence_rationale": "Direct retained implementation evidence.",
+        "user_visible_consequence": "The operation returns the wrong state.",
+        "manual_validation": "Run the changed state-transition test.",
+    }
+    gateway = ScriptedGateway([ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "candidate_drafts": [final_candidate], "dismissed_leads": [],
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 10, "completion_tokens": 20},
+        request_diagnostics={},
+    )])
+    session.gateway = gateway
+    session._execute_calls(({
+        "id": "retain-defect-lead", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O1", "disposition": "covered",
+            "reason": "The assigned implementation was inspected.",
+            "evidence_ids": [evidence_id], "next_actions": [],
+            "defect_assessment": {
+                "result": "needs_followup",
+                "summary": "The return-state consequence needs one synthesis pass.",
+                "candidate_drafts": [],
+            },
+        }),
+    },))
+
+    assert session._model_checkpoint_memory()["defect_leads"]
+
+    result = session.finalize()
+
+    assert len(gateway.requests) == 1
+    assert gateway.requests[0].tools_enabled is False
+    assert tuple(item.claim for item in session.candidate_findings) == (
+        "The changed branch returns the wrong state.",
+    )
+    assert result.report["candidate_finding_ids"]
+
+
 def test_candidate_tools_report_and_withdraw_with_short_session_handles():
     session = make_session(ScriptedGateway([]))
     tool_names = {item["name"] for item in session.conversation.tool_schemas}
@@ -714,6 +920,10 @@ def test_resolution_accepts_owned_full_id_and_stringified_array_arguments():
             "reason": "The changed implementation preserves the contract.",
             "evidence_ids": json.dumps([read_result["evidence_id"]]),
             "next_actions": "[]",
+            "defect_assessment": {
+                "result": "none_observed", "summary": "No defect observed.",
+                "candidate_drafts": [],
+            },
         }),
     },))
 
@@ -723,6 +933,10 @@ def test_resolution_accepts_owned_full_id_and_stringified_array_arguments():
         "target": "O1",
         "disposition": "covered",
         "reason": "accepted",
+        "candidate_results": [],
+        "defect_assessment": {
+            "result": "none_observed", "lead_retained": False,
+        },
     }
 
 
@@ -735,6 +949,10 @@ def test_repeated_identical_obligation_rejection_pauses_instead_of_compacting():
             "reason": "The implementation was inspected.",
             "evidence_ids": [],
             "next_actions": [],
+            "defect_assessment": {
+                "result": "none_observed", "summary": "No defect observed.",
+                "candidate_drafts": [],
+            },
         },
         call_id="reject-1",
     )
@@ -780,6 +998,10 @@ def test_targeted_read_retains_neutral_evidence_until_resolution_is_accepted():
             "target": "O1", "disposition": "covered",
             "reason": "The changed implementation preserves the contract.",
             "evidence_ids": [result["evidence_id"]], "next_actions": [],
+            "defect_assessment": {
+                "result": "none_observed", "summary": "No defect observed.",
+                "candidate_drafts": [],
+            },
         }),
     },))
 
@@ -818,6 +1040,10 @@ def test_resolution_can_bind_untargeted_retained_evidence_when_scope_matches():
             "target": "O1", "disposition": "covered",
             "reason": "The retained implementation matches the assigned scope.",
             "evidence_ids": [evidence_id], "next_actions": [],
+            "defect_assessment": {
+                "result": "none_observed", "summary": "No defect observed.",
+                "candidate_drafts": [],
+            },
         }),
     },))
 
@@ -847,6 +1073,10 @@ def test_resolution_does_not_bind_untargeted_evidence_outside_scope():
             "target": "O1", "disposition": "covered",
             "reason": "Unrelated retained evidence should not prove the implementation.",
             "evidence_ids": [evidence_id], "next_actions": [],
+            "defect_assessment": {
+                "result": "none_observed", "summary": "No defect observed.",
+                "candidate_drafts": [],
+            },
         }),
     },))
 
@@ -1704,6 +1934,11 @@ def test_checkpoint_prompt_lists_controller_owned_obligation_state():
             "reason": "A consumer trace is still required.",
             "evidence_ids": [],
             "next_actions": ["Trace the changed producer into its consumer."],
+            "defect_assessment": {
+                "result": "needs_followup",
+                "summary": "The consumer consequence still needs investigation.",
+                "candidate_drafts": [],
+            },
         }),
     },))
 
