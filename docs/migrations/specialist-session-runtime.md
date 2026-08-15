@@ -132,7 +132,7 @@ Create or review these files in the consuming repository before enabling
 
 1. `.github/workflows/ai-review.yml`: use a reviewed immutable action pin. The
    tested local baseline below pins
-   `125m125/pr-reviewer-action@ea54cc7d3776b94861d881a653b3c5559172a3da`.
+   `125m125/pr-reviewer-action@f3e0fa9bb4ce2e82ee16b782c615e9141858467d`.
    Grant `contents: read`
    and `pull-requests: write` for `review_comment`; native modes need the same
    PR-write permission. Check out the PR head with `fetch-depth: 0`.
@@ -239,7 +239,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
-      - uses: 125m125/pr-reviewer-action@ea54cc7d3776b94861d881a653b3c5559172a3da
+      - uses: 125m125/pr-reviewer-action@f3e0fa9bb4ce2e82ee16b782c615e9141858467d
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           ai_base_url: ${{ vars.LM_STUDIO_BASE_URL }}

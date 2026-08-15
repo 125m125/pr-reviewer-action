@@ -188,7 +188,7 @@ def test_migration_contains_copy_ready_tested_qwen_baseline():
     text = MIGRATION.read_text(encoding="utf-8")
     normalized = " ".join(text.split())
     for required in (
-        "125m125/pr-reviewer-action@ea54cc7d3776b94861d881a653b3c5559172a3da",
+        "125m125/pr-reviewer-action@f3e0fa9bb4ce2e82ee16b782c615e9141858467d",
         'ai_model: qwen/qwen3.6-35b-a3b',
         'ai_max_tokens: "8192"',
         'model_context_tokens: "80056"',
