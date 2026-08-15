@@ -496,6 +496,79 @@ def test_obligation_state_tools_use_short_handles_without_repository_budget():
     assert "OB-code" not in session.conversation.events[-1]["content"]
 
 
+def test_candidate_tools_report_and_withdraw_with_short_session_handles():
+    session = make_session(ScriptedGateway([]))
+    tool_names = {item["name"] for item in session.conversation.tool_schemas}
+    before = session.budget.snapshot().tool_calls
+    session._execute_calls(({
+        "id": "read-candidate", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+
+    progressed = session._execute_calls(({
+        "id": "report-1", "name": "report_candidate",
+        "arguments": json.dumps({
+            "claim": "The changed branch returns the wrong state.",
+            "affected_location": "a.py:4",
+            "causal_chain": "The changed input reaches the invalid return branch.",
+            "severity": "major",
+            "category": "correctness",
+            "supporting_evidence_ids": [evidence_id],
+            "contradicting_evidence_ids": [],
+            "related_targets": ["O1"],
+            "confidence_rationale": "Direct retained implementation evidence.",
+            "user_visible_consequence": "The operation returns the wrong state.",
+            "manual_validation": "Run the changed state-transition test.",
+        }),
+    },))
+
+    report = json.loads(session.conversation.events[-1]["content"])
+    assert {"report_candidate", "withdraw_candidate"}.issubset(tool_names)
+    assert progressed is True
+    assert report == {"accepted": True, "target": "C1"}
+    assert len(session.candidate_findings) == 1
+    candidate_id = session.candidate_findings[0].candidate_id
+    assert candidate_id != "C1"
+    assert session.budget.snapshot().tool_calls == before + 1
+
+    progressed = session._execute_calls(({
+        "id": "withdraw-1", "name": "withdraw_candidate",
+        "arguments": json.dumps({
+            "target": "C1",
+            "reason": "The later consumer evidence disproves reachability.",
+            "evidence_ids": [evidence_id],
+        }),
+    },))
+
+    withdrawal = json.loads(session.conversation.events[-1]["content"])
+    assert progressed is True
+    assert withdrawal == {"accepted": True, "target": "C1", "status": "withdrawn"}
+    assert session.candidate_findings == ()
+    payload = session._cumulative_checkpoint_payload()
+    assert payload["candidate_statuses"][candidate_id] == "withdrawn"
+    assert payload["candidate_withdrawals"][candidate_id]["reason"].startswith(
+        "The later consumer evidence"
+    )
+
+
+def test_withdraw_candidate_rejects_unknown_or_foreign_handle():
+    session = make_session(ScriptedGateway([]))
+
+    progressed = session._execute_calls(({
+        "id": "withdraw-unknown", "name": "withdraw_candidate",
+        "arguments": json.dumps({"target": "C9", "reason": "Not this session."}),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert progressed is False
+    assert result == {
+        "accepted": False,
+        "target": "C9",
+        "reason": "unknown candidate target",
+    }
+
+
 def test_specialist_assignment_exposes_controller_obligation_handles():
     assignment = SpecialistAssignment(
         assignment_id="assignment-1",
@@ -531,6 +604,42 @@ def test_checkpoint_repairs_only_missing_obligation_dispositions():
         if event.get("kind") == "user" and "Repair the previous checkpoint" in event["content"]
     )
     assert "Missing obligation decisions: O1, O2" in repair_prompt
+
+
+def test_checkpoint_normalizes_safe_obligation_update_aliases_and_defaults():
+    session = make_session(ScriptedGateway([]))
+    payload = {
+        "unresolved": [],
+        "obligation_updates": [
+            {"target": "O1", "status": "blocked", "notes": "Needs a consumer trace."},
+            {"target": "O2", "disposition": "blocked", "conclusion": "Tests remain unread."},
+        ],
+        "candidate_updates": [],
+        "new_candidates": [],
+        "unknowns": [],
+    }
+
+    checkpoint = session._checkpoint_from_text(json.dumps(payload))
+
+    assert checkpoint is not None
+    assessments = session.obligation_assessments.assessments()
+    assert [item.disposition.value for item in assessments] == ["blocked", "blocked"]
+    assert assessments[0].reason == "Needs a consumer trace."
+    assert assessments[0].evidence_ids == ()
+    assert assessments[0].next_actions == ()
+
+
+def test_checkpoint_records_precise_validation_error_for_invalid_update():
+    session = make_session(ScriptedGateway([]))
+    payload = {
+        "unresolved": [],
+        "obligation_updates": [{"target": "O1", "status": "maybe"}],
+        "candidate_updates": [], "new_candidates": [], "unknowns": [],
+    }
+
+    assert session._checkpoint_from_text(json.dumps(payload)) is None
+    assert "O1" in session._last_checkpoint_validation_error
+    assert "disposition" in session._last_checkpoint_validation_error
 
 
 def test_checkpoint_schema_can_account_for_large_combined_assignment():

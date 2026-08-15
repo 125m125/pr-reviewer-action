@@ -173,6 +173,7 @@ class ReviewHandoffContext:
     what_changed: tuple[str, ...] = ()
     what_changed_is_validated_overview: bool = False
     ai_reviewed: tuple[str, ...] = ()
+    ai_reviewed_is_validated_summary: bool = False
     human_focus: tuple[str, ...] = ()
     # Controller-supplied unchanged paths that are valid context for prose
     # such as an affected consumer or retained evidence source.  They are not
@@ -1754,7 +1755,9 @@ def project_review_handoff(
         max_chars=600 if context.what_changed_is_validated_overview else 160,
     )
     ai_reviewed = behavioral_summaries(
-        context.ai_reviewed, limit=3, require_path=True,
+        context.ai_reviewed,
+        limit=3,
+        require_path=not context.ai_reviewed_is_validated_summary,
         allowed_paths=reviewed_paths,
     )
     human_focus = tuple(

@@ -23,7 +23,8 @@ receives active candidates only.
 ## Assignments and changed context
 
 The deterministic plan keeps isolated recipe assignments intact and bounds
-ordinary assignments to six obligations. It splits oversized ordinary groups
+ordinary assignments toward six obligations, or the smallest balanced size
+possible under the configured hard session cap. It splits oversized ordinary groups
 before scheduling and never relies on the optional planner for validity.
 
 Each assignment receives changed context ordered by its own obligation scope and

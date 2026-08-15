@@ -828,6 +828,7 @@ def _changed_context(
     obligations: Iterable[CoverageObligation],
     topology: Mapping[str, Any],
 ) -> tuple[tuple[ChangedPathContext, ...], int]:
+    obligations = tuple(obligations)
     relevant_paths = {
         path.replace("\\", "/").strip("/")
         for obligation in obligations
@@ -841,9 +842,32 @@ def _changed_context(
     }
     facts_value = topology.get("changed_contract_facts", {})
     facts = facts_value if isinstance(facts_value, Mapping) else {}
+    seed_paths = {
+        path.replace("\\", "/").strip("/")
+        for obligation in obligations for path in obligation.seed_hints if path
+    }
+    minimum_scope = {
+        path: min(
+            len(set((*obligation.scope, *obligation.seed_hints)))
+            for obligation in obligations
+            if path in {
+                item.replace("\\", "/").strip("/")
+                for item in (*obligation.scope, *obligation.seed_hints)
+            }
+        )
+        for path in relevant_paths
+    }
     scoped_paths = sorted(
-        path for path in relevant_paths
-        if path in changed_paths or path in facts
+        (
+            path for path in relevant_paths
+            if path in changed_paths or path in facts
+        ),
+        key=lambda path: (
+            0 if path in seed_paths else 1,
+            minimum_scope[path],
+            1 if path.lower().endswith((".md", ".adoc", ".rst", ".txt")) else 0,
+            path,
+        ),
     )
     selected = scoped_paths[:_MAX_CHANGED_CONTEXT_PATHS]
     context: list[ChangedPathContext] = []
@@ -1053,14 +1077,17 @@ def fallback_assignment_plan(
         # Preserve room for isolated candidates while always creating at least
         # one ordinary contender so immutable risk, not isolation kind, decides
         # who receives the final hard session slot.
-        ordinary_items = [item for _, group in ordinary_groups for item in group]
+        ordinary_items = sorted(
+            (item for _, group in ordinary_groups for item in group),
+            key=lambda item: (_PRIORITY_RANK[item.risk_tier], item.id),
+        )
         ordinary_paths = {
             path for item in ordinary_items for path in (*item.scope, *item.seed_hints)
         }
         workload_slots = max(
             min(len(ordinary_groups), 6),
             len({_priority(group) for _, group in ordinary_groups}),
-            (len(ordinary_items) + 9) // 10,
+            (len(ordinary_items) + 5) // 6,
             (len(ordinary_paths) + 7) // 8,
         )
         available_slots = max(
@@ -1069,10 +1096,10 @@ def fallback_assignment_plan(
             - min(len(isolated_candidates), session_cap - 1),
         )
         ordinary_slots = min(available_slots, max(1, workload_slots))
-        bucket_count = min(ordinary_slots, len(ordinary_groups))
+        bucket_count = min(ordinary_slots, len(ordinary_items))
         buckets: list[list[CoverageObligation]] = [[] for _ in range(bucket_count)]
-        for index, (_, items) in enumerate(ordinary_groups):
-            buckets[index % bucket_count].extend(items)
+        for index, obligation in enumerate(ordinary_items):
+            buckets[index % bucket_count].append(obligation)
         ordinary_candidates = [
             (f"combined:{index + 1}", items)
             for index, items in enumerate(buckets)

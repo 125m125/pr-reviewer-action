@@ -18,6 +18,16 @@ provider capacity are understood.
   Model checkpoints carry working memory and candidate deltas; controller-owned
   coverage and evidence metadata remain authoritative and are not repeated by
   the model.
+- Specialists retain concrete defects immediately with `report_candidate` and
+  receive short session-local handles (`C1`, `C2`, ...). If later evidence
+  disproves a candidate, they use `withdraw_candidate` with the handle and a
+  reason. Do not ask repository prompts to invent candidate IDs or repeat full
+  candidate objects in every checkpoint.
+- Deterministic assignments are balanced across the configured session
+  capacity (targeting roughly six ordinary obligations per specialist when
+  capacity permits). Assignment orientation ranks directly scoped code and
+  seed paths ahead of broad documentation scopes; dedicated and independent
+  recipe assignments remain isolated.
 - The current-head version-2 policy derives deterministic coverage obligations.
   Recipes record whether work is `coverage`, `dedicated`, or `independent`, so
   the runtime can account for every selected and omitted obligation.
@@ -25,7 +35,8 @@ provider capacity are understood.
   policy or allowlist is not trusted until validation succeeds; an invalid
   policy produces a constrained/degraded result rather than broader access.
 - The published handoff is deliberately sparse: it gives a human the verdict,
-  topics, and review boundary. Detailed evidence, access requests, and findings
+  a behavioral change overview, what the AI reviewed, and useful human focus.
+  Detailed evidence, access requests, and findings
   remain in resolvable notes instead of duplicating every finding in the sticky
   summary.
 - Direct budgets bound the whole run, per-session turns, read-only tool calls,
@@ -138,6 +149,9 @@ Create or review these files in the consuming repository before enabling
 5. `.github/ai-review-prompt.md`: concise repository addendum. Set
    `system_prompt_file` to this path and `system_prompt_mode: append`; do not
    copy the bundled specialist protocol into it.
+   Do not redefine checkpoint JSON, candidate IDs, or summarizer schemas here;
+   those are action-owned protocols. Repository guidance should describe
+   project behavior, trust boundaries, and practical review priorities.
 6. `.github/ai-review-diff-priorities.json`: optional project-specific ordering
    for large diffs. Omit it for a small initial test and use built-in ordering,
    or add narrow glob rules when documentation, contracts, configuration, or

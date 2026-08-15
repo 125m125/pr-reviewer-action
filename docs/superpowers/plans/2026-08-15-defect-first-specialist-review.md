@@ -39,7 +39,7 @@
 - Test: `tests/test_specialist_runtime_assignments.py`
 
 **Interfaces:**
-- Produces: ordinary assignments containing at most six obligations.
+- Produces: balanced ordinary assignments targeting six obligations, bounded by the configured session cap.
 - Produces: `changed_context` ranked against each assignment's scope and seeds.
 
 - [ ] Add failing tests for a 19-obligation ordinary group and documentation-heavy changed manifests.

@@ -96,7 +96,7 @@ from .web_evidence import (
 _SCHEMA_VERSION = 2
 _MAX_ARTIFACT_STRING = 16 * 1024
 _MAX_ARTIFACT_ITEMS = 2_000
-_MAX_CHANGE_OVERVIEW_ITEMS = 12
+_MAX_CHANGE_OVERVIEW_ITEMS = 5
 _PROHIBITED_OVERVIEW_CLAIM = re.compile(
     r"(?i)\b(?:unsafe|safe\s+to\s+merge|ready\s+to\s+merge|merge[- ]safe|"
     r"(?:introduces?|causes?|creates?|contains?|has)\s+(?:an?\s+)?"
@@ -595,10 +595,7 @@ def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
         return value
     if not isinstance(value, Mapping):
         raise TypeError("handoff summarizer must return an object")
-    expected = {
-        "ai_reviewed_summary", "human_focus", "referenced_paths",
-        "referenced_component_ids", "referenced_obligation_ids",
-    }
+    expected = {"ai_reviewed_summary", "human_focus"}
     if not expected <= set(value):
         raise ValueError("handoff summarizer required fields are missing")
 
@@ -617,7 +614,7 @@ def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
         return item
 
     def identifiers(key: str) -> tuple[str, ...]:
-        raw = value.get(key)
+        raw = value.get(key, ())
         if isinstance(raw, (str, bytes)) or not isinstance(raw, (tuple, list)):
             raise TypeError(f"handoff summarizer {key} must be an array")
         selected = tuple(dict.fromkeys(
@@ -4036,11 +4033,6 @@ class ReviewController:
         # controller-backed values and silently discard compatible-model
         # overproduction; claims in the actual prose remain strictly checked.
         declared_paths.intersection_update(allowed_reference_paths)
-        declared_component_ids = {
-            item for item in proposal.referenced_component_ids
-            if item in component_ids
-        }
-
         combined = (
             proposal.ai_reviewed_summary + " " + proposal.human_focus
         )
@@ -4058,9 +4050,6 @@ class ReviewController:
         direct_context_paths = _direct_change_references(combined, context_paths)
         if direct_context_paths:
             raise ValueError("handoff summary contains a direct change claim for an unchanged path")
-        declared_components = {
-            item.casefold() for item in declared_component_ids
-        }
         allowed_components = {item.casefold() for item in component_ids}
         concrete_component_refs = {
             match.group(1).casefold()
@@ -4071,8 +4060,7 @@ class ReviewController:
             }
         }
         if (
-            not concrete_component_refs <= declared_components
-            or not concrete_component_refs <= allowed_components
+            not concrete_component_refs <= allowed_components
         ):
             raise ValueError(
                 "handoff summary contains an undeclared or unknown component"
@@ -4118,6 +4106,7 @@ class ReviewController:
             base,
             what_changed=(overview,),
             ai_reviewed=(proposal.ai_reviewed_summary,),
+            ai_reviewed_is_validated_summary=True,
             review_emphasis_topics=(),
             human_focus=(proposal.human_focus,),
         )
@@ -4230,18 +4219,16 @@ class ReviewController:
                             ).strip(),
                         },
                         "successful_review_facts": {
-                            "covered_obligation_ids": covered_obligation_ids,
-                            "evidence_paths": tuple(sorted({
-                                record.source_path
-                                for record in state.evidence.snapshot().records
-                                if record.is_usable_for_coverage
-                                and record.source_path
-                            })),
-                            "specialist_scopes": tuple(
-                                tuple(assignment.boundary_paths)
-                                for assignment in state.assignments.values()
-                                if assignment.id in state.assignment_sessions
+                            "covered_subjects": tuple(
+                                obligation.subject
+                                for obligation in state.obligations
+                                if obligation.id in covered_obligation_ids
+                            )[:8],
+                            "covered_obligation_count": len(covered_obligation_ids),
+                            "retained_evidence_count": len(
+                                state.evidence.snapshot().records
                             ),
+                            "reviewed_components": context.component_ids,
                             "note_themes": tuple(sorted({
                                 note.severity for note in state.notes
                                 if note.severity
@@ -4271,19 +4258,9 @@ class ReviewController:
                     }
                     summary = replace(
                         summary,
-                        referenced_paths=tuple(
-                            path for path in summary.referenced_paths
-                            if _normalize_repository_path(path)
-                            in allowed_summary_paths
-                        ),
-                        referenced_component_ids=tuple(
-                            item for item in summary.referenced_component_ids
-                            if item in context.component_ids
-                        ),
-                        referenced_obligation_ids=tuple(
-                            item for item in summary.referenced_obligation_ids
-                            if item in covered_obligation_ids
-                        ),
+                        referenced_paths=tuple(sorted(allowed_summary_paths))[:12],
+                        referenced_component_ids=context.component_ids[:12],
+                        referenced_obligation_ids=covered_obligation_ids[:12],
                     )
                     context = self._apply_handoff_summary_proposal(
                         state, context, summary,

@@ -2706,7 +2706,7 @@ def test_handoff_summarizer_writes_behavioral_review_handoff_from_validated_stat
         # The recorded wire-role name remains stable for offline replay.
         assert request.role == "finalizer"
         assert request.context["change_overview"]["overview"]
-        assert request.context["successful_review_facts"]["covered_obligation_ids"]
+        assert request.context["successful_review_facts"]["covered_obligation_count"]
         assert set(request.context) == {
             "change_overview", "successful_review_facts", "prepared_notes",
         }
@@ -2723,13 +2723,6 @@ def test_handoff_summarizer_writes_behavioral_review_handoff_from_validated_stat
                 "Recheck failure recovery at the worker boundary, especially behavior "
                 "after an ambiguous delivery result."
             ),
-            "referenced_paths": ["src/worker.py"],
-            "referenced_component_ids": ["worker"],
-            "referenced_obligation_ids": [
-                request.context["successful_review_facts"][
-                    "covered_obligation_ids"
-                ][0]
-            ],
         }
 
     result = _controller(tmp_path, finalizer=summarizer).run(inputs)
@@ -2886,14 +2879,6 @@ def test_handoff_summarizer_sanitizes_extra_fields_and_unknown_references(
                 "The review traced retry handling in `src/worker.py`."
             ),
             "human_focus": "Recheck the worker boundary.",
-            "referenced_paths": ["src/worker.py", "src/invented.py"],
-            "referenced_component_ids": ["worker", "invented"],
-            "referenced_obligation_ids": [
-                request.context["successful_review_facts"][
-                    "covered_obligation_ids"
-                ][0],
-                "obligation:invented",
-            ],
             "review_markdown": "This unsupported extra field must be ignored.",
         },
     ).run(inputs)

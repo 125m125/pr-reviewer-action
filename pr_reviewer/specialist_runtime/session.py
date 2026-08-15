@@ -94,6 +94,53 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "target", "disposition", "reason", "evidence_ids", "next_actions",
         ], "additionalProperties": False},
     },
+    {
+        "name": "report_candidate",
+        "description": (
+            "Immediately retain one concrete defect candidate. The controller "
+            "returns a short session-local C# handle for later withdrawal."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "claim": {"type": "string"},
+            "affected_location": {"type": "string"},
+            "causal_chain": {"type": "string"},
+            "severity": {"type": "string"},
+            "category": {"type": "string"},
+            "supporting_evidence_ids": {
+                "type": "array", "items": {"type": "string"},
+            },
+            "contradicting_evidence_ids": {
+                "type": "array", "items": {"type": "string"},
+            },
+            "related_targets": {
+                "type": "array", "items": {"type": "string"},
+                "description": "Assigned obligation handles such as O1.",
+            },
+            "confidence_rationale": {"type": "string"},
+            "user_visible_consequence": {"type": "string"},
+            "manual_validation": {"type": "string"},
+        }, "required": [
+            "claim", "affected_location", "causal_chain", "severity",
+            "category", "supporting_evidence_ids", "contradicting_evidence_ids",
+            "related_targets", "confidence_rationale",
+            "user_visible_consequence", "manual_validation",
+        ], "additionalProperties": False},
+    },
+    {
+        "name": "withdraw_candidate",
+        "description": (
+            "Withdraw one candidate reported by this session after later "
+            "evidence disproves it. Silence never withdraws a candidate."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "target": {
+                "type": "string",
+                "description": "Short candidate handle returned by report_candidate, such as C1.",
+            },
+            "reason": {"type": "string"},
+            "evidence_ids": {"type": "array", "items": {"type": "string"}},
+        }, "required": ["target", "reason"], "additionalProperties": False},
+    },
 )
 _OBLIGATION_LOCAL_TOOL_NAMES = frozenset(
     str(item["name"]) for item in _OBLIGATION_LOCAL_TOOL_SCHEMAS
@@ -1017,6 +1064,8 @@ class SpecialistSession:
         # update is accounted for even though only active findings are exposed
         # through ``candidate_findings`` and checkpoints.
         self._candidate_statuses: dict[str, str] = {}
+        self._candidate_targets: dict[str, str] = {}
+        self._candidate_withdrawals: dict[str, dict[str, object]] = {}
         self._candidate_retention_signal = _CandidateRetentionSignal()
         self.latest_checkpoint = self._project_checkpoint(())
         self.source_access_requests: tuple[
@@ -1119,13 +1168,21 @@ class SpecialistSession:
         for candidate in self.candidate_findings[:_MAX_CHECKPOINT_CANDIDATE_IDS]:
             claim = " ".join(candidate.claim.split())[:180]
             entries.append({
-                "candidate_id": candidate.candidate_id,
+                "target": self._candidate_target(candidate.candidate_id),
                 "claim": claim,
                 "affected_location": candidate.affected_location,
             })
-        return "Active candidates (use these exact IDs for updates): " + json.dumps(
+        return "Active candidates (use these targets with withdraw_candidate): " + json.dumps(
             entries, sort_keys=True,
         )
+
+    def _candidate_target(self, candidate_id: str) -> str:
+        for target, known_id in self._candidate_targets.items():
+            if known_id == candidate_id:
+                return target
+        target = f"C{len(self._candidate_targets) + 1}"
+        self._candidate_targets[target] = candidate_id
+        return target
 
     def _checkpoint_prompt(
         self,
@@ -1795,6 +1852,8 @@ class SpecialistSession:
             })
             return False
         self._obligation_local_tool_calls += 1
+        if name in {"report_candidate", "withdraw_candidate"}:
+            return self._execute_candidate_tool(call_id, name, arguments)
         try:
             if name == "explain_obligation":
                 payload = self.obligation_assessments.explain(target)
@@ -1857,6 +1916,110 @@ class SpecialistSession:
             accepted = False
         self.conversation.add_tool_result(call_id, payload, is_error=False)
         return accepted
+
+    def _execute_candidate_tool(
+        self, call_id: str, name: str, arguments: Mapping[str, Any],
+    ) -> bool:
+        if name == "withdraw_candidate":
+            target = str(arguments.get("target") or "").strip()
+            candidate_id = self._candidate_targets.get(target)
+            reason = _bounded_text(arguments.get("reason"), max_length=300)
+            active_ids = {item.candidate_id for item in self.candidate_findings}
+            if not candidate_id or candidate_id not in active_ids:
+                payload = {
+                    "accepted": False, "target": target,
+                    "reason": "unknown candidate target",
+                }
+                self.conversation.add_tool_result(call_id, payload)
+                return False
+            if not reason:
+                payload = {
+                    "accepted": False, "target": target,
+                    "reason": "withdrawal reason is required",
+                }
+                self.conversation.add_tool_result(call_id, payload)
+                return False
+            retained = {
+                record.id: record for record in self.evidence_store.snapshot().records
+            }
+            evidence_ids = tuple(dict.fromkeys(
+                item for value in _tool_string_list(arguments.get("evidence_ids"))
+                if (item := _resolve_retained_evidence_id(value, retained)) is not None
+            ))
+            self.candidate_findings = tuple(
+                item for item in self.candidate_findings
+                if item.candidate_id != candidate_id
+            )
+            self._candidate_statuses[candidate_id] = "withdrawn"
+            self._candidate_withdrawals[candidate_id] = {
+                "reason": reason,
+                "evidence_ids": list(evidence_ids),
+            }
+            self.latest_checkpoint = replace(
+                self.latest_checkpoint,
+                candidate_finding_ids=tuple(
+                    item.candidate_id for item in self.candidate_findings
+                ),
+            )
+            self.conversation.add_tool_result(call_id, {
+                "accepted": True, "target": target, "status": "withdrawn",
+            })
+            return True
+
+        retained = {
+            record.id: record for record in self.evidence_store.snapshot().records
+        }
+        related_obligations: list[str] = []
+        for target in _tool_string_list(arguments.get("related_targets")):
+            try:
+                related_obligations.append(
+                    self.obligation_assessments.obligation_id(target)
+                )
+            except KeyError:
+                self.conversation.add_tool_result(call_id, {
+                    "accepted": False,
+                    "reason": f"unknown obligation target: {target}",
+                })
+                return False
+        next_target = f"C{len(self._candidate_targets) + 1}"
+        digest = hashlib.sha256(
+            f"{self.session_id}\0{next_target}".encode("utf-8")
+        ).hexdigest()[:16]
+        candidate_id = f"candidate:{digest}:{next_target}"
+        value = {
+            "candidate_id": candidate_id,
+            "root_cause_fingerprint": hashlib.sha256(
+                (str(arguments.get("affected_location") or "") + "\0"
+                 + str(arguments.get("claim") or "")).encode("utf-8")
+            ).hexdigest(),
+            **dict(arguments),
+            "related_obligation_ids": related_obligations,
+        }
+        value.pop("related_targets", None)
+        candidate = self._candidate_from_checkpoint(
+            value,
+            retained=retained,
+            assigned=set(self._assigned_obligation_ids()),
+        )
+        if candidate is None:
+            self.conversation.add_tool_result(call_id, {
+                "accepted": False,
+                "reason": "candidate lacks valid evidence, obligation, or required detail",
+            })
+            return False
+        self.candidate_findings = (*self.candidate_findings, candidate)
+        self._candidate_statuses[candidate_id] = "active"
+        self._candidate_targets[next_target] = candidate_id
+        self.latest_checkpoint = replace(
+            self.latest_checkpoint,
+            candidate_finding_ids=tuple(
+                item.candidate_id for item in self.candidate_findings
+            ),
+        )
+        self.conversation.add_tool_result(call_id, {
+            "accepted": True, "target": next_target,
+        })
+        return True
 
     def _execute_calls(self, calls: tuple[dict[str, Any], ...]) -> bool:
         progressed = False
@@ -2424,6 +2587,10 @@ class SpecialistSession:
                 disposition is CheckpointDisposition.COMPACT_RESUME
             ),
         )
+        if checkpoint is None and not initial_error:
+            initial_error = self._last_checkpoint_validation_error or (
+                "checkpoint response was not a valid checkpoint object"
+            )
         initial_parse = "valid" if checkpoint is not None else "invalid"
         needs_repair = checkpoint is None or _candidate_retention_lost(
             self._candidate_retention_signal,
@@ -2482,6 +2649,10 @@ class SpecialistSession:
                             disposition is CheckpointDisposition.COMPACT_RESUME
                         ),
                     )
+                    if checkpoint is None:
+                        repair_error = self._last_checkpoint_validation_error or (
+                            "checkpoint repair was not a valid checkpoint object"
+                        )
                 repair_parse = "valid" if checkpoint is not None else "invalid"
                 repair_finish_reason = repair.finish_reason
             else:
@@ -2622,12 +2793,41 @@ class SpecialistSession:
         prepared_obligation_updates: list[tuple[Mapping[str, Any], tuple[str, ...]]] = []
         for update in obligation_updates:
             if not isinstance(update, Mapping):
+                self._last_checkpoint_validation_error = (
+                    "obligation_updates must contain objects"
+                )
+                return None
+            normalized_update = dict(update)
+            if not normalized_update.get("disposition") and normalized_update.get("status"):
+                normalized_update["disposition"] = normalized_update.pop("status")
+            if not normalized_update.get("reason"):
+                for alias in ("notes", "conclusion"):
+                    if normalized_update.get(alias):
+                        normalized_update["reason"] = normalized_update.pop(alias)
+                        break
+            normalized_update.pop("status", None)
+            normalized_update.pop("notes", None)
+            normalized_update.pop("conclusion", None)
+            normalized_update.setdefault("evidence_ids", [])
+            normalized_update.setdefault("next_actions", [])
+            target_label = str(normalized_update.get("target") or "<missing>")
+            if str(normalized_update.get("disposition") or "") not in {
+                "covered", "not_applicable", "exhausted", "blocked", "unresolved",
+            }:
+                self._last_checkpoint_validation_error = (
+                    f"Obligation update {target_label} has an invalid or missing disposition"
+                )
+                return None
+            if not str(normalized_update.get("reason") or "").strip():
+                self._last_checkpoint_validation_error = (
+                    f"Obligation update {target_label} is missing reason"
+                )
                 return None
             resolved_evidence_ids = tuple(
-                item for value in _strings(update.get("evidence_ids"))
+                item for value in _strings(normalized_update.get("evidence_ids"))
                 if (item := _resolve_retained_evidence_id(value, retained)) is not None
             )
-            prepared_obligation_updates.append((update, resolved_evidence_ids))
+            prepared_obligation_updates.append((normalized_update, resolved_evidence_ids))
         assigned = set(self._assigned_obligation_ids())
         pending_targets = {
             item.target for item in self.obligation_assessments.assessments()
@@ -2747,6 +2947,10 @@ class SpecialistSession:
             )
             if not proposal.accepted:
                 self.obligation_assessments.restore(assessment_before)
+                self._last_checkpoint_validation_error = (
+                    f"Obligation update {update.get('target') or '<missing>'} "
+                    f"was rejected: {proposal.reason}"
+                )
                 return None
         self.candidate_findings = tuple(candidates[key] for key in sorted(candidates))
         self._candidate_statuses = candidate_statuses
@@ -3661,6 +3865,7 @@ class SpecialistSession:
                 asdict(candidate) for candidate in self.candidate_findings
             ],
             "candidate_statuses": dict(sorted(self._candidate_statuses.items())),
+            "candidate_withdrawals": dict(sorted(self._candidate_withdrawals.items())),
             "coverage": {
                 "obligation_statuses": {
                     obligation_id: status.value

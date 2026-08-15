@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from pr_reviewer.specialist_runtime.policy import RuntimeConfig
@@ -1056,6 +1058,65 @@ def test_merged_changed_context_reports_paths_omitted_by_the_bound():
     assert merged.changed_context_omitted_paths == 2
 
 
+def test_changed_context_prioritizes_direct_code_scope_over_broad_docs():
+    docs = tuple(f"docs/plan-{index}.md" for index in range(14))
+    code = "pr_reviewer/specialist_runtime/session.py"
+    obligations = (
+        CoverageObligation(
+            obligation_id="topology:session:implementation",
+            origin="topology", subject="session implementation",
+            required_evidence_categories=("implementation",), scope=(code,),
+        ),
+        CoverageObligation(
+            obligation_id="recipe:broad:documentation",
+            origin="recipe", subject="documented behavior",
+            required_evidence_categories=("documentation",), scope=(*docs, code),
+        ),
+    )
+    topology = {
+        "changed_files": [*docs, code],
+        "changed_contract_facts": {},
+    }
+
+    plan = fallback_assignment_plan(obligations, topology, RuntimeConfig(max_sessions=1))
+
+    assert plan.assignments[0].changed_context[0].path == code
+
+
+def test_fallback_balances_large_ordinary_workload_across_available_sessions():
+    ordinary = tuple(
+        CoverageObligation(
+            obligation_id=f"topology:component-{index}:implementation",
+            origin="topology", subject=f"component {index}",
+            required_evidence_categories=("implementation",),
+            scope=(f"src/component_{index}.py",),
+        )
+        for index in range(60)
+    )
+    isolated = tuple(
+        CoverageObligation(
+            obligation_id=f"recipe:isolated-{index}", origin="recipe",
+            subject=f"isolated {index}", required_evidence_categories=("tests",),
+            scope=(f"tests/isolated_{index}.py",), recipe_id=f"recipe-{index}",
+            recipe_execution="dedicated",
+        )
+        for index in range(3)
+    )
+    topology = {"changed_files": [item.scope[0] for item in (*ordinary, *isolated)]}
+
+    plan = fallback_assignment_plan(
+        (*ordinary, *isolated), topology, RuntimeConfig(max_sessions=12),
+    )
+
+    ordinary_sizes = [
+        len(item.obligation_ids) for item in plan.assignments
+        if not item.id.startswith("fallback-recipe-dedicated")
+    ]
+    assert len(plan.assignments) == 12
+    assert max(ordinary_sizes) <= 7
+    assert max(ordinary_sizes) - min(ordinary_sizes) <= 1
+
+
 def test_split_recomputes_context_after_parent_context_was_truncated():
     paths = tuple(f"component/behavior_{index}.py" for index in range(14))
     obligations = tuple(
@@ -1083,7 +1144,9 @@ def test_split_recomputes_context_after_parent_context_was_truncated():
         max_sessions=2,
         session_limits=BudgetLimits(model_turns=8, tool_calls=20, recoveries=1),
     )
-    base = fallback_assignment_plan(obligations, topology, two_sessions)
+    base = fallback_assignment_plan(
+        obligations, topology, replace(two_sessions, max_sessions=1),
+    )
     original = base.assignments[0]
     assert len(original.changed_context) == 12
     assert original.changed_context_omitted_paths == 2
