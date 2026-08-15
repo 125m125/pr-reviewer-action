@@ -604,6 +604,31 @@ def test_checkpoint_repairs_only_missing_obligation_dispositions():
         if event.get("kind") == "user" and "Repair the previous checkpoint" in event["content"]
     )
     assert "Missing obligation decisions: O1, O2" in repair_prompt
+    assert '"pending_obligations"' in repair_prompt
+    assert '"target": "O1"' in repair_prompt
+    assert '"target": "O2"' in repair_prompt
+
+
+def test_checkpoint_repairs_partially_declared_pending_obligations():
+    session = make_session(ScriptedGateway([
+        checkpoint_response(
+            inspected=[], unresolved=["OB-code"],
+            obligation_updates=[], candidate_updates=[], new_candidates=[],
+        ),
+        checkpoint_response(
+            inspected=[], unresolved=["OB-code", "OB-tests"],
+            obligation_updates=[], candidate_updates=[], new_candidates=[],
+        ),
+    ]))
+
+    result = session.request_checkpoint("checkpoint-retention-reserve")
+
+    assert result.degraded is False
+    repair_prompt = next(
+        event["content"] for event in session.conversation.events
+        if event.get("kind") == "user" and "Repair the previous checkpoint" in event["content"]
+    )
+    assert "Missing obligation decisions: O2" in repair_prompt
 
 
 def test_checkpoint_normalizes_safe_obligation_update_aliases_and_defaults():
@@ -1664,6 +1689,64 @@ def test_checkpoint_prompt_contains_compact_active_candidate_register():
     assert "Active candidates" in prompt
 
 
+def test_checkpoint_prompt_lists_controller_owned_obligation_state():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway)
+    session._execute_calls(({
+        "id": "resolve-1", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O1",
+            "disposition": "unresolved",
+            "reason": "A consumer trace is still required.",
+            "evidence_ids": [],
+            "next_actions": ["Trace the changed producer into its consumer."],
+        }),
+    },))
+
+    session.request_checkpoint("controller-request")
+
+    prompt = json.loads(gateway.requests[0].messages)[-1]["content"]
+    assert '"pending_obligations": [{"required_evidence": ["tests"], ' in prompt
+    assert '"subject": "tests/test_a.py", "target": "O2"' in prompt
+    assert '"accepted_obligations": [{"disposition": "unresolved", ' in prompt
+    assert '"target": "O1"' in prompt
+    assert '"disposition":"not_applicable"' in prompt
+    assert '"state"' not in prompt
+
+
+def test_checkpoint_generation_schema_omits_legacy_candidate_findings():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway)
+
+    session.request_checkpoint("controller-request")
+
+    schema = gateway.requests[0].response_schema
+    assert "candidate_findings" not in schema["properties"]
+    assert "new_candidates" in schema["properties"]
+    prompt = json.loads(gateway.requests[0].messages)[-1]["content"]
+    assert 'legacy "candidate_findings"' not in prompt
+
+
+def test_checkpoint_parser_silently_accepts_legacy_candidate_findings():
+    session = make_session(ScriptedGateway([]))
+    payload = {
+        "unresolved": ["OB-code", "OB-tests"],
+        "candidate_findings": [],
+        "candidate_updates": [],
+        "new_candidates": [],
+        "unknowns": [],
+    }
+
+    checkpoint = session._checkpoint_from_text(json.dumps(payload))
+
+    assert checkpoint is not None
+    assert "candidate_findings" not in session._last_checkpoint_dropped_keys
+
+
 def test_checkpoint_turn_disables_reasoning_to_reserve_output_for_json():
     gateway = ScriptedGateway([candidate_update_checkpoint_response()])
     session = make_session(gateway)
@@ -1903,7 +1986,8 @@ def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract()
     checkpoint_request = gateway.requests[1].messages
     repair_request = gateway.requests[2].messages
     for prompt in (checkpoint_request, repair_request):
-        assert "candidate_findings" in prompt
+        assert "candidate_findings" not in prompt
+        assert "new_candidates" in prompt
         assert "candidate_finding_ids" not in prompt
         assert "exact retained evidence IDs" in prompt
         assert "repository paths are not evidence IDs" in prompt
@@ -2747,7 +2831,8 @@ def test_checkpoint_request_includes_compact_schema_contract():
     assert "Required keys:" in checkpoint_request
     assert '"unresolved"' in checkpoint_request
     assert '"candidate_finding_ids"' not in checkpoint_request
-    assert '"candidate_findings"' in checkpoint_request
+    assert '"candidate_findings"' not in checkpoint_request
+    assert 'new_candidates' in checkpoint_request
     assert "controller derives internal candidate handles" in checkpoint_request
     assert (
         "evidence_by_obligation"

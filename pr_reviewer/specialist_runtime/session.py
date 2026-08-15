@@ -325,9 +325,11 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
     ],
     "additionalProperties": False,
 }
-# Candidate lifecycle fields are additive so older providers can still emit the
-# legacy ``candidate_findings`` array.  New checkpoints use compact updates and
-# a separate array for genuinely new candidate objects.
+# Keep the legacy candidate shape for parser compatibility without advertising
+# the legacy field to new model calls.
+_LEGACY_CANDIDATE_FINDINGS_SCHEMA = _CHECKPOINT_SCHEMA["properties"].pop(
+    "candidate_findings",
+)
 _CHECKPOINT_SCHEMA["properties"]["candidate_updates"] = {
     "type": "array",
     "items": {
@@ -351,7 +353,7 @@ _CHECKPOINT_SCHEMA["properties"]["candidate_updates"] = {
 }
 _CHECKPOINT_SCHEMA["properties"]["new_candidates"] = {
     "type": "array",
-    "items": _CHECKPOINT_SCHEMA["properties"]["candidate_findings"]["items"],
+    "items": _LEGACY_CANDIDATE_FINDINGS_SCHEMA["items"],
 }
 _COMPACTING_CHECKPOINT_SCHEMA: dict[str, Any] = {
     **_CHECKPOINT_SCHEMA,
@@ -447,9 +449,8 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
     "updated with status withdrawn or superseded; omission never withdraws one. "
     "Use compact candidate_updates entries such as "
     "{\"candidate_id\":\"c1\",\"status\":\"withdrawn\",\"reason\":\"...\"}. "
-    "Put full candidate objects only in new_candidates. The legacy "
-    "\"candidate_findings\" array is accepted for compatibility; the "
-    "controller derives internal candidate handles from admitted candidate objects. "
+    "Put full candidate objects only in new_candidates. The controller derives "
+    "internal candidate handles from admitted candidate objects. "
     "Keep checkpoints compact: emit at most 8 new candidates, with one concise "
     "sentence per claim/causal_chain/consequence/manual_validation field; keep "
     "claim under 300 characters, causal_chain and confidence_rationale under 600 "
@@ -1176,6 +1177,46 @@ class SpecialistSession:
             entries, sort_keys=True,
         )
 
+    def _checkpoint_obligation_contract(self) -> str:
+        pending: list[dict[str, object]] = []
+        accepted: list[dict[str, str]] = []
+        for assessment in self.obligation_assessments.assessments():
+            if assessment.disposition.value == "pending":
+                obligation = self.coverage.obligation(assessment.obligation_id)
+                pending.append({
+                    "target": assessment.target,
+                    "subject": obligation.subject,
+                    "required_evidence": list(obligation.required_evidence_categories),
+                })
+            else:
+                accepted.append({
+                    "target": assessment.target,
+                    "disposition": assessment.disposition.value,
+                })
+        contract = "Checkpoint obligation contract: " + json.dumps({
+            "pending_obligations": pending,
+            "accepted_obligations": accepted,
+        }, sort_keys=True)
+        if not pending:
+            return contract + (
+                " No obligations are pending; return empty obligation_updates "
+                "and unresolved arrays."
+            )
+        example_target = str(pending[0]["target"])
+        return contract + (
+            " For every pending_obligations target, emit exactly one "
+            "obligation_updates entry or list the target in unresolved. Do not "
+            "repeat accepted_obligations. Use this exact update shape: "
+            + json.dumps({
+                "target": example_target,
+                "disposition": "not_applicable",
+                "reason": "...",
+                "evidence_ids": [],
+                "next_actions": [],
+            }, separators=(",", ":"))
+            + "."
+        )
+
     def _candidate_target(self, candidate_id: str) -> str:
         for target, known_id in self._candidate_targets.items():
             if known_id == candidate_id:
@@ -1208,6 +1249,8 @@ class SpecialistSession:
             )
             + "\n"
             + self._active_candidate_register()
+            + "\n"
+            + self._checkpoint_obligation_contract()
             + _CHECKPOINT_WORKING_MEMORY_INSTRUCTION
             + _CHECKPOINT_RETENTION_INSTRUCTION
         )
@@ -2604,7 +2647,11 @@ class SpecialistSession:
         repair_error = ""
         if needs_repair and allow_repair:
             repair_attempted = True
-            repair_instruction = _CHECKPOINT_REPAIR_INSTRUCTION
+            repair_instruction = (
+                _CHECKPOINT_REPAIR_INSTRUCTION
+                + "\n"
+                + self._checkpoint_obligation_contract()
+            )
             if self._last_checkpoint_validation_error:
                 repair_instruction += " " + self._last_checkpoint_validation_error
             self.conversation.add_user(repair_instruction)
@@ -2755,7 +2802,7 @@ class SpecialistSession:
             raw = raw["checkpoint"]
         if raw is None or not isinstance(raw.get("unresolved"), list):
             return None
-        recognized_keys = set(_CHECKPOINT_SCHEMA["properties"])
+        recognized_keys = set(_CHECKPOINT_SCHEMA["properties"]) | {"candidate_findings"}
         self._last_checkpoint_dropped_keys = tuple(sorted(set(raw) - recognized_keys))
         previous = self.latest_checkpoint
         working_summary = (
@@ -2848,7 +2895,7 @@ class SpecialistSession:
             key=lambda value: int(value[1:]) if value[1:].isdigit() else value,
         )
         modern_checkpoint = "obligation_updates" in raw
-        if modern_checkpoint and not unresolved and missing_targets:
+        if modern_checkpoint and missing_targets:
             self._last_checkpoint_validation_error = (
                 "Missing obligation decisions: " + ", ".join(missing_targets)
                 + ". Add each target to obligation_updates or unresolved; "
