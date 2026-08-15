@@ -23,6 +23,12 @@ provider capacity are understood.
   disproves a candidate, they use `withdraw_candidate` with the handle and a
   reason. Do not ask repository prompts to invent candidate IDs or repeat full
   candidate objects in every checkpoint.
+- Every obligation-resolution proposal also carries a small defect assessment:
+  `none_observed`, up to three independently validated `candidate_drafts`, or a
+  concrete `needs_followup` lead. This keeps defect recognition next to the
+  evidence instead of relying on a late whole-session recall pass. Surviving
+  leads are retained through compaction and receive at most one bounded,
+  tools-disabled synthesis turn during finalization.
 - Deterministic assignments are balanced across the configured session
   capacity (targeting roughly six ordinary obligations per specialist when
   capacity permits). Assignment orientation ranks directly scoped code and
@@ -132,7 +138,7 @@ Create or review these files in the consuming repository before enabling
 
 1. `.github/workflows/ai-review.yml`: use a reviewed immutable action pin. The
    tested local baseline below pins
-   `125m125/pr-reviewer-action@a7107b70ab0448e7c480cee06133aa61c9ff8f0e`.
+   `125m125/pr-reviewer-action@9091b940f9f64081dcf64070b71f2a3552e36318`.
    Grant `contents: read`
    and `pull-requests: write` for `review_comment`; native modes need the same
    PR-write permission. Check out the PR head with `fetch-depth: 0`.
@@ -239,7 +245,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
-      - uses: 125m125/pr-reviewer-action@a7107b70ab0448e7c480cee06133aa61c9ff8f0e
+      - uses: 125m125/pr-reviewer-action@9091b940f9f64081dcf64070b71f2a3552e36318
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           ai_base_url: ${{ vars.LM_STUDIO_BASE_URL }}
@@ -539,6 +545,11 @@ They use a separate per-session allowance of 32 bookkeeping calls, so a malforme
 or repetitive local-tool loop is still bounded.
 Repository reads can be targeted with `targets: ["O1"]`; the result remains
 neutral evidence until the controller accepts a semantic conclusion.
+Each `propose_obligation_resolution` call must also say whether that fresh
+evidence produced no defect indicator, one to three candidate drafts, or a
+specific lead that needs follow-up. Candidate drafts are accepted or rejected
+independently from both the obligation resolution and their sibling drafts.
+Repository prompts should explain domain priorities, not reproduce this schema.
 
 Valid dispositions are `covered`, `not_applicable`, `exhausted`, `blocked`, and
 `unresolved`. Only `unresolved` names concrete novel next actions. Once an action
@@ -585,6 +596,11 @@ not need to be repeated in checkpoints.
   not-applicable/exhausted/blocked obligations remain auditable in the artifact;
   they do not create detail comments or a request-changes verdict without a
   concrete accepted finding.
+- A surviving `needs_followup` defect lead is compact controller-owned memory,
+  not a verification-request comment. At finalization the runtime performs one
+  bounded synthesis over only those leads and their retained evidence. A failed
+  or inconclusive synthesis leaves the lead visible in the artifact; it does
+  not manufacture a finding or trigger a generic scan of all prior evidence.
 
 ## What to expect
 

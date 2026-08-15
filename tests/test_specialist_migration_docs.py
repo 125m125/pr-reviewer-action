@@ -188,7 +188,7 @@ def test_migration_contains_copy_ready_tested_qwen_baseline():
     text = MIGRATION.read_text(encoding="utf-8")
     normalized = " ".join(text.split())
     for required in (
-        "125m125/pr-reviewer-action@a7107b70ab0448e7c480cee06133aa61c9ff8f0e",
+        "125m125/pr-reviewer-action@9091b940f9f64081dcf64070b71f2a3552e36318",
         'ai_model: qwen/qwen3.6-35b-a3b',
         'ai_max_tokens: "8192"',
         'model_context_tokens: "80056"',
@@ -205,6 +205,10 @@ def test_migration_contains_copy_ready_tested_qwen_baseline():
         "controller-owned coverage and evidence metadata",
         "Structurally valid checkpoints are accepted in parts",
         "authoritative receipt",
+        "candidate_drafts",
+        "needs_followup",
+        "independently",
+        "one bounded synthesis",
         "Fresh version-2 adopters should not create this file",
     ):
         assert required in normalized
