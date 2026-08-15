@@ -132,7 +132,7 @@ Create or review these files in the consuming repository before enabling
 
 1. `.github/workflows/ai-review.yml`: use a reviewed immutable action pin. The
    tested local baseline below pins
-   `125m125/pr-reviewer-action@f3e0fa9bb4ce2e82ee16b782c615e9141858467d`.
+   `125m125/pr-reviewer-action@a7107b70ab0448e7c480cee06133aa61c9ff8f0e`.
    Grant `contents: read`
    and `pull-requests: write` for `review_comment`; native modes need the same
    PR-write permission. Check out the PR head with `fetch-depth: 0`.
@@ -239,7 +239,7 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
-      - uses: 125m125/pr-reviewer-action@f3e0fa9bb4ce2e82ee16b782c615e9141858467d
+      - uses: 125m125/pr-reviewer-action@a7107b70ab0448e7c480cee06133aa61c9ff8f0e
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           ai_base_url: ${{ vars.LM_STUDIO_BASE_URL }}
@@ -569,6 +569,17 @@ not need to be repeated in checkpoints.
   obligation statuses, or evidence metadata. Empty candidate arrays are valid
   and do not imply degradation. A malformed response is repaired once before a
   bounded deterministic projection is used.
+- Structurally valid checkpoints are accepted in parts. Durable working memory
+  and valid obligation/candidate changes are retained even when another proposed
+  change fails controller validation. The controller then requests one small,
+  tools-disabled correction containing only the rejected obligation or candidate
+  changes; it does not ask the model to regenerate the full checkpoint.
+- After that focused correction, the controller appends an authoritative receipt
+  with the current pending obligations and active candidate state. Rejected
+  obligation resolutions remain unresolved, rejected new candidates remain
+  inactive, and rejected withdrawals or supersessions preserve the candidate's
+  prior state. The receipt also says whether tools will be re-enabled when the
+  durable specialist resumes.
 - Coverage is not evidence-seeking at all costs. An unchanged seed file can
   explain a contract but does not automatically cover changed behavior. Closed
   not-applicable/exhausted/blocked obligations remain auditable in the artifact;
