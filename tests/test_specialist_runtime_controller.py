@@ -1665,6 +1665,67 @@ def test_malformed_change_summary_falls_back_to_bounded_facts(tmp_path):
     )
 
 
+def test_semantically_invalid_change_summary_gets_one_focused_repair(tmp_path):
+    calls = []
+    inputs = replace(
+        _inputs(tmp_path),
+        changed_files=("src/worker.py", "docs/guide.md"),
+        topology={
+            **_inputs(tmp_path).topology,
+            "changed_files": ["src/worker.py", "docs/guide.md"],
+            "components": [{
+                "id": "worker",
+                "changed_files": ["src/worker.py", "docs/guide.md"],
+            }],
+            "change_facts": _change_facts_payload({
+                "src/worker.py": {"change_type": "modifies", "symbols": ["deliver"]},
+                "docs/guide.md": {"change_type": "modifies", "headings": ["Usage"]},
+            }),
+        },
+    )
+
+    def summarizer(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return {
+                "overview": "Updates worker delivery and its usage guide.",
+                "key_changes": [{
+                    "path": "src/worker.py, docs/guide.md",
+                    "component": "worker",
+                    "summary": "Updates delivery behavior and documentation.",
+                }],
+                "cross_component_effects": [],
+                "uncertainties": [],
+            }
+        return {
+            "overview": "Updates worker delivery and its usage guide.",
+            "key_changes": [{
+                "path": "src/worker.py",
+                "component": "worker",
+                "summary": "Updates delivery behavior and documentation.",
+            }],
+            "cross_component_effects": [],
+            "uncertainties": [],
+        }
+
+    result = _controller(tmp_path, change_summarizer=summarizer).run(inputs)
+
+    assert [request.request_id for request in calls] == [
+        "change_summarizer:1", "change_summarizer:repair:1",
+    ]
+    assert calls[1].context["repair"]["reason"] == (
+        "ValueError: change overview contains unchanged or duplicate path"
+    )
+    assert result.artifact["change_overview"]["key_changes"][0]["path"] == (
+        "src/worker.py"
+    )
+    assert not any(
+        event.kind == "recovery"
+        and event.payload.get("component") == "change_summarizer"
+        for event in result.events
+    )
+
+
 def test_failed_immutable_diff_uses_explicit_degraded_fallback(tmp_path):
     observed = {}
     summarizer_called = False

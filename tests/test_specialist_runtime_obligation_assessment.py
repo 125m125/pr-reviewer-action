@@ -67,6 +67,29 @@ def test_covered_requires_eligible_retained_evidence():
     assert ledger.assessment("O1").evidence_ids == (record.id,)
 
 
+def test_covered_accepts_eligible_subset_and_ignores_supplemental_evidence():
+    ledger = _ledger()
+    store, direct = _store_with_path()
+    supplemental, _collection = store.add_tool_result_with_collection(
+        session_id="session-1",
+        tool="read_pr_diff",
+        arguments={"path": "tests/test_workflow.py"},
+        result={"status": "ok", "content": "supporting test"},
+    )
+
+    result = ledger.propose(
+        target="O1", disposition="covered", reason="Wiring is correct.",
+        evidence_ids=(direct.id, supplemental.id), next_actions=(),
+        evidence=store.snapshot(),
+        eligible=lambda record, _obligation: record.id == direct.id,
+    )
+
+    assert result.accepted is True
+    assert result.eligible_evidence_ids == (direct.id,)
+    assert result.ignored_supplemental_evidence_ids == (supplemental.id,)
+    assert ledger.assessment("O1").evidence_ids == (direct.id,)
+
+
 def test_unresolved_requires_a_novel_concrete_next_action():
     ledger = _ledger()
     store, _record = _store_with_path()

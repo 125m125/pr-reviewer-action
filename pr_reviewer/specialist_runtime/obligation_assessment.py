@@ -57,6 +57,8 @@ class AssessmentProposalResult:
     target: str
     disposition: ObligationDisposition | None
     reason: str
+    eligible_evidence_ids: tuple[str, ...] = ()
+    ignored_supplemental_evidence_ids: tuple[str, ...] = ()
 
 
 def _bounded(value: object, limit: int) -> str:
@@ -214,6 +216,19 @@ class ObligationAssessmentLedger:
         fingerprint = _fingerprint(actions)
         records = {record.id: record for record in evidence.records}
         obligation = self._obligations[assessment.obligation_id]
+        eligible_ids = retained_ids
+        ignored_ids: tuple[str, ...] = ()
+        if (
+            proposed is ObligationDisposition.COVERED
+            and all(item in records for item in retained_ids)
+        ):
+            eligible_ids = tuple(
+                item for item in retained_ids
+                if eligible(records[item], obligation)
+            )
+            ignored_ids = tuple(
+                item for item in retained_ids if item not in eligible_ids
+            )
         error = ""
         if not conclusion:
             error = "a concise reason is required"
@@ -221,9 +236,7 @@ class ObligationAssessmentLedger:
             error = "proposal references unknown retained evidence"
         elif proposed is ObligationDisposition.COVERED and not retained_ids:
             error = "covered requires retained evidence"
-        elif proposed is ObligationDisposition.COVERED and not all(
-            eligible(records[item], obligation) for item in retained_ids
-        ):
+        elif proposed is ObligationDisposition.COVERED and not eligible_ids:
             error = "covered requires eligible retained evidence"
         elif proposed is ObligationDisposition.NOT_APPLICABLE and not any(
             records[item].is_usable_for_coverage
@@ -250,17 +263,23 @@ class ObligationAssessmentLedger:
             action_fingerprint=fingerprint, accepted=not error,
             validation_reason=error or "accepted",
             evidence_before_count=len(assessment.evidence_ids),
-            evidence_after_count=len(retained_ids),
+            evidence_after_count=len(eligible_ids),
         )
         attempts = (*assessment.attempts, attempt)[-12:]
         if error:
             self._assessments[target] = ObligationAssessment(
                 **{**assessment.__dict__, "attempts": attempts}
             )
-            return AssessmentProposalResult(False, target, proposed, error)
+            return AssessmentProposalResult(
+                False, target, proposed, error,
+                eligible_ids, ignored_ids,
+            )
         self._assessments[target] = ObligationAssessment(
             target=target, obligation_id=assessment.obligation_id,
             disposition=proposed, reason=conclusion,
-            evidence_ids=retained_ids, next_actions=actions, attempts=attempts,
+            evidence_ids=eligible_ids, next_actions=actions, attempts=attempts,
         )
-        return AssessmentProposalResult(True, target, proposed, "accepted")
+        return AssessmentProposalResult(
+            True, target, proposed, "accepted",
+            eligible_ids, ignored_ids,
+        )

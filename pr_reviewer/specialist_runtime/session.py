@@ -157,7 +157,10 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "Propose covered, not_applicable, exhausted, blocked, or unresolved; "
             "the controller validates it immediately. Also assess concrete "
             "defects while the obligation evidence is fresh; candidate drafts "
-            "are admitted independently even if this resolution is rejected."
+            "are admitted independently even if this resolution is rejected. "
+            "For covered, cite at least one direct in-scope evidence ID. Tests "
+            "and consumers may be cited as supplemental evidence; the controller "
+            "retains only the eligible subset for coverage."
         ),
         "parameters": {"type": "object", "properties": {
             "target": {
@@ -1154,6 +1157,7 @@ class SpecialistSession:
         self._last_checkpoint_dropped_keys: tuple[str, ...] = ()
         self._last_checkpoint_validation_error = ""
         self._last_checkpoint_rejections: tuple[_CheckpointChangeRejection, ...] = ()
+        self._last_checkpoint_evidence_receipts: tuple[dict[str, object], ...] = ()
         self._last_valid_checkpoint: SessionCheckpoint | None = None
         self._obligation_local_tool_calls = 0
         self._obligation_rejection_counts: dict[tuple[str, str, int], int] = {}
@@ -1409,6 +1413,15 @@ class SpecialistSession:
             else "The specialist is paused with this controller-owned state."
         )
         return "\n".join(lines)
+
+    @staticmethod
+    def _checkpoint_evidence_receipt(
+        receipts: Iterable[Mapping[str, object]],
+    ) -> str:
+        return (
+            "Checkpoint evidence receipt (controller-authoritative): "
+            + json.dumps(list(receipts), sort_keys=True)
+        )
 
     def _candidate_target(self, candidate_id: str) -> str:
         for target, known_id in self._candidate_targets.items():
@@ -2148,6 +2161,10 @@ class SpecialistSession:
                         result.disposition.value if result.disposition else None
                     ),
                     "reason": result.reason,
+                    "eligible_evidence_ids": list(result.eligible_evidence_ids),
+                    "ignored_supplemental_evidence_ids": list(
+                        result.ignored_supplemental_evidence_ids
+                    ),
                 }
                 accepted = result.accepted
                 if accepted:
@@ -3030,6 +3047,7 @@ class SpecialistSession:
             else:
                 repair_parse = "unavailable"
         change_rejections = self._last_checkpoint_rejections
+        evidence_receipts = list(self._last_checkpoint_evidence_receipts)
         if checkpoint is not None and change_rejections and allow_repair:
             correction_attempted = True
             # The durable memory and accepted sibling changes are authoritative
@@ -3094,6 +3112,9 @@ class SpecialistSession:
                     )
                     if corrected is not None:
                         checkpoint = corrected
+                        evidence_receipts.extend(
+                            self._last_checkpoint_evidence_receipts
+                        )
                         correction_parse = "valid"
                         rejected_corrections = {
                             (item.kind, item.target)
@@ -3114,6 +3135,14 @@ class SpecialistSession:
                 disposition=disposition,
                 accepted_corrections=accepted_corrections,
             ))
+        if checkpoint is not None and evidence_receipts:
+            unique_receipts = tuple({
+                json.dumps(item, sort_keys=True): item
+                for item in evidence_receipts
+            }.values())
+            self.conversation.add_user(
+                self._checkpoint_evidence_receipt(unique_receipts)
+            )
         retention_unknown = _candidate_retention_lost(
             self._candidate_retention_signal,
             checkpoint,
@@ -3229,7 +3258,9 @@ class SpecialistSession:
     ) -> SessionCheckpoint | None:
         self._last_checkpoint_validation_error = ""
         self._last_checkpoint_rejections = ()
+        self._last_checkpoint_evidence_receipts = ()
         rejections: list[_CheckpointChangeRejection] = []
+        evidence_receipts: list[dict[str, object]] = []
         raw = _json_object(text)
         if (
             isinstance(raw, Mapping)
@@ -3493,6 +3524,10 @@ class SpecialistSession:
             self._rejected_candidate_ids.discard(candidate_id)
 
         for update, resolved_evidence_ids in prepared_obligation_updates:
+            if str(update.get("disposition") or "").strip().casefold() == "covered":
+                self._associate_proposed_evidence(
+                    str(update.get("target") or ""), resolved_evidence_ids,
+                )
             proposal = self.obligation_assessments.propose(
                 target=str(update.get("target") or ""),
                 disposition=str(update.get("disposition") or ""),
@@ -3510,10 +3545,19 @@ class SpecialistSession:
                     "obligation", target, proposal.reason, dict(update),
                 ))
                 continue
+            if proposal.ignored_supplemental_evidence_ids:
+                evidence_receipts.append({
+                    "target": proposal.target,
+                    "eligible_evidence_ids": proposal.eligible_evidence_ids,
+                    "ignored_supplemental_evidence_ids": (
+                        proposal.ignored_supplemental_evidence_ids
+                    ),
+                })
         self.candidate_findings = tuple(candidates[key] for key in sorted(candidates))
         self._candidate_statuses = candidate_statuses
         self._current_gaps = self._derive_current_gaps()
         self._last_checkpoint_rejections = tuple(rejections)
+        self._last_checkpoint_evidence_receipts = tuple(evidence_receipts)
         evidence_ids = list(dict.fromkeys(evidence_ids))
         return SessionCheckpoint(
             session_id=self.session_id,

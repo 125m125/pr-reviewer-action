@@ -188,6 +188,66 @@ def test_compact_negotiation_offers_resume_only_for_novel_checkpoint_action():
     assert "resume" in target["allowed_actions"]
 
 
+def test_compact_negotiation_only_advertises_globally_admissible_high_risk_actions():
+    blocked = ObligationAssessment(
+        target="O1", obligation_id="OB1",
+        disposition=ObligationDisposition.PENDING,
+    )
+    actionable = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.UNRESOLVED,
+        reason="Inspect the remaining consumer.",
+        next_actions=("read src/consumer.py diff",),
+    )
+    state = state_for(checkpoints=(
+        SessionCheckpoint(
+            session_id="S1", state=SessionState.CHECKPOINT,
+            obligation_assessments=(blocked,),
+        ),
+        SessionCheckpoint(
+            session_id="S2", state=SessionState.CHECKPOINT,
+            obligation_assessments=(actionable,),
+        ),
+    ))
+
+    targets = compact_negotiation_context(state)["targets"]
+
+    assert len(targets) == 1
+    target = targets[0]
+    assert target["subject"] == "src/a.py"
+    assert "resume" in target["allowed_actions"]
+    assert "record_unknown" not in target["allowed_actions"]
+
+
+def test_fallback_skips_infeasible_critical_target_for_actionable_high_target():
+    critical_blocked = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.PENDING,
+    )
+    high_actionable = ObligationAssessment(
+        target="O1", obligation_id="OB1",
+        disposition=ObligationDisposition.UNRESOLVED,
+        reason="Inspect the remaining workflow test.",
+        next_actions=("read tests/test_a.py diff",),
+    )
+    state = state_for(checkpoints=(
+        SessionCheckpoint(
+            session_id="S2", state=SessionState.CHECKPOINT,
+            obligation_assessments=(critical_blocked,),
+        ),
+        SessionCheckpoint(
+            session_id="S1", state=SessionState.CHECKPOINT,
+            obligation_assessments=(high_actionable,),
+        ),
+    ))
+
+    action = fallback_next_action(state)
+
+    assert action.kind == "resume"
+    assert action.obligation_ids == ("OB1",)
+    assert action.session_id == "S1"
+
+
 def test_compact_negotiation_omits_closed_assessment():
     assessment = ObligationAssessment(
         target="O1", obligation_id="OB2",
@@ -214,7 +274,7 @@ def test_compact_negotiation_rejects_resume_without_novel_action():
         obligation_assessments=(assessment,),
     ),))
 
-    with pytest.raises(NegotiationError, match="not allowed"):
+    with pytest.raises(NegotiationError, match="not currently admissible"):
         validate_compact_negotiation({
             "kind": "resume", "target": "U1", "reason": "Keep reading.",
         }, state)
@@ -241,11 +301,27 @@ def test_compact_negotiation_rejects_multi_action_payloads():
 
 
 def test_compact_negotiation_normalizes_unambiguous_kind_alias():
+    state = state_for(
+        resources=(
+            SessionResources(
+                "S1", remaining_model_turns=3, remaining_tool_calls=0,
+                lease_remaining_sec=100.0,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=3, remaining_tool_calls=0,
+                lease_remaining_sec=100.0,
+            ),
+        ),
+        current_session_count=2,
+        max_sessions=2,
+        max_followup_sessions=0,
+        new_session_turns_remaining=0,
+    )
     proposal = validate_compact_negotiation({
         "kind": "record-unknown",
         "target": "U1",
         "reason": "No bounded evidence remains.",
-    }, state_for())
+    }, state)
 
     assert proposal.actions[0].kind == "record_unknown"
 

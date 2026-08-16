@@ -282,6 +282,27 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             ),
             "next_actions": assessment.next_actions if assessment is not None else (),
         })
+    has_feasible_high_risk = any(
+        target["risk_tier"] in {"high", "critical"}
+        and any(
+            action != "record_unknown"
+            for action in target["allowed_actions"]
+        )
+        for target in targets
+    )
+    if has_feasible_high_risk:
+        admissible: list[dict[str, object]] = []
+        for target in targets:
+            if target["risk_tier"] not in {"high", "critical"}:
+                admissible.append(target)
+                continue
+            actions = tuple(
+                action for action in target["allowed_actions"]
+                if action != "record_unknown"
+            )
+            if actions:
+                admissible.append({**target, "allowed_actions": actions})
+        targets = admissible
     return {
         "protocol": "choose exactly one action for one target handle",
         "targets": tuple(targets),
@@ -429,6 +450,8 @@ def _compact_raw_to_legacy(
         item for item in compact_negotiation_context(state)["targets"]
         if item["handle"] == target
     ), None)
+    if obligation is not None and projected_target is None:
+        errors.append(f"target {target!r} is not currently admissible")
     if (
         kind is not None
         and projected_target is not None
@@ -734,72 +757,32 @@ def validate_compact_negotiation(
     return validate_negotiation(_compact_raw_to_legacy(raw, state), state)
 
 
-def _fallback_raw(
-    kind: str,
-    obligation: CoverageObligation,
-    *,
-    session_id: str | None = None,
-) -> dict[str, Any]:
-    action: dict[str, Any] = {
-        "kind": kind,
-        "obligation_ids": [obligation.id],
-        "expected_evidence": list(obligation.required_evidence_categories),
-        "estimated_turns": 0 if kind == "record_unknown" else 1,
-        "reason": (
-            "Deterministic fallback selected the highest-risk uncovered obligation."
-            if kind != "record_unknown"
-            else "No feasible bounded investigation remains; apply the obligation's unresolved policy."
-        ),
-    }
-    if session_id is not None:
-        action["session_id"] = session_id
-    return {"actions": [action]}
-
-
 def fallback_next_action(state: NegotiationState) -> NegotiationAction:
     """Choose one stable, narrow next action for the highest-risk uncovered work."""
-    uncovered = _negotiable_obligations(state)
-    if not uncovered:
+    targets = compact_negotiation_context(state)["targets"]
+    if not targets:
         raise NegotiationError("no uncovered mandatory obligations remain")
-    obligation = uncovered[0]
-    assessment = _assessment_by_obligation(state).get(obligation.id)
-    if (
-        assessment is not None
-        and (
-            (
-                assessment.disposition is ObligationDisposition.UNRESOLVED
-                and not assessment.next_actions
-            )
-            or (
-                assessment.disposition is ObligationDisposition.PENDING
-                and obligation.risk_tier not in {"high", "critical"}
-            )
-        )
-    ):
-        return validate_negotiation(
-            _fallback_raw("record_unknown", obligation), state,
-        ).actions[0]
-
-    primary_owners = sorted(
-        item.session_id for item in state.session_ownership
-        if obligation.id in item.primary_obligation_ids
+    for target in targets:
+        for kind in ("resume", "consult", "new_session"):
+            if kind not in target["allowed_actions"]:
+                continue
+            return validate_compact_negotiation({
+                "kind": kind,
+                "target": target["handle"],
+                "reason": (
+                    "Deterministic fallback selected the highest-risk feasible "
+                    "bounded investigation."
+                ),
+            }, state).actions[0]
+    target = next(
+        item for item in targets
+        if "record_unknown" in item["allowed_actions"]
     )
-    resources = {item.session_id: item for item in state.session_resources}
-    for session_id in primary_owners:
-        resource = resources.get(session_id)
-        if (
-            resource is None
-            or resource.remaining_model_turns <= _CHECKPOINT_TURN_RESERVE
-        ):
-            continue
-        try:
-            return validate_negotiation(
-                _fallback_raw("resume", obligation, session_id=session_id), state
-            ).actions[0]
-        except NegotiationError:
-            continue
-
-    try:
-        return validate_negotiation(_fallback_raw("new_session", obligation), state).actions[0]
-    except NegotiationError:
-        return validate_negotiation(_fallback_raw("record_unknown", obligation), state).actions[0]
+    return validate_compact_negotiation({
+        "kind": "record_unknown",
+        "target": target["handle"],
+        "reason": (
+            "No feasible bounded investigation remains; apply the obligation's "
+            "unresolved policy."
+        ),
+    }, state).actions[0]

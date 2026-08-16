@@ -945,6 +945,8 @@ def test_resolution_accepts_owned_full_id_and_stringified_array_arguments():
         "target": "O1",
         "disposition": "covered",
         "reason": "accepted",
+        "eligible_evidence_ids": [read_result["evidence_id"]],
+        "ignored_supplemental_evidence_ids": [],
         "candidate_results": [],
         "defect_assessment": {
             "result": "none_observed", "lead_retained": False,
@@ -1159,6 +1161,79 @@ def test_checkpoint_obligation_update_uses_same_resolution_validator():
     assessment = result.checkpoint.obligation_assessments[0]
     assert assessment.disposition.value == "covered"
     assert "OB-code" not in result.checkpoint.unknowns
+
+
+def test_checkpoint_resolution_associates_direct_evidence_and_ignores_supplement():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-direct", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py"}),
+    },))
+    direct_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    session._execute_calls(({
+        "id": "read-test", "name": "read_file",
+        "arguments": json.dumps({"path": "tests/test_a.py"}),
+    },))
+    supplemental_id = json.loads(session.conversation.events[-1]["content"])[
+        "evidence_id"
+    ]
+
+    checkpoint = session._checkpoint_from_text(json.dumps({
+        "unresolved": ["OB-tests"],
+        "obligation_updates": [{
+            "target": "O1", "disposition": "covered",
+            "reason": "The changed implementation preserves the contract.",
+            "evidence_ids": [direct_id, supplemental_id], "next_actions": [],
+        }],
+        "candidate_updates": [],
+        "new_candidates": [],
+    }))
+
+    assert checkpoint is not None
+    assessment = session.obligation_assessments.assessment("O1")
+    assert assessment.disposition.value == "covered"
+    assert assessment.evidence_ids == (direct_id,)
+    assert session._last_checkpoint_evidence_receipts == ({
+        "target": "O1",
+        "eligible_evidence_ids": (direct_id,),
+        "ignored_supplemental_evidence_ids": (supplemental_id,),
+    },)
+
+
+def test_checkpoint_request_reports_ignored_supplemental_evidence_to_specialist():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-direct", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py"}),
+    },))
+    direct_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    session._execute_calls(({
+        "id": "read-test", "name": "read_file",
+        "arguments": json.dumps({"path": "tests/test_a.py"}),
+    },))
+    supplemental_id = json.loads(session.conversation.events[-1]["content"])[
+        "evidence_id"
+    ]
+    session.gateway = ScriptedGateway([checkpoint_response(
+        inspected=["a.py", "tests/test_a.py"],
+        unresolved=["OB-tests"],
+        obligation_updates=[{
+            "target": "O1", "disposition": "covered",
+            "reason": "The changed implementation preserves the contract.",
+            "evidence_ids": [direct_id, supplemental_id], "next_actions": [],
+        }],
+    )])
+
+    session.request_checkpoint()
+
+    receipts = [
+        event["content"] for event in session.conversation.events
+        if event["kind"] == "user"
+        and str(event["content"]).startswith("Checkpoint evidence receipt")
+    ]
+    assert len(receipts) == 1
+    assert direct_id in receipts[0]
+    assert supplemental_id in receipts[0]
 
 
 def test_invalid_checkpoint_obligation_batch_rolls_back_earlier_updates():

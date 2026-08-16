@@ -46,6 +46,13 @@ def test_planner_system_prompt_explicitly_disables_review_exploration_and_tools(
     assert "textual tool-call" in prompt
 
 
+def test_change_summarizer_prompt_forbids_joined_path_fields():
+    prompt = cli._ROLE_SYSTEM["change_summarizer"]
+
+    assert "one exact changed path" in prompt
+    assert "never join paths" in prompt
+
+
 def test_controller_role_prompts_do_not_inherit_repository_review_instructions():
     repository_prompt = "Inspect files with tools and publish a repository review."
 
@@ -507,6 +514,21 @@ def test_runtime_event_line_explains_record_unknown_negotiation_action():
     assert "Trust-boundary evidence was not available" in line
 
 
+def test_runtime_event_line_reports_successful_negotiation_adjustment():
+    from pr_reviewer.specialist_runtime.events import RunEvent
+
+    line = cli._runtime_event_line(RunEvent(4, "negotiation_adjustment", {
+        "component": "negotiator",
+        "action": "resume",
+        "reason": "high-risk target retained a feasible bounded investigation",
+    }))
+
+    assert line == (
+        "negotiation adjusted kind=resume: high-risk target retained a "
+        "feasible bounded investigation"
+    )
+
+
 def runtime_source_paths() -> tuple[Path, ...]:
     root = Path(__file__).resolve().parent.parent
     return (
@@ -764,6 +786,23 @@ def test_degradation_summary_exposes_optional_planner_fallback():
         "optional planner fell back to deterministic_base: ValueError: planner context exceeds configured byte limit (316994>180000)",
         "",
     ), )
+
+
+def test_degradation_summary_omits_successful_negotiation_adjustment():
+    rows = cli._degradation_summary_rows({
+        "degradation": [],
+        "events": [{
+            "kind": "recovery",
+            "payload": {
+                "component": "negotiator",
+                "action": "resume",
+                "reason": "high-risk target retained a feasible bounded investigation",
+            },
+        }],
+        "sessions": [],
+    })
+
+    assert rows == ()
 
 
 def test_cli_rejects_incomplete_or_wrong_current_head_snapshot(monkeypatch, tmp_path):

@@ -2865,6 +2865,27 @@ class ReviewController:
         ):
             return fallback
         try:
+            context = {
+                "change_facts": (
+                    change_facts
+                    if isinstance(change_facts, Mapping)
+                    else state.inputs.topology.get(
+                        "changed_contract_facts", {},
+                    )
+                ),
+                "changed_files": state.inputs.changed_files,
+                "components": state.inputs.topology.get("components", ()),
+                "path_components": state.inputs.topology.get(
+                    "path_components", {},
+                ),
+                "relationships": state.inputs.topology.get(
+                    "relationships", (),
+                ),
+                "pr_metadata": {
+                    key: state.inputs.pr_metadata.get(key, "")
+                    for key in ("title", "body")
+                },
+            }
             proposed = self._model_request(
                 state,
                 role="change_summarizer",
@@ -2872,29 +2893,34 @@ class ReviewController:
                 phase=RunPhase.PLANNING,
                 component=self.change_summarizer,
                 method="summarize",
-                context={
-                    "change_facts": (
-                        change_facts
-                        if isinstance(change_facts, Mapping)
-                        else state.inputs.topology.get(
-                            "changed_contract_facts", {},
-                        )
-                    ),
-                    "changed_files": state.inputs.changed_files,
-                    "components": state.inputs.topology.get("components", ()),
-                    "path_components": state.inputs.topology.get(
-                        "path_components", {},
-                    ),
-                    "relationships": state.inputs.topology.get(
-                        "relationships", (),
-                    ),
-                    "pr_metadata": {
-                        key: state.inputs.pr_metadata.get(key, "")
-                        for key in ("title", "body")
-                    },
-                },
+                context=context,
             )
-            return _validated_change_overview(proposed, state.inputs)
+            try:
+                return _validated_change_overview(proposed, state.inputs)
+            except ValueError as validation_error:
+                if self.clock() >= state.deadline.cutoff_for(RunPhase.PLANNING):
+                    raise
+                repaired = self._model_request(
+                    state,
+                    role="change_summarizer",
+                    request_id="change_summarizer:repair:1",
+                    phase=RunPhase.PLANNING,
+                    component=self.change_summarizer,
+                    method="summarize",
+                    context={
+                        **context,
+                        "repair": {
+                            "reason": _bounded_error(validation_error),
+                            "invalid_response": _json_value(proposed),
+                            "instruction": (
+                                "Repair only the rejected structured summary. "
+                                "Each key_changes.path must be one exact changed "
+                                "path; never join paths in one string."
+                            ),
+                        },
+                    },
+                )
+                return _validated_change_overview(repaired, state.inputs)
         except Exception as exc:
             state.journal.emit("recovery", {
                 "component": "change_summarizer",
@@ -3299,7 +3325,7 @@ class ReviewController:
                 ):
                     alternative = fallback_next_action(negotiation_state)
                     if alternative.kind != "record_unknown":
-                        state.journal.emit("recovery", {
+                        state.journal.emit("negotiation_adjustment", {
                             "component": "negotiator",
                             "action": alternative.kind,
                             "reason": (
@@ -3322,7 +3348,7 @@ class ReviewController:
                 })
         try:
             action = fallback_next_action(negotiation_state)
-            state.journal.emit("recovery", {
+            state.journal.emit("negotiation_adjustment", {
                 "component": "negotiator", "action": action.kind,
                 "obligation_ids": action.obligation_ids,
             })

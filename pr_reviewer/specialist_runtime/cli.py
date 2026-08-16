@@ -81,8 +81,9 @@ _ROLE_SYSTEM = {
         "...],\"summary\":string}],\"uncertainties\":[string,...]}. Every path and "
         "component must be copied exactly from the supplied controller facts. `overview` "
         "must be exactly one concise sentence ending in punctuation. Return at "
-        "most five key_changes total; group related paths into behavioral changes "
-        "instead of inventorying files. Do not "
+        "most five key_changes total. Each key_changes.path must contain one exact "
+        "changed path; never join paths in one field. Group broader behavior in the "
+        "summary or cross-component effects instead of inventorying files. Do not "
         "state a consequence, defect, risk, verdict, finding, severity, approval or "
         "merge-safety judgment, verification result, test result, review result, or "
         "coverage claim. Describe only changed behavior and purpose from bounded "
@@ -126,6 +127,8 @@ _ROLE_SYSTEM = {
         "budgets, or an actions array; the controller derives those values from the "
         "selected target. Use a hyphenated spelling only when unavoidable (for example "
         "record-unknown); arbitrary or unsupported kinds remain invalid."
+        " Tools being unavailable to this decision role does not limit a scheduled "
+        "specialist: resume, consult, and new_session run with their advertised tools."
     ),
     "critic": (
         "Adjudicate only evidence-backed candidates from the supplied immutable state. "
@@ -1681,6 +1684,9 @@ def _runtime_event_line(
         )
         suffix = f" target={target}" if target else ""
         return f"negotiation applied kind={action} outcome={outcome}{suffix}"
+    if kind == "negotiation_adjustment":
+        action = _compact_text(payload.get("action"), 40)
+        return f"negotiation adjusted kind={action}{(': ' + error) if error else ''}"
     if kind in {"model_request_started", "model_request_completed", "model_request_failed", "model_request_timed_out"}:
         status = kind.removeprefix("model_request_")
         suffix = f": {error}" if error else ""
@@ -1940,6 +1946,13 @@ def _degradation_summary_rows(
             continue
         payload = event["payload"]
         component = str(payload.get("component", "recovery"))
+        if (
+            component == "negotiator"
+            and str(payload.get("action", "")) in {
+                "resume", "consult", "new_session", "record_unknown",
+            }
+        ):
+            continue
         if component in listed_components:
             continue
         listed_components.add(component)
