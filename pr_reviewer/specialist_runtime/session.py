@@ -486,6 +486,9 @@ _CHECKPOINT_CONTROLLER_STATE_INSTRUCTION = (
 )
 _OBLIGATION_PROTOCOL_INSTRUCTION = (
     " Coverage is not a request to find supporting evidence at all costs. "
+    "Actively attempt to falsify the changed behavior before resolving an obligation; "
+    "look for a reachable failure, contradicted contract, or affected consumer rather "
+    "than treating evidence collection as checklist completion. "
     "Use the short target handles from obligation_targets when calling "
     "obligation tools; exact assigned obligation IDs are accepted only as a "
     "compatibility fallback. "
@@ -1151,6 +1154,7 @@ class SpecialistSession:
         self._last_checkpoint_dropped_keys: tuple[str, ...] = ()
         self._last_checkpoint_validation_error = ""
         self._last_checkpoint_rejections: tuple[_CheckpointChangeRejection, ...] = ()
+        self._last_valid_checkpoint: SessionCheckpoint | None = None
         self._obligation_local_tool_calls = 0
         self._obligation_rejection_counts: dict[tuple[str, str, int], int] = {}
         self._repeated_obligation_rejection = False
@@ -1916,6 +1920,7 @@ class SpecialistSession:
                         "model-stopped-without-valid-checkpoint",
                     )
                 self.latest_checkpoint = checkpoint
+                self._last_valid_checkpoint = checkpoint
                 self._checkpoint_state_degraded = False
                 diagnostic = self._record_checkpoint_diagnostic(
                     reason="normal-completion",
@@ -2846,6 +2851,8 @@ class SpecialistSession:
     ) -> SessionResult:
         """Request a structured checkpoint; never force a final report."""
         disposition = CheckpointDisposition(disposition)
+        prior_checkpoint = self._last_valid_checkpoint
+        had_valid_checkpoint = prior_checkpoint is not None
         if candidate_signal is not None:
             self._candidate_retention_signal = (
                 self._candidate_retention_signal.merged(candidate_signal)
@@ -2875,6 +2882,29 @@ class SpecialistSession:
                 and self._request_events[-1].status == "completed"
             ):
                 raise
+            retention_unknown = _candidate_retention_lost(
+                self._candidate_retention_signal,
+                prior_checkpoint,
+                accounted_candidate_ids=self._accounted_candidate_ids(),
+            )
+            if had_valid_checkpoint and not retention_unknown:
+                self.latest_checkpoint = prior_checkpoint
+                self._checkpoint_state_degraded = False
+                self._last_checkpoint_should_resume = False
+                diagnostic = self._record_checkpoint_diagnostic(
+                    reason=reason,
+                    disposition=CheckpointDisposition.PAUSE,
+                    initial_parse="unavailable",
+                    repair_attempted=False,
+                    repair_parse="not_attempted",
+                    fallback_projection=False,
+                    retention_unknown=False,
+                    initial_error=f"{type(exc).__name__}: {exc}",
+                    context_admission=checkpoint_context_admission,
+                )
+                diagnostic["retained_prior_checkpoint"] = True
+                self.state = SessionState.CHECKPOINT
+                return self._snapshot()
             checkpoint = self._project_checkpoint(self._current_gaps)
             self.latest_checkpoint = (
                 self._checkpoint_with_retention_unknown(checkpoint)
@@ -3090,7 +3120,15 @@ class SpecialistSession:
             accounted_candidate_ids=self._accounted_candidate_ids(),
         )
         fallback_projection = checkpoint is None
-        if fallback_projection:
+        retained_prior_checkpoint = bool(
+            fallback_projection and had_valid_checkpoint and not retention_unknown
+        )
+        if retained_prior_checkpoint:
+            checkpoint = prior_checkpoint
+            fallback_projection = False
+            disposition = CheckpointDisposition.PAUSE
+            self._last_checkpoint_should_resume = False
+        elif fallback_projection:
             checkpoint = self._project_checkpoint(
                 self._current_gaps,
                 candidate_retention_unknown=retention_unknown,
@@ -3117,6 +3155,7 @@ class SpecialistSession:
             context_admission=checkpoint_context_admission,
         )
         checkpoint_diagnostic.update({
+            "retained_prior_checkpoint": retained_prior_checkpoint,
             "change_correction_attempted": correction_attempted,
             "change_correction_parse": correction_parse,
             "change_correction_error": correction_error[:300],
@@ -3126,7 +3165,12 @@ class SpecialistSession:
             ),
         })
         self.latest_checkpoint = checkpoint
-        if not fallback_projection and not retention_unknown:
+        if (
+            not fallback_projection
+            and not retention_unknown
+            and not retained_prior_checkpoint
+        ):
+            self._last_valid_checkpoint = checkpoint
             progress_fingerprint = self._checkpoint_progress_fingerprint(checkpoint)
             checkpoint_diagnostic.update({
                 "progress_fingerprint": progress_fingerprint[:16],
@@ -4027,7 +4071,9 @@ class SpecialistSession:
     def _reconstruct_from_valid_checkpoint(self) -> bool:
         """Emergency rebuild from controller-owned cumulative checkpoint state."""
         if (
-            not self._checkpoint_spans
+            self._last_valid_checkpoint is None
+            or self.latest_checkpoint is not self._last_valid_checkpoint
+            or not self._checkpoint_spans
             or not self.latest_checkpoint.working_summary
             or not self.latest_checkpoint.completed_steps
         ):

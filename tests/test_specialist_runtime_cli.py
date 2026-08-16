@@ -59,6 +59,14 @@ def test_controller_role_prompts_do_not_inherit_repository_review_instructions()
         assert "Tools are unavailable" in prompt
 
 
+def test_critic_requests_verification_only_for_one_concrete_missing_fact():
+    prompt = cli._ROLE_SYSTEM["critic"]
+
+    assert "plausible concrete defect consequence" in prompt
+    assert "exactly one clearly identified missing fact" in prompt
+    assert "vague or speculative concern" in prompt
+
+
 def test_planner_projection_declares_controller_owned_transform_permissions():
     projected = cli._compact_planner_context({
         "base_plan": {"assignments": [

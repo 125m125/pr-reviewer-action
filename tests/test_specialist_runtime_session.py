@@ -446,6 +446,18 @@ def make_session(
     )
 
 
+def test_specialist_protocol_requires_falsifying_changed_behavior_first():
+    assignment = SpecialistAssignment(
+        assignment_id="assignment-1", objective="Review the assigned behavior",
+        primary_obligation_ids=("OB-code",), seed_paths=("a.py",),
+    )
+
+    prompt = specialist_assignment_prompt(assignment)
+
+    assert "attempt to falsify the changed behavior" in prompt
+    assert "before resolving an obligation" in prompt
+
+
 def seed_successful_tool_exchange(
     session, *, call_id, path, content, reasoning="private analysis",
 ):
@@ -1823,8 +1835,8 @@ def test_sparse_checkpoint_preserves_prior_cumulative_working_state():
     assert second.checkpoint.proposed_next_actions == first.checkpoint.proposed_next_actions
 
 
-def test_invalid_checkpoint_fallback_and_recovery_preserve_prior_working_state():
-    """An invalid checkpoint keeps the prior recovery continuation state."""
+def test_invalid_late_checkpoint_and_recovery_preserve_prior_working_state():
+    """An invalid late checkpoint pauses on the prior validated state."""
     initial = checkpoint_response(
         inspected=[],
         unresolved=["OB-tests"],
@@ -1844,7 +1856,8 @@ def test_invalid_checkpoint_fallback_and_recovery_preserve_prior_working_state()
     fallback = session.request_checkpoint("controller-request")
     session.recover("repetitive-transcript")
 
-    assert fallback.degraded is True
+    assert fallback.degraded is False
+    assert fallback.finalization_diagnostics[-1]["retained_prior_checkpoint"] is True
     assert fallback.checkpoint.working_summary == first.checkpoint.working_summary
     assert fallback.checkpoint.completed_steps == first.checkpoint.completed_steps
     assert fallback.checkpoint.hypotheses == first.checkpoint.hypotheses
@@ -2572,6 +2585,106 @@ def test_checkpoint_projection_degradation_survives_finalization():
 
     assert checkpoint.degraded is True
     assert finalized.degraded is True
+
+
+def test_late_invalid_checkpoint_retains_prior_valid_state_without_degradation():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["a.py"], unresolved=["OB-tests"],
+            working_summary="Validated review state.",
+        ),
+        invalid_response("plain-text conclusion"),
+        invalid_response("still-malformed"),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    first = session.request_checkpoint("controller-request", disposition="pause")
+    prior_checkpoint = first.checkpoint
+
+    result = session.request_checkpoint(
+        "no-progress-guard", disposition="compact_resume",
+    )
+
+    assert result.state.value == "checkpoint"
+    assert result.checkpoint == prior_checkpoint
+    assert result.degraded is False
+    assert session.finalize().degraded is False
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["initial_parse"] == "invalid"
+    assert diagnostic["repair_parse"] == "invalid"
+    assert diagnostic["retained_prior_checkpoint"] is True
+    assert diagnostic["disposition"] == "pause"
+
+
+def test_late_unavailable_checkpoint_retains_prior_valid_state_without_degradation():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["a.py"], unresolved=["OB-tests"],
+            working_summary="Validated review state.",
+        ),
+        TimeoutError("checkpoint request timed out"),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    prior_checkpoint = session.request_checkpoint(
+        "controller-request", disposition="pause",
+    ).checkpoint
+
+    result = session.request_checkpoint(
+        "no-progress-guard", disposition="compact_resume",
+    )
+
+    assert result.checkpoint == prior_checkpoint
+    assert result.degraded is False
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["initial_parse"] == "unavailable"
+    assert diagnostic["retained_prior_checkpoint"] is True
+    assert diagnostic["disposition"] == "pause"
+
+
+def test_recovery_span_does_not_make_initial_invalid_checkpoint_valid():
+    session = make_session(ScriptedGateway([
+        invalid_response("plain-text conclusion"),
+        invalid_response("still-malformed"),
+    ]), max_context_tokens=100_000)
+    session.recover("context-pressure")
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is True
+    assert result.finalization_diagnostics[-1]["fallback_projection"] is True
+    assert result.finalization_diagnostics[-1].get(
+        "retained_prior_checkpoint", False,
+    ) is False
+
+
+def test_late_failure_retains_actual_valid_checkpoint_not_newer_projection():
+    lost_candidate = json.dumps({
+        "candidate_finding_ids": ["lost-candidate"],
+        "candidate_findings": [{
+            "candidate_id": "lost-candidate",
+            "claim": "A candidate-shaped response that was never admitted.",
+        }],
+    })
+    session = make_session(ScriptedGateway([
+        checkpoint_response(
+            inspected=["a.py"], unresolved=["OB-tests"],
+            working_summary="Validated review state.",
+        ),
+        invalid_response(lost_candidate),
+        invalid_response("still-malformed"),
+        invalid_response("plain-text conclusion"),
+        invalid_response("still-malformed"),
+    ]), max_context_tokens=100_000)
+    valid_checkpoint = session.request_checkpoint("controller-request").checkpoint
+    projected = session.request_checkpoint("controller-request")
+    assert projected.degraded is True
+    assert projected.checkpoint != valid_checkpoint
+    session._rejected_candidate_ids.add("lost-candidate")
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert result.checkpoint == valid_checkpoint
+    assert result.finalization_diagnostics[-1]["retained_prior_checkpoint"] is True
 
 
 def test_initial_compact_resume_without_working_memory_never_compacts():
