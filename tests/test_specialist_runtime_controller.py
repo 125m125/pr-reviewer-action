@@ -2401,6 +2401,14 @@ def test_critic_failure_rejects_ambiguous_candidate(tmp_path):
         "reason": "critic-rejected",
         "target_id": None,
     }]
+    assert result.artifact["rejected_candidate_diagnostics"] == ({
+        "affected_location": "src/worker.py:7",
+        "candidate_id": "ambiguous",
+        "claim": "Maybe broken",
+        "critic_action": "reject",
+        "final_reason": "critic-rejected",
+        "severity": "major",
+    },)
     assert all(
         item["candidate_id"] != "ambiguous"
         for item in result.artifact["accepted_candidates"]
@@ -2414,6 +2422,33 @@ def test_critic_failure_rejects_ambiguous_candidate(tmp_path):
         for item in result.artifact["rejected_candidates"]
     )
     assert result.verdict != "request_changes" or result.verdict_source != "supported-findings"
+
+
+def test_info_candidate_diagnostic_preserves_critic_keep_and_masks_claim(tmp_path):
+    candidate = CandidateFinding(
+        candidate_id="informational",
+        root_cause_fingerprint="model",
+        claim="Leak token=super-secret-value in review logs",
+        affected_location="scripts/redact.py:53",
+        severity="info",
+    )
+
+    result = _controller(
+        tmp_path,
+        critic=lambda _request: {"actions": [{
+            "candidate_id": candidate.candidate_id,
+            "action": "keep",
+        }]},
+    ).run(replace(_inputs(tmp_path), candidate_findings=(candidate,)))
+
+    assert result.artifact["rejected_candidate_diagnostics"] == ({
+        "affected_location": "scripts/redact.py:53",
+        "candidate_id": "informational",
+        "claim": "Leak [REDACTED] in review logs",
+        "critic_action": "keep",
+        "final_reason": "non-actionable-info",
+        "severity": "info",
+    },)
 
 
 def test_empty_candidate_set_skips_critic_without_degradation(tmp_path):

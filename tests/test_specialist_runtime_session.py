@@ -524,6 +524,18 @@ def test_obligation_resolution_schema_requires_bounded_candidate_assessment():
     assert assessment["properties"]["candidate_drafts"]["maxItems"] == 3
 
 
+def test_concrete_candidate_schema_excludes_non_actionable_info_severity():
+    session = make_session(ScriptedGateway([]))
+    schema = next(
+        item["parameters"] for item in session.conversation.tool_schemas
+        if item["name"] == "report_candidate"
+    )
+
+    assert schema["properties"]["severity"]["enum"] == [
+        "minor", "major", "blocker",
+    ]
+
+
 def test_missing_defect_assessment_cannot_resolve_obligation():
     session = make_session(ScriptedGateway([]))
     session._execute_calls(({

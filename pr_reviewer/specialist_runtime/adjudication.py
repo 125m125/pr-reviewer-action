@@ -34,6 +34,14 @@ _CRITIC_ACTIONS = frozenset({
     "keep", "reject", "merge", "request_verification", "downgrade_unknown",
 })
 _SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
+_SEVERITY_ALIASES = {
+    "critical": "blocker",
+    "high": "major",
+    "medium": "minor",
+    "moderate": "minor",
+    "low": "minor",
+    "informational": "info",
+}
 _NOTE_VALUE_LIMIT = 1000
 
 
@@ -286,8 +294,9 @@ def _stable_strings(values: object) -> tuple[str, ...]:
     return tuple(sorted({_unicode(item).strip() for item in values if _unicode(item).strip()}))
 
 
-def _normalized_severity(value: object) -> str:
+def normalize_candidate_severity(value: object) -> str:
     severity = _unicode(value).strip().lower()
+    severity = _SEVERITY_ALIASES.get(severity, severity)
     return severity if severity in _SEVERITY_RANK else "info"
 
 
@@ -304,7 +313,7 @@ def _normalized_candidate(candidate: CandidateFinding) -> CandidateFinding:
         candidate,
         root_cause_fingerprint=fingerprint,
         affected_location=_unicode(candidate.affected_location).strip(),
-        severity=_normalized_severity(candidate.severity),
+        severity=normalize_candidate_severity(candidate.severity),
         category=category,
         supporting_evidence_ids=_stable_strings(candidate.supporting_evidence_ids),
         contradicting_evidence_ids=_stable_strings(candidate.contradicting_evidence_ids),
@@ -564,7 +573,7 @@ def _consolidated_candidate(
     severity = severity_selector(
         severity_candidates or candidates,
         key=lambda item: (
-            _SEVERITY_RANK[_normalized_severity(item.severity)],
+            _SEVERITY_RANK[normalize_candidate_severity(item.severity)],
             item.candidate_id,
         ),
     ).severity
@@ -581,7 +590,7 @@ def _consolidated_candidate(
         root_cause_fingerprint=_root_fingerprint(identity),
         controller_root_fingerprint=_root_fingerprint(identity),
         affected_location=affected_location,
-        severity=_normalized_severity(severity),
+        severity=normalize_candidate_severity(severity),
         category=identity[2],
         supporting_evidence_ids=supporting,
         contradicting_evidence_ids=contradicting,

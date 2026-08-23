@@ -35,6 +35,7 @@ from .adjudication import (
     build_review_notes,
     build_source_access_request_notes,
     consolidate_candidates,
+    normalize_candidate_severity,
     review_orientation_label,
 )
 from .assignments import (
@@ -1766,6 +1767,7 @@ class _RunState:
     candidates: dict[str, CandidateFinding] = field(default_factory=dict)
     candidate_occurrences: dict[str, CandidateFinding] = field(default_factory=dict)
     collision_dispositions: list[dict[str, object]] = field(default_factory=list)
+    critic_actions: dict[str, str] = field(default_factory=dict)
     source_requests: list[
         SourceAccessRequest | RepositoryAccessRequest
     ] = field(default_factory=list)
@@ -3741,6 +3743,12 @@ class ReviewController:
                     self._degrade(state, "critic", _bounded_error(exc))
                 critic_result = self._conservative_critic(candidates)
         try:
+            critic_rows, _missing = _partial_critic_result(
+                critic_result, candidates,
+            )
+            state.critic_actions = {
+                item["candidate_id"]: item["action"] for item in critic_rows
+            }
             state.review = adjudicate_candidates(
                 candidates, critic_result, state.evidence,
                 obligations=obligation_map, changed_files=state.inputs.changed_files,
@@ -3750,6 +3758,32 @@ class ReviewController:
             state.review = AdjudicatedReview()
         for disposition in state.review.dispositions:
             state.journal.emit("candidate_disposition", _json_value(disposition))
+
+    @staticmethod
+    def _rejected_candidate_diagnostics(
+        state: _RunState,
+    ) -> list[dict[str, str]]:
+        diagnostics: list[dict[str, str]] = []
+        for disposition in state.review.rejected:
+            candidate = state.candidates.get(disposition.candidate_id)
+            if candidate is None:
+                continue
+            severity = normalize_candidate_severity(candidate.severity)
+            diagnostics.append({
+                "candidate_id": disposition.candidate_id,
+                "claim": mask_runtime_text(candidate.claim, limit=500),
+                "affected_location": mask_runtime_text(
+                    candidate.affected_location, limit=300,
+                ),
+                "severity": severity,
+                "critic_action": state.critic_actions.get(
+                    disposition.candidate_id, "missing",
+                ),
+                "final_reason": mask_runtime_text(
+                    disposition.reason, limit=200,
+                ),
+            })
+        return diagnostics
 
     def _handoff_context(self, state: _RunState, status: str) -> ReviewHandoffContext:
         assert state.coverage is not None
@@ -4523,6 +4557,9 @@ class ReviewController:
             "candidate_dispositions": [
                 _json_value(item) for item in state.review.dispositions
             ] + list(state.collision_dispositions),
+            "rejected_candidate_diagnostics": (
+                self._rejected_candidate_diagnostics(state)
+            ),
             "artifact_id": run_id,
             "artifact_write": {
                 "status": "ready" if path is not None else "failed",
@@ -4747,6 +4784,7 @@ class ReviewController:
             "accepted_candidates", "rejected_candidates", "handoff", "notes",
             "coverage_verification_requests", "retention_verification_requests",
             "candidate_dispositions", "candidate_unknowns",
+            "rejected_candidate_diagnostics",
             "verdict", "degradation", "publishing", "event_references",
             "evaluation_status", "artifact_write", "timing",
             "events", "event_journal",
@@ -5540,6 +5578,9 @@ class ReviewController:
                 "candidate_dispositions": [
                     _json_value(item) for item in state.review.dispositions
                 ] + list(state.collision_dispositions),
+                "rejected_candidate_diagnostics": (
+                    self._rejected_candidate_diagnostics(state)
+                ),
                 "candidate_unknowns": [
                     _json_value(item) for item in state.review.unknowns
                 ],

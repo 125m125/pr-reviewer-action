@@ -661,6 +661,20 @@ def test_info_candidate_is_not_published_as_an_actionable_finding():
     assert review.rejected[0].reason == "non-actionable-info"
 
 
+def test_common_high_severity_alias_is_adjudicated_as_major():
+    store, evidence_id = _store()
+    candidate = _candidate(
+        evidence_ids=(evidence_id,),
+        severity="\nhigh\n",
+    )
+
+    review = _adjudicate((candidate,), store)
+
+    assert review.rejected == ()
+    assert len(review.accepted) == 1
+    assert review.accepted[0].severity == "major"
+
+
 @pytest.mark.parametrize("location", ["", "src/other.py:8", "C:\\repo\\src\\store.py:41"])
 def test_missing_or_off_change_location_becomes_verification_not_factual(location: str):
     store, evidence_id = _store()

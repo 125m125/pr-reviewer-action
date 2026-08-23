@@ -56,7 +56,14 @@ _CANDIDATE_DRAFT_PROPERTIES: dict[str, Any] = {
     "claim": {"type": "string"},
     "affected_location": {"type": "string"},
     "causal_chain": {"type": "string"},
-    "severity": {"type": "string"},
+    "severity": {
+        "type": "string",
+        "enum": ["minor", "major", "blocker"],
+        "description": (
+            "Actionable defect severity. Informational observations are not "
+            "candidate findings and must not be reported with this tool."
+        ),
+    },
     "category": {"type": "string"},
     "supporting_evidence_ids": {
         "type": "array", "items": {"type": "string"},
