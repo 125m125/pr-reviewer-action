@@ -481,6 +481,7 @@ class FinalizerProposal:
 class HandoffSummaryProposal:
     """Bounded reviewer-facing prose with explicit controller-owned references."""
 
+    what_changed_summary: str
     ai_reviewed_summary: str
     human_focus: str
     referenced_paths: tuple[str, ...] = ()
@@ -600,8 +601,10 @@ def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
     if not expected <= set(value):
         raise ValueError("handoff summarizer required fields are missing")
 
-    def text(key: str) -> str:
+    def text(key: str, *, allow_empty: bool = False) -> str:
         item = " ".join(str(value.get(key) or "").split())
+        if not item and allow_empty:
+            return ""
         if not item or len(item) > 600:
             raise ValueError(f"handoff summarizer {key} is invalid")
         # Keep each section a summary rather than a hidden finding list.
@@ -610,6 +613,19 @@ def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
             # Preserve the useful first sentence instead of discarding the
             # complete handoff when a compatible model appends explanation.
             item = item[:sentence_ends[0].end()].strip()
+        elif not sentence_ends:
+            item += "."
+        return item
+
+    def change_summary() -> str:
+        item = " ".join(str(value.get("what_changed_summary") or "").split())
+        if not item:
+            return ""
+        if len(item) > 600:
+            raise ValueError("handoff summarizer what_changed_summary is invalid")
+        sentence_ends = list(re.finditer(r"[.!?](?:\s|$)", item))
+        if len(sentence_ends) > 3:
+            item = item[:sentence_ends[2].end()].strip()
         elif not sentence_ends:
             item += "."
         return item
@@ -627,8 +643,9 @@ def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
         return selected[:12]
 
     return HandoffSummaryProposal(
+        what_changed_summary=change_summary(),
         ai_reviewed_summary=text("ai_reviewed_summary"),
-        human_focus=text("human_focus"),
+        human_focus=text("human_focus", allow_empty=True),
         referenced_paths=identifiers("referenced_paths"),
         referenced_component_ids=identifiers("referenced_component_ids"),
         referenced_obligation_ids=identifiers("referenced_obligation_ids"),
@@ -3785,6 +3802,75 @@ class ReviewController:
             })
         return diagnostics
 
+    @staticmethod
+    def _specialist_checkpoint_summaries(
+        state: _RunState,
+    ) -> tuple[dict[str, object], ...]:
+        """Project one bounded latest checkpoint per admitted specialist."""
+        assert state.coverage is not None
+        obligation_map = {item.id: item for item in state.obligations}
+        statuses = dict(state.coverage.snapshot().obligation_statuses)
+        latest: dict[str, tuple[str, object]] = {}
+        for (assignment_id, session_id), result in state.session_results.items():
+            if session_id not in state.quarantined_session_ids:
+                latest[session_id] = (assignment_id, result)
+
+        def strings(
+            values: Iterable[object], *, limit: int = 240,
+        ) -> tuple[str, ...]:
+            return tuple(
+                text
+                for value in tuple(values)[:5]
+                if (text := mask_runtime_text(value, limit=limit).strip())
+            )
+
+        projected: list[dict[str, object]] = []
+        for session_id in sorted(latest)[:12]:
+            assignment_id, result = latest[session_id]
+            assignment = state.assignments.get(assignment_id)
+            checkpoint = getattr(result, "checkpoint", None)
+            if assignment is None or checkpoint is None:
+                continue
+            assigned_ids = tuple(dict.fromkeys((
+                *getattr(assignment, "primary_obligation_ids", ()),
+                *getattr(assignment, "obligation_ids", ()),
+                *getattr(assignment, "independent_obligation_ids", ()),
+            )))
+            covered_subjects = strings(
+                obligation_map[item].subject
+                for item in assigned_ids
+                if item in obligation_map
+                and statuses.get(item) is ObligationStatus.COVERED
+            )
+            unresolved_subjects = strings(
+                obligation_map[item].subject
+                for item in assigned_ids
+                if item in obligation_map
+                and statuses.get(item) not in {
+                    ObligationStatus.COVERED,
+                    ObligationStatus.NOT_APPLICABLE,
+                }
+            )
+            projected.append({
+                "assignment_id": mask_runtime_text(assignment_id, limit=160),
+                "objective": mask_runtime_text(
+                    getattr(assignment, "objective", ""), limit=300,
+                ),
+                "working_summary": mask_runtime_text(
+                    getattr(checkpoint, "working_summary", ""), limit=600,
+                ),
+                "completed_steps": strings(
+                    getattr(checkpoint, "completed_steps", ()),
+                ),
+                "covered_subjects": covered_subjects,
+                "unresolved_subjects": unresolved_subjects,
+                "unknowns": strings(getattr(checkpoint, "unknowns", ())),
+                "proposed_next_actions": strings(
+                    getattr(checkpoint, "proposed_next_actions", ()),
+                ),
+            })
+        return tuple(projected)
+
     def _handoff_context(self, state: _RunState, status: str) -> ReviewHandoffContext:
         assert state.coverage is not None
         coverage = state.coverage.snapshot()
@@ -4110,9 +4196,11 @@ class ReviewController:
         # controller-backed values and silently discard compatible-model
         # overproduction; claims in the actual prose remain strictly checked.
         declared_paths.intersection_update(allowed_reference_paths)
-        combined = (
-            proposal.ai_reviewed_summary + " " + proposal.human_focus
-        )
+        combined = " ".join((
+            proposal.what_changed_summary,
+            proposal.ai_reviewed_summary,
+            proposal.human_focus,
+        ))
         prose_paths = {
             _normalize_repository_path(path)
             for path in _prose_path_references(combined, tracked_paths)
@@ -4182,11 +4270,20 @@ class ReviewController:
             raise ValueError("validated change overview is unavailable")
         return replace(
             base,
-            what_changed=(overview,),
+            what_changed=(
+                (proposal.what_changed_summary,)
+                if proposal.what_changed_summary
+                else base.what_changed
+            ),
+            what_changed_is_validated_overview=True,
             ai_reviewed=(proposal.ai_reviewed_summary,),
             ai_reviewed_is_validated_summary=True,
             review_emphasis_topics=(),
-            human_focus=(proposal.human_focus,),
+            human_focus=(
+                (proposal.human_focus,)
+                if proposal.human_focus
+                else base.human_focus
+            ),
         )
 
     @staticmethod
@@ -4291,11 +4388,10 @@ class ReviewController:
                     component=self.finalizer,
                     method="finalize",
                     context={
-                        "change_overview": {
-                            "overview": str(
-                                state.change_overview.get("overview") or ""
-                            ).strip(),
-                        },
+                        "change_overview": _json_value(state.change_overview),
+                        "specialist_checkpoint_summaries": (
+                            self._specialist_checkpoint_summaries(state)
+                        ),
                         "successful_review_facts": {
                             "covered_subjects": tuple(
                                 obligation.subject

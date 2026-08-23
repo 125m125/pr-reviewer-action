@@ -414,6 +414,16 @@ def test_handoff_summary_parser_keeps_first_sentence_of_overlong_focus():
     assert proposal.human_focus == "Recheck the unresolved runtime boundary."
 
 
+def test_handoff_summary_parser_allows_empty_human_focus():
+    proposal = _handoff_summary_proposal({
+        "what_changed_summary": "Updates the bounded runtime behavior.",
+        "ai_reviewed_summary": "Reviewed retained runtime evidence.",
+        "human_focus": "",
+    })
+
+    assert proposal.human_focus == ""
+
+
 def test_unresolved_high_risk_coverage_becomes_an_actionable_verification_request():
     obligation = CoverageObligation(
         obligation_id="obligation:high-risk",
@@ -1578,7 +1588,9 @@ def test_one_validated_change_overview_reaches_every_review_role(tmp_path):
     assert observed["specialist"] == controller_module._json_value(expected)
     assert observed["negotiator"] == expected
     assert observed["critic"] == expected
-    assert observed["finalizer"] == {"overview": proposal["overview"]}
+    assert controller_module._json_value(observed["finalizer"]) == (
+        controller_module._json_value(proposal)
+    )
     assert controller_module._json_value(
         observed["change_summarizer"]["change_facts"]
     ) == inputs.topology["change_facts"]
@@ -2878,7 +2890,8 @@ def test_handoff_summarizer_writes_behavioral_review_handoff_from_validated_stat
         assert request.context["change_overview"]["overview"]
         assert request.context["successful_review_facts"]["covered_obligation_count"]
         assert set(request.context) == {
-            "change_overview", "successful_review_facts", "prepared_notes",
+            "change_overview", "specialist_checkpoint_summaries",
+            "successful_review_facts", "prepared_notes",
         }
         assert "policy" not in request.context
         assert "coverage" not in request.context
@@ -2920,6 +2933,113 @@ def test_handoff_summarizer_writes_behavioral_review_handoff_from_validated_stat
     from scripts.eval_harness import _unsupported_handoff_lines
 
     assert _unsupported_handoff_lines(result.artifact) == []
+
+
+def test_handoff_summarizer_uses_full_overview_and_latest_checkpoint_summaries(
+    tmp_path,
+):
+    change_overview = {
+        "overview": "Updates worker delivery behavior.",
+        "key_changes": [{
+            "path": "src/worker.py",
+            "component": "worker",
+            "summary": "Adds bounded retry orchestration around delivery.",
+        }],
+        "cross_component_effects": [{
+            "components": ["worker", "delivery"],
+            "summary": "Retry state now affects the worker delivery contract.",
+        }],
+        "uncertainties": [],
+    }
+    observed = {}
+
+    class SummarizedSession(_SuccessfulSession):
+        def explore(self):
+            result = super().explore()
+            return replace(result, checkpoint=replace(
+                result.checkpoint,
+                working_summary=(
+                    "Traced ambiguous delivery retries through the changed worker."
+                ),
+                completed_steps=("Compared the retry branch with its consumer.",),
+                unknowns=(
+                    "External acknowledgement token=super-secret-value remains unresolved.",
+                ),
+                proposed_next_actions=("Recheck acknowledgement handling.",),
+            ))
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return SummarizedSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    def summarizer(request):
+        observed.update(request.context)
+        return {
+            "what_changed_summary": (
+                "Worker delivery now uses bounded retry orchestration. "
+                "The retry state also participates in the delivery contract."
+            ),
+            "ai_reviewed_summary": (
+                "The review traced ambiguous delivery retries through the changed "
+                "worker, compared the retry branch with its consumer, and retained "
+                "the resulting implementation evidence for the delivery obligation."
+            ),
+            "human_focus": (
+                "Recheck the unresolved external acknowledgement behavior."
+            ),
+        }
+
+    inputs = replace(_inputs(tmp_path), topology={
+        **_inputs(tmp_path).topology,
+        "components": [
+            {"id": "worker", "changed_files": ["src/worker.py"]},
+            {"id": "delivery", "changed_files": []},
+        ],
+    })
+    result = _controller(
+        tmp_path,
+        change_summarizer=lambda _request: change_overview,
+        session_factory=factory,
+        finalizer=summarizer,
+    ).run(inputs)
+
+    assert controller_module._json_value(observed["change_overview"]) == (
+        controller_module._json_value(change_overview)
+    )
+    checkpoint_summaries = controller_module._json_value(
+        observed["specialist_checkpoint_summaries"]
+    )
+    assert len(checkpoint_summaries) == 1
+    checkpoint_summary = checkpoint_summaries[0]
+    assert checkpoint_summary["assignment_id"]
+    assert checkpoint_summary["objective"]
+    assert checkpoint_summary["working_summary"] == (
+        "Traced ambiguous delivery retries through the changed worker."
+    )
+    assert checkpoint_summary["completed_steps"] == [
+        "Compared the retry branch with its consumer.",
+    ]
+    assert set(checkpoint_summary["covered_subjects"]) == {
+        "src/worker.py", "delivery",
+    }
+    assert checkpoint_summary["unresolved_subjects"] == []
+    assert checkpoint_summary["unknowns"] == [
+        "External acknowledgement [REDACTED] remains unresolved.",
+    ]
+    assert checkpoint_summary["proposed_next_actions"] == [
+        "Recheck acknowledgement handling.",
+    ]
+    assert result.handoff.what_changed == (
+        "Worker delivery now uses bounded retry orchestration. "
+        "The retry state also participates in the delivery contract.",
+    )
+    assert len(result.handoff.ai_reviewed[0]) > 160
+    assert "### What the AI reviewed" in result.handoff.markdown
 
 
 def test_handoff_summarizer_accepts_generic_component_scope_prose(tmp_path):

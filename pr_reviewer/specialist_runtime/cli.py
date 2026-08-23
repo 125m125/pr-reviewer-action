@@ -162,16 +162,23 @@ _ROLE_SYSTEM = {
         "detailed claims belong in review notes."
     ),
     "handoff_summarizer": (
-        "Write exactly one concise sentence for `ai_reviewed_summary` and one for "
-        "`human_focus`. Return "
-        "{\"ai_reviewed_summary\":string,\"human_focus\":string}. Orient a human reviewer around "
+        "Write two or three concise content-focused sentences for "
+        "`what_changed_summary`, exactly one concise sentence for "
+        "`ai_reviewed_summary`, and one for `human_focus` (or an empty string "
+        "when no material unresolved area needs emphasis). Return "
+        "{\"what_changed_summary\":string,\"ai_reviewed_summary\":string,"
+        "\"human_focus\":string}. Ground change claims only in the complete validated "
+        "change_overview. Use specialist_checkpoint_summaries to explain what the AI "
+        "actually investigated and which material area still needs human attention. "
+        "Do not turn checkpoint hypotheses or unknowns into change claims. Orient a human reviewer around "
         "behavior and review scope; do not list files, findings, severities, exact defect "
         "claims, unknowns, verification requests, verdicts, approvals, or merge safety. "
         "This is a presentation step, not code review. Tools are unavailable and the "
-        "supplied facts are final; do not inspect or request files. Use only "
-        "successful_review_facts. Do not add reference arrays or path inventories; "
+        "supplied facts are final; do not inspect or request files. Use only the supplied "
+        "change_overview, specialist_checkpoint_summaries, successful_review_facts, "
+        "and prepared_notes. Do not add reference arrays or path inventories; "
         "the controller owns provenance. Do not claim complete coverage. The controller reuses the separately "
-        "validated change overview for What changed; do not rewrite it."
+        "validated change overview and latest admitted checkpoint summaries."
     ),
 }
 _SPECIALIST_SYSTEM = (

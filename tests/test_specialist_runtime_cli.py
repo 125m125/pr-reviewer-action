@@ -1940,9 +1940,10 @@ def test_handoff_summarizer_prompt_limits_prose_to_controller_facts(
     prompt_lower = prompt.casefold()
 
     assert "successful_review_facts" in prompt
+    assert "specialist_checkpoint_summaries" in prompt
+    assert "Ground change claims only in the complete validated change_overview" in prompt
     assert "do not list files, findings, severities" in prompt
     assert "do not claim complete coverage" in prompt_lower
-    assert "do not rewrite it" in prompt
 
 
 def test_specialist_prompt_requires_exact_honest_changed_locations(

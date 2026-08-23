@@ -1767,6 +1767,7 @@ def project_review_handoff(
         context.ai_reviewed,
         limit=3,
         require_path=not context.ai_reviewed_is_validated_summary,
+        max_chars=600 if context.ai_reviewed_is_validated_summary else 160,
         allowed_paths=reviewed_paths,
     )
     human_focus = tuple(
