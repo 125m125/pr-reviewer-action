@@ -2989,20 +2989,38 @@ class SpecialistSession:
         accepted_corrections: set[tuple[str, str]] = set()
         if needs_repair and allow_repair:
             repair_attempted = True
-            repair_instruction = (
-                _CHECKPOINT_REPAIR_INSTRUCTION
-                + "\n"
-                + self._checkpoint_obligation_contract()
+            reasoning_only_retry = bool(
+                not turn.content.strip() and turn.reasoning.strip()
+                and _json_object(turn.reasoning) is None
             )
-            if self._last_checkpoint_validation_error:
-                repair_instruction += " " + self._last_checkpoint_validation_error
-            self.conversation.add_user(repair_instruction)
+            if reasoning_only_retry:
+                # The provider spent the whole strict turn in private reasoning.
+                # Retry from the identical pre-response checkpoint state so that
+                # the failed reasoning cannot consume the repair's context.
+                del self.conversation.events[checkpoint_request_start + 1:]
+                self.conversation.events[checkpoint_request_start]["content"] += (
+                    "\nThe previous attempt produced only private reasoning and "
+                    "was discarded. Keep internal reasoning brief and emit the "
+                    "required JSON object within this response."
+                )
+            else:
+                repair_instruction = (
+                    _CHECKPOINT_REPAIR_INSTRUCTION
+                    + "\n"
+                    + self._checkpoint_obligation_contract()
+                )
+                if self._last_checkpoint_validation_error:
+                    repair_instruction += " " + self._last_checkpoint_validation_error
+                self.conversation.add_user(repair_instruction)
             repair_event_count = len(self._request_events)
             try:
                 repair = self._request(
                     tools_enabled=False,
                     schema=checkpoint_schema,
-                    purpose="checkpoint-repair",
+                    purpose=(
+                        "checkpoint-clean-retry"
+                        if reasoning_only_retry else "checkpoint-repair"
+                    ),
                     max_output_tokens=self.checkpoint_max_tokens,
                     allow_compaction=False,
                     allow_gateway_fallbacks=allow_gateway_fallbacks,

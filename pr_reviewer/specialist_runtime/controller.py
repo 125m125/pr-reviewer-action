@@ -802,6 +802,13 @@ def _deterministic_handoff_change_summary(
     change_overview: Mapping[str, object],
 ) -> tuple[str, ...]:
     """Render bounded behavioral prose when a run cannot trust model prose."""
+    def bounded_fact(value: object, limit: int) -> str:
+        text = " ".join(str(value or "").split())
+        if len(text) <= limit:
+            return text
+        prefix = text[:limit - 1].rsplit(" ", 1)[0].rstrip(" ,;:.")
+        return prefix + "…"
+
     overview = " ".join(str(change_overview.get("overview") or "").split())
     if not overview:
         return ()
@@ -816,7 +823,7 @@ def _deterministic_handoff_change_summary(
             if summary.casefold() in {"changes", "modifies"}:
                 continue
             if summary and summary not in summaries:
-                summaries.append(summary[:180])
+                summaries.append(bounded_fact(summary, 180))
             if len(summaries) == 3:
                 break
     if summaries:
@@ -834,7 +841,7 @@ def _deterministic_handoff_change_summary(
             else:
                 text = " ".join(str(item).split())
             if text and text not in effect_text:
-                effect_text.append(text[:180])
+                effect_text.append(bounded_fact(text, 180))
             if len(effect_text) == 2:
                 break
     if effect_text and len(result) < 3:
@@ -3264,6 +3271,16 @@ class ReviewController:
                 return (fallback_next_action(negotiation_state),)
             except NegotiationError:
                 return ()
+        if (
+            negotiation_state.remaining_deadline_sec
+            < negotiation_state.seconds_per_turn
+        ):
+            state.journal.emit("negotiation_adjustment", {
+                "component": "negotiator",
+                "action": "stop",
+                "reason": "no model turn fits the remaining exploration deadline",
+            })
+            return ()
         if self.negotiator is not None:
             try:
                 compact_context = compact_negotiation_context(negotiation_state)
@@ -4081,8 +4098,9 @@ class ReviewController:
             match.group(1).casefold()
             for match in _HANDOFF_COMPONENT_REFERENCE.finditer(combined)
             if match.group(1).casefold() not in {
-                "cross", "human", "repository", "runtime", "security",
-                "system", "trust",
+                "affected", "changed", "cross", "human", "repository",
+                "reviewed", "runtime", "security", "supplied", "system",
+                "trust",
             }
         }
         if (

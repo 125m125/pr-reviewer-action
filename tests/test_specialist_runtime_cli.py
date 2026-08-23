@@ -915,6 +915,10 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
     monkeypatch.setenv("MODEL_CONTEXT_TOKENS", "32000")
     monkeypatch.setenv("SPECIALIST_TEMPERATURE", "0.2")
     monkeypatch.setenv("SPECIALIST_STREAM_WATCHDOG", "false")
+    monkeypatch.setenv(
+        "SPECIALIST_STRUCTURED_CHAT_TEMPLATE_KWARGS",
+        '{"enable_thinking":false}',
+    )
     monkeypatch.setenv("TOOL_MAX_RESPONSE_BYTES", "5432")
     monkeypatch.setenv("TOOL_REQUEST_TIMEOUT_SEC", "7")
     monkeypatch.setenv("SEARCH_URL", "https://search.example/search")
@@ -930,6 +934,7 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
     }
     assert controller.change_summarizer.gateway is gateway
     assert gateway.stream_watchdog is False
+    assert gateway.structured_chat_template_kwargs == {"enable_thinking": False}
     assert config.request_timeout_sec == 41
     assert config.max_tokens == 1234
     assert config.recovery_max_tokens == 456

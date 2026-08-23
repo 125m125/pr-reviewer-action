@@ -196,6 +196,14 @@ inputs:
     description: Interrupt streamed specialist turns that repeat paragraphs or blocks and recover once from compact evidence.
     required: false
     default: "true"
+  specialist_structured_chat_template_kwargs:
+    description: >-
+      Optional JSON object added as chat_template_kwargs only to specialist-runtime
+      structured turns. Leave empty for provider portability; llama.cpp-compatible
+      Qwen deployments can use {"enable_thinking":false} so checkpoints spend their
+      output budget on the required JSON instead of private reasoning.
+    required: false
+    default: ""
   specialist_max_truncation_continuations:
     description: Deprecated no-op retained for one release; durable sessions checkpoint instead of issuing truncation-continuation turns.
     required: false
@@ -835,6 +843,7 @@ runs:
         SPECIALIST_MAX_CONVERSATION_TOKENS: ${{ inputs.specialist_max_conversation_tokens }}
         SPECIALIST_TEMPERATURE: ${{ inputs.specialist_temperature }}
         SPECIALIST_STREAM_WATCHDOG: ${{ inputs.specialist_stream_watchdog }}
+        SPECIALIST_STRUCTURED_CHAT_TEMPLATE_KWARGS: ${{ inputs.specialist_structured_chat_template_kwargs }}
         SPECIALIST_MAX_TRUNCATION_CONTINUATIONS: ${{ inputs.specialist_max_truncation_continuations }}
         SPECIALIST_PLANNER_MAX_CONTEXT_BYTES: ${{ inputs.specialist_planner_max_context_bytes }}
         SPECIALIST_PACKET_MAX_BYTES: ${{ inputs.specialist_packet_max_bytes }}
@@ -970,6 +979,7 @@ runs:
         SPECIALIST_MAX_CONVERSATION_TOKENS: ${{ inputs.specialist_max_conversation_tokens }}
         SPECIALIST_TEMPERATURE: ${{ inputs.specialist_temperature }}
         SPECIALIST_STREAM_WATCHDOG: ${{ inputs.specialist_stream_watchdog }}
+        SPECIALIST_STRUCTURED_CHAT_TEMPLATE_KWARGS: ${{ inputs.specialist_structured_chat_template_kwargs }}
         SPECIALIST_MAX_TRUNCATION_CONTINUATIONS: ${{ inputs.specialist_max_truncation_continuations }}
         SPECIALIST_PLANNER_MAX_CONTEXT_BYTES: ${{ inputs.specialist_planner_max_context_bytes }}
         SPECIALIST_PACKET_MAX_BYTES: ${{ inputs.specialist_packet_max_bytes }}

@@ -88,9 +88,10 @@ replay and provider capacity have been demonstrated.
 | `specialist_pass_timeout_sec` | retained | `600` | `600` | Bounds an individual model request within the global deadline. |
 | `specialist_max_tokens` | retained | `4096` | `8192` for the tested local Qwen baseline | Provides room for bounded structured checkpoints and repairs without changing the lifetime turn limit. |
 | `specialist_recovery_max_tokens` | retained | `2048` | `2048` | Bounds the first reconstructed specialist model turn after a recovery. |
-| `specialist_max_conversation_tokens` | retained | `96000` | `96000` | Bounds each session transcript separately from model context. |
+| `specialist_max_conversation_tokens` | retained | `96000` | `60000` for a 75000-token local window | Keeps ordinary transcript pressure below the provider window while preserving checkpoint/output headroom. |
 | `specialist_temperature` | retained | `0.0` | `0.0` | Keeps exploration deterministic while replay behavior is established. |
-| `model_context_tokens` | retained |  | Set the provider's actual served window; use `80056` for the tested local Qwen configuration | Derives corpus/diff and admission budgets from the real context window. Never copy a model's advertised maximum when the server is configured lower. |
+| `model_context_tokens` | retained |  | Set the provider's actual served window; use `75000` for the tested local Qwen configuration | Derives corpus/diff and admission budgets from the real context window. Never copy a model's advertised maximum when the server is configured lower. |
+| `specialist_structured_chat_template_kwargs` | added |  | `{"enable_thinking":false}` for llama.cpp-compatible Qwen servers; otherwise leave blank | Applies provider-specific chat-template options only to no-tool structured roles so exploration can retain reasoning while checkpoints spend their output on JSON. Providers that reject unknown request fields must leave it empty. |
 | `system_prompt_file` | retained |  | `.github/ai-review-prompt.md` | Stores repository conventions alongside the code being reviewed. |
 | `system_prompt_mode` | changed | `replace` | `append` | Preserves the action-owned specialist protocol and appends repository conventions. |
 | `specialist_stream_watchdog` | retained | `true` | `true` | Stops repeated streamed blocks and permits one compact recovery. |
@@ -268,7 +269,7 @@ jobs:
           system_prompt_file: .github/ai-review-prompt.md
           system_prompt_mode: append
           review_scope: full
-          model_context_tokens: "80056"
+          model_context_tokens: "75000"
           specialist_review_deadline_sec: "7200"
           specialist_concurrency: "1"
           specialist_max_sessions: "12"
@@ -282,11 +283,13 @@ jobs:
           specialist_max_tokens: "8192"
           specialist_pass_timeout_sec: "1200"
           specialist_recovery_max_tokens: "4096"
+          specialist_max_conversation_tokens: "60000"
+          specialist_structured_chat_template_kwargs: '{"enable_thinking":false}'
           publish_review_comment: "false"
           publish_mode: review_comment
 ```
 
-The `80056` context value is the served window of the tested local Qwen setup,
+The `75000` context value is the served window of the tested local Qwen setup,
 not a universal constant. Replace it with the other provider's real configured
 window. After a successful evaluation, change `review_strategy` to `specialists`
 and `publish_review_comment` to `"true"`. Raise `specialist_concurrency` only

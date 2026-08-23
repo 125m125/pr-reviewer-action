@@ -3025,6 +3025,38 @@ def test_checkpoint_diagnostic_admission_keeps_initial_and_repair_reserves():
     assert diagnostic["repair_response_reserve_tokens"] == session.checkpoint_max_tokens
 
 
+def test_reasoning_only_checkpoint_retries_without_retaining_failed_response():
+    long_reasoning = "I should emit the checkpoint next. " * 1_100
+    gateway = EstimatingGateway(
+        [
+            replace(
+                reasoning_only_response(long_reasoning),
+                usage={"prompt_tokens": 57_595, "completion_tokens": 8_192},
+            ),
+            checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+        ],
+        rendered_bytes=12_000,
+    )
+    session = make_session(
+        gateway,
+        max_tokens=8_192,
+        max_context_tokens=75_000,
+        model_turns=4,
+    )
+
+    result = session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+
+    assert result.degraded is False
+    assert len(gateway.requests) == 2
+    assert long_reasoning not in gateway.requests[1].messages
+    assert "Keep internal reasoning brief" in gateway.requests[1].messages
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["repair_attempted"] is True
+    assert diagnostic["repair_parse"] == "valid"
+
+
 def test_epoch_compaction_rejects_invalid_checkpoint_and_failed_repair():
     gateway = ScriptedGateway([
         invalid_response("invalid checkpoint"),

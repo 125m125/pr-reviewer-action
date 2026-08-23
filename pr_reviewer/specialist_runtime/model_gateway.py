@@ -95,6 +95,7 @@ class OpenAIModelGateway:
     api_format: str = "openai"
     response_format: str = "json_schema"
     stream_watchdog: bool = True
+    structured_chat_template_kwargs: Mapping[str, Any] = field(default_factory=dict)
     transport: Transport | None = None
 
     def __post_init__(self) -> None:
@@ -129,7 +130,7 @@ class OpenAIModelGateway:
         )
         if response_format not in {"off", "json_object", "json_schema"}:
             raise ValueError("response_format_override must be off, json_object, or json_schema")
-        return request.conversation.to_request_payload(
+        payload = request.conversation.to_request_payload(
             "openai",
             self.model_for_role(request.role),
             stream=request.stream,
@@ -145,6 +146,11 @@ class OpenAIModelGateway:
             tokens_param=request.tokens_param,
             cache_prefix=request.cache_prefix,
         )
+        if not request.tools_enabled and self.structured_chat_template_kwargs:
+            payload["chat_template_kwargs"] = dict(
+                self.structured_chat_template_kwargs
+            )
+        return payload
 
     def rendered_request_bytes(self, request: ModelTurnRequest) -> int:
         """Return the compact UTF-8 size of the exact provider payload."""

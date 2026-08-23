@@ -96,7 +96,7 @@ jobs:
           ai_verdict_reasoning_effort: none
           ai_stream: "true"
           ai_max_tokens: "8192"
-          model_context_tokens: "80056"
+          model_context_tokens: "75000"
           ai_request_timeout_sec: "1200"
           standards_file: .github/ai-review-rules.md
           system_prompt_file: .github/ai-review-prompt.md
@@ -131,9 +131,10 @@ jobs:
           # Keep the larger project-specific budgets; the new watchdog still
           # interrupts repetitive streamed output before it consumes them.
           specialist_recovery_max_tokens: "4096"
-          specialist_max_conversation_tokens: "200000"
+          specialist_max_conversation_tokens: "60000"
           specialist_temperature: "0.6"
           specialist_stream_watchdog: "true"
+          specialist_structured_chat_template_kwargs: '{"enable_thinking":false}'
 
           # Specialist calls reuse the existing read-only executor restrictions.
           tool_max_response_bytes: "12000"

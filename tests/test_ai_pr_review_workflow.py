@@ -82,6 +82,18 @@ def test_dogfood_workflow_temporarily_allows_large_planner_preflight():
     ) == '"180000"'
 
 
+def test_dogfood_workflow_matches_served_qwen_context_and_disables_strict_thinking():
+    workflow = _WORKFLOW.read_text(encoding="utf-8").splitlines()
+
+    assert _scalar(workflow, "model_context_tokens", 10) == '"75000"'
+    assert _scalar(
+        workflow, "specialist_max_conversation_tokens", 10,
+    ) == '"60000"'
+    assert _scalar(
+        workflow, "specialist_structured_chat_template_kwargs", 10,
+    ) == "'{\"enable_thinking\":false}'"
+
+
 def test_action_exposes_project_diff_priority_file():
     action = (_ROOT / "action.yml").read_text(encoding="utf-8")
 

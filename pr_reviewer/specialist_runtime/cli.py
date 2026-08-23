@@ -295,6 +295,7 @@ class CliConfig:
     response_format: str
     tokens_param: str
     reasoning_effort: str | None
+    structured_chat_template_kwargs: Mapping[str, object]
     request_timeout_sec: int
     max_tokens: int
     recovery_max_tokens: int
@@ -387,6 +388,22 @@ class CliConfig:
         tokens_param = source.get("AI_TOKENS_PARAM", "max_tokens").strip() or "max_tokens"
         if tokens_param not in {"max_tokens", "max_completion_tokens"}:
             raise ValueError("ai_tokens_param must be max_tokens or max_completion_tokens")
+        raw_template_kwargs = source.get(
+            "SPECIALIST_STRUCTURED_CHAT_TEMPLATE_KWARGS", "",
+        ).strip()
+        structured_template_kwargs: Mapping[str, object] = {}
+        if raw_template_kwargs:
+            try:
+                parsed_template_kwargs = json.loads(raw_template_kwargs)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "specialist_structured_chat_template_kwargs must be a JSON object"
+                ) from exc
+            if not isinstance(parsed_template_kwargs, Mapping):
+                raise ValueError(
+                    "specialist_structured_chat_template_kwargs must be a JSON object"
+                )
+            structured_template_kwargs = dict(parsed_template_kwargs)
         return cls(
             workspace=root,
             environment=source,
@@ -401,6 +418,7 @@ class CliConfig:
             response_format=source.get("AI_RESPONSE_FORMAT", "off").strip().lower(),
             tokens_param=tokens_param,
             reasoning_effort=(source.get("AI_REASONING_EFFORT", "").strip() or None),
+            structured_chat_template_kwargs=structured_template_kwargs,
             request_timeout_sec=request_timeout,
             max_tokens=_positive_int(source, "SPECIALIST_MAX_TOKENS", 4096),
             recovery_max_tokens=_positive_int(source, "SPECIALIST_RECOVERY_MAX_TOKENS", 2048),
@@ -879,6 +897,7 @@ def build_controller(
         default_temperature=config.temperature,
         tokens_param=config.tokens_param,
         reasoning_effort=config.reasoning_effort,
+        structured_chat_template_kwargs=config.structured_chat_template_kwargs,
     )
     role_response_format = "json_object" if config.response_format == "json_schema" else None
     change_summarizer = _BoundedRoleAdapter(

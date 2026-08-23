@@ -191,6 +191,17 @@ def test_specialist_watchdog_inputs_are_declared_and_wired():
         assert f"{env_name}: ${{{{ inputs.{name} }}}}" in content
 
 
+def test_structured_specialist_template_kwargs_are_declared_and_wired():
+    content = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
+    inputs = parse_action_inputs()
+
+    assert "specialist_structured_chat_template_kwargs" in inputs
+    assert (
+        "SPECIALIST_STRUCTURED_CHAT_TEMPLATE_KWARGS: "
+        "${{ inputs.specialist_structured_chat_template_kwargs }}"
+    ) in content
+
+
 def _action_defaults() -> dict[str, str]:
     content = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
     defaults: dict[str, str] = {}

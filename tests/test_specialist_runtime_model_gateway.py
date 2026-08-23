@@ -98,6 +98,25 @@ def test_rendered_request_bytes_uses_structured_schema_without_tools():
     ).encode("utf-8"))
 
 
+def test_structured_template_kwargs_apply_only_when_tools_are_disabled():
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1",
+        api_key="",
+        default_model="main",
+        structured_chat_template_kwargs={"enable_thinking": False},
+    )
+
+    structured = gateway.render_request(turn_request(
+        conversation("checkpoint"), tools_enabled=False,
+    ))
+    exploration = gateway.render_request(turn_request(
+        conversation("explore"), tools_enabled=True,
+    ))
+
+    assert structured["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "chat_template_kwargs" not in exploration
+
+
 def test_role_model_override_and_deadline_bound_timeout():
     calls = []
     gateway = OpenAIModelGateway(

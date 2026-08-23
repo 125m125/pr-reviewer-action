@@ -48,7 +48,12 @@ from pr_reviewer.specialist_runtime.callbacks import (
 )
 from pr_reviewer.specialist_runtime.events import EventJournal
 from pr_reviewer.specialist_runtime.evidence import EvidenceStore
-from pr_reviewer.specialist_runtime.coverage import derive_obligations
+from pr_reviewer.specialist_runtime.coverage import (
+    CoverageLedger,
+    CoverageReconciliation,
+    CoverageSnapshot,
+    derive_obligations,
+)
 from pr_reviewer.specialist_runtime.budget import BudgetLedger, RunDeadline
 from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy, RuntimeConfig
 from pr_reviewer.specialist_runtime.model_gateway import ModelTurnResult
@@ -1409,6 +1414,58 @@ def _controller(tmp_path, **overrides):
     return ReviewController(**values)
 
 
+def test_negotiator_stops_cleanly_when_no_model_turn_fits_deadline(tmp_path):
+    called = False
+
+    def negotiator(_request):
+        nonlocal called
+        called = True
+        return {"kind": "new_session", "target": "U1", "reason": "continue"}
+
+    inputs = _inputs(tmp_path)
+    obligations = derive_obligations(
+        inputs.topology, inputs.classification, inputs.policy,
+    )
+    coverage = CoverageLedger(obligations)
+    snapshot = coverage.snapshot()
+    target = obligations[0].id
+    state = _RunState(
+        inputs=inputs,
+        journal=EventJournal(),
+        deadline=RunDeadline(
+            0.0, inputs.config.review_deadline_sec, inputs.config.phase_shares,
+        ),
+        evidence=EvidenceStore(),
+        obligations=obligations,
+        coverage=coverage,
+    )
+    reconciliation = CoverageReconciliation(
+        snapshot=CoverageSnapshot(
+            snapshot.obligation_statuses,
+            snapshot.recipe_statuses,
+            snapshot.evidence_by_obligation,
+        ),
+        newly_covered_obligation_ids=(),
+        uncovered_obligation_ids=(target,),
+        attempted_unresolved_obligation_ids=(),
+        never_covered_obligation_ids=(target,),
+    )
+    controller = _controller(
+        tmp_path, negotiator=negotiator, clock=lambda: 89.5,
+    )
+
+    actions = controller._negotiate(state, reconciliation)
+
+    assert actions == ()
+    assert called is False
+    assert state.degradations == []
+    assert any(
+        item.kind == "negotiation_adjustment"
+        and item.payload.get("action") == "stop"
+        for item in state.journal.snapshot()
+    )
+
+
 def test_one_validated_change_overview_reaches_every_review_role(tmp_path):
     observed = {}
     inputs = replace(
@@ -1801,6 +1858,23 @@ def test_handoff_effects_render_summary_text_not_mapping_repr():
         "the transport layer."
     )
     assert "{'components'" not in " ".join(summary)
+
+
+def test_handoff_fallback_clips_long_facts_at_word_boundaries():
+    long_key_change = (
+        "Modifies session configuration including "
+        "specialist_max_tool_calls_per_session and "
+        + ("additional behavior " * 20)
+    )
+
+    summary = controller_module._deterministic_handoff_change_summary({
+        "overview": "The review runtime changes session configuration.",
+        "key_changes": [{"summary": long_key_change}],
+        "cross_component_effects": [],
+    })
+
+    assert "additional behavi." not in " ".join(summary)
+    assert "…" in summary[1]
 
 
 def test_optional_planner_absence_keeps_authoritative_base_without_degradation(tmp_path):
@@ -2811,6 +2885,30 @@ def test_handoff_summarizer_writes_behavioral_review_handoff_from_validated_stat
     from scripts.eval_harness import _unsupported_handoff_lines
 
     assert _unsupported_handoff_lines(result.artifact) == []
+
+
+def test_handoff_summarizer_accepts_generic_component_scope_prose(tmp_path):
+    def summarizer(_request):
+        return {
+            "ai_reviewed_summary": (
+                "The AI reviewed the supplied component scope with emphasis on "
+                "delivery behavior."
+            ),
+            "human_focus": (
+                "Recheck the reviewed component behavior around ambiguous delivery."
+            ),
+        }
+
+    result = _controller(tmp_path, finalizer=summarizer).run(_inputs(tmp_path))
+
+    assert result.handoff.ai_reviewed == (
+        "The AI reviewed the supplied component scope with emphasis on delivery "
+        "behavior.",
+    )
+    assert not any(
+        item["component"] == "handoff_summarizer"
+        for item in result.artifact["degradation"]
+    )
 
 
 @pytest.mark.parametrize(
