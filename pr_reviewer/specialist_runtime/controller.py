@@ -131,10 +131,6 @@ _URL_CANDIDATE = re.compile(
     r"(?:[A-Za-z0-9-]+\.){2,}[A-Za-z]{2,63}"
     r")"
 )
-_HANDOFF_COMPONENT_REFERENCE = re.compile(
-    r"(?i)\b(?:the\s+)?([a-z][a-z0-9_-]{1,63})\s+"
-    r"(?:component|service|gateway|boundary)\b"
-)
 _DETERMINISTIC_CONTEXT_KEYS = frozenset({
     "context_paths", "related_paths", "affected_paths", "affected_consumers",
     "affected_producers", "affected_callees", "affected_callers",
@@ -4153,7 +4149,6 @@ class ReviewController:
             for path in state.inputs.changed_files
             if _normalize_repository_path(path)
         }
-        component_ids = set(base.component_ids)
         assert state.coverage is not None
         coverage = state.coverage.snapshot()
         covered_ids = {
@@ -4215,23 +4210,6 @@ class ReviewController:
         direct_context_paths = _direct_change_references(combined, context_paths)
         if direct_context_paths:
             raise ValueError("handoff summary contains a direct change claim for an unchanged path")
-        allowed_components = {item.casefold() for item in component_ids}
-        concrete_component_refs = {
-            match.group(1).casefold()
-            for match in _HANDOFF_COMPONENT_REFERENCE.finditer(combined)
-            if match.group(1).casefold() not in {
-                "affected", "changed", "cross", "human", "repository",
-                "reviewed", "runtime", "security", "supplied", "system",
-                "trust",
-            }
-        }
-        if (
-            not concrete_component_refs <= allowed_components
-        ):
-            raise ValueError(
-                "handoff summary contains an undeclared or unknown component"
-            )
-
         normalized = " ".join(combined.casefold().split())
         forbidden_judgments = (
             "approve", "request changes", "request_changes", "merge safe",

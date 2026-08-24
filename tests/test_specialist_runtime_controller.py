@@ -3066,6 +3066,30 @@ def test_handoff_summarizer_accepts_generic_component_scope_prose(tmp_path):
     )
 
 
+def test_handoff_summarizer_accepts_natural_subsystem_vocabulary(tmp_path):
+    def summarizer(_request):
+        return {
+            "ai_reviewed_summary": (
+                "The AI reviewed durable session safety invariants and "
+                "tool-secret boundary guards."
+            ),
+            "human_focus": (
+                "Confirm that adversarial tests cover plausible bypasses."
+            ),
+        }
+
+    result = _controller(tmp_path, finalizer=summarizer).run(_inputs(tmp_path))
+
+    assert result.handoff.ai_reviewed == (
+        "The AI reviewed durable session safety invariants and tool-secret "
+        "boundary guards.",
+    )
+    assert not any(
+        item["component"] == "handoff_summarizer"
+        for item in result.artifact["degradation"]
+    )
+
+
 @pytest.mark.parametrize(
     "proposal",
     (
@@ -3074,20 +3098,6 @@ def test_handoff_summarizer_accepts_generic_component_scope_prose(tmp_path):
             "human_focus": "Recheck the worker boundary.",
             "referenced_paths": ["src/invented.py"],
             "referenced_component_ids": ["worker"],
-            "referenced_obligation_ids": [],
-        },
-        {
-            "ai_reviewed_summary": "The review covered the invented gateway.",
-            "human_focus": "Recheck the worker boundary.",
-            "referenced_paths": [],
-            "referenced_component_ids": ["invented-gateway"],
-            "referenced_obligation_ids": [],
-        },
-        {
-            "ai_reviewed_summary": "The review traced the invented gateway.",
-            "human_focus": "Recheck the invented boundary.",
-            "referenced_paths": [],
-            "referenced_component_ids": [],
             "referenced_obligation_ids": [],
         },
         {

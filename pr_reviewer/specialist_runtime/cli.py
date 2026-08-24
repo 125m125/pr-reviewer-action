@@ -1972,6 +1972,8 @@ def _degradation_summary_rows(
             continue
         payload = event["payload"]
         component = str(payload.get("component", "recovery"))
+        if component == "specialist" and not str(payload.get("reason", "")).strip():
+            continue
         if (
             component == "negotiator"
             and str(payload.get("action", "")) in {

@@ -768,6 +768,30 @@ def test_degradation_summary_exposes_specialist_root_causes_without_model_dump()
     assert rows[1] == ("change_summarizer", "ValueError: summary claims coverage", "")
 
 
+def test_degradation_summary_omits_reasonless_specialist_recovery_duplicate():
+    rows = cli._degradation_summary_rows({
+        "degradation": [{
+            "component": "specialist:fallback-combined-1",
+            "reason": "CallbackTimedOut: specialist-gateway callback timed out",
+        }],
+        "events": [{
+            "kind": "recovery",
+            "payload": {
+                "component": "specialist",
+                "assignment_id": "fallback-combined-1",
+                "action": "bounded_followup_or_unknown",
+            },
+        }],
+        "sessions": [],
+    })
+
+    assert rows == ((
+        "specialist:fallback-combined-1",
+        "CallbackTimedOut: specialist-gateway callback timed out",
+        "turns=?; tools=?",
+    ),)
+
+
 def test_degradation_summary_exposes_optional_planner_fallback():
     rows = cli._degradation_summary_rows({
         "degradation": [],
