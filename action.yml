@@ -828,7 +828,7 @@ runs:
         SPECIALIST_MAX_MODEL_TURNS_PER_SESSION: ${{ inputs.specialist_max_model_turns_per_session }}
         SPECIALIST_MAX_TOOL_CALLS_PER_SESSION: ${{ inputs.specialist_max_tool_calls_per_session }}
         SPECIALIST_MAX_TOTAL_MODEL_TURNS: ${{ inputs.specialist_max_total_model_turns }}
-        SPECIALIST_MAX_TOTAL_TOOL_CALLS: ${{ inputs.specialist_max_total_tool_calls }}
+        SPECIALIST_MAX_TOTAL_TOOL_CALLS: ${{ inputs.specialist_max_total_model_turns }}
         SPECIALIST_MAX_RECOVERIES_PER_SESSION: ${{ inputs.specialist_max_recoveries_per_session }}
         SPECIALIST_CONFIG_FILE: ${{ inputs.specialist_config_file }}
         SPECIALIST_PLANNER_MAX_TOOL_CALLS: ${{ inputs.specialist_planner_max_tool_calls }}
