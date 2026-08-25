@@ -641,7 +641,7 @@ def _native_event(
     if policy_result.verdict == "notice":
         return "COMMENT", "coverage incomplete; non-verdict specialist review"
     if policy_result.verdict == "request_changes":
-        return "REQUEST_CHANGES", "policy requested changes"
+        return "COMMENT", "policy requested changes"
     if policy_result.verdict != "approve":
         raise ValueError("policy verdict must be approve, request_changes, or notice")
     if not approval.allow_approve:
