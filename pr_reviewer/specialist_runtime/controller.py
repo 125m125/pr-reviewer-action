@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 import secrets
 import tempfile
+from threading import Event
 import time
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Protocol
@@ -1810,6 +1811,7 @@ class _IsolatedSessionHandle:
     lease: SessionLease
     baseline_evidence_ids: frozenset[str] = frozenset()
     latest_result: object | None = None
+    exploration_done: Event = field(default_factory=Event, repr=False)
 
     @property
     def candidate_findings(self) -> tuple[CandidateFinding, ...]:
@@ -1838,13 +1840,26 @@ class _IsolatedSessionHandle:
         )
 
     def explore(self) -> object:
-        result = self.session.explore()
-        self._validate_result(result)
-        if result.state.value == "exploring":
-            raise RuntimeError("specialist returned while still exploring")
-        self._validate_owned_outputs(result)
-        self.latest_result = result
-        return result
+        self.exploration_done.clear()
+        try:
+            result = self.session.explore()
+            self._validate_result(result)
+            if result.state.value == "exploring":
+                raise RuntimeError("specialist returned while still exploring")
+            self._validate_owned_outputs(result)
+            self.latest_result = result
+            return result
+        finally:
+            self.exploration_done.set()
+
+    def wait_for_exploration(self, timeout: float) -> bool:
+        """Wait for an abandoned exploration callback before reusing its state."""
+        return self.exploration_done.wait(max(0.0, float(timeout)))
+
+    def mark_exploration_interrupted(self) -> None:
+        callback = getattr(self.session, "mark_exploration_interrupted", None)
+        if callable(callback):
+            callback()
 
     def apply_coverage_feedback(self, gaps: Iterable[str]) -> None:
         callback = getattr(self.session, "apply_coverage_feedback", None)
@@ -1869,8 +1884,6 @@ class _IsolatedSessionHandle:
         self.lease = lease
 
     def finalize(self) -> object:
-        if self.latest_result is None or self.latest_result.state.value == "exploring":
-            raise RuntimeError("an exploring or uncheckpointed session cannot be finalized")
         result = self.session.finalize()
         self._validate_result(result)
         self._validate_owned_outputs(result)
@@ -3020,7 +3033,7 @@ class ReviewController:
         binder = getattr(session, "bind_request_attempt_journal", None)
         if callable(binder) and state.request_attempt_journal is not None:
             binder(state.request_attempt_journal, assignment.id)
-        return _IsolatedSessionHandle(
+        handle = _IsolatedSessionHandle(
             assignment=assignment,
             session=session,
             session_id=session_id,
@@ -3029,6 +3042,11 @@ class ReviewController:
             lease=lease,
             baseline_evidence_ids=frozenset(snapshot.evidence.evidence_ids),
         )
+        # Register immediately so a worker that is interrupted at the phase
+        # cutoff still has a durable handle for finalization recovery.
+        state.sessions[session_id] = handle
+        state.assignment_sessions[assignment.id] = session_id
+        return handle
 
     def _run_wave(
         self,
@@ -3137,13 +3155,26 @@ class ReviewController:
                 "action": "bounded_followup_or_unknown",
             })
         for assignment_id in result.in_flight_assignment_ids:
-            session_id = state.assignment_sessions.pop(assignment_id, None)
-            if session_id is not None:
-                state.sessions.pop(session_id, None)
-            state.journal.emit("session_quarantined", {
+            session_id = state.assignment_sessions.get(assignment_id)
+            handle = state.sessions.get(session_id) if session_id else None
+            if isinstance(handle, _IsolatedSessionHandle):
+                handle.mark_exploration_interrupted()
+            state.journal.emit("session_interrupted", {
                 "assignment_id": assignment_id,
-                "reason": "in_flight_after_wave_cutoff",
+                "session_id": session_id or "",
+                "reason": "in_flight_after_wave_cutoff; retained_for_checkpoint_recovery",
             })
+        retained_assignments = {
+            item.assignment_id
+            for item in result.results
+        } | set(result.in_flight_assignment_ids)
+        for assignment in assignment_items:
+            if assignment.id in retained_assignments or existing_handles[assignment.id] is not None:
+                continue
+            session_id = expected_ids[assignment.id]
+            state.sessions.pop(session_id, None)
+            if state.assignment_sessions.get(assignment.id) == session_id:
+                state.assignment_sessions.pop(assignment.id, None)
         before_ids = set(wave_snapshot.evidence.evidence_ids)
         for record in state.evidence.snapshot().records:
             if record.id not in before_ids:
@@ -5364,6 +5395,17 @@ class ReviewController:
                         "absolute deadline reached; specialist finalization used retained checkpoint",
                     )
                     break
+                wait_for_exploration = getattr(session, "wait_for_exploration", None)
+                if callable(wait_for_exploration):
+                    remaining = state.deadline.remaining(now=self.clock())
+                    if not wait_for_exploration(remaining):
+                        reason = (
+                            "interrupted specialist exploration did not stop before "
+                            "the finalization deadline"
+                        )
+                        self._degrade(state, f"specialist:{session.assignment.id}", reason)
+                        self._quarantine_session(state, session.session_id, reason)
+                        continue
                 updated, _ = self._session_hook(
                     state,
                     key,

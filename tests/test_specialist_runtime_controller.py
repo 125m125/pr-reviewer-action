@@ -4157,12 +4157,15 @@ def test_phase_cutoff_freezes_in_flight_request_once_before_late_completion(tmp_
         )
         frozen_artifact = json.dumps(result.artifact, sort_keys=True)
 
-        assert len(attempts) == 1
+        assert len(attempts) == 2
         assert attempts[0]["status"] == "timed_out_at_phase_cutoff"
         assert attempts[0]["in_flight"] is True
+        assert attempts[1]["status"] == "completed"
+        assert attempts[1]["purpose"] == "checkpoint"
         assert tuple(event["kind"] for event in request_events) == (
             "specialist_request_started",
             "specialist_request_timed_out_at_phase_cutoff",
+            "specialist_request_completed",
         )
         assert tuple(event["kind"] for event in gateway_events) == (
             "llm_request_started",
@@ -4175,10 +4178,10 @@ def test_phase_cutoff_freezes_in_flight_request_once_before_late_completion(tmp_
             assert event["payload"]["admission_source"] == attempts[0][
                 "admission_source"
             ]
-        for event in (request_events[-1], gateway_events[-1]):
+        for event in (request_events[1], gateway_events[-1]):
             assert event["payload"]["actual_prompt_tokens"] == 0
             assert event["payload"]["actual_completion_tokens"] == 0
-        assert result.artifact["budgets"]["totals"]["model_turns"] == 1
+        assert result.artifact["budgets"]["totals"]["model_turns"] == 2
         assert result.artifact["budgets"]["totals"]["specialist_model_cutoff"] == 1
         assert any(
             event["kind"] == "session_in_flight"

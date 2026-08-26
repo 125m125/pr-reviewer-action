@@ -316,7 +316,14 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
                     "claim": {"type": "string", "maxLength": 300},
                     "affected_location": {"type": "string", "maxLength": 256},
                     "causal_chain": {"type": "string", "maxLength": 600},
-                    "severity": {"type": "string", "maxLength": 32},
+                    "severity": {
+                        "type": "string",
+                        "enum": ["minor", "major", "blocker"],
+                        "description": (
+                            "Actionable defect severity. Informational observations "
+                            "are not candidate findings; use unknowns instead."
+                        ),
+                    },
                     "category": {"type": "string", "maxLength": 64},
                     "supporting_evidence_ids": {
                         "type": "array", "maxItems": 12,
@@ -346,7 +353,7 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
                 "required": [
                     "candidate_id", "claim", "affected_location",
                     "causal_chain", "supporting_evidence_ids",
-                    "related_obligation_ids", "confidence_rationale",
+                    "related_obligation_ids", "confidence_rationale", "severity",
                     "user_visible_consequence",
                     "manual_validation",
                 ],
@@ -1178,6 +1185,7 @@ class SpecialistSession:
         self._request_events: list[SpecialistRequestEvent] = []
         self._finalization_diagnostics: list[dict[str, object]] = []
         self._checkpoint_state_degraded = False
+        self._checkpoint_recovery_required = False
         self._last_context_admission: dict[str, object] = {}
         self._admission_calibration = {
             "tools": _AdmissionCalibration(),
@@ -1928,8 +1936,15 @@ class SpecialistSession:
                         )
                     continue
                 checkpoint = self._checkpoint_from_text(turn.content)
+                candidate_change_rejected = any(
+                    item.kind == "candidate-new"
+                    for item in self._last_checkpoint_rejections
+                ) and not (
+                    checkpoint is not None and checkpoint.candidate_finding_ids
+                )
                 if (
                     checkpoint is None
+                    or candidate_change_rejected
                     or _candidate_retention_lost(
                         self._candidate_retention_signal,
                         checkpoint,
@@ -2883,6 +2898,20 @@ class SpecialistSession:
             )
         checkpoint_request_start = len(self.conversation.events)
         self.conversation.add_user(self._checkpoint_prompt(reason, disposition))
+        candidate_rejections = tuple(
+            item for item in self._last_checkpoint_rejections
+            if item.kind == "candidate-new"
+        )
+        if candidate_rejections:
+            self.conversation.add_user(
+                "Repair the previous checkpoint's rejected candidate fields "
+                "before continuing. "
+                + "; ".join(
+                    f"{item.target}: {item.reason}"
+                    for item in candidate_rejections
+                )
+                + ". Every candidate must include severity=blocker, major, or minor."
+            )
         checkpoint_schema = (
             _COMPACTING_CHECKPOINT_SCHEMA
             if disposition is CheckpointDisposition.COMPACT_RESUME
@@ -2980,10 +3009,20 @@ class SpecialistSession:
                 "checkpoint response was not a valid checkpoint object"
             )
         initial_parse = "valid" if checkpoint is not None else "invalid"
-        needs_repair = checkpoint is None or _candidate_retention_lost(
-            self._candidate_retention_signal,
-            checkpoint,
-            accounted_candidate_ids=self._accounted_candidate_ids(),
+        candidate_change_rejected = any(
+            item.kind == "candidate-new"
+            for item in self._last_checkpoint_rejections
+        ) and not (
+            checkpoint is not None and checkpoint.candidate_finding_ids
+        )
+        needs_repair = (
+            checkpoint is None
+            or candidate_change_rejected
+            or _candidate_retention_lost(
+                self._candidate_retention_signal,
+                checkpoint,
+                accounted_candidate_ids=self._accounted_candidate_ids(),
+            )
         )
         repair_attempted = False
         repair_parse = "not_attempted"
@@ -3018,6 +3057,19 @@ class SpecialistSession:
                 )
                 if self._last_checkpoint_validation_error:
                     repair_instruction += " " + self._last_checkpoint_validation_error
+                candidate_rejections = tuple(
+                    item for item in self._last_checkpoint_rejections
+                    if item.kind == "candidate-new"
+                )
+                if candidate_rejections:
+                    repair_instruction += (
+                        " Candidate corrections required: "
+                        + "; ".join(
+                            f"{item.target}: {item.reason}"
+                            for item in candidate_rejections
+                        )
+                        + "."
+                    )
                 self.conversation.add_user(repair_instruction)
             repair_event_count = len(self._request_events)
             try:
@@ -3655,18 +3707,25 @@ class SpecialistSession:
         confidence_rationale = str(
             value.get("confidence_rationale") or ""
         ).strip()
+        severity = str(value.get("severity") or "").strip().lower()
         required = {
             "candidate_id": candidate_id,
             "claim": claim,
             "affected_location": affected_location,
             "causal_chain": causal_chain,
             "confidence_rationale": confidence_rationale,
+            "severity": severity,
             "user_visible_consequence": consequence,
             "manual_validation": validation,
         }
         missing = [key for key, item in required.items() if not item]
         if missing:
             return None, "missing required candidate fields: " + ", ".join(missing)
+        if severity not in {"blocker", "major", "minor"}:
+            return None, (
+                "candidate severity must be one of blocker, major, or minor; "
+                "do not use info for a candidate"
+            )
         raw_supporting = _strings(value.get("supporting_evidence_ids"))
         raw_contradicting = _strings(value.get("contradicting_evidence_ids"))
         supporting = tuple(dict.fromkeys(
@@ -3710,7 +3769,7 @@ class SpecialistSession:
             claim=claim,
             affected_location=affected_location,
             causal_chain=causal_chain,
-            severity=str(value.get("severity") or "info").strip(),
+            severity=severity,
             category=str(value.get("category") or "").strip(),
             supporting_evidence_ids=supporting,
             contradicting_evidence_ids=contradicting,
@@ -4715,6 +4774,16 @@ class SpecialistSession:
         self.lease.request_timeout(
             self.request_timeout_sec, now=self.clock(),
         )
+        if self._checkpoint_recovery_required:
+            # Exploration may have been interrupted after the previous
+            # checkpoint. Give the same session one bounded, tools-disabled
+            # checkpoint turn so conclusions from that tail are not silently
+            # discarded. If recovery fails, request_checkpoint retains the
+            # previous validated state (or creates a conservative fallback).
+            self.request_checkpoint(
+                "interrupted-exploration",
+                disposition=CheckpointDisposition.PAUSE,
+            )
         self.state = SessionState.FINALIZING
         self._synthesize_defect_leads()
         retention_unknown = _CANDIDATE_RETENTION_UNKNOWN in self.latest_checkpoint.unknowns
@@ -4725,6 +4794,10 @@ class SpecialistSession:
             degraded=(retention_unknown or self._checkpoint_state_degraded),
         )
         return self._final_result
+
+    def mark_exploration_interrupted(self) -> None:
+        """Require a checkpoint before finalization after a cutoff."""
+        self._checkpoint_recovery_required = True
 
     def _cache_checkpoint_fallback(self) -> SessionResult:
         self.state = SessionState.COMPLETE

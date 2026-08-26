@@ -1753,6 +1753,22 @@ def test_finalization_closes_from_valid_checkpoint_without_model_call():
     assert len(gateway.requests) == 1
 
 
+def test_finalization_recovers_checkpoint_after_interrupted_exploration():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway)
+    session.mark_exploration_interrupted()
+
+    result = session.finalize()
+
+    assert result.state is SessionState.COMPLETE
+    assert result.report["source"] == "checkpoint-finalization"
+    assert len(gateway.requests) == 1
+    assert gateway.requests[0].tools_enabled is False
+    assert gateway.requests[0].messages_contain("interrupted-exploration")
+
+
 def test_checkpoint_derives_candidate_ids_from_candidate_objects():
     response = candidate_checkpoint_response(["candidate-code"])
     payload = json.loads(response.text)
@@ -1771,6 +1787,34 @@ def test_checkpoint_derives_candidate_ids_from_candidate_objects():
     result = session.explore()
 
     assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
+
+
+def test_checkpoint_repairs_candidate_missing_actionable_severity():
+    invalid = json.loads(candidate_checkpoint_response(("candidate-code",)).text)
+    invalid["candidate_findings"][0].pop("severity")
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        ModelTurnResult(
+            response={}, tool_calls=(), text=json.dumps(invalid),
+            text_source="content", finish_reason="stop",
+            usage={"prompt_tokens": 3, "completion_tokens": 2},
+            request_diagnostics={},
+        ),
+        candidate_checkpoint_response(("candidate-code",)),
+    ])
+    session = make_session(gateway)
+
+    result = session.explore()
+
+    assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
+    assert session.candidate_findings[0].severity == "major"
+    repair_prompts = [
+        event["content"] for event in session.conversation.events
+        if event.get("kind") == "user"
+        and "Repair the previous checkpoint" in event.get("content", "")
+    ]
+    assert repair_prompts
+    assert "severity" in repair_prompts[-1]
 
 
 def test_checkpoint_carries_forward_candidates_when_update_arrays_are_empty():
@@ -2149,6 +2193,7 @@ def test_checkpoint_partially_accepts_candidates_and_repairs_only_rejected_draft
         "claim": "The changed branch returns the wrong state.",
         "affected_location": "a.py:4",
         "causal_chain": "The changed input reaches the invalid return branch.",
+        "severity": "major",
         "supporting_evidence_ids": [record.id],
         "related_obligation_ids": ["O1"],
         "confidence_rationale": "consequence_support:affected_consumer; evidence_ids=" + record.id,
@@ -2199,6 +2244,7 @@ def test_rejected_candidate_update_preserves_and_reports_current_state():
         "claim": "The changed branch returns the wrong state.",
         "affected_location": "a.py:4",
         "causal_chain": "The changed input reaches the invalid return branch.",
+        "severity": "major",
         "supporting_evidence_ids": [record.id],
         "related_obligation_ids": ["OB-code"],
         "confidence_rationale": (
