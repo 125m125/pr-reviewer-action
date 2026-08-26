@@ -1084,11 +1084,24 @@ def fallback_assignment_plan(
         ordinary_paths = {
             path for item in ordinary_items for path in (*item.scope, *item.seed_hints)
         }
-        workload_slots = max(
-            min(len(ordinary_groups), 6),
-            len({_priority(group) for _, group in ordinary_groups}),
-            (len(ordinary_items) + 5) // 6,
-            (len(ordinary_paths) + 7) // 8,
+        changed_paths = {
+            str(path).strip() for path in topology.get("changed_files", ())
+            if str(path).strip()
+        }
+        changed_line_count = topology.get("changed_line_count")
+        workload_slots = (
+            1
+            if (
+                0 < len(changed_paths) <= 3
+                and isinstance(changed_line_count, int)
+                and 0 <= changed_line_count <= 500
+            )
+            else max(
+                min(len(ordinary_groups), 6),
+                len({_priority(group) for _, group in ordinary_groups}),
+                (len(ordinary_items) + 5) // 6,
+                (len(ordinary_paths) + 7) // 8,
+            )
         )
         available_slots = max(
             1,

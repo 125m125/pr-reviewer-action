@@ -362,7 +362,7 @@ def test_unrelated_evidence_id_cannot_launder_candidate_into_acceptance():
 
     assert review.accepted == ()
     assert review.verification_requests[0].candidate.candidate_id == candidate.candidate_id
-    assert review.verification_requests[0].reason == "evidence-does-not-satisfy-related-obligation"
+    assert review.verification_requests[0].reason == "consequence-not-supported"
 
 
 @pytest.mark.parametrize(

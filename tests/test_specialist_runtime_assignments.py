@@ -1117,6 +1117,46 @@ def test_fallback_balances_large_ordinary_workload_across_available_sessions():
     assert max(ordinary_sizes) - min(ordinary_sizes) <= 1
 
 
+def test_fallback_coalesces_small_change_ordinary_work_into_one_session():
+    paths = ("action.yml", "scripts/redact.py", "pr_reviewer/publish.py")
+    ordinary = tuple(
+        CoverageObligation(
+            obligation_id=f"topology:ordinary-{index}", origin="topology",
+            subject=f"ordinary {index}", required_evidence_categories=("implementation",),
+            scope=(paths[index % len(paths)],),
+        )
+        for index in range(12)
+    )
+    isolated = (
+        CoverageObligation(
+            obligation_id="recipe:security", origin="recipe", subject="security",
+            required_evidence_categories=("tests",), scope=paths,
+            recipe_id="security", recipe_execution="independent",
+            requires_independent_verification=True,
+        ),
+        CoverageObligation(
+            obligation_id="recipe:publishing", origin="recipe", subject="publishing",
+            required_evidence_categories=("tests",), scope=paths,
+            recipe_id="publishing", recipe_execution="dedicated",
+        ),
+    )
+    topology = {"changed_files": list(paths), "changed_line_count": 3}
+
+    plan = fallback_assignment_plan(
+        (*ordinary, *isolated), topology, RuntimeConfig(max_sessions=8),
+    )
+
+    ordinary_assignments = tuple(
+        item for item in plan.assignments if item.id.startswith("fallback-combined")
+    )
+    assert len(plan.assignments) == 3
+    assert len(ordinary_assignments) == 1
+    assert set(ordinary_assignments[0].obligation_ids) == {
+        item.id for item in ordinary
+    }
+    assert plan.unassigned_obligation_ids == ()
+
+
 def test_split_recomputes_context_after_parent_context_was_truncated():
     paths = tuple(f"component/behavior_{index}.py" for index in range(14))
     obligations = tuple(

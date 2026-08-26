@@ -954,7 +954,6 @@ def _authorize(
     value: AcceptedFinding | CandidateFinding,
     *,
     records: Mapping[str, EvidenceRecord],
-    evidence_snapshot: EvidenceSnapshot,
     obligations: Mapping[str, CoverageObligation],
     changed_files: tuple[str, ...],
 ) -> tuple[AcceptedFinding | None, str]:
@@ -1002,29 +1001,7 @@ def _authorize(
     if len(usable_support) != len(supporting_records):
         return None, "unusable-retained-evidence"
     related = tuple(obligations[item] for item in candidate.related_obligation_ids)
-    def satisfies(record: EvidenceRecord, obligation: CoverageObligation) -> bool:
-        associations = evidence_snapshot.associations_for(
-            record.id, obligation.id,
-        )
-        if associations:
-            return any(
-                evidence_satisfies_obligation(
-                    replace(record, category=category), obligation,
-                )
-                for _collection, association in associations
-                for category in association.categories
-            )
-        return evidence_satisfies_obligation(record, obligation)
-
-    satisfying = tuple(sorted(
-        (
-            record for record in usable_support
-            if any(satisfies(record, obligation) for obligation in related)
-        ),
-        key=lambda item: item.id,
-    ))
-    if not satisfying:
-        return None, "evidence-does-not-satisfy-related-obligation"
+    supporting = tuple(sorted(usable_support, key=lambda item: item.id))
     contradiction_records = [records.get(item) for item in candidate.contradicting_evidence_ids]
     if any(record is None for record in contradiction_records):
         return None, "missing-retained-evidence"
@@ -1035,7 +1012,7 @@ def _authorize(
     ))
     consequence_support_reason = _consequence_support_reason(
         candidate,
-        supporting=satisfying,
+        supporting=supporting,
         contradictions=contradictions,
         related=related,
         affected_file=affected_file,
@@ -1048,14 +1025,14 @@ def _authorize(
         if item.strip()
     }
     cited_records = tuple(
-        record for record in (*satisfying, *contradictions)
+        record for record in (*supporting, *contradictions)
         if record.id in cited_ids
     )
     if any(not record.content.strip() or record.truncated for record in cited_records):
         consequence_support_reason = "consequence-not-supported"
     if consequence_support_reason:
         return None, consequence_support_reason
-    supporting_citations = tuple(_citation(record) for record in satisfying)
+    supporting_citations = tuple(_citation(record) for record in supporting)
     contradicting_citations = tuple(_citation(record) for record in contradictions)
     return AcceptedFinding(
         candidate_id=candidate.candidate_id,
@@ -1068,7 +1045,7 @@ def _authorize(
         causal_chain=candidate.causal_chain,
         severity=candidate.severity,
         category=candidate.category,
-        supporting_evidence_ids=tuple(record.id for record in satisfying),
+        supporting_evidence_ids=tuple(record.id for record in supporting),
         contradicting_evidence_ids=tuple(record.id for record in contradictions),
         related_obligation_ids=candidate.related_obligation_ids,
         supporting_citations=supporting_citations,
@@ -1314,7 +1291,6 @@ def adjudicate_candidates(
         authorized, reason = _authorize(
             candidate,
             records=records,
-            evidence_snapshot=evidence_snapshot,
             obligations=obligation_map,
             changed_files=changed,
         )
@@ -1405,7 +1381,6 @@ def _revalidated_findings(
         authorized, reason = _authorize(
             value,
             records=records,
-            evidence_snapshot=evidence_snapshot,
             obligations=obligation_map,
             changed_files=changed,
         )

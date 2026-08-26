@@ -3042,6 +3042,27 @@ def test_handoff_summarizer_uses_full_overview_and_latest_checkpoint_summaries(
     assert "### What the AI reviewed" in result.handoff.markdown
 
 
+def test_handoff_change_summary_may_name_request_changes_behavior(tmp_path):
+    def summarizer(_request):
+        return {
+            "what_changed_summary": (
+                "The native publisher changes how request_changes is submitted."
+            ),
+            "ai_reviewed_summary": "The AI traced the changed publishing branch.",
+            "human_focus": "Recheck the resulting native review event.",
+        }
+
+    result = _controller(tmp_path, finalizer=summarizer).run(_inputs(tmp_path))
+
+    assert result.handoff.what_changed == (
+        "The native publisher changes how request_changes is submitted.",
+    )
+    assert not any(
+        item["component"] == "handoff_summarizer"
+        for item in result.artifact["degradation"]
+    )
+
+
 def test_handoff_summarizer_accepts_generic_component_scope_prose(tmp_path):
     def summarizer(_request):
         return {

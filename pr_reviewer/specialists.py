@@ -776,6 +776,18 @@ def build_topology(
         "generated_artifacts": generated_artifacts,
         "changed_contract_facts": changed_contract_facts,
     }
+    changed_line_counts: list[int] = []
+    for item in pr_files:
+        if not item.get("filename"):
+            continue
+        additions = item.get("additions")
+        deletions = item.get("deletions")
+        if not all(isinstance(value, int) and value >= 0 for value in (additions, deletions)):
+            changed_line_counts = []
+            break
+        changed_line_counts.append(additions + deletions)
+    if len(changed_line_counts) == len(changed):
+        topology["changed_line_count"] = sum(changed_line_counts)
     if change_facts is not None:
         topology["change_facts"] = change_facts
     return topology

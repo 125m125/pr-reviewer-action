@@ -142,6 +142,19 @@ def test_authoritative_change_facts_stay_capped_when_api_patches_are_missing(
     assert paths[-1] not in topology["change_facts"]["facts"]
 
 
+def test_topology_records_total_changed_lines_from_complete_file_metadata():
+    topology = build_topology(
+        [
+            {"filename": "src/a.py", "additions": 3, "deletions": 2},
+            {"filename": "src/b.py", "additions": 5, "deletions": 1},
+        ],
+        {},
+        ("src/a.py", "src/b.py"),
+    )
+
+    assert topology["changed_line_count"] == 11
+
+
 def test_failed_per_path_diff_is_explicit_and_not_an_empty_authoritative_fact(
     monkeypatch,
     tmp_path,

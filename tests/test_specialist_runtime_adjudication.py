@@ -944,6 +944,21 @@ def test_missing_structured_consequence_or_validation_downgrades_to_verification
     )
 
 
+def test_candidate_evidence_need_not_match_obligation_coverage_category():
+    store, evidence_id = _store()
+    obligation = _obligation(category="tests")
+    candidate = _candidate(evidence_ids=(evidence_id,))
+
+    review = _adjudicate(
+        (candidate,), {candidate.candidate_id: "keep"}, store,
+        obligations=_obligations(obligation),
+    )
+
+    assert tuple(item.candidate_id for item in review.accepted) == (
+        candidate.candidate_id,
+    )
+
+
 def test_comment_mode_does_not_move_detailed_findings_into_handoff_or_notes():
     store, evidence_id = _store()
     candidate = _candidate(evidence_ids=(evidence_id,))

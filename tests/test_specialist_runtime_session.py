@@ -2150,7 +2150,7 @@ def test_checkpoint_partially_accepts_candidates_and_repairs_only_rejected_draft
         "affected_location": "a.py:4",
         "causal_chain": "The changed input reaches the invalid return branch.",
         "supporting_evidence_ids": [record.id],
-        "related_obligation_ids": ["OB-code"],
+        "related_obligation_ids": ["O1"],
         "confidence_rationale": "consequence_support:affected_consumer; evidence_ids=" + record.id,
         "user_visible_consequence": "The caller receives the wrong state.",
         "manual_validation": "Run the state transition test.",
@@ -2179,9 +2179,11 @@ def test_checkpoint_partially_accepts_candidates_and_repairs_only_rejected_draft
     assert tuple(item.candidate_id for item in session.candidate_findings) == (
         "candidate-good",
     )
+    assert session.candidate_findings[0].related_obligation_ids == ("OB-code",)
     assert len(gateway.requests) == 2
     correction_prompt = json.loads(gateway.requests[1].messages)[-1]["content"]
     assert "candidate-bad rejected" in correction_prompt
+    assert "missing required candidate fields: user_visible_consequence" in correction_prompt
     assert "candidate-good rejected" not in correction_prompt
     assert "candidate-bad" in session.conversation.events[-1]["content"]
 

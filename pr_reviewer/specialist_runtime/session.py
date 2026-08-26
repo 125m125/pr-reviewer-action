@@ -2363,7 +2363,7 @@ class SpecialistSession:
             "related_obligation_ids": related_obligations,
         }
         value.pop("related_targets", None)
-        candidate = self._candidate_from_checkpoint(
+        candidate, rejection_reason = self._candidate_from_checkpoint(
             value,
             retained=retained,
             assigned=set(self._assigned_obligation_ids()),
@@ -2371,7 +2371,7 @@ class SpecialistSession:
         if candidate is None:
             return ({
                 "accepted": False,
-                "reason": "candidate lacks valid evidence, obligation, or required detail",
+                "reason": rejection_reason,
             }, False)
         self.candidate_findings = (*self.candidate_findings, candidate)
         self._candidate_statuses[candidate_id] = "active"
@@ -3444,7 +3444,7 @@ class SpecialistSession:
                 str(value.get("candidate_id") or "").strip()
                 if isinstance(value, Mapping) else ""
             ) or f"N{index}"
-            candidate = self._candidate_from_checkpoint(
+            candidate, rejection_reason = self._candidate_from_checkpoint(
                 value,
                 retained=retained,
                 assigned=assigned,
@@ -3452,7 +3452,7 @@ class SpecialistSession:
             if candidate is None:
                 rejections.append(_CheckpointChangeRejection(
                     "candidate-new", candidate_label,
-                    "candidate payload failed evidence or shape validation",
+                    rejection_reason,
                     dict(value) if isinstance(value, Mapping) else {},
                 ))
                 self._rejected_candidate_ids.add(candidate_label)
@@ -3633,9 +3633,9 @@ class SpecialistSession:
         *,
         retained: Mapping[str, EvidenceRecord],
         assigned: set[str],
-    ) -> CandidateFinding | None:
+    ) -> tuple[CandidateFinding | None, str]:
         if not isinstance(value, Mapping):
-            return None
+            return None, "candidate must be an object"
         allowed = {
             "candidate_id", "root_cause_fingerprint", "claim",
             "affected_location", "causal_chain", "severity", "category",
@@ -3643,8 +3643,9 @@ class SpecialistSession:
             "related_obligation_ids", "confidence_rationale",
             "user_visible_consequence", "manual_validation",
         }
-        if set(value) - allowed:
-            return None
+        unsupported = sorted(set(value) - allowed)
+        if unsupported:
+            return None, "unsupported candidate fields: " + ", ".join(unsupported)
         candidate_id = str(value.get("candidate_id") or "").strip()
         claim = str(value.get("claim") or "").strip()
         affected_location = str(value.get("affected_location") or "").strip()
@@ -3654,11 +3655,18 @@ class SpecialistSession:
         confidence_rationale = str(
             value.get("confidence_rationale") or ""
         ).strip()
-        if not all((
-            candidate_id, claim, affected_location, causal_chain,
-            confidence_rationale, consequence, validation,
-        )):
-            return None
+        required = {
+            "candidate_id": candidate_id,
+            "claim": claim,
+            "affected_location": affected_location,
+            "causal_chain": causal_chain,
+            "confidence_rationale": confidence_rationale,
+            "user_visible_consequence": consequence,
+            "manual_validation": validation,
+        }
+        missing = [key for key, item in required.items() if not item]
+        if missing:
+            return None, "missing required candidate fields: " + ", ".join(missing)
         raw_supporting = _strings(value.get("supporting_evidence_ids"))
         raw_contradicting = _strings(value.get("contradicting_evidence_ids"))
         supporting = tuple(dict.fromkeys(
@@ -3675,13 +3683,20 @@ class SpecialistSession:
             )
             if item is not None
         ))
-        obligations = _strings(value.get("related_obligation_ids"))
-        if (
-            not supporting
-            or not obligations
-            or any(item not in assigned for item in obligations)
-        ):
-            return None
+        if not supporting:
+            return None, "candidate has no retained supporting evidence"
+        raw_obligations = _strings(value.get("related_obligation_ids"))
+        if not raw_obligations:
+            return None, "candidate has no related obligation targets"
+        obligations: list[str] = []
+        for target in raw_obligations:
+            obligation_id = self.obligation_assessments.obligation_id(target)
+            if obligation_id is None and target in assigned:
+                obligation_id = target
+            if obligation_id is None or obligation_id not in assigned:
+                return None, f"unknown related obligation target: {target}"
+            obligations.append(obligation_id)
+        resolved_obligations = tuple(dict.fromkeys(obligations))
         model_identities = {
             retained[item].model_identity
             for item in supporting
@@ -3699,7 +3714,7 @@ class SpecialistSession:
             category=str(value.get("category") or "").strip(),
             supporting_evidence_ids=supporting,
             contradicting_evidence_ids=contradicting,
-            related_obligation_ids=obligations,
+            related_obligation_ids=resolved_obligations,
             collector_session_id=self.session_id,
             model_identity=(
                 next(iter(model_identities)) if len(model_identities) == 1 else ""
@@ -3709,7 +3724,7 @@ class SpecialistSession:
             ),
             user_visible_consequence=consequence,
             manual_validation=validation,
-        )
+        ), ""
 
     def _derive_current_gaps(self) -> tuple[str, ...]:
         statuses = self.coverage.obligation_statuses()

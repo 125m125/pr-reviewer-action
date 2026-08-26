@@ -4211,12 +4211,16 @@ class ReviewController:
         if direct_context_paths:
             raise ValueError("handoff summary contains a direct change claim for an unchanged path")
         normalized = " ".join(combined.casefold().split())
+        judgment_text = " ".join((
+            proposal.ai_reviewed_summary,
+            proposal.human_focus,
+        )).casefold()
         forbidden_judgments = (
             "approve", "request changes", "request_changes", "merge safe",
             "safe to merge", "no further review", "no issues", "fully covered",
             "all obligations", "complete coverage",
         )
-        if any(value in normalized for value in forbidden_judgments):
+        if any(value in judgment_text for value in forbidden_judgments):
             raise ValueError("handoff summary attempts to change verdict or coverage")
         if re.search(
             r"(?:^|\s)(?:blocker|major|minor|finding|defect)\b|"
