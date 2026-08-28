@@ -27,6 +27,7 @@ from pr_reviewer.specialist_runtime.model_gateway import (
 from pr_reviewer.specialist_runtime.request_attempts import RequestAttemptJournal
 from pr_reviewer.specialist_runtime.session import (
     COMPACTED_EVIDENCE_TOOL_NAME,
+    TEST_RESULTS_TOOL_NAME,
     SpecialistSession,
     _candidate_retention_signal,
     _is_context_limit_error,
@@ -140,7 +141,11 @@ def candidate_checkpoint_response(candidate_ids):
             "category": "correctness",
             "supporting_evidence_ids": [evidence_id],
             "related_obligation_ids": ["OB-code"],
-            "confidence_rationale": "Direct retained file evidence.",
+            "confidence_rationale": (
+                f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
+                "input=changed state; condition=state reaches invalid branch; "
+                "outcome=operation returns the wrong state"
+            ),
             "user_visible_consequence": "The operation returns the wrong state.",
             "manual_validation": "Run the state transition test.",
         } for candidate_id in candidate_ids],
@@ -279,6 +284,32 @@ def test_compacted_evidence_requires_authorized_target_and_purpose():
 
     assert missing["status"] == "error"
     assert unknown["status"] == "error"
+
+
+def test_test_results_tool_filters_existing_ci_results_by_regex_or_substring():
+    session = make_session(ScriptedGateway([]))
+    session.evidence_store.add_tool_result(
+        session_id="ci:test-results",
+        tool="ci_test_results",
+        arguments={"file": "tests/test_notes.py", "name": "test_request_changes"},
+        result={"status": "ok", "test": {
+            "name": "tests.test_notes::test_request_changes",
+            "status": "failed", "file": "tests/test_notes.py", "line": 12,
+            "message": "expected REQUEST_CHANGES",
+        }},
+        category="test-result",
+        source="tests/test_notes.py",
+    )
+    session._execute_calls(({
+        "id": "tests-1",
+        "name": TEST_RESULTS_TOOL_NAME,
+        "arguments": json.dumps({"name_contains": "request_changes"}),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["status"] == "ok"
+    assert result["count"] == 1
+    assert result["tests"][0]["name"].endswith("test_request_changes")
 
 
 def test_reworded_checkpoint_does_not_count_as_semantic_progress():
@@ -599,7 +630,11 @@ def test_obligation_resolution_accepts_valid_candidate_siblings_independently():
         "severity": "major", "category": "correctness",
         "supporting_evidence_ids": [evidence_id],
         "contradicting_evidence_ids": [], "related_targets": ["O1"],
-        "confidence_rationale": "Direct retained implementation evidence.",
+        "confidence_rationale": (
+            f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
+            "input=changed state; condition=state reaches invalid branch; "
+            "outcome=operation returns the wrong state"
+        ),
         "user_visible_consequence": "The operation returns the wrong state.",
         "manual_validation": "Run the changed state-transition test.",
     }
@@ -646,7 +681,11 @@ def test_candidate_draft_survives_rejected_obligation_resolution():
         "severity": "major", "category": "correctness",
         "supporting_evidence_ids": [evidence_id],
         "contradicting_evidence_ids": [], "related_targets": ["O1"],
-        "confidence_rationale": "Direct retained implementation evidence.",
+        "confidence_rationale": (
+            f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
+            "input=changed state; condition=state reaches invalid branch; "
+            "outcome=operation returns the wrong state"
+        ),
         "user_visible_consequence": "The operation returns the wrong state.",
         "manual_validation": "Run the changed state-transition test.",
     }
@@ -688,7 +727,11 @@ def test_followup_defect_lead_survives_memory_and_gets_one_final_synthesis_turn(
         "severity": "major", "category": "correctness",
         "supporting_evidence_ids": [evidence_id],
         "contradicting_evidence_ids": [], "related_targets": ["O1"],
-        "confidence_rationale": "Direct retained implementation evidence.",
+        "confidence_rationale": (
+            f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
+            "input=changed state; condition=state reaches invalid branch; "
+            "outcome=operation returns the wrong state"
+        ),
         "user_visible_consequence": "The operation returns the wrong state.",
         "manual_validation": "Run the changed state-transition test.",
     }
@@ -747,7 +790,11 @@ def test_candidate_tools_report_and_withdraw_with_short_session_handles():
             "supporting_evidence_ids": [evidence_id],
             "contradicting_evidence_ids": [],
             "related_targets": ["O1"],
-            "confidence_rationale": "Direct retained implementation evidence.",
+            "confidence_rationale": (
+                f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
+                "input=changed state; condition=state reaches invalid branch; "
+                "outcome=operation returns the wrong state"
+            ),
             "user_visible_consequence": "The operation returns the wrong state.",
             "manual_validation": "Run the changed state-transition test.",
         }),
@@ -1457,6 +1504,36 @@ def test_emergency_checkpoint_recovers_one_exploration_context_error():
     assert diagnostic["disposition"] == "compact_resume"
     assert diagnostic["compaction_level"] == "emergency"
     assert diagnostic["emergency_outcome"] == "checkpoint_succeeded"
+
+
+def test_report_candidate_rejection_returns_repair_hints_and_retains_lead():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-candidate", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    session._execute_calls(({
+        "id": "report-invalid", "name": "report_candidate",
+        "arguments": json.dumps({
+            "claim": "The changed branch returns the wrong state.",
+            "affected_location": "a.py:4",
+            "causal_chain": "The changed input reaches the invalid return branch.",
+            "severity": "major", "category": "correctness",
+            "supporting_evidence_ids": [evidence_id],
+            "contradicting_evidence_ids": [], "related_targets": ["O1"],
+            "confidence_rationale": "The code looks suspicious.",
+            "user_visible_consequence": "The operation returns the wrong state.",
+            "manual_validation": "Run the state transition test.",
+        }),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["accepted"] is False
+    assert result["retryable"] is True
+    assert "consequence_support:<kind>" in result["repair_hints"][0]
+    assert result["lead"].startswith("L-candidate-")
+    assert session._model_checkpoint_memory()["defect_leads"]
 
 
 def test_emergency_checkpoint_context_error_stops_without_a_third_request():
@@ -2196,7 +2273,11 @@ def test_checkpoint_partially_accepts_candidates_and_repairs_only_rejected_draft
         "severity": "major",
         "supporting_evidence_ids": [record.id],
         "related_obligation_ids": ["O1"],
-        "confidence_rationale": "consequence_support:affected_consumer; evidence_ids=" + record.id,
+        "confidence_rationale": (
+            "consequence_support:reachable_input_path; evidence_ids=" + record.id
+            + "; input=changed state; condition=state reaches invalid branch; "
+            "outcome=caller receives the wrong state"
+        ),
         "user_visible_consequence": "The caller receives the wrong state.",
         "manual_validation": "Run the state transition test.",
     }
@@ -2248,7 +2329,9 @@ def test_rejected_candidate_update_preserves_and_reports_current_state():
         "supporting_evidence_ids": [record.id],
         "related_obligation_ids": ["OB-code"],
         "confidence_rationale": (
-            "consequence_support:affected_consumer; evidence_ids=" + record.id
+            "consequence_support:reachable_input_path; evidence_ids=" + record.id
+            + "; input=changed state; condition=state reaches invalid branch; "
+            "outcome=caller receives the wrong state"
         ),
         "user_visible_consequence": "The caller receives the wrong state.",
         "manual_validation": "Run the state transition test.",
@@ -3817,7 +3900,11 @@ def test_partial_candidate_retention_repairs_only_the_rejected_candidate():
             "category": "correctness",
             "supporting_evidence_ids": [evidence_id],
             "related_obligation_ids": ["OB-code"],
-            "confidence_rationale": "Direct retained file evidence.",
+            "confidence_rationale": (
+                f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
+                "input=changed state; condition=state reaches invalid branch; "
+                "outcome=operation returns the wrong state"
+            ),
             "user_visible_consequence": "Cancelled work is shown as active.",
             "manual_validation": "Run the cancellation-state test.",
         },
@@ -4416,7 +4503,11 @@ def test_checkpoint_collects_only_evidence_backed_candidate_objects():
             "category": "correctness",
             "supporting_evidence_ids": [evidence_id],
             "related_obligation_ids": ["OB-code"],
-            "confidence_rationale": "Direct retained file evidence.",
+            "confidence_rationale": (
+                f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
+                "input=changed state; condition=state reaches invalid branch; "
+                "outcome=operation returns the wrong state"
+            ),
             "user_visible_consequence": "Cancelled work is shown as active.",
             "manual_validation": "Run the cancellation-state test.",
         },
@@ -4681,7 +4772,11 @@ def _session_with_retained_candidate(final_responses):
         "category": "correctness",
         "supporting_evidence_ids": [evidence_id],
         "related_obligation_ids": ["OB-code"],
-        "confidence_rationale": "Direct retained file evidence.",
+        "confidence_rationale": (
+            f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
+            "input=changed state; condition=state reaches invalid branch; "
+            "outcome=operation returns the wrong state"
+        ),
         "user_visible_consequence": "Cancelled work is shown as active.",
         "manual_validation": "Run the cancellation-state test.",
     }]

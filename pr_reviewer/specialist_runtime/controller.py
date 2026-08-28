@@ -63,6 +63,7 @@ from .coverage import (
     session_ownership_for_assignment,
 )
 from .evidence import EvidenceSnapshot, EvidenceStore
+from .test_results import seed_test_results
 from .events import EventJournal, RunEvent
 from .negotiation import (
     NegotiationAction,
@@ -1206,6 +1207,7 @@ class ReviewInputs:
         SourceAccessRequest | RepositoryAccessRequest, ...
     ] = ()
     verification_requests: tuple[Mapping[str, Any], ...] = ()
+    test_results: tuple[Mapping[str, Any], ...] = ()
     pr_metadata: Mapping[str, Any] = field(default_factory=dict)
     configuration_warnings: tuple[str, ...] = ()
     adapter_configuration: Mapping[str, Any] = field(default_factory=dict)
@@ -2287,6 +2289,7 @@ class ReviewController:
         session_factory: Callable[..., object] | None = None,
         negotiator: object | None = None,
         critic: object | None = None,
+        repairer: object | None = None,
         finalizer: object | None = None,
         evidence_store: EvidenceStore | None = None,
         evidence_seed: EvidenceSeed | None = None,
@@ -2314,6 +2317,10 @@ class ReviewController:
         self.session_factory = session_factory
         self.negotiator = negotiator
         self.critic = critic
+        # Kept as a source-compatible constructor argument. Candidate proof
+        # repair now happens at report/checkpoint admission, while the critic
+        # remains the final adjudicator; no post-adjudication repair call is made.
+        self.repairer = repairer
         self.finalizer = finalizer
         self._provided_evidence_store = evidence_store
         self._evidence_seed = evidence_seed
@@ -3802,7 +3809,6 @@ class ReviewController:
             state.review = AdjudicatedReview()
         for disposition in state.review.dispositions:
             state.journal.emit("candidate_disposition", _json_value(disposition))
-
     @staticmethod
     def _rejected_candidate_diagnostics(
         state: _RunState,
@@ -5247,6 +5253,17 @@ class ReviewController:
                     raise TypeError(
                         "evidence_store_factory must return EvidenceStore"
                     )
+            if inputs.test_results:
+                seeded = seed_test_results(
+                    state.evidence,
+                    inputs.test_results,
+                    repository=inputs.repository,
+                    head_sha=inputs.head_sha,
+                )
+                journal.emit("test_results_seeded", {
+                    "count": len(seeded),
+                    "evidence_ids": list(seeded),
+                })
             journal.emit("run_started", {
                 "repository": inputs.repository,
                 "pr_number": inputs.pr_number,

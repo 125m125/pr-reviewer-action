@@ -21,8 +21,11 @@ provider capacity are understood.
 - Specialists retain concrete defects immediately with `report_candidate` and
   receive short session-local handles (`C1`, `C2`, ...). If later evidence
   disproves a candidate, they use `withdraw_candidate` with the handle and a
-  reason. Do not ask repository prompts to invent candidate IDs or repeat full
-  candidate objects in every checkpoint.
+  reason. Submission runs a cheap proof preflight; malformed proof is rejected
+  immediately with bounded `repair_hints` and a retained lead so the specialist
+  can retry while the evidence is still in context. Do not ask repository
+  prompts to invent candidate IDs or repeat full candidate objects in every
+  checkpoint.
 - Every obligation-resolution proposal also carries a small defect assessment:
   `none_observed`, up to three independently validated `candidate_drafts`, or a
   concrete `needs_followup` lead. This keeps defect recognition next to the
@@ -48,6 +51,11 @@ provider capacity are understood.
 - Direct budgets bound the whole run, per-session turns, read-only tool calls,
   recovery, concurrency, and the absolute deadline. The artifact records the
   budget and event accounting, policy result, head SHA, and publication state.
+- CI test results can be supplied as a repository-local, immutable-head-bound
+  JSON manifest with `specialist_test_results_file`. The controller seeds each
+  case as typed `test-result` evidence; specialists query it with
+  `read_test_results` using a name substring or regular expression. The tool
+  never executes tests or downloads arbitrary artifacts.
 
 ## Migration inputs
 
@@ -63,6 +71,7 @@ replay and provider capacity have been demonstrated.
 | `review_strategy` | added | `single` | Begin with `specialists_evaluate`, then use `specialists` with `publish_review_comment: "true"` | Evaluate without publishing before enabling the handoff; the strategy alone never publishes. |
 | `review_policy_file` | added | `.github/ai-review-policy.json` | Keep the default and commit a version-2 policy | The validated current-head policy selects work and limits sources/publishing. |
 | `review_diff_priority_file` | added | `.github/ai-review-diff-priorities.json` | Keep the default; add the file only when project-specific ordering or quotas improve large-diff orientation | Rules only reorder or quota paths already present in the immutable changed-file manifest. Missing or invalid files safely use built-in priorities. |
+| `specialist_test_results_file` | added |  | Set to a CI-produced path such as `ci/test-results.json` when available | Makes actual test outcomes searchable by every specialist and provides admissible evidence for behavioral-test claims without allowing arbitrary test execution. |
 | `ai_max_tokens` | retained | `8192` | `8192` for the tested local Qwen baseline | Leaves enough room for reasoning-heavy structured roles and checkpoint repair. |
 | `specialist_review_deadline_sec` | added | `7200` | `7200` initially; raise only after measured runs need it | This is the absolute run deadline, including finalization and artifact production. |
 | `specialist_phase_shares` | added | `{"planning":10,"initial":60,"followup":20,"finalization":10}` | Keep the default before tuning from artifacts | The four percentages must total 100 and prevent one phase consuming the run. |
@@ -107,6 +116,36 @@ The `publish_mode` default is intentionally empty, not `comment`. Do not copy an
 older static `comment` default into a specialist workflow: omission means
 `review_comment` for `specialists` and `specialists_evaluate`; writing
 `publish_mode: comment` deliberately requests the sticky-comment behavior.
+
+### CI test-results manifest
+
+The optional file is JSON and must be bound to the reviewed head. It may contain
+either a top-level `tests` array or named `reports`:
+
+```json
+{
+  "repository": "owner/repository",
+  "head_sha": "<40-to-64-hex-head-sha>",
+  "reports": [{
+    "name": "pytest",
+    "workflow": "validate",
+    "job": "tests",
+    "tests": [{
+      "name": "tests.test_notes::test_request_changes",
+      "status": "failed",
+      "file": "tests/test_notes.py",
+      "line": 12,
+      "message": "expected REQUEST_CHANGES"
+    }]
+  }]
+}
+```
+
+Have the validation workflow write this normalized file (or convert its JUnit
+output before the review job) and pass its repository-relative path as the
+input. A specialist can then call `read_test_results` with `name_contains` or
+`name_regex`, optionally filtering by status. Source inspection alone is never
+treated as a test execution result.
 
 ## Version-1 to version-2 mapping
 

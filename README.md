@@ -91,6 +91,61 @@ flowchart LR
     F --> G[Publish<br/>comment / native review]
 ```
 
+### Specialist review pipeline
+
+The specialist strategy expands the model step into bounded sessions. The
+negotiator is the continuation selector: it runs between the initial and
+follow-up waves and may schedule one bounded action at a time.
+
+```mermaid
+flowchart TD
+    P[Precheck and immutable PR snapshot] --> S[Collect context and deterministic obligations]
+    S --> SUM[Change summarizer<br/><small>LLM, bounded structured role</small>]
+    SUM --> PLAN[Planner<br/><small>LLM optional; deterministic plan is fallback</small>]
+    PLAN --> W1
+
+    subgraph W1[Initial specialist wave]
+        direction TB
+        SP1[Specialist session]
+        SP2[Specialist session]
+        SPN[Specialist session …]
+        SP1 --> PF1[report_candidate preflight]
+        SP2 --> PF2[report_candidate preflight]
+        SPN --> PFN[report_candidate preflight]
+        PF1 -->|accepted| EV1[Evidence and candidate state]
+        PF2 -->|accepted| EV2[Evidence and candidate state]
+        PFN -->|accepted| EVN[Evidence and candidate state]
+        PF1 -->|rejected with repair hints| SP1
+        PF2 -->|rejected with repair hints| SP2
+        PFN -->|rejected with repair hints| SPN
+        SP1 -. context pressure / completion .-> CP[Checkpoint and bounded repair]
+        SP2 -. context pressure / completion .-> CP
+        SPN -. context pressure / completion .-> CP
+        CP -->|compact-resume when progress exists| SP1
+    end
+
+    W1 --> N[Negotiator / continuation selector<br/><small>LLM proposal + deterministic validation</small>]
+    N -->|resume or consult existing session| W2[Follow-up wave]
+    N -->|start bounded new session| W2
+    N -->|record unknown / no feasible action| F[Finalization]
+    W2 --> N
+
+    F --> FIN[Final specialist checkpoints/finalization]
+    FIN --> CR[Critic<br/><small>LLM: keep, reject, merge, verify</small>]
+    CR --> ADJ[Deterministic adjudicator<br/><small>evidence, consequence, severity, location</small>]
+    ADJ --> HAND[Handoff summarizer<br/><small>LLM presentation role</small>]
+    HAND --> PUB[Publish notes and human handoff]
+```
+
+Candidate preflight rejects only the candidate, not the specialist session. The
+model receives the exact failed checks as a tool result and can collect better
+evidence immediately. If a candidate change is rejected while producing a
+checkpoint, checkpoint repair may correct that candidate or leave it as a
+bounded next action. A compact-resume checkpoint continues the same session
+only when it demonstrates meaningful progress; repeated no-progress checkpoints
+remain paused. The negotiator can later decide whether that session deserves a
+bounded follow-up. The critic does not schedule sessions.
+
 What it supports:
 
 | | |
@@ -380,6 +435,7 @@ for the complete schema, source-rule boundaries, and conversion checklist.
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `evidence_providers_file` | Optional JSON file in the reviewed repo defining evidence provider commands | No | `""` |
+| `specialist_test_results_file` | Optional repository-local JSON manifest of CI test results bound to the reviewed head SHA | No | `""` |
 | `evidence_provider_timeout_sec` | Default timeout in seconds for each evidence provider command | No | `30` |
 | `evidence_provider_max_output_bytes` | Max stdout or stderr bytes captured per provider command | No | `20000` |
 | `evidence_provider_parallelism` | Max evidence provider commands run concurrently (set `1` to force serial execution) | No | `4` |

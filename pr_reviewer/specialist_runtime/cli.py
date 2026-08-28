@@ -51,6 +51,7 @@ from .session import (
     SpecialistSession,
     specialist_assignment_prompt,
 )
+from .test_results import load_test_results
 from .types import BudgetLimits, ReviewHandoff, ReviewNote, ReviewNoteKind
 from .web_evidence import SecureFetcher, SearxngSearchProvider, SourcePolicy
 
@@ -191,7 +192,10 @@ _SPECIALIST_SYSTEM = (
     "or bounded changed_context does not prove the omitted content is absent; request a narrower "
     "diff or source range, or record the evidence limit. During exploration, use "
     "read_compacted_evidence only for evidence IDs explicitly listed by a compaction marker; "
-    "do not invent IDs or use it to reread un-compacted results. "
+    "do not invent IDs or use it to reread un-compacted results. Use read_test_results "
+    "with either name_contains or name_regex when controller-seeded CI results are relevant; "
+    "cite its evidence_id. A test source file is not a test execution result, so do not claim "
+    "failing_behavioral_test without CI test-result evidence. "
     "tools or concise analysis and do not emit a whole-PR verdict. When the controller asks "
     "for a checkpoint, return only the requested checkpoint object matching its schema. "
     "The controller closes a valid checkpoint deterministically; do not emit a separate "
@@ -251,7 +255,12 @@ def _bool(env: Mapping[str, str], name: str, default: bool) -> bool:
 def _safe_repository_path(workspace: Path, value: str, *, label: str) -> Path:
     text = str(value).strip().replace("\\", "/")
     candidate = PurePosixPath(text)
-    if not text or candidate.is_absolute() or ".." in candidate.parts:
+    if (
+        not text
+        or candidate.is_absolute()
+        or re.match(r"^[A-Za-z]:/", text)
+        or ".." in candidate.parts
+    ):
         raise ValueError(f"{label} must stay inside the reviewed repository")
     resolved = (workspace / Path(*candidate.parts)).resolve()
     try:
@@ -318,6 +327,7 @@ class CliConfig:
     tool_request_timeout_sec: int
     system_prompt: str
     deprecation_warnings: tuple[str, ...] = ()
+    test_results_file: Path | None = None
 
     @classmethod
     def from_env(
@@ -345,6 +355,11 @@ class CliConfig:
         policy_path = _safe_repository_path(root, policy_value, label="review_policy_file")
         legacy_value = source.get("SPECIALIST_CONFIG_FILE", _LEGACY_POLICY)
         legacy_path = _safe_repository_path(root, legacy_value, label="specialist_config_file")
+        test_results_value = source.get("SPECIALIST_TEST_RESULTS_FILE", "").strip()
+        test_results_file = (
+            _safe_repository_path(root, test_results_value, label="specialist_test_results_file")
+            if test_results_value else None
+        )
         if "SPECIALIST_CONFIG_FILE" in source and (
             legacy_value != _LEGACY_POLICY
             or (not policy_path.is_file() and legacy_path.is_file())
@@ -443,6 +458,7 @@ class CliConfig:
             tool_request_timeout_sec=_positive_int(source, "TOOL_REQUEST_TIMEOUT_SEC", 20),
             system_prompt=_read_system_prompt(root, source),
             deprecation_warnings=tuple(dict.fromkeys(warnings)),
+            test_results_file=test_results_file,
         )
 
 
@@ -814,6 +830,21 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
     endpoint_identity = parsed_endpoint.hostname or "unconfigured"
     if parsed_endpoint.port:
         endpoint_identity += f":{parsed_endpoint.port}"
+    test_results: tuple[Mapping[str, Any], ...] = ()
+    if config.test_results_file is not None:
+        if config.test_results_file.is_file():
+            try:
+                test_results = load_test_results(
+                    config.test_results_file,
+                    repository=str(config.environment.get("REPO", "")).strip(),
+                    head_sha=head_sha,
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                policy_warnings = (*policy_warnings, f"SPECIALIST_TEST_RESULTS_FILE: {type(exc).__name__}: {str(exc)[:160]}")
+                degraded = True
+        else:
+            policy_warnings = (*policy_warnings, "SPECIALIST_TEST_RESULTS_FILE: file not found")
+            degraded = True
     inputs = ReviewInputs(
         repository=config.environment.get("REPO", "").strip(),
         pr_number=int(pr.get("number") or config.environment.get("PR_NUMBER", 0)),
@@ -825,6 +856,7 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
         config=config.runtime,
         changed_files=changed_files,
         tracked_paths=tracked_paths,
+        test_results=test_results,
         artifact_path="specialist-review-artifact.json",
         allow_approve=_bool(config.environment, "ALLOW_APPROVE", False),
         publishing_mode=publish_mode,

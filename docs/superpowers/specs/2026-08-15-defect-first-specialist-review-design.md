@@ -14,7 +14,12 @@ handle such as `C1`. `withdraw_candidate` accepts one handle created by the same
 session plus a reason and optional retained evidence IDs. Withdrawal removes the
 candidate from the active set but retains an audited status entry. Silence never
 withdraws a candidate, and changing a claim means withdrawing the old handle and
-reporting a replacement.
+reporting a replacement. Candidate submissions are preflighted immediately for
+typed consequence support, retained usable evidence, and obligation references.
+Rejections return bounded repair hints and retain a compact defect lead so the
+specialist can repair or replace the draft before checkpoint compaction. The
+critic remains the final adjudicator; there is no separate post-adjudication
+candidate-repair model call.
 
 Checkpoints preserve active candidate state implicitly. Candidate updates remain
 a recovery compatibility path, not the normal reporting mechanism. The critic

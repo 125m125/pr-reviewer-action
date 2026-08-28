@@ -464,6 +464,10 @@ inputs:
     description: Optional JSON file in the reviewed repository that defines evidence providers to run before review
     required: false
     default: ""
+  specialist_test_results_file:
+    description: Optional repository-local JSON manifest of CI test results bound to the reviewed head SHA; specialists can query matching test names without executing tests
+    required: false
+    default: ""
   evidence_provider_timeout_sec:
     description: Default timeout in seconds for each evidence provider command
     required: false
@@ -871,6 +875,7 @@ runs:
         CONTEXT_LIMIT_MODE: ${{ inputs.context_limit_mode }}
         MODEL_CONTEXT_TOKENS: ${{ inputs.model_context_tokens }}
         EVIDENCE_PROVIDERS_FILE: ${{ inputs.evidence_providers_file }}
+        SPECIALIST_TEST_RESULTS_FILE: ${{ inputs.specialist_test_results_file }}
         EVIDENCE_PROVIDER_TIMEOUT_SEC: ${{ inputs.evidence_provider_timeout_sec }}
         EVIDENCE_PROVIDER_MAX_OUTPUT_BYTES: ${{ inputs.evidence_provider_max_output_bytes }}
         EVIDENCE_BLOCKER_ENFORCEMENT: ${{ inputs.evidence_blocker_enforcement }}
@@ -1024,6 +1029,7 @@ runs:
         ENRICHMENT_BUDGET_SEC: ${{ inputs.enrichment_budget_sec }}
         IMAGE_DIGEST_BUDGET_SEC: ${{ inputs.image_digest_budget_sec }}
         EVIDENCE_PROVIDERS_FILE: ${{ inputs.evidence_providers_file }}
+        SPECIALIST_TEST_RESULTS_FILE: ${{ inputs.specialist_test_results_file }}
         EVIDENCE_PROVIDER_TIMEOUT_SEC: ${{ inputs.evidence_provider_timeout_sec }}
         EVIDENCE_PROVIDER_MAX_OUTPUT_BYTES: ${{ inputs.evidence_provider_max_output_bytes }}
         EVIDENCE_PROVIDER_PARALLELISM: ${{ inputs.evidence_provider_parallelism }}

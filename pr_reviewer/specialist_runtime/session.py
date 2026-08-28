@@ -189,8 +189,12 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     {
         "name": "report_candidate",
         "description": (
-            "Immediately retain one concrete defect candidate. The controller "
-            "returns a short session-local C# handle for later withdrawal."
+            "Immediately retain one concrete defect candidate. The controller runs a "
+            "cheap proof preflight before admission. If rejected, the tool result has "
+            "accepted=false, retryable=true, repair_hints, and a retained lead; fix the "
+            "listed fields/evidence and call report_candidate again while the evidence "
+            "is fresh. A rejected draft is not a published finding. Accepted candidates "
+            "return a short session-local C# handle for later withdrawal."
         ),
         "parameters": _CANDIDATE_DRAFT_SCHEMA,
     },
@@ -209,12 +213,31 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "evidence_ids": {"type": "array", "items": {"type": "string"}},
         }, "required": ["target", "reason"], "additionalProperties": False},
     },
+    {
+        "name": "read_test_results",
+        "description": (
+            "Search controller-seeded CI test-result evidence. Provide either "
+            "name_contains or name_regex; matching test cases include their "
+            "status, failure details, source path/line when available, and "
+            "the evidence ID to cite. This tool never executes tests or fetches "
+            "arbitrary artifacts."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "name_contains": {"type": "string", "maxLength": 300},
+            "name_regex": {"type": "string", "maxLength": 300},
+            "status": {"type": "string", "enum": [
+                "passed", "failed", "skipped", "errored", "xfailed", "unknown",
+            ]},
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 50},
+        }, "additionalProperties": False},
+    },
 )
 _OBLIGATION_LOCAL_TOOL_NAMES = frozenset(
     str(item["name"]) for item in _OBLIGATION_LOCAL_TOOL_SCHEMAS
 )
 
 COMPACTED_EVIDENCE_TOOL_NAME = "read_compacted_evidence"
+TEST_RESULTS_TOOL_NAME = "read_test_results"
 COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
     "name": COMPACTED_EVIDENCE_TOOL_NAME,
     "description": (
@@ -1219,11 +1242,22 @@ class SpecialistSession:
                     "collection is meant to inform."
                 ),
             }
-        # A controller that deliberately supplied no tools (notably for an
-        # untrusted fork) must remain tool-free. Local bookkeeping is exposed
-        # only alongside an already-authorized specialist tool catalogue.
+        # CI test results are controller-seeded, immutable evidence and remain
+        # available even when repository/web tools are disabled (for example on
+        # an untrusted fork). Do not advertise an otherwise tool-free catalogue
+        # when no results were seeded; this preserves the fork/tool isolation
+        # contract and avoids presenting unusable tools.
         if schemas:
             schemas.extend(json.loads(json.dumps(_OBLIGATION_LOCAL_TOOL_SCHEMAS)))
+        elif any(
+            record.category.casefold() == "test-result"
+            for record in self.evidence_store.snapshot().records
+        ):
+            schemas.append(next(
+                json.loads(json.dumps(item))
+                for item in _OBLIGATION_LOCAL_TOOL_SCHEMAS
+                if item.get("name") == TEST_RESULTS_TOOL_NAME
+            ))
         self.conversation.tool_schemas = schemas
 
     def _assignment_prompt(self) -> str:
@@ -2359,10 +2393,11 @@ class SpecialistSession:
                     self.obligation_assessments.obligation_id(target)
                 )
             except KeyError:
-                return ({
-                    "accepted": False,
-                    "reason": f"unknown obligation target: {target}",
-                }, False)
+                return self._candidate_rejection(
+                    arguments,
+                    f"unknown obligation target: {target}",
+                    retained,
+                ), False
         next_target = f"C{len(self._candidate_targets) + 1}"
         digest = hashlib.sha256(
             f"{self.session_id}\0{next_target}".encode("utf-8")
@@ -2384,10 +2419,9 @@ class SpecialistSession:
             assigned=set(self._assigned_obligation_ids()),
         )
         if candidate is None:
-            return ({
-                "accepted": False,
-                "reason": rejection_reason,
-            }, False)
+            return self._candidate_rejection(
+                arguments, rejection_reason, retained,
+            ), False
         self.candidate_findings = (*self.candidate_findings, candidate)
         self._candidate_statuses[candidate_id] = "active"
         self._candidate_targets[next_target] = candidate_id
@@ -2398,6 +2432,24 @@ class SpecialistSession:
             ),
         )
         return ({"accepted": True, "target": next_target}, True)
+
+    def _candidate_rejection(
+        self,
+        arguments: Mapping[str, Any],
+        reason: str,
+        retained: Mapping[str, EvidenceRecord],
+    ) -> dict[str, object]:
+        hints = self._candidate_repair_hints(reason)
+        lead = self._retain_rejected_candidate_lead(
+            arguments, reason, retained,
+        )
+        return {
+            "accepted": False,
+            "retryable": True,
+            "reason": reason,
+            "repair_hints": hints,
+            "lead": lead,
+        }
 
     def _execute_calls(self, calls: tuple[dict[str, Any], ...]) -> bool:
         progressed = False
@@ -2429,6 +2481,10 @@ class SpecialistSession:
                 )
                 continue
             if name in _OBLIGATION_LOCAL_TOOL_NAMES:
+                if name == TEST_RESULTS_TOOL_NAME:
+                    result = self._read_test_results(arguments)
+                    self.conversation.add_tool_result(call_id, result)
+                    continue
                 progressed = (
                     self._execute_obligation_tool(call_id, name, arguments)
                     or progressed
@@ -3502,6 +3558,10 @@ class SpecialistSession:
                 assigned=assigned,
             )
             if candidate is None:
+                if isinstance(value, Mapping):
+                    self._retain_rejected_candidate_lead(
+                        value, rejection_reason, retained,
+                    )
                 rejections.append(_CheckpointChangeRejection(
                     "candidate-new", candidate_label,
                     rejection_reason,
@@ -3728,6 +3788,24 @@ class SpecialistSession:
             )
         raw_supporting = _strings(value.get("supporting_evidence_ids"))
         raw_contradicting = _strings(value.get("contradicting_evidence_ids"))
+        missing_supporting = tuple(
+            item for item in raw_supporting
+            if _resolve_retained_evidence_id(item, retained) is None
+        )
+        if missing_supporting:
+            return None, (
+                "candidate references unavailable supporting evidence: "
+                + ", ".join(missing_supporting[:4])
+            )
+        missing_contradicting = tuple(
+            item for item in raw_contradicting
+            if _resolve_retained_evidence_id(item, retained) is None
+        )
+        if missing_contradicting:
+            return None, (
+                "candidate references unavailable contradicting evidence: "
+                + ", ".join(missing_contradicting[:4])
+            )
         supporting = tuple(dict.fromkeys(
             item for item in (
                 _resolve_retained_evidence_id(value, retained)
@@ -3761,7 +3839,7 @@ class SpecialistSession:
             for item in supporting
             if retained[item].model_identity
         }
-        return CandidateFinding(
+        candidate = CandidateFinding(
             candidate_id=candidate_id,
             root_cause_fingerprint=str(
                 value.get("root_cause_fingerprint") or ""
@@ -3783,7 +3861,178 @@ class SpecialistSession:
             ),
             user_visible_consequence=consequence,
             manual_validation=validation,
-        ), ""
+        )
+        hints = self._candidate_preflight_hints(
+            candidate, retained=retained, assigned=assigned,
+        )
+        if hints:
+            return None, self._format_candidate_rejection(
+                "candidate proof preflight failed", hints,
+            )
+        return candidate, ""
+
+    @staticmethod
+    def _format_candidate_rejection(reason: str, hints: Iterable[str]) -> str:
+        values = tuple(dict.fromkeys(
+            str(item).strip() for item in hints if str(item).strip()
+        ))
+        if not values:
+            return reason
+        return reason + "; repair hints: " + " | ".join(values[:6])
+
+    @staticmethod
+    def _candidate_repair_hints(reason: str) -> list[str]:
+        text = str(reason or "")
+        marker = "; repair hints:"
+        if marker in text:
+            return [
+                item.strip() for item in text.split(marker, 1)[1].split("|")
+                if item.strip()
+            ]
+        if text.startswith("missing required candidate fields:"):
+            fields = text.split(":", 1)[1].strip()
+            return [
+                f"provide the required field: {item.strip()}"
+                for item in fields.split(",") if item.strip()
+            ]
+        if text == "candidate has no retained supporting evidence":
+            return ["cite an evidence ID returned by a permitted read-only tool"]
+        if text.startswith("candidate references unavailable"):
+            return ["use exact evidence IDs returned by the tools"]
+        if text.startswith("unknown related obligation target:"):
+            return ["use an exact assigned obligation target from the assignment"]
+        if text.startswith("unsupported candidate fields:"):
+            fields = text.split(":", 1)[1].strip()
+            return [
+                f"remove unsupported field: {item.strip()}"
+                for item in fields.split(",") if item.strip()
+            ]
+        if "severity" in text.casefold():
+            return ["set severity to blocker, major, or minor; do not use info"]
+        return ["repair the candidate fields and proof using retained tool evidence"]
+
+    def _candidate_preflight_hints(
+        self,
+        candidate: CandidateFinding,
+        *,
+        retained: Mapping[str, EvidenceRecord],
+        assigned: set[str],
+    ) -> tuple[str, ...]:
+        """Run cheap local proof checks before admitting a candidate."""
+        hints: list[str] = []
+        rationale = candidate.confidence_rationale.strip()
+        prefix = "consequence_support:"
+        if not rationale.casefold().startswith(prefix):
+            hints.append(
+                "confidence_rationale must start with consequence_support:<kind>"
+            )
+            return tuple(hints)
+        declaration = rationale[len(prefix):]
+        head, *raw_fields = declaration.split(";")
+        kind = head.strip().casefold()
+        allowed = {
+            "reachable_input_path", "failing_behavioral_test", "violated_invariant",
+            "affected_consumer", "contradicting_evidence",
+        }
+        if kind not in allowed:
+            hints.append(
+                "use one of reachable_input_path, failing_behavioral_test, "
+                "violated_invariant, affected_consumer, or contradicting_evidence"
+            )
+            return tuple(hints)
+        details: dict[str, str] = {}
+        for raw_field in raw_fields:
+            key, separator, value = raw_field.partition("=")
+            if separator and key.strip() and value.strip():
+                details[key.strip().casefold()] = value.strip()
+        cited = tuple(dict.fromkeys(
+            value.strip() for value in details.get("evidence_ids", "").split(",")
+            if value.strip()
+        ))
+        if not cited:
+            hints.append("cite at least one retained evidence ID in evidence_ids")
+        elif any(_resolve_retained_evidence_id(value, retained) is None for value in cited):
+            hints.append("use exact evidence IDs returned by the tools")
+        elif any(
+            not retained[resolved].is_usable_for_coverage
+            for value in cited
+            if (resolved := _resolve_retained_evidence_id(value, retained)) is not None
+        ):
+            hints.append("cite evidence from a successful, non-empty tool result")
+        if kind == "reachable_input_path":
+            for key in ("input", "condition"):
+                if not details.get(key):
+                    hints.append(f"reachable_input_path requires {key}=...")
+            if not details.get("outcome"):
+                hints.append("reachable_input_path requires outcome=...")
+        elif kind == "failing_behavioral_test":
+            if not details.get("test") or not details.get("observed"):
+                hints.append("failing_behavioral_test requires test=... and observed=...")
+            valid_test_evidence = any(
+                (resolved := _resolve_retained_evidence_id(value, retained)) is not None
+                and (
+                    retained[resolved].category.casefold()
+                    in {"test", "tests", "test-result", "behavioral-test"}
+                    or retained[resolved].tool.casefold()
+                    in {"pytest", "run_tests", "test", "ci_test_results"}
+                )
+                for value in cited
+            )
+            if not valid_test_evidence:
+                hints.append(
+                    "failing_behavioral_test requires evidence from read_test_results "
+                    "or an equivalent CI execution record"
+                )
+        elif kind == "violated_invariant":
+            obligation_id = details.get("obligation_id", "")
+            if not obligation_id or obligation_id not in assigned:
+                hints.append("violated_invariant requires an assigned obligation_id")
+            if not details.get("contract"):
+                hints.append("violated_invariant requires contract=subject or predicate_index:N")
+            if not details.get("violation"):
+                hints.append("violated_invariant requires violation=...")
+        elif kind == "affected_consumer":
+            for key in ("producer", "consumer", "outcome"):
+                if not details.get(key):
+                    hints.append(f"affected_consumer requires {key}=...")
+        elif kind == "contradicting_evidence":
+            if not details.get("conflict"):
+                hints.append("contradicting_evidence requires conflict=...")
+            if not candidate.contradicting_evidence_ids:
+                hints.append("cite at least one contradicting_evidence_id")
+        return tuple(dict.fromkeys(hints))
+
+    def _retain_rejected_candidate_lead(
+        self,
+        arguments: Mapping[str, Any],
+        reason: str,
+        retained: Mapping[str, EvidenceRecord],
+    ) -> str:
+        """Retain a compact rejected idea for checkpoint/follow-up synthesis."""
+        claim = _bounded_text(arguments.get("claim"), max_length=280)
+        location = _bounded_text(arguments.get("affected_location"), max_length=200)
+        evidence_ids = tuple(dict.fromkeys(
+            resolved
+            for value in _tool_string_list(arguments.get("supporting_evidence_ids"))
+            if (resolved := _resolve_retained_evidence_id(value, retained)) is not None
+        ))[:8]
+        identity = hashlib.sha256(
+            (claim + "\0" + location + "\0" + reason).encode("utf-8", "replace")
+        ).hexdigest()[:12]
+        lead = f"L-candidate-{identity}"
+        if not any(str(item.get("lead") or "") == lead for item in self._defect_leads):
+            self._defect_leads.append({
+                "lead": lead,
+                "target": f"candidate-draft:{identity}",
+                "summary": _bounded_text(
+                    f"Rejected candidate at {location or 'unspecified location'}: "
+                    f"{claim or 'claim omitted'}. {reason}",
+                    max_length=700,
+                ),
+                "evidence_ids": list(evidence_ids),
+            })
+            del self._defect_leads[:-8]
+        return lead
 
     def _derive_current_gaps(self) -> tuple[str, ...]:
         statuses = self.coverage.obligation_statuses()
@@ -4457,6 +4706,59 @@ class SpecialistSession:
             "limit": limit,
             "truncated": offset + len(excerpt) < len(content),
             "source_truncated": bool(record.truncated),
+        }
+
+    def _read_test_results(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        """Return bounded controller-seeded test cases matching a model query."""
+        contains = str(arguments.get("name_contains") or "").strip().casefold()
+        expression = str(arguments.get("name_regex") or "").strip()
+        if not contains and not expression:
+            return {"status": "error", "error": "provide name_contains or name_regex"}
+        if contains and expression:
+            return {"status": "error", "error": "provide only one name filter"}
+        matcher = None
+        if expression:
+            try:
+                matcher = re.compile(expression, re.IGNORECASE)
+            except re.error as exc:
+                return {"status": "error", "error": f"invalid name_regex: {exc}"}
+        try:
+            requested_limit = int(arguments.get("max_results", 20))
+        except (TypeError, ValueError):
+            requested_limit = 20
+        limit = max(1, min(50, requested_limit))
+        requested_status = str(arguments.get("status") or "").casefold()
+        matches: list[dict[str, Any]] = []
+        total = 0
+        for record in self.evidence_store.snapshot().records:
+            if record.category.casefold() != "test-result":
+                continue
+            try:
+                payload = json.loads(record.content)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            test = payload.get("test") if isinstance(payload, Mapping) else None
+            if not isinstance(test, Mapping):
+                continue
+            name = str(test.get("name") or "")
+            if not name or (contains and contains not in name.casefold()):
+                continue
+            if matcher is not None and matcher.search(name) is None:
+                continue
+            status = str(test.get("status") or "unknown").casefold()
+            if requested_status and status != requested_status:
+                continue
+            total += 1
+            if len(matches) < limit:
+                item = dict(test)
+                item["evidence_id"] = record.id
+                matches.append(item)
+        return {
+            "status": "ok",
+            "count": len(matches),
+            "total_matches": total,
+            "truncated": total > len(matches),
+            "tests": matches,
         }
 
     def _snapshot(
