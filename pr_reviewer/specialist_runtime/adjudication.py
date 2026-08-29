@@ -862,18 +862,31 @@ def _consequence_support_reason(
     )
 
     if kind == "reachable_input_path":
-        causal_identity = _detail_identity(candidate.causal_chain)
-        consequence_identity = _detail_identity(candidate.user_visible_consequence)
         input_identity = _detail_identity(details.get("input", ""))
         condition_identity = _detail_identity(details.get("condition", ""))
         outcome_identity = _detail_identity(details.get("outcome", ""))
+        causal_terms = {
+            item for item in re.findall(r"[\w-]+", _detail_identity(candidate.causal_chain))
+            if len(item) >= 4
+        }
+        consequence_terms = {
+            item for item in re.findall(
+                r"[\w-]+", _detail_identity(candidate.user_visible_consequence),
+            ) if len(item) >= 4
+        }
+        input_terms = {
+            item for item in re.findall(r"[\w-]+", input_identity) if len(item) >= 4
+        }
+        condition_terms = {
+            item for item in re.findall(r"[\w-]+", condition_identity) if len(item) >= 4
+        }
+        outcome_terms = {
+            item for item in re.findall(r"[\w-]+", outcome_identity) if len(item) >= 4
+        }
         if (
-            input_identity
-            and input_identity in causal_identity
-            and condition_identity
-            and condition_identity in causal_identity
-            and outcome_identity
-            and outcome_identity in consequence_identity
+            input_terms & causal_terms
+            and condition_terms & causal_terms
+            and outcome_terms & consequence_terms
             and any(record.source_path == affected_file for record in cited_support)
         ):
             return ""

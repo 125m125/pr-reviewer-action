@@ -1297,9 +1297,26 @@ def test_session_finalization_diagnostics_are_artifact_only(tmp_path):
 
     class DiagnosedSession(_SuccessfulSession):
         def finalize(self):
+            result = super().finalize()
             return replace(
-                super().finalize(),
+                result,
                 finalization_diagnostics=(diagnostic,),
+                report={
+                    **dict(result.report or {}),
+                    "defect_synthesis": {
+                        "attempted": True,
+                        "status": "valid",
+                        "initial_candidate_results": [{
+                            "accepted": False,
+                            "reason": "consequence-not-supported",
+                            "failed_check": "affected_consumer.consumer_evidence_id",
+                        }],
+                        "repair_attempted": True,
+                        "repair_candidate_results": [{
+                            "accepted": True, "target": "C1",
+                        }],
+                    },
+                },
             )
 
     def factory(
@@ -1316,6 +1333,9 @@ def test_session_finalization_diagnostics_are_artifact_only(tmp_path):
     assert result.artifact["sessions"][0]["finalization_diagnostics"] == ({
         **diagnostic,
     },)
+    assert result.artifact["sessions"][0]["defect_synthesis"][
+        "initial_candidate_results"
+    ][0]["failed_check"] == "affected_consumer.consumer_evidence_id"
     assert any(
         item["kind"] == "specialist_checkpoint_diagnostics"
         and item["payload"]["diagnostics"] == ({**diagnostic},)

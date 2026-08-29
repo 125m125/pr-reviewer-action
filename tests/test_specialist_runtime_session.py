@@ -97,12 +97,25 @@ def tool_call_response(name, arguments, call_id=None):
     )
 
 
+def reachable_consequence_support(
+    *, input="changed state", condition="state reaches invalid branch",
+    outcome="operation returns the wrong state",
+):
+    return {
+        "kind": "reachable_input_path",
+        "input": input,
+        "condition": condition,
+        "outcome": outcome,
+    }
+
+
 def checkpoint_response(*, inspected, unresolved, **overrides):
     payload = {
         "inspected": inspected,
         "unresolved": unresolved,
         "hypotheses": [],
-        "candidate_finding_ids": [],
+        "candidate_updates": [],
+        "new_candidates": [],
         "invariants_evaluated": [],
         "unknowns": unresolved,
         "proposed_next_actions": [],
@@ -130,8 +143,8 @@ def candidate_checkpoint_response(candidate_ids):
     text = json.dumps({
         "inspected": ["a.py"],
         "unresolved": ["OB-tests"],
-        "candidate_finding_ids": list(candidate_ids),
-        "candidate_findings": [{
+        "candidate_updates": [],
+        "new_candidates": [{
             "candidate_id": candidate_id,
             "root_cause_fingerprint": f"root:{candidate_id}",
             "claim": f"The changed branch exposes issue {candidate_id}.",
@@ -141,11 +154,7 @@ def candidate_checkpoint_response(candidate_ids):
             "category": "correctness",
             "supporting_evidence_ids": [evidence_id],
             "related_obligation_ids": ["OB-code"],
-            "confidence_rationale": (
-                f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
-                "input=changed state; condition=state reaches invalid branch; "
-                "outcome=operation returns the wrong state"
-            ),
+            "consequence_support": reachable_consequence_support(),
             "user_visible_consequence": "The operation returns the wrong state.",
             "manual_validation": "Run the state transition test.",
         } for candidate_id in candidate_ids],
@@ -363,18 +372,102 @@ def test_candidate_admission_rejects_the_same_consequence_gap_as_adjudication():
         "supporting_evidence_ids": [record.id],
         "contradicting_evidence_ids": [],
         "related_targets": ["O1"],
-        "confidence_rationale": (
-            "consequence_support:reachable_input_path; "
-            f"evidence_ids={record.id}; input=request timeout; "
-            "condition=retry is enabled; outcome=The operation returns the wrong state"
-        ),
+        "consequence_support": {
+            "kind": "reachable_input_path",
+            "input": "request timeout",
+            "outcome": "The operation returns the wrong state",
+        },
         "user_visible_consequence": "The operation returns the wrong state.",
         "manual_validation": "Run the state transition test.",
     })
 
     assert admitted is False
-    assert payload["reason"].startswith("consequence-not-supported")
-    assert any("input and condition" in hint for hint in payload["repair_hints"])
+    assert payload["failed_check"] == "reachable_input_path.condition"
+    assert any("input, condition, and outcome" in hint for hint in payload["repair_hints"])
+
+
+def test_affected_consumer_support_uses_evidence_ids_and_derives_paths():
+    obligations = (CoverageObligation(
+        obligation_id="OB-redaction", origin="test", subject="source redaction",
+        required_evidence_categories=("implementation",),
+        scope=("scripts/redact.py", "pr_reviewer/tool_executors.py"),
+    ),)
+    assignment = SpecialistAssignment(
+        assignment_id="assignment-redaction", objective="Review source redaction",
+        primary_obligation_ids=("OB-redaction",), seed_paths=("scripts/redact.py",),
+    )
+    session = make_session(
+        ScriptedGateway([]), obligations=obligations, assignment=assignment,
+    )
+    producer = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file",
+        arguments={"path": "scripts/redact.py"},
+        result={"status": "ok", "content": "password was removed from the key regex"},
+        category="implementation", source="scripts/redact.py",
+    )
+    consumer = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file",
+        arguments={"path": "pr_reviewer/tool_executors.py"},
+        result={"status": "ok", "content": "return mask_source_secrets(content)"},
+        category="implementation", source="pr_reviewer/tool_executors.py",
+    )
+
+    payload, admitted = session._admit_candidate({
+        "claim": "Literal password assignments are no longer redacted.",
+        "affected_location": "scripts/redact.py:40",
+        "causal_chain": "The source redactor feeds tool output without matching password keys.",
+        "severity": "major", "category": "security",
+        "supporting_evidence_ids": [producer.id, consumer.id],
+        "contradicting_evidence_ids": [], "related_targets": ["O1"],
+        "consequence_support": {
+            "kind": "affected_consumer",
+            "producer_evidence_id": producer.id,
+            "consumer_evidence_id": consumer.id,
+            "outcome": "Literal passwords reach the review model unredacted.",
+        },
+        "user_visible_consequence": "Literal passwords reach the review model unredacted.",
+        "manual_validation": "Read a source fixture containing password=secret.",
+    })
+
+    assert admitted is True
+    assert payload == {"accepted": True, "target": "C1"}
+    rationale = session.candidate_findings[0].confidence_rationale
+    assert "producer=scripts/redact.py" in rationale
+    assert "consumer=pr_reviewer/tool_executors.py" in rationale
+
+
+def test_candidate_rejection_identifies_acceptable_evidence_and_failed_predicate():
+    session = make_session(ScriptedGateway([]))
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file",
+        arguments={"path": "a.py"},
+        result={"status": "ok", "content": "changed implementation"},
+        category="implementation", source="a.py",
+    )
+
+    payload, admitted = session._admit_candidate({
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches the invalid branch.",
+        "severity": "major", "category": "correctness",
+        "supporting_evidence_ids": [record.id],
+        "contradicting_evidence_ids": [], "related_targets": ["O1"],
+        "consequence_support": {
+            "kind": "affected_consumer",
+            "producer_evidence_id": record.id,
+            "consumer_evidence_id": "evidence:not-retained",
+            "outcome": "The operation returns the wrong state.",
+        },
+        "user_visible_consequence": "The operation returns the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    })
+
+    assert admitted is False
+    assert payload["failed_check"] == "affected_consumer.consumer_evidence_id"
+    assert payload["acceptable_evidence"] == [{
+        "evidence_id": record.id, "source_path": "a.py",
+    }]
+    assert any(record.id in hint and "a.py" in hint for hint in payload["repair_hints"])
 
 
 def test_reworded_checkpoint_does_not_count_as_semantic_progress():
@@ -630,6 +723,12 @@ def test_concrete_candidate_schema_excludes_non_actionable_info_severity():
     assert schema["properties"]["severity"]["enum"] == [
         "minor", "major", "blocker",
     ]
+    assert "confidence_rationale" not in schema["properties"]
+    support = schema["properties"]["consequence_support"]
+    assert support["properties"]["kind"]["enum"] == [
+        "reachable_input_path", "failing_behavioral_test",
+        "violated_invariant", "affected_consumer", "contradicting_evidence",
+    ]
 
 
 def test_missing_defect_assessment_cannot_resolve_obligation():
@@ -695,11 +794,7 @@ def test_obligation_resolution_accepts_valid_candidate_siblings_independently():
         "severity": "major", "category": "correctness",
         "supporting_evidence_ids": [evidence_id],
         "contradicting_evidence_ids": [], "related_targets": ["O1"],
-        "confidence_rationale": (
-            f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
-            "input=changed state; condition=state reaches invalid branch; "
-            "outcome=operation returns the wrong state"
-        ),
+        "consequence_support": reachable_consequence_support(),
         "user_visible_consequence": "The operation returns the wrong state.",
         "manual_validation": "Run the changed state-transition test.",
     }
@@ -746,11 +841,7 @@ def test_candidate_draft_survives_rejected_obligation_resolution():
         "severity": "major", "category": "correctness",
         "supporting_evidence_ids": [evidence_id],
         "contradicting_evidence_ids": [], "related_targets": ["O1"],
-        "confidence_rationale": (
-            f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
-            "input=changed state; condition=state reaches invalid branch; "
-            "outcome=operation returns the wrong state"
-        ),
+        "consequence_support": reachable_consequence_support(),
         "user_visible_consequence": "The operation returns the wrong state.",
         "manual_validation": "Run the changed state-transition test.",
     }
@@ -792,11 +883,7 @@ def test_followup_defect_lead_survives_memory_and_gets_one_final_synthesis_turn(
         "severity": "major", "category": "correctness",
         "supporting_evidence_ids": [evidence_id],
         "contradicting_evidence_ids": [], "related_targets": ["O1"],
-        "confidence_rationale": (
-            f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
-            "input=changed state; condition=state reaches invalid branch; "
-            "outcome=operation returns the wrong state"
-        ),
+        "consequence_support": reachable_consequence_support(),
         "user_visible_consequence": "The operation returns the wrong state.",
         "manual_validation": "Run the changed state-transition test.",
     }
@@ -834,6 +921,74 @@ def test_followup_defect_lead_survives_memory_and_gets_one_final_synthesis_turn(
     assert result.report["candidate_finding_ids"]
 
 
+def test_final_synthesis_repairs_rejected_candidates_once_with_tools_disabled():
+    session = make_session(ScriptedGateway([]), model_turns=4)
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file",
+        arguments={"path": "a.py"},
+        result={"status": "ok", "content": "changed implementation"},
+        category="implementation", source="a.py",
+    )
+    base = {
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches the invalid branch.",
+        "severity": "major", "category": "correctness",
+        "supporting_evidence_ids": [record.id],
+        "contradicting_evidence_ids": [], "related_targets": ["O1"],
+        "user_visible_consequence": "The operation returns the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    }
+    rejected = {**base, "consequence_support": {
+        "kind": "affected_consumer",
+        "producer_evidence_id": record.id,
+        "consumer_evidence_id": "evidence:not-retained",
+        "outcome": "The operation returns the wrong state.",
+    }}
+    repaired = {**base, "consequence_support": {
+        "kind": "reachable_input_path",
+        "input": "changed state",
+        "condition": "invalid branch",
+        "outcome": "The operation returns the wrong state.",
+    }}
+    gateway = ScriptedGateway([
+        ModelTurnResult(
+            response={}, tool_calls=(), text=json.dumps({
+                "candidate_drafts": [rejected], "dismissed_leads": [],
+            }), text_source="content", finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 20},
+            request_diagnostics={},
+        ),
+        ModelTurnResult(
+            response={}, tool_calls=(), text=json.dumps({
+                "candidate_drafts": [repaired],
+            }), text_source="content", finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 20},
+            request_diagnostics={},
+        ),
+    ])
+    session.gateway = gateway
+    session._defect_leads = [{
+        "lead": "L1", "target": "O1", "summary": "Wrong-state lead",
+        "evidence_ids": [record.id],
+    }]
+
+    session._synthesize_defect_leads()
+
+    assert len(gateway.requests) == 2
+    assert all(request.tools_enabled is False for request in gateway.requests)
+    assert gateway.requests[1].messages_contain(
+        "affected_consumer.consumer_evidence_id"
+    )
+    assert len(session.candidate_findings) == 1
+    diagnostic = session._defect_synthesis_diagnostic
+    assert diagnostic["repair_attempted"] is True
+    assert diagnostic["initial_candidate_results"][0]["accepted"] is False
+    assert diagnostic["repair_candidate_results"] == [
+        {"accepted": True, "target": "C1"},
+    ]
+
+
 def test_candidate_tools_report_and_withdraw_with_short_session_handles():
     session = make_session(ScriptedGateway([]))
     tool_names = {item["name"] for item in session.conversation.tool_schemas}
@@ -855,11 +1010,7 @@ def test_candidate_tools_report_and_withdraw_with_short_session_handles():
             "supporting_evidence_ids": [evidence_id],
             "contradicting_evidence_ids": [],
             "related_targets": ["O1"],
-            "confidence_rationale": (
-                f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
-                "input=changed state; condition=state reaches invalid branch; "
-                "outcome=operation returns the wrong state"
-            ),
+            "consequence_support": reachable_consequence_support(),
             "user_visible_consequence": "The operation returns the wrong state.",
             "manual_validation": "Run the changed state-transition test.",
         }),
@@ -1587,7 +1738,7 @@ def test_report_candidate_rejection_returns_repair_hints_and_retains_lead():
             "severity": "major", "category": "correctness",
             "supporting_evidence_ids": [evidence_id],
             "contradicting_evidence_ids": [], "related_targets": ["O1"],
-            "confidence_rationale": "The code looks suspicious.",
+            "consequence_support": {"kind": "reachable_input_path"},
             "user_visible_consequence": "The operation returns the wrong state.",
             "manual_validation": "Run the state transition test.",
         }),
@@ -1596,7 +1747,7 @@ def test_report_candidate_rejection_returns_repair_hints_and_retains_lead():
     result = json.loads(session.conversation.events[-1]["content"])
     assert result["accepted"] is False
     assert result["retryable"] is True
-    assert "consequence_support:<kind>" in result["repair_hints"][0]
+    assert result["failed_check"] == "reachable_input_path.input"
     assert result["lead"].startswith("L-candidate-")
     assert session._model_checkpoint_memory()["defect_leads"]
 
@@ -1675,7 +1826,7 @@ def test_invalid_emergency_checkpoint_does_not_request_repair():
 
 def test_rejected_emergency_checkpoint_rolls_back_all_tentative_state():
     rejected_candidate = (
-        '{"candidate_findings":[{"candidate_id":"phantom-candidate",'
+        '{"new_candidates":[{"candidate_id":"phantom-candidate",'
         '"claim":"rejected emergency output"}]}'
     )
     gateway = ScriptedGateway([
@@ -1727,8 +1878,7 @@ def test_retention_losing_emergency_without_prior_reports_projected_fallback():
     candidate_turn = ModelTurnResult(**{
         **candidate_turn.__dict__,
         "text": (
-            '{"candidate_finding_ids":["candidate-unretained"],'
-            '"candidate_findings":[{"candidate_id":"candidate-unretained",'
+                '{"new_candidates":[{"candidate_id":"candidate-unretained",'
             '"claim":"material candidate before context pressure"}]}'
         ),
         "text_source": "content",
@@ -1933,7 +2083,7 @@ def test_checkpoint_derives_candidate_ids_from_candidate_objects():
 
 def test_checkpoint_repairs_candidate_missing_actionable_severity():
     invalid = json.loads(candidate_checkpoint_response(("candidate-code",)).text)
-    invalid["candidate_findings"][0].pop("severity")
+    invalid["new_candidates"][0].pop("severity")
     gateway = ScriptedGateway([
         tool_call_response("read_file", {"path": "a.py"}),
         ModelTurnResult(
@@ -2177,7 +2327,7 @@ def test_checkpoint_accepts_new_candidates_separately_from_updates():
                 "inspected": ["a.py"],
                 "unresolved": ["OB-tests"],
                 "candidate_updates": [],
-                "new_candidates": candidate_payload["candidate_findings"],
+                "new_candidates": candidate_payload["new_candidates"],
                 "unknowns": ["OB-tests"],
             }),
         }),
@@ -2254,7 +2404,7 @@ def test_checkpoint_generation_schema_omits_legacy_candidate_findings():
     assert 'legacy "candidate_findings"' not in prompt
 
 
-def test_checkpoint_parser_silently_accepts_legacy_candidate_findings():
+def test_checkpoint_parser_drops_unadvertised_candidate_findings():
     session = make_session(ScriptedGateway([]))
     payload = {
         "unresolved": ["OB-code", "OB-tests"],
@@ -2267,7 +2417,7 @@ def test_checkpoint_parser_silently_accepts_legacy_candidate_findings():
     checkpoint = session._checkpoint_from_text(json.dumps(payload))
 
     assert checkpoint is not None
-    assert "candidate_findings" not in session._last_checkpoint_dropped_keys
+    assert "candidate_findings" in session._last_checkpoint_dropped_keys
 
 
 def test_checkpoint_partially_accepts_obligations_and_repairs_only_rejections():
@@ -2338,10 +2488,8 @@ def test_checkpoint_partially_accepts_candidates_and_repairs_only_rejected_draft
         "severity": "major",
         "supporting_evidence_ids": [record.id],
         "related_obligation_ids": ["O1"],
-        "confidence_rationale": (
-            "consequence_support:reachable_input_path; evidence_ids=" + record.id
-            + "; input=changed state; condition=state reaches invalid branch; "
-            "outcome=caller receives the wrong state"
+        "consequence_support": reachable_consequence_support(
+            outcome="caller receives the wrong state",
         ),
         "user_visible_consequence": "The caller receives the wrong state.",
         "manual_validation": "Run the state transition test.",
@@ -2375,6 +2523,8 @@ def test_checkpoint_partially_accepts_candidates_and_repairs_only_rejected_draft
     correction_prompt = json.loads(gateway.requests[1].messages)[-1]["content"]
     assert "candidate-bad rejected" in correction_prompt
     assert "missing required candidate fields: user_visible_consequence" in correction_prompt
+    assert '"failed_check": "candidate.user_visible_consequence"' in correction_prompt
+    assert record.id in correction_prompt
     assert "candidate-good rejected" not in correction_prompt
     assert "candidate-bad" in session.conversation.events[-1]["content"]
 
@@ -2393,10 +2543,8 @@ def test_rejected_candidate_update_preserves_and_reports_current_state():
         "severity": "major",
         "supporting_evidence_ids": [record.id],
         "related_obligation_ids": ["OB-code"],
-        "confidence_rationale": (
-            "consequence_support:reachable_input_path; evidence_ids=" + record.id
-            + "; input=changed state; condition=state reaches invalid branch; "
-            "outcome=caller receives the wrong state"
+        "consequence_support": reachable_consequence_support(
+            outcome="caller receives the wrong state",
         ),
         "user_visible_consequence": "The caller receives the wrong state.",
         "manual_validation": "Run the state transition test.",
@@ -2613,10 +2761,10 @@ def test_invalid_supersession_preserves_source_but_accepts_valid_withdrawal():
                 "status": "withdrawn",
             },
         ),
-        new_candidates=payload["candidate_findings"],
+        new_candidates=payload["new_candidates"],
     )
     valid_new = candidate_update_checkpoint_response(
-        new_candidates=payload["candidate_findings"],
+        new_candidates=payload["new_candidates"],
     )
     gateway = ScriptedGateway([
         tool_call_response("read_file", {"path": "a.py"}),
@@ -2643,7 +2791,7 @@ def test_embedded_malformed_candidate_json_is_retention_material():
     """Truncated candidate JSON after prose remains conservatively degraded."""
     gateway = ScriptedGateway([
         invalid_response(
-            'Here is the checkpoint draft: {"candidate_findings": '
+            'Here is the checkpoint draft: {"new_candidates": '
             '[{"candidate_id":"candidate-lost","claim":"issue"}'
         ),
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
@@ -2941,8 +3089,7 @@ def test_recovery_span_does_not_make_initial_invalid_checkpoint_valid():
 
 def test_late_failure_retains_actual_valid_checkpoint_not_newer_projection():
     lost_candidate = json.dumps({
-        "candidate_finding_ids": ["lost-candidate"],
-        "candidate_findings": [{
+        "new_candidates": [{
             "candidate_id": "lost-candidate",
             "claim": "A candidate-shaped response that was never admitted.",
         }],
@@ -3670,7 +3817,7 @@ def test_checkpoint_request_includes_compact_schema_contract():
 
 def test_truncated_empty_candidate_checkpoint_is_not_a_material_retention_signal():
     text = json.dumps({
-        "candidate_findings": [],
+        "new_candidates": [],
         "candidate_updates": [],
         "new_candidates": [],
         "completed_steps": [
@@ -3705,8 +3852,7 @@ def test_exploration_reasoning_json_is_not_admitted_or_candidate_signaled():
     private_checkpoint = {
         "inspected": ["a.py"],
         "unresolved": [],
-        "candidate_finding_ids": ["private-candidate"],
-        "candidate_findings": [{
+        "new_candidates": [{
             "candidate_id": "private-candidate",
             "claim": "private draft only",
         }],
@@ -3732,7 +3878,7 @@ def test_checkpoint_request_repairs_reasoning_only_json_from_retained_history():
         reasoning_only_response({
             "inspected": ["a.py"],
             "unresolved": [],
-            "candidate_finding_ids": [],
+            "new_candidates": [],
             "unknowns": [],
         }),
         checkpoint_response(inspected=[], unresolved=["OB-tests"]),
@@ -3754,7 +3900,7 @@ def test_checkpoint_reasoning_only_repair_degrades_to_projection():
         reasoning_only_response({
             "inspected": ["a.py"],
             "unresolved": [],
-            "candidate_finding_ids": [],
+            "new_candidates": [],
             "unknowns": [],
         }),
     ])
@@ -3786,7 +3932,7 @@ def test_unrecoverable_candidate_text_is_reported_as_retention_unknown():
     """Fallback state cannot look like a trustworthy zero-findings checkpoint."""
     gateway = ScriptedGateway([
         invalid_response(
-            '{"unresolved": [], "candidate_findings": '
+            '{"unresolved": [], "new_candidates": '
             '[{"candidate_id": "candidate-lost", "claim": "material issue"}]'
         ),
         invalid_response("still-not-json"),
@@ -3812,7 +3958,7 @@ def test_exploration_candidate_text_survives_checkpoint_handoff_as_unknown():
     """A later clean checkpoint cannot erase an earlier malformed candidate."""
     gateway = ScriptedGateway([
         invalid_response(
-            '{"unresolved": [], "candidate_findings": '
+            '{"unresolved": [], "new_candidates": '
             '[{"candidate_id": "candidate-lost", "claim": "material issue"}]'
         ),
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
@@ -3837,8 +3983,7 @@ def test_tool_turn_candidate_signal_survives_resume_and_clean_checkpoint():
     candidate_turn = ModelTurnResult(**{
         **candidate_turn.__dict__,
         "text": (
-            '{"candidate_finding_ids":["candidate-tool-loss"],'
-            '"candidate_findings":[{"candidate_id":"candidate-tool-loss",'
+                '{"new_candidates":[{"candidate_id":"candidate-tool-loss",'
             '"claim":"material issue"}]}'
         ),
         "text_source": "content",
@@ -3874,7 +4019,7 @@ def test_anonymous_candidate_signal_cannot_be_cleared_by_unrelated_admission():
     )
     anonymous_turn = ModelTurnResult(**{
         **anonymous_turn.__dict__,
-        "text": '{"candidate_findings":[{"claim":"unidentified issue"}]}',
+        "text": '{"new_candidates":[{"claim":"unidentified issue"}]}',
         "text_source": "content",
     })
     named = candidate_checkpoint_response(("candidate-named",))
@@ -3897,7 +4042,10 @@ def test_candidate_id_overflow_cannot_be_cleared_by_bounded_admissions():
     overflow_turn = ModelTurnResult(**{
         **overflow_turn.__dict__,
         "text": json.dumps({
-            "candidate_finding_ids": list(declared_ids),
+            "new_candidates": [
+                {"candidate_id": candidate_id, "claim": "material issue"}
+                for candidate_id in declared_ids
+            ],
         }),
         "text_source": "content",
     })
@@ -3928,7 +4076,7 @@ def test_checkpoint_admission_failure_preserves_exploration_candidate_unknown():
     """A failed checkpoint request cannot erase prior malformed candidate material."""
     gateway = ScriptedGateway([
         invalid_response(
-            '{"unresolved": [], "candidate_findings": '
+            '{"unresolved": [], "new_candidates": '
             '[{"candidate_id": "candidate-lost", "claim": "material issue"}]'
         ),
         TimeoutError("checkpoint provider timed out"),
@@ -3953,8 +4101,7 @@ def test_partial_candidate_retention_repairs_only_the_rejected_candidate():
     )
     checkpoint = checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])
     raw = json.loads(checkpoint.text)
-    raw["candidate_finding_ids"] = ["candidate-code", "candidate-lost"]
-    raw["candidate_findings"] = [
+    raw["new_candidates"] = [
         {
             "candidate_id": "candidate-code",
             "root_cause_fingerprint": "root:candidate-code",
@@ -3965,10 +4112,8 @@ def test_partial_candidate_retention_repairs_only_the_rejected_candidate():
             "category": "correctness",
             "supporting_evidence_ids": [evidence_id],
             "related_obligation_ids": ["OB-code"],
-            "confidence_rationale": (
-                f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
-                "input=changed state; condition=state reaches invalid branch; "
-                "outcome=Cancelled work is shown as active"
+            "consequence_support": reachable_consequence_support(
+                outcome="Cancelled work is shown as active",
             ),
             "user_visible_consequence": "Cancelled work is shown as active.",
             "manual_validation": "Run the cancellation-state test.",
@@ -3982,8 +4127,7 @@ def test_partial_candidate_retention_repairs_only_the_rejected_candidate():
         **checkpoint.__dict__,
         "text": json.dumps({
             **raw,
-            "candidate_finding_ids": ["candidate-code"],
-            "candidate_findings": [raw["candidate_findings"][0]],
+                "new_candidates": [raw["new_candidates"][0]],
         }),
     })
     gateway = ScriptedGateway([
@@ -4556,8 +4700,7 @@ def test_checkpoint_collects_only_evidence_backed_candidate_objects():
     )
     checkpoint = checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])
     raw = json.loads(checkpoint.text)
-    raw["candidate_finding_ids"] = ["candidate-code", "candidate-forged"]
-    raw["candidate_findings"] = [
+    raw["new_candidates"] = [
         {
             "candidate_id": "candidate-code",
             "root_cause_fingerprint": "root:candidate-code",
@@ -4568,10 +4711,8 @@ def test_checkpoint_collects_only_evidence_backed_candidate_objects():
             "category": "correctness",
             "supporting_evidence_ids": [evidence_id],
             "related_obligation_ids": ["OB-code"],
-            "confidence_rationale": (
-                f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
-                "input=changed state; condition=state reaches invalid branch; "
-                "outcome=Cancelled work is shown as active"
+            "consequence_support": reachable_consequence_support(
+                outcome="Cancelled work is shown as active",
             ),
             "user_visible_consequence": "Cancelled work is shown as active.",
             "manual_validation": "Run the cancellation-state test.",
@@ -4594,8 +4735,7 @@ def test_checkpoint_collects_only_evidence_backed_candidate_objects():
         **checkpoint.__dict__,
         "text": json.dumps({
             **raw,
-            "candidate_finding_ids": ["candidate-code"],
-            "candidate_findings": [raw["candidate_findings"][0]],
+                "new_candidates": [raw["new_candidates"][0]],
         }),
     })
     gateway = ScriptedGateway([
@@ -4826,8 +4966,7 @@ def _session_with_retained_candidate(final_responses):
     )
     checkpoint = checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])
     raw = json.loads(checkpoint.text)
-    raw["candidate_finding_ids"] = ["candidate-code"]
-    raw["candidate_findings"] = [{
+    raw["new_candidates"] = [{
         "candidate_id": "candidate-code",
         "root_cause_fingerprint": "root:candidate-code",
         "claim": "The changed branch skips the cancellation state.",
@@ -4837,10 +4976,8 @@ def _session_with_retained_candidate(final_responses):
         "category": "correctness",
         "supporting_evidence_ids": [evidence_id],
         "related_obligation_ids": ["OB-code"],
-        "confidence_rationale": (
-            f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
-            "input=changed state; condition=state reaches invalid branch; "
-            "outcome=Cancelled work is shown as active"
+        "consequence_support": reachable_consequence_support(
+            outcome="Cancelled work is shown as active",
         ),
         "user_visible_consequence": "Cancelled work is shown as active.",
         "manual_validation": "Run the cancellation-state test.",

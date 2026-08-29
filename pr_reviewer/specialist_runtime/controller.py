@@ -4719,6 +4719,10 @@ class ReviewController:
                     ))
                     if result else []
                 ),
+                "defect_synthesis": (
+                    _json_value(result.report.get("defect_synthesis", {}))
+                    if result and isinstance(result.report, Mapping) else {}
+                ),
             })
         session_budgets = {
             item["session_id"]: item["budget"] for item in sessions
@@ -5704,6 +5708,13 @@ class ReviewController:
                             "finalization_diagnostics",
                             (),
                         ),
+                    ),
+                    "defect_synthesis": (
+                        _json_value(emergency_results[session_id].report.get(
+                            "defect_synthesis", {},
+                        ))
+                        if isinstance(emergency_results[session_id].report, Mapping)
+                        else {}
                     ),
                 }
                 for session_id in sorted(emergency_results)

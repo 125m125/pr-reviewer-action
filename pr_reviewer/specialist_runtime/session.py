@@ -53,6 +53,38 @@ from .web_evidence import (
 
 ToolExecutor = Callable[..., dict[str, Any]]
 
+_CONSEQUENCE_SUPPORT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "Structured proof of the concrete consequence. Supporting evidence is "
+        "taken from supporting_evidence_ids; do not repeat it here. "
+        "reachable_input_path requires input, condition, outcome; "
+        "failing_behavioral_test requires test, observed; violated_invariant "
+        "requires obligation_target, contract, violation; affected_consumer "
+        "requires producer_evidence_id, consumer_evidence_id, outcome; "
+        "contradicting_evidence requires conflict and contradicting_evidence_ids."
+    ),
+    "properties": {
+        "kind": {"type": "string", "enum": [
+            "reachable_input_path", "failing_behavioral_test",
+            "violated_invariant", "affected_consumer", "contradicting_evidence",
+        ]},
+        "input": {"type": "string"},
+        "condition": {"type": "string"},
+        "outcome": {"type": "string"},
+        "test": {"type": "string"},
+        "observed": {"type": "string"},
+        "obligation_target": {"type": "string"},
+        "contract": {"type": "string"},
+        "violation": {"type": "string"},
+        "producer_evidence_id": {"type": "string"},
+        "consumer_evidence_id": {"type": "string"},
+        "conflict": {"type": "string"},
+    },
+    "required": ["kind"],
+    "additionalProperties": False,
+}
+
 _CANDIDATE_DRAFT_PROPERTIES: dict[str, Any] = {
     "claim": {"type": "string"},
     "affected_location": {"type": "string"},
@@ -76,7 +108,7 @@ _CANDIDATE_DRAFT_PROPERTIES: dict[str, Any] = {
         "type": "array", "items": {"type": "string"},
         "description": "Assigned obligation handles such as O1.",
     },
-    "confidence_rationale": {"type": "string"},
+    "consequence_support": _CONSEQUENCE_SUPPORT_SCHEMA,
     "user_visible_consequence": {"type": "string"},
     "manual_validation": {"type": "string"},
 }
@@ -135,6 +167,17 @@ _DEFECT_SYNTHESIS_SCHEMA: dict[str, Any] = {
         },
     },
     "required": ["candidate_drafts", "dismissed_leads"],
+    "additionalProperties": False,
+}
+_DEFECT_SYNTHESIS_REPAIR_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "candidate_drafts": {
+            "type": "array", "maxItems": 3,
+            "items": _CANDIDATE_DRAFT_SCHEMA,
+        },
+    },
+    "required": ["candidate_drafts"],
     "additionalProperties": False,
 }
 
@@ -330,7 +373,7 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
             "type": "array", "maxItems": 12,
             "items": {"type": "string", "maxLength": 500},
         },
-        "candidate_findings": {
+        "new_candidates": {
             "type": "array", "maxItems": 8,
             "items": {
                 "type": "object",
@@ -361,23 +404,14 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
                         "type": "array", "maxItems": 12,
                         "items": {"type": "string", "maxLength": 256},
                     },
-                    "confidence_rationale": {
-                        "type": "string", "maxLength": 700,
-                        "description": (
-                            "Typed consequence support declaration. Start with "
-                            "consequence_support: and one of reachable_input_path, "
-                            "failing_behavioral_test, violated_invariant, affected_consumer, "
-                            "or contradicting_evidence, followed by evidence_ids containing "
-                            "exact retained evidence IDs and the form's required key=value details."
-                        ),
-                    },
+                    "consequence_support": _CONSEQUENCE_SUPPORT_SCHEMA,
                     "user_visible_consequence": {"type": "string", "maxLength": 300},
                     "manual_validation": {"type": "string", "maxLength": 300},
                 },
                 "required": [
                     "candidate_id", "claim", "affected_location",
                     "causal_chain", "supporting_evidence_ids",
-                    "related_obligation_ids", "confidence_rationale", "severity",
+                    "related_obligation_ids", "consequence_support", "severity",
                     "user_visible_consequence",
                     "manual_validation",
                 ],
@@ -424,11 +458,6 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
     ],
     "additionalProperties": False,
 }
-# Keep the legacy candidate shape for parser compatibility without advertising
-# the legacy field to new model calls.
-_LEGACY_CANDIDATE_FINDINGS_SCHEMA = _CHECKPOINT_SCHEMA["properties"].pop(
-    "candidate_findings",
-)
 _CHECKPOINT_SCHEMA["properties"]["candidate_updates"] = {
     "type": "array",
     "items": {
@@ -449,10 +478,6 @@ _CHECKPOINT_SCHEMA["properties"]["candidate_updates"] = {
         "required": ["candidate_id", "status"],
         "additionalProperties": False,
     },
-}
-_CHECKPOINT_SCHEMA["properties"]["new_candidates"] = {
-    "type": "array",
-    "items": _LEGACY_CANDIDATE_FINDINGS_SCHEMA["items"],
 }
 _COMPACTING_CHECKPOINT_SCHEMA: dict[str, Any] = {
     **_CHECKPOINT_SCHEMA,
@@ -500,6 +525,7 @@ class _CheckpointChangeRejection:
     target: str
     reason: str
     payload: Mapping[str, Any]
+    diagnostic: Mapping[str, Any] | None = None
 
 
 _CHECKPOINT_LIFECYCLE_INSTRUCTIONS = {
@@ -567,8 +593,9 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
     "internal candidate handles from admitted candidate objects. "
     "Keep checkpoints compact: emit at most 8 new candidates, with one concise "
     "sentence per claim/causal_chain/consequence/manual_validation field; keep "
-    "claim under 300 characters, causal_chain and confidence_rationale under 600 "
-    "characters, and consequence/manual_validation under 300 characters. "
+    "claim under 300 characters, causal_chain under 600 characters, and "
+    "consequence/manual_validation under 300 characters. Use the structured "
+    "consequence_support object advertised by the schema. "
     "Use only exact "
     "retained evidence IDs (evidence:<hash>) from successful tool results in "
     "evidence_ids and supporting_evidence_ids; repository paths are not evidence IDs."
@@ -716,13 +743,8 @@ def _contains_candidate_shaped_text(text: str) -> bool:
         return False
     return bool(
         re.search(
-            r"[\"']?(?:candidate_findings|candidate_updates|new_candidates)"
+            r"[\"']?(?:candidate_updates|new_candidates)"
             r"[\"']?\s*:\s*\[\s*\{",
-            text,
-            flags=re.IGNORECASE,
-        )
-        or re.search(
-            r"[\"']?candidate_finding_ids[\"']?\s*:\s*\[\s*[\"']",
             text,
             flags=re.IGNORECASE,
         )
@@ -734,7 +756,7 @@ def _contains_candidate_json_syntax(text: str) -> bool:
     if not isinstance(text, str):
         return False
     return bool(re.search(
-        r"[\"']?candidate_(?:findings|updates|new_candidates|finding_ids)"
+        r"[\"']?(?:candidate_updates|new_candidates)"
         r"[\"']?\s*:\s*[\[{]",
         text,
         flags=re.IGNORECASE,
@@ -785,8 +807,7 @@ def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
     lowered_text = text.casefold() if isinstance(text, str) else ""
     has_candidate_key = any(
         key in lowered_text for key in (
-            "candidate_findings", "candidate_updates", "new_candidates",
-            "candidate_finding_ids",
+            "candidate_updates", "new_candidates",
         )
     )
     structured_text = bool(
@@ -806,7 +827,6 @@ def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
         )
     if not any(
         key in raw for key in (
-            "candidate_finding_ids", "candidate_findings",
             "candidate_updates", "new_candidates",
         )
     ):
@@ -818,33 +838,6 @@ def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
     candidate_ids: list[str] = []
     unidentified_shapes = 0
     omitted_candidate_ids = 0
-    raw_declared_ids = raw.get("candidate_finding_ids")
-    if isinstance(raw_declared_ids, list):
-        if len(raw_declared_ids) > _MAX_CHECKPOINT_CANDIDATE_IDS:
-            omitted_candidate_ids = 1
-        for value in raw_declared_ids[:_MAX_CHECKPOINT_CANDIDATE_IDS + 1]:
-            candidate_id = str(value).strip()
-            if candidate_id:
-                candidate_ids.append(candidate_id)
-    elif raw_declared_ids is not None and raw_declared_ids != ():
-        unidentified_shapes = 1
-    raw_candidates = raw.get("candidate_findings")
-    if isinstance(raw_candidates, list):
-        if len(raw_candidates) > _MAX_CHECKPOINT_CANDIDATE_IDS:
-            omitted_candidate_ids = 1
-        for value in raw_candidates[:_MAX_CHECKPOINT_CANDIDATE_IDS + 1]:
-            if isinstance(value, Mapping):
-                candidate_id = str(value.get("candidate_id") or "").strip()
-                if candidate_id:
-                    candidate_ids.append(candidate_id)
-                    if not str(value.get("claim") or "").strip():
-                        unidentified_shapes += 1
-                else:
-                    unidentified_shapes += 1
-            else:
-                unidentified_shapes += 1
-    elif raw_candidates is not None and raw_candidates != ():
-        unidentified_shapes += 1
     raw_new_candidates = raw.get("new_candidates")
     if isinstance(raw_new_candidates, list):
         if len(raw_new_candidates) > _MAX_CHECKPOINT_CANDIDATE_IDS:
@@ -1409,7 +1402,13 @@ class SpecialistSession:
             "changes were rejected:",
         ]
         for item in rejections:
-            lines.append(f"- {item.target} rejected: {item.reason}")
+            lines.append(
+                f"- {item.target} rejected: "
+                + (
+                    json.dumps(item.diagnostic, sort_keys=True)
+                    if item.diagnostic is not None else item.reason
+                )
+            )
         lines.extend((
             "Return only corrections for these rejected changes. For each "
             "rejected obligation, revise its obligation_updates entry or list "
@@ -2469,15 +2468,78 @@ class SpecialistSession:
         reason: str,
         retained: Mapping[str, EvidenceRecord],
     ) -> dict[str, object]:
-        hints = self._candidate_repair_hints(reason)
         lead = self._retain_rejected_candidate_lead(
             arguments, reason, retained,
         )
+        return self._candidate_rejection_diagnostic(
+            reason, retained=retained, lead=lead, candidate=arguments,
+        )
+
+    def _candidate_rejection_diagnostic(
+        self,
+        reason: str,
+        *,
+        retained: Mapping[str, EvidenceRecord],
+        lead: str,
+        candidate: Mapping[str, Any] | None = None,
+    ) -> dict[str, object]:
+        failed_check = ""
+        marker = "; failed_check="
+        if marker in reason:
+            failed_check = reason.split(marker, 1)[1].split(";", 1)[0].strip()
+        elif reason.startswith("missing required candidate fields:"):
+            failed_check = "candidate." + reason.split(":", 1)[1].split(",", 1)[0].strip()
+        elif reason.startswith("unsupported candidate fields:"):
+            failed_check = "candidate.fields"
+        elif "severity" in reason.casefold():
+            failed_check = "candidate.severity"
+        elif "supporting evidence" in reason.casefold():
+            failed_check = "candidate.supporting_evidence_ids"
+        elif "related obligation" in reason.casefold():
+            failed_check = "candidate.related_targets"
+        support = (
+            candidate.get("consequence_support", {})
+            if isinstance(candidate, Mapping) else {}
+        )
+        preferred_values: list[str] = []
+        if isinstance(candidate, Mapping):
+            preferred_values.extend(_strings(candidate.get("supporting_evidence_ids")))
+            preferred_values.extend(_strings(candidate.get("contradicting_evidence_ids")))
+        if isinstance(support, Mapping):
+            preferred_values.extend(
+                str(support.get(key) or "").strip()
+                for key in ("producer_evidence_id", "consumer_evidence_id")
+                if str(support.get(key) or "").strip()
+            )
+        preferred = tuple(dict.fromkeys(preferred_values))
+        ordered_ids = tuple(dict.fromkeys((
+            *(
+                resolved for value in preferred
+                if (resolved := _resolve_retained_evidence_id(value, retained)) is not None
+            ),
+            *retained,
+        )))
+        acceptable_evidence = [
+            {"evidence_id": record.id, "source_path": record.source_path}
+            for evidence_id in ordered_ids
+            if (record := retained[evidence_id]).is_usable_for_coverage
+            and record.source_path
+        ][:12]
+        hints = self._candidate_repair_hints(reason)
+        if acceptable_evidence:
+            hints.append(
+                "acceptable retained evidence: " + ", ".join(
+                    f"{item['evidence_id']} ({item['source_path']})"
+                    for item in acceptable_evidence
+                )
+            )
         return {
             "accepted": False,
             "retryable": True,
             "reason": reason,
+            **({"failed_check": failed_check} if failed_check else {}),
             "repair_hints": hints,
+            "acceptable_evidence": acceptable_evidence,
             "lead": lead,
         }
 
@@ -3450,7 +3512,7 @@ class SpecialistSession:
             raw = raw["checkpoint"]
         if raw is None or not isinstance(raw.get("unresolved"), list):
             return None
-        recognized_keys = set(_CHECKPOINT_SCHEMA["properties"]) | {"candidate_findings"}
+        recognized_keys = set(_CHECKPOINT_SCHEMA["properties"])
         self._last_checkpoint_dropped_keys = tuple(sorted(set(raw) - recognized_keys))
         previous = self.latest_checkpoint
         working_summary = (
@@ -3578,22 +3640,17 @@ class SpecialistSession:
             obligation_id = self.obligation_assessments.obligation_id(target)
             if obligation_id in assigned:
                 self.coverage.mark_unresolved(obligation_id)
-        declared_candidate_ids = set(_strings(raw.get("candidate_finding_ids")))
         candidates: dict[str, CandidateFinding] = {
             item.candidate_id: item for item in self.candidate_findings
         }
         candidate_statuses = dict(self._candidate_statuses)
-        # Legacy checkpoints may repeat full candidate objects. Treat them as
-        # additions while preserving all previously active candidates.
-        raw_candidates = raw.get("candidate_findings")
         new_candidates = raw.get("new_candidates")
-        candidate_payloads: list[object] = []
-        if isinstance(raw_candidates, list):
-            candidate_payloads.extend(raw_candidates)
         if isinstance(new_candidates, list):
-            candidate_payloads.extend(new_candidates)
+            candidate_payloads: list[object] = list(new_candidates)
         elif new_candidates is not None:
             return None
+        else:
+            candidate_payloads = []
         for index, value in enumerate(candidate_payloads, start=1):
             candidate_label = (
                 str(value.get("candidate_id") or "").strip()
@@ -3605,18 +3662,22 @@ class SpecialistSession:
                 assigned=assigned,
             )
             if candidate is None:
+                lead = ""
                 if isinstance(value, Mapping):
-                    self._retain_rejected_candidate_lead(
+                    lead = self._retain_rejected_candidate_lead(
                         value, rejection_reason, retained,
                     )
+                diagnostic = self._candidate_rejection_diagnostic(
+                    rejection_reason, retained=retained, lead=lead,
+                    candidate=value if isinstance(value, Mapping) else None,
+                )
                 rejections.append(_CheckpointChangeRejection(
                     "candidate-new", candidate_label,
                     rejection_reason,
                     dict(value) if isinstance(value, Mapping) else {},
+                    diagnostic,
                 ))
                 self._rejected_candidate_ids.add(candidate_label)
-                continue
-            if declared_candidate_ids and candidate.candidate_id not in declared_candidate_ids:
                 continue
             existing = candidates.get(candidate.candidate_id)
             if existing is not None and existing != candidate:
@@ -3786,6 +3847,136 @@ class SpecialistSession:
             ),
         )
 
+    @staticmethod
+    def _proof_rejection(check: str, *hints: str) -> str:
+        return (
+            "candidate proof preflight failed; failed_check=" + check
+            + "; repair hints: " + " | ".join(hints)
+        )
+
+    def _consequence_support_rationale(
+        self,
+        value: object,
+        *,
+        supporting: tuple[str, ...],
+        contradicting: tuple[str, ...],
+        retained: Mapping[str, EvidenceRecord],
+        related_obligations: tuple[str, ...],
+    ) -> tuple[str | None, str]:
+        if not isinstance(value, Mapping):
+            return None, self._proof_rejection(
+                "consequence_support.object",
+                "provide consequence_support as a structured object",
+            )
+        allowed = set(_CONSEQUENCE_SUPPORT_SCHEMA["properties"])
+        unsupported = sorted(set(value) - allowed)
+        if unsupported:
+            return None, self._proof_rejection(
+                "consequence_support.fields",
+                "remove unsupported fields: " + ", ".join(unsupported),
+            )
+        kind = str(value.get("kind") or "").strip().casefold()
+        if kind not in set(_CONSEQUENCE_SUPPORT_SCHEMA["properties"]["kind"]["enum"]):
+            return None, self._proof_rejection(
+                "consequence_support.kind",
+                "use one advertised consequence_support kind",
+            )
+
+        def detail(name: str) -> str:
+            return _bounded_text(value.get(name), max_length=500).replace(";", ",")
+
+        def require(*names: str) -> tuple[str, ...]:
+            return tuple(name for name in names if not detail(name))
+
+        evidence_ids = ",".join(supporting)
+        fields: list[tuple[str, str]] = [("evidence_ids", evidence_ids)]
+        if kind == "reachable_input_path":
+            missing = require("input", "condition", "outcome")
+            if missing:
+                return None, self._proof_rejection(
+                    f"{kind}.{missing[0]}",
+                    "provide input, condition, and outcome; wording need not be copied elsewhere",
+                )
+            fields.extend((name, detail(name)) for name in ("input", "condition", "outcome"))
+        elif kind == "failing_behavioral_test":
+            missing = require("test", "observed")
+            if missing:
+                return None, self._proof_rejection(
+                    f"{kind}.{missing[0]}", "provide test and observed",
+                )
+            fields.extend((name, detail(name)) for name in ("test", "observed"))
+        elif kind == "violated_invariant":
+            missing = require("obligation_target", "contract", "violation")
+            if missing:
+                return None, self._proof_rejection(
+                    f"{kind}.{missing[0]}",
+                    "provide obligation_target, contract, and violation",
+                )
+            target = detail("obligation_target")
+            obligation_id = self.obligation_assessments.obligation_id(target)
+            if obligation_id not in related_obligations:
+                return None, self._proof_rejection(
+                    f"{kind}.obligation_target",
+                    "use a related assigned obligation target",
+                )
+            fields.extend((
+                ("obligation_id", obligation_id),
+                ("contract", detail("contract")),
+                ("violation", detail("violation")),
+            ))
+        elif kind == "affected_consumer":
+            producer_id = _resolve_retained_evidence_id(
+                value.get("producer_evidence_id"), retained,
+            )
+            consumer_id = _resolve_retained_evidence_id(
+                value.get("consumer_evidence_id"), retained,
+            )
+            if producer_id is None or producer_id not in supporting:
+                return None, self._proof_rejection(
+                    f"{kind}.producer_evidence_id",
+                    "use one exact supporting_evidence_id with a retained source path",
+                )
+            if consumer_id is None or consumer_id not in supporting:
+                return None, self._proof_rejection(
+                    f"{kind}.consumer_evidence_id",
+                    "use one exact supporting_evidence_id with a retained source path",
+                )
+            producer = retained[producer_id].source_path
+            consumer = retained[consumer_id].source_path
+            if not producer:
+                return None, self._proof_rejection(
+                    f"{kind}.producer_evidence_id",
+                    f"evidence {producer_id} has no retained source path",
+                )
+            if not consumer:
+                return None, self._proof_rejection(
+                    f"{kind}.consumer_evidence_id",
+                    f"evidence {consumer_id} has no retained source path",
+                )
+            if not detail("outcome"):
+                return None, self._proof_rejection(
+                    f"{kind}.outcome", "provide the concrete consumer outcome",
+                )
+            fields.extend((
+                ("producer", producer), ("consumer", consumer),
+                ("outcome", detail("outcome")),
+            ))
+        else:
+            if not contradicting:
+                return None, self._proof_rejection(
+                    f"{kind}.contradicting_evidence_ids",
+                    "cite at least one contradicting_evidence_id",
+                )
+            if not detail("conflict"):
+                return None, self._proof_rejection(
+                    f"{kind}.conflict", "describe the concrete evidence conflict",
+                )
+            fields[0] = ("evidence_ids", ",".join((*supporting, *contradicting)))
+            fields.append(("conflict", detail("conflict")))
+        return "consequence_support:" + kind + "; " + "; ".join(
+            f"{key}={item}" for key, item in fields
+        ), ""
+
     def _candidate_from_checkpoint(
         self,
         value: object,
@@ -3799,7 +3990,7 @@ class SpecialistSession:
             "candidate_id", "root_cause_fingerprint", "claim",
             "affected_location", "causal_chain", "severity", "category",
             "supporting_evidence_ids", "contradicting_evidence_ids",
-            "related_obligation_ids", "confidence_rationale",
+            "related_obligation_ids", "consequence_support",
             "user_visible_consequence", "manual_validation",
         }
         unsupported = sorted(set(value) - allowed)
@@ -3811,16 +4002,13 @@ class SpecialistSession:
         causal_chain = str(value.get("causal_chain") or "").strip()
         consequence = str(value.get("user_visible_consequence") or "").strip()
         validation = str(value.get("manual_validation") or "").strip()
-        confidence_rationale = str(
-            value.get("confidence_rationale") or ""
-        ).strip()
         severity = str(value.get("severity") or "").strip().lower()
         required = {
             "candidate_id": candidate_id,
             "claim": claim,
             "affected_location": affected_location,
             "causal_chain": causal_chain,
-            "confidence_rationale": confidence_rationale,
+            "consequence_support": value.get("consequence_support"),
             "severity": severity,
             "user_visible_consequence": consequence,
             "manual_validation": validation,
@@ -3881,6 +4069,15 @@ class SpecialistSession:
                 return None, f"unknown related obligation target: {target}"
             obligations.append(obligation_id)
         resolved_obligations = tuple(dict.fromkeys(obligations))
+        confidence_rationale, support_error = self._consequence_support_rationale(
+            value.get("consequence_support"),
+            supporting=supporting,
+            contradicting=contradicting,
+            retained=retained,
+            related_obligations=resolved_obligations,
+        )
+        if confidence_rationale is None:
+            return None, support_error
         model_identities = {
             retained[item].model_identity
             for item in supporting
@@ -3903,9 +4100,7 @@ class SpecialistSession:
             model_identity=(
                 next(iter(model_identities)) if len(model_identities) == 1 else ""
             ),
-            confidence_rationale=_rewrite_rationale_evidence_ids(
-                confidence_rationale, retained,
-            ),
+            confidence_rationale=confidence_rationale,
             user_visible_consequence=consequence,
             manual_validation=validation,
         )
@@ -3923,7 +4118,16 @@ class SpecialistSession:
             changed_files=self.changed_files,
         )
         if authorization_reason:
-            return None, authorization_reason
+            kind = str(value.get("consequence_support", {}).get("kind") or "proof")
+            hint = (
+                "use concrete input and condition terms also present in causal_chain, "
+                "and outcome terms also present in user_visible_consequence"
+                if kind == "reachable_input_path"
+                else "repair the structured proof using the listed retained evidence"
+            )
+            return None, self._proof_rejection(
+                f"{kind}.authorization", hint,
+            )
         return candidate, ""
 
     @staticmethod
@@ -3966,9 +4170,8 @@ class SpecialistSession:
             return ["set severity to blocker, major, or minor; do not use info"]
         if text.startswith("consequence-not-supported"):
             return [
-                "for reachable_input_path, copy the input and condition phrases "
-                "into causal_chain and the outcome phrase into user_visible_consequence; "
-                "cite retained evidence from the affected changed file",
+                "use concrete proof terms linked to the candidate consequence and cite "
+                "retained evidence from the affected changed file",
             ]
         if text == "missing-changed-causal-file":
             return ["set affected_location to an exact changed repository path or changed line"]
@@ -5050,11 +5253,16 @@ class SpecialistSession:
             self._defect_synthesis_diagnostic["status"] = "invalid"
             return
         candidate_results: list[dict[str, object]] = []
+        rejected_drafts: list[dict[str, object]] = []
         for draft in drafts[:3]:
             candidate_result, _accepted = self._admit_candidate(
                 draft if isinstance(draft, Mapping) else {},
             )
             candidate_results.append(candidate_result)
+            if not _accepted and isinstance(draft, Mapping):
+                rejected_drafts.append({
+                    "draft": dict(draft), "diagnostic": candidate_result,
+                })
         dismissed_handles = {
             str(item.get("lead") or "").strip()
             for item in dismissed if isinstance(item, Mapping)
@@ -5067,7 +5275,56 @@ class SpecialistSession:
         self._defect_synthesis_diagnostic.update({
             "status": "valid",
             "candidate_results": candidate_results,
+            "initial_candidate_results": candidate_results,
+            "repair_attempted": False,
+            "repair_candidate_results": [],
             "remaining_leads": len(self._defect_leads),
+        })
+        if not rejected_drafts:
+            return
+        self._defect_synthesis_diagnostic["repair_attempted"] = True
+        self.conversation.add_user(
+            "Final defect-synthesis candidate repair. The synthesis response was "
+            "accepted, but the candidate drafts below were rejected independently. "
+            "Tools remain disabled. Return only corrected candidate_drafts; omit a "
+            "draft if the supplied retained evidence cannot support it.\n"
+            + json.dumps(rejected_drafts, sort_keys=True)
+        )
+        try:
+            repair_turn = self._request(
+                tools_enabled=False,
+                schema=_DEFECT_SYNTHESIS_REPAIR_SCHEMA,
+                purpose="defect-lead-synthesis-repair",
+                max_output_tokens=min(self.max_tokens, 2_048),
+            )
+        except Exception as exc:
+            self._defect_synthesis_diagnostic.update({
+                "repair_status": "unavailable",
+                "repair_error": format_callback_error(exc, limit=300),
+            })
+            return
+        self.conversation.add_assistant_turn(
+            reasoning=repair_turn.reasoning,
+            content=repair_turn.content,
+            calls=repair_turn.tool_calls,
+        )
+        repair_raw = None if repair_turn.tool_calls else _json_object(repair_turn.content)
+        repair_drafts = (
+            repair_raw.get("candidate_drafts")
+            if isinstance(repair_raw, Mapping) else None
+        )
+        if not isinstance(repair_drafts, list):
+            self._defect_synthesis_diagnostic["repair_status"] = "invalid"
+            return
+        repair_results: list[dict[str, object]] = []
+        for draft in repair_drafts[:3]:
+            candidate_result, _accepted = self._admit_candidate(
+                draft if isinstance(draft, Mapping) else {},
+            )
+            repair_results.append(candidate_result)
+        self._defect_synthesis_diagnostic.update({
+            "repair_status": "valid",
+            "repair_candidate_results": repair_results,
         })
 
     def recover(self, reason: str) -> SessionResult:

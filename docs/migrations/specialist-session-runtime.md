@@ -22,8 +22,13 @@ provider capacity are understood.
   receive short session-local handles (`C1`, `C2`, ...). If later evidence
   disproves a candidate, they use `withdraw_candidate` with the handle and a
   reason. Submission runs a cheap proof preflight; malformed proof is rejected
-  immediately with bounded `repair_hints` and a retained lead so the specialist
-  can retry while the evidence is still in context. Do not ask repository
+  immediately with the failed predicate, bounded `repair_hints`, acceptable
+  retained evidence IDs/source paths, and a retained lead so the specialist can
+  retry while the evidence is still in context. Candidate proof is supplied as
+  the structured `consequence_support` object advertised by the tool schema;
+  `affected_consumer` selects producer and consumer evidence IDs and lets the
+  controller derive canonical paths. Do not add the removed free-form
+  `confidence_rationale` input or ask repository
   prompts to invent candidate IDs or repeat full candidate objects in every
   checkpoint.
 - Every obligation-resolution proposal also carries a small defect assessment:
@@ -31,7 +36,9 @@ provider capacity are understood.
   concrete `needs_followup` lead. This keeps defect recognition next to the
   evidence instead of relying on a late whole-session recall pass. Surviving
   leads are retained through compaction and receive at most one bounded,
-  tools-disabled synthesis turn during finalization.
+  tools-disabled synthesis turn during finalization. Rejected synthesis drafts
+  receive one focused tools-disabled repair turn, and both admission attempts
+  and their rejection reasons are recorded in the structured artifact.
 - Deterministic assignments are balanced across the configured session
   capacity (targeting roughly six ordinary obligations per specialist when
   capacity permits). Assignment orientation ranks directly scoped code and
