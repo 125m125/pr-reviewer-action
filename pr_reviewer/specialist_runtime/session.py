@@ -17,6 +17,7 @@ from pr_reviewer.conversation import Conversation, EpochCompactionStats
 from pr_reviewer.tool_loop import decode_native_tool_arguments, native_tool_request_key
 from pr_reviewer.transport import ModelRequestError
 
+from .adjudication import candidate_authorization_reason
 from .budget import BudgetExhausted, BudgetLedger, SessionLease
 from .callbacks import (
     CALLBACK_POOL,
@@ -1118,6 +1119,8 @@ class SpecialistSession:
         recovery_evidence_bytes: int = 8_000,
         clock: Callable[[], float] = time.monotonic,
         wire_safety_tokens: int = 256,
+        max_tool_result_bytes: int = 12_000,
+        changed_files: tuple[str, ...] = (),
         change_overview: Mapping[str, object] | None = None,
     ) -> None:
         if not session_id.strip():
@@ -1157,6 +1160,19 @@ class SpecialistSession:
         self.recovery_evidence_bytes = recovery_evidence_bytes
         self.clock = clock
         self.wire_safety_tokens = max(0, int(wire_safety_tokens))
+        self.max_tool_result_bytes = max(0, int(max_tool_result_bytes))
+        self.changed_files = tuple(dict.fromkeys(
+            str(path).replace("\\", "/").strip("/")
+            for path in (
+                changed_files
+                or tuple(
+                    scope
+                    for obligation in self.coverage.obligations()
+                    for scope in obligation.scope
+                )
+            )
+            if str(path).strip()
+        ))
         self.state = SessionState.CREATED
         self._current_gaps = self._assigned_obligation_ids()
         self.obligation_assessments = ObligationAssessmentLedger(
@@ -1202,6 +1218,7 @@ class SpecialistSession:
         self._legacy_obligation_authority_used = False
         self._checkpoint_spans: list[_CheckpointSpan] = []
         self._tool_lease_exhausted = False
+        self._tool_calls_deferred_for_checkpoint = False
         self._recovery_turn_pending = False
         self._emergency_checkpoint_attempted = False
         self._final_result: SessionResult | None = None
@@ -1247,12 +1264,17 @@ class SpecialistSession:
         # an untrusted fork). Do not advertise an otherwise tool-free catalogue
         # when no results were seeded; this preserves the fork/tool isolation
         # contract and avoids presenting unusable tools.
-        if schemas:
-            schemas.extend(json.loads(json.dumps(_OBLIGATION_LOCAL_TOOL_SCHEMAS)))
-        elif any(
+        has_test_results = any(
             record.category.casefold() == "test-result"
             for record in self.evidence_store.snapshot().records
-        ):
+        )
+        local_schemas = tuple(
+            item for item in _OBLIGATION_LOCAL_TOOL_SCHEMAS
+            if item.get("name") != TEST_RESULTS_TOOL_NAME or has_test_results
+        )
+        if schemas:
+            schemas.extend(json.loads(json.dumps(local_schemas)))
+        elif has_test_results:
             schemas.append(next(
                 json.loads(json.dumps(item))
                 for item in _OBLIGATION_LOCAL_TOOL_SCHEMAS
@@ -1654,7 +1676,7 @@ class SpecialistSession:
                 )
         return prompt_tokens, completion_tokens
 
-    def _checkpoint_pressure_due(self) -> bool:
+    def _checkpoint_pressure_due(self, *, reserve_tool_result: bool = False) -> bool:
         projected = Conversation(
             system=self.conversation.system,
             events=list(self.conversation.events),
@@ -1677,6 +1699,10 @@ class SpecialistSession:
             + (self.checkpoint_max_tokens * 2)
             + repair_instruction_tokens
             + self.wire_safety_tokens
+            + (
+                math.ceil(self.max_tool_result_bytes / 3)
+                if reserve_tool_result else 0
+            )
         )
         return reserved_tokens >= self.max_context_tokens
 
@@ -2011,6 +2037,9 @@ class SpecialistSession:
                 self.state = SessionState.CHECKPOINT
                 return self._snapshot()
             progressed = self._execute_calls(turn.tool_calls)
+            if self._tool_calls_deferred_for_checkpoint:
+                self._tool_calls_deferred_for_checkpoint = False
+                return self._checkpoint_and_resume("deferred-tool-result-growth")
             if self._repeated_obligation_rejection:
                 self._repeated_obligation_rejection = False
                 return self.request_checkpoint(
@@ -2066,6 +2095,7 @@ class SpecialistSession:
                     disposition=CheckpointDisposition.COMPACT_RESUME,
                     allow_gateway_fallbacks=False,
                     allow_repair=False,
+                    max_output_tokens=min(self.checkpoint_max_tokens, 2_048),
                 )
             except BaseException as exc:
                 rollback_tentative_checkpoint()
@@ -2453,9 +2483,21 @@ class SpecialistSession:
 
     def _execute_calls(self, calls: tuple[dict[str, Any], ...]) -> bool:
         progressed = False
-        for call in calls:
+        for index, call in enumerate(calls):
             call_id = str(call.get("id") or "")
             name = str(call.get("name") or "")
+            if self._checkpoint_pressure_due(reserve_tool_result=True):
+                for deferred in calls[index:]:
+                    self.conversation.add_tool_result(
+                        str(deferred.get("id") or ""),
+                        {
+                            "status": "deferred",
+                            "reason": "checkpoint_required",
+                            "retry_after_compaction": True,
+                        },
+                    )
+                self._tool_calls_deferred_for_checkpoint = True
+                break
             try:
                 arguments = decode_native_tool_arguments(call.get("arguments"))
             except (json.JSONDecodeError, ValueError, TypeError) as exc:
@@ -2943,6 +2985,7 @@ class SpecialistSession:
         candidate_signal: _CandidateRetentionSignal | None = None,
         allow_gateway_fallbacks: bool = True,
         allow_repair: bool = True,
+        max_output_tokens: int | None = None,
     ) -> SessionResult:
         """Request a structured checkpoint; never force a final report."""
         disposition = CheckpointDisposition(disposition)
@@ -2973,6 +3016,10 @@ class SpecialistSession:
             if disposition is CheckpointDisposition.COMPACT_RESUME
             else _CHECKPOINT_SCHEMA
         )
+        checkpoint_output_tokens = min(
+            self.checkpoint_max_tokens,
+            max_output_tokens if max_output_tokens is not None else self.checkpoint_max_tokens,
+        )
         request_event_count = len(self._request_events)
         checkpoint_context_admission: dict[str, object] = {}
         try:
@@ -2980,7 +3027,7 @@ class SpecialistSession:
                 tools_enabled=False,
                 schema=checkpoint_schema,
                 purpose="checkpoint",
-                max_output_tokens=self.checkpoint_max_tokens,
+                max_output_tokens=checkpoint_output_tokens,
                 allow_compaction=False,
                 allow_gateway_fallbacks=allow_gateway_fallbacks,
             )
@@ -3869,6 +3916,14 @@ class SpecialistSession:
             return None, self._format_candidate_rejection(
                 "candidate proof preflight failed", hints,
             )
+        authorization_reason = candidate_authorization_reason(
+            candidate,
+            self.evidence_store.snapshot(),
+            obligations={item.id: item for item in self.coverage.obligations()},
+            changed_files=self.changed_files,
+        )
+        if authorization_reason:
+            return None, authorization_reason
         return candidate, ""
 
     @staticmethod
@@ -3909,6 +3964,24 @@ class SpecialistSession:
             ]
         if "severity" in text.casefold():
             return ["set severity to blocker, major, or minor; do not use info"]
+        if text.startswith("consequence-not-supported"):
+            return [
+                "for reachable_input_path, copy the input and condition phrases "
+                "into causal_chain and the outcome phrase into user_visible_consequence; "
+                "cite retained evidence from the affected changed file",
+            ]
+        if text == "missing-changed-causal-file":
+            return ["set affected_location to an exact changed repository path or changed line"]
+        if text in {"missing-retained-evidence", "unusable-retained-evidence"}:
+            return ["cite exact IDs from successful, non-empty retained tool evidence"]
+        if text in {"missing-related-obligation", "unknown-related-obligation"}:
+            return ["use an exact assigned obligation target from the assignment"]
+        if text in {
+            "missing-required-finding-detail", "non-distinct-required-finding-detail",
+        }:
+            return [
+                "provide distinct claim, causal chain, user consequence, and manual validation text"
+            ]
         return ["repair the candidate fields and proof using retained tool evidence"]
 
     def _candidate_preflight_hints(

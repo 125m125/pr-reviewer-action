@@ -51,11 +51,14 @@ provider capacity are understood.
 - Direct budgets bound the whole run, per-session turns, read-only tool calls,
   recovery, concurrency, and the absolute deadline. The artifact records the
   budget and event accounting, policy result, head SHA, and publication state.
-- CI test results can be supplied as a repository-local, immutable-head-bound
-  JSON manifest with `specialist_test_results_file`. The controller seeds each
-  case as typed `test-result` evidence; specialists query it with
-  `read_test_results` using a name substring or regular expression. The tool
-  never executes tests or downloads arbitrary artifacts.
+- On GitHub, the action automatically discovers bounded same-head artifacts
+  named like JUnit/test-results, parses their JUnit XML, and binds the normalized
+  cases to the immutable repository/head. A renderer such as
+  `dorny/test-reporter` may publish the same XML to GitHub Checks, but the XML
+  must also be uploaded with `actions/upload-artifact` for a later manually
+  triggered review workflow to retrieve it. `read_test_results` is advertised
+  only when at least one case was parsed. Custom CI can instead supply a
+  repository-local normalized JSON manifest with `specialist_test_results_file`.
 
 ## Migration inputs
 
@@ -71,7 +74,7 @@ replay and provider capacity have been demonstrated.
 | `review_strategy` | added | `single` | Begin with `specialists_evaluate`, then use `specialists` with `publish_review_comment: "true"` | Evaluate without publishing before enabling the handoff; the strategy alone never publishes. |
 | `review_policy_file` | added | `.github/ai-review-policy.json` | Keep the default and commit a version-2 policy | The validated current-head policy selects work and limits sources/publishing. |
 | `review_diff_priority_file` | added | `.github/ai-review-diff-priorities.json` | Keep the default; add the file only when project-specific ordering or quotas improve large-diff orientation | Rules only reorder or quota paths already present in the immutable changed-file manifest. Missing or invalid files safely use built-in priorities. |
-| `specialist_test_results_file` | added |  | Set to a CI-produced path such as `ci/test-results.json` when available | Makes actual test outcomes searchable by every specialist and provides admissible evidence for behavioral-test claims without allowing arbitrary test execution. |
+| `specialist_test_results_file` | added |  | Usually leave empty. On GitHub, the action discovers bounded same-head artifacts whose names contain `junit` or `test-results`. Set an explicit normalized JSON path only for custom CI integration. | Makes actual test outcomes searchable when at least one JUnit case was parsed and provides admissible evidence for behavioral-test claims without allowing arbitrary test execution. |
 | `ai_max_tokens` | retained | `8192` | `8192` for the tested local Qwen baseline | Leaves enough room for reasoning-heavy structured roles and checkpoint repair. |
 | `specialist_review_deadline_sec` | added | `7200` | `7200` initially; raise only after measured runs need it | This is the absolute run deadline, including finalization and artifact production. |
 | `specialist_phase_shares` | added | `{"planning":10,"initial":60,"followup":20,"finalization":10}` | Keep the default before tuning from artifacts | The four percentages must total 100 and prevent one phase consuming the run. |
@@ -239,6 +242,7 @@ on:
     types: [opened, reopened, synchronize, ready_for_review]
 
 permissions:
+  actions: read
   contents: read
   pull-requests: write
 

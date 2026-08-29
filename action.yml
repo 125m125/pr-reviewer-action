@@ -465,7 +465,7 @@ inputs:
     required: false
     default: ""
   specialist_test_results_file:
-    description: Optional repository-local JSON manifest of CI test results bound to the reviewed head SHA; specialists can query matching test names without executing tests
+    description: Optional repository-local normalized CI test manifest; when empty on GitHub, same-head JUnit/test-results artifacts are discovered and normalized automatically
     required: false
     default: ""
   evidence_provider_timeout_sec:

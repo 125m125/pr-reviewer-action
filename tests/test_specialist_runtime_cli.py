@@ -692,6 +692,8 @@ def test_cli_writes_structured_handoff_notes_artifact_and_compatibility_output(
     assert "\\!\\[image\\]\\(https://evil\\.example/x\\)" in summary
     assert "negotiator\\[details\\]\\(https://evil\\.example\\)" in summary
     assert "fallback after &lt;timeout&gt;" in summary
+    assert "Candidates: submitted 0" in summary
+    assert "CI test evidence: unavailable" in summary
 
 
 def test_cli_preserves_non_blocking_notice_in_compatibility_output(monkeypatch, tmp_path):
@@ -709,6 +711,39 @@ def test_cli_preserves_non_blocking_notice_in_compatibility_output(monkeypatch, 
 
     compatibility = json.loads((tmp_path / "specialist-ai-output.json").read_text())
     assert compatibility["verdict"] == "notice"
+
+
+def test_cli_summary_reports_junit_sources_and_counts(monkeypatch, tmp_path):
+    write_review_workspace(tmp_path)
+    manifest = tmp_path / "test-results.json"
+    manifest.write_text(json.dumps({
+        "repository": "owner/repo", "head_sha": "h" * 40,
+        "statistics": {
+            "source_reports": 2, "total": 3, "retained": 3,
+            "passed": 1, "failed": 1, "skipped": 1, "errored": 0,
+        },
+        "reports": [{
+            "name": "junit.zip:python/pytest.xml", "tests": [],
+            "statistics": {
+                "total": 2, "retained": 2, "passed": 1,
+                "failed": 1, "skipped": 0, "errored": 0,
+            },
+        }],
+    }), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REVIEW_STRATEGY", "specialists")
+    monkeypatch.setenv("REPO", "owner/repo")
+    monkeypatch.setenv("SPECIALIST_TEST_RESULTS_FILE", "test-results.json")
+    monkeypatch.setattr(cli, "_git_changed_files", lambda *_: ("src/app.py",))
+    monkeypatch.setattr(
+        cli, "build_controller", lambda config, **_kwargs: ScriptedController(tmp_path)
+    )
+
+    assert cli.main() == 0
+
+    summary = (tmp_path / "specialist-review-summary.md").read_text()
+    assert "3 tests from 2 JUnit reports; 1 failed; 3 retained" in summary
+    assert "| junit\\.zip:python/pytest\\.xml | 2 | 2 | 1 | 1 | 0 | 0 |" in summary
 
 
 def test_degradation_summary_exposes_specialist_root_causes_without_model_dump():

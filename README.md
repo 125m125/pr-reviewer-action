@@ -38,6 +38,7 @@ on:
     types: [opened, reopened, synchronize, ready_for_review]
 
 permissions:
+  actions: read
   contents: read
   pull-requests: write
 
@@ -435,7 +436,7 @@ for the complete schema, source-rule boundaries, and conversion checklist.
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `evidence_providers_file` | Optional JSON file in the reviewed repo defining evidence provider commands | No | `""` |
-| `specialist_test_results_file` | Optional repository-local JSON manifest of CI test results bound to the reviewed head SHA | No | `""` |
+| `specialist_test_results_file` | Optional repository-local normalized test manifest. When empty on GitHub, bounded same-head artifacts named like JUnit/test-results are discovered and normalized automatically. | No | `""` |
 | `evidence_provider_timeout_sec` | Default timeout in seconds for each evidence provider command | No | `30` |
 | `evidence_provider_max_output_bytes` | Max stdout or stderr bytes captured per provider command | No | `20000` |
 | `evidence_provider_parallelism` | Max evidence provider commands run concurrently (set `1` to force serial execution) | No | `4` |

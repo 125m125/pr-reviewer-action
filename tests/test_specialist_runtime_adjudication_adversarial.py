@@ -884,6 +884,45 @@ def test_explicit_critic_merge_combines_distinct_claims_under_same_causal_root()
     )
 
 
+def test_critic_can_merge_authorized_independently_worded_duplicate():
+    store, evidence_id = _store()
+    target = _candidate(
+        "candidate-a", evidence_ids=(evidence_id,),
+        claim="The retry duplicates the write",
+    )
+    duplicate = replace(
+        target,
+        candidate_id="candidate-b",
+        claim="An ambiguous response causes the same record to be persisted twice",
+        category="idempotency",
+        causal_chain=(
+            "An ambiguous response reaches the retry branch, and the retry repeats a write."
+        ),
+        confidence_rationale=(
+            "consequence_support:reachable_input_path; "
+            f"evidence_ids={evidence_id}; input=ambiguous response; "
+            "condition=retry repeats a write; "
+            "outcome=A user action can be persisted twice"
+        ),
+    )
+
+    review = adjudicate_candidates(
+        (target, duplicate),
+        (
+            {"candidate_id": "candidate-a", "action": "keep"},
+            {"candidate_id": "candidate-b", "action": "merge", "target_id": "candidate-a"},
+        ),
+        store,
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert len(review.accepted) == 1
+    assert review.accepted[0].contributor_candidate_ids == (
+        "candidate-a", "candidate-b",
+    )
+
+
 def test_duplicate_consequence_or_validation_placeholder_downgrades_to_verification():
     store, evidence_id = _store()
     complete = _candidate(evidence_ids=(evidence_id,))

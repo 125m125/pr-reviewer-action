@@ -136,7 +136,7 @@ def candidate_checkpoint_response(candidate_ids):
             "root_cause_fingerprint": f"root:{candidate_id}",
             "claim": f"The changed branch exposes issue {candidate_id}.",
             "affected_location": "a.py:4",
-            "causal_chain": "The new state reaches an invalid branch.",
+            "causal_chain": "The changed state reaches invalid branch.",
             "severity": "major",
             "category": "correctness",
             "supporting_evidence_ids": [evidence_id],
@@ -310,6 +310,71 @@ def test_test_results_tool_filters_existing_ci_results_by_regex_or_substring():
     assert result["status"] == "ok"
     assert result["count"] == 1
     assert result["tests"][0]["name"].endswith("test_request_changes")
+
+
+def test_test_results_tool_is_not_advertised_without_seeded_cases():
+    session = make_session(ScriptedGateway([]))
+
+    assert TEST_RESULTS_TOOL_NAME not in {
+        schema["name"] for schema in session.conversation.tool_schemas
+    }
+
+
+def test_context_pressure_defers_tool_calls_without_charging_or_deduplicating():
+    session = make_session(ScriptedGateway([]), tool_calls=4)
+    session._checkpoint_pressure_due = lambda *args, **kwargs: True
+    call = {
+        "id": "deferred-read",
+        "name": "read_file",
+        "arguments": json.dumps({"path": "a.py"}),
+    }
+
+    progressed = session._execute_calls((call,))
+
+    payload = json.loads(session.conversation.events[-1]["content"])
+    assert progressed is False
+    assert payload == {
+        "status": "deferred",
+        "reason": "checkpoint_required",
+        "retry_after_compaction": True,
+    }
+    assert session.budget.snapshot().tool_calls == 0
+    assert session._successful_requests == {}
+    assert session._tool_calls_deferred_for_checkpoint is True
+
+
+def test_candidate_admission_rejects_the_same_consequence_gap_as_adjudication():
+    session = make_session(ScriptedGateway([]))
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id,
+        tool="read_file",
+        arguments={"path": "a.py"},
+        result={"status": "ok", "content": "changed implementation"},
+        category="implementation",
+        source="a.py",
+    )
+
+    payload, admitted = session._admit_candidate({
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches the invalid branch.",
+        "severity": "major",
+        "category": "correctness",
+        "supporting_evidence_ids": [record.id],
+        "contradicting_evidence_ids": [],
+        "related_targets": ["O1"],
+        "confidence_rationale": (
+            "consequence_support:reachable_input_path; "
+            f"evidence_ids={record.id}; input=request timeout; "
+            "condition=retry is enabled; outcome=The operation returns the wrong state"
+        ),
+        "user_visible_consequence": "The operation returns the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    })
+
+    assert admitted is False
+    assert payload["reason"].startswith("consequence-not-supported")
+    assert any("input and condition" in hint for hint in payload["repair_hints"])
 
 
 def test_reworded_checkpoint_does_not_count_as_semantic_progress():
@@ -626,7 +691,7 @@ def test_obligation_resolution_accepts_valid_candidate_siblings_independently():
     valid = {
         "claim": "The changed branch returns the wrong state.",
         "affected_location": "a.py:4",
-        "causal_chain": "The changed input reaches the invalid return branch.",
+        "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
         "severity": "major", "category": "correctness",
         "supporting_evidence_ids": [evidence_id],
         "contradicting_evidence_ids": [], "related_targets": ["O1"],
@@ -677,7 +742,7 @@ def test_candidate_draft_survives_rejected_obligation_resolution():
     draft = {
         "claim": "The changed branch returns the wrong state.",
         "affected_location": "a.py:4",
-        "causal_chain": "The changed input reaches the invalid return branch.",
+        "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
         "severity": "major", "category": "correctness",
         "supporting_evidence_ids": [evidence_id],
         "contradicting_evidence_ids": [], "related_targets": ["O1"],
@@ -723,7 +788,7 @@ def test_followup_defect_lead_survives_memory_and_gets_one_final_synthesis_turn(
     final_candidate = {
         "claim": "The changed branch returns the wrong state.",
         "affected_location": "a.py:4",
-        "causal_chain": "The changed input reaches the invalid return branch.",
+        "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
         "severity": "major", "category": "correctness",
         "supporting_evidence_ids": [evidence_id],
         "contradicting_evidence_ids": [], "related_targets": ["O1"],
@@ -784,7 +849,7 @@ def test_candidate_tools_report_and_withdraw_with_short_session_handles():
         "arguments": json.dumps({
             "claim": "The changed branch returns the wrong state.",
             "affected_location": "a.py:4",
-            "causal_chain": "The changed input reaches the invalid return branch.",
+            "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
             "severity": "major",
             "category": "correctness",
             "supporting_evidence_ids": [evidence_id],
@@ -1487,7 +1552,7 @@ def test_emergency_checkpoint_recovers_one_exploration_context_error():
     assert result.degraded is False
     assert len(gateway.requests) == 2
     assert [request.tools_enabled for request in gateway.requests] == [True, False]
-    assert gateway.requests[1].max_tokens == session.checkpoint_max_tokens
+    assert gateway.requests[1].max_tokens == min(session.checkpoint_max_tokens, 2_048)
     assert gateway.requests[1].reasoning_effort == "none"
     first_messages = json.loads(gateway.requests[0].messages)
     emergency_messages = json.loads(gateway.requests[1].messages)
@@ -1518,7 +1583,7 @@ def test_report_candidate_rejection_returns_repair_hints_and_retains_lead():
         "arguments": json.dumps({
             "claim": "The changed branch returns the wrong state.",
             "affected_location": "a.py:4",
-            "causal_chain": "The changed input reaches the invalid return branch.",
+            "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
             "severity": "major", "category": "correctness",
             "supporting_evidence_ids": [evidence_id],
             "contradicting_evidence_ids": [], "related_targets": ["O1"],
@@ -2269,7 +2334,7 @@ def test_checkpoint_partially_accepts_candidates_and_repairs_only_rejected_draft
         "candidate_id": "candidate-good",
         "claim": "The changed branch returns the wrong state.",
         "affected_location": "a.py:4",
-        "causal_chain": "The changed input reaches the invalid return branch.",
+        "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
         "severity": "major",
         "supporting_evidence_ids": [record.id],
         "related_obligation_ids": ["O1"],
@@ -2324,7 +2389,7 @@ def test_rejected_candidate_update_preserves_and_reports_current_state():
         "candidate_id": "candidate-good",
         "claim": "The changed branch returns the wrong state.",
         "affected_location": "a.py:4",
-        "causal_chain": "The changed input reaches the invalid return branch.",
+        "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
         "severity": "major",
         "supporting_evidence_ids": [record.id],
         "related_obligation_ids": ["OB-code"],
@@ -3895,7 +3960,7 @@ def test_partial_candidate_retention_repairs_only_the_rejected_candidate():
             "root_cause_fingerprint": "root:candidate-code",
             "claim": "The changed branch skips the cancellation state.",
             "affected_location": "a.py:4",
-            "causal_chain": "The new state reaches a switch without a matching arm.",
+            "causal_chain": "The changed state reaches invalid branch in a switch without a matching arm.",
             "severity": "major",
             "category": "correctness",
             "supporting_evidence_ids": [evidence_id],
@@ -3903,7 +3968,7 @@ def test_partial_candidate_retention_repairs_only_the_rejected_candidate():
             "confidence_rationale": (
                 f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
                 "input=changed state; condition=state reaches invalid branch; "
-                "outcome=operation returns the wrong state"
+                "outcome=Cancelled work is shown as active"
             ),
             "user_visible_consequence": "Cancelled work is shown as active.",
             "manual_validation": "Run the cancellation-state test.",
@@ -4498,7 +4563,7 @@ def test_checkpoint_collects_only_evidence_backed_candidate_objects():
             "root_cause_fingerprint": "root:candidate-code",
             "claim": "The changed branch skips the cancellation state.",
             "affected_location": "a.py:4",
-            "causal_chain": "The new state reaches a switch without a matching arm.",
+            "causal_chain": "The changed state reaches invalid branch in a switch without a matching arm.",
             "severity": "major",
             "category": "correctness",
             "supporting_evidence_ids": [evidence_id],
@@ -4506,7 +4571,7 @@ def test_checkpoint_collects_only_evidence_backed_candidate_objects():
             "confidence_rationale": (
                 f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
                 "input=changed state; condition=state reaches invalid branch; "
-                "outcome=operation returns the wrong state"
+                "outcome=Cancelled work is shown as active"
             ),
             "user_visible_consequence": "Cancelled work is shown as active.",
             "manual_validation": "Run the cancellation-state test.",
@@ -4767,7 +4832,7 @@ def _session_with_retained_candidate(final_responses):
         "root_cause_fingerprint": "root:candidate-code",
         "claim": "The changed branch skips the cancellation state.",
         "affected_location": "a.py:4",
-        "causal_chain": "The new state reaches a switch without a matching arm.",
+        "causal_chain": "The changed state reaches invalid branch in a switch without a matching arm.",
         "severity": "major",
         "category": "correctness",
         "supporting_evidence_ids": [evidence_id],
@@ -4775,7 +4840,7 @@ def _session_with_retained_candidate(final_responses):
         "confidence_rationale": (
             f"consequence_support:reachable_input_path; evidence_ids={evidence_id}; "
             "input=changed state; condition=state reaches invalid branch; "
-            "outcome=operation returns the wrong state"
+            "outcome=Cancelled work is shown as active"
         ),
         "user_visible_consequence": "Cancelled work is shown as active.",
         "manual_validation": "Run the cancellation-state test.",

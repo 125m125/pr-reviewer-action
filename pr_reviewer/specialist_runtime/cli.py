@@ -1120,6 +1120,8 @@ def build_controller(
             recovery_evidence_bytes=max(
                 1_000, config.recovery_max_tokens * 4,
             ),
+            max_tool_result_bytes=config.tool_response_bytes,
+            changed_files=allowed_diff_paths,
             change_overview=change_overview,
         )
 
@@ -2134,6 +2136,18 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
         bool(assignment_plan.get("planner_repaired", False))
     ).lower()
     diagnostic_rows = _degradation_summary_rows(artifact)
+    candidate_stats = (
+        artifact.get("candidate_statistics", {})
+        if isinstance(artifact, Mapping) else {}
+    )
+    if not isinstance(candidate_stats, Mapping):
+        candidate_stats = {}
+    critic_actions = candidate_stats.get("critic_actions", {})
+    critic_action_text = ""
+    if isinstance(critic_actions, Mapping) and critic_actions:
+        critic_action_text = " (" + ", ".join(
+            f"{key}={value}" for key, value in sorted(critic_actions.items())
+        ) + ")"
     summary_lines = [
         "# Specialist review",
         "",
@@ -2142,7 +2156,69 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
         f"- Review notes: {len(notes)}",
         f"- Publishing ready: `{str(result.publishing_ready).lower()}`",
         f"- Assignment plan: `{plan_source}` (repaired: `{planner_repaired}`)",
+        "- Candidates: submitted "
+        + str(candidate_stats.get("submitted", 0))
+        + "; critic decisions " + str(candidate_stats.get("critic_decisions", 0))
+        + critic_action_text
+        + "; accepted " + str(candidate_stats.get("accepted", 0))
+        + "; merged " + str(candidate_stats.get("merged", 0))
+        + "; verification " + str(candidate_stats.get("verification", 0))
+        + "; rejected " + str(candidate_stats.get("rejected", 0)),
     ]
+    test_manifest: Mapping[str, object] = {}
+    if config.test_results_file is not None and config.test_results_file.is_file():
+        try:
+            parsed_manifest = json.loads(
+                config.test_results_file.read_text(encoding="utf-8")
+            )
+            if isinstance(parsed_manifest, Mapping):
+                test_manifest = parsed_manifest
+        except (OSError, ValueError, json.JSONDecodeError):
+            test_manifest = {}
+    test_stats = test_manifest.get("statistics", {})
+    if not isinstance(test_stats, Mapping):
+        test_stats = {}
+    try:
+        retained_tests = max(0, int(test_stats.get("retained", 0) or 0))
+    except (TypeError, ValueError):
+        retained_tests = 0
+    if retained_tests:
+        summary_lines.append(
+            "- CI test evidence: "
+            f"{test_stats.get('total', retained_tests)} tests from "
+            f"{test_stats.get('source_reports', 0)} JUnit reports; "
+            f"{test_stats.get('failed', 0)} failed; {retained_tests} retained"
+        )
+        reports = test_manifest.get("reports", [])
+        report_rows = tuple(
+            report for report in reports
+            if isinstance(report, Mapping)
+            and isinstance(report.get("statistics"), Mapping)
+        )[:12] if isinstance(reports, list) else ()
+        if report_rows:
+            summary_lines.extend((
+                "", "## CI test evidence", "",
+                "| Source report | Total | Retained | Passed | Failed | Skipped | Errors |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ))
+            for report in report_rows:
+                stats = report["statistics"]
+                summary_lines.append(
+                    "| " + _summary_cell(report.get("name", "JUnit"), limit=160)
+                    + " | " + " | ".join(
+                        str(stats.get(key, 0))
+                        for key in (
+                            "total", "retained", "passed", "failed", "skipped", "errored",
+                        )
+                    ) + " |"
+                )
+    else:
+        reason = str(test_manifest.get("availability_reason") or (
+            "no normalized same-head JUnit manifest was available"
+        ))
+        summary_lines.append(
+            "- CI test evidence: unavailable — " + _summary_cell(reason, limit=240)
+        )
     if diagnostic_rows:
         summary_lines.extend((
             "",

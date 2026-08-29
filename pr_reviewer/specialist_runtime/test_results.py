@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
+import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
+from xml.etree import ElementTree
 
 from .evidence import EvidenceProvenance, EvidenceStore
 
@@ -13,6 +16,8 @@ from .evidence import EvidenceProvenance, EvidenceStore
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 _STATUSES = frozenset({"passed", "failed", "skipped", "errored", "xfailed", "unknown"})
 _MAX_CASES = 2_000
+_MAX_JUNIT_XML_BYTES = 10 * 1024 * 1024
+_MAX_JUNIT_ARCHIVE_BYTES = 50 * 1024 * 1024
 
 
 def _path(value: object) -> str:
@@ -58,6 +63,165 @@ def _case(raw: Mapping[str, object], *, report: str, workflow: str, job: str) ->
     if line_int > 0:
         result["line"] = line_int
     return result
+
+
+def _junit_report(source: str, content: bytes) -> dict[str, object] | None:
+    if (
+        not content
+        or len(content) > _MAX_JUNIT_XML_BYTES
+        or b"<!DOCTYPE" in content.upper()
+        or b"<!ENTITY" in content.upper()
+    ):
+        return None
+    try:
+        root = ElementTree.fromstring(content)
+    except ElementTree.ParseError:
+        return None
+    tests: list[dict[str, object]] = []
+    for node in root.iter("testcase"):
+        name = _text(node.get("name"), 1_000)
+        classname = _text(node.get("classname"), 1_000)
+        if not name:
+            continue
+        failure = node.find("failure")
+        error = node.find("error")
+        skipped = node.find("skipped")
+        detail = failure if failure is not None else (
+            error if error is not None else skipped
+        )
+        status = (
+            "failed" if failure is not None else
+            "errored" if error is not None else
+            "skipped" if skipped is not None else
+            "passed"
+        )
+        test: dict[str, object] = {
+            "name": f"{classname}::{name}" if classname else name,
+            "status": status,
+            "file": _path(node.get("file")),
+            "message": _text(
+                ((detail.get("message") if detail is not None else "") or
+                 (detail.text if detail is not None else ""))
+            ),
+        }
+        try:
+            line = int(node.get("line") or 0)
+        except (TypeError, ValueError):
+            line = 0
+        if line > 0:
+            test["line"] = line
+        tests.append(test)
+    return {"name": source, "tests": tests} if tests else None
+
+
+def build_junit_manifest(
+    paths: Iterable[str | Path], *, repository: str, head_sha: str,
+) -> dict[str, object]:
+    """Normalize bounded JUnit XML files or ZIP artifacts for one immutable head."""
+    if not repository.strip() or not _SHA_RE.fullmatch(head_sha.strip()):
+        raise ValueError("test result binding requires repository and immutable head SHA")
+    reports: list[dict[str, object]] = []
+    total_archive_bytes = 0
+    for raw_path in paths:
+        path = Path(raw_path)
+        if not path.is_file():
+            continue
+        total_archive_bytes += path.stat().st_size
+        if total_archive_bytes > _MAX_JUNIT_ARCHIVE_BYTES:
+            break
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as archive:
+                for member in sorted(archive.infolist(), key=lambda item: item.filename):
+                    if (
+                        member.is_dir()
+                        or not member.filename.casefold().endswith(".xml")
+                        or member.file_size > _MAX_JUNIT_XML_BYTES
+                    ):
+                        continue
+                    report = _junit_report(
+                        f"{path.name}:{_path(member.filename)}",
+                        archive.read(member),
+                    )
+                    if report is not None:
+                        reports.append(report)
+        elif path.suffix.casefold() == ".xml":
+            report = _junit_report(path.name, path.read_bytes())
+            if report is not None:
+                reports.append(report)
+
+    counts = {key: 0 for key in ("passed", "failed", "skipped", "errored")}
+    total = 0
+    ranked_cases: list[tuple[int, int, int]] = []
+    for report_index, report in enumerate(reports):
+        for test_index, test in enumerate(report["tests"]):
+            status = str(test.get("status") or "unknown")
+            ranked_cases.append((
+                0 if status in {"failed", "errored"} else 1,
+                report_index,
+                test_index,
+            ))
+    selected_cases = {
+        (report_index, test_index)
+        for _priority, report_index, test_index
+        in sorted(ranked_cases)[:_MAX_CASES]
+    }
+    bounded_reports: list[dict[str, object]] = []
+    for report_index, report in enumerate(reports):
+        tests = list(report["tests"])
+        total += len(tests)
+        for test in tests:
+            status = str(test.get("status") or "unknown")
+            if status in counts:
+                counts[status] += 1
+        selected = [
+            test for test_index, test in enumerate(tests)
+            if (report_index, test_index) in selected_cases
+        ]
+        report_counts = {
+            key: sum(test.get("status") == key for test in tests)
+            for key in counts
+        }
+        bounded_reports.append({
+            **report,
+            "tests": selected,
+            "statistics": {
+                "total": len(tests),
+                "retained": len(selected),
+                **report_counts,
+            },
+        })
+    return {
+        "repository": repository.strip(),
+        "head_sha": head_sha.strip(),
+        "reports": bounded_reports,
+        "statistics": {
+            "source_reports": len(reports),
+            "total": total,
+            "retained": len(selected_cases),
+            **counts,
+        },
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Normalize bounded JUnit artifacts")
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--head-sha", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--unavailable-reason", default="")
+    parser.add_argument("artifacts", nargs="*")
+    args = parser.parse_args(argv)
+    manifest = build_junit_manifest(
+        args.artifacts, repository=args.repository, head_sha=args.head_sha,
+    )
+    if not manifest["statistics"]["retained"]:
+        manifest["availability_reason"] = (
+            args.unavailable_reason or "no parseable same-head JUnit test cases found"
+        )
+    Path(args.output).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    return 0
 
 
 def load_test_results(
@@ -148,4 +312,8 @@ def seed_test_results(
     return tuple(seeded)
 
 
-__all__ = ["load_test_results", "seed_test_results"]
+__all__ = ["build_junit_manifest", "load_test_results", "seed_test_results"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

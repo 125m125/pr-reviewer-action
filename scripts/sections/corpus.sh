@@ -211,6 +211,13 @@ case "$REVIEW_STRATEGY" in specialists|specialists_evaluate) SPECIALIST_PIPELINE
 if [[ "$SPECIALIST_PIPELINE_ENABLED" == "true" ]]; then
   section_timer_start "specialist-review"
   log "Running generic specialist review strategy: $REVIEW_STRATEGY"
+  if [[ -z "${SPECIALIST_TEST_RESULTS_FILE:-}" ]]; then
+    SPECIALIST_TEST_RESULTS_FILE="specialist-test-results.json"
+    if ! bash "$SCRIPT_DIR/collect_junit_results.sh" "$SPECIALIST_TEST_RESULTS_FILE"; then
+      warn "Same-head JUnit artifact collection failed; test-result tool disabled"
+      SPECIALIST_TEST_RESULTS_FILE=""
+    fi
+  fi
   # Sourced defaults are shell variables, while the CLI boundary intentionally
   # reads only an explicit environment. Export the normalized runtime contract
   # so standalone/smoke invocations behave exactly like the composite action.
@@ -224,6 +231,7 @@ if [[ "$SPECIALIST_PIPELINE_ENABLED" == "true" ]]; then
   export SPECIALIST_RECOVERY_MAX_TOKENS
   export SPECIALIST_MAX_CONVERSATION_TOKENS SPECIALIST_TEMPERATURE
   export SPECIALIST_STREAM_WATCHDOG SPECIALIST_PLANNER_MAX_TOKENS
+  export SPECIALIST_TEST_RESULTS_FILE
   if ! IS_FORK_PR="$IS_FORK_PR" python3 "$SCRIPT_DIR/run_specialist_reviews.py"; then
     error "Specialist review pipeline failed"
     exit 1

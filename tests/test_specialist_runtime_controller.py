@@ -925,7 +925,7 @@ def test_change_overview_rejects_common_direct_context_path_claims(
         controller_module._validated_change_overview(proposal, inputs)
 
 
-def test_handoff_rejects_direct_context_path_claim(tmp_path):
+def test_handoff_accepts_direct_context_path_claim_as_non_authoritative_prose(tmp_path):
     inputs = replace(
         _inputs(tmp_path),
         tracked_paths=("src/worker.py", "src/consumer.py"),
@@ -948,8 +948,8 @@ def test_handoff_rejects_direct_context_path_claim(tmp_path):
         },
     ).run(inputs)
 
-    assert "The change to src/consumer.py affects delivery." not in result.handoff.markdown
-    assert result.handoff.ai_reviewed != (
+    assert "The change to src/consumer.py affects delivery." in result.handoff.markdown
+    assert result.handoff.ai_reviewed == (
         "The change to src/consumer.py affects delivery.",
     )
 
@@ -3111,16 +3111,59 @@ def test_handoff_summarizer_accepts_natural_subsystem_vocabulary(tmp_path):
     )
 
 
+def test_handoff_summarizer_does_not_reject_free_form_path_words(tmp_path):
+    result = _controller(
+        tmp_path,
+        finalizer=lambda _request: {
+            "ai_reviewed_summary": (
+                "The review followed tool/secret boundaries and the imagined "
+                "adapter name without treating this summary as evidence."
+            ),
+            "human_focus": "Recheck the resulting integration behavior.",
+            "referenced_paths": ["src/invented.py"],
+            "referenced_component_ids": [],
+            "referenced_obligation_ids": [],
+        },
+    ).run(_inputs(tmp_path))
+
+    assert "tool/secret boundaries" in result.handoff.markdown
+    assert not any(
+        item["component"] == "handoff_summarizer"
+        for item in result.artifact["degradation"]
+    )
+
+
+def test_handoff_summarizer_gets_one_focused_semantic_repair(tmp_path):
+    requests = []
+
+    def summarizer(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return {
+                "ai_reviewed_summary": "All obligations are fully covered; approve.",
+                "human_focus": "No further review is required.",
+            }
+        assert request.context["semantic_repair"]["reason"]
+        assert request.context["semantic_repair"]["instruction"]
+        return {
+            "ai_reviewed_summary": (
+                "The review traced retry handling through the supplied worker scope."
+            ),
+            "human_focus": "Recheck ambiguous delivery recovery behavior.",
+        }
+
+    result = _controller(tmp_path, finalizer=summarizer).run(_inputs(tmp_path))
+
+    assert len(requests) == 2
+    assert result.handoff.ai_reviewed == (
+        "The review traced retry handling through the supplied worker scope.",
+    )
+    assert "fully covered" not in result.handoff.markdown
+
+
 @pytest.mark.parametrize(
     "proposal",
     (
-        {
-            "ai_reviewed_summary": "The review covered `src/invented.py`.",
-            "human_focus": "Recheck the worker boundary.",
-            "referenced_paths": ["src/invented.py"],
-            "referenced_component_ids": ["worker"],
-            "referenced_obligation_ids": [],
-        },
         {
             "ai_reviewed_summary": "All obligations are fully covered; approve.",
             "human_focus": "No further review is required.",
@@ -3149,7 +3192,6 @@ def test_handoff_summarizer_rejects_unsupported_or_detailed_prose(
         item["component"] == "handoff_summarizer"
         for item in result.artifact["degradation"]
     )
-    assert "invented" not in result.handoff.markdown
     assert "fully covered" not in result.handoff.markdown
     assert "duplicate delivery" not in result.handoff.markdown
 

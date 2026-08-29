@@ -7,6 +7,7 @@ terminal artifact; it does not reproduce their policy decisions.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 import hashlib
@@ -4180,73 +4181,17 @@ class ReviewController:
         base: ReviewHandoffContext,
         proposal: HandoffSummaryProposal,
     ) -> ReviewHandoffContext:
-        """Admit concise prose only when every declared authority reference exists."""
-        changed_paths = {
-            _normalize_repository_path(path)
-            for path in state.inputs.changed_files
-            if _normalize_repository_path(path)
-        }
-        assert state.coverage is not None
-        coverage = state.coverage.snapshot()
-        covered_ids = {
-            obligation_id
-            for obligation_id, status in coverage.obligation_statuses
-            if status is ObligationStatus.COVERED
-        }
-        tracked_paths = {
-            _normalize_repository_path(path)
-            for path in (*state.inputs.tracked_paths, *state.inputs.changed_files)
-            if _normalize_repository_path(path)
-        }
-        retained_evidence_paths = {
-            _normalize_repository_path(record.source_path)
-            for record in state.evidence.snapshot().records
-            if record.is_usable_for_coverage and record.source_path
-        }
-        covered_obligation_paths = {
-            _normalize_repository_path(path)
-            for obligation in state.obligations
-            if obligation.id in covered_ids
-            for path in (*obligation.scope, *obligation.seed_hints)
-            if _normalize_repository_path(path)
-        }
-        context_paths = _deterministic_context_paths(
-            state.inputs.topology,
-            tracked_paths,
-            extra_paths=(
-                *retained_evidence_paths,
-                *covered_obligation_paths,
-            ),
-        )
-        allowed_reference_paths = changed_paths | set(context_paths)
-        declared_paths = {
-            _normalize_repository_path(path)
-            for path in proposal.referenced_paths
-            if _normalize_repository_path(path)
-        }
-        # These arrays are orientation metadata rather than authority. Keep
-        # controller-backed values and silently discard compatible-model
-        # overproduction; claims in the actual prose remain strictly checked.
-        declared_paths.intersection_update(allowed_reference_paths)
+        """Admit concise presentation prose without treating words as authority."""
         combined = " ".join((
             proposal.what_changed_summary,
             proposal.ai_reviewed_summary,
             proposal.human_focus,
         ))
-        prose_paths = {
-            _normalize_repository_path(path)
-            for path in _prose_path_references(combined, tracked_paths)
-        }
-        if not prose_paths <= allowed_reference_paths:
-            raise ValueError("handoff summary contains an undeclared path")
-        # References in otherwise valid prose are orientation metadata.  If a
-        # model omitted the redundant reference array, retain the path after
-        # the same changed/context allowlist check instead of discarding the
-        # entire handoff.
-        declared_paths.update(prose_paths)
-        direct_context_paths = _direct_change_references(combined, context_paths)
-        if direct_context_paths:
-            raise ValueError("handoff summary contains a direct change claim for an unchanged path")
+        # Path-looking words and the optional reference arrays are orientation
+        # prose, not review authority. Findings, coverage and changed-line
+        # locations remain controller-validated elsewhere; rejecting a human
+        # summary because ``tool/secret`` resembles a path causes more harm
+        # than accepting an imprecise component name here.
         normalized = " ".join(combined.casefold().split())
         judgment_text = " ".join((
             proposal.ai_reviewed_summary,
@@ -4399,6 +4344,37 @@ class ReviewController:
                     in coverage_snapshot.obligation_statuses
                     if obligation_status is ObligationStatus.COVERED
                 )
+                handoff_request_context = {
+                    "change_overview": _json_value(state.change_overview),
+                    "specialist_checkpoint_summaries": (
+                        self._specialist_checkpoint_summaries(state)
+                    ),
+                    "successful_review_facts": {
+                        "covered_subjects": tuple(
+                            obligation.subject
+                            for obligation in state.obligations
+                            if obligation.id in covered_obligation_ids
+                        )[:8],
+                        "covered_obligation_count": len(covered_obligation_ids),
+                        "retained_evidence_count": len(
+                            state.evidence.snapshot().records
+                        ),
+                        "reviewed_components": context.component_ids,
+                        "note_themes": tuple(sorted({
+                            note.severity for note in state.notes
+                            if note.severity
+                        })),
+                        "degraded_stages": context.degraded_stages,
+                        "component_ids": context.component_ids,
+                    },
+                    "prepared_notes": {
+                        "count": len(state.notes),
+                        "themes": tuple(sorted({
+                            note.severity or note.kind.value
+                            for note in state.notes
+                        })),
+                    },
+                }
                 proposed = self._model_request(
                     state,
                     role="finalizer",
@@ -4406,37 +4382,7 @@ class ReviewController:
                     phase=RunPhase.FINALIZATION,
                     component=self.finalizer,
                     method="finalize",
-                    context={
-                        "change_overview": _json_value(state.change_overview),
-                        "specialist_checkpoint_summaries": (
-                            self._specialist_checkpoint_summaries(state)
-                        ),
-                        "successful_review_facts": {
-                            "covered_subjects": tuple(
-                                obligation.subject
-                                for obligation in state.obligations
-                                if obligation.id in covered_obligation_ids
-                            )[:8],
-                            "covered_obligation_count": len(covered_obligation_ids),
-                            "retained_evidence_count": len(
-                                state.evidence.snapshot().records
-                            ),
-                            "reviewed_components": context.component_ids,
-                            "note_themes": tuple(sorted({
-                                note.severity for note in state.notes
-                                if note.severity
-                            })),
-                            "degraded_stages": context.degraded_stages,
-                            "component_ids": context.component_ids,
-                        },
-                        "prepared_notes": {
-                            "count": len(state.notes),
-                            "themes": tuple(sorted({
-                                note.severity or note.kind.value
-                                for note in state.notes
-                            })),
-                        },
-                    },
+                    context=handoff_request_context,
                 )
                 if isinstance(proposed, Mapping) and {
                     "ai_reviewed_summary", "human_focus",
@@ -4455,9 +4401,40 @@ class ReviewController:
                         referenced_component_ids=context.component_ids[:12],
                         referenced_obligation_ids=covered_obligation_ids[:12],
                     )
-                    context = self._apply_handoff_summary_proposal(
-                        state, context, summary,
-                    )
+                    try:
+                        context = self._apply_handoff_summary_proposal(
+                            state, context, summary,
+                        )
+                    except ValueError as exc:
+                        repaired = self._model_request(
+                            state,
+                            role="finalizer",
+                            request_id="finalizer:repair:1",
+                            phase=RunPhase.FINALIZATION,
+                            component=self.finalizer,
+                            method="finalize",
+                            context={
+                                **handoff_request_context,
+                                "semantic_repair": {
+                                    "reason": _bounded_error(exc),
+                                    "instruction": (
+                                        "Rewrite only the concise human handoff. Do not "
+                                        "state a verdict, coverage conclusion, finding, "
+                                        "severity, or exact defect location."
+                                    ),
+                                },
+                            },
+                        )
+                        summary = _handoff_summary_proposal(repaired)
+                        summary = replace(
+                            summary,
+                            referenced_paths=tuple(sorted(allowed_summary_paths))[:12],
+                            referenced_component_ids=context.component_ids[:12],
+                            referenced_obligation_ids=covered_obligation_ids[:12],
+                        )
+                        context = self._apply_handoff_summary_proposal(
+                            state, context, summary,
+                        )
                     state.journal.emit("handoff_summary_applied", {
                         "referenced_paths": summary.referenced_paths,
                         "referenced_component_ids": (
@@ -4672,6 +4649,22 @@ class ReviewController:
             "candidate_dispositions": [
                 _json_value(item) for item in state.review.dispositions
             ] + list(state.collision_dispositions),
+            "candidate_statistics": {
+                "submitted": len(state.candidates),
+                "critic_decisions": len(state.critic_actions),
+                "critic_actions": dict(sorted(Counter(
+                    state.critic_actions.values()
+                ).items())),
+                "accepted": len(state.review.accepted),
+                "merged": sum(
+                    item.action == "merge" for item in state.review.dispositions
+                ),
+                "verification": len(state.review.verification_requests),
+                "rejected": len(state.review.rejected),
+                "final_reasons": dict(sorted(Counter(
+                    item.reason for item in state.review.dispositions
+                ).items())),
+            },
             "rejected_candidate_diagnostics": (
                 self._rejected_candidate_diagnostics(state)
             ),

@@ -758,12 +758,17 @@ def _deduplication_key(candidate: CandidateFinding) -> str:
     return "dedup:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def _merge_identity(candidate: CandidateFinding) -> tuple[str, str, str]:
-    affected_file, _, _ = _path(candidate.affected_location)
-    return (
-        affected_file,
-        _identity_text(candidate.category),
-        _identity_text(candidate.causal_chain),
+def _merge_compatible(source: CandidateFinding, target: CandidateFinding) -> bool:
+    """Allow critic deduplication without making it an authorization bypass."""
+    source_file, _, source_state = _path(source.affected_location)
+    target_file, _, target_state = _path(target.affected_location)
+    if source_state != "ok" or target_state != "ok" or source_file != target_file:
+        return False
+    return bool(
+        source.root_cause_fingerprint
+        and source.root_cause_fingerprint == target.root_cause_fingerprint
+    ) or bool(
+        set(source.supporting_evidence_ids) & set(target.supporting_evidence_ids)
     )
 
 
@@ -1062,6 +1067,25 @@ def _authorize(
     ), ""
 
 
+def candidate_authorization_reason(
+    candidate: CandidateFinding,
+    evidence: EvidenceStore | EvidenceSnapshot,
+    *,
+    obligations: Mapping[str, CoverageObligation],
+    changed_files: Iterable[str],
+) -> str:
+    """Run the final authority gate early and return its rejection reason."""
+    obligation_map, changed = _controller_state(obligations, changed_files)
+    records = {record.id: record for record in _snapshot(evidence).records}
+    _accepted, reason = _authorize(
+        candidate,
+        records=records,
+        obligations=obligation_map,
+        changed_files=changed,
+    )
+    return reason
+
+
 def _decision_rows(critic_result: object) -> tuple[Mapping[str, Any], ...]:
     if isinstance(critic_result, Mapping):
         nested = critic_result.get("actions", critic_result.get("decisions"))
@@ -1305,7 +1329,7 @@ def adjudicate_candidates(
             continue
         if action == "merge":
             target = candidate_by_id.get(target_id)
-            if target is None or _merge_identity(target) != _merge_identity(candidate):
+            if target is None or not _merge_compatible(candidate, target):
                 disposition = CandidateDisposition(
                     candidate_id, "reject", "invalid-merge-target", target_id or None
                 )
