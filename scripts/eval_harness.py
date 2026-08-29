@@ -595,14 +595,68 @@ def _expected_finding_note(finding: Mapping[str, Any]) -> str:
     def citation_lines(values: object) -> list[str]:
         if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
             return []
-        return [
-            "- ID " + _quoted_note(item.get("evidence_id"), limit=160)
-            + "; category " + _quoted_note(item.get("category"), limit=100)
-            + "; tool " + _quoted_note(item.get("tool"), limit=100)
-            + "; source " + _quoted_note(item.get("source"))
-            + "; content hash " + _quoted_note(item.get("content_hash"), limit=80)
-            for item in values if isinstance(item, Mapping)
-        ]
+        source_kinds: dict[str, set[str]] = {}
+        for item in values:
+            if not isinstance(item, Mapping):
+                continue
+            source = str(item.get("source") or "").strip() or "retained-tool-result"
+            if source.startswith("path:"):
+                source = source[5:]
+            path = source.replace("\\", "/").casefold()
+            tool = str(item.get("tool") or "").strip().casefold()
+            category = str(item.get("category") or "").strip().casefold()
+            if tool == "ci_test_results" or category in {
+                "test-result", "test-results", "behavioral-test",
+            }:
+                kind = "ci"
+            elif tool == "read_pr_diff":
+                kind = "diff"
+            elif (
+                category in {"test", "tests"}
+                or path.startswith(("test/", "tests/"))
+                or "/test/" in path
+                or "/tests/" in path
+            ):
+                kind = "test"
+            elif tool in {"read_file", "git_grep", "git_blame"}:
+                kind = "implementation"
+            else:
+                kind = "other"
+            source_kinds.setdefault(source, set()).add(kind)
+        grouped: dict[str, list[str]] = {}
+        generic: set[str] = set()
+        for source, kinds in source_kinds.items():
+            if "ci" in kinds:
+                label = "CI test result"
+            elif "diff" in kinds and "implementation" in kinds:
+                label = "Changed implementation and PR diff"
+            elif "diff" in kinds:
+                label = "Changed PR diff"
+            elif "test" in kinds:
+                label = "Related test code"
+            elif "implementation" in kinds:
+                label = "Implementation"
+            else:
+                label = "Other retained evidence"
+            if source == "retained-tool-result":
+                generic.add(label)
+            else:
+                grouped.setdefault(label, []).append(source)
+        lines = []
+        for label in (
+            "Changed implementation and PR diff", "Changed PR diff",
+            "Implementation", "Related test code", "CI test result",
+            "Other retained evidence",
+        ):
+            sources = sorted(set(grouped.get(label, ())))
+            if sources:
+                lines.append(
+                    f"- {label}: "
+                    + ", ".join(_quoted_note(source) for source in sources)
+                )
+            if label in generic:
+                lines.append(f"- {label} retained.")
+        return lines
 
     consequences = tuple(finding.get("user_visible_consequences", ())) or (
         finding.get("user_visible_consequence", ""),
@@ -618,12 +672,12 @@ def _expected_finding_note(finding: Mapping[str, Any]) -> str:
         + "\n\n**User-visible consequence:**\n"
         + "\n".join("- " + _quoted_note(item) for item in consequences)
         + "\n\n**Causal chain:** " + _quoted_note(finding.get("causal_chain"))
-        + "\n\n**Supporting evidence provenance / citations:**\n"
+        + "\n\n**Evidence checked:**\n"
         + "\n".join(supporting)
     )
     if contradicting:
         markdown += (
-            "\n\n**Contradicting evidence provenance / citations:**\n"
+            "\n\n**Contradicting evidence checked:**\n"
             + "\n".join(contradicting)
         )
     return (

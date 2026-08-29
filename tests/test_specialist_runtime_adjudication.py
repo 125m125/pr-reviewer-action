@@ -922,10 +922,54 @@ def test_review_comment_builds_typed_detailed_finding_note():
     assert note.related_obligation_ids == ("obligation-1",)
     assert note.file == "src/store.py"
     assert note.line == 41
-    assert "Supporting evidence provenance" in note.markdown
+    assert "Evidence checked" in note.markdown
+    assert "evidence:" not in note.markdown
+    assert "content hash" not in note.markdown
     assert "Suggested validation" in note.markdown
     assert "A user action can be persisted twice" in note.markdown
     assert "Force an ambiguous retry" in note.markdown
+
+
+def test_finding_note_groups_machine_citations_into_human_evidence_summary():
+    store, implementation_id = _store()
+    diff = store.add_tool_result(
+        session_id="session-1", tool="read_pr_diff",
+        arguments={"path": "src/store.py"},
+        result={"status": "ok", "content": "- old\n+ new"},
+        category="implementation", source="src/store.py",
+    )
+    test_code = store.add_tool_result(
+        session_id="session-1", tool="read_file",
+        arguments={"path": "tests/test_store.py"},
+        result={"status": "ok", "content": "assert exactly_one_write"},
+        category="tests", source="tests/test_store.py",
+    )
+    test_result = store.add_tool_result(
+        session_id="session-1", tool="ci_test_results",
+        arguments={"name_contains": "exactly_one_write"},
+        result={"status": "ok", "content": "failed: expected one write"},
+        category="test-result", source="retained-tool-result",
+    )
+    candidate = _candidate(evidence_ids=(
+        implementation_id, diff.id, test_code.id, test_result.id,
+    ))
+    review = _adjudicate((candidate,), {candidate.candidate_id: "keep"}, store)
+
+    note = build_review_notes(
+        review, store, "review_comment",
+        obligations=_obligations(), changed_files=CHANGED_FILES,
+    )[0]
+
+    assert "**Evidence checked:**" in note.markdown
+    assert (
+        "- Changed implementation and PR diff: <code>src/store.py</code>"
+        in note.markdown
+    )
+    assert "- Related test code: <code>tests/test_store.py</code>" in note.markdown
+    assert "- CI test result retained." in note.markdown
+    assert implementation_id not in note.markdown
+    assert diff.id not in note.markdown
+    assert "content hash" not in note.markdown
 
 
 def test_missing_structured_consequence_or_validation_downgrades_to_verification():

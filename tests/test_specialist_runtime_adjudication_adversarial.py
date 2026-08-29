@@ -1645,7 +1645,9 @@ def test_notes_quote_bounded_single_line_values_and_never_raw_evidence():
     markdown = notes[0].markdown
     assert "javascript:" not in markdown
     assert raw_evidence not in markdown
-    assert "Supporting evidence provenance" in markdown
+    assert "Evidence checked" in markdown
+    assert "evidence:" not in markdown
+    assert "content hash" not in markdown
     assert "User-visible consequence" in markdown
     assert "Causal chain" in markdown
     assert "Suggested validation" in markdown
@@ -1677,8 +1679,8 @@ def test_finding_note_separates_supporting_and_contradicting_provenance():
     finding = review.accepted[0]
     assert tuple(item.evidence_id for item in finding.supporting_citations) == (supporting_id,)
     assert tuple(item.evidence_id for item in finding.contradicting_citations) == (contradiction.id,)
-    assert "Supporting evidence provenance" in notes[0].markdown
-    assert "Contradicting evidence provenance" in notes[0].markdown
+    assert "Evidence checked" in notes[0].markdown
+    assert "Contradicting evidence checked" in notes[0].markdown
 
 
 @pytest.mark.parametrize("line", [True, False, 0, -1, "7", object()])

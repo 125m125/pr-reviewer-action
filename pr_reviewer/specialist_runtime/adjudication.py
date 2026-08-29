@@ -2353,20 +2353,75 @@ def build_source_access_request_notes(
     return tuple(notes[key] for key in sorted(notes))
 
 
-def _finding_note(finding: AcceptedFinding) -> ReviewNote:
-    def citation_lines(citations: tuple[EvidenceCitation, ...]) -> list[str]:
-        lines = []
-        for citation in citations:
+def _human_evidence_lines(citations: tuple[EvidenceCitation, ...]) -> list[str]:
+    """Collapse machine provenance into a source-oriented human summary."""
+    source_kinds: dict[str, set[str]] = {}
+    for citation in citations:
+        source = _unicode(citation.source).strip() or "retained-tool-result"
+        if source.startswith("path:"):
+            source = source[5:]
+        path = source.replace("\\", "/").casefold()
+        tool = _unicode(citation.tool).strip().casefold()
+        category = _unicode(citation.category).strip().casefold()
+        if tool == "ci_test_results" or category in {
+            "test-result", "test-results", "behavioral-test",
+        }:
+            kind = "ci"
+        elif tool == "read_pr_diff":
+            kind = "diff"
+        elif (
+            category in {"test", "tests"}
+            or path.startswith(("test/", "tests/"))
+            or "/test/" in path
+            or "/tests/" in path
+        ):
+            kind = "test"
+        elif tool in {"read_file", "git_grep", "git_blame"}:
+            kind = "implementation"
+        else:
+            kind = "other"
+        source_kinds.setdefault(source, set()).add(kind)
+
+    grouped: dict[str, list[str]] = {}
+    generic: set[str] = set()
+    for source, kinds in source_kinds.items():
+        if "ci" in kinds:
+            label = "CI test result"
+        elif "diff" in kinds and "implementation" in kinds:
+            label = "Changed implementation and PR diff"
+        elif "diff" in kinds:
+            label = "Changed PR diff"
+        elif "test" in kinds:
+            label = "Related test code"
+        elif "implementation" in kinds:
+            label = "Implementation"
+        else:
+            label = "Other retained evidence"
+        if source == "retained-tool-result":
+            generic.add(label)
+        else:
+            grouped.setdefault(label, []).append(source)
+
+    order = (
+        "Changed implementation and PR diff", "Changed PR diff",
+        "Implementation", "Related test code", "CI test result",
+        "Other retained evidence",
+    )
+    lines: list[str] = []
+    for label in order:
+        sources = sorted(set(grouped.get(label, ())))
+        if sources:
             lines.append(
-                "- ID " + _quoted(citation.evidence_id, limit=160)
-                + "; category " + _quoted(citation.category, limit=100)
-                + "; tool " + _quoted(citation.tool, limit=100)
-                + "; source " + _quoted(citation.source)
-                + "; content hash " + _quoted(citation.content_hash, limit=80)
+                f"- {label}: " + ", ".join(_quoted(item) for item in sources)
             )
-        return lines
-    supporting_lines = citation_lines(finding.supporting_citations)
-    contradicting_lines = citation_lines(finding.contradicting_citations)
+        if label in generic:
+            lines.append(f"- {label} retained.")
+    return lines
+
+
+def _finding_note(finding: AcceptedFinding) -> ReviewNote:
+    supporting_lines = _human_evidence_lines(finding.supporting_citations)
+    contradicting_lines = _human_evidence_lines(finding.contradicting_citations)
     consequence_lines = [
         "- " + _quoted(item)
         for item in (
@@ -2383,10 +2438,10 @@ def _finding_note(finding: AcceptedFinding) -> ReviewNote:
         "**Claim:** " + _quoted(finding.claim)
         + "\n\n**User-visible consequence:**\n" + "\n".join(consequence_lines)
         + "\n\n**Causal chain:** " + _quoted(finding.causal_chain)
-        + "\n\n**Supporting evidence provenance / citations:**\n"
+        + "\n\n**Evidence checked:**\n"
         + "\n".join(supporting_lines)
         + (
-            "\n\n**Contradicting evidence provenance / citations:**\n"
+            "\n\n**Contradicting evidence checked:**\n"
             + "\n".join(contradicting_lines)
             if contradicting_lines else ""
         )
