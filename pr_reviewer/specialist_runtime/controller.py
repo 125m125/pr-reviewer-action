@@ -3641,6 +3641,17 @@ class ReviewController:
         return tuple(state.candidates[key] for key in sorted(state.candidates))
 
     @staticmethod
+    def _refresh_session_candidate_occurrences(state: _RunState) -> None:
+        """Re-project the final candidate set owned by each specialist session."""
+        for occurrence_ref in tuple(state.candidate_occurrences):
+            if occurrence_ref.startswith("session:"):
+                del state.candidate_occurrences[occurrence_ref]
+        for session_id, session in state.sessions.items():
+            prefix = f"session:{session_id}:"
+            for index, candidate in enumerate(session.candidate_findings):
+                state.candidate_occurrences[f"{prefix}{index}"] = candidate
+
+    @staticmethod
     def _conservative_critic(candidates: Iterable[CandidateFinding]) -> dict[str, object]:
         decisions = []
         for item in sorted(candidates, key=lambda value: value.candidate_id):
@@ -3661,6 +3672,7 @@ class ReviewController:
             state.review = AdjudicatedReview()
             return
         critic_result: object
+        critic_context: dict[str, object] | None = None
         if self.critic is None:
             self._degrade(state, "critic", "deterministic conservative critic fallback")
             critic_result = self._conservative_critic(candidates)
@@ -3795,16 +3807,119 @@ class ReviewController:
                     self._degrade(state, "critic", _bounded_error(exc))
                 critic_result = self._conservative_critic(candidates)
         try:
+            state.review = adjudicate_candidates(
+                candidates, critic_result, state.evidence,
+                obligations=obligation_map, changed_files=state.inputs.changed_files,
+            )
+            invalid_merge_ids = tuple(
+                item.candidate_id
+                for item in state.review.dispositions
+                if item.reason == "invalid-merge-target-kept"
+            )
+            if (
+                invalid_merge_ids
+                and self.critic is not None
+                and critic_context is not None
+            ):
+                invalid_id_set = set(invalid_merge_ids)
+                original_rows, _missing = _partial_critic_result(
+                    critic_result, candidates,
+                )
+                original_by_id = {
+                    item["candidate_id"]: item for item in original_rows
+                }
+                state.journal.emit("critic_merge_repair_requested", {
+                    "invalid_candidate_ids": invalid_merge_ids,
+                    "rejected_merges": tuple(
+                        original_by_id[item]
+                        for item in invalid_merge_ids
+                        if item in original_by_id
+                    ),
+                })
+                try:
+                    repaired = self._model_request(
+                        state,
+                        role="critic",
+                        request_id="critic:merge-repair",
+                        phase=RunPhase.FINALIZATION,
+                        component=self.critic,
+                        method="adjudicate",
+                        context={
+                            "candidates": tuple(
+                                item for item in candidates
+                                if item.candidate_id in invalid_id_set
+                            ),
+                            "candidate_evidence": {
+                                candidate_id: critic_context[
+                                    "candidate_evidence"
+                                ][candidate_id]
+                                for candidate_id in invalid_merge_ids
+                            },
+                            "eligible_merge_targets": tuple(
+                                item for item in candidates
+                                if item.candidate_id not in invalid_id_set
+                            ),
+                            "critic_merge_repair": {
+                                "invalid_candidate_ids": invalid_merge_ids,
+                                "rejected_merges": tuple(
+                                    original_by_id[item]
+                                    for item in invalid_merge_ids
+                                    if item in original_by_id
+                                ),
+                                "instruction": (
+                                    "The requested merges were not deterministically "
+                                    "compatible. Return one corrected action for each listed "
+                                    "candidate ID. Keep the candidate unless another listed "
+                                    "action is justified; merge only into an eligible target."
+                                ),
+                            },
+                        },
+                    )
+                    repaired_rows, _ignored_missing = _partial_critic_result(
+                        repaired, candidates,
+                    )
+                    repaired_by_id = {
+                        item["candidate_id"]: item
+                        for item in repaired_rows
+                        if item["candidate_id"] in invalid_id_set
+                    }
+                    still_missing = tuple(
+                        item for item in invalid_merge_ids
+                        if item not in repaired_by_id
+                    )
+                    if still_missing:
+                        raise ValueError(
+                            "critic merge repair omitted candidate decisions"
+                        )
+                    combined_rows = tuple(
+                        repaired_by_id.get(
+                            item.candidate_id,
+                            original_by_id[item.candidate_id],
+                        )
+                        for item in candidates
+                    )
+                    critic_result = _validated_critic_result(
+                        {"actions": combined_rows}, candidates,
+                    )
+                    state.review = adjudicate_candidates(
+                        candidates, critic_result, state.evidence,
+                        obligations=obligation_map,
+                        changed_files=state.inputs.changed_files,
+                    )
+                    state.journal.emit("critic_merge_repair_completed", {
+                        "repaired_candidate_ids": invalid_merge_ids,
+                    })
+                except Exception as repair_exc:
+                    state.journal.emit("critic_merge_repair_failed", {
+                        "candidate_ids": invalid_merge_ids,
+                        "reason": _bounded_error(repair_exc),
+                    })
             critic_rows, _missing = _partial_critic_result(
                 critic_result, candidates,
             )
             state.critic_actions = {
                 item["candidate_id"]: item["action"] for item in critic_rows
             }
-            state.review = adjudicate_candidates(
-                candidates, critic_result, state.evidence,
-                obligations=obligation_map, changed_files=state.inputs.changed_files,
-            )
         except Exception as exc:
             self._degrade(state, "adjudication", _bounded_error(exc))
             state.review = AdjudicatedReview()
@@ -5491,6 +5606,7 @@ class ReviewController:
                 state.session_results.items()
             ):
                 self._promote_degraded_session_result(state, assignment_id, result)
+            self._refresh_session_candidate_occurrences(state)
             candidates = self._collect_candidates(state)
             self._adjudicate(state, candidates)
             state.source_requests.extend(inputs.source_access_requests)

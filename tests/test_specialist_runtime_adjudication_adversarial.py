@@ -923,6 +923,55 @@ def test_critic_can_merge_authorized_independently_worded_duplicate():
     )
 
 
+def test_invalid_critic_merge_keeps_independently_authorized_candidate():
+    store, first_evidence_id = _store()
+    second = store.add_tool_result(
+        session_id="session-2",
+        tool="read_file",
+        arguments={"path": "src/store.py"},
+        result={"status": "ok", "content": "audit_after_retry()"},
+        category="implementation",
+    )
+    target = replace(
+        _candidate("candidate-a", evidence_ids=(first_evidence_id,)),
+        root_cause_fingerprint="root-a",
+    )
+    source = replace(
+        _candidate(
+            "candidate-b",
+            evidence_ids=(second.id,),
+            claim="The audit path may duplicate the persisted action",
+        ),
+        root_cause_fingerprint="root-b",
+    )
+
+    review = adjudicate_candidates(
+        (target, source),
+        (
+            {"candidate_id": target.candidate_id, "action": "keep"},
+            {
+                "candidate_id": source.candidate_id,
+                "action": "merge",
+                "target_id": target.candidate_id,
+            },
+        ),
+        store,
+        obligations=_controller_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert {item.candidate_id for item in review.accepted} == {
+        target.candidate_id, source.candidate_id,
+    }
+    assert review.rejected == ()
+    disposition = next(
+        item for item in review.dispositions
+        if item.candidate_id == source.candidate_id
+    )
+    assert disposition.action == "keep"
+    assert disposition.reason == "invalid-merge-target-kept"
+
+
 def test_duplicate_consequence_or_validation_placeholder_downgrades_to_verification():
     store, evidence_id = _store()
     complete = _candidate(evidence_ids=(evidence_id,))

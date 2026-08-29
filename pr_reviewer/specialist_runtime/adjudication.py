@@ -1331,9 +1331,9 @@ def adjudicate_candidates(
             target = candidate_by_id.get(target_id)
             if target is None or not _merge_compatible(candidate, target):
                 disposition = CandidateDisposition(
-                    candidate_id, "reject", "invalid-merge-target", target_id or None
+                    candidate_id, "keep", "invalid-merge-target-kept", target_id or None
                 )
-                rejected[candidate_id] = disposition
+                accepted[candidate_id] = authorized
                 dispositions[candidate_id] = disposition
                 continue
             merge_sources.setdefault(target_id, []).append(authorized)
@@ -1363,15 +1363,30 @@ def adjudicate_candidates(
 
     by_fingerprint: dict[str, list[AcceptedFinding]] = {}
     for finding in accepted.values():
-        by_fingerprint.setdefault(finding.deduplication_key, []).append(finding)
+        disposition = dispositions.get(finding.candidate_id)
+        fingerprint = finding.deduplication_key
+        if (
+            disposition is not None
+            and disposition.reason == "invalid-merge-target-kept"
+        ):
+            # Do not silently accomplish a critic-requested merge through the
+            # fallback semantic deduplicator after rejecting that merge.  The
+            # controller may ask the critic for one corrected decision.
+            fingerprint = f"{fingerprint}:{finding.candidate_id}"
+        by_fingerprint.setdefault(fingerprint, []).append(finding)
     deduplicated: dict[str, AcceptedFinding] = {}
     for fingerprint in sorted(by_fingerprint):
         group = tuple(sorted(by_fingerprint[fingerprint], key=lambda item: item.candidate_id))
         representative_id = group[0].candidate_id
         deduplicated[representative_id] = _merge_findings(group, representative_id)
-        dispositions[representative_id] = CandidateDisposition(
-            representative_id, "keep", "accepted"
-        )
+        existing_disposition = dispositions.get(representative_id)
+        if (
+            existing_disposition is None
+            or existing_disposition.reason != "invalid-merge-target-kept"
+        ):
+            dispositions[representative_id] = CandidateDisposition(
+                representative_id, "keep", "accepted"
+            )
         for contributor in group[1:]:
             dispositions[contributor.candidate_id] = CandidateDisposition(
                 contributor.candidate_id, "merge", "semantic-duplicate", representative_id

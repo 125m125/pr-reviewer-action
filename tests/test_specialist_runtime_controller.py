@@ -1324,6 +1324,49 @@ def test_session_finalization_diagnostics_are_artifact_only(tmp_path):
     assert "candidate-forged" not in result.handoff.markdown
 
 
+def test_controller_collects_candidate_added_during_session_finalization(tmp_path):
+    class FinalizationCandidateSession(_SuccessfulSession):
+        def explore(self):
+            result = super().explore()
+            self.final_candidate = self.candidate_findings[0]
+            self.candidate_findings = ()
+            self.exploration_result = replace(
+                result,
+                checkpoint=replace(result.checkpoint, candidate_finding_ids=()),
+            )
+            return self.exploration_result
+
+        def finalize(self):
+            self.candidate_findings = (self.final_candidate,)
+            return replace(
+                self.exploration_result,
+                state=SessionState.COMPLETE,
+                checkpoint=replace(
+                    self.exploration_result.checkpoint,
+                    candidate_finding_ids=(self.final_candidate.candidate_id,),
+                ),
+                report={
+                    "summary": "Final synthesis admitted a candidate.",
+                    "recommendation": "controller-review-required",
+                },
+            )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return FinalizationCandidateSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    result = _controller(tmp_path, session_factory=factory).run(_inputs(tmp_path))
+
+    assert [
+        item["candidate_id"] for item in result.artifact["accepted_candidates"]
+    ] == ["candidate-delivery"]
+
+
 def test_checkpoint_diagnostic_projection_allowlists_bounded_lifecycle_fields(tmp_path):
     diagnostic = {
         "reason": "context-pressure",
@@ -2624,6 +2667,137 @@ def test_malformed_critic_result_uses_evidence_gated_conservative_fallback(
     ]
     assert len(critic_degradations) == 1
     assert "private" not in critic_degradations[0]["reason"]
+
+
+def test_critic_gets_one_focused_correction_for_invalid_merge(tmp_path):
+    store = EvidenceStore()
+    first = store.add_tool_result(
+        session_id="seed-a",
+        tool="read_file",
+        arguments={"path": "src/worker.py"},
+        result={"status": "ok", "content": "retry_write()"},
+        category="implementation",
+    )
+    second = store.add_tool_result(
+        session_id="seed-b",
+        tool="read_file",
+        arguments={"path": "src/worker.py"},
+        result={"status": "ok", "content": "audit_after_retry()"},
+        category="implementation",
+    )
+    obligation = CoverageObligation(
+        obligation_id="obligation-worker",
+        origin="topology",
+        subject="worker retry behavior",
+        required_evidence_categories=("implementation",),
+        satisfaction_predicates=("recorded_evidence",),
+        scope=("src/worker.py",),
+        mandatory=True,
+    )
+    target = CandidateFinding(
+        candidate_id="retry-write",
+        root_cause_fingerprint="root-retry",
+        claim="An ambiguous response can persist one action twice",
+        affected_location="src/worker.py:7",
+        causal_chain="An ambiguous response reaches the retry branch and retry repeats a write.",
+        severity="major",
+        category="idempotency",
+        supporting_evidence_ids=(first.id,),
+        related_obligation_ids=(obligation.id,),
+        confidence_rationale=(
+            "consequence_support:reachable_input_path; "
+            f"evidence_ids={first.id}; input=ambiguous response; "
+            "condition=retry repeats a write; "
+            "outcome=A user action can be persisted twice"
+        ),
+        user_visible_consequence="A user action can be persisted twice.",
+        manual_validation="Force an ambiguous response and count persisted actions.",
+    )
+    source = CandidateFinding(
+        candidate_id="duplicate-audit",
+        root_cause_fingerprint="root-audit",
+        claim="The audit callback may emit two records for one action",
+        affected_location="src/worker.py:9",
+        causal_chain=(
+            "An ambiguous response reaches the audit callback and the audit callback "
+            "observes the repeated write."
+        ),
+        severity="minor",
+        category="audit",
+        supporting_evidence_ids=(second.id,),
+        related_obligation_ids=(obligation.id,),
+        confidence_rationale=(
+            "consequence_support:reachable_input_path; "
+            f"evidence_ids={second.id}; input=ambiguous response; "
+            "condition=audit callback observes the repeated write; "
+            "outcome=Operators see duplicate audit records"
+        ),
+        user_visible_consequence="Operators see duplicate audit records.",
+        manual_validation="Force an ambiguous response and count audit records.",
+    )
+    critic_requests = []
+
+    class NoCandidateSession(_SuccessfulSession):
+        def explore(self):
+            result = super().explore()
+            self.candidate_findings = ()
+            return replace(
+                result,
+                checkpoint=replace(result.checkpoint, candidate_finding_ids=()),
+            )
+
+        def finalize(self):
+            result = self.explore()
+            return replace(result, state=SessionState.COMPLETE)
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return NoCandidateSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    def critic(request):
+        critic_requests.append(request)
+        if len(critic_requests) == 1:
+            return {"actions": [
+                {"candidate_id": target.candidate_id, "action": "keep"},
+                {
+                    "candidate_id": source.candidate_id,
+                    "action": "merge",
+                    "target_id": target.candidate_id,
+                },
+            ]}
+        repair = request.context["critic_merge_repair"]
+        assert repair["invalid_candidate_ids"] == (source.candidate_id,)
+        return {"actions": [
+            {"candidate_id": source.candidate_id, "action": "keep"},
+        ]}
+
+    result = _controller(
+        tmp_path,
+        critic=critic,
+        session_factory=factory,
+        evidence_seed=EvidenceSeed(
+            repository="owner/repository",
+            head_sha="b" * 40,
+            snapshot=store.snapshot(),
+        ),
+        obligation_deriver=lambda *_args, **_kwargs: (obligation,),
+    ).run(replace(
+        _inputs(tmp_path), candidate_findings=(target, source),
+    ))
+
+    assert len(critic_requests) == 2
+    assert {item["candidate_id"] for item in result.artifact["accepted_candidates"]} >= {
+        target.candidate_id, source.candidate_id,
+    }
+    assert any(
+        item["kind"] == "critic_merge_repair_completed"
+        for item in result.artifact["events"]
+    )
 
 
 def test_critic_degradation_emits_one_verification_request_per_controller_root(
