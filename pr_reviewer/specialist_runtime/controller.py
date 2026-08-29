@@ -2024,9 +2024,15 @@ _CHECKPOINT_DIAGNOSTIC_SCALARS = frozenset({
     "compaction_input_tokens_after", "removed_reasoning_messages",
     "placeholder_replaced_results", "removed_old_exchanges",
     "retained_full_results", "emergency_outcome",
+    "change_correction_attempted", "change_correction_parse",
+    "change_correction_error", "change_correction_attempt_count",
+    "change_correction_valid_count", "change_correction_invalid_count",
+    "change_correction_output_limited_count", "change_correction_rejected_count",
 })
 _CHECKPOINT_DIAGNOSTIC_TUPLES = frozenset({
     "candidate_ids", "omitted_candidate_ids", "candidate_finding_ids",
+    "rejected_checkpoint_changes",
+    "rejected_correction_changes",
 })
 
 
@@ -5586,6 +5592,53 @@ class ReviewController:
                             "diagnostics": _checkpoint_diagnostics_projection(
                                 diagnostics,
                             ),
+                        })
+                    synthesis = (
+                        report.get("defect_synthesis", {})
+                        if isinstance(report, Mapping) else {}
+                    )
+                    if isinstance(synthesis, Mapping) and synthesis.get("attempted"):
+                        candidate_results = tuple(
+                            item for key in (
+                                "initial_candidate_results",
+                                "repair_candidate_results",
+                            )
+                            for item in (
+                                synthesis.get(key, ())
+                                if isinstance(synthesis.get(key), (list, tuple))
+                                else ()
+                            )
+                            if isinstance(item, Mapping)
+                        )
+                        repair_attempts = tuple(
+                            item for item in synthesis.get("repair_attempts", ())
+                            if isinstance(item, Mapping)
+                        ) if isinstance(
+                            synthesis.get("repair_attempts"), (list, tuple)
+                        ) else ()
+                        journal.emit("specialist_defect_synthesis", {
+                            "assignment_id": session.assignment.id,
+                            "session_id": result.session_id,
+                            "status": str(synthesis.get("status") or ""),
+                            "accepted_candidates": sum(
+                                item.get("accepted") is True
+                                for item in candidate_results
+                            ),
+                            "rejected_candidates": sum(
+                                item.get("accepted") is False
+                                for item in candidate_results
+                            ),
+                            "repair_status": str(
+                                synthesis.get("repair_status") or ""
+                            ),
+                            "repair_attempt_count": len(repair_attempts),
+                            "repair_output_limited_count": sum(
+                                item.get("status") == "output_limit"
+                                for item in repair_attempts
+                            ),
+                            "repair_error": _mask_runtime_text(str(
+                                synthesis.get("repair_error") or ""
+                            ))[:300],
                         })
                     journal.emit("session_transition", {
                         "session_id": result.session_id,

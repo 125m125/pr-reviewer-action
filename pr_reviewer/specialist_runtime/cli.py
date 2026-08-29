@@ -1830,13 +1830,58 @@ def _runtime_event_line(
                 field("repair_parse"),
                 field("fallback_projection"),
                 field("retention_unknown"),
+                field("change_correction_parse", "correction"),
+                field("change_correction_attempt_count", "correction_attempts"),
+                field("change_correction_valid_count", "correction_valid"),
+                field("change_correction_invalid_count", "correction_invalid"),
+                field(
+                    "change_correction_output_limited_count",
+                    "correction_output_limited",
+                ),
+                field(
+                    "change_correction_rejected_count",
+                    "correction_rejected",
+                ),
             ))
+            rejected_changes = latest.get("rejected_checkpoint_changes")
+            if isinstance(rejected_changes, (list, tuple)):
+                details.append(f"rejected_changes={len(rejected_changes)}")
+            rejected_corrections = latest.get("rejected_correction_changes")
+            if isinstance(rejected_corrections, (list, tuple)):
+                details.append(
+                    f"rejected_corrections={len(rejected_corrections)}"
+                )
+            correction_error = latest.get("change_correction_error")
+            if isinstance(correction_error, str) and correction_error:
+                details.append(
+                    "correction_error=" + _compact_text(correction_error, 160)
+                )
             details = [item for item in details if item]
             return (
                 f"specialist {session_id} checkpoint lifecycle: "
                 + (" ".join(details) if details else "recorded")
             )
         return f"specialist {session_id} checkpoint lifecycle: recorded"
+    if kind == "specialist_defect_synthesis":
+        details = []
+        for key, label in (
+            ("status", "status"),
+            ("accepted_candidates", "accepted"),
+            ("rejected_candidates", "rejected"),
+            ("repair_status", "repair"),
+            ("repair_attempt_count", "repair_attempts"),
+            ("repair_output_limited_count", "repair_output_limited"),
+        ):
+            value = payload.get(key)
+            if isinstance(value, (bool, int, float, str)) and value not in ("", None):
+                details.append(f"{label}={_compact_text(value, 80)}")
+        repair_error = payload.get("repair_error")
+        if isinstance(repair_error, str) and repair_error:
+            details.append("error=" + _compact_text(repair_error, 180))
+        return (
+            f"specialist {session_id} defect synthesis: "
+            + (" ".join(details) if details else "recorded")
+        )
     if kind == "specialist_initializing":
         return (
             f"initializing specialist {session_id} assignment="

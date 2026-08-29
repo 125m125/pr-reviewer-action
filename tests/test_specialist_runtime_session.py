@@ -423,7 +423,6 @@ def test_affected_consumer_support_uses_evidence_ids_and_derives_paths():
             "kind": "affected_consumer",
             "producer_evidence_id": producer.id,
             "consumer_evidence_id": consumer.id,
-            "outcome": "Literal passwords reach the review model unredacted.",
         },
         "user_visible_consequence": "Literal passwords reach the review model unredacted.",
         "manual_validation": "Read a source fixture containing password=secret.",
@@ -434,6 +433,7 @@ def test_affected_consumer_support_uses_evidence_ids_and_derives_paths():
     rationale = session.candidate_findings[0].confidence_rationale
     assert "producer=scripts/redact.py" in rationale
     assert "consumer=pr_reviewer/tool_executors.py" in rationale
+    assert "outcome=Literal passwords reach the review model unredacted." in rationale
 
 
 def test_candidate_rejection_identifies_acceptable_evidence_and_failed_predicate():
@@ -987,6 +987,88 @@ def test_final_synthesis_repairs_rejected_candidates_once_with_tools_disabled():
     assert diagnostic["repair_candidate_results"] == [
         {"accepted": True, "target": "C1"},
     ]
+
+
+def test_final_synthesis_repairs_rejected_candidates_independently():
+    session = make_session(ScriptedGateway([]), model_turns=6)
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file",
+        arguments={"path": "a.py"},
+        result={"status": "ok", "content": "changed implementation"},
+        category="implementation", source="a.py",
+    )
+
+    def draft(claim):
+        return {
+            "claim": claim,
+            "affected_location": "a.py:4",
+            "causal_chain": "The changed state reaches the invalid branch.",
+            "severity": "major", "category": "correctness",
+            "supporting_evidence_ids": [record.id],
+            "contradicting_evidence_ids": [], "related_targets": ["O1"],
+            "consequence_support": {
+                "kind": "affected_consumer",
+                "producer_evidence_id": record.id,
+                "consumer_evidence_id": "evidence:not-retained",
+            },
+            "user_visible_consequence": "The operation returns the wrong state.",
+            "manual_validation": "Run the state transition test.",
+        }
+
+    first = draft("First rejected defect.")
+    second = draft("Second rejected defect.")
+    repaired = {
+        **first,
+        "consequence_support": {
+            "kind": "reachable_input_path",
+            "input": "changed state", "condition": "invalid branch",
+            "outcome": "The operation returns the wrong state.",
+        },
+    }
+    gateway = ScriptedGateway([
+        ModelTurnResult(
+            response={}, tool_calls=(), text=json.dumps({
+                "candidate_drafts": [first, second], "dismissed_leads": [],
+            }), text_source="content", finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 20},
+            request_diagnostics={},
+        ),
+        ModelTurnResult(
+            response={}, tool_calls=(), text=json.dumps({
+                "candidate_drafts": [repaired],
+            }), text_source="content", finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 20},
+            request_diagnostics={},
+        ),
+        ModelTurnResult(
+            response={}, tool_calls=(), text='{"candidate_drafts":[',
+            text_source="content", finish_reason="length",
+            usage={"prompt_tokens": 10, "completion_tokens": 2_048},
+            request_diagnostics={},
+        ),
+    ])
+    session.gateway = gateway
+    session._defect_leads = [{
+        "lead": "L1", "target": "O1", "summary": "Wrong-state leads",
+        "evidence_ids": [record.id],
+    }]
+
+    session._synthesize_defect_leads()
+
+    assert len(gateway.requests) == 3
+    first_repair = json.loads(gateway.requests[1].messages)[-1]["content"]
+    second_repair = json.loads(gateway.requests[2].messages)[-1]["content"]
+    assert "First rejected defect" in first_repair
+    assert "Second rejected defect" not in first_repair
+    assert "Second rejected defect" in second_repair
+    assert "First rejected defect" not in second_repair
+    assert tuple(item.claim for item in session.candidate_findings) == (
+        "First rejected defect.",
+    )
+    diagnostic = session._defect_synthesis_diagnostic
+    assert diagnostic["repair_status"] == "partial"
+    assert diagnostic["repair_attempts"][0]["status"] == "valid"
+    assert diagnostic["repair_attempts"][1]["status"] == "output_limit"
 
 
 def test_candidate_tools_report_and_withdraw_with_short_session_handles():
@@ -2527,6 +2609,128 @@ def test_checkpoint_partially_accepts_candidates_and_repairs_only_rejected_draft
     assert record.id in correction_prompt
     assert "candidate-good rejected" not in correction_prompt
     assert "candidate-bad" in session.conversation.events[-1]["content"]
+
+
+def test_checkpoint_repairs_each_rejected_candidate_in_a_focused_turn():
+    session = make_session(ScriptedGateway([]), model_turns=5)
+    record = seed_successful_tool_exchange(
+        session, call_id="candidate-evidence", path="a.py",
+        content="The changed branch returns the wrong state.",
+    )
+    base = {
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
+        "severity": "major",
+        "supporting_evidence_ids": [record.id],
+        "related_obligation_ids": ["O1"],
+        "consequence_support": reachable_consequence_support(
+            outcome="caller receives the wrong state",
+        ),
+        "manual_validation": "Run the state transition test.",
+    }
+    rejected_one = {**base, "candidate_id": "candidate-one"}
+    rejected_two = {**base, "candidate_id": "candidate-two"}
+    corrected_one = {
+        **rejected_one,
+        "user_visible_consequence": "The caller receives the wrong state.",
+    }
+    corrected_two = {
+        **rejected_two,
+        "claim": "The changed branch returns a stale state.",
+        "user_visible_consequence": "The caller receives a stale state.",
+    }
+    initial = checkpoint_response(
+        inspected=[], unresolved=["OB-code", "OB-tests"],
+        obligation_updates=[], candidate_updates=[],
+        new_candidates=[rejected_one, rejected_two], unknowns=[],
+    )
+
+    def correction(candidate):
+        return ModelTurnResult(
+            response={}, tool_calls=(), text=json.dumps({
+                "unresolved": [], "obligation_updates": [],
+                "candidate_updates": [], "new_candidates": [candidate],
+            }), text_source="content", finish_reason="stop",
+            usage={"prompt_tokens": 3, "completion_tokens": 2},
+            request_diagnostics={},
+        )
+
+    gateway = ScriptedGateway([
+        initial, correction(corrected_one), correction(corrected_two),
+    ])
+    session.gateway = gateway
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert len(gateway.requests) == 3
+    first_prompt = json.loads(gateway.requests[1].messages)[-1]["content"]
+    second_prompt = json.loads(gateway.requests[2].messages)[-1]["content"]
+    assert "candidate-one rejected" in first_prompt
+    assert "candidate-two rejected" not in first_prompt
+    assert "candidate-two rejected" in second_prompt
+    assert "candidate-one rejected" not in second_prompt
+    assert {item.candidate_id for item in session.candidate_findings} == {
+        "candidate-one", "candidate-two",
+    }
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["change_correction_attempt_count"] == 2
+    assert diagnostic["change_correction_valid_count"] == 2
+    assert diagnostic["change_correction_parse"] == "valid"
+
+
+def test_checkpoint_receipt_explains_a_rejected_candidate_correction():
+    session = make_session(ScriptedGateway([]), model_turns=3)
+    record = seed_successful_tool_exchange(
+        session, call_id="candidate-evidence", path="a.py",
+        content="The changed branch returns the wrong state.",
+    )
+    candidate = {
+        "candidate_id": "candidate-one",
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
+        "severity": "major",
+        "supporting_evidence_ids": [record.id],
+        "related_obligation_ids": ["O1"],
+        "consequence_support": {
+            "kind": "affected_consumer",
+            "producer_evidence_id": record.id,
+            "consumer_evidence_id": "evidence:not-retained",
+        },
+        "user_visible_consequence": "The caller receives the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    }
+    initial_candidate = dict(candidate)
+    initial_candidate.pop("user_visible_consequence")
+    initial = checkpoint_response(
+        inspected=[], unresolved=["OB-code", "OB-tests"],
+        obligation_updates=[], candidate_updates=[],
+        new_candidates=[initial_candidate], unknowns=[],
+    )
+    correction = ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "unresolved": [], "obligation_updates": [],
+            "candidate_updates": [], "new_candidates": [candidate],
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    session.gateway = ScriptedGateway([initial, correction])
+
+    result = session.request_checkpoint("controller-request")
+
+    receipt = session.conversation.events[-1]["content"]
+    assert "candidate-one remains rejected and inactive" in receipt
+    assert "affected_consumer.consumer_evidence_id" in receipt
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["change_correction_parse"] == "valid"
+    assert diagnostic["change_correction_rejected_count"] == 1
+    assert any(
+        "affected_consumer.consumer_evidence_id" in item
+        for item in diagnostic["rejected_correction_changes"]
+    )
 
 
 def test_rejected_candidate_update_preserves_and_reports_current_state():

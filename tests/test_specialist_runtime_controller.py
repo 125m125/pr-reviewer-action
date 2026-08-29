@@ -1341,6 +1341,14 @@ def test_session_finalization_diagnostics_are_artifact_only(tmp_path):
         and item["payload"]["diagnostics"] == ({**diagnostic},)
         for item in result.artifact["events"]
     )
+    synthesis_event = next(
+        item for item in result.artifact["events"]
+        if item["kind"] == "specialist_defect_synthesis"
+    )
+    assert synthesis_event["payload"]["status"] == "valid"
+    assert synthesis_event["payload"]["repair_status"] == ""
+    assert synthesis_event["payload"]["accepted_candidates"] == 1
+    assert synthesis_event["payload"]["rejected_candidates"] == 1
     assert "candidate-forged" not in result.handoff.markdown
 
 
@@ -1407,6 +1415,21 @@ def test_checkpoint_diagnostic_projection_allowlists_bounded_lifecycle_fields(tm
         "removed_old_exchanges": 2,
         "retained_full_results": 2,
         "emergency_outcome": "not_attempted",
+        "change_correction_attempted": True,
+        "change_correction_parse": "partial",
+        "change_correction_attempt_count": 3,
+        "change_correction_valid_count": 2,
+        "change_correction_invalid_count": 1,
+        "change_correction_output_limited_count": 1,
+        "change_correction_rejected_count": 1,
+        "change_correction_error": "candidate C3 response hit output limit",
+        "rejected_checkpoint_changes": (
+            "C1:affected_consumer.consumer_evidence_id",
+            "C3:contradicting_evidence.contradicting_evidence_ids",
+        ),
+        "rejected_correction_changes": (
+            "C3:affected_consumer.consumer_evidence_id",
+        ),
         "prompt": "secret prompt",
         "raw_response": "secret response",
         "evidence_body": "secret evidence",
@@ -1445,6 +1468,16 @@ def test_checkpoint_diagnostic_projection_allowlists_bounded_lifecycle_fields(tm
     assert projected["actual_prompt_tokens"] == 11_900
     assert projected["compaction_level"] == "regular"
     assert projected["emergency_outcome"] == "not_attempted"
+    assert projected["change_correction_parse"] == "partial"
+    assert projected["change_correction_attempt_count"] == 3
+    assert projected["change_correction_rejected_count"] == 1
+    assert projected["rejected_checkpoint_changes"] == (
+        "C1:affected_consumer.consumer_evidence_id",
+        "C3:contradicting_evidence.contradicting_evidence_ids",
+    )
+    assert projected["rejected_correction_changes"] == (
+        "C3:affected_consumer.consumer_evidence_id",
+    )
     assert all(
         value is None or isinstance(value, (bool, int, float, str, tuple))
         for value in projected.values()

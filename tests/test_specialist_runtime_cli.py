@@ -432,6 +432,21 @@ def test_runtime_checkpoint_diagnostic_is_one_bounded_compaction_lifecycle_line(
                 "removed_old_exchanges": 2,
                 "retained_full_results": 2,
                 "emergency_outcome": "checkpoint_succeeded",
+                "change_correction_attempted": True,
+                "change_correction_parse": "partial",
+                "change_correction_attempt_count": 3,
+                "change_correction_valid_count": 2,
+                "change_correction_invalid_count": 1,
+                "change_correction_output_limited_count": 1,
+                "change_correction_rejected_count": 1,
+                "change_correction_error": "candidate C3 response hit output limit",
+                "rejected_checkpoint_changes": (
+                    "C1:affected_consumer.consumer_evidence_id",
+                    "C3:contradicting_evidence.contradicting_evidence_ids",
+                ),
+                "rejected_correction_changes": (
+                    "C3:affected_consumer.consumer_evidence_id",
+                ),
                 "prompt": "secret prompt",
                 "raw_response": "secret response",
                 "evidence_body": "secret evidence",
@@ -456,6 +471,14 @@ def test_runtime_checkpoint_diagnostic_is_one_bounded_compaction_lifecycle_line(
         "removed_exchanges=2",
         "retained_results=2",
         "emergency=checkpoint_succeeded",
+        "correction=partial",
+        "correction_attempts=3",
+        "correction_valid=2",
+        "correction_invalid=1",
+        "correction_output_limited=1",
+        "correction_rejected=1",
+        "rejected_changes=2",
+        "rejected_corrections=1",
     ):
         assert fragment in line
     for secret in ("secret prompt", "secret response", "secret evidence", "secret reasoning"):
@@ -497,6 +520,33 @@ def test_runtime_sink_renders_each_batched_checkpoint_diagnostic_once(capsys):
     assert sum("disposition=pause" in line for line in lifecycle) == 1
     assert "secret first prompt" not in "\n".join(lines)
     assert "secret final response" not in "\n".join(lines)
+
+
+def test_runtime_defect_synthesis_line_explains_repair_failures():
+    from pr_reviewer.specialist_runtime.events import RunEvent
+
+    line = cli._runtime_event_line(RunEvent(
+        5,
+        "specialist_defect_synthesis",
+        {
+            "session_id": "session:test",
+            "status": "valid",
+            "accepted_candidates": 1,
+            "rejected_candidates": 2,
+            "repair_status": "partial",
+            "repair_attempt_count": 2,
+            "repair_output_limited_count": 1,
+            "repair_error": "one repair response hit its output limit",
+        },
+    ))
+
+    assert "defect synthesis" in line
+    assert "accepted=1" in line
+    assert "rejected=2" in line
+    assert "repair=partial" in line
+    assert "repair_attempts=2" in line
+    assert "repair_output_limited=1" in line
+    assert "one repair response hit its output limit" in line
 
 
 def test_runtime_event_line_explains_record_unknown_negotiation_action():

@@ -61,8 +61,11 @@ _CONSEQUENCE_SUPPORT_SCHEMA: dict[str, Any] = {
         "reachable_input_path requires input, condition, outcome; "
         "failing_behavioral_test requires test, observed; violated_invariant "
         "requires obligation_target, contract, violation; affected_consumer "
-        "requires producer_evidence_id, consumer_evidence_id, outcome; "
-        "contradicting_evidence requires conflict and contradicting_evidence_ids."
+        "requires producer_evidence_id and consumer_evidence_id; its outcome "
+        "is taken from user_visible_consequence; "
+        "contradicting_evidence requires conflict and top-level "
+        "contradicting_evidence_ids copied exactly from the conflicting retained "
+        "IDs (the same IDs may also remain in supporting_evidence_ids)."
     ),
     "properties": {
         "kind": {"type": "string", "enum": [
@@ -173,7 +176,7 @@ _DEFECT_SYNTHESIS_REPAIR_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "candidate_drafts": {
-            "type": "array", "maxItems": 3,
+            "type": "array", "maxItems": 1,
             "items": _CANDIDATE_DRAFT_SCHEMA,
         },
     },
@@ -1426,8 +1429,21 @@ class SpecialistSession:
         *,
         disposition: CheckpointDisposition,
         accepted_corrections: set[tuple[str, str]] | None = None,
+        correction_rejections: tuple[_CheckpointChangeRejection, ...] = (),
     ) -> str:
         accepted_corrections = accepted_corrections or set()
+
+        def rejection_detail(item: _CheckpointChangeRejection) -> str:
+            rejected = next((
+                value for value in correction_rejections
+                if value.kind == item.kind and value.target == item.target
+            ), None)
+            if rejected is None:
+                return ""
+            return json.dumps(
+                rejected.diagnostic, sort_keys=True,
+            ) if rejected.diagnostic is not None else rejected.reason
+
         lines = [
             "Correction result (controller-authoritative; supersedes proposed "
             "checkpoint state changes):",
@@ -1461,15 +1477,21 @@ class SpecialistSession:
                         f"- {item.target} correction accepted; current state is {state}."
                     )
                 else:
+                    detail = rejection_detail(item)
                     lines.append(
                         f"- {item.target} update rejected or omitted; "
                         f"current state remains {state}."
+                        + (f" Rejection: {detail}" if detail else "")
                     )
             else:
                 if (item.kind, item.target) in accepted_corrections:
                     lines.append(f"- {item.target} correction accepted as active.")
                 else:
-                    lines.append(f"- {item.target} remains rejected and inactive.")
+                    detail = rejection_detail(item)
+                    lines.append(
+                        f"- {item.target} remains rejected and inactive."
+                        + (f" Rejection: {detail}" if detail else "")
+                    )
         pending = [
             item.target for item in self.obligation_assessments.assessments()
             if item.disposition.value == "pending"
@@ -3174,15 +3196,8 @@ class SpecialistSession:
                 "checkpoint response was not a valid checkpoint object"
             )
         initial_parse = "valid" if checkpoint is not None else "invalid"
-        candidate_change_rejected = any(
-            item.kind == "candidate-new"
-            for item in self._last_checkpoint_rejections
-        ) and not (
-            checkpoint is not None and checkpoint.candidate_finding_ids
-        )
         needs_repair = (
             checkpoint is None
-            or candidate_change_rejected
             or _candidate_retention_lost(
                 self._candidate_retention_signal,
                 checkpoint,
@@ -3197,6 +3212,12 @@ class SpecialistSession:
         correction_attempted = False
         correction_parse = "not_attempted"
         correction_error = ""
+        correction_attempt_count = 0
+        correction_valid_count = 0
+        correction_invalid_count = 0
+        correction_output_limited_count = 0
+        correction_rejected_count = 0
+        rejected_correction_changes: list[str] = []
         accepted_corrections: set[tuple[str, str]] = set()
         if needs_repair and allow_repair:
             repair_attempted = True
@@ -3292,91 +3313,146 @@ class SpecialistSession:
         evidence_receipts = list(self._last_checkpoint_evidence_receipts)
         if checkpoint is not None and change_rejections and allow_repair:
             correction_attempted = True
-            # The durable memory and accepted sibling changes are authoritative
-            # before asking only for rejected state-change corrections.
-            self.latest_checkpoint = checkpoint
-            self.conversation.add_user(
-                self._checkpoint_correction_prompt(change_rejections)
+            # Keep obligation decisions together, but give every rejected
+            # candidate its own bounded correction turn. One verbose or
+            # truncated candidate must not discard its siblings.
+            obligation_rejections = tuple(
+                item for item in change_rejections if item.kind == "obligation"
             )
-            correction_event_count = len(self._request_events)
-            try:
-                correction = self._request(
-                    tools_enabled=False,
-                    schema=self._checkpoint_correction_schema(change_rejections),
-                    purpose="checkpoint-change-correction",
-                    max_output_tokens=min(self.checkpoint_max_tokens, 2_048),
-                    allow_compaction=False,
-                    allow_gateway_fallbacks=allow_gateway_fallbacks,
+            candidate_rejections = tuple(
+                item for item in change_rejections if item.kind != "obligation"
+            )
+            correction_groups = tuple(
+                item for item in (
+                    obligation_rejections,
+                    *((candidate,) for candidate in candidate_rejections),
+                ) if item
+            )
+            correction_errors: list[str] = []
+            for correction_group in correction_groups:
+                correction_attempt_count += 1
+                # The durable memory and accepted sibling changes are
+                # authoritative before asking only for one rejected change.
+                self.latest_checkpoint = checkpoint
+                self.conversation.add_user(
+                    self._checkpoint_correction_prompt(correction_group)
                 )
-            except (BudgetExhausted, TimeoutError) as exc:
-                if (
-                    len(self._request_events) > correction_event_count
-                    and self._request_events[-1].status == "completed"
-                ):
-                    raise
-                correction = None
-                correction_error = f"{type(exc).__name__}: {exc}"
-            if correction is not None:
-                self.conversation.add_assistant_turn(
-                    reasoning=correction.reasoning,
-                    content=correction.content,
-                    calls=correction.tool_calls,
-                )
-                if correction.tool_calls:
-                    correction_error = (
-                        "tool calls returned while correction tools were disabled"
+                correction_event_count = len(self._request_events)
+                correction_max_tokens = min(self.checkpoint_max_tokens, 2_048)
+                try:
+                    correction = self._request(
+                        tools_enabled=False,
+                        schema=self._checkpoint_correction_schema(correction_group),
+                        purpose="checkpoint-change-correction",
+                        max_output_tokens=correction_max_tokens,
+                        allow_compaction=False,
+                        allow_gateway_fallbacks=allow_gateway_fallbacks,
                     )
-                    correction_parse = "invalid"
-                else:
-                    correction_raw = _json_object(correction.content)
-                    proposed_corrections: set[tuple[str, str]] = set()
-                    if isinstance(correction_raw, Mapping):
-                        for kind, key in (
-                            ("candidate-update", "candidate_updates"),
-                            ("candidate-new", "new_candidates"),
-                        ):
-                            values = correction_raw.get(key, [])
-                            if isinstance(values, list):
-                                proposed_corrections.update(
-                                    (kind, candidate_id)
-                                    for value in values if isinstance(value, Mapping)
-                                    if (candidate_id := str(
-                                        value.get("candidate_id") or ""
-                                    ).strip())
-                                )
-                    corrected = self._checkpoint_from_text(
-                        correction.content,
-                        require_complete_pending=False,
-                        allowed_obligation_targets={
-                            item.target for item in change_rejections
-                            if item.kind == "obligation"
-                        },
+                except (BudgetExhausted, TimeoutError) as exc:
+                    if (
+                        len(self._request_events) > correction_event_count
+                        and self._request_events[-1].status == "completed"
+                    ):
+                        raise
+                    correction = None
+                    correction_errors.append(f"{type(exc).__name__}: {exc}")
+                    correction_invalid_count += 1
+                group_correction_rejections: tuple[_CheckpointChangeRejection, ...] = ()
+                if correction is not None:
+                    self.conversation.add_assistant_turn(
+                        reasoning=correction.reasoning,
+                        content=correction.content,
+                        calls=correction.tool_calls,
                     )
-                    if corrected is not None:
-                        checkpoint = corrected
-                        evidence_receipts.extend(
-                            self._last_checkpoint_evidence_receipts
+                    completion_tokens = (
+                        correction.usage.get("completion_tokens", 0)
+                        if isinstance(correction.usage, Mapping) else 0
+                    )
+                    output_limited = bool(
+                        str(correction.finish_reason).casefold()
+                        in {"length", "max_tokens"}
+                        or (
+                            isinstance(completion_tokens, (int, float))
+                            and completion_tokens >= correction_max_tokens
                         )
-                        correction_parse = "valid"
-                        rejected_corrections = {
-                            (item.kind, item.target)
-                            for item in self._last_checkpoint_rejections
-                        }
-                        accepted_corrections = (
-                            proposed_corrections - rejected_corrections
+                    )
+                    if output_limited:
+                        correction_output_limited_count += 1
+                    if correction.tool_calls:
+                        correction_errors.append(
+                            "tool calls returned while correction tools were disabled"
                         )
+                        correction_invalid_count += 1
                     else:
-                        correction_parse = "invalid"
-                        correction_error = self._last_checkpoint_validation_error or (
-                            "checkpoint correction was not a valid correction object"
+                        correction_raw = _json_object(correction.content)
+                        proposed_corrections: set[tuple[str, str]] = set()
+                        if isinstance(correction_raw, Mapping):
+                            for kind, key in (
+                                ("candidate-update", "candidate_updates"),
+                                ("candidate-new", "new_candidates"),
+                            ):
+                                values = correction_raw.get(key, [])
+                                if isinstance(values, list):
+                                    proposed_corrections.update(
+                                        (kind, candidate_id)
+                                        for value in values
+                                        if isinstance(value, Mapping)
+                                        if (candidate_id := str(
+                                            value.get("candidate_id") or ""
+                                        ).strip())
+                                    )
+                        corrected = self._checkpoint_from_text(
+                            correction.content,
+                            require_complete_pending=False,
+                            allowed_obligation_targets={
+                                item.target for item in correction_group
+                                if item.kind == "obligation"
+                            },
                         )
+                        if corrected is not None:
+                            checkpoint = corrected
+                            evidence_receipts.extend(
+                                self._last_checkpoint_evidence_receipts
+                            )
+                            correction_valid_count += 1
+                            rejected_corrections = {
+                                (item.kind, item.target)
+                                for item in self._last_checkpoint_rejections
+                            }
+                            group_correction_rejections = tuple(
+                                self._last_checkpoint_rejections
+                            )
+                            correction_rejected_count += len(
+                                group_correction_rejections
+                            )
+                            rejected_correction_changes.extend(
+                                f"{item.target}:{item.reason}"[:300]
+                                for item in group_correction_rejections
+                            )
+                            accepted_corrections.update(
+                                proposed_corrections - rejected_corrections
+                            )
+                        else:
+                            correction_invalid_count += 1
+                            correction_errors.append(
+                                self._last_checkpoint_validation_error
+                                or "checkpoint correction was not a valid correction object"
+                            )
+                self.conversation.add_user(self._checkpoint_correction_receipt(
+                    correction_group,
+                    disposition=disposition,
+                    accepted_corrections=accepted_corrections,
+                    correction_rejections=group_correction_rejections,
+                ))
+            if correction_valid_count == correction_attempt_count:
+                correction_parse = "valid"
+            elif correction_valid_count:
+                correction_parse = "partial"
+            elif correction_attempt_count:
+                correction_parse = "invalid"
             else:
                 correction_parse = "unavailable"
-            self.conversation.add_user(self._checkpoint_correction_receipt(
-                change_rejections,
-                disposition=disposition,
-                accepted_corrections=accepted_corrections,
-            ))
+            correction_error = " | ".join(dict.fromkeys(correction_errors))[:300]
         if checkpoint is not None and evidence_receipts:
             unique_receipts = tuple({
                 json.dumps(item, sort_keys=True): item
@@ -3430,10 +3506,18 @@ class SpecialistSession:
             "change_correction_attempted": correction_attempted,
             "change_correction_parse": correction_parse,
             "change_correction_error": correction_error[:300],
+            "change_correction_attempt_count": correction_attempt_count,
+            "change_correction_valid_count": correction_valid_count,
+            "change_correction_invalid_count": correction_invalid_count,
+            "change_correction_output_limited_count": (
+                correction_output_limited_count
+            ),
+            "change_correction_rejected_count": correction_rejected_count,
             "rejected_checkpoint_changes": tuple(
                 f"{item.target}:{item.reason}"[:300]
                 for item in change_rejections
             ),
+            "rejected_correction_changes": tuple(rejected_correction_changes),
         })
         self.latest_checkpoint = checkpoint
         if (
@@ -3862,6 +3946,7 @@ class SpecialistSession:
         contradicting: tuple[str, ...],
         retained: Mapping[str, EvidenceRecord],
         related_obligations: tuple[str, ...],
+        user_visible_consequence: str,
     ) -> tuple[str | None, str]:
         if not isinstance(value, Mapping):
             return None, self._proof_rejection(
@@ -3953,19 +4038,18 @@ class SpecialistSession:
                     f"{kind}.consumer_evidence_id",
                     f"evidence {consumer_id} has no retained source path",
                 )
-            if not detail("outcome"):
-                return None, self._proof_rejection(
-                    f"{kind}.outcome", "provide the concrete consumer outcome",
-                )
             fields.extend((
                 ("producer", producer), ("consumer", consumer),
-                ("outcome", detail("outcome")),
+                ("outcome", _bounded_text(
+                    user_visible_consequence, max_length=500,
+                ).replace(";", ",")),
             ))
         else:
             if not contradicting:
                 return None, self._proof_rejection(
                     f"{kind}.contradicting_evidence_ids",
-                    "cite at least one contradicting_evidence_id",
+                    "copy at least one exact conflicting retained ID into the "
+                    "top-level contradicting_evidence_ids array",
                 )
             if not detail("conflict"):
                 return None, self._proof_rejection(
@@ -4075,6 +4159,7 @@ class SpecialistSession:
             contradicting=contradicting,
             retained=retained,
             related_obligations=resolved_obligations,
+            user_visible_consequence=consequence,
         )
         if confidence_rationale is None:
             return None, support_error
@@ -4268,14 +4353,17 @@ class SpecialistSession:
             if not details.get("violation"):
                 hints.append("violated_invariant requires violation=...")
         elif kind == "affected_consumer":
-            for key in ("producer", "consumer", "outcome"):
+            for key in ("producer", "consumer"):
                 if not details.get(key):
                     hints.append(f"affected_consumer requires {key}=...")
         elif kind == "contradicting_evidence":
             if not details.get("conflict"):
                 hints.append("contradicting_evidence requires conflict=...")
             if not candidate.contradicting_evidence_ids:
-                hints.append("cite at least one contradicting_evidence_id")
+                hints.append(
+                    "copy at least one exact conflicting retained ID into the "
+                    "top-level contradicting_evidence_ids array"
+                )
         return tuple(dict.fromkeys(hints))
 
     def _retain_rejected_candidate_lead(
@@ -5283,48 +5371,96 @@ class SpecialistSession:
         if not rejected_drafts:
             return
         self._defect_synthesis_diagnostic["repair_attempted"] = True
-        self.conversation.add_user(
-            "Final defect-synthesis candidate repair. The synthesis response was "
-            "accepted, but the candidate drafts below were rejected independently. "
-            "Tools remain disabled. Return only corrected candidate_drafts; omit a "
-            "draft if the supplied retained evidence cannot support it.\n"
-            + json.dumps(rejected_drafts, sort_keys=True)
-        )
-        try:
-            repair_turn = self._request(
-                tools_enabled=False,
-                schema=_DEFECT_SYNTHESIS_REPAIR_SCHEMA,
-                purpose="defect-lead-synthesis-repair",
-                max_output_tokens=min(self.max_tokens, 2_048),
-            )
-        except Exception as exc:
-            self._defect_synthesis_diagnostic.update({
-                "repair_status": "unavailable",
-                "repair_error": format_callback_error(exc, limit=300),
-            })
-            return
-        self.conversation.add_assistant_turn(
-            reasoning=repair_turn.reasoning,
-            content=repair_turn.content,
-            calls=repair_turn.tool_calls,
-        )
-        repair_raw = None if repair_turn.tool_calls else _json_object(repair_turn.content)
-        repair_drafts = (
-            repair_raw.get("candidate_drafts")
-            if isinstance(repair_raw, Mapping) else None
-        )
-        if not isinstance(repair_drafts, list):
-            self._defect_synthesis_diagnostic["repair_status"] = "invalid"
-            return
         repair_results: list[dict[str, object]] = []
-        for draft in repair_drafts[:3]:
-            candidate_result, _accepted = self._admit_candidate(
-                draft if isinstance(draft, Mapping) else {},
+        repair_attempts: list[dict[str, object]] = []
+        repair_errors: list[str] = []
+        repair_max_tokens = min(self.max_tokens, 2_048)
+        for rejected in rejected_drafts:
+            diagnostic = rejected.get("diagnostic", {})
+            lead = (
+                str(diagnostic.get("lead") or "")
+                if isinstance(diagnostic, Mapping) else ""
             )
-            repair_results.append(candidate_result)
+            self.conversation.add_user(
+                "Final defect-synthesis candidate repair. The synthesis response "
+                "was accepted, but this one candidate draft was rejected. Tools "
+                "remain disabled. Return zero or one corrected candidate_drafts "
+                "item; omit it if the supplied retained evidence cannot support "
+                "the defect.\n"
+                + json.dumps(rejected, sort_keys=True)
+            )
+            attempt: dict[str, object] = {"lead": lead, "status": "started"}
+            try:
+                repair_turn = self._request(
+                    tools_enabled=False,
+                    schema=_DEFECT_SYNTHESIS_REPAIR_SCHEMA,
+                    purpose="defect-lead-synthesis-repair",
+                    max_output_tokens=repair_max_tokens,
+                )
+            except Exception as exc:
+                error = format_callback_error(exc, limit=300)
+                attempt.update({"status": "unavailable", "error": error})
+                repair_errors.append(error)
+                repair_attempts.append(attempt)
+                continue
+            self.conversation.add_assistant_turn(
+                reasoning=repair_turn.reasoning,
+                content=repair_turn.content,
+                calls=repair_turn.tool_calls,
+            )
+            completion_tokens = (
+                repair_turn.usage.get("completion_tokens", 0)
+                if isinstance(repair_turn.usage, Mapping) else 0
+            )
+            output_limited = bool(
+                str(repair_turn.finish_reason).casefold()
+                in {"length", "max_tokens"}
+                or (
+                    isinstance(completion_tokens, (int, float))
+                    and completion_tokens >= repair_max_tokens
+                )
+            )
+            attempt.update({
+                "finish_reason": str(repair_turn.finish_reason or ""),
+                "completion_tokens": completion_tokens,
+            })
+            repair_raw = (
+                None if repair_turn.tool_calls else _json_object(repair_turn.content)
+            )
+            repair_drafts = (
+                repair_raw.get("candidate_drafts")
+                if isinstance(repair_raw, Mapping) else None
+            )
+            if not isinstance(repair_drafts, list):
+                attempt["status"] = "output_limit" if output_limited else "invalid"
+                attempt["error"] = (
+                    "repair response did not contain a valid candidate_drafts array"
+                )
+                repair_errors.append(str(attempt["error"]))
+                repair_attempts.append(attempt)
+                continue
+            attempt_results: list[dict[str, object]] = []
+            for draft in repair_drafts[:1]:
+                candidate_result, _accepted = self._admit_candidate(
+                    draft if isinstance(draft, Mapping) else {},
+                )
+                attempt_results.append(candidate_result)
+                repair_results.append(candidate_result)
+            attempt.update({"status": "valid", "candidate_results": attempt_results})
+            repair_attempts.append(attempt)
+        valid_attempts = sum(
+            item.get("status") == "valid" for item in repair_attempts
+        )
+        repair_status = (
+            "valid" if valid_attempts == len(repair_attempts)
+            else "partial" if valid_attempts
+            else "invalid"
+        )
         self._defect_synthesis_diagnostic.update({
-            "repair_status": "valid",
+            "repair_status": repair_status,
             "repair_candidate_results": repair_results,
+            "repair_attempts": repair_attempts,
+            "repair_error": " | ".join(dict.fromkeys(repair_errors))[:300],
         })
 
     def recover(self, reason: str) -> SessionResult:
