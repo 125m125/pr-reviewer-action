@@ -124,6 +124,10 @@ inputs:
     description: Global read-only tool-call lease shared by all specialist sessions in one review run.
     required: false
     default: "640"
+  specialist_remediator_max_evidence_chars:
+    description: Maximum cited-evidence characters supplied to each accepted-finding remediation request.
+    required: false
+    default: "32000"
   specialist_max_recoveries_per_session:
     description: Lifetime reconstruction limit for one logical specialist session.
     required: false
@@ -833,6 +837,7 @@ runs:
         SPECIALIST_MAX_TOOL_CALLS_PER_SESSION: ${{ inputs.specialist_max_tool_calls_per_session }}
         SPECIALIST_MAX_TOTAL_MODEL_TURNS: ${{ inputs.specialist_max_total_model_turns }}
         SPECIALIST_MAX_TOTAL_TOOL_CALLS: ${{ inputs.specialist_max_total_tool_calls }}
+        SPECIALIST_REMEDIATOR_MAX_EVIDENCE_CHARS: ${{ inputs.specialist_remediator_max_evidence_chars }}
         SPECIALIST_MAX_RECOVERIES_PER_SESSION: ${{ inputs.specialist_max_recoveries_per_session }}
         SPECIALIST_CONFIG_FILE: ${{ inputs.specialist_config_file }}
         SPECIALIST_PLANNER_MAX_TOOL_CALLS: ${{ inputs.specialist_planner_max_tool_calls }}
@@ -963,6 +968,7 @@ runs:
         SPECIALIST_MAX_TOOL_CALLS_PER_SESSION: ${{ inputs.specialist_max_tool_calls_per_session }}
         SPECIALIST_MAX_TOTAL_MODEL_TURNS: ${{ inputs.specialist_max_total_model_turns }}
         SPECIALIST_MAX_TOTAL_TOOL_CALLS: ${{ inputs.specialist_max_total_tool_calls }}
+        SPECIALIST_REMEDIATOR_MAX_EVIDENCE_CHARS: ${{ inputs.specialist_remediator_max_evidence_chars }}
         SPECIALIST_MAX_RECOVERIES_PER_SESSION: ${{ inputs.specialist_max_recoveries_per_session }}
         PUBLISH_MODE: ${{ inputs.publish_mode != '' && inputs.publish_mode || (inputs.review_strategy == 'single' && 'comment' || 'review_comment') }}
         ALLOW_APPROVE: ${{ inputs.allow_approve }}

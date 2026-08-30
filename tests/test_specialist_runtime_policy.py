@@ -426,6 +426,14 @@ def test_runtime_config_accepts_controller_owned_global_leases():
     assert config.max_total_tool_calls == 333
 
 
+def test_runtime_config_controls_remediator_evidence_budget():
+    assert RuntimeConfig.from_env({}).remediator_max_evidence_chars == 32_000
+    config = RuntimeConfig.from_env({
+        "SPECIALIST_REMEDIATOR_MAX_EVIDENCE_CHARS": "48000",
+    })
+    assert config.remediator_max_evidence_chars == 48_000
+
+
 def load_review_policy_from_value(value):
     """Exercise the real file parser while keeping policy fixtures concise."""
     import tempfile

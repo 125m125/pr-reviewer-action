@@ -99,6 +99,15 @@ from .web_evidence import (
 )
 
 
+# The remediator's model prompt is intentionally bounded.  Anchor validation
+# is controller-owned, however, and needs its own immutable diff budget so a
+# large set of cited evidence cannot hide the changed lines required to verify
+# an exact suggestion.
+_REMEDIATION_EVIDENCE_LIMIT = 16_000
+_REMEDIATION_RECORD_LIMIT = 6_000
+_REMEDIATION_VALIDATION_DIFF_LIMIT = 16_000
+
+
 _SCHEMA_VERSION = 2
 _MAX_ARTIFACT_STRING = 16 * 1024
 _MAX_ARTIFACT_ITEMS = 2_000
@@ -4402,7 +4411,10 @@ class ReviewController:
 
     @staticmethod
     def _remediation_evidence_context(
-        state: _RunState, finding: AcceptedFinding,
+        state: _RunState,
+        finding: AcceptedFinding,
+        *,
+        max_chars: int = _REMEDIATION_EVIDENCE_LIMIT,
     ) -> tuple[dict[str, object], ...]:
         cited = set(finding.supporting_evidence_ids).union(
             finding.contradicting_evidence_ids
@@ -4413,10 +4425,10 @@ class ReviewController:
             if record.id not in cited:
                 continue
             content = str(record.content or "")
-            remaining = 16_000 - used
+            remaining = max_chars - used
             if remaining <= 0:
                 break
-            excerpt = content[:min(6_000, remaining)]
+            excerpt = content[:min(_REMEDIATION_RECORD_LIMIT, remaining)]
             used += len(excerpt)
             selected.append({
                 "evidence_id": record.id,
@@ -4444,7 +4456,17 @@ class ReviewController:
         """
         selected = list(evidence_context)
         selected_ids = {str(item.get("evidence_id") or "") for item in selected}
-        used = sum(len(str(item.get("content") or "")) for item in selected)
+        # Keep authoritative diff material in a separate budget.  The cited
+        # evidence above is sized for the remediator prompt and may already
+        # consume its full cap before the diff record is encountered.
+        diff_used = sum(
+            len(str(item.get("content") or ""))
+            for item in selected
+            if (
+                item.get("tool") == "read_pr_diff"
+                and item.get("path") == finding.affected_file
+            )
+        )
         for record in state.evidence.snapshot().records:
             if (
                 record.id in selected_ids
@@ -4452,11 +4474,11 @@ class ReviewController:
                 or record.source_path != finding.affected_file
             ):
                 continue
-            remaining = 16_000 - used
+            remaining = _REMEDIATION_VALIDATION_DIFF_LIMIT - diff_used
             if remaining <= 0:
                 break
-            excerpt = record.content[:min(6_000, remaining)]
-            used += len(excerpt)
+            excerpt = record.content[:min(_REMEDIATION_RECORD_LIMIT, remaining)]
+            diff_used += len(excerpt)
             selected.append({
                 "evidence_id": record.id,
                 "category": record.category,
@@ -4569,7 +4591,11 @@ class ReviewController:
         if self.remediator is None:
             return
         for finding in state.review.accepted:
-            evidence_context = self._remediation_evidence_context(state, finding)
+            evidence_context = self._remediation_evidence_context(
+                state,
+                finding,
+                max_chars=state.inputs.config.remediator_max_evidence_chars,
+            )
             validation_context = self._remediation_validation_context(
                 state, finding, evidence_context,
             )

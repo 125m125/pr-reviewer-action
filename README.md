@@ -283,6 +283,7 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_max_tool_calls_per_session` | Lifetime read-only tool-call limit for one logical specialist session | No | `128` |
 | `specialist_max_total_model_turns` | Global model-turn lease shared by all specialist sessions in one review | No | `320` |
 | `specialist_max_total_tool_calls` | Global read-only tool-call lease shared by all specialist sessions in one review | No | `640` |
+| `specialist_remediator_max_evidence_chars` | Maximum cited-evidence characters supplied to each accepted-finding remediation request | No | `32000` |
 | `specialist_max_recoveries_per_session` | Lifetime reconstruction limit for one logical specialist session | No | `1` |
 | `specialist_config_file` | Deprecated one-release alias for a version-1 policy; migrate to `review_policy_file` | No | `.github/ai-review-specialists.json` |
 | `specialist_planner_max_tool_calls` | Deprecated no-op; the planner role does not expose tools. Use `specialist_max_tool_calls_per_session` | No | `2` |

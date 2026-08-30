@@ -92,6 +92,7 @@ replay and provider capacity have been demonstrated.
 | `specialist_max_tool_calls_per_session` | added | `128` | `128` | Allows multi-call evidence turns without exhausting tools before the 64-turn lifetime bound; actual calls remain controller-accounted. |
 | `specialist_max_total_model_turns` | added | `320` | `320` | Bounds total provider turns across all admitted specialists so raising the session cap does not multiply review cost. |
 | `specialist_max_total_tool_calls` | added | `640` | `640` | Bounds total repository calls while preserving the recommended two-tool-calls-per-model-turn ratio. |
+| `specialist_remediator_max_evidence_chars` | added | `32000` | `32000` | Bounds cited evidence supplied to each accepted-finding remediation request; increase when remediation needs more source context, independently of the validation diff budget. |
 | `specialist_max_recoveries_per_session` | added | `1` | `1` | Allows one bounded reconstruction without endless retrying. |
 | `specialist_config_file` | deprecated | `.github/ai-review-specialists.json` | Retain only while translating version-1 recipes | One-release compatibility alias; `review_policy_file` is the version-2 authority. |
 | `specialist_max_initial_passes` | deprecated | `6` | Replace with `specialist_max_sessions: "8"` | Legacy alias, not the version-2 session limit. |
@@ -328,6 +329,7 @@ jobs:
           specialist_max_tool_calls_per_session: "128"
           specialist_max_total_model_turns: "320"
           specialist_max_total_tool_calls: "640"
+          specialist_remediator_max_evidence_chars: "32000"
           specialist_max_recoveries_per_session: "1"
           specialist_planner_max_tokens: "8192"
           specialist_max_tokens: "8192"

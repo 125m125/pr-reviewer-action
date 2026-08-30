@@ -1267,6 +1267,24 @@ def test_controller_generates_guidance_for_accepted_finding_without_degrading(tm
     )
 
 
+def test_remediator_evidence_context_uses_configured_character_limit(tmp_path):
+    calls = []
+
+    def remediator(request):
+        calls.append(request)
+        return {"kind": "guidance", "guidance": "Keep the retry idempotent."}
+
+    inputs = _inputs(tmp_path)
+    inputs = replace(
+        inputs,
+        config=replace(inputs.config, remediator_max_evidence_chars=5),
+    )
+    _controller(tmp_path, remediator=remediator).run(inputs)
+
+    evidence = calls[0].context["evidence_context"]
+    assert sum(len(str(item["content"])) for item in evidence) <= 5
+
+
 def test_line_less_finding_requests_guidance_only_remediation(tmp_path):
     calls = []
 
@@ -1419,6 +1437,78 @@ def test_exact_remediation_uses_authoritative_diff_even_when_finding_did_not_cit
         remediator=lambda _request: {
             "kind": "exact", "start_line": 7, "end_line": 7,
             "replacement": "def process(): return process_once()",
+        },
+    ).run(_inputs(tmp_path))
+
+    assert result.artifact["remediation"]["generated"] == 1
+
+
+def test_validation_diff_has_separate_budget_from_cited_evidence_cap(tmp_path):
+    class CrowdedEvidenceSession(_SuccessfulSession):
+        def explore(self):
+            result = super().explore()
+            filler_ids = []
+            for index in range(3):
+                record = self.evidence_store.add_tool_result(
+                    session_id=self.session_id,
+                    tool="read_file",
+                    arguments={"path": f"src/filler-{index}.py"},
+                    result={"status": "ok", "content": "x" * 6_000},
+                    category="implementation",
+                    source=f"src/filler-{index}.py",
+                )
+                filler_ids.append(record.id)
+            diff = self.evidence_store.add_tool_result(
+                session_id=self.session_id,
+                tool="read_pr_diff",
+                arguments={"path": "src/worker.py"},
+                result={
+                    "status": "ok",
+                    "content": (
+                        "diff --git a/src/worker.py b/src/worker.py\n"
+                        "--- a/src/worker.py\n+++ b/src/worker.py\n"
+                        "@@ -6,2 +6,2 @@\n"
+                        " context\n+def process(): pass\n"
+                    ),
+                },
+                category="implementation",
+                source="src/worker.py",
+            )
+            candidate = replace(
+                self.candidate_findings[0],
+                supporting_evidence_ids=(
+                    *self.candidate_findings[0].supporting_evidence_ids,
+                    *filler_ids,
+                ),
+            )
+            self.candidate_findings = (candidate,)
+            return replace(
+                result,
+                checkpoint=replace(
+                    result.checkpoint,
+                    evidence_ids=(
+                        *result.checkpoint.evidence_ids,
+                        *filler_ids,
+                        diff.id,
+                    ),
+                ),
+            )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return CrowdedEvidenceSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    result = _controller(
+        tmp_path,
+        session_factory=factory,
+        remediator=lambda _request: {
+            "kind": "exact", "start_line": 6, "end_line": 7,
+            "replacement": "context\ndef process(): return process_once()",
         },
     ).run(_inputs(tmp_path))
 
