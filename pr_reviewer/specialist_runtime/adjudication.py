@@ -289,6 +289,54 @@ def _exact_changed_location(
     return "", None, "invalid"
 
 
+def _added_diff_lines_by_path(
+    records: Iterable[EvidenceRecord],
+) -> dict[str, frozenset[int]]:
+    """Return controller-observed added RIGHT-side lines from retained diffs."""
+    mutable: dict[str, set[int]] = {}
+    hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+    for record in records:
+        path = str(record.source_path or "").replace("\\", "/").strip("/")
+        if record.tool != "read_pr_diff" or record.truncated or not path:
+            continue
+        added = mutable.setdefault(path, set())
+        current: int | None = None
+        for raw in record.content.splitlines():
+            match = hunk.match(raw)
+            if match:
+                current = int(match.group(1))
+            elif current is None or raw.startswith(("diff --git ", "--- ", "+++ ")):
+                continue
+            elif raw.startswith("-"):
+                continue
+            elif raw.startswith("\\"):
+                continue
+            else:
+                if raw.startswith("+"):
+                    added.add(current)
+                current += 1
+    return {path: frozenset(lines) for path, lines in mutable.items()}
+
+
+def _best_confirmed_line(
+    lines: Iterable[int | None],
+    *,
+    confirmed: frozenset[int] | None,
+    preferred: int | None = None,
+) -> int | None:
+    values = tuple(line for line in lines if line is not None)
+    if confirmed is None:
+        return preferred
+    valid = tuple(line for line in values if line in confirmed)
+    if not valid:
+        return None
+    counts = {line: valid.count(line) for line in set(valid)}
+    return min(
+        counts,
+        key=lambda line: (-counts[line], line != preferred, line),
+    )
+
+
 def _stable_strings(values: object) -> tuple[str, ...]:
     if values is None:
         return ()
@@ -447,6 +495,7 @@ def _consolidated_candidate(
     obligations: Mapping[str, CoverageObligation],
     valid_evidence_ids: set[str] | None,
     supported_evidence_by_candidate: Mapping[str, frozenset[str]],
+    added_diff_lines: Mapping[str, frozenset[int]],
 ) -> CandidateFinding:
     candidates = tuple(sorted(values, key=lambda item: item.candidate_id))
     path = identity[0]
@@ -527,6 +576,14 @@ def _consolidated_candidate(
             if len(locations) == 1
             else None
         )
+    best_line = _best_confirmed_line(
+        (
+            _path(candidate.affected_location)[1]
+            for candidate in candidates
+        ),
+        confirmed=added_diff_lines.get(path),
+        preferred=best_line,
+    )
     affected_location = path + (
         f":{best_line}" if best_line is not None else ""
     )
@@ -623,6 +680,7 @@ def consolidate_candidates(
         if evidence_snapshot is not None
         else {}
     )
+    added_diff_lines = _added_diff_lines_by_path(records.values())
     valid_ids = (
         {
             record.id for record in records.values()
@@ -704,6 +762,21 @@ def consolidate_candidates(
         values = grouped[key]
         if key[0] != "root" or len(values) == 1:
             candidate = values[0]
+            candidate_path, candidate_line, location_state = _path(
+                candidate.affected_location
+            )
+            if location_state == "ok" and candidate_path in added_diff_lines:
+                candidate_line = _best_confirmed_line(
+                    (candidate_line,),
+                    confirmed=added_diff_lines[candidate_path],
+                    preferred=candidate_line,
+                )
+                candidate = replace(
+                    candidate,
+                    affected_location=candidate_path + (
+                        f":{candidate_line}" if candidate_line is not None else ""
+                    ),
+                )
             controller_fingerprint = (
                 _root_fingerprint((key[1], key[2], key[3]))
                 if key[0] == "root"
@@ -729,6 +802,7 @@ def consolidate_candidates(
             obligations=obligation_map,
             valid_evidence_ids=valid_ids,
             supported_evidence_by_candidate=supported_evidence_by_candidate,
+            added_diff_lines=added_diff_lines,
         )
         consolidated.append(merged)
         for candidate in sorted(values, key=lambda item: item.candidate_id):
@@ -990,6 +1064,11 @@ def _authorize(
         return None, "missing-changed-causal-file"
     if not _identity_text(candidate.claim) or not _identity_text(candidate.causal_chain):
         return None, "missing-required-finding-detail"
+    added_diff_lines = _added_diff_lines_by_path(records.values())
+    if affected_file in added_diff_lines:
+        line = _best_confirmed_line(
+            (line,), confirmed=added_diff_lines[affected_file], preferred=line,
+        )
     raw_consequences = (
         value.user_visible_consequences
         if isinstance(value, AcceptedFinding) and value.user_visible_consequences
@@ -1192,7 +1271,12 @@ def _record_verification_or_platform_rejection(
     )
 
 
-def _merge_findings(group: Iterable[AcceptedFinding], representative_id: str) -> AcceptedFinding:
+def _merge_findings(
+    group: Iterable[AcceptedFinding],
+    representative_id: str,
+    *,
+    added_diff_lines: Mapping[str, frozenset[int]] | None = None,
+) -> AcceptedFinding:
     values = tuple(sorted(group, key=lambda item: item.candidate_id))
     representative = next(item for item in values if item.candidate_id == representative_id)
     supporting_citations = {
@@ -1216,8 +1300,18 @@ def _merge_findings(group: Iterable[AcceptedFinding], representative_id: str) ->
         for item in values
         for detail in (item.manual_validations or (item.manual_validation,))
     )
+    confirmed = (
+        added_diff_lines.get(representative.affected_file)
+        if added_diff_lines is not None else None
+    )
+    line = _best_confirmed_line(
+        (item.line for item in values),
+        confirmed=confirmed,
+        preferred=representative.line,
+    )
     return replace(
         representative,
+        line=line,
         severity=max(values, key=lambda item: _SEVERITY_RANK[item.severity]).severity,
         supporting_evidence_ids=tuple(sorted({
             evidence_id for item in values for evidence_id in item.supporting_evidence_ids
@@ -1257,6 +1351,7 @@ def adjudicate_candidates(
     obligation_map, changed = _controller_state(obligations, changed_files)
     evidence_snapshot = _snapshot(evidence)
     records = {record.id: record for record in evidence_snapshot.records}
+    added_diff_lines = _added_diff_lines_by_path(records.values())
     candidate_by_id: dict[str, CandidateFinding] = {}
     duplicate_ids: set[str] = set()
     for value in candidates:
@@ -1371,7 +1466,10 @@ def adjudicate_candidates(
                     target_id=target_id,
                 )
             continue
-        accepted[target_id] = _merge_findings((target, *sources), target_id)
+        accepted[target_id] = _merge_findings(
+            (target, *sources), target_id,
+            added_diff_lines=added_diff_lines,
+        )
         for source in sources:
             dispositions[source.candidate_id] = CandidateDisposition(
                 source.candidate_id, "merge", "merged", target_id
@@ -1394,7 +1492,10 @@ def adjudicate_candidates(
     for fingerprint in sorted(by_fingerprint):
         group = tuple(sorted(by_fingerprint[fingerprint], key=lambda item: item.candidate_id))
         representative_id = group[0].candidate_id
-        deduplicated[representative_id] = _merge_findings(group, representative_id)
+        deduplicated[representative_id] = _merge_findings(
+            group, representative_id,
+            added_diff_lines=added_diff_lines,
+        )
         existing_disposition = dispositions.get(representative_id)
         if (
             existing_disposition is None
@@ -2454,6 +2555,7 @@ def _finding_note(
         + "\n\n**Suggested validation:**\n" + "\n".join(validation_lines)
     )
     start_line = None
+    note_line = finding.line
     if remediation is not None and remediation.kind == "exact":
         markdown += (
             "\n\n**Suggested change:**\n\n```suggestion\n"
@@ -2461,6 +2563,7 @@ def _finding_note(
             + "\n```"
         )
         start_line = remediation.start_line
+        note_line = remediation.end_line
     elif remediation is not None and remediation.kind == "guidance":
         markdown += "\n\n**Suggested approach:** " + _quoted(remediation.guidance)
     return ReviewNote(
@@ -2470,7 +2573,7 @@ def _finding_note(
         related_obligation_ids=finding.related_obligation_ids,
         evidence_ids=tuple(citation.evidence_id for citation in finding.citations),
         file=finding.affected_file,
-        line=finding.line,
+        line=note_line,
         start_line=start_line,
         severity=finding.severity,
     )

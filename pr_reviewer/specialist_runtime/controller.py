@@ -4431,6 +4431,7 @@ class ReviewController:
     @staticmethod
     def _remediation_diff_lines(
         evidence_context: Iterable[Mapping[str, object]], path: str,
+        *, added_only: bool = False,
     ) -> set[int]:
         lines: set[int] = set()
         hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
@@ -4448,7 +4449,8 @@ class ReviewController:
                 elif current is not None and raw.startswith("-"):
                     continue
                 elif current is not None and not raw.startswith("\\"):
-                    lines.add(current)
+                    if not added_only or raw.startswith("+"):
+                        lines.add(current)
                     current += 1
         return lines
 
@@ -4488,11 +4490,20 @@ class ReviewController:
             or start <= 0 or end < start or end - start >= 20
         ):
             raise ValueError("exact remediation requires a valid range of at most 20 lines")
-        if finding.line is None or end != finding.line:
-            raise ValueError("exact remediation range must end at the finding line")
+        if (
+            finding.line is None
+            or start < max(1, finding.line - 10)
+            or end > finding.line + 10
+        ):
+            raise ValueError("exact remediation range must stay within ten lines of the finding")
         diff_lines = cls._remediation_diff_lines(evidence_context, finding.affected_file)
         if not diff_lines or any(line not in diff_lines for line in range(start, end + 1)):
             raise ValueError("exact remediation range is not present in retained PR diff evidence")
+        added_lines = cls._remediation_diff_lines(
+            evidence_context, finding.affected_file, added_only=True,
+        )
+        if end not in added_lines:
+            raise ValueError("exact remediation must end on an added right-side diff line")
         if (
             not replacement or len(replacement.encode("utf-8")) > 4_000
             or len(replacement.splitlines()) > 40

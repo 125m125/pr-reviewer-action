@@ -1338,6 +1338,66 @@ def test_controller_generates_exact_remediation_from_retained_diff(tmp_path):
     assert result.artifact["remediation"]["generated"] == 1
 
 
+def test_controller_allows_nearby_exact_remediation_anchor(tmp_path):
+    class DiffSession(_SuccessfulSession):
+        def explore(self):
+            result = super().explore()
+            diff = self.evidence_store.add_tool_result(
+                session_id=self.session_id,
+                tool="read_pr_diff",
+                arguments={"path": "src/worker.py"},
+                result={
+                    "status": "ok",
+                    "content": (
+                        "diff --git a/src/worker.py b/src/worker.py\n"
+                        "--- a/src/worker.py\n+++ b/src/worker.py\n"
+                        "@@ -6,3 +6,3 @@\n context\n"
+                        "+value = request.payload\n"
+                        "+return consume(value)\n"
+                    ),
+                },
+                category="implementation",
+                source="src/worker.py",
+            )
+            candidate = replace(
+                self.candidate_findings[0],
+                supporting_evidence_ids=(
+                    *self.candidate_findings[0].supporting_evidence_ids, diff.id,
+                ),
+            )
+            self.candidate_findings = (candidate,)
+            return replace(
+                result,
+                checkpoint=replace(
+                    result.checkpoint,
+                    evidence_ids=(*result.checkpoint.evidence_ids, diff.id),
+                ),
+            )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return DiffSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    result = _controller(
+        tmp_path,
+        session_factory=factory,
+        remediator=lambda _request: {
+            "kind": "exact", "start_line": 8, "end_line": 8,
+            "replacement": "return consume(request.payload)",
+        },
+    ).run(_inputs(tmp_path))
+
+    assert result.artifact["remediation"]["generated"] == 1
+    assert result.notes[0].line == 8
+    assert result.notes[0].start_line == 8
+    assert "return consume(request.payload)" in result.notes[0].markdown
+
+
 @pytest.mark.parametrize("behavior, expected_status", [
     (lambda _request: {"kind": "skip", "reason": "No safe local edit."}, "skipped"),
     (lambda _request: (_ for _ in ()).throw(RuntimeError("provider failed")), "rejected"),

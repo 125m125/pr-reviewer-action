@@ -159,8 +159,9 @@ _ROLE_SYSTEM = {
         "{\"kind\":\"guidance\",\"guidance\":string}; or "
         "{\"kind\":\"skip\",\"reason\":string}. Prefer exact only for a small, "
         "complete replacement that follows directly from current-head diff evidence; "
-        "the range must end at the supplied finding line. Use guidance for broader or "
-        "multi-file work, and skip when the evidence does not justify a safe change. "
+        "the range must stay within ten lines of the supplied finding line and end "
+        "on an added right-side diff line. Use guidance for broader or multi-file "
+        "work, and skip when the evidence does not justify a safe change. "
         "Do not change the finding, add defects, mention evidence IDs to the human, or "
         "emit markdown fences."
     ),

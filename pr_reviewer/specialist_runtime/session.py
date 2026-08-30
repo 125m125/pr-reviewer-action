@@ -591,9 +591,12 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
     "candidate state changed. Existing candidates remain active unless explicitly "
     "updated with status withdrawn or superseded; omission never withdraws one. "
     "Use compact candidate_updates entries such as "
-    "{\"candidate_id\":\"c1\",\"status\":\"withdrawn\",\"reason\":\"...\"}. "
-    "Put full candidate objects only in new_candidates. The controller derives "
-    "internal candidate handles from admitted candidate objects. "
+    "{\"candidate_id\":\"C1\",\"status\":\"withdrawn\",\"reason\":\"...\"}. "
+    "Use the controller C# handles from the latest authoritative receipt for "
+    "existing candidates. A superseded update must include superseded_by with "
+    "a different active C# handle. Put full candidate objects only in "
+    "new_candidates; their original candidate_id remains valid within the same "
+    "checkpoint until the controller assigns a handle. "
     "Keep checkpoints compact: emit at most 8 new candidates, with one concise "
     "sentence per claim/causal_chain/consequence/manual_validation field; keep "
     "claim under 300 characters, causal_chain under 600 characters, and "
@@ -1183,6 +1186,7 @@ class SpecialistSession:
         self._candidate_statuses: dict[str, str] = {}
         self._rejected_candidate_ids: set[str] = set()
         self._candidate_targets: dict[str, str] = {}
+        self._announced_candidate_targets: set[str] = set()
         self._candidate_withdrawals: dict[str, dict[str, object]] = {}
         self._defect_leads: list[dict[str, object]] = []
         self._next_defect_lead = 1
@@ -1471,7 +1475,8 @@ class SpecialistSession:
             key=lambda value: (value.target, value.kind),
         ):
             if item.kind == "candidate-update":
-                state = self._candidate_statuses.get(item.target, "inactive")
+                candidate_id = self._candidate_id_from_reference(item.target)
+                state = self._candidate_statuses.get(candidate_id, "inactive")
                 if (item.kind, item.target) in accepted_corrections:
                     lines.append(
                         f"- {item.target} correction accepted; current state is {state}."
@@ -1522,6 +1527,44 @@ class SpecialistSession:
         target = f"C{len(self._candidate_targets) + 1}"
         self._candidate_targets[target] = candidate_id
         return target
+
+    def _candidate_id_from_reference(self, value: object) -> str:
+        """Resolve a controller C# handle while retaining new local IDs."""
+        reference = str(value or "").strip()
+        return self._candidate_targets.get(reference, reference)
+
+    def _known_candidate_target(self, candidate_id: str) -> str:
+        return next((
+            target for target, known_id in self._candidate_targets.items()
+            if known_id == candidate_id
+        ), candidate_id)
+
+    def _candidate_alias_receipt(self) -> str:
+        assignments = []
+        for candidate in self.candidate_findings:
+            target = self._candidate_target(candidate.candidate_id)
+            if target in self._announced_candidate_targets:
+                continue
+            self._announced_candidate_targets.add(target)
+            assignments.append(f"{candidate.candidate_id} → {target}")
+        if not assignments:
+            return ""
+        return (
+            "Candidate handles assigned (controller-authoritative): "
+            + "; ".join(assignments)
+            + ". Use C# handles for all subsequent candidate updates and "
+            "withdrawals. Previous candidate IDs remain accepted as aliases "
+            "but are no longer canonical."
+        )
+
+    def _model_candidate_payload(self, candidate: CandidateFinding) -> dict[str, object]:
+        payload = asdict(candidate)
+        payload["candidate_id"] = self._candidate_target(candidate.candidate_id)
+        payload["contributor_candidate_ids"] = [
+            self._known_candidate_target(value)
+            for value in candidate.contributor_candidate_ids
+        ]
+        return payload
 
     def _checkpoint_prompt(
         self,
@@ -2476,6 +2519,7 @@ class SpecialistSession:
         self.candidate_findings = (*self.candidate_findings, candidate)
         self._candidate_statuses[candidate_id] = "active"
         self._candidate_targets[next_target] = candidate_id
+        self._announced_candidate_targets.add(next_target)
         self.latest_checkpoint = replace(
             self.latest_checkpoint,
             candidate_finding_ids=tuple(
@@ -3461,6 +3505,10 @@ class SpecialistSession:
             self.conversation.add_user(
                 self._checkpoint_evidence_receipt(unique_receipts)
             )
+        if checkpoint is not None:
+            alias_receipt = self._candidate_alias_receipt()
+            if alias_receipt:
+                self.conversation.add_user(alias_receipt)
         retention_unknown = _candidate_retention_lost(
             self._candidate_retention_signal,
             checkpoint,
@@ -3787,14 +3835,19 @@ class SpecialistSession:
         for index, update in enumerate(updates, start=1):
             if not isinstance(update, Mapping):
                 return None
-            candidate_id = str(update.get("candidate_id") or "").strip()
+            candidate_id = self._candidate_id_from_reference(
+                update.get("candidate_id")
+            )
             status = str(update.get("status") or "").strip().lower()
             if (
                 not candidate_id
                 or status not in {"active", "withdrawn", "superseded"}
                 or candidate_id not in candidate_statuses
             ):
-                target = candidate_id or f"candidate-update-{index}"
+                target = (
+                    self._known_candidate_target(candidate_id)
+                    if candidate_id else f"candidate-update-{index}"
+                )
                 rejections.append(_CheckpointChangeRejection(
                     "candidate-update", target,
                     "candidate update references an unknown ID or invalid status",
@@ -3805,21 +3858,23 @@ class SpecialistSession:
             if status == "active":
                 if candidate_id not in candidates:
                     rejections.append(_CheckpointChangeRejection(
-                        "candidate-update", candidate_id,
+                        "candidate-update", self._known_candidate_target(candidate_id),
                         "active update references a candidate that is not active",
                         dict(update),
                     ))
                     self._rejected_candidate_ids.add(candidate_id)
                     continue
             elif status == "superseded":
-                replacement_id = str(update.get("superseded_by") or "").strip()
+                replacement_id = self._candidate_id_from_reference(
+                    update.get("superseded_by")
+                )
                 if (
                     not replacement_id
                     or replacement_id == candidate_id
                     or replacement_id not in candidates
                 ):
                     rejections.append(_CheckpointChangeRejection(
-                        "candidate-update", candidate_id,
+                        "candidate-update", self._known_candidate_target(candidate_id),
                         "supersession requires a different active replacement",
                         dict(update),
                     ))
@@ -3835,10 +3890,12 @@ class SpecialistSession:
             if status != "superseded":
                 accepted_candidate_updates.append((update, candidate_id, status))
                 continue
-            replacement_id = str(update.get("superseded_by") or "").strip()
+            replacement_id = self._candidate_id_from_reference(
+                update.get("superseded_by")
+            )
             if proposed_statuses.get(replacement_id) != "active":
                 rejections.append(_CheckpointChangeRejection(
-                    "candidate-update", candidate_id,
+                    "candidate-update", self._known_candidate_target(candidate_id),
                     "superseding replacement did not remain active",
                     dict(update),
                 ))
@@ -5215,7 +5272,10 @@ class SpecialistSession:
             "working_summary": checkpoint.working_summary,
             "completed_steps": list(checkpoint.completed_steps),
             "hypotheses": list(checkpoint.hypotheses),
-            "candidate_finding_ids": list(checkpoint.candidate_finding_ids),
+            "candidate_finding_ids": [
+                self._known_candidate_target(candidate_id)
+                for candidate_id in checkpoint.candidate_finding_ids
+            ],
             "obligation_statuses": {
                 obligation_id: status.value
                 for obligation_id, status in checkpoint.obligation_statuses
@@ -5232,10 +5292,17 @@ class SpecialistSession:
         return {
             "latest_checkpoint": checkpoint_payload,
             "candidate_findings": [
-                asdict(candidate) for candidate in self.candidate_findings
+                self._model_candidate_payload(candidate)
+                for candidate in self.candidate_findings
             ],
-            "candidate_statuses": dict(sorted(self._candidate_statuses.items())),
-            "candidate_withdrawals": dict(sorted(self._candidate_withdrawals.items())),
+            "candidate_statuses": dict(sorted(
+                (self._known_candidate_target(candidate_id), status)
+                for candidate_id, status in self._candidate_statuses.items()
+            )),
+            "candidate_withdrawals": dict(sorted(
+                (self._known_candidate_target(candidate_id), value)
+                for candidate_id, value in self._candidate_withdrawals.items()
+            )),
             "defect_leads": [dict(item) for item in self._defect_leads],
             "coverage": {
                 "obligation_statuses": {
@@ -5259,7 +5326,8 @@ class SpecialistSession:
             "completed_steps": list(checkpoint.completed_steps),
             "hypotheses": list(checkpoint.hypotheses),
             "active_candidates": [
-                asdict(candidate) for candidate in self.candidate_findings
+                self._model_candidate_payload(candidate)
+                for candidate in self.candidate_findings
             ],
             "defect_leads": [dict(item) for item in self._defect_leads],
             "unknowns": list(checkpoint.unknowns),

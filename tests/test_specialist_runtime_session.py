@@ -27,6 +27,7 @@ from pr_reviewer.specialist_runtime.model_gateway import (
 from pr_reviewer.specialist_runtime.request_attempts import RequestAttemptJournal
 from pr_reviewer.specialist_runtime.session import (
     COMPACTED_EVIDENCE_TOOL_NAME,
+    CheckpointDisposition,
     TEST_RESULTS_TOOL_NAME,
     SpecialistSession,
     _candidate_retention_signal,
@@ -1121,8 +1122,8 @@ def test_candidate_tools_report_and_withdraw_with_short_session_handles():
     assert withdrawal == {"accepted": True, "target": "C1", "status": "withdrawn"}
     assert session.candidate_findings == ()
     payload = session._cumulative_checkpoint_payload()
-    assert payload["candidate_statuses"][candidate_id] == "withdrawn"
-    assert payload["candidate_withdrawals"][candidate_id]["reason"].startswith(
+    assert payload["candidate_statuses"] == {"C1": "withdrawn"}
+    assert payload["candidate_withdrawals"]["C1"]["reason"].startswith(
         "The later consumer evidence"
     )
 
@@ -2298,8 +2299,8 @@ def test_cumulative_checkpoint_payload_materializes_omitted_candidates():
     assert payload["latest_checkpoint"]["completed_steps"] == [
         "Collected implementation evidence for a.py.",
     ]
-    assert payload["candidate_findings"][0]["candidate_id"] == "candidate-code"
-    assert payload["candidate_statuses"] == {"candidate-code": "active"}
+    assert payload["candidate_findings"][0]["candidate_id"] == "C1"
+    assert payload["candidate_statuses"] == {"C1": "active"}
     assert payload["latest_checkpoint"]["evidence_ids"]
     assert payload["coverage"]["obligation_statuses"]["OB-code"] == "pending"
     assert payload["evidence_metadata"][0]["id"].startswith("evidence:")
@@ -2608,7 +2609,10 @@ def test_checkpoint_partially_accepts_candidates_and_repairs_only_rejected_draft
     assert '"failed_check": "candidate.user_visible_consequence"' in correction_prompt
     assert record.id in correction_prompt
     assert "candidate-good rejected" not in correction_prompt
-    assert "candidate-bad" in session.conversation.events[-1]["content"]
+    assert any(
+        "candidate-bad" in str(event.get("content") or "")
+        for event in session.conversation.events
+    )
 
 
 def test_checkpoint_repairs_each_rejected_candidate_in_a_focused_turn():
@@ -2786,10 +2790,12 @@ def test_rejected_candidate_update_preserves_and_reports_current_state():
     assert tuple(item.candidate_id for item in session.candidate_findings) == (
         "candidate-good",
     )
-    receipt = session.conversation.events[-1]["content"]
-    assert "candidate-good update rejected" in receipt
-    assert "remains active" in receipt
-    assert "candidate-good remains rejected and inactive" not in receipt
+    receipts = "\n".join(
+        str(event.get("content") or "") for event in session.conversation.events
+    )
+    assert "C1 update rejected" in receipts
+    assert "remains active" in receipts
+    assert "candidate-good remains rejected and inactive" not in receipts
 
 
 def test_checkpoint_turn_disables_reasoning_to_reserve_output_for_json():
@@ -2906,6 +2912,108 @@ def test_superseded_update_requires_known_replacement_candidate():
     assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
 
 
+def test_checkpoint_candidate_handles_can_supersede_active_candidate():
+    session = make_session(ScriptedGateway([]))
+    seed_successful_tool_exchange(
+        session, call_id="candidate-handle-evidence", path="a.py",
+        content="contents:a.py",
+    )
+    established = session._checkpoint_from_text(
+        candidate_checkpoint_response(("candidate-old", "candidate-new")).text
+    )
+    assert established is not None
+    assert session._candidate_target("candidate-old") == "C1"
+    assert session._candidate_target("candidate-new") == "C2"
+
+    updated = session._checkpoint_from_text(
+        candidate_update_checkpoint_response(updates=({
+            "candidate_id": "C1",
+            "status": "superseded",
+            "superseded_by": "C2",
+            "reason": "The narrower candidate has the corrected location.",
+        },)).text
+    )
+
+    assert updated is not None
+    assert updated.candidate_finding_ids == ("candidate-new",)
+    assert session._candidate_statuses["candidate-old"] == "superseded"
+
+
+def test_candidate_handle_assignment_is_announced_once_and_model_state_is_canonical():
+    session = make_session(ScriptedGateway([]))
+    seed_successful_tool_exchange(
+        session, call_id="candidate-alias-evidence", path="a.py",
+        content="contents:a.py",
+    )
+    established = session._checkpoint_from_text(
+        candidate_checkpoint_response(("candidate-old",)).text
+    )
+    assert established is not None
+    session.latest_checkpoint = established
+
+    receipt = session._candidate_alias_receipt()
+    memory = session._model_checkpoint_memory()
+    cumulative = session._cumulative_checkpoint_payload()
+
+    assert "candidate-old → C1" in receipt
+    assert "Use C# handles for all subsequent candidate updates" in receipt
+    assert session._candidate_alias_receipt() == ""
+    assert memory["active_candidates"][0]["candidate_id"] == "C1"
+    assert cumulative["candidate_findings"][0]["candidate_id"] == "C1"
+    assert cumulative["latest_checkpoint"]["candidate_finding_ids"] == ["C1"]
+    assert cumulative["candidate_statuses"] == {"C1": "active"}
+
+
+def test_checkpoint_feedback_announces_new_candidate_handle():
+    gateway = ScriptedGateway([
+        candidate_checkpoint_response(("candidate-old",)),
+    ])
+    session = make_session(gateway)
+    seed_successful_tool_exchange(
+        session, call_id="candidate-feedback-evidence", path="a.py",
+        content="contents:a.py",
+    )
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert any(
+        event.get("kind") == "user"
+        and "candidate-old → C1" in str(event.get("content") or "")
+        for event in session.conversation.events
+    )
+
+
+def test_candidate_handle_rejection_receipt_reports_canonical_current_state():
+    session = make_session(ScriptedGateway([]))
+    seed_successful_tool_exchange(
+        session, call_id="candidate-receipt-evidence", path="a.py",
+        content="contents:a.py",
+    )
+    established = session._checkpoint_from_text(
+        candidate_checkpoint_response(("candidate-old",)).text
+    )
+    assert established is not None
+    assert session._candidate_target("candidate-old") == "C1"
+
+    rejected = session._checkpoint_from_text(
+        candidate_update_checkpoint_response(updates=({
+            "candidate_id": "C1",
+            "status": "superseded",
+            "superseded_by": "C1",
+        },)).text
+    )
+    assert rejected is not None
+
+    receipt = session._checkpoint_correction_receipt(
+        session._last_checkpoint_rejections,
+        disposition=CheckpointDisposition.PAUSE,
+    )
+
+    assert "C1 update rejected or omitted; current state remains active" in receipt
+    assert "Current active candidates: C1" in receipt
+
+
 def test_plain_prose_candidate_words_do_not_trigger_retention_unknown():
     """Candidate vocabulary in ordinary prose is not structured candidate state."""
     gateway = ScriptedGateway([
@@ -2987,7 +3095,7 @@ def test_invalid_supersession_preserves_source_but_accepts_valid_withdrawal():
         "candidate-code",
     )
     assert tuple(item.target for item in session._last_checkpoint_rejections) == (
-        "candidate-code",
+        "C1",
     )
 
 
@@ -4012,7 +4120,7 @@ def test_checkpoint_request_includes_compact_schema_contract():
     assert '"candidate_finding_ids"' not in checkpoint_request
     assert '"candidate_findings"' not in checkpoint_request
     assert 'new_candidates' in checkpoint_request
-    assert "controller derives internal candidate handles" in checkpoint_request
+    assert "Use the controller C# handles" in checkpoint_request
     assert (
         "evidence_by_obligation"
         not in gateway.requests[1].response_schema["properties"]

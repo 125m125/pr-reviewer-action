@@ -260,6 +260,54 @@ def test_controller_root_merge_retains_precise_location_valid_evidence_obligatio
     assert merged.root_cause_fingerprint.startswith("root:")
 
 
+def test_controller_root_merge_prefers_evidence_backed_changed_line():
+    store, evidence_id = _store()
+    diff = store.add_tool_result(
+        session_id="session-1",
+        tool="read_pr_diff",
+        arguments={"path": "src/store.py"},
+        result={
+            "status": "ok",
+            "content": (
+                "diff --git a/src/store.py b/src/store.py\n"
+                "--- a/src/store.py\n+++ b/src/store.py\n"
+                "@@ -40,3 +40,3 @@\n context\n"
+                "+return validate_budget(remaining)\n"
+                " context\n"
+            ),
+        },
+        category="implementation",
+        source="src/store.py",
+    )
+    wrong = _candidate(
+        "budget-a",
+        claim="validate_budget permits an oversized output allowance",
+        location="src/store.py:42",
+        category="budget-validation",
+        evidence_ids=(evidence_id, diff.id),
+        causal_chain="validate_budget compares the wrong remaining-token value.",
+    )
+    correct = _candidate(
+        "budget-b",
+        claim="The validate_budget output guard can exceed remaining context",
+        location="src/store.py:41",
+        category="budget-validation",
+        evidence_ids=(evidence_id, diff.id),
+        causal_chain="The changed validate_budget contract uses the wrong comparison.",
+    )
+
+    result = consolidate_candidates(
+        (wrong, correct),
+        changed_files=CHANGED_FILES,
+        change_facts={"src/store.py": {"symbols": ("validate_budget",)}},
+        obligations=_obligations(),
+        evidence=store,
+    )
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0].affected_location == "src/store.py:41"
+
+
 def test_unsupported_duplicate_cannot_supply_a_more_precise_location():
     store, evidence_id = _store()
     supported = _candidate(
@@ -667,6 +715,52 @@ def test_merge_preserves_retained_provenance_contradictions_and_highest_severity
     assert finding.contradicting_evidence_ids == (contradiction.id,)
     assert finding.severity == "major"
     assert finding.contributor_candidate_ids == ("candidate-a", "candidate-b")
+
+
+def test_merge_prefers_evidence_backed_changed_line_over_representative_line():
+    store, first_evidence_id = _store()
+    diff = store.add_tool_result(
+        session_id="session-1",
+        tool="read_pr_diff",
+        arguments={"path": "src/store.py"},
+        result={
+            "status": "ok",
+            "content": (
+                "diff --git a/src/store.py b/src/store.py\n"
+                "--- a/src/store.py\n+++ b/src/store.py\n"
+                "@@ -40,3 +40,3 @@\n context\n"
+                "+return persist_once(record)\n"
+                " context\n"
+            ),
+        },
+        category="implementation",
+        source="src/store.py",
+    )
+    wrong_target = _candidate(
+        "candidate-a", location="src/store.py:42",
+        evidence_ids=(first_evidence_id, diff.id),
+    )
+    correct_source = _candidate(
+        "candidate-b", location="src/store.py:41",
+        evidence_ids=(first_evidence_id, diff.id),
+    )
+
+    review = _adjudicate(
+        (wrong_target, correct_source),
+        (
+            {"candidate_id": wrong_target.candidate_id, "action": "keep"},
+            {
+                "candidate_id": correct_source.candidate_id,
+                "action": "merge",
+                "target_id": wrong_target.candidate_id,
+            },
+        ),
+        store,
+    )
+
+    assert len(review.accepted) == 1
+    assert review.accepted[0].candidate_id == wrong_target.candidate_id
+    assert review.accepted[0].line == 41
 
 
 def test_merge_cannot_launder_missing_evidence():
