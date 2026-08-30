@@ -308,6 +308,61 @@ def test_controller_root_merge_prefers_evidence_backed_changed_line():
     assert result.candidates[0].affected_location == "src/store.py:41"
 
 
+def test_controller_line_confirmation_reads_wrapped_executor_patch():
+    store, evidence_id = _store()
+    diff = store.add_tool_result(
+        session_id="session-1",
+        tool="read_pr_diff",
+        arguments={"path": "src/store.py"},
+        result={
+            "status": "ok",
+            "result": {
+                "path": "src/store.py",
+                "patch": (
+                    "diff --git a/src/store.py b/src/store.py\n"
+                    "--- a/src/store.py\n+++ b/src/store.py\n"
+                    "@@ -40 +40 @@\n-old\n+new\n"
+                ),
+                "range": None,
+            },
+        },
+        category="implementation",
+        source="src/store.py",
+    )
+    candidate = _candidate(
+        "wrapped-diff", location="src/store.py:40",
+        evidence_ids=(evidence_id, diff.id),
+    )
+
+    result = consolidate_candidates(
+        (candidate,), changed_files=CHANGED_FILES,
+        change_facts={}, obligations=_obligations(), evidence=store,
+    )
+
+    assert result.candidates[0].affected_location == "src/store.py:40"
+
+
+def test_unparseable_diff_does_not_disprove_submitted_line():
+    store, evidence_id = _store()
+    diff = store.add_tool_result(
+        session_id="session-1", tool="read_pr_diff",
+        arguments={"path": "src/store.py"},
+        result={"status": "ok", "content": "diff unavailable"},
+        category="implementation", source="src/store.py",
+    )
+    candidate = _candidate(
+        "unparseable-diff", location="src/store.py:41",
+        evidence_ids=(evidence_id, diff.id),
+    )
+
+    result = consolidate_candidates(
+        (candidate,), changed_files=CHANGED_FILES,
+        change_facts={}, obligations=_obligations(), evidence=store,
+    )
+
+    assert result.candidates[0].affected_location == "src/store.py:41"
+
+
 def test_unsupported_duplicate_cannot_supply_a_more_precise_location():
     store, evidence_id = _store()
     supported = _candidate(

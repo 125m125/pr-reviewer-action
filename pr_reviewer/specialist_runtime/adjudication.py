@@ -299,11 +299,13 @@ def _added_diff_lines_by_path(
         path = str(record.source_path or "").replace("\\", "/").strip("/")
         if record.tool != "read_pr_diff" or record.truncated or not path:
             continue
-        added = mutable.setdefault(path, set())
+        added: set[int] = set()
+        saw_hunk = False
         current: int | None = None
         for raw in record.content.splitlines():
             match = hunk.match(raw)
             if match:
+                saw_hunk = True
                 current = int(match.group(1))
             elif current is None or raw.startswith(("diff --git ", "--- ", "+++ ")):
                 continue
@@ -315,6 +317,8 @@ def _added_diff_lines_by_path(
                 if raw.startswith("+"):
                     added.add(current)
                 current += 1
+        if saw_hunk:
+            mutable.setdefault(path, set()).update(added)
     return {path: frozenset(lines) for path, lines in mutable.items()}
 
 

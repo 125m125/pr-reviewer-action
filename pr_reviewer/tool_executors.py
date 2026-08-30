@@ -172,7 +172,7 @@ def _resolve_workspace_path(path, workspace_root):
 
     return resolved, None
 
-def read_file(path, workspace_root, offset=None, limit=None):
+def read_file(path, workspace_root, offset=None, limit=None, include_line_numbers=False):
     """Read a file, optionally a 1-based line window, with path protection.
 
     ``offset``/``limit`` let the model read a slice of a large file without
@@ -188,17 +188,54 @@ def read_file(path, workspace_root, offset=None, limit=None):
     except Exception as exc:
         return {"error": str(exc)}
 
-    if offset is None and limit is None:
+    if offset is None and limit is None and not include_line_numbers:
         return {"content": content[:12000]}
 
     lines = content.splitlines(keepends=True)
     start = max((offset or 1) - 1, 0)
     end = start + limit if limit is not None else len(lines)
-    window = "".join(lines[start:end])
+    selected = lines[start:end]
+    window = (
+        "".join(
+            f"RIGHT {line_number} | {line}"
+            for line_number, line in enumerate(selected, start=start + 1)
+        )
+        if include_line_numbers else "".join(selected)
+    )
     return {
         "content": window[:12000],
-        "range": {"offset": start + 1, "lines": len(lines[start:end]), "total_lines": len(lines)},
+        "range": {"offset": start + 1, "lines": len(selected), "total_lines": len(lines)},
     }
+
+
+_DIFF_HUNK_COORDINATES_RE = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"
+)
+
+
+def _number_diff_lines(patch):
+    """Label unified-diff rows with explicit GitHub LEFT/RIGHT coordinates."""
+    old_line = new_line = None
+    rendered = []
+    for raw in patch.splitlines(keepends=True):
+        match = _DIFF_HUNK_COORDINATES_RE.match(raw)
+        if match:
+            old_line, new_line = int(match.group(1)), int(match.group(3))
+            rendered.append(raw)
+        elif old_line is None or new_line is None or raw.startswith("\\"):
+            rendered.append(raw)
+        elif raw.startswith("-") and not raw.startswith("---"):
+            rendered.append(f"- [LEFT {old_line} | RIGHT -] {raw[1:]}")
+            old_line += 1
+        elif raw.startswith("+") and not raw.startswith("+++"):
+            rendered.append(f"+ [LEFT - | RIGHT {new_line}] {raw[1:]}")
+            new_line += 1
+        else:
+            content = raw[1:] if raw.startswith(" ") else raw
+            rendered.append(f"  [LEFT {old_line} | RIGHT {new_line}] {content}")
+            old_line += 1
+            new_line += 1
+    return "".join(rendered)
 
 def _read_bounded_line_window(stream, offset, limit, max_bytes):
     """Stream a line window without retaining the skipped patch prefix."""
@@ -495,7 +532,8 @@ def execute_tool_request(
             if not path:
                 raise ValueError("Missing 'path' argument")
             res = read_file(
-                path, workspace_root, _opt_int(args.get("offset")), _opt_int(args.get("limit"))
+                path, workspace_root, _opt_int(args.get("offset")), _opt_int(args.get("limit")),
+                args.get("include_line_numbers") is True,
             )
             if res.get("error"):
                 raise ValueError(res["error"])
@@ -637,6 +675,8 @@ def execute_tool_request(
                     f"git diff failed: {mask_secrets(output.strip())}"
                 )
             masked_patch, _redaction_count = mask_source_secrets(output)
+            if args.get("include_line_numbers") is True:
+                masked_patch = _number_diff_lines(masked_patch)
             encoded_patch = masked_patch.encode("utf-8", errors="replace")
             if len(encoded_patch) > max_response_bytes:
                 marker = b"\n[truncated]"

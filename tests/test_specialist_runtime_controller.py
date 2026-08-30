@@ -1267,6 +1267,40 @@ def test_controller_generates_guidance_for_accepted_finding_without_degrading(tm
     )
 
 
+def test_line_less_finding_requests_guidance_only_remediation(tmp_path):
+    calls = []
+
+    class FileFindingSession(_SuccessfulSession):
+        def explore(self):
+            result = super().explore()
+            self.candidate_findings = (
+                replace(self.candidate_findings[0], affected_location="src/worker.py"),
+            )
+            return result
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return FileFindingSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    def remediator(request):
+        calls.append(request)
+        return {"kind": "guidance", "guidance": "Restore idempotent processing."}
+
+    result = _controller(
+        tmp_path, session_factory=factory, remediator=remediator,
+    ).run(_inputs(tmp_path))
+
+    assert calls[0].context["finding"]["affected_line"] is None
+    assert "exact" not in calls[0].context["output_contract"]
+    assert set(calls[0].context["output_contract"]) == {"guidance", "skip"}
+    assert "Suggested approach" in result.notes[0].markdown
+
+
 def test_invalid_remediation_is_omitted_without_losing_finding(tmp_path):
     result = _controller(
         tmp_path,

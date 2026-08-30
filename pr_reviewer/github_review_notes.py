@@ -274,6 +274,9 @@ def choose_note_anchor(
     snapshot was supplied.
     """
 
+    # Future: carry LEFT-side coordinates through findings and publishing so a
+    # deletion-only defect can be attached to the removed line instead of the file.
+
     path = _safe_repo_path(getattr(note, "file", None))
     if not path:
         return None

@@ -113,6 +113,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "type": "integer",
                     "description": "Optional max number of lines to read from offset.",
                 },
+                "include_line_numbers": {
+                    "type": "boolean",
+                    "description": (
+                        "Label each current-head line as RIGHT N for exact GitHub anchors."
+                    ),
+                },
             },
             "required": ["path"],
             "additionalProperties": False,
@@ -278,6 +284,14 @@ SPECIALIST_PR_DIFF_SCHEMA: dict[str, Any] = {
             "limit": {
                 "type": "integer",
                 "description": "Optional patch-line limit (1-400, default 400).",
+            },
+            "include_line_numbers": {
+                "type": "boolean",
+                "description": (
+                    "Label every hunk row with explicit old LEFT and new RIGHT coordinates. "
+                    "Use an added '+' RIGHT line for affected_location; removed LEFT lines "
+                    "are evidence only."
+                ),
             },
         },
         "oneOf": [

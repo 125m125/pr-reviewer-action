@@ -185,6 +185,47 @@ def test_read_pr_diff_uses_bounded_file_scoped_merge_base_argv(
     ]
 
 
+def test_read_pr_diff_can_render_explicit_left_and_right_coordinates(
+    monkeypatch, tmp_path,
+):
+    base_sha = "1" * 40
+    head_sha = "2" * 40
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("same\nnew\n", encoding="utf-8")
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.BytesIO(
+                b"diff --git a/src/app.py b/src/app.py\n"
+                b"--- a/src/app.py\n+++ b/src/app.py\n"
+                b"@@ -4,3 +4,3 @@\n same\n-old\n+new\n"
+            )
+            self.returncode = 0
+
+        def wait(self, timeout):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(
+        tool_executors.subprocess, "Popen", lambda *args, **kwargs: FakeProcess()
+    )
+
+    result = tool_executors.execute_tool_request(
+        "read_pr_diff",
+        {"path": "src/app.py", "include_line_numbers": True},
+        str(tmp_path), {"owner/repo"}, "owner/repo", (), 12000, 15,
+        base_sha=base_sha, head_sha=head_sha,
+        allowed_diff_paths=("src/app.py",),
+    )
+
+    patch = result["result"]["patch"]
+    assert "  [LEFT 4 | RIGHT 4] same" in patch
+    assert "- [LEFT 5 | RIGHT -] old" in patch
+    assert "+ [LEFT - | RIGHT 5] new" in patch
+
+
 def test_read_pr_diff_batches_authorized_paths_under_one_shared_cap(
     monkeypatch, tmp_path,
 ):

@@ -4556,14 +4556,17 @@ class ReviewController:
                             "manual_validation": finding.manual_validation,
                         },
                         "evidence_context": evidence_context,
-                        "output_contract": {
+                        "output_contract": ({
                             "exact": {
                                 "kind": "exact", "start_line": "integer",
                                 "end_line": "integer", "replacement": "string",
                             },
                             "guidance": {"kind": "guidance", "guidance": "string"},
                             "skip": {"kind": "skip", "reason": "string"},
-                        },
+                        } if finding.line is not None else {
+                            "guidance": {"kind": "guidance", "guidance": "string"},
+                            "skip": {"kind": "skip", "reason": "string"},
+                        }),
                     },
                 )
                 remediation = self._validate_remediation(

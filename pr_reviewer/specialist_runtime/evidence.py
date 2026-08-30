@@ -123,6 +123,8 @@ def _result_content(result: Mapping[str, Any]) -> str:
     nested = result.get("result")
     if isinstance(nested, Mapping) and "content" in nested:
         content = nested["content"]
+    elif isinstance(nested, Mapping) and "patch" in nested:
+        content = nested["patch"]
     elif "content" in result:
         content = result["content"]
     elif "error" in result:
@@ -132,6 +134,17 @@ def _result_content(result: Mapping[str, Any]) -> str:
     else:
         content = result
     return content if isinstance(content, str) else _canonical_json(content)
+
+
+def _result_truncated(result: Mapping[str, Any]) -> bool:
+    nested = result.get("result")
+    if not isinstance(nested, Mapping):
+        return False
+    value = nested.get("range")
+    return bool(
+        isinstance(value, Mapping)
+        and (value.get("truncated") is True or value.get("has_more") is True)
+    )
 
 
 def _source_identity(arguments: Mapping[str, Any], source: str | None = None) -> str:
@@ -641,7 +654,7 @@ class EvidenceStore:
             content=content,
             content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
             mime_type=str(mime_type).strip() if mime_type else None,
-            truncated=truncated,
+            truncated=truncated or _result_truncated(result),
             redacted=redacted or arguments_redacted or provenance_redacted or source_redacted,
             imported_by=(session_id,),
             redaction_types=redaction_types,

@@ -99,6 +99,23 @@ def test_evidence_retains_redaction_and_truncation_state():
     assert "supersecretvalue" not in record.content
 
 
+def test_diff_evidence_retains_executor_range_truncation():
+    store = EvidenceStore()
+
+    record = store.add_tool_result(
+        session_id="S1", tool="read_pr_diff", arguments={"path": "src/app.py"},
+        result={
+            "status": "ok",
+            "result": {
+                "path": "src/app.py", "patch": "@@ -1 +1 @@\n-old\n+new\n",
+                "range": {"truncated": True},
+            },
+        },
+    )
+
+    assert record.truncated is True
+
+
 def test_repository_evidence_preserves_dynamic_secret_reference_semantics():
     store = EvidenceStore()
     source = 'return f"Webhook failed; api_token={api_token}"'
