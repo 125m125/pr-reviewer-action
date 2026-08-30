@@ -613,6 +613,12 @@ not need to be repeated in checkpoints.
 
 ## Reliability corrections for current-runtime adopters
 
+- Accepted findings now receive one bounded, tools-disabled remediation turn.
+  The role inherits `specialist_critic_model` and requires no new project input.
+  It may produce a controller-validated GitHub suggestion for a small current-
+  diff range, general guidance for broader work, or skip. Remediation never
+  changes adjudication, verdicts, or degradation state; machine diagnostics are
+  retained in the review artifact under `remediation`.
 - Candidate IDs are specialist-local handles. Do not assume that a model ID such
   as `c1` is globally unique; the controller scopes collisions before critic
   adjudication and retains the original ID in artifact dispositions.

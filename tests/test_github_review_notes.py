@@ -6,6 +6,7 @@ import json
 import os
 import stat
 import types
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -131,6 +132,23 @@ def test_graphql_variables_are_exact_for_line_and_file_anchors():
         "body": file_note.managed_markdown,
         "subjectType": "FILE",
         "path": "b.py",
+    }
+
+
+def test_graphql_variables_include_validated_multiline_suggestion_range():
+    note = normalize_note(
+        replace(_note(line=6), start_line=5), DIFF, ("a.py",),
+    )
+
+    assert build_review_thread_variables("review-id", note) == {
+        "pullRequestReviewId": "review-id",
+        "body": note.managed_markdown,
+        "subjectType": "LINE",
+        "path": "a.py",
+        "line": 6,
+        "side": "RIGHT",
+        "startLine": 5,
+        "startSide": "RIGHT",
     }
 
 

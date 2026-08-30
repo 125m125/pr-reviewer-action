@@ -63,6 +63,7 @@ class NoteAnchor:
     path: str
     line: int | None = None
     side: str | None = None
+    start_line: int | None = None
 
 
 @dataclass(frozen=True)
@@ -288,7 +289,19 @@ def choose_note_anchor(
         and line > 0
         and line in added_lines.get(path, set())
     ):
-        return NoteAnchor("LINE", path, line, "RIGHT")
+        commentable_lines = diff_positions(diff_text).get(path, {})
+        start_line = getattr(note, "start_line", None)
+        if not (
+            isinstance(start_line, int)
+            and not isinstance(start_line, bool)
+            and 0 < start_line < line
+            and all(
+                candidate in commentable_lines
+                for candidate in range(start_line, line + 1)
+            )
+        ):
+            start_line = None
+        return NoteAnchor("LINE", path, line, "RIGHT", start_line)
     return NoteAnchor("FILE", path)
 
 
@@ -362,6 +375,7 @@ def _note_reply_digest(note: NormalizedReviewNote) -> str:
                 "path": note.anchor.path,
                 "line": note.anchor.line,
                 "side": note.anchor.side,
+                "start_line": note.anchor.start_line,
             }
             if note.anchor is not None
             else None
@@ -431,6 +445,11 @@ def build_review_thread_variables(
     }
     if note.anchor.subject_type == "LINE":
         variables.update({"line": note.anchor.line, "side": "RIGHT"})
+        if note.anchor.start_line is not None:
+            variables.update({
+                "startLine": note.anchor.start_line,
+                "startSide": "RIGHT",
+            })
     elif note.anchor.subject_type != "FILE":
         raise ValueError("unsupported review-note anchor")
     return variables
@@ -2058,8 +2077,8 @@ mutation CreatePendingReview($pullRequestId: ID!, $commitOID: GitObjectID!, $bod
 """.strip()
 
 _ADD_THREAD_MUTATION = """
-mutation AddManagedReviewThread($pullRequestReviewId: ID!, $body: String!, $subjectType: PullRequestReviewThreadSubjectType!, $path: String!, $line: Int, $side: DiffSide) {
-  addPullRequestReviewThread(input: {pullRequestReviewId: $pullRequestReviewId, body: $body, subjectType: $subjectType, path: $path, line: $line, side: $side}) {
+mutation AddManagedReviewThread($pullRequestReviewId: ID!, $body: String!, $subjectType: PullRequestReviewThreadSubjectType!, $path: String!, $line: Int, $side: DiffSide, $startLine: Int, $startSide: DiffSide) {
+  addPullRequestReviewThread(input: {pullRequestReviewId: $pullRequestReviewId, body: $body, subjectType: $subjectType, path: $path, line: $line, side: $side, startLine: $startLine, startSide: $startSide}) {
     thread { id comments(first: 1) { nodes { databaseId url } } }
   }
 }

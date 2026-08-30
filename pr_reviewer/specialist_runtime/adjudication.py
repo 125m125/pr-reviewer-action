@@ -22,7 +22,10 @@ from pr_reviewer.enforcement import RuntimeVerdictPolicyResult, derive_runtime_v
 
 from .coverage import evidence_satisfies_obligation
 from .evidence import EvidenceRecord, EvidenceSnapshot, EvidenceStore
-from .types import CandidateFinding, CoverageObligation, ReviewHandoff, ReviewNote, ReviewNoteKind
+from .types import (
+    CandidateFinding, CoverageObligation, FindingRemediation, ReviewHandoff,
+    ReviewNote, ReviewNoteKind,
+)
 from .web_evidence import (
     RepositoryAccessRequest,
     SourceAccessRequest,
@@ -2419,7 +2422,10 @@ def _human_evidence_lines(citations: tuple[EvidenceCitation, ...]) -> list[str]:
     return lines
 
 
-def _finding_note(finding: AcceptedFinding) -> ReviewNote:
+def _finding_note(
+    finding: AcceptedFinding,
+    remediation: FindingRemediation | None = None,
+) -> ReviewNote:
     supporting_lines = _human_evidence_lines(finding.supporting_citations)
     contradicting_lines = _human_evidence_lines(finding.contradicting_citations)
     consequence_lines = [
@@ -2447,6 +2453,16 @@ def _finding_note(finding: AcceptedFinding) -> ReviewNote:
         )
         + "\n\n**Suggested validation:**\n" + "\n".join(validation_lines)
     )
+    start_line = None
+    if remediation is not None and remediation.kind == "exact":
+        markdown += (
+            "\n\n**Suggested change:**\n\n```suggestion\n"
+            + remediation.replacement.rstrip("\n")
+            + "\n```"
+        )
+        start_line = remediation.start_line
+    elif remediation is not None and remediation.kind == "guidance":
+        markdown += "\n\n**Suggested approach:** " + _quoted(remediation.guidance)
     return ReviewNote(
         kind=ReviewNoteKind.FINDING,
         fingerprint=finding.root_cause_fingerprint,
@@ -2455,6 +2471,7 @@ def _finding_note(finding: AcceptedFinding) -> ReviewNote:
         evidence_ids=tuple(citation.evidence_id for citation in finding.citations),
         file=finding.affected_file,
         line=finding.line,
+        start_line=start_line,
         severity=finding.severity,
     )
 
@@ -2468,6 +2485,7 @@ def build_review_notes(
     changed_files: Iterable[str],
     verification_requests: Iterable[object] = (),
     source_access_requests: Iterable[object] = (),
+    remediations: Mapping[str, FindingRemediation] | None = None,
 ) -> tuple[ReviewNote, ...]:
     """Build typed notes only after defensive controller-state revalidation."""
     if publishing_mode == "comment":
@@ -2482,7 +2500,11 @@ def build_review_notes(
     authoritative, defensive_verification = _revalidated_findings(
         review.accepted, evidence=snapshot, obligations=obligation_map, changed_files=changed
     )
-    notes: list[ReviewNote] = [_finding_note(item) for item in authoritative]
+    remediation_map = remediations or {}
+    notes: list[ReviewNote] = [
+        _finding_note(item, remediation_map.get(item.root_cause_fingerprint))
+        for item in authoritative
+    ]
     candidate_requests: list[CandidateVerificationRequest] = []
     for item in review.verification_requests:
         if isinstance(item, CandidateVerificationRequest):

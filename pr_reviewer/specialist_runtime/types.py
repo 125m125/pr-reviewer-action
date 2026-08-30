@@ -181,6 +181,15 @@ class ReviewHandoff:
 
 
 @dataclass(frozen=True)
+class FindingRemediation:
+    kind: str
+    guidance: str = ""
+    replacement: str = ""
+    start_line: int | None = None
+    end_line: int | None = None
+
+
+@dataclass(frozen=True)
 class ReviewNote:
     kind: ReviewNoteKind
     fingerprint: str
@@ -189,6 +198,7 @@ class ReviewNote:
     evidence_ids: tuple[str, ...] = ()
     file: str | None = None
     line: int | None = None
+    start_line: int | None = None
     severity: str | None = None
 
 

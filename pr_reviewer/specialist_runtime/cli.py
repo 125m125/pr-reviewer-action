@@ -151,6 +151,19 @@ _ROLE_SYSTEM = {
         "the listed missing_candidate_ids; accepted decisions are already retained and "
         "must not be repeated."
     ),
+    "remediator": (
+        "Suggest a bounded remediation only for the supplied already accepted finding. "
+        "Tools are unavailable. Use only the supplied affected location and retained "
+        "evidence excerpts. Return exactly one of: {\"kind\":\"exact\","
+        "\"start_line\":integer,\"end_line\":integer,\"replacement\":string}; "
+        "{\"kind\":\"guidance\",\"guidance\":string}; or "
+        "{\"kind\":\"skip\",\"reason\":string}. Prefer exact only for a small, "
+        "complete replacement that follows directly from current-head diff evidence; "
+        "the range must end at the supplied finding line. Use guidance for broader or "
+        "multi-file work, and skip when the evidence does not justify a safe change. "
+        "Do not change the finding, add defects, mention evidence IDs to the human, or "
+        "emit markdown fences."
+    ),
     "finalizer": (
         "Select or reorder only exact controller-provided behavioral sentences from "
         "handoff_summary_candidates; do not author prose. Return one object using only "
@@ -393,6 +406,7 @@ class CliConfig:
             "specialist": specialist_model,
             "negotiator": critic_model,
             "critic": critic_model,
+            "remediator": critic_model,
             "finalizer": source.get("SPECIALIST_AGGREGATOR_MODEL", "").strip() or model,
         }
         context_tokens = _positive_int(
@@ -961,6 +975,11 @@ def build_controller(
         role_response_format,
         runtime_logger=runtime_logger,
     )
+    remediator = _BoundedRoleAdapter(
+        gateway, _role_prompt(config.system_prompt, "remediator"),
+        config.recovery_max_tokens, role_response_format,
+        runtime_logger=runtime_logger,
+    )
     finalizer = _BoundedRoleAdapter(
         gateway, _role_prompt(config.system_prompt, "handoff_summarizer"),
         config.max_tokens,
@@ -1129,6 +1148,7 @@ def build_controller(
         session_factory=session_factory,
         negotiator=negotiator,
         critic=critic,
+        remediator=remediator,
         finalizer=finalizer,
         artifact_output_root=config.artifact_root,
         event_sink=event_sink,

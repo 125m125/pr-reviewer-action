@@ -134,7 +134,8 @@ flowchart TD
     F --> FIN[Final specialist checkpoints/finalization]
     FIN --> CR[Critic<br/><small>LLM: keep, reject, merge, verify</small>]
     CR --> ADJ[Deterministic adjudicator<br/><small>evidence, consequence, severity, location</small>]
-    ADJ --> HAND[Handoff summarizer<br/><small>LLM presentation role</small>]
+    ADJ --> REM[Remediator<br/><small>LLM: exact suggestion, guidance, or skip</small>]
+    REM --> HAND[Handoff summarizer<br/><small>LLM presentation role</small>]
     HAND --> PUB[Publish notes and human handoff]
 ```
 
@@ -146,6 +147,9 @@ bounded next action. A compact-resume checkpoint continues the same session
 only when it demonstrates meaningful progress; repeated no-progress checkpoints
 remain paused. The negotiator can later decide whether that session deserves a
 bounded follow-up. The critic does not schedule sessions.
+The remediator runs only for accepted findings, without tools, and cannot alter
+the finding or verdict. Invalid, skipped, or failed remediation is omitted while
+the original finding remains publishable.
 
 What it supports:
 

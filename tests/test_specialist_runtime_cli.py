@@ -1039,9 +1039,11 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
     assert gateway.role_models == {
         "change_summarizer": "planner", "planner": "planner",
         "specialist": "worker", "negotiator": "critic",
-        "critic": "critic", "finalizer": "finalizer",
+        "critic": "critic", "remediator": "critic", "finalizer": "finalizer",
     }
     assert controller.change_summarizer.gateway is gateway
+    assert controller.remediator.gateway is gateway
+    assert controller.remediator.max_tokens == 456
     assert gateway.stream_watchdog is False
     assert gateway.structured_chat_template_kwargs == {"enable_thinking": False}
     assert config.request_timeout_sec == 41

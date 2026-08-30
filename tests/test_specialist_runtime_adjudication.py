@@ -21,6 +21,7 @@ from pr_reviewer.specialist_runtime.types import (
     CandidateFinding,
     CoverageObligation,
     ReviewNoteKind,
+    FindingRemediation,
 )
 
 
@@ -970,6 +971,47 @@ def test_finding_note_groups_machine_citations_into_human_evidence_summary():
     assert implementation_id not in note.markdown
     assert diff.id not in note.markdown
     assert "content hash" not in note.markdown
+
+
+def test_finding_note_renders_validated_exact_remediation_as_suggestion():
+    store, evidence_id = _store()
+    candidate = _candidate(evidence_ids=(evidence_id,))
+    review = _adjudicate((candidate,), {candidate.candidate_id: "keep"}, store)
+    finding = review.accepted[0]
+
+    note = build_review_notes(
+        review, store, "review_comment",
+        obligations=_obligations(), changed_files=CHANGED_FILES,
+        remediations={finding.root_cause_fingerprint: FindingRemediation(
+            kind="exact",
+            replacement="return persist_once(record)",
+            start_line=41,
+            end_line=41,
+        )},
+    )[0]
+
+    assert "**Suggested change:**" in note.markdown
+    assert "```suggestion\nreturn persist_once(record)\n```" in note.markdown
+    assert note.start_line == 41
+
+
+def test_finding_note_renders_guidance_without_machine_diagnostics():
+    store, evidence_id = _store()
+    candidate = _candidate(evidence_ids=(evidence_id,))
+    review = _adjudicate((candidate,), {candidate.candidate_id: "keep"}, store)
+    finding = review.accepted[0]
+
+    note = build_review_notes(
+        review, store, "review_comment",
+        obligations=_obligations(), changed_files=CHANGED_FILES,
+        remediations={finding.root_cause_fingerprint: FindingRemediation(
+            kind="guidance",
+            guidance="Preserve the idempotency key across the retry boundary.",
+        )},
+    )[0]
+
+    assert "**Suggested approach:**" in note.markdown
+    assert "Preserve the idempotency key" in note.markdown
 
 
 def test_missing_structured_consequence_or_validation_downgrades_to_verification():

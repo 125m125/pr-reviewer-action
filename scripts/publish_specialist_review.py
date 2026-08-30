@@ -75,6 +75,7 @@ def _notes(value: object) -> tuple[ReviewNote, ...]:
             evidence_ids=tuple(item.get("evidence_ids") or ()),
             file=item.get("file"),
             line=item.get("line"),
+            start_line=item.get("start_line"),
             severity=item.get("severity"),
         ))
     return tuple(notes)

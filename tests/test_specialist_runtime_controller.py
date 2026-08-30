@@ -1243,6 +1243,119 @@ def test_controller_runs_obligations_assignments_sessions_and_finalizer(tmp_path
     ]
 
 
+def test_controller_generates_guidance_for_accepted_finding_without_degrading(tmp_path):
+    calls = []
+
+    def remediator(request):
+        calls.append(request)
+        return {
+            "kind": "guidance",
+            "guidance": "Keep the delivery idempotency key stable across retries.",
+        }
+
+    result = _controller(tmp_path, remediator=remediator).run(_inputs(tmp_path))
+
+    assert len(calls) == 1
+    assert calls[0].role == "remediator"
+    assert calls[0].context["finding"]["claim"] == "A retry can process one delivery twice"
+    assert "evidence_context" in calls[0].context
+    assert "Suggested approach" in result.notes[0].markdown
+    assert result.artifact["remediation"]["generated"] == 1
+    assert not any(
+        item["component"] == "remediator"
+        for item in result.artifact["degradation"]
+    )
+
+
+def test_invalid_remediation_is_omitted_without_losing_finding(tmp_path):
+    result = _controller(
+        tmp_path,
+        remediator=lambda _request: {
+            "kind": "exact", "start_line": 999, "end_line": 999,
+            "replacement": "unsafe()",
+        },
+    ).run(_inputs(tmp_path))
+
+    assert len(result.artifact["accepted_candidates"]) == 1
+    assert "Suggested change" not in result.notes[0].markdown
+    assert result.artifact["remediation"]["generated"] == 0
+    assert result.artifact["remediation"]["diagnostics"][0]["status"] == "rejected"
+
+
+def test_controller_generates_exact_remediation_from_retained_diff(tmp_path):
+    class DiffSession(_SuccessfulSession):
+        def explore(self):
+            result = super().explore()
+            diff = self.evidence_store.add_tool_result(
+                session_id=self.session_id,
+                tool="read_pr_diff",
+                arguments={"path": "src/worker.py"},
+                result={
+                    "status": "ok",
+                    "content": (
+                        "diff --git a/src/worker.py b/src/worker.py\n"
+                        "--- a/src/worker.py\n+++ b/src/worker.py\n"
+                        "@@ -6,2 +6,2 @@\n context\n+def process(): pass\n"
+                    ),
+                },
+                category="implementation",
+                source="src/worker.py",
+            )
+            candidate = replace(
+                self.candidate_findings[0],
+                supporting_evidence_ids=(
+                    *self.candidate_findings[0].supporting_evidence_ids, diff.id,
+                ),
+            )
+            self.candidate_findings = (candidate,)
+            return replace(
+                result,
+                checkpoint=replace(
+                    result.checkpoint,
+                    evidence_ids=(*result.checkpoint.evidence_ids, diff.id),
+                ),
+            )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return DiffSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    result = _controller(
+        tmp_path,
+        session_factory=factory,
+        remediator=lambda _request: {
+            "kind": "exact", "start_line": 7, "end_line": 7,
+            "replacement": "def process(): return process_once()",
+        },
+    ).run(_inputs(tmp_path))
+
+    assert "```suggestion" in result.notes[0].markdown
+    assert result.artifact["remediation"]["generated"] == 1
+
+
+@pytest.mark.parametrize("behavior, expected_status", [
+    (lambda _request: {"kind": "skip", "reason": "No safe local edit."}, "skipped"),
+    (lambda _request: (_ for _ in ()).throw(RuntimeError("provider failed")), "rejected"),
+])
+def test_remediation_skip_or_failure_never_degrades_review(
+    tmp_path, behavior, expected_status,
+):
+    result = _controller(tmp_path, remediator=behavior).run(_inputs(tmp_path))
+
+    assert len(result.artifact["accepted_candidates"]) == 1
+    assert result.artifact["remediation"]["generated"] == 0
+    assert result.artifact["remediation"]["diagnostics"][0]["status"] == expected_status
+    assert not any(
+        item["component"] == "remediator"
+        for item in result.artifact["degradation"]
+    )
+
+
 @pytest.mark.parametrize(
     ("excluded_recipes", "expected_status"),
     [

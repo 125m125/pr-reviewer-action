@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 from pr_reviewer.conversation import Conversation
 from pr_reviewer.specialists import classify_file_roles
 from .adjudication import (
+    AcceptedFinding,
     AdjudicatedReview,
     ReviewHandoffContext,
     ReviewOrientationTopic,
@@ -83,6 +84,7 @@ from .scheduler import SessionScheduler, WaveResult, WaveSnapshot
 from .types import (
     BudgetUsage,
     CandidateFinding,
+    FindingRemediation,
     change_overview_orientation,
     CoverageObligation,
     ObligationStatus,
@@ -1793,6 +1795,8 @@ class _RunState:
     unknowns: list[dict[str, object]] = field(default_factory=list)
     degradations: list[dict[str, str]] = field(default_factory=list)
     review: AdjudicatedReview = field(default_factory=AdjudicatedReview)
+    remediations: dict[str, FindingRemediation] = field(default_factory=dict)
+    remediation_diagnostics: list[dict[str, object]] = field(default_factory=list)
     handoff: ReviewHandoff = field(default_factory=ReviewHandoff)
     notes: tuple[ReviewNote, ...] = ()
     verdict: str = "notice"
@@ -2297,6 +2301,7 @@ class ReviewController:
         negotiator: object | None = None,
         critic: object | None = None,
         repairer: object | None = None,
+        remediator: object | None = None,
         finalizer: object | None = None,
         evidence_store: EvidenceStore | None = None,
         evidence_seed: EvidenceSeed | None = None,
@@ -2326,8 +2331,10 @@ class ReviewController:
         self.critic = critic
         # Kept as a source-compatible constructor argument. Candidate proof
         # repair now happens at report/checkpoint admission, while the critic
-        # remains the final adjudicator; no post-adjudication repair call is made.
+        # remains the final adjudicator. The separate remediator can only add
+        # presentation guidance after acceptance; it cannot repair proof.
         self.repairer = repairer
+        self.remediator = remediator
         self.finalizer = finalizer
         self._provided_evidence_store = evidence_store
         self._evidence_seed = evidence_seed
@@ -4393,6 +4400,177 @@ class ReviewController:
             status=status,
         )
 
+    @staticmethod
+    def _remediation_evidence_context(
+        state: _RunState, finding: AcceptedFinding,
+    ) -> tuple[dict[str, object], ...]:
+        cited = set(finding.supporting_evidence_ids).union(
+            finding.contradicting_evidence_ids
+        )
+        selected = []
+        used = 0
+        for record in state.evidence.snapshot().records:
+            if record.id not in cited:
+                continue
+            content = str(record.content or "")
+            remaining = 16_000 - used
+            if remaining <= 0:
+                break
+            excerpt = content[:min(6_000, remaining)]
+            used += len(excerpt)
+            selected.append({
+                "evidence_id": record.id,
+                "category": record.category,
+                "tool": record.tool,
+                "path": record.source_path,
+                "content": excerpt,
+                "truncated": record.truncated or len(excerpt) < len(content),
+            })
+        return tuple(selected)
+
+    @staticmethod
+    def _remediation_diff_lines(
+        evidence_context: Iterable[Mapping[str, object]], path: str,
+    ) -> set[int]:
+        lines: set[int] = set()
+        hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+        for item in evidence_context:
+            if item.get("tool") != "read_pr_diff" or item.get("path") != path:
+                continue
+            current: int | None = None
+            for raw in str(item.get("content") or "").splitlines():
+                if raw.startswith(("diff --git ", "--- ", "+++ ")):
+                    current = None
+                    continue
+                match = hunk.match(raw)
+                if match:
+                    current = int(match.group(1))
+                elif current is not None and raw.startswith("-"):
+                    continue
+                elif current is not None and not raw.startswith("\\"):
+                    lines.add(current)
+                    current += 1
+        return lines
+
+    @classmethod
+    def _validate_remediation(
+        cls,
+        value: object,
+        finding: AcceptedFinding,
+        evidence_context: tuple[dict[str, object], ...],
+    ) -> FindingRemediation | None:
+        if not isinstance(value, Mapping):
+            raise ValueError("remediation response must be an object")
+        kind = str(value.get("kind") or "").strip().lower()
+        if kind == "skip":
+            if set(value) - {"kind", "reason"}:
+                raise ValueError("skip remediation contains unsupported fields")
+            return None
+        if kind == "guidance":
+            if set(value) - {"kind", "guidance"}:
+                raise ValueError("guidance remediation contains unsupported fields")
+            guidance = " ".join(str(value.get("guidance") or "").split())
+            if not guidance:
+                raise ValueError("guidance remediation requires guidance")
+            return FindingRemediation(
+                kind="guidance", guidance=_mask_runtime_text(guidance)[:1000],
+            )
+        if kind != "exact":
+            raise ValueError("remediation kind must be exact, guidance, or skip")
+        if set(value) - {"kind", "start_line", "end_line", "replacement"}:
+            raise ValueError("exact remediation contains unsupported fields")
+        start = value.get("start_line")
+        end = value.get("end_line")
+        replacement = str(value.get("replacement") or "").rstrip("\n")
+        if (
+            not isinstance(start, int) or isinstance(start, bool)
+            or not isinstance(end, int) or isinstance(end, bool)
+            or start <= 0 or end < start or end - start >= 20
+        ):
+            raise ValueError("exact remediation requires a valid range of at most 20 lines")
+        if finding.line is None or end != finding.line:
+            raise ValueError("exact remediation range must end at the finding line")
+        diff_lines = cls._remediation_diff_lines(evidence_context, finding.affected_file)
+        if not diff_lines or any(line not in diff_lines for line in range(start, end + 1)):
+            raise ValueError("exact remediation range is not present in retained PR diff evidence")
+        if (
+            not replacement or len(replacement.encode("utf-8")) > 4_000
+            or len(replacement.splitlines()) > 40
+            or "```" in replacement
+            or "<!-- ai-pr-review" in replacement.lower()
+            or _mask_runtime_text(replacement) != replacement
+        ):
+            raise ValueError("exact remediation replacement is unsafe or exceeds its bound")
+        return FindingRemediation(
+            kind="exact", replacement=replacement,
+            start_line=start, end_line=end,
+        )
+
+    def _generate_remediations(self, state: _RunState) -> None:
+        if self.remediator is None:
+            return
+        for finding in state.review.accepted:
+            evidence_context = self._remediation_evidence_context(state, finding)
+            diagnostic: dict[str, object] = {
+                "finding_id": finding.root_cause_fingerprint,
+                "status": "started",
+            }
+            state.journal.emit("remediation_started", diagnostic)
+            if state.deadline.remaining(now=self.clock()) <= 0:
+                diagnostic.update({
+                    "status": "skipped",
+                    "reason": "no finalization time remained after the human handoff",
+                })
+                state.remediation_diagnostics.append(diagnostic)
+                state.journal.emit("remediation_completed", diagnostic)
+                continue
+            try:
+                value = self._model_request(
+                    state,
+                    role="remediator",
+                    request_id=f"remediator:{finding.root_cause_fingerprint[:24]}",
+                    phase=RunPhase.FINALIZATION,
+                    component=self.remediator,
+                    method="generate",
+                    context={
+                        "finding": {
+                            "finding_id": finding.root_cause_fingerprint,
+                            "claim": finding.claim,
+                            "user_visible_consequence": finding.user_visible_consequence,
+                            "causal_chain": finding.causal_chain,
+                            "severity": finding.severity,
+                            "category": finding.category,
+                            "affected_path": finding.affected_file,
+                            "affected_line": finding.line,
+                            "manual_validation": finding.manual_validation,
+                        },
+                        "evidence_context": evidence_context,
+                        "output_contract": {
+                            "exact": {
+                                "kind": "exact", "start_line": "integer",
+                                "end_line": "integer", "replacement": "string",
+                            },
+                            "guidance": {"kind": "guidance", "guidance": "string"},
+                            "skip": {"kind": "skip", "reason": "string"},
+                        },
+                    },
+                )
+                remediation = self._validate_remediation(
+                    value, finding, evidence_context,
+                )
+                if remediation is not None:
+                    state.remediations[finding.root_cause_fingerprint] = remediation
+                    diagnostic.update({"status": "generated", "kind": remediation.kind})
+                else:
+                    diagnostic.update({"status": "skipped", "reason": _mask_runtime_text(
+                        str(value.get("reason") or "model declined remediation")
+                        if isinstance(value, Mapping) else "model declined remediation"
+                    )[:300]})
+            except BaseException as exc:
+                diagnostic.update({"status": "rejected", "reason": _bounded_error(exc)})
+            state.remediation_diagnostics.append(diagnostic)
+            state.journal.emit("remediation_completed", diagnostic)
+
     def _finalize_products(self, state: _RunState) -> None:
         assert state.coverage is not None
         obligation_map = {item.id: item for item in state.obligations}
@@ -4443,6 +4621,7 @@ class ReviewController:
                     *state.retention_verification_requests,
                 ),
                 source_access_requests=state.source_requests,
+                remediations=state.remediations,
             )
         except Exception as exc:
             self._degrade(state, "review_notes", _bounded_error(exc))
@@ -4668,6 +4847,24 @@ class ReviewController:
             state.handoff = self._minimal_handoff(
                 state.verdict, bool(state.degradations),
             )
+        self._generate_remediations(state)
+        if state.remediations:
+            try:
+                state.notes = build_review_notes(
+                    state.review, state.evidence, state.effective_publishing_mode,
+                    obligations=obligation_map,
+                    changed_files=state.inputs.changed_files,
+                    verification_requests=(
+                        *state.inputs.verification_requests,
+                        *state.retention_verification_requests,
+                    ),
+                    source_access_requests=state.source_requests,
+                    remediations=state.remediations,
+                )
+            except Exception as exc:
+                state.journal.emit("remediation_note_render_failed", {
+                    "reason": _bounded_error(exc),
+                })
 
     def _phase_allocations(self, state: _RunState) -> list[dict[str, object]]:
         shares = state.inputs.config.phase_shares
@@ -4793,6 +4990,10 @@ class ReviewController:
             "rejected_candidate_diagnostics": (
                 self._rejected_candidate_diagnostics(state)
             ),
+            "remediation": {
+                "generated": len(state.remediations),
+                "diagnostics": list(state.remediation_diagnostics),
+            },
             "artifact_id": run_id,
             "artifact_write": {
                 "status": "ready" if path is not None else "failed",
@@ -5891,6 +6092,10 @@ class ReviewController:
                 "rejected_candidate_diagnostics": (
                     self._rejected_candidate_diagnostics(state)
                 ),
+                "remediation": {
+                    "generated": len(state.remediations),
+                    "diagnostics": list(state.remediation_diagnostics),
+                },
                 "candidate_unknowns": [
                     _json_value(item) for item in state.review.unknowns
                 ],
