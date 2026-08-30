@@ -519,6 +519,40 @@ def test_critic_cannot_publish_candidate_without_retained_evidence():
     assert review.verification_requests[0].reason == "missing-retained-evidence"
 
 
+def test_authorized_merge_source_is_kept_when_target_is_not_authoritative():
+    store, evidence_id = _store()
+    target = _candidate(
+        "candidate-target",
+        evidence_ids=(evidence_id, "MISSING"),
+    )
+    source = _candidate("candidate-source", evidence_ids=(evidence_id,))
+
+    review = _adjudicate(
+        (target, source),
+        {"actions": [
+            {"candidate_id": target.candidate_id, "action": "keep"},
+            {
+                "candidate_id": source.candidate_id,
+                "action": "merge",
+                "target_id": target.candidate_id,
+            },
+        ]},
+        store,
+    )
+
+    assert [item.candidate_id for item in review.accepted] == [source.candidate_id]
+    assert [item.candidate.candidate_id for item in review.verification_requests] == [
+        target.candidate_id,
+    ]
+    source_disposition = next(
+        item for item in review.dispositions
+        if item.candidate_id == source.candidate_id
+    )
+    assert source_disposition.action == "keep"
+    assert source_disposition.reason == "invalid-merge-target-kept"
+    assert source_disposition.target_id == target.candidate_id
+
+
 def test_fingerprint_normalizes_file_category_claim_and_ignores_line():
     store, evidence_id = _store()
     first = _candidate(evidence_ids=(evidence_id,))

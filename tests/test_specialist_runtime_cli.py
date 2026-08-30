@@ -549,6 +549,26 @@ def test_runtime_defect_synthesis_line_explains_repair_failures():
     assert "one repair response hit its output limit" in line
 
 
+def test_runtime_event_line_reports_candidate_disposition():
+    from pr_reviewer.specialist_runtime.events import RunEvent
+
+    line = cli._runtime_event_line(RunEvent(
+        6,
+        "candidate_disposition",
+        {
+            "candidate_id": "candidate-source",
+            "action": "keep",
+            "reason": "invalid-merge-target-kept",
+            "target_id": "candidate-target",
+        },
+    ))
+
+    assert "candidate candidate-source" in line
+    assert "action=keep" in line
+    assert "reason=invalid-merge-target-kept" in line
+    assert "target=candidate-target" in line
+
+
 def test_runtime_event_line_explains_record_unknown_negotiation_action():
     from pr_reviewer.specialist_runtime.events import RunEvent
 

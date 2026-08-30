@@ -1745,6 +1745,97 @@ def test_controller_collects_candidate_added_during_session_finalization(tmp_pat
     ] == ["candidate-delivery"]
 
 
+def test_controller_admits_evidence_from_successful_session_finalization(tmp_path):
+    class FinalizationEvidenceSession(_SuccessfulSession):
+        def explore(self):
+            result = super().explore()
+            self.candidate_findings = ()
+            self.exploration_result = replace(
+                result,
+                checkpoint=replace(result.checkpoint, candidate_finding_ids=()),
+            )
+            return self.exploration_result
+
+        def finalize(self):
+            record = self.evidence_store.add_tool_result(
+                session_id=self.session_id,
+                tool="read_pr_diff",
+                arguments={"path": "src/worker.py"},
+                result={
+                    "status": "ok",
+                    "content": "diff --git a/src/worker.py b/src/worker.py",
+                },
+                category="implementation",
+            )
+            obligation_id = self.assignment.obligation_ids[0]
+            self.candidate_findings = (CandidateFinding(
+                candidate_id="candidate-finalization-evidence",
+                root_cause_fingerprint="model-value",
+                claim="A retry can process one delivery twice",
+                affected_location="src/worker.py:7",
+                causal_chain=(
+                    "The retry path repeats processing after an ambiguous result."
+                ),
+                severity="minor",
+                category="failure_recovery",
+                supporting_evidence_ids=(record.id,),
+                related_obligation_ids=(obligation_id,),
+                collector_session_id=self.session_id,
+                model_identity="specialist-test",
+                confidence_rationale=(
+                    "consequence_support:reachable_input_path; "
+                    f"evidence_ids={record.id}; input=ambiguous result; "
+                    "condition=retry path repeats processing; "
+                    "outcome=One delivery can be applied twice"
+                ),
+                user_visible_consequence="One delivery can be applied twice.",
+                manual_validation=(
+                    "Force the retry path and verify one processing result."
+                ),
+            ),)
+            return replace(
+                self.exploration_result,
+                state=SessionState.COMPLETE,
+                checkpoint=replace(
+                    self.exploration_result.checkpoint,
+                    evidence_ids=(
+                        *self.exploration_result.checkpoint.evidence_ids,
+                        record.id,
+                    ),
+                    candidate_finding_ids=(
+                        "candidate-finalization-evidence",
+                    ),
+                ),
+                report={
+                    "summary": "Finalization evidence admitted a candidate.",
+                    "recommendation": "controller-review-required",
+                },
+            )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return FinalizationEvidenceSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    result = _controller(tmp_path, session_factory=factory).run(_inputs(tmp_path))
+
+    assert [
+        item["candidate_id"] for item in result.artifact["accepted_candidates"]
+    ] == ["candidate-finalization-evidence"]
+    accepted_evidence = result.artifact["accepted_candidates"][0][
+        "supporting_evidence_ids"
+    ]
+    assert any(
+        item["evidence_id"] in accepted_evidence
+        and item["collector_session_id"].startswith("session:")
+        for item in result.artifact["evidence"]
+    )
+
+
 def test_checkpoint_diagnostic_projection_allowlists_bounded_lifecycle_fields(tmp_path):
     diagnostic = {
         "reason": "context-pressure",

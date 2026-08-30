@@ -5846,6 +5846,9 @@ class ReviewController:
                     state, key, "finalize", RunPhase.FINALIZATION,
                 )
                 if succeeded and result is not None:
+                    state.evidence.merge_completed_snapshot(
+                        session.evidence.snapshot(),
+                    )
                     state.session_results[(session.assignment.id, result.session_id)] = result
                     self._promote_degraded_session_result(
                         state, session.assignment.id, result,

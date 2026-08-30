@@ -1909,6 +1909,15 @@ def _runtime_event_line(
             f"specialist {session_id} defect synthesis: "
             + (" ".join(details) if details else "recorded")
         )
+    if kind == "candidate_disposition":
+        candidate_id = _compact_text(payload.get("candidate_id"), 120)
+        action = _compact_text(payload.get("action"), 40)
+        reason = _compact_text(payload.get("reason"), 160)
+        target = _compact_text(payload.get("target_id"), 120)
+        details = f"action={action} reason={reason}"
+        if target:
+            details += f" target={target}"
+        return f"candidate {candidate_id} disposition: {details}"
     if kind == "specialist_initializing":
         return (
             f"initializing specialist {session_id} assignment="

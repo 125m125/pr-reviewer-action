@@ -1461,13 +1461,12 @@ def adjudicate_candidates(
         target = accepted.get(target_id)
         if target is None:
             for source in sources:
-                _record_verification_or_platform_rejection(
-                    candidate_by_id[source.candidate_id],
-                    "merge-target-not-authoritative",
-                    verification=verification,
-                    rejected=rejected,
-                    dispositions=dispositions,
-                    target_id=target_id,
+                accepted[source.candidate_id] = source
+                dispositions[source.candidate_id] = CandidateDisposition(
+                    source.candidate_id,
+                    "keep",
+                    "invalid-merge-target-kept",
+                    target_id,
                 )
             continue
         accepted[target_id] = _merge_findings(
