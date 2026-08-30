@@ -374,8 +374,23 @@ def test_topology_extracts_bounded_changed_hunk_context():
     assert topology["changed_contract_facts"]["worker/delivery.py"][
         "hunk_summaries"
     ] == [
-        "new lines 18-24: def deliver(message):",
-        "new lines 76-78: class RetryQueue:",
+        "changed hunk at new-file lines 18-24: def deliver(message):",
+        "changed hunk at new-file lines 76-78: class RetryQueue:",
+    ]
+
+
+def test_change_facts_describe_modified_hunks_without_claiming_new_symbols():
+    facts = specialists._facts_from_patch(
+        "pr_reviewer/github_review_notes.py",
+        "M",
+        (
+            "@@ -640,4 +640,4 @@ def _native_event(policy_result):\n"
+            " context\n-    return old\n+    return new\n"
+        ),
+    )
+
+    assert facts["hunk_summaries"] == [
+        "changed hunk at new-file lines 640-643: def _native_event(policy_result):",
     ]
 
 
@@ -401,7 +416,7 @@ def test_modified_python_function_is_a_changed_contract_fact():
     ]
     assert facts["symbols"] == ["_handoff_context"]
     assert facts["hunk_summaries"] == [
-        "new lines 2110-2116: def _handoff_context(self, state, status):",
+        "changed hunk at new-file lines 2110-2116: def _handoff_context(self, state, status):",
     ]
 
 

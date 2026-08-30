@@ -4429,12 +4429,54 @@ class ReviewController:
         return tuple(selected)
 
     @staticmethod
+    def _remediation_validation_context(
+        state: _RunState,
+        finding: AcceptedFinding,
+        evidence_context: tuple[dict[str, object], ...],
+    ) -> tuple[dict[str, object], ...]:
+        """Add immutable path diffs needed to validate a safe suggestion.
+
+        Candidate consolidation may retain only the evidence cited by the
+        winning candidate.  Anchor validation must still use the controller's
+        authoritative PR diff for the affected path, otherwise a valid
+        suggestion can be rejected merely because another candidate performed
+        the diff read.
+        """
+        selected = list(evidence_context)
+        selected_ids = {str(item.get("evidence_id") or "") for item in selected}
+        used = sum(len(str(item.get("content") or "")) for item in selected)
+        for record in state.evidence.snapshot().records:
+            if (
+                record.id in selected_ids
+                or record.tool != "read_pr_diff"
+                or record.source_path != finding.affected_file
+            ):
+                continue
+            remaining = 16_000 - used
+            if remaining <= 0:
+                break
+            excerpt = record.content[:min(6_000, remaining)]
+            used += len(excerpt)
+            selected.append({
+                "evidence_id": record.id,
+                "category": record.category,
+                "tool": record.tool,
+                "path": record.source_path,
+                "content": excerpt,
+                "truncated": record.truncated or len(excerpt) < len(record.content),
+            })
+        return tuple(selected)
+
+    @staticmethod
     def _remediation_diff_lines(
         evidence_context: Iterable[Mapping[str, object]], path: str,
         *, added_only: bool = False,
     ) -> set[int]:
         lines: set[int] = set()
         hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+        numbered = re.compile(
+            r"^([ +-]) \[LEFT (?:\d+|-) \| RIGHT (\d+|-)\]"
+        )
         for item in evidence_context:
             if item.get("tool") != "read_pr_diff" or item.get("path") != path:
                 continue
@@ -4446,6 +4488,12 @@ class ReviewController:
                 match = hunk.match(raw)
                 if match:
                     current = int(match.group(1))
+                elif (numbered_match := numbered.match(raw)):
+                    right_line = numbered_match.group(2)
+                    if right_line != "-":
+                        is_added = numbered_match.group(1) == "+"
+                        if not added_only or is_added:
+                            lines.add(int(right_line))
                 elif current is not None and raw.startswith("-"):
                     continue
                 elif current is not None and not raw.startswith("\\"):
@@ -4522,6 +4570,9 @@ class ReviewController:
             return
         for finding in state.review.accepted:
             evidence_context = self._remediation_evidence_context(state, finding)
+            validation_context = self._remediation_validation_context(
+                state, finding, evidence_context,
+            )
             diagnostic: dict[str, object] = {
                 "finding_id": finding.root_cause_fingerprint,
                 "status": "started",
@@ -4570,7 +4621,7 @@ class ReviewController:
                     },
                 )
                 remediation = self._validate_remediation(
-                    value, finding, evidence_context,
+                    value, finding, validation_context,
                 )
                 if remediation is not None:
                     state.remediations[finding.root_cause_fingerprint] = remediation

@@ -1372,6 +1372,59 @@ def test_controller_generates_exact_remediation_from_retained_diff(tmp_path):
     assert result.artifact["remediation"]["generated"] == 1
 
 
+def test_exact_remediation_uses_authoritative_diff_even_when_finding_did_not_cite_it(
+    tmp_path,
+):
+    class UncitedDiffSession(_SuccessfulSession):
+        def explore(self):
+            result = super().explore()
+            diff = self.evidence_store.add_tool_result(
+                session_id=self.session_id,
+                tool="read_pr_diff",
+                arguments={"path": "src/worker.py"},
+                result={
+                    "status": "ok",
+                    "content": (
+                        "diff --git a/src/worker.py b/src/worker.py\n"
+                        "--- a/src/worker.py\n+++ b/src/worker.py\n"
+                        "@@ -6,2 +6,2 @@\n"
+                        " context\n+def process(): pass\n"
+                    ),
+                },
+                category="implementation",
+                source="src/worker.py",
+            )
+            # The finding cites only its original evidence.  The controller
+            # still owns the immutable diff and must use it for safe anchors.
+            return replace(
+                result,
+                checkpoint=replace(
+                    result.checkpoint,
+                    evidence_ids=(*result.checkpoint.evidence_ids, diff.id),
+                ),
+            )
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return UncitedDiffSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    result = _controller(
+        tmp_path,
+        session_factory=factory,
+        remediator=lambda _request: {
+            "kind": "exact", "start_line": 7, "end_line": 7,
+            "replacement": "def process(): return process_once()",
+        },
+    ).run(_inputs(tmp_path))
+
+    assert result.artifact["remediation"]["generated"] == 1
+
+
 def test_controller_allows_nearby_exact_remediation_anchor(tmp_path):
     class DiffSession(_SuccessfulSession):
         def explore(self):

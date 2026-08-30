@@ -327,9 +327,11 @@ def _facts_from_patch(
                     "(no new lines)"
                 )
             elif count == 1:
-                line_label = f"new line {start}"
+                line_label = f"changed hunk at new-file line {start}"
             else:
-                line_label = f"new lines {start}-{start + count - 1}"
+                line_label = (
+                    f"changed hunk at new-file lines {start}-{start + count - 1}"
+                )
             context = re.sub(
                 r"[^A-Za-z0-9 _().,:/+[\]-]+", " ",
                 hunk_match.group(3),
