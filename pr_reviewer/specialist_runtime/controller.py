@@ -65,7 +65,6 @@ from .coverage import (
     session_ownership_for_assignment,
 )
 from .evidence import EvidenceSnapshot, EvidenceStore
-from .test_results import seed_test_results
 from .events import EventJournal, RunEvent
 from .negotiation import (
     NegotiationAction,
@@ -97,6 +96,7 @@ from .web_evidence import (
     SourceAccessRequest,
     access_request_identity,
 )
+from pr_reviewer.transport import is_model_endpoint_unavailable
 
 
 # The remediator's model prompt is intentionally bounded.  Anchor validation
@@ -2897,6 +2897,8 @@ class ReviewController:
                 })
             return result.plan
         except Exception as exc:
+            if is_model_endpoint_unavailable(exc):
+                raise
             diagnostic = _bounded_error(exc)
             state.planner_diagnostics.append(diagnostic)
             state.journal.emit("planner_transformation_ignored", {
@@ -2987,6 +2989,8 @@ class ReviewController:
                 )
                 return _validated_change_overview(repaired, state.inputs)
         except Exception as exc:
+            if is_model_endpoint_unavailable(exc):
+                raise
             state.journal.emit("recovery", {
                 "component": "change_summarizer",
                 "action": "deterministic-fallback",
@@ -3052,6 +3056,7 @@ class ReviewController:
         args = (
             assignment, lease, snapshot, local_evidence, local_coverage,
             state.obligations, expected_session_id, state.change_overview,
+            state.inputs.test_results,
         )
         session = factory(*args if any(
             item.kind is inspect.Parameter.VAR_POSITIONAL
@@ -5593,6 +5598,8 @@ class ReviewController:
         try:
             return self._run_impl(inputs, terminal_capture)
         except BaseException as exc:
+            if is_model_endpoint_unavailable(exc):
+                raise
             return self._last_resort_result(identity, terminal_capture, exc)
 
     def _run_impl(
@@ -5664,15 +5671,8 @@ class ReviewController:
                         "evidence_store_factory must return EvidenceStore"
                     )
             if inputs.test_results:
-                seeded = seed_test_results(
-                    state.evidence,
-                    inputs.test_results,
-                    repository=inputs.repository,
-                    head_sha=inputs.head_sha,
-                )
-                journal.emit("test_results_seeded", {
-                    "count": len(seeded),
-                    "evidence_ids": list(seeded),
+                journal.emit("test_results_indexed", {
+                    "count": len(inputs.test_results),
                 })
             journal.emit("run_started", {
                 "repository": inputs.repository,
@@ -6007,6 +6007,8 @@ class ReviewController:
                 status=self._review_status(state),
             )
         except BaseException as exc:  # terminal artifact survives every controlled failure
+            if is_model_endpoint_unavailable(exc):
+                raise
             self._finish_after_unexpected(state, exc)
             if state.coverage is None:
                 state.coverage = CoverageLedger(())

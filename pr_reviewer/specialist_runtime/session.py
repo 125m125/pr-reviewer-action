@@ -30,6 +30,7 @@ from .evidence import EvidenceRecord, EvidenceStore
 from .model_gateway import ModelGateway, ModelTurnRequest, ModelTurnResult
 from .obligation_assessment import ObligationAssessmentLedger
 from .request_attempts import RequestAttemptJournal
+from .test_results import retain_test_result
 from .types import (
     BudgetUsage,
     CandidateFinding,
@@ -1121,6 +1122,9 @@ class SpecialistSession:
         max_tool_result_bytes: int = 12_000,
         changed_files: tuple[str, ...] = (),
         change_overview: Mapping[str, object] | None = None,
+        test_results: tuple[Mapping[str, object], ...] = (),
+        test_results_repository: str = "",
+        test_results_head_sha: str = "",
     ) -> None:
         if not session_id.strip():
             raise ValueError("session_id must not be empty")
@@ -1160,6 +1164,13 @@ class SpecialistSession:
         self.clock = clock
         self.wire_safety_tokens = max(0, int(wire_safety_tokens))
         self.max_tool_result_bytes = max(0, int(max_tool_result_bytes))
+        if not isinstance(test_results, tuple) or any(
+            not isinstance(item, Mapping) for item in test_results
+        ):
+            raise TypeError("test_results must be a tuple of mappings")
+        self.test_results = test_results
+        self.test_results_repository = str(test_results_repository).strip()
+        self.test_results_head_sha = str(test_results_head_sha).strip()
         self.changed_files = tuple(dict.fromkeys(
             str(path).replace("\\", "/").strip("/")
             for path in (
@@ -1264,10 +1275,7 @@ class SpecialistSession:
         # an untrusted fork). Do not advertise an otherwise tool-free catalogue
         # when no results were seeded; this preserves the fork/tool isolation
         # contract and avoids presenting unusable tools.
-        has_test_results = any(
-            record.category.casefold() == "test-result"
-            for record in self.evidence_store.snapshot().records
-        )
+        has_test_results = bool(self.test_results)
         local_schemas = tuple(
             item for item in _OBLIGATION_LOCAL_TOOL_SCHEMAS
             if item.get("name") != TEST_RESULTS_TOOL_NAME or has_test_results
@@ -5151,16 +5159,7 @@ class SpecialistSession:
         requested_status = str(arguments.get("status") or "").casefold()
         matches: list[dict[str, Any]] = []
         total = 0
-        for record in self.evidence_store.snapshot().records:
-            if record.category.casefold() != "test-result":
-                continue
-            try:
-                payload = json.loads(record.content)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            test = payload.get("test") if isinstance(payload, Mapping) else None
-            if not isinstance(test, Mapping):
-                continue
+        for index, test in enumerate(self.test_results, start=1):
             name = str(test.get("name") or "")
             if not name or (contains and contains not in name.casefold()):
                 continue
@@ -5172,7 +5171,14 @@ class SpecialistSession:
             total += 1
             if len(matches) < limit:
                 item = dict(test)
-                item["evidence_id"] = record.id
+                item["evidence_id"] = retain_test_result(
+                    self.evidence_store,
+                    test,
+                    repository=self.test_results_repository,
+                    head_sha=self.test_results_head_sha,
+                    index=index,
+                    session_id=self.session_id,
+                )
                 matches.append(item)
         return {
             "status": "ok",

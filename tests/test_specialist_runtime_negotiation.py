@@ -188,6 +188,41 @@ def test_compact_negotiation_offers_resume_only_for_novel_checkpoint_action():
     assert "resume" in target["allowed_actions"]
 
 
+def test_compact_negotiation_preserves_checkpoint_lead_before_obligation_update():
+    checkpoint = SessionCheckpoint(
+        session_id="S2",
+        state=SessionState.CHECKPOINT,
+        evidence_ids=("E-diff", "E-consumer"),
+        working_summary=(
+            "The changed redactor no longer masks literal passwords; the "
+            "consumer path still needs one bounded trace."
+        ),
+        unknowns=("OB2",),
+        proposed_next_actions=(
+            "Trace mask_source_secrets through the retained consumer call sites.",
+        ),
+        obligation_assessments=(ObligationAssessment(
+            target="O1",
+            obligation_id="OB2",
+            disposition=ObligationDisposition.PENDING,
+        ),),
+    )
+
+    target = next(
+        item for item in compact_negotiation_context(
+            state_for(checkpoints=(checkpoint,)),
+        )["targets"]
+        if item["subject"] == "src/a.py"
+    )
+
+    assert target["summary"].startswith("The changed redactor")
+    assert target["next_actions"] == checkpoint.proposed_next_actions
+    assert target["evidence_delta"] == 0
+    assert target["retained_evidence_count"] == 2
+    assert "resume" in target["allowed_actions"]
+    assert "record_unknown" not in target["allowed_actions"]
+
+
 def test_compact_negotiation_only_advertises_globally_admissible_high_risk_actions():
     blocked = ObligationAssessment(
         target="O1", obligation_id="OB1",

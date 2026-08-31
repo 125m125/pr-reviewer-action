@@ -789,13 +789,13 @@ def test_cli_summary_reports_junit_sources_and_counts(monkeypatch, tmp_path):
     manifest.write_text(json.dumps({
         "repository": "owner/repo", "head_sha": "h" * 40,
         "statistics": {
-            "source_reports": 2, "total": 3, "retained": 3,
+            "source_reports": 2, "total": 3, "indexed": 3,
             "passed": 1, "failed": 1, "skipped": 1, "errored": 0,
         },
         "reports": [{
             "name": "junit.zip:python/pytest.xml", "tests": [],
             "statistics": {
-                "total": 2, "retained": 2, "passed": 1,
+                "total": 2, "indexed": 2, "passed": 1,
                 "failed": 1, "skipped": 0, "errored": 0,
             },
         }],
@@ -812,7 +812,7 @@ def test_cli_summary_reports_junit_sources_and_counts(monkeypatch, tmp_path):
     assert cli.main() == 0
 
     summary = (tmp_path / "specialist-review-summary.md").read_text()
-    assert "3 tests from 2 JUnit reports; 1 failed; 3 retained" in summary
+    assert "3 tests from 2 JUnit reports; 1 failed; 3 indexed" in summary
     assert "| junit\\.zip:python/pytest\\.xml | 2 | 2 | 1 | 1 | 0 | 0 |" in summary
 
 

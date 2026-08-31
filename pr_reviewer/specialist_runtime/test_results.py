@@ -15,9 +15,9 @@ from .evidence import EvidenceProvenance, EvidenceStore
 
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
 _STATUSES = frozenset({"passed", "failed", "skipped", "errored", "xfailed", "unknown"})
-_MAX_CASES = 2_000
 _MAX_JUNIT_XML_BYTES = 10 * 1024 * 1024
 _MAX_JUNIT_ARCHIVE_BYTES = 50 * 1024 * 1024
+_MAX_TOTAL_JUNIT_XML_BYTES = 50 * 1024 * 1024
 
 
 def _path(value: object) -> str:
@@ -122,22 +122,31 @@ def build_junit_manifest(
         raise ValueError("test result binding requires repository and immutable head SHA")
     reports: list[dict[str, object]] = []
     total_archive_bytes = 0
+    total_xml_bytes = 0
+    omitted_artifacts = 0
+    omitted_reports = 0
     for raw_path in paths:
         path = Path(raw_path)
         if not path.is_file():
             continue
-        total_archive_bytes += path.stat().st_size
-        if total_archive_bytes > _MAX_JUNIT_ARCHIVE_BYTES:
-            break
+        artifact_bytes = path.stat().st_size
+        if total_archive_bytes + artifact_bytes > _MAX_JUNIT_ARCHIVE_BYTES:
+            omitted_artifacts += 1
+            continue
+        total_archive_bytes += artifact_bytes
         if zipfile.is_zipfile(path):
             with zipfile.ZipFile(path) as archive:
                 for member in sorted(archive.infolist(), key=lambda item: item.filename):
-                    if (
-                        member.is_dir()
-                        or not member.filename.casefold().endswith(".xml")
-                        or member.file_size > _MAX_JUNIT_XML_BYTES
-                    ):
+                    if member.is_dir() or not member.filename.casefold().endswith(".xml"):
                         continue
+                    if (
+                        member.file_size > _MAX_JUNIT_XML_BYTES
+                        or total_xml_bytes + member.file_size
+                        > _MAX_TOTAL_JUNIT_XML_BYTES
+                    ):
+                        omitted_reports += 1
+                        continue
+                    total_xml_bytes += member.file_size
                     report = _junit_report(
                         f"{path.name}:{_path(member.filename)}",
                         archive.read(member),
@@ -145,61 +154,56 @@ def build_junit_manifest(
                     if report is not None:
                         reports.append(report)
         elif path.suffix.casefold() == ".xml":
+            if (
+                path.stat().st_size > _MAX_JUNIT_XML_BYTES
+                or total_xml_bytes + path.stat().st_size
+                > _MAX_TOTAL_JUNIT_XML_BYTES
+            ):
+                omitted_reports += 1
+                continue
+            total_xml_bytes += path.stat().st_size
             report = _junit_report(path.name, path.read_bytes())
             if report is not None:
                 reports.append(report)
 
     counts = {key: 0 for key in ("passed", "failed", "skipped", "errored")}
     total = 0
-    ranked_cases: list[tuple[int, int, int]] = []
-    for report_index, report in enumerate(reports):
-        for test_index, test in enumerate(report["tests"]):
-            status = str(test.get("status") or "unknown")
-            ranked_cases.append((
-                0 if status in {"failed", "errored"} else 1,
-                report_index,
-                test_index,
-            ))
-    selected_cases = {
-        (report_index, test_index)
-        for _priority, report_index, test_index
-        in sorted(ranked_cases)[:_MAX_CASES]
-    }
     bounded_reports: list[dict[str, object]] = []
-    for report_index, report in enumerate(reports):
+    for report in reports:
         tests = list(report["tests"])
         total += len(tests)
         for test in tests:
             status = str(test.get("status") or "unknown")
             if status in counts:
                 counts[status] += 1
-        selected = [
-            test for test_index, test in enumerate(tests)
-            if (report_index, test_index) in selected_cases
-        ]
         report_counts = {
             key: sum(test.get("status") == key for test in tests)
             for key in counts
         }
         bounded_reports.append({
             **report,
-            "tests": selected,
+            "tests": tests,
             "statistics": {
                 "total": len(tests),
-                "retained": len(selected),
+                "indexed": len(tests),
                 **report_counts,
             },
         })
+    statistics = {
+        "source_reports": len(reports),
+        "total": total,
+        "indexed": total,
+        **counts,
+    }
+    if omitted_reports:
+        statistics["omitted_reports"] = omitted_reports
+    if omitted_artifacts:
+        statistics["omitted_artifacts"] = omitted_artifacts
     return {
         "repository": repository.strip(),
         "head_sha": head_sha.strip(),
         "reports": bounded_reports,
-        "statistics": {
-            "source_reports": len(reports),
-            "total": total,
-            "retained": len(selected_cases),
-            **counts,
-        },
+        "statistics": statistics,
     }
 
 
@@ -214,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
     manifest = build_junit_manifest(
         args.artifacts, repository=args.repository, head_sha=args.head_sha,
     )
-    if not manifest["statistics"]["retained"]:
+    if not manifest["statistics"]["indexed"]:
         manifest["availability_reason"] = (
             args.unavailable_reason or "no parseable same-head JUnit test cases found"
         )
@@ -268,9 +272,43 @@ def load_test_results(
             parsed = _case(raw, report=report_name, workflow=workflow, job=job)
             if parsed is not None:
                 results.append(parsed)
-            if len(results) >= _MAX_CASES:
-                return tuple(results)
     return tuple(results)
+
+
+def retain_test_result(
+    store: EvidenceStore,
+    result: Mapping[str, object],
+    *,
+    repository: str,
+    head_sha: str,
+    index: int,
+    session_id: str,
+) -> str:
+    """Materialize one queried test case as immutable citable evidence."""
+    if not isinstance(store, EvidenceStore):
+        raise TypeError("store must be an EvidenceStore")
+    payload = dict(result)
+    source = str(payload.get("file") or "").strip() or None
+    record = store.add_tool_result(
+        session_id=session_id,
+        tool="ci_test_results",
+        arguments={
+            "repository": repository,
+            "head_sha": head_sha,
+            "index": index,
+            "name": payload.get("name", ""),
+            **({"file": source} if source else {}),
+        },
+        result={"status": "ok", "test": payload},
+        category="test-result",
+        source=source,
+        mime_type="application/json",
+        provenance=EvidenceProvenance(
+            head_sha=head_sha,
+            source_classification="ci-test-result",
+        ),
+    )
+    return record.id
 
 
 def seed_test_results(
@@ -284,35 +322,24 @@ def seed_test_results(
     if not isinstance(store, EvidenceStore):
         raise TypeError("store must be an EvidenceStore")
     seeded: list[str] = []
-    for index, result in enumerate(tuple(results)[:_MAX_CASES], start=1):
+    for index, result in enumerate(tuple(results), start=1):
         if not isinstance(result, Mapping):
             continue
-        payload = dict(result)
-        source = str(payload.get("file") or "").strip() or None
-        record = store.add_tool_result(
+        seeded.append(retain_test_result(
+            store,
+            result,
+            repository=repository,
+            head_sha=head_sha,
+            index=index,
             session_id="ci:test-results",
-            tool="ci_test_results",
-            arguments={
-                "repository": repository,
-                "head_sha": head_sha,
-                "index": index,
-                "name": payload.get("name", ""),
-                **({"file": source} if source else {}),
-            },
-            result={"status": "ok", "test": payload},
-            category="test-result",
-            source=source,
-            mime_type="application/json",
-            provenance=EvidenceProvenance(
-                head_sha=head_sha,
-                source_classification="ci-test-result",
-            ),
-        )
-        seeded.append(record.id)
+        ))
     return tuple(seeded)
 
 
-__all__ = ["build_junit_manifest", "load_test_results", "seed_test_results"]
+__all__ = [
+    "build_junit_manifest", "load_test_results", "retain_test_result",
+    "seed_test_results",
+]
 
 
 if __name__ == "__main__":

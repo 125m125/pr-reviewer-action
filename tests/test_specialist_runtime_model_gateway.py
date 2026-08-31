@@ -98,6 +98,31 @@ def test_rendered_request_bytes_uses_structured_schema_without_tools():
     ).encode("utf-8"))
 
 
+def test_unreachable_endpoint_does_not_retry_without_structured_output():
+    calls = []
+
+    def unavailable(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise ModelRequestError("connection refused")
+
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1",
+        api_key="",
+        default_model="main",
+        response_format="json_schema",
+        transport=unavailable,
+    )
+
+    with pytest.raises(ModelRequestError, match="connection refused"):
+        gateway.complete(turn_request(
+            conversation("checkpoint"),
+            tools_enabled=False,
+            response_schema={"type": "object", "properties": {}},
+        ))
+
+    assert len(calls) == 1
+
+
 def test_structured_template_kwargs_apply_only_when_tools_are_disabled():
     gateway = OpenAIModelGateway(
         base_url="http://model/v1",

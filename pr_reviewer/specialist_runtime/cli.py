@@ -1003,6 +1003,7 @@ def build_controller(
         obligations,
         session_id,
         change_overview=None,
+        test_results=(),
     ):
         del snapshot
         assigned_obligation_ids = set(dict.fromkeys((
@@ -1145,6 +1146,11 @@ def build_controller(
             max_tool_result_bytes=config.tool_response_bytes,
             changed_files=allowed_diff_paths,
             change_overview=change_overview,
+            test_results=tuple(test_results),
+            test_results_repository=config.environment.get("REPO", ""),
+            test_results_head_sha=(
+                immutable_diff_range[1] if immutable_diff_range else ""
+            ),
         )
 
     # The current-head policy is attached after workspace loading in main.
@@ -2256,15 +2262,29 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
     if not isinstance(test_stats, Mapping):
         test_stats = {}
     try:
-        retained_tests = max(0, int(test_stats.get("retained", 0) or 0))
+        indexed_tests = max(0, int(test_stats.get("indexed", 0) or 0))
     except (TypeError, ValueError):
-        retained_tests = 0
-    if retained_tests:
+        indexed_tests = 0
+    if indexed_tests:
+        try:
+            omitted_reports = max(0, int(test_stats.get("omitted_reports", 0) or 0))
+            omitted_artifacts = max(
+                0, int(test_stats.get("omitted_artifacts", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            omitted_reports = omitted_artifacts = 0
+        omissions = tuple(
+            label for count, label in (
+                (omitted_artifacts, f"{omitted_artifacts} artifacts"),
+                (omitted_reports, f"{omitted_reports} reports"),
+            ) if count
+        )
         summary_lines.append(
             "- CI test evidence: "
-            f"{test_stats.get('total', retained_tests)} tests from "
+            f"{test_stats.get('total', indexed_tests)} tests from "
             f"{test_stats.get('source_reports', 0)} JUnit reports; "
-            f"{test_stats.get('failed', 0)} failed; {retained_tests} retained"
+            f"{test_stats.get('failed', 0)} failed; {indexed_tests} indexed"
+            + (f"; {', '.join(omissions)} omitted by safety limits" if omissions else "")
         )
         reports = test_manifest.get("reports", [])
         report_rows = tuple(
@@ -2275,7 +2295,7 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
         if report_rows:
             summary_lines.extend((
                 "", "## CI test evidence", "",
-                "| Source report | Total | Retained | Passed | Failed | Skipped | Errors |",
+                "| Source report | Total | Indexed | Passed | Failed | Skipped | Errors |",
                 "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
             ))
             for report in report_rows:
@@ -2285,7 +2305,7 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
                     + " | " + " | ".join(
                         str(stats.get(key, 0))
                         for key in (
-                            "total", "retained", "passed", "failed", "skipped", "errored",
+                            "total", "indexed", "passed", "failed", "skipped", "errored",
                         )
                     ) + " |"
                 )

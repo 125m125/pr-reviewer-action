@@ -296,20 +296,25 @@ def test_compacted_evidence_requires_authorized_target_and_purpose():
     assert unknown["status"] == "error"
 
 
-def test_test_results_tool_filters_existing_ci_results_by_regex_or_substring():
-    session = make_session(ScriptedGateway([]))
-    session.evidence_store.add_tool_result(
-        session_id="ci:test-results",
-        tool="ci_test_results",
-        arguments={"file": "tests/test_notes.py", "name": "test_request_changes"},
-        result={"status": "ok", "test": {
-            "name": "tests.test_notes::test_request_changes",
-            "status": "failed", "file": "tests/test_notes.py", "line": 12,
-            "message": "expected REQUEST_CHANGES",
-        }},
-        category="test-result",
-        source="tests/test_notes.py",
+def test_test_results_tool_materializes_only_matching_indexed_cases_as_evidence():
+    indexed = ({
+        "name": "tests.test_notes::test_request_changes",
+        "status": "failed", "file": "tests/test_notes.py", "line": 12,
+        "message": "expected REQUEST_CHANGES",
+        "report": "pytest.xml", "workflow": "validate", "job": "pytest",
+    }, {
+        "name": "tests.test_notes::test_comment",
+        "status": "passed", "file": "tests/test_notes.py", "line": 20,
+        "message": "", "report": "pytest.xml",
+        "workflow": "validate", "job": "pytest",
+    })
+    session = make_session(
+        ScriptedGateway([]),
+        test_results=indexed,
     )
+    assert session.test_results is indexed
+    assert session.evidence_store.snapshot().records == ()
+
     session._execute_calls(({
         "id": "tests-1",
         "name": TEST_RESULTS_TOOL_NAME,
@@ -320,6 +325,10 @@ def test_test_results_tool_filters_existing_ci_results_by_regex_or_substring():
     assert result["status"] == "ok"
     assert result["count"] == 1
     assert result["tests"][0]["name"].endswith("test_request_changes")
+    evidence_id = result["tests"][0]["evidence_id"]
+    records = session.evidence_store.snapshot().records
+    assert [record.id for record in records] == [evidence_id]
+    assert records[0].category == "test-result"
 
 
 def test_test_results_tool_is_not_advertised_without_seeded_cases():
@@ -598,7 +607,7 @@ def make_session(
     execute_tool=None, lease=None, assignment=None, obligations=None,
     budget_limits=None, max_tokens=1024,
     request_timeout_sec=30.0, max_context_tokens=24_000,
-    recovery_max_tokens=None, clock=time.monotonic,
+    recovery_max_tokens=None, clock=time.monotonic, test_results=(),
 ):
     obligations = obligations or (
         CoverageObligation(
@@ -632,6 +641,9 @@ def make_session(
         lease=lease, request_timeout_sec=request_timeout_sec, max_tokens=max_tokens,
         max_context_tokens=max_context_tokens,
         recovery_max_tokens=recovery_max_tokens or max_tokens,
+        test_results=test_results,
+        test_results_repository="owner/repository",
+        test_results_head_sha="b" * 40,
         clock=clock,
     )
 

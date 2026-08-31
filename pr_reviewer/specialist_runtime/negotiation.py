@@ -226,18 +226,36 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
     assessments = _assessment_by_obligation(state)
     ownership = tuple(state.session_ownership)
     resources = {item.session_id: item for item in state.session_resources}
+    checkpoints = {item.session_id: item for item in state.checkpoints}
     targets: list[dict[str, object]] = []
     for index, item in enumerate(obligations, start=1):
         assessment = assessments.get(item.id)
+        owners = tuple(
+            owner for owner in ownership if item.id in owner.obligation_ids
+        )
+        owner_checkpoints = tuple(
+            checkpoints[owner.session_id]
+            for owner in owners if owner.session_id in checkpoints
+        )
+        checkpoint_actions = tuple(dict.fromkeys(
+            action
+            for checkpoint in owner_checkpoints
+            for action in checkpoint.proposed_next_actions
+            if action.strip() and action not in checkpoint.unknowns
+        ))
+        next_actions = tuple(dict.fromkeys((
+            *(assessment.next_actions if assessment is not None else ()),
+            *checkpoint_actions,
+        )))
         has_novel_action = (
             assessment is None
             or (
-                assessment.disposition is ObligationDisposition.UNRESOLVED
-                and bool(assessment.next_actions)
+                assessment.disposition in {
+                    ObligationDisposition.PENDING,
+                    ObligationDisposition.UNRESOLVED,
+                }
+                and bool(next_actions)
             )
-        )
-        owners = tuple(
-            owner for owner in ownership if item.id in owner.obligation_ids
         )
         primary = any(item.id in owner.primary_obligation_ids for owner in owners)
         actions = ["record_unknown"]
@@ -265,22 +283,38 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
         for action in ("resume", "consult"):
             if action in owner_actions:
                 actions.insert(0, action)
+        checkpoint_summary = next((
+            " ".join(checkpoint.working_summary.split())[:1_200]
+            for checkpoint in owner_checkpoints
+            if checkpoint.working_summary.strip()
+        ), "")
+        assessment_delta = (
+            assessment.attempts[-1].evidence_delta
+            if assessment is not None and assessment.attempts else 0
+        )
+        checkpoint_evidence_delta = len({
+            evidence_id
+            for checkpoint in owner_checkpoints
+            for evidence_id in (
+                *checkpoint.evidence_ids,
+                *checkpoint.imported_evidence_ids,
+            )
+        })
         targets.append({
             "handle": f"U{index}",
             "risk_tier": item.risk_tier,
             "subject": item.subject,
             "summary": (
-                assessment.reason if assessment is not None else
+                assessment.reason if assessment is not None and assessment.reason else
+                checkpoint_summary or
                 f"Investigate the {item.risk_tier}-risk obligation concerning {item.subject}."
             ),
             "allowed_actions": tuple(actions),
             "last_conclusion": assessment.reason if assessment is not None else "",
             "attempt_count": len(assessment.attempts) if assessment is not None else 0,
-            "evidence_delta": (
-                assessment.attempts[-1].evidence_delta
-                if assessment is not None and assessment.attempts else 0
-            ),
-            "next_actions": assessment.next_actions if assessment is not None else (),
+            "evidence_delta": assessment_delta,
+            "retained_evidence_count": checkpoint_evidence_delta,
+            "next_actions": next_actions,
         })
     has_feasible_high_risk = any(
         target["risk_tier"] in {"high", "critical"}

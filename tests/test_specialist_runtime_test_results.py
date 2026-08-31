@@ -1,6 +1,7 @@
 import json
 import zipfile
 
+import pr_reviewer.specialist_runtime.test_results as test_results_module
 from pr_reviewer.specialist_runtime.evidence import EvidenceStore
 from pr_reviewer.specialist_runtime.test_results import (
     build_junit_manifest,
@@ -114,7 +115,7 @@ def test_build_junit_manifest_groups_multiple_language_reports(tmp_path):
     assert manifest["statistics"] == {
         "source_reports": 2,
         "total": 3,
-        "retained": 3,
+        "indexed": 3,
         "passed": 1,
         "failed": 1,
         "skipped": 1,
@@ -125,7 +126,7 @@ def test_build_junit_manifest_groups_multiple_language_reports(tmp_path):
     }
 
 
-def test_build_junit_manifest_retains_failures_before_early_passing_overflow(tmp_path):
+def test_build_junit_manifest_indexes_all_safely_parsed_cases(tmp_path):
     archive = tmp_path / "junit.zip"
     cases = "".join(
         f"<testcase classname='suite' name='pass_{index}'/>"
@@ -139,6 +140,32 @@ def test_build_junit_manifest_retains_failures_before_early_passing_overflow(tmp
         (archive,), repository="owner/repo", head_sha="a" * 40,
     )
 
-    retained = manifest["reports"][0]["tests"]
-    assert len(retained) == 2_000
-    assert any(test["name"].endswith("late_failure") for test in retained)
+    indexed = manifest["reports"][0]["tests"]
+    assert len(indexed) == 2_001
+    assert manifest["statistics"]["indexed"] == 2_001
+    assert any(test["name"].endswith("late_failure") for test in indexed)
+
+
+def test_build_junit_manifest_reports_artifacts_omitted_by_safety_cap(
+    tmp_path, monkeypatch,
+):
+    first = tmp_path / "first.xml"
+    second = tmp_path / "second.xml"
+    first.write_text(
+        "<testsuite><testcase name='first'/></testsuite>", encoding="utf-8",
+    )
+    second.write_text(
+        "<testsuite><testcase name='second'/></testsuite>", encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        test_results_module,
+        "_MAX_JUNIT_ARCHIVE_BYTES",
+        first.stat().st_size,
+    )
+
+    manifest = build_junit_manifest(
+        (first, second), repository="owner/repo", head_sha="a" * 40,
+    )
+
+    assert manifest["statistics"]["indexed"] == 1
+    assert manifest["statistics"]["omitted_artifacts"] == 1

@@ -19,7 +19,7 @@ from pr_reviewer.tool_loop import (
     effective_intermediate_text,
     extract_intermediate_turn_parts,
 )
-from pr_reviewer.transport import run_chat_request
+from pr_reviewer.transport import is_model_endpoint_unavailable, run_chat_request
 
 # ``transport`` adds scripts/ to sys.path before importing this module's
 # dependencies, so this is the same redaction implementation used by the
@@ -261,6 +261,8 @@ class OpenAIModelGateway:
             try:
                 return post(candidate)
             except Exception as final_exc:
+                if is_model_endpoint_unavailable(final_exc):
+                    raise
                 final_error = mask_secrets(str(final_exc))[:1000]
                 raise RuntimeError(
                     f"structured output request failed: {original_error}; "
@@ -275,6 +277,8 @@ class OpenAIModelGateway:
         except Exception as exc:
             usable = False
             original_error = mask_secrets(str(exc))[:1000]
+            if is_model_endpoint_unavailable(exc):
+                raise
             if not allow_fallbacks:
                 raise
             provider_rejected = bool(getattr(exc, "provider_rejected", False))

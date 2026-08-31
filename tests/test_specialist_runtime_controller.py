@@ -80,6 +80,7 @@ from pr_reviewer.specialist_runtime.web_evidence import (
     SourceAccessRequest,
     repository_access_request,
 )
+from pr_reviewer.transport import ModelRequestError
 
 
 def _change_facts_payload(facts, *, status="ok", failures=()):
@@ -99,6 +100,30 @@ def test_controller_public_api_is_importable():
     assert ReviewController
     assert ReviewInputs
     assert ReviewResult
+
+
+def test_unreachable_model_endpoint_stops_before_specialist_sessions(tmp_path):
+    session_factory_calls = []
+
+    def unavailable(_request):
+        raise ModelRequestError(
+            "model request failed with exit code 7: connection refused",
+        )
+
+    def factory(*args):
+        session_factory_calls.append(args)
+        return _factory(*args)
+
+    controller = _controller(
+        tmp_path,
+        change_summarizer=unavailable,
+        session_factory=factory,
+    )
+
+    with pytest.raises(ModelRequestError, match="connection refused"):
+        controller.run(_inputs(tmp_path))
+
+    assert session_factory_calls == []
 
 
 def test_gateway_role_repair_continues_from_retained_reasoning_and_content():
