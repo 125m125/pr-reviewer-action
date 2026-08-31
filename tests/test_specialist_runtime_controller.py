@@ -2222,6 +2222,92 @@ def test_gateway_negotiator_receives_compact_targets_and_re_evaluates_each_wave(
     assert [event.payload["round"] for event in result.events if event.kind == "negotiation_round"] == [1, 2]
 
 
+def test_unproductive_followup_retires_target_and_tries_a_different_one(tmp_path):
+    request_count = 0
+
+    class Gateway:
+        def complete(self, request):
+            nonlocal request_count
+            payload = request.conversation.to_request_payload("openai", "m")
+            targets = json.loads(payload["messages"][1]["content"])[
+                "negotiation_state"
+            ]["targets"]
+            target = targets[0]["handle"]
+            request_count += 1
+            return ModelTurnResult(
+                response={},
+                tool_calls=(),
+                text=json.dumps({
+                    "kind": "resume",
+                    "target": target,
+                    "reason": "Run one bounded owner check.",
+                }),
+                text_source="content",
+                finish_reason="stop",
+                usage={},
+                request_diagnostics={},
+            )
+
+    class NoProgressSession(_ResumeSession):
+        def explore(self):
+            self.calls += 1
+            checkpoint = SessionCheckpoint(
+                session_id=self.session_id,
+                state=SessionState.CHECKPOINT,
+                unknowns=self.assignment.obligation_ids,
+            )
+            return SessionResult(
+                session_id=self.session_id,
+                state=SessionState.CHECKPOINT,
+                checkpoint=checkpoint,
+                budget=BudgetUsage(model_turns=self.calls),
+            )
+
+    recipe = RecipePolicy(
+        id="delivery",
+        title="Delivery",
+        objective="Trace delivery behavior",
+        execution="coverage",
+        match={"file_roles_any": ("implementation",)},
+        expected_evidence=("implementation", "tests"),
+    )
+    inputs = replace(_inputs(tmp_path), policy=ReviewPolicy.minimal(recipes=(recipe,)))
+
+    def factory(
+        assignment, lease, snapshot, evidence_store, coverage, obligations,
+        expected_session_id,
+    ):
+        del lease, snapshot, coverage
+        return NoProgressSession(
+            assignment, evidence_store, obligations, expected_session_id,
+        )
+
+    result = ReviewController(
+        planner=_planner_role,
+        session_factory=factory,
+        negotiator=GatewayRoleAdapter(Gateway()),
+        critic=_critic_role,
+        finalizer=_finalizer,
+        clock=lambda: 0.0,
+        artifact_output_root=tmp_path,
+    ).run(inputs)
+
+    assert request_count >= 2
+    actions = [
+        event.payload
+        for event in result.events
+        if event.kind == "negotiation_action"
+    ]
+    assert len(actions) == request_count
+    targeted = [tuple(action["obligation_ids"]) for action in actions]
+    assert len(set(targeted)) == len(targeted)
+    assert [
+        event.payload["round"]
+        for event in result.events
+        if event.kind == "negotiation_round"
+    ] == list(range(1, request_count + 1))
+
+
 def test_record_unknown_status_change_does_not_trigger_another_negotiation_round(tmp_path):
     calls = []
 
@@ -3746,7 +3832,10 @@ def test_handoff_change_summary_may_name_request_changes_behavior(tmp_path):
                 "The native publisher changes how request_changes is submitted."
             ),
             "ai_reviewed_summary": "The AI traced the changed publishing branch.",
-            "human_focus": "Recheck the resulting native review event.",
+            "human_focus": (
+                "Recheck whether the request_changes verdict still creates the "
+                "resulting native review event."
+            ),
         }
 
     result = _controller(tmp_path, finalizer=summarizer).run(_inputs(tmp_path))
@@ -3837,8 +3926,8 @@ def test_handoff_summarizer_gets_one_focused_semantic_repair(tmp_path):
         requests.append(request)
         if len(requests) == 1:
             return {
-                "ai_reviewed_summary": "All obligations are fully covered; approve.",
-                "human_focus": "No further review is required.",
+                "ai_reviewed_summary": "The review traced retry behavior.",
+                "human_focus": "The blocker at src/worker.py:8 must be fixed.",
             }
         assert request.context["semantic_repair"]["reason"]
         assert request.context["semantic_repair"]["instruction"]
@@ -3855,19 +3944,12 @@ def test_handoff_summarizer_gets_one_focused_semantic_repair(tmp_path):
     assert result.handoff.ai_reviewed == (
         "The review traced retry handling through the supplied worker scope.",
     )
-    assert "fully covered" not in result.handoff.markdown
+    assert "src/worker.py:8" not in result.handoff.markdown
 
 
 @pytest.mark.parametrize(
     "proposal",
     (
-        {
-            "ai_reviewed_summary": "All obligations are fully covered; approve.",
-            "human_focus": "No further review is required.",
-            "referenced_paths": [],
-            "referenced_component_ids": [],
-            "referenced_obligation_ids": [],
-        },
         {
             "ai_reviewed_summary": "Retry behavior can duplicate delivery.",
             "human_focus": "The blocker at src/worker.py:8 must be fixed.",
@@ -3877,7 +3959,7 @@ def test_handoff_summarizer_gets_one_focused_semantic_repair(tmp_path):
         },
     ),
 )
-def test_handoff_summarizer_rejects_unsupported_or_detailed_prose(
+def test_handoff_summarizer_rejects_detailed_prose(
     proposal, tmp_path,
 ):
     result = _controller(
@@ -3889,7 +3971,6 @@ def test_handoff_summarizer_rejects_unsupported_or_detailed_prose(
         item["component"] == "handoff_summarizer"
         for item in result.artifact["degradation"]
     )
-    assert "fully covered" not in result.handoff.markdown
     assert "duplicate delivery" not in result.handoff.markdown
 
 

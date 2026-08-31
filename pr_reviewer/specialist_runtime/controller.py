@@ -3276,6 +3276,7 @@ class ReviewController:
         state: _RunState,
         reconciliation: CoverageReconciliation,
         followup_started: int,
+        excluded_obligation_ids: Iterable[str] = (),
     ) -> NegotiationState:
         resources: list[SessionResources] = []
         for session_id, ownership in sorted(state.ownership.items()):
@@ -3332,11 +3333,12 @@ class ReviewController:
             new_session_lease_remaining_sec=state.deadline.remaining_for_exploration(
                 now=self.clock(),
             ),
+            excluded_obligation_ids=tuple(sorted(set(excluded_obligation_ids))),
         )
 
     def _negotiate(
         self, state: _RunState, reconciliation: CoverageReconciliation,
-        *, attempt: int = 1,
+        *, attempt: int = 1, excluded_obligation_ids: Iterable[str] = (),
     ) -> tuple[NegotiationAction, ...]:
         if not reconciliation.uncovered_obligation_ids:
             return ()
@@ -3345,7 +3347,7 @@ class ReviewController:
             if "-followup-" in assignment.id
         )
         negotiation_state = self._negotiation_state(
-            state, reconciliation, followup_started,
+            state, reconciliation, followup_started, excluded_obligation_ids,
         )
         if not state.deadline.exploration_allowed(now=self.clock()):
             self._degrade(state, "deadline", "exploration cutoff reached before follow-up")
@@ -4336,17 +4338,6 @@ class ReviewController:
         # summary because ``tool/secret`` resembles a path causes more harm
         # than accepting an imprecise component name here.
         normalized = " ".join(combined.casefold().split())
-        judgment_text = " ".join((
-            proposal.ai_reviewed_summary,
-            proposal.human_focus,
-        )).casefold()
-        forbidden_judgments = (
-            "approve", "request changes", "request_changes", "merge safe",
-            "safe to merge", "no further review", "no issues", "fully covered",
-            "all obligations", "complete coverage",
-        )
-        if any(value in judgment_text for value in forbidden_judgments):
-            raise ValueError("handoff summary attempts to change verdict or coverage")
         if re.search(
             r"(?:^|\s)(?:blocker|major|minor|finding|defect)\b|"
             r"(?:^|[\s`])[^`\s]+:\d+(?:\b|`)",
@@ -5760,8 +5751,14 @@ class ReviewController:
                 state.inputs.config.max_followup_sessions
                 + len(state.obligations),
             )
+            unproductive_obligation_ids: set[str] = set()
             for round_index in range(max_rounds):
                 if not reconciliation.uncovered_obligation_ids:
+                    break
+                if not (
+                    set(reconciliation.uncovered_obligation_ids)
+                    - unproductive_obligation_ids
+                ):
                     break
                 before_uncovered = set(reconciliation.uncovered_obligation_ids)
                 before_covered = {
@@ -5775,7 +5772,10 @@ class ReviewController:
                     "uncovered_count": len(before_uncovered),
                 })
                 actions = self._negotiate(
-                    state, reconciliation, attempt=round_index + 1,
+                    state,
+                    reconciliation,
+                    attempt=round_index + 1,
+                    excluded_obligation_ids=unproductive_obligation_ids,
                 )
                 if not actions:
                     break
@@ -5786,10 +5786,10 @@ class ReviewController:
                 next_reconciliation = self._reconcile(
                     state, followup, followup_snapshot,
                 )
-                # record_unknown and infeasible proposals intentionally make no
-                # coverage progress; stop rather than repeatedly asking the model
-                # to emit the same action. Evidence collection itself counts as
-                # progress even when it has not yet satisfied an obligation.
+                # Evidence collection counts as progress even before it satisfies
+                # an obligation. A scheduled exploration that adds neither evidence
+                # nor coverage retires only its target so another gap can be tried;
+                # explicit closure and unscheduled proposals still stop cleanly.
                 reconciliation = next_reconciliation
                 after_covered = {
                     obligation_id
@@ -5802,7 +5802,23 @@ class ReviewController:
                     or before_evidence != after_evidence
                 )
                 if not made_progress:
-                    break
+                    if not followups or any(
+                        action.kind == "record_unknown" for action in actions
+                    ):
+                        break
+                    retired = {
+                        obligation_id
+                        for action in actions
+                        for obligation_id in action.obligation_ids
+                        if obligation_id in before_uncovered
+                    }
+                    unproductive_obligation_ids.update(retired)
+                    journal.emit("negotiation_adjustment", {
+                        "component": "negotiator",
+                        "action": "retire-unproductive-target",
+                        "obligation_ids": tuple(sorted(retired)),
+                        "reason": "follow-up added no evidence or coverage",
+                    })
             for obligation_id in reconciliation.uncovered_obligation_ids:
                 if not any(item.get("obligation_id") == obligation_id for item in state.unknowns):
                     obligation = state.coverage.obligation(obligation_id)

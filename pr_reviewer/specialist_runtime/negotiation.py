@@ -126,6 +126,7 @@ class NegotiationState:
     new_session_turn_cap: int
     new_session_lease_remaining_sec: float
     new_session_tool_call_cap: int
+    excluded_obligation_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         obligation_ids = [item.id for item in self.obligations]
@@ -149,6 +150,11 @@ class NegotiationState:
         unknown_coverage = sorted(set(coverage_ids) - set(obligation_ids))
         if unknown_coverage:
             raise ValueError("coverage contains unknown obligations: " + ", ".join(unknown_coverage))
+        unknown_exclusions = sorted(set(self.excluded_obligation_ids) - set(obligation_ids))
+        if unknown_exclusions:
+            raise ValueError(
+                "excluded obligations are unknown: " + ", ".join(unknown_exclusions)
+            )
         assignment_by_id = {
             _assignment_id(item): item for item in self.assignments
         }
@@ -365,6 +371,7 @@ def _negotiable_obligations(
 ) -> tuple[CoverageObligation, ...]:
     statuses = dict(state.coverage.obligation_statuses)
     assessments = _assessment_by_obligation(state)
+    excluded = frozenset(state.excluded_obligation_ids)
     terminal = {
         ObligationDisposition.COVERED,
         ObligationDisposition.NOT_APPLICABLE,
@@ -374,7 +381,8 @@ def _negotiable_obligations(
     return tuple(sorted(
         (
             item for item in state.obligations
-            if item.mandatory
+            if item.id not in excluded
+            and item.mandatory
             and item.required_evidence_categories
             and statuses.get(item.id, ObligationStatus.PENDING) in {
                 ObligationStatus.PENDING, ObligationStatus.UNRESOLVED,
