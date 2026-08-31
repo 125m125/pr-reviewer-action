@@ -119,7 +119,10 @@ def checkpoint_response(*, inspected, unresolved, **overrides):
         "new_candidates": [],
         "invariants_evaluated": [],
         "unknowns": unresolved,
-        "proposed_next_actions": [],
+        "proposed_next_actions": (
+            ["Inspect the remaining obligation with retained repository evidence."]
+            if unresolved else []
+        ),
         "working_summary": "The checkpoint retains the current working state.",
         "completed_steps": ["Reviewed the assigned checkpoint scope."],
     }
@@ -160,6 +163,9 @@ def candidate_checkpoint_response(candidate_ids):
             "manual_validation": "Run the state transition test.",
         } for candidate_id in candidate_ids],
         "unknowns": ["OB-tests"],
+        "proposed_next_actions": [
+            "Inspect the remaining behavioral test obligation.",
+        ],
         "working_summary": "The candidate checkpoint retains the working state.",
         "completed_steps": ["Collected and assessed the candidate evidence."],
     })
@@ -178,6 +184,10 @@ def candidate_update_checkpoint_response(*, updates=(), new_candidates=(), unres
         "candidate_updates": list(updates),
         "new_candidates": list(new_candidates),
         "unknowns": list(unresolved),
+        "proposed_next_actions": (
+            ["Inspect the remaining behavioral test obligation."]
+            if unresolved else []
+        ),
         "working_summary": "The candidate lifecycle state remains cumulative.",
         "completed_steps": ["Reviewed the active candidate lifecycle updates."],
     })
@@ -1248,6 +1258,7 @@ def test_checkpoint_records_precise_rejection_for_invalid_update():
         "unresolved": ["O2"],
         "obligation_updates": [{"target": "O1", "status": "maybe"}],
         "candidate_updates": [], "new_candidates": [], "unknowns": [],
+        "proposed_next_actions": ["Inspect the remaining test obligation."],
     }
 
     assert session._checkpoint_from_text(json.dumps(payload)) is not None
@@ -1557,6 +1568,7 @@ def test_checkpoint_resolution_associates_direct_evidence_and_ignores_supplement
         }],
         "candidate_updates": [],
         "new_candidates": [],
+        "proposed_next_actions": ["Inspect the remaining test obligation."],
     }))
 
     assert checkpoint is not None
@@ -2424,6 +2436,9 @@ def test_checkpoint_accepts_new_candidates_separately_from_updates():
                 "candidate_updates": [],
                 "new_candidates": candidate_payload["new_candidates"],
                 "unknowns": ["OB-tests"],
+                "proposed_next_actions": [
+                    "Inspect the remaining behavioral test obligation.",
+                ],
             }),
         }),
     ])
@@ -2507,6 +2522,9 @@ def test_checkpoint_parser_drops_unadvertised_candidate_findings():
         "candidate_updates": [],
         "new_candidates": [],
         "unknowns": [],
+        "proposed_next_actions": [
+            "Inspect the remaining implementation and test obligations.",
+        ],
     }
 
     checkpoint = session._checkpoint_from_text(json.dumps(payload))
@@ -2773,6 +2791,9 @@ def test_rejected_candidate_update_preserves_and_reports_current_state():
         "unresolved": ["OB-code", "OB-tests"],
         "obligation_updates": [], "candidate_updates": [],
         "new_candidates": [candidate],
+        "proposed_next_actions": [
+            "Inspect the remaining implementation and test obligations.",
+        ],
     }))
     assert established is not None
     session.latest_checkpoint = established
@@ -3209,7 +3230,7 @@ def test_checkpoint_disposition_is_explicit_in_cumulative_prompt(
     else:
         assert required == {
             "unresolved", "obligation_updates", "candidate_updates",
-            "new_candidates", "unknowns",
+            "new_candidates", "unknowns", "proposed_next_actions",
         }
 
 
@@ -4059,7 +4080,7 @@ def test_pressure_requests_checkpoint_before_exploration():
         gateway,
         max_tokens=2_048,
         recovery_max_tokens=1_024,
-        max_context_tokens=7_000,
+        max_context_tokens=7_500,
     )
     attempts = RequestAttemptJournal()
     session.bind_request_attempt_journal(attempts, "assignment-1")
@@ -4170,6 +4191,32 @@ def test_malformed_checkpoint_is_repaired_before_projection():
     assert gateway.requests[1].tools_enabled is False
     assert gateway.requests[2].tools_enabled is False
     assert gateway.requests[2].messages_contain("Repair the previous checkpoint")
+
+
+@pytest.mark.parametrize("invalid_actions", ([], ["OB-code"], ["O1"]))
+def test_unresolved_checkpoint_repairs_missing_concrete_next_action(invalid_actions):
+    incomplete = checkpoint_response(
+        inspected=[], unresolved=["OB-code", "OB-tests"],
+        proposed_next_actions=invalid_actions,
+    )
+    repaired = checkpoint_response(
+        inspected=[], unresolved=["OB-code", "OB-tests"],
+        proposed_next_actions=[
+            "Trace the changed producer into its downstream consumer.",
+        ],
+    )
+    gateway = ScriptedGateway([incomplete, repaired])
+
+    result = make_session(gateway).request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert len(gateway.requests) == 2
+    assert result.checkpoint.proposed_next_actions == (
+        "Trace the changed producer into its downstream consumer.",
+    )
+    assert gateway.requests[1].messages_contain(
+        "Unresolved obligations require at least one concrete proposed_next_actions"
+    )
 
 
 def test_exploration_reasoning_json_is_not_admitted_or_candidate_signaled():

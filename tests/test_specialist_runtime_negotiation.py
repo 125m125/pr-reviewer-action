@@ -192,7 +192,6 @@ def test_compact_negotiation_preserves_checkpoint_lead_before_obligation_update(
     checkpoint = SessionCheckpoint(
         session_id="S2",
         state=SessionState.CHECKPOINT,
-        evidence_ids=("E-diff", "E-consumer"),
         working_summary=(
             "The changed redactor no longer masks literal passwords; the "
             "consumer path still needs one bounded trace."
@@ -208,9 +207,22 @@ def test_compact_negotiation_preserves_checkpoint_lead_before_obligation_update(
         ),),
     )
 
+    state = state_for(
+        checkpoints=(checkpoint,),
+        resources=(
+            SessionResources(
+                "S1", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0, retained_evidence_count=17,
+            ),
+        ),
+    )
     target = next(
         item for item in compact_negotiation_context(
-            state_for(checkpoints=(checkpoint,)),
+            state,
         )["targets"]
         if item["subject"] == "src/a.py"
     )
@@ -218,7 +230,7 @@ def test_compact_negotiation_preserves_checkpoint_lead_before_obligation_update(
     assert target["summary"].startswith("The changed redactor")
     assert target["next_actions"] == checkpoint.proposed_next_actions
     assert target["evidence_delta"] == 0
-    assert target["retained_evidence_count"] == 2
+    assert target["retained_evidence_count"] == 17
     assert "resume" in target["allowed_actions"]
     assert "record_unknown" not in target["allowed_actions"]
 

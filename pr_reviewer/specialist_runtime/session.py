@@ -458,7 +458,7 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
     },
     "required": [
         "unresolved", "obligation_updates", "candidate_updates",
-        "new_candidates", "unknowns",
+        "new_candidates", "unknowns", "proposed_next_actions",
     ],
     "additionalProperties": False,
 }
@@ -498,7 +498,8 @@ _COMPACTING_CHECKPOINT_SCHEMA: dict[str, Any] = {
     },
     "required": [
         "unresolved", "obligation_updates", "candidate_updates",
-        "new_candidates", "unknowns", "working_summary", "completed_steps",
+        "new_candidates", "unknowns", "proposed_next_actions",
+        "working_summary", "completed_steps",
     ],
 }
 
@@ -585,7 +586,8 @@ _CHECKPOINT_WORKING_MEMORY_INSTRUCTION = (
 )
 _CHECKPOINT_RETENTION_INSTRUCTION = (
     " Required keys: unresolved, obligation_updates, candidate_updates, "
-    "new_candidates, and unknowns. Every still-pending obligation target must "
+    "new_candidates, unknowns, and proposed_next_actions. Every still-pending "
+    "obligation target must "
     "appear either in obligation_updates or unresolved; do not repeat targets "
     "whose controller-owned disposition was already accepted. "
     "Empty candidate_updates and new_candidates arrays are valid and mean no "
@@ -3776,6 +3778,36 @@ class SpecialistSession:
                 "do not repeat already accepted targets."
             )
             return None
+        proposed_next_actions = (
+            _bounded_strings(
+                raw.get("proposed_next_actions"), max_items=12, max_length=500,
+            )
+            if "proposed_next_actions" in raw
+            else previous.proposed_next_actions
+        )
+        unresolved_action_labels = {
+            value.strip().casefold() for value in (
+                *unresolved,
+                *unresolved_targets,
+                *self._current_gaps,
+                *(
+                    self.obligation_assessments.obligation_id(target)
+                    for target in unresolved_targets
+                ),
+            ) if value.strip()
+        }
+        concrete_next_actions = tuple(
+            action for action in proposed_next_actions
+            if action.strip().casefold() not in unresolved_action_labels
+            and len(action.split()) >= 2
+        )
+        if unresolved_targets and not concrete_next_actions:
+            self._last_checkpoint_validation_error = (
+                "Unresolved obligations require at least one concrete "
+                "proposed_next_actions entry describing the next repository "
+                "or evidence check; obligation IDs alone are not actions."
+            )
+            return None
         for target in unresolved_targets:
             obligation_id = self.obligation_assessments.obligation_id(target)
             if obligation_id in assigned:
@@ -3978,16 +4010,7 @@ class SpecialistSession:
                 else previous.invariants_evaluated
             ),
             unknowns=self._current_gaps,
-            proposed_next_actions=(
-                _bounded_strings(
-                    raw.get("proposed_next_actions"),
-                    max_items=12,
-                    max_length=500,
-                )
-                or self._current_gaps
-                if "proposed_next_actions" in raw
-                else previous.proposed_next_actions
-            ),
+            proposed_next_actions=(proposed_next_actions or self._current_gaps),
             obligation_assessments=(
                 ()
                 if self._legacy_obligation_authority_used

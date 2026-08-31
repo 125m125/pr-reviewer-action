@@ -79,6 +79,7 @@ class SessionResources:
     remaining_model_turns: int
     lease_remaining_sec: float
     remaining_tool_calls: int
+    retained_evidence_count: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -95,6 +96,12 @@ class SessionResources:
             or self.remaining_tool_calls < 0
         ):
             raise ValueError("remaining_tool_calls must be a non-negative integer")
+        if (
+            isinstance(self.retained_evidence_count, bool)
+            or not isinstance(self.retained_evidence_count, int)
+            or self.retained_evidence_count < 0
+        ):
+            raise ValueError("retained_evidence_count must be a non-negative integer")
         if not isfinite(self.lease_remaining_sec) or self.lease_remaining_sec < 0:
             raise ValueError("lease_remaining_sec must be non-negative and finite")
 
@@ -292,14 +299,13 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             assessment.attempts[-1].evidence_delta
             if assessment is not None and assessment.attempts else 0
         )
-        checkpoint_evidence_delta = len({
-            evidence_id
-            for checkpoint in owner_checkpoints
-            for evidence_id in (
-                *checkpoint.evidence_ids,
-                *checkpoint.imported_evidence_ids,
-            )
-        })
+        retained_evidence_count = max(
+            (
+                resources[owner.session_id].retained_evidence_count
+                for owner in owners if owner.session_id in resources
+            ),
+            default=0,
+        )
         targets.append({
             "handle": f"U{index}",
             "risk_tier": item.risk_tier,
@@ -313,7 +319,7 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             "last_conclusion": assessment.reason if assessment is not None else "",
             "attempt_count": len(assessment.attempts) if assessment is not None else 0,
             "evidence_delta": assessment_delta,
-            "retained_evidence_count": checkpoint_evidence_delta,
+            "retained_evidence_count": retained_evidence_count,
             "next_actions": next_actions,
         })
     has_feasible_high_risk = any(

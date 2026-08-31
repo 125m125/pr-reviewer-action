@@ -3299,6 +3299,7 @@ class ReviewController:
                 remaining_model_turns=remaining_turns,
                 remaining_tool_calls=remaining_tools,
                 lease_remaining_sec=session.lease.remaining(now=self.clock()),
+                retained_evidence_count=len(session.evidence.snapshot().records),
             ))
         checkpoints = tuple(
             state.session_results[key].checkpoint for key in sorted(state.session_results)

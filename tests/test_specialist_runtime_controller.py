@@ -2215,6 +2215,10 @@ def test_gateway_negotiator_receives_compact_targets_and_re_evaluates_each_wave(
     # second negotiation decision even though the unresolved ID is unchanged.
     assert len(requests) == 2
     assert all("obligation_id" not in target for target in requests[0]["negotiation_state"]["targets"])
+    assert any(
+        target["retained_evidence_count"] > 0
+        for target in requests[1]["negotiation_state"]["targets"]
+    )
     assert [event.payload["round"] for event in result.events if event.kind == "negotiation_round"] == [1, 2]
 
 
