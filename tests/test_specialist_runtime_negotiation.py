@@ -28,6 +28,7 @@ from pr_reviewer.specialist_runtime.negotiation import (
 from pr_reviewer.specialist_runtime.policy import RuntimeConfig
 from pr_reviewer.specialist_runtime.types import (
     CoverageObligation,
+    InvestigationLead,
     ObligationStatus,
     SessionCheckpoint,
     SessionState,
@@ -93,6 +94,7 @@ def state_for(
     assignments: tuple[Assignment | SpecialistAssignment, ...] | None = None,
     session_ownership: tuple[SessionOwnership, ...] | None = None,
     checkpoints: tuple[SessionCheckpoint, ...] = (),
+    investigation_leads: tuple[InvestigationLead, ...] = (),
 ) -> NegotiationState:
     obligations = (
         obligation("OB1", risk="high"),
@@ -132,7 +134,82 @@ def state_for(
         new_session_turn_cap=new_session_turn_cap,
         new_session_tool_call_cap=new_session_tool_call_cap,
         new_session_lease_remaining_sec=new_session_lease_remaining_sec,
+        investigation_leads=investigation_leads,
     )
+
+
+def test_compact_negotiation_routes_open_lead_to_capable_existing_session():
+    lead = InvestigationLead(
+        lead_id="lead:web", summary="The external contract may have changed.",
+        affected_paths=("src/a.py",), evidence_ids=("evidence:1",),
+        next_action="Check the official contract documentation.",
+        required_capability="web", origin_session_id="S1",
+    )
+    resources = (
+        SessionResources(
+            "S1", remaining_model_turns=4, remaining_tool_calls=3,
+            lease_remaining_sec=100.0, advertised_tools=("read_file",),
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=4, remaining_tool_calls=3,
+            lease_remaining_sec=100.0,
+            advertised_tools=("read_file", "web_search", "web_fetch"),
+        ),
+    )
+    state = state_for(
+        covered=("OB1", "OB2"), resources=resources,
+        investigation_leads=(lead,),
+    )
+
+    context = compact_negotiation_context(state)
+    assert context["targets"] == ({
+        "handle": "L1",
+        "risk_tier": "normal",
+        "subject": "src/a.py",
+        "summary": "The external contract may have changed.",
+        "allowed_actions": ("consult", "new_session", "record_unknown"),
+        "last_conclusion": "",
+        "attempt_count": 0,
+        "evidence_delta": 0,
+        "retained_evidence_count": 1,
+        "next_actions": ("Check the official contract documentation.",),
+        "required_capability": "web",
+    },)
+    action = validate_compact_negotiation({
+        "kind": "consult", "target": "L1",
+        "reason": "Use the existing web-capable specialist.",
+    }, state).actions[0]
+    assert action.lead_ids == ("lead:web",)
+    assert action.obligation_ids == ()
+    assert action.session_id == "S2"
+
+
+def test_fallback_records_blocked_lead_when_no_capable_investigation_is_feasible():
+    lead = InvestigationLead(
+        lead_id="lead:web", summary="The external contract may have changed.",
+        affected_paths=("src/a.py",), evidence_ids=("evidence:1",),
+        next_action="Check the official contract documentation.",
+        required_capability="web", origin_session_id="S1",
+    )
+    state = state_for(
+        covered=("OB1", "OB2"), max_sessions=2,
+        max_followup_sessions=0, new_session_turns_remaining=0,
+        investigation_leads=(lead,),
+        resources=(
+            SessionResources(
+                "S1", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0, advertised_tools=("read_file",),
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0, advertised_tools=("read_file",),
+            ),
+        ),
+    )
+
+    action = fallback_next_action(state)
+    assert action.kind == "record_unknown"
+    assert action.lead_ids == ("lead:web",)
 
 
 def resume_raw(**updates):

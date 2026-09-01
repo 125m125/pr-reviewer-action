@@ -69,6 +69,9 @@ from pr_reviewer.specialist_runtime.types import (
     BudgetUsage,
     CandidateFinding,
     CoverageObligation,
+    InvestigationLead,
+    InvestigationLeadStatus,
+    LeadResolution,
     ObligationStatus,
     PhaseShares,
     ReviewNoteKind,
@@ -100,6 +103,48 @@ def test_controller_public_api_is_importable():
     assert ReviewController
     assert ReviewInputs
     assert ReviewResult
+
+
+def test_controller_admits_and_explicitly_resolves_session_investigation_lead(tmp_path):
+    controller = _controller(tmp_path)
+    state = _RunState(
+        inputs=_inputs(tmp_path), journal=EventJournal(),
+        deadline=RunDeadline(0.0, 90.0, PhaseShares()),
+        evidence=EvidenceStore(),
+    )
+    lead = InvestigationLead(
+        lead_id="lead:one", summary="A downstream caller may regress.",
+        affected_paths=("src/worker.py",), evidence_ids=("evidence:1",),
+        next_action="Trace the downstream caller.",
+        required_capability="repository", origin_session_id="S1",
+    )
+    report = SessionResult(
+        session_id="S1", state=SessionState.CHECKPOINT,
+        checkpoint=SessionCheckpoint("S1", SessionState.CHECKPOINT),
+        budget=BudgetUsage(), investigation_leads=(lead,),
+    )
+
+    controller._admit_investigation_lead_state(state, report)
+    controller._admit_investigation_lead_state(state, report)
+
+    assert tuple(state.investigation_leads) == ("lead:one",)
+    resolution = SessionResult(
+        session_id="S2", state=SessionState.CHECKPOINT,
+        checkpoint=SessionCheckpoint("S2", SessionState.CHECKPOINT),
+        budget=BudgetUsage(),
+        investigation_lead_resolutions=(LeadResolution(
+            lead_id="lead:one",
+            status=InvestigationLeadStatus.RESOLVED_NO_ISSUE,
+            reason="The only caller supplies the required value.",
+            evidence_ids=("evidence:2",),
+        ),),
+    )
+    controller._admit_investigation_lead_state(state, resolution)
+
+    admitted = state.investigation_leads["lead:one"]
+    assert admitted.status is InvestigationLeadStatus.RESOLVED_NO_ISSUE
+    assert admitted.assigned_session_id == "S2"
+    assert admitted.resolution_reason.startswith("The only caller")
 
 
 def test_unreachable_model_endpoint_stops_before_specialist_sessions(tmp_path):

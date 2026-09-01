@@ -86,6 +86,9 @@ from .types import (
     FindingRemediation,
     change_overview_orientation,
     CoverageObligation,
+    InvestigationLead,
+    InvestigationLeadStatus,
+    LeadResolution,
     ObligationStatus,
     ReviewHandoff,
     ReviewNote,
@@ -1799,6 +1802,7 @@ class _RunState:
     source_requests: list[
         SourceAccessRequest | RepositoryAccessRequest
     ] = field(default_factory=list)
+    investigation_leads: dict[str, InvestigationLead] = field(default_factory=dict)
     retention_verification_requests: tuple[Mapping[str, object], ...] = ()
     coverage_verification_requests: tuple[Mapping[str, object], ...] = ()
     unknowns: list[dict[str, object]] = field(default_factory=list)
@@ -3141,6 +3145,7 @@ class ReviewController:
             state.sessions[expected_session_id] = item.session
             state.assignment_sessions[item.assignment_id] = expected_session_id
             state.session_results[(item.assignment_id, expected_session_id)] = item.session_result
+            self._admit_investigation_lead_state(state, item.session_result)
             self._admit_specialist_request_events(state, item.session_result)
             state.ownership[item.session_result.session_id] = self._ownership(
                 assignment, item.session_result.session_id, state,
@@ -3222,6 +3227,56 @@ class ReviewController:
                 })
         return result, wave_snapshot
 
+    def _admit_investigation_lead_state(
+        self, state: _RunState, session_result: object,
+    ) -> None:
+        """Merge detached lead reports and explicit resolutions into run state."""
+        for lead in tuple(getattr(session_result, "investigation_leads", ())):
+            if not isinstance(lead, InvestigationLead):
+                continue
+            if lead.lead_id in state.investigation_leads:
+                continue
+            if len(state.investigation_leads) >= 32:
+                state.journal.emit("investigation_lead_rejected", {
+                    "lead_id": lead.lead_id,
+                    "reason": "run investigation lead allowance exhausted",
+                })
+                continue
+            state.investigation_leads[lead.lead_id] = lead
+            state.journal.emit("investigation_lead_reported", {
+                "lead_id": lead.lead_id,
+                "origin_session_id": lead.origin_session_id,
+                "required_capability": lead.required_capability,
+                "affected_paths": lead.affected_paths,
+                "evidence_ids": lead.evidence_ids,
+            })
+        for resolution in tuple(getattr(
+            session_result, "investigation_lead_resolutions", (),
+        )):
+            if not isinstance(resolution, LeadResolution):
+                continue
+            lead = state.investigation_leads.get(resolution.lead_id)
+            if lead is None:
+                state.journal.emit("investigation_lead_resolution_rejected", {
+                    "lead_id": resolution.lead_id,
+                    "reason": "unknown controller lead",
+                })
+                continue
+            state.investigation_leads[resolution.lead_id] = replace(
+                lead,
+                status=resolution.status,
+                assigned_session_id=session_result.session_id,
+                resolution_reason=resolution.reason,
+                candidate_ids=resolution.candidate_ids,
+            )
+            state.journal.emit("investigation_lead_resolved", {
+                "lead_id": resolution.lead_id,
+                "status": resolution.status.value,
+                "session_id": session_result.session_id,
+                "candidate_ids": resolution.candidate_ids,
+                "evidence_ids": resolution.evidence_ids,
+            })
+
     def _reconcile(
         self,
         state: _RunState,
@@ -3301,6 +3356,14 @@ class ReviewController:
                 remaining_tool_calls=remaining_tools,
                 lease_remaining_sec=session.lease.remaining(now=self.clock()),
                 retained_evidence_count=len(session.evidence.snapshot().records),
+                advertised_tools=tuple(sorted(
+                    str(item.get("name") or "").strip()
+                    for item in getattr(
+                        getattr(session.session, "conversation", None),
+                        "tool_schemas", (),
+                    )
+                    if str(item.get("name") or "").strip()
+                )),
             ))
         checkpoints = tuple(
             state.session_results[key].checkpoint for key in sorted(state.session_results)
@@ -3334,13 +3397,26 @@ class ReviewController:
                 now=self.clock(),
             ),
             excluded_obligation_ids=tuple(sorted(set(excluded_obligation_ids))),
+            investigation_leads=tuple(
+                state.investigation_leads[key]
+                for key in sorted(state.investigation_leads)
+            ),
         )
 
     def _negotiate(
         self, state: _RunState, reconciliation: CoverageReconciliation,
         *, attempt: int = 1, excluded_obligation_ids: Iterable[str] = (),
     ) -> tuple[NegotiationAction, ...]:
-        if not reconciliation.uncovered_obligation_ids:
+        if (
+            not reconciliation.uncovered_obligation_ids
+            and not any(
+                item.status in {
+                    InvestigationLeadStatus.OPEN,
+                    InvestigationLeadStatus.SCHEDULED,
+                }
+                for item in state.investigation_leads.values()
+            )
+        ):
             return ()
         followup_started = sum(
             1 for assignment in state.assignments.values()
@@ -3468,6 +3544,7 @@ class ReviewController:
                 "kind": action.kind,
                 "session_id": action.session_id,
                 "obligation_ids": action.obligation_ids,
+                "lead_ids": action.lead_ids,
                 "estimated_turns": action.estimated_turns,
                 "reason": action.reason,
             })
@@ -3482,9 +3559,19 @@ class ReviewController:
                         "reason": "bounded investigation exhausted all concrete novel actions",
                         "resolution_policy": dict(action.resolution_policies).get(obligation_id),
                     })
+                for lead_id in action.lead_ids:
+                    lead = state.investigation_leads.get(lead_id)
+                    if lead is None:
+                        continue
+                    state.investigation_leads[lead_id] = replace(
+                        lead,
+                        status=InvestigationLeadStatus.BLOCKED,
+                        resolution_reason=action.reason,
+                    )
                 state.journal.emit("negotiation_action_applied", {
                     "kind": action.kind,
                     "obligation_ids": action.obligation_ids,
+                    "lead_ids": action.lead_ids,
                     "outcome": "recorded_exhausted",
                 })
                 continue
@@ -3506,13 +3593,29 @@ class ReviewController:
                         "outcome": "skipped_missing_session",
                     })
                     continue
-                succeeded, _ = self._session_hook(
-                    state,
-                    action.session_id,
-                    "apply_coverage_feedback",
-                    RunPhase.FOLLOWUP,
-                    action.obligation_ids,
-                )
+                if action.lead_ids:
+                    lead_id = action.lead_ids[0]
+                    lead = state.investigation_leads.get(lead_id)
+                    lead_target = self._investigation_lead_target(state, lead_id)
+                    succeeded, _ = self._session_hook(
+                        state, action.session_id,
+                        "apply_investigation_lead_feedback",
+                        RunPhase.FOLLOWUP, lead_target, lead,
+                    ) if lead is not None else (False, None)
+                    if succeeded and lead is not None:
+                        state.investigation_leads[lead_id] = replace(
+                            lead,
+                            status=InvestigationLeadStatus.SCHEDULED,
+                            assigned_session_id=action.session_id,
+                        )
+                else:
+                    succeeded, _ = self._session_hook(
+                        state,
+                        action.session_id,
+                        "apply_coverage_feedback",
+                        RunPhase.FOLLOWUP,
+                        action.obligation_ids,
+                    )
                 if succeeded:
                     result.append(assignment)
                     outcome = "scheduled"
@@ -3522,7 +3625,49 @@ class ReviewController:
                     "kind": action.kind,
                     "session_id": action.session_id,
                     "obligation_ids": action.obligation_ids,
+                    "lead_ids": action.lead_ids,
                     "outcome": outcome,
+                })
+                continue
+            if action.lead_ids:
+                lead_id = action.lead_ids[0]
+                lead = state.investigation_leads.get(lead_id)
+                if lead is None:
+                    continue
+                assignment = Assignment(
+                    id=f"investigation-lead-followup-{index}",
+                    title=f"Investigation lead follow-up {index}",
+                    objective=lead.next_action,
+                    obligation_ids=(), recipe_ids=(),
+                    lenses=("investigation-lead",),
+                    seed_paths=lead.affected_paths,
+                    boundary_paths=lead.affected_paths,
+                    expected_evidence=(lead.required_capability,),
+                    estimated_turns=max(2, action.estimated_turns),
+                    priority="high",
+                    model_turn_limit=state.inputs.config.session_limits.model_turns,
+                    tool_call_limit=state.inputs.config.session_limits.tool_calls,
+                    investigation_leads=(lead,),
+                )
+                state.assignments[assignment.id] = assignment
+                expected_session_id = self._session_identity(state, assignment)
+                state.assignment_sessions[assignment.id] = expected_session_id
+                scheduled = replace(
+                    lead,
+                    status=InvestigationLeadStatus.SCHEDULED,
+                    assigned_session_id=expected_session_id,
+                )
+                assignment = replace(
+                    assignment, investigation_leads=(scheduled,),
+                )
+                state.assignments[assignment.id] = assignment
+                state.investigation_leads[lead_id] = scheduled
+                result.append(assignment)
+                state.journal.emit("negotiation_action_applied", {
+                    "kind": action.kind,
+                    "lead_ids": action.lead_ids,
+                    "assignment_id": assignment.id,
+                    "outcome": "scheduled",
                 })
                 continue
             selected = tuple(
@@ -3603,6 +3748,11 @@ class ReviewController:
                 "outcome": "scheduled",
             })
         return tuple(result)
+
+    @staticmethod
+    def _investigation_lead_target(state: _RunState, lead_id: str) -> str:
+        ordered = tuple(sorted(state.investigation_leads))
+        return f"L{ordered.index(lead_id) + 1}"
 
     def _collect_candidates(self, state: _RunState) -> tuple[CandidateFinding, ...]:
         for index, candidate in enumerate(state.inputs.candidate_findings):
@@ -5747,14 +5897,27 @@ class ReviewController:
                 1,
                 state.inputs.config.max_followup_sessions
                 + len(state.obligations),
+                state.inputs.config.max_followup_sessions
+                + len(state.obligations)
+                + min(32, len(state.investigation_leads)),
             )
             unproductive_obligation_ids: set[str] = set()
             for round_index in range(max_rounds):
-                if not reconciliation.uncovered_obligation_ids:
+                open_lead_ids = {
+                    item.lead_id for item in state.investigation_leads.values()
+                    if item.status in {
+                        InvestigationLeadStatus.OPEN,
+                        InvestigationLeadStatus.SCHEDULED,
+                    }
+                }
+                if not reconciliation.uncovered_obligation_ids and not open_lead_ids:
                     break
-                if not (
-                    set(reconciliation.uncovered_obligation_ids)
-                    - unproductive_obligation_ids
+                if (
+                    not (
+                        set(reconciliation.uncovered_obligation_ids)
+                        - unproductive_obligation_ids
+                    )
+                    and not open_lead_ids
                 ):
                     break
                 before_uncovered = set(reconciliation.uncovered_obligation_ids)
@@ -5764,9 +5927,14 @@ class ReviewController:
                     if status is ObligationStatus.COVERED
                 }
                 before_evidence = frozenset(state.evidence.snapshot().evidence_ids)
+                before_lead_statuses = {
+                    key: value.status
+                    for key, value in state.investigation_leads.items()
+                }
                 journal.emit("negotiation_round", {
                     "round": round_index + 1,
                     "uncovered_count": len(before_uncovered),
+                    "open_lead_count": len(open_lead_ids),
                 })
                 actions = self._negotiate(
                     state,
@@ -5794,9 +5962,14 @@ class ReviewController:
                     if status is ObligationStatus.COVERED
                 }
                 after_evidence = frozenset(state.evidence.snapshot().evidence_ids)
+                after_lead_statuses = {
+                    key: value.status
+                    for key, value in state.investigation_leads.items()
+                }
                 made_progress = (
                     bool(after_covered - before_covered)
                     or before_evidence != after_evidence
+                    or before_lead_statuses != after_lead_statuses
                 )
                 if not made_progress:
                     if not followups or any(
@@ -5810,10 +5983,24 @@ class ReviewController:
                         if obligation_id in before_uncovered
                     }
                     unproductive_obligation_ids.update(retired)
+                    retired_leads = {
+                        lead_id
+                        for action in actions
+                        for lead_id in action.lead_ids
+                        if lead_id in open_lead_ids
+                    }
+                    for lead_id in retired_leads:
+                        lead = state.investigation_leads[lead_id]
+                        state.investigation_leads[lead_id] = replace(
+                            lead,
+                            status=InvestigationLeadStatus.BLOCKED,
+                            resolution_reason="follow-up added no evidence or explicit resolution",
+                        )
                     journal.emit("negotiation_adjustment", {
                         "component": "negotiator",
                         "action": "retire-unproductive-target",
                         "obligation_ids": tuple(sorted(retired)),
+                        "lead_ids": tuple(sorted(retired_leads)),
                         "reason": "follow-up added no evidence or coverage",
                     })
             for obligation_id in reconciliation.uncovered_obligation_ids:
@@ -5825,6 +6012,18 @@ class ReviewController:
                         "reason": "mandatory coverage remained unresolved after bounded follow-up",
                         "resolution_policy": obligation.unresolved_policy,
                     })
+            for lead_id, lead in tuple(state.investigation_leads.items()):
+                if lead.status in {
+                    InvestigationLeadStatus.OPEN,
+                    InvestigationLeadStatus.SCHEDULED,
+                }:
+                    state.investigation_leads[lead_id] = replace(
+                        lead,
+                        status=InvestigationLeadStatus.BLOCKED,
+                        resolution_reason=(
+                            "investigation lead remained unresolved after bounded follow-up"
+                        ),
+                    )
 
             self._complete_phase(state)
             self._transition(state, "finalization")
@@ -5864,6 +6063,7 @@ class ReviewController:
                         session.evidence.snapshot(),
                     )
                     state.session_results[(session.assignment.id, result.session_id)] = result
+                    self._admit_investigation_lead_state(state, result)
                     self._promote_degraded_session_result(
                         state, session.assignment.id, result,
                     )
