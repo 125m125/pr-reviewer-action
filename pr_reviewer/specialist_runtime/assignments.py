@@ -9,7 +9,7 @@ import re
 from typing import Any
 
 from .policy import RuntimeConfig
-from .types import CoverageObligation
+from .types import CoverageObligation, InvestigationLead
 
 
 _REQUIRED_FIELDS = (
@@ -87,6 +87,7 @@ class Assignment:
     families: tuple[ReviewFamilyBrief, ...] = ()
     model_turn_limit: int = 0
     tool_call_limit: int = 0
+    investigation_leads: tuple[InvestigationLead, ...] = ()
 
     @property
     def assignment_id(self) -> str:

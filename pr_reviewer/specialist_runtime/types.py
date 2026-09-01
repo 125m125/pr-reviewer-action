@@ -73,6 +73,39 @@ class ReviewNoteKind(str, Enum):
     SOURCE_ACCESS_REQUEST = "source_access_request"
 
 
+class InvestigationLeadStatus(str, Enum):
+    OPEN = "open"
+    SCHEDULED = "scheduled"
+    RESOLVED_CANDIDATE = "resolved_candidate"
+    RESOLVED_NO_ISSUE = "resolved_no_issue"
+    BLOCKED = "blocked"
+    DROPPED = "dropped"
+
+
+@dataclass(frozen=True)
+class InvestigationLead:
+    lead_id: str
+    summary: str
+    affected_paths: tuple[str, ...]
+    evidence_ids: tuple[str, ...]
+    next_action: str
+    required_capability: str
+    origin_session_id: str
+    status: InvestigationLeadStatus = InvestigationLeadStatus.OPEN
+    assigned_session_id: str | None = None
+    resolution_reason: str = ""
+    candidate_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LeadResolution:
+    lead_id: str
+    status: InvestigationLeadStatus
+    reason: str
+    evidence_ids: tuple[str, ...] = ()
+    candidate_ids: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class CoverageObligation:
     obligation_id: str
@@ -116,6 +149,7 @@ class SpecialistAssignment:
     estimated_effort: int = 0
     priority: int = 0
     overlap_justification: str = ""
+    investigation_leads: tuple[InvestigationLead, ...] = ()
 
 
 @dataclass(frozen=True)

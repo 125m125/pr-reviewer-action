@@ -39,6 +39,8 @@ from pr_reviewer.specialist_runtime.session import (
 from pr_reviewer.specialist_runtime.types import (
     BudgetLimits,
     CoverageObligation,
+    InvestigationLead,
+    InvestigationLeadStatus,
     RunPhase,
     SessionCheckpoint,
     SessionState,
@@ -752,6 +754,208 @@ def test_concrete_candidate_schema_excludes_non_actionable_info_severity():
         "reachable_input_path", "failing_behavioral_test",
         "violated_invariant", "affected_consumer", "contradicting_evidence",
     ]
+
+
+def test_investigation_lead_tool_is_bounded_and_resolution_is_assignment_scoped():
+    ordinary = make_session(ScriptedGateway([]))
+    ordinary_tools = {
+        item["name"]: item["parameters"]
+        for item in ordinary.conversation.tool_schemas
+    }
+
+    assert "report_investigation_lead" in ordinary_tools
+    assert "resolve_investigation_lead" not in ordinary_tools
+    report_schema = ordinary_tools["report_investigation_lead"]
+    assert report_schema["properties"]["evidence_ids"]["maxItems"] == 8
+    assert report_schema["properties"]["affected_paths"]["maxItems"] == 8
+    assert report_schema["properties"]["required_capability"]["enum"] == [
+        "none", "repository", "tests", "web",
+    ]
+
+    assignment = SpecialistAssignment(
+        assignment_id="lead-assignment",
+        objective="Investigate the routed lead",
+        investigation_leads=(InvestigationLead(
+            lead_id="lead:abc123",
+            summary="A caller may rely on the changed fallback.",
+            affected_paths=("a.py",),
+            evidence_ids=(),
+            next_action="Trace the affected caller.",
+            required_capability="repository",
+            origin_session_id="S0",
+        ),),
+    )
+    assigned = make_session(ScriptedGateway([]), assignment=assignment)
+    assigned_tools = {item["name"] for item in assigned.conversation.tool_schemas}
+
+    assert "resolve_investigation_lead" in assigned_tools
+    prompt = json.loads(assigned._assignment_prompt().split("\n", 1)[1])
+    assert prompt["investigation_lead_targets"] == [{
+        "target": "L1",
+        "lead_id": "lead:abc123",
+        "summary": "A caller may rely on the changed fallback.",
+        "affected_paths": ["a.py"],
+        "evidence_ids": [],
+        "next_action": "Trace the affected caller.",
+        "required_capability": "repository",
+    }]
+
+
+def test_report_investigation_lead_retains_evidence_and_deduplicates():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-lead", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    arguments = {
+        "summary": "The changed fallback may be relied on by another component.",
+        "affected_paths": ["a.py"],
+        "evidence_ids": [evidence_id],
+        "next_action": "Trace consumers of the changed fallback.",
+        "required_capability": "repository",
+    }
+
+    first_progress = session._execute_calls(({
+        "id": "lead-1", "name": "report_investigation_lead",
+        "arguments": json.dumps(arguments),
+    },))
+    first = json.loads(session.conversation.events[-1]["content"])
+    second_progress = session._execute_calls(({
+        "id": "lead-2", "name": "report_investigation_lead",
+        "arguments": json.dumps(arguments),
+    },))
+    second = json.loads(session.conversation.events[-1]["content"])
+
+    assert first_progress is True
+    assert first == {"accepted": True, "target": "L1", "duplicate": False}
+    assert second_progress is False
+    assert second == {"accepted": True, "target": "L1", "duplicate": True}
+    result = session._snapshot()
+    assert len(result.investigation_leads) == 1
+    assert result.investigation_leads[0].evidence_ids == (evidence_id,)
+
+
+def test_report_investigation_lead_rejects_unretained_evidence_and_unscoped_path():
+    session = make_session(ScriptedGateway([]))
+
+    progressed = session._execute_calls(({
+        "id": "lead-invalid", "name": "report_investigation_lead",
+        "arguments": json.dumps({
+            "summary": "An unrelated path might have a problem.",
+            "affected_paths": ["outside.py"],
+            "evidence_ids": ["evidence:missing"],
+            "next_action": "Inspect the unrelated path.",
+            "required_capability": "repository",
+        }),
+    },))
+
+    assert progressed is False
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["accepted"] is False
+    assert "retained evidence" in result["reason"]
+    assert session._snapshot().investigation_leads == ()
+
+
+def test_assigned_investigation_lead_can_be_explicitly_resolved():
+    lead = InvestigationLead(
+        lead_id="lead:abc123",
+        summary="The changed fallback may be relied on elsewhere.",
+        affected_paths=("a.py",), evidence_ids=(),
+        next_action="Trace the caller.", required_capability="repository",
+        origin_session_id="S0",
+    )
+    assignment = SpecialistAssignment(
+        assignment_id="lead-assignment", objective="Investigate routed lead",
+        investigation_leads=(lead,),
+    )
+    session = make_session(ScriptedGateway([]), assignment=assignment)
+
+    progressed = session._execute_calls(({
+        "id": "resolve-lead", "name": "resolve_investigation_lead",
+        "arguments": json.dumps({
+            "target": "L1", "status": "resolved_no_issue",
+            "reason": "The only caller supplies the required fallback explicitly.",
+            "evidence_ids": [],
+        }),
+    },))
+
+    assert progressed is True
+    assert json.loads(session.conversation.events[-1]["content"]) == {
+        "accepted": True, "target": "L1", "status": "resolved_no_issue",
+    }
+    resolution = session._snapshot().investigation_lead_resolutions[0]
+    assert resolution.lead_id == "lead:abc123"
+    assert resolution.status is InvestigationLeadStatus.RESOLVED_NO_ISSUE
+
+
+def test_single_assigned_lead_is_resolved_when_it_produces_a_candidate():
+    lead = InvestigationLead(
+        lead_id="lead:candidate", summary="The changed branch may fail.",
+        affected_paths=("a.py",), evidence_ids=(),
+        next_action="Prove the changed consequence.", required_capability="repository",
+        origin_session_id="S0",
+    )
+    assignment = SpecialistAssignment(
+        assignment_id="lead-assignment", objective="Investigate routed lead",
+        primary_obligation_ids=("OB-code",), investigation_leads=(lead,),
+    )
+    session = make_session(ScriptedGateway([]), assignment=assignment)
+    session._execute_calls(({
+        "id": "read-lead-candidate", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["L1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+
+    session._execute_calls(({
+        "id": "report-lead-candidate", "name": "report_candidate",
+        "arguments": json.dumps({
+            "claim": "The changed branch returns the wrong state.",
+            "affected_location": "a.py:4",
+            "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
+            "severity": "major", "category": "correctness",
+            "supporting_evidence_ids": [evidence_id],
+            "contradicting_evidence_ids": [], "related_targets": ["O1"],
+            "consequence_support": reachable_consequence_support(),
+            "user_visible_consequence": "The operation returns the wrong state.",
+            "manual_validation": "Run the changed state-transition test.",
+        }),
+    },))
+
+    resolution = session._snapshot().investigation_lead_resolutions[0]
+    assert resolution.status is InvestigationLeadStatus.RESOLVED_CANDIDATE
+    assert resolution.candidate_ids == (session.candidate_findings[0].candidate_id,)
+
+
+def test_investigation_lead_feedback_authorizes_targeted_tools_and_evidence_recovery():
+    session = make_session(ScriptedGateway([]))
+    lead = InvestigationLead(
+        lead_id="lead:later", summary="A later controller lead.",
+        affected_paths=("a.py",), evidence_ids=(),
+        next_action="Inspect its consumer.", required_capability="repository",
+        origin_session_id="S0",
+    )
+
+    session.apply_investigation_lead_feedback("L7", lead)
+    progressed = session._execute_calls(({
+        "id": "read-lead-target", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["L7"]}),
+    },))
+
+    assert progressed is True
+    assert "resolve_investigation_lead" in {
+        item["name"] for item in session.conversation.tool_schemas
+    }
+    assert "A later controller lead" in session.conversation.events[-2]["content"]
+    record = seed_successful_tool_exchange(
+        session, call_id="old-lead-read", path="a.py", content="old evidence",
+    )
+    session._compacted_evidence[record.id] = record
+    recovered = session._read_compacted_evidence({
+        "evidence_id": record.id, "target": "L7",
+        "purpose": "contradiction_check", "offset": 0, "limit": 100,
+    })
+    assert recovered["status"] == "ok"
 
 
 def test_missing_defect_assessment_cannot_resolve_obligation():

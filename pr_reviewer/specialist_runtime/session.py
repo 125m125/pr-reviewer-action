@@ -36,6 +36,9 @@ from .types import (
     CandidateFinding,
     change_overview_orientation,
     CoverageObligation,
+    InvestigationLead,
+    InvestigationLeadStatus,
+    LeadResolution,
     ObligationStatus,
     RunPhase,
     SessionCheckpoint,
@@ -260,6 +263,48 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "reason": {"type": "string"},
             "evidence_ids": {"type": "array", "items": {"type": "string"}},
         }, "required": ["target", "reason"], "additionalProperties": False},
+    },
+    {
+        "name": "report_investigation_lead",
+        "description": (
+            "Report a concrete, evidence-backed suspicion outside the current "
+            "assignment that warrants separate investigation. If the defect is "
+            "already proven, use report_candidate instead."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "summary": {"type": "string", "maxLength": 500},
+            "affected_paths": {
+                "type": "array", "maxItems": 8,
+                "items": {"type": "string", "maxLength": 500},
+            },
+            "evidence_ids": {
+                "type": "array", "minItems": 1, "maxItems": 8,
+                "items": {"type": "string"},
+            },
+            "next_action": {"type": "string", "maxLength": 500},
+            "required_capability": {"type": "string", "enum": [
+                "none", "repository", "tests", "web",
+            ]},
+        }, "required": [
+            "summary", "evidence_ids", "next_action", "required_capability",
+        ], "additionalProperties": False},
+    },
+    {
+        "name": "resolve_investigation_lead",
+        "description": (
+            "Explicitly resolve one controller-assigned investigation lead "
+            "without a candidate, or mark it blocked. Silence never resolves a lead."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string", "description": "Assigned L# lead target."},
+            "status": {"type": "string", "enum": [
+                "resolved_no_issue", "blocked",
+            ]},
+            "reason": {"type": "string", "maxLength": 500},
+            "evidence_ids": {
+                "type": "array", "maxItems": 8, "items": {"type": "string"},
+            },
+        }, "required": ["target", "status", "reason"], "additionalProperties": False},
     },
     {
         "name": "read_test_results",
@@ -943,6 +988,7 @@ def specialist_assignment_prompt(
     primary = tuple(getattr(assignment, "primary_obligation_ids", ()))
     all_ids = tuple(getattr(assignment, "obligation_ids", ()))
     independent = tuple(getattr(assignment, "independent_obligation_ids", ()))
+    investigation_leads = tuple(getattr(assignment, "investigation_leads", ()))
     payload = {
         "assignment_id": getattr(
             assignment, "assignment_id", getattr(assignment, "id", ""),
@@ -957,6 +1003,18 @@ def specialist_assignment_prompt(
             )
         ],
         "independent_obligation_ids": list(independent),
+        "investigation_lead_targets": [
+            {
+                "target": f"L{index}",
+                "lead_id": lead.lead_id,
+                "summary": lead.summary,
+                "affected_paths": list(lead.affected_paths),
+                "evidence_ids": list(lead.evidence_ids),
+                "next_action": lead.next_action,
+                "required_capability": lead.required_capability,
+            }
+            for index, lead in enumerate(investigation_leads, start=1)
+        ],
         "analytical_lens": lenses,
         "seed_paths": list(getattr(assignment, "seed_paths", ())),
         "permitted_boundaries": list(getattr(
@@ -1093,6 +1151,8 @@ class SessionResult:
     degraded: bool = False
     request_events: tuple[SpecialistRequestEvent, ...] = ()
     finalization_diagnostics: tuple[Mapping[str, object], ...] = ()
+    investigation_leads: tuple[InvestigationLead, ...] = ()
+    investigation_lead_resolutions: tuple[LeadResolution, ...] = ()
 
 
 class SpecialistSession:
@@ -1201,6 +1261,17 @@ class SpecialistSession:
         self._candidate_targets: dict[str, str] = {}
         self._announced_candidate_targets: set[str] = set()
         self._candidate_withdrawals: dict[str, dict[str, object]] = {}
+        self._investigation_leads: dict[str, InvestigationLead] = {}
+        self._investigation_lead_targets: dict[str, str] = {}
+        self._investigation_lead_resolutions: dict[str, LeadResolution] = {}
+        self._assigned_investigation_lead_ids: set[str] = set()
+        for index, lead in enumerate(
+            tuple(getattr(self.assignment, "investigation_leads", ())), start=1,
+        ):
+            target = f"L{index}"
+            self._investigation_leads[lead.lead_id] = lead
+            self._investigation_lead_targets[target] = lead.lead_id
+            self._assigned_investigation_lead_ids.add(lead.lead_id)
         self._defect_leads: list[dict[str, object]] = []
         self._next_defect_lead = 1
         self._defect_synthesis_diagnostic: dict[str, object] = {
@@ -1268,7 +1339,7 @@ class SpecialistSession:
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Optional short obligation targets this neutral evidence "
+                    "Optional short controller work-item targets this neutral evidence "
                     "collection is meant to inform."
                 ),
             }
@@ -1280,7 +1351,13 @@ class SpecialistSession:
         has_test_results = bool(self.test_results)
         local_schemas = tuple(
             item for item in _OBLIGATION_LOCAL_TOOL_SCHEMAS
-            if item.get("name") != TEST_RESULTS_TOOL_NAME or has_test_results
+            if (
+                (item.get("name") != TEST_RESULTS_TOOL_NAME or has_test_results)
+                and (
+                    item.get("name") != "resolve_investigation_lead"
+                    or bool(self._investigation_lead_targets)
+                )
+            )
         )
         if schemas:
             schemas.extend(json.loads(json.dumps(local_schemas)))
@@ -2264,6 +2341,8 @@ class SpecialistSession:
         self._obligation_local_tool_calls += 1
         if name in {"report_candidate", "withdraw_candidate"}:
             return self._execute_candidate_tool(call_id, name, arguments)
+        if name in {"report_investigation_lead", "resolve_investigation_lead"}:
+            return self._execute_investigation_lead_tool(call_id, name, arguments)
         try:
             if name == "explain_obligation":
                 payload = self.obligation_assessments.explain(target)
@@ -2359,6 +2438,125 @@ class SpecialistSession:
             accepted = False
         self.conversation.add_tool_result(call_id, payload, is_error=False)
         return accepted
+
+    def _execute_investigation_lead_tool(
+        self, call_id: str, name: str, arguments: Mapping[str, Any],
+    ) -> bool:
+        retained = {
+            record.id: record for record in self.evidence_store.snapshot().records
+        }
+        if name == "resolve_investigation_lead":
+            target = str(arguments.get("target") or "").strip()
+            lead_id = self._investigation_lead_targets.get(target, "")
+            status_text = str(arguments.get("status") or "").strip()
+            reason = _bounded_text(arguments.get("reason"), max_length=500)
+            if lead_id not in self._assigned_investigation_lead_ids:
+                payload = {
+                    "accepted": False, "target": target,
+                    "reason": "unknown assigned investigation lead target",
+                }
+                self.conversation.add_tool_result(call_id, payload)
+                return False
+            if status_text not in {"resolved_no_issue", "blocked"} or not reason:
+                payload = {
+                    "accepted": False, "target": target,
+                    "reason": "status and concrete reason are required",
+                }
+                self.conversation.add_tool_result(call_id, payload)
+                return False
+            evidence_ids = tuple(dict.fromkeys(
+                item for value in _tool_string_list(arguments.get("evidence_ids"))
+                if (item := _resolve_retained_evidence_id(value, retained)) is not None
+            ))[:8]
+            status = InvestigationLeadStatus(status_text)
+            self._investigation_lead_resolutions[lead_id] = LeadResolution(
+                lead_id=lead_id, status=status, reason=reason,
+                evidence_ids=evidence_ids,
+            )
+            self.conversation.add_tool_result(call_id, {
+                "accepted": True, "target": target, "status": status.value,
+            })
+            return True
+
+        summary = _bounded_text(arguments.get("summary"), max_length=500)
+        next_action = _bounded_text(arguments.get("next_action"), max_length=500)
+        capability = str(arguments.get("required_capability") or "").strip()
+        requested_evidence = _tool_string_list(arguments.get("evidence_ids"))[:8]
+        evidence_ids = tuple(dict.fromkeys(
+            item for value in requested_evidence
+            if (item := _resolve_retained_evidence_id(value, retained)) is not None
+        ))
+        if not summary or not next_action:
+            payload = {
+                "accepted": False,
+                "reason": "summary and next_action are required",
+            }
+            self.conversation.add_tool_result(call_id, payload)
+            return False
+        if capability not in {"none", "repository", "tests", "web"}:
+            payload = {
+                "accepted": False, "reason": "invalid required_capability",
+            }
+            self.conversation.add_tool_result(call_id, payload)
+            return False
+        if not requested_evidence or len(evidence_ids) != len(requested_evidence):
+            payload = {
+                "accepted": False,
+                "reason": "all evidence_ids must reference retained evidence",
+            }
+            self.conversation.add_tool_result(call_id, payload)
+            return False
+        affected_paths = tuple(dict.fromkeys(
+            path for value in _tool_string_list(arguments.get("affected_paths"))[:8]
+            if (path := _normalized_path(value))
+        ))
+        evidence_paths = {
+            _normalized_path(retained[evidence_id].source_path or "")
+            for evidence_id in evidence_ids
+        }
+        permitted_paths = set(self.changed_files) | evidence_paths
+        invalid_paths = tuple(
+            path for path in affected_paths if path not in permitted_paths
+        )
+        if invalid_paths:
+            payload = {
+                "accepted": False,
+                "reason": "affected_paths must be changed paths or cited evidence source paths",
+                "invalid_paths": list(invalid_paths),
+            }
+            self.conversation.add_tool_result(call_id, payload)
+            return False
+        identity = hashlib.sha256(json.dumps({
+            "summary": summary.casefold(),
+            "paths": sorted(affected_paths),
+            "next_action": next_action.casefold(),
+        }, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        lead_id = f"lead:{identity}"
+        duplicate = lead_id in self._investigation_leads
+        if not duplicate:
+            if len(self._investigation_leads) >= 32:
+                payload = {
+                    "accepted": False,
+                    "reason": "investigation lead allowance exhausted",
+                }
+                self.conversation.add_tool_result(call_id, payload)
+                return False
+            self._investigation_leads[lead_id] = InvestigationLead(
+                lead_id=lead_id, summary=summary, affected_paths=affected_paths,
+                evidence_ids=evidence_ids, next_action=next_action,
+                required_capability=capability, origin_session_id=self.session_id,
+            )
+            target = f"L{len(self._investigation_lead_targets) + 1}"
+            self._investigation_lead_targets[target] = lead_id
+        else:
+            target = next(
+                key for key, value in self._investigation_lead_targets.items()
+                if value == lead_id
+            )
+        self.conversation.add_tool_result(call_id, {
+            "accepted": True, "target": target, "duplicate": duplicate,
+        })
+        return not duplicate
 
     def _process_defect_assessment(
         self,
@@ -2536,6 +2734,15 @@ class SpecialistSession:
                 item.candidate_id for item in self.candidate_findings
             ),
         )
+        if len(self._assigned_investigation_lead_ids) == 1:
+            lead_id = next(iter(self._assigned_investigation_lead_ids))
+            self._investigation_lead_resolutions[lead_id] = LeadResolution(
+                lead_id=lead_id,
+                status=InvestigationLeadStatus.RESOLVED_CANDIDATE,
+                reason="The assigned investigation lead produced an admitted candidate.",
+                evidence_ids=candidate.supporting_evidence_ids,
+                candidate_ids=(candidate.candidate_id,),
+            )
         return ({"accepted": True, "target": next_target}, True)
 
     def _candidate_rejection(
@@ -2708,18 +2915,26 @@ class SpecialistSession:
                 requested_targets = tuple(dict.fromkeys(
                     item.strip() for item in raw_targets
                 ))
-                resolved = tuple(
-                    self.obligation_assessments.obligation_id(item)
-                    for item in requested_targets
-                )
-                if any(item is None for item in resolved):
+                lead_targets = set(self._investigation_lead_targets)
+                resolved: list[str] = []
+                invalid_targets: list[str] = []
+                for item in requested_targets:
+                    if item in lead_targets:
+                        continue
+                    try:
+                        resolved.append(
+                            self.obligation_assessments.obligation_id(item)
+                        )
+                    except KeyError:
+                        invalid_targets.append(item)
+                if invalid_targets:
                     self.budget.record_tool_rejection("unassigned obligation targets")
                     self.conversation.add_tool_result(
                         call_id, {"error": "targets contain an unassigned handle"},
                         is_error=True,
                     )
                     continue
-                requested_obligation_ids = tuple(str(item) for item in resolved)
+                requested_obligation_ids = tuple(resolved)
             raw_obligation_ids = arguments.pop("obligation_ids", ())
             if raw_obligation_ids in (None, ()):
                 legacy_obligation_ids: tuple[str, ...] = ()
@@ -4605,6 +4820,45 @@ class SpecialistSession:
                     self.coverage.mark_unresolved(obligation_id)
         self._current_gaps = self._derive_current_gaps()
 
+    def apply_investigation_lead_feedback(
+        self, target: str, lead: InvestigationLead,
+    ) -> None:
+        """Attach one controller-selected lead to this durable session."""
+        if self._final_result is not None:
+            return
+        normalized_target = str(target).strip()
+        if not normalized_target or not isinstance(lead, InvestigationLead):
+            raise ValueError("a target and investigation lead are required")
+        self._investigation_leads[lead.lead_id] = lead
+        self._investigation_lead_targets[normalized_target] = lead.lead_id
+        self._assigned_investigation_lead_ids.add(lead.lead_id)
+        if not any(
+            item.get("name") == "resolve_investigation_lead"
+            for item in self.conversation.tool_schemas
+        ):
+            schema = next(
+                item for item in _OBLIGATION_LOCAL_TOOL_SCHEMAS
+                if item.get("name") == "resolve_investigation_lead"
+            )
+            self.conversation.tool_schemas.append(
+                json.loads(json.dumps(schema))
+            )
+        self.state = SessionState.COVERAGE_EVALUATION
+        self.conversation.add_user(
+            "Controller-selected investigation lead. Tools are available again. "
+            "Investigate only this lead, report a proven defect with report_candidate, "
+            "or explicitly close it with resolve_investigation_lead: "
+            + json.dumps({
+                "target": normalized_target,
+                "summary": lead.summary,
+                "affected_paths": list(lead.affected_paths),
+                "evidence_ids": list(lead.evidence_ids),
+                "next_action": lead.next_action,
+                "required_capability": lead.required_capability,
+            }, sort_keys=True)
+        )
+        self.budget.reset_no_progress_streak("material investigation lead feedback")
+
     def update_lease(self, lease: SessionLease) -> None:
         """Advance the same durable session to a controller-issued later lease."""
         if not isinstance(lease, SessionLease):
@@ -5103,6 +5357,7 @@ class SpecialistSession:
         authorized_targets = set(self._assigned_obligation_ids())
         authorized_targets.update(self.obligation_assessments.handles())
         authorized_targets.update(self._candidate_statuses)
+        authorized_targets.update(self._investigation_lead_targets)
         authorized_targets.update(
             str(getattr(item, "family_id", ""))
             for item in getattr(self.assignment, "families", ())
@@ -5226,6 +5481,10 @@ class SpecialistSession:
             request_events=tuple(self._request_events),
             finalization_diagnostics=tuple(
                 dict(item) for item in self._finalization_diagnostics
+            ),
+            investigation_leads=tuple(self._investigation_leads.values()),
+            investigation_lead_resolutions=tuple(
+                self._investigation_lead_resolutions.values()
             ),
         )
 
