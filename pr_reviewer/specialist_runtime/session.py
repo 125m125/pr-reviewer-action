@@ -4587,7 +4587,9 @@ class SpecialistSession:
                 for action in self.obligation_assessments.assessment(target).next_actions
             )
             self.conversation.add_user(
-                "Coverage feedback; continue the same investigation for these gaps: "
+                "Coverage feedback. The previous checkpoint proposed_next_actions "
+                "have expired; continue the same investigation only for these "
+                "controller-selected gaps: "
                 + json.dumps(normalized)
                 + (
                     ". Complete one of these controller-accepted novel actions: "

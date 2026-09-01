@@ -4044,9 +4044,6 @@ class ReviewController:
                 "covered_subjects": covered_subjects,
                 "unresolved_subjects": unresolved_subjects,
                 "unknowns": strings(getattr(checkpoint, "unknowns", ())),
-                "proposed_next_actions": strings(
-                    getattr(checkpoint, "proposed_next_actions", ()),
-                ),
             })
         return tuple(projected)
 

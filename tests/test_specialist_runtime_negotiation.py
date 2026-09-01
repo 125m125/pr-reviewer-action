@@ -188,7 +188,7 @@ def test_compact_negotiation_offers_resume_only_for_novel_checkpoint_action():
     assert "resume" in target["allowed_actions"]
 
 
-def test_compact_negotiation_preserves_checkpoint_lead_before_obligation_update():
+def test_compact_negotiation_does_not_promote_checkpoint_todos_to_scheduler_actions():
     checkpoint = SessionCheckpoint(
         session_id="S2",
         state=SessionState.CHECKPOINT,
@@ -220,19 +220,10 @@ def test_compact_negotiation_preserves_checkpoint_lead_before_obligation_update(
             ),
         ),
     )
-    target = next(
-        item for item in compact_negotiation_context(
-            state,
-        )["targets"]
-        if item["subject"] == "src/a.py"
-    )
+    context = compact_negotiation_context(state)
 
-    assert target["summary"].startswith("The changed redactor")
-    assert target["next_actions"] == checkpoint.proposed_next_actions
-    assert target["evidence_delta"] == 0
-    assert target["retained_evidence_count"] == 17
-    assert "resume" in target["allowed_actions"]
-    assert "record_unknown" not in target["allowed_actions"]
+    assert all(item["subject"] != "src/a.py" for item in context["targets"])
+    assert checkpoint.proposed_next_actions[0] not in str(context)
 
 
 def test_compact_negotiation_only_advertises_globally_admissible_high_risk_actions():

@@ -3594,6 +3594,20 @@ def test_epoch_compaction_runs_only_after_compact_resume_checkpoint_validates():
     assert '"proposed_next_actions"' in continuation[0]["content"]
 
 
+def test_later_controller_feedback_expires_checkpoint_todos():
+    session = make_session(ScriptedGateway([]))
+    session.latest_checkpoint = replace(
+        session.latest_checkpoint,
+        proposed_next_actions=("Read an unrelated historical file.",),
+    )
+
+    session.apply_coverage_feedback(("OB-tests",))
+
+    message = session.conversation.events[-1]["content"]
+    assert "previous checkpoint proposed_next_actions have expired" in message
+    assert "Read an unrelated historical file." not in message
+
+
 def test_checkpoint_diagnostic_projects_admission_and_regular_compaction_counts():
     gateway = EstimatingGateway(
         [

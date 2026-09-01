@@ -3814,9 +3814,7 @@ def test_handoff_summarizer_uses_full_overview_and_latest_checkpoint_summaries(
     assert checkpoint_summary["unknowns"] == [
         "External acknowledgement [REDACTED] remains unresolved.",
     ]
-    assert checkpoint_summary["proposed_next_actions"] == [
-        "Recheck acknowledgement handling.",
-    ]
+    assert "proposed_next_actions" not in checkpoint_summary
     assert result.handoff.what_changed == (
         "Worker delivery now uses bounded retry orchestration. "
         "The retry state also participates in the delivery contract.",

@@ -250,16 +250,10 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             checkpoints[owner.session_id]
             for owner in owners if owner.session_id in checkpoints
         )
-        checkpoint_actions = tuple(dict.fromkeys(
-            action
-            for checkpoint in owner_checkpoints
-            for action in checkpoint.proposed_next_actions
-            if action.strip() and action not in checkpoint.unknowns
-        ))
-        next_actions = tuple(dict.fromkeys((
-            *(assessment.next_actions if assessment is not None else ()),
-            *checkpoint_actions,
-        )))
+        next_actions = (
+            tuple(dict.fromkeys(assessment.next_actions))
+            if assessment is not None else ()
+        )
         has_novel_action = (
             assessment is None
             or (
