@@ -61,7 +61,8 @@ If evidence already supports a concrete defect, the prompt directs the specialis
 to use `report_candidate` instead. A rejected candidate continues through the
 existing focused-repair path rather than being duplicated as a lead.
 
-The controller assigns a stable `L#` handle, deduplicates materially equivalent
+The controller derives a stable canonical lead ID, exposes a bounded `L#` handle
+to the negotiator and assigned specialist, deduplicates materially equivalent
 leads, records their origin session and evidence, and maintains one of these
 states:
 
@@ -75,6 +76,12 @@ states:
 
 Leads exist only for the current immutable review run. They are preserved in the
 artifact for audit but are not carried into a later PR review.
+
+A session explicitly assigned an `L#` target also receives the narrow
+`resolve_investigation_lead` tool. It can mark that target `resolved_no_issue` or
+`blocked` with a concrete reason and retained evidence IDs. An admitted candidate
+from a one-lead assignment marks the target `resolved_candidate`. Silence never
+resolves a lead.
 
 ## Routing and negotiation
 
