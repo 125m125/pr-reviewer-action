@@ -473,6 +473,7 @@ for the complete schema, source-rule boundaries, and conversion checklist.
 | `tool_allowed_gh_api_repos` | Comma-separated owner/repo allowlist for `gh_api`; use `*` to allow any repo endpoint still permitted by the tool path allowlist (empty = current repo only) | No | `""` |
 | `tool_request_timeout_sec` | Timeout in seconds for each tool execution request | No | `20` |
 | `search_url` | Search-engine endpoint (e.g. a SearXNG `/search` URL) that enables the read-only `web_search` tool in the native tool loop. When set, the model can search for a page and then `web_fetch` the best result; empty leaves `web_search` un-advertised. The model supplies only the query — the host is fixed by this setting. Subject to the same fork gating as the rest of the tool harness | No | `""` |
+| `allow_private_search_url` | Explicitly allow the configured `search_url` to use private HTTP(S) endpoints and non-standard ports; intended for trusted self-hosted runners and still subject to fork gating | No | `false` |
 | `tool_max_search_results` | Maximum results returned per `web_search` call | No | `5` |
 | `tool_failure_enforcement` | Force `request_changes` when tool harness planning fails | No | `false` |
 | `tool_min_successful_requests` | Minimum successful tool requests required when `tool_failure_enforcement=true` | No | `0` |

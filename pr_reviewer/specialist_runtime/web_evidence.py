@@ -87,8 +87,11 @@ class SearxngSearchProvider:
         max_redirects: int = 3,
         monotonic: Callable[[], float] = time.monotonic,
         blocking_guard: _BoundedBlockingCallGuard | None = None,
+        allow_private_search_url: bool = False,
     ) -> None:
-        canonical, host = _canonical_search_endpoint(endpoint)
+        canonical, host = _canonical_search_endpoint(
+            endpoint, allow_private_search_url=allow_private_search_url,
+        )
         if request_timeout <= 0 or max_response_bytes <= 0 or max_redirects < 0:
             raise ValueError("search provider limits must be positive")
         self.endpoint = canonical
@@ -102,11 +105,16 @@ class SearxngSearchProvider:
         self.max_response_bytes = max_response_bytes
         self.max_redirects = max_redirects
         self.monotonic = monotonic
+        self.allow_private_search_url = allow_private_search_url
 
     @classmethod
-    def is_valid_endpoint(cls, endpoint: str) -> bool:
+    def is_valid_endpoint(
+        cls, endpoint: str, *, allow_private_search_url: bool = False,
+    ) -> bool:
         try:
-            _canonical_search_endpoint(endpoint)
+            _canonical_search_endpoint(
+                endpoint, allow_private_search_url=allow_private_search_url,
+            )
         except (SourceDenied, ValueError):
             return False
         return True
@@ -118,15 +126,25 @@ class SearxngSearchProvider:
         query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
         query_pairs.extend((("q", query), ("format", "json")))
         current_url = urlunsplit((
-            "https", self.host, parsed.path or "/", urlencode(query_pairs), "",
+            parsed.scheme, parsed.netloc, parsed.path or "/",
+            urlencode(query_pairs), "",
         ))
         deadline = self.monotonic() + self.request_timeout
         response: HttpResponse | None = None
         for redirect_count in range(self.max_redirects + 1):
-            canonical, host = _canonical_search_endpoint(current_url, required_host=self.host)
+            canonical, host = _canonical_search_endpoint(
+                current_url,
+                required_host=self.host,
+                allow_private_search_url=self.allow_private_search_url,
+            )
+            parsed_canonical = urlsplit(canonical)
+            port = parsed_canonical.port or (
+                443 if parsed_canonical.scheme == "https" else 80
+            )
             addresses = _public_addresses(
-                host, 443, self.resolver, deadline, self.monotonic,
+                host, port, self.resolver, deadline, self.monotonic,
                 self.blocking_guard,
+                allow_private=self.allow_private_search_url,
             )
             remaining = _remaining(deadline, self.monotonic)
             response = self.transport.request(HttpRequest(
@@ -495,6 +513,7 @@ def _encode_query(query: str) -> str:
 
 def _canonical_search_endpoint(
     endpoint: str, *, required_host: str | None = None,
+    allow_private_search_url: bool = False,
 ) -> tuple[str, str]:
     try:
         parsed = urlsplit(str(endpoint).strip())
@@ -503,9 +522,11 @@ def _canonical_search_endpoint(
         raise SourceDenied("search endpoint URL is invalid") from exc
     host = _normalize_hostname(parsed.hostname)
     if (
-        parsed.scheme.lower() != "https"
+        parsed.scheme.lower() not in (
+            ("http", "https") if allow_private_search_url else ("https",)
+        )
         or not host
-        or port not in (None, 443)
+        or (not allow_private_search_url and port not in (None, 443))
         or parsed.username is not None
         or parsed.password is not None
         or bool(parsed.fragment)
@@ -523,7 +544,11 @@ def _canonical_search_endpoint(
     except ValueError as exc:
         raise SourceDenied("search endpoint query is invalid") from exc
     canonical_query = urlencode(query_pairs)
-    return urlunsplit(("https", host, _encode_path(path), canonical_query, "")), host
+    scheme = parsed.scheme.lower()
+    authority = host
+    if port is not None and port != (443 if scheme == "https" else 80):
+        authority = f"{host}:{port}"
+    return urlunsplit((scheme, authority, _encode_path(path), canonical_query, "")), host
 
 
 def _remaining(deadline: float, monotonic: Callable[[], float]) -> float:
@@ -875,6 +900,8 @@ def _public_addresses(
     deadline: float,
     monotonic: Callable[[], float],
     blocking_guard: _BoundedBlockingCallGuard,
+    *,
+    allow_private: bool = False,
 ) -> tuple[str, ...]:
     try:
         literal = ipaddress.ip_address(host)
@@ -908,12 +935,17 @@ def _public_addresses(
             raise SourceDenied("source address resolution returned an invalid address") from exc
         if (
             address in _METADATA_ADDRESSES
-            or address.is_loopback
-            or address.is_private
-            or address.is_link_local
-            or address.is_multicast
-            or address.is_reserved
-            or address.is_unspecified
+            or (
+                not allow_private
+                and (
+                    address.is_loopback
+                    or address.is_private
+                    or address.is_link_local
+                    or address.is_multicast
+                    or address.is_reserved
+                    or address.is_unspecified
+                )
+            )
         ):
             raise SourceDenied("source address is private or otherwise unsafe")
         approved.append(str(address))
@@ -937,8 +969,25 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
 
 
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """Plain HTTP connection whose TCP peer is a previously checked IP."""
+
+    def __init__(
+        self, host: str, port: int, resolved_ip: str, timeout: float,
+        context: ssl.SSLContext,
+    ) -> None:
+        del context
+        super().__init__(host, port=port, timeout=timeout)
+        self._resolved_ip = resolved_ip
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection(
+            (self._resolved_ip, self.port), self.timeout, self.source_address
+        )
+
+
 class StdlibHttpTransport:
-    """Credential-free HTTPS transport pinned to an approved resolved IP."""
+    """Credential-free HTTP(S) transport pinned to an approved resolved IP."""
 
     def __init__(
         self,
@@ -955,9 +1004,12 @@ class StdlibHttpTransport:
 
     def request(self, request: HttpRequest) -> HttpResponse:
         parsed = urlsplit(request.url)
-        port = parsed.port or 443
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
         deadline = request.deadline or (self._monotonic() + request.timeout)
-        connection = self._connection_factory(
+        connection_factory = self._connection_factory
+        if parsed.scheme == "http" and connection_factory is _PinnedHTTPSConnection:
+            connection_factory = _PinnedHTTPConnection
+        connection = connection_factory(
             parsed.hostname or "", port, request.resolved_ip,
             _remaining(deadline, self._monotonic), self._ssl_context,
         )

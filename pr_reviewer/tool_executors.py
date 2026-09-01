@@ -408,6 +408,7 @@ def web_search(
     source_policy=None,
     provider: SearchProvider | None = None,
     search_scan_limit=25,
+    allow_private_search_url=False,
 ):
     """Return policy-filtered discovery metadata, never raw search output."""
     if not search_url:
@@ -415,7 +416,9 @@ def web_search(
     try:
         policy = source_policy or SourcePolicy(())
         search_provider = provider or SearxngSearchProvider(
-            search_url, request_timeout=request_timeout,
+            search_url,
+            request_timeout=request_timeout,
+            allow_private_search_url=allow_private_search_url,
         )
         return discover(
             query,
@@ -518,6 +521,7 @@ def execute_tool_request(
     base_sha=None,
     head_sha=None,
     allowed_diff_paths=(),
+    allow_private_search_url=False,
 ):
     """Execute a single tool request and return the result dict.
 
@@ -583,6 +587,7 @@ def execute_tool_request(
                         search_scan_limit=search_scan_limit, deadline_at=deadline_at,
                         base_sha=base_sha, head_sha=head_sha,
                         allowed_diff_paths=allowed_diff_paths,
+                        allow_private_search_url=allow_private_search_url,
                     )
                     nested_result = nested.get("result", {})
                     patches.append({
@@ -803,6 +808,7 @@ def execute_tool_request(
                 source_policy=policy,
                 provider=search_provider,
                 search_scan_limit=search_scan_limit,
+                allow_private_search_url=allow_private_search_url,
             )
             if res.get("error"):
                 raise ValueError(res["error"])

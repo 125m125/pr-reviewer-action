@@ -569,11 +569,16 @@ def run_native_loop(
     # Discovery is useful only when both the operator fixed an endpoint and
     # current source rules give it approved URLs to return.
     search_url = os.getenv("SEARCH_URL", "").strip()
+    allow_private_search_url = (
+        os.getenv("ALLOW_PRIVATE_SEARCH_URL", "false").strip().lower() == "true"
+    )
     max_search_results = env_int_bounded("TOOL_MAX_SEARCH_RESULTS", 5, 1, 15)
     source_policy = load_current_source_policy(
         workspace_root, os.getenv("SPECIALIST_CONFIG_FILE", "").strip()
     )
-    tool_schemas = web_tool_schemas(search_url, source_policy)
+    tool_schemas = web_tool_schemas(
+        search_url, source_policy, allow_private_search_url,
+    )
 
     # Read-only MCP tools (#245), allowlisted via TOOL_MCP_SERVERS. Fork-gating
     # happens upstream in run_review.sh (the env is blanked on fork PRs unless
@@ -794,6 +799,7 @@ def run_native_loop(
             search_url,
             max_search_results,
             source_policy=source_policy,
+            allow_private_search_url=allow_private_search_url,
         )
 
     # Result summarization between rounds (#197 §2): when the conversation

@@ -601,6 +601,13 @@ inputs:
       the same fork gating as the rest of the tool harness.
     required: false
     default: ""
+  allow_private_search_url:
+    description: >-
+      Allow the explicitly configured search_url to use private HTTP(S)
+      endpoints and non-standard ports. Keep false unless running on a trusted
+      self-hosted runner; fork pull requests remain tool-gated separately.
+    required: false
+    default: "false"
   tool_max_search_results:
     description: Maximum results returned per web_search call
     required: false
@@ -904,6 +911,7 @@ runs:
         TOOL_ALLOWED_GH_API_REPOS: ${{ inputs.tool_allowed_gh_api_repos }}
         TOOL_REQUEST_TIMEOUT_SEC: ${{ inputs.tool_request_timeout_sec }}
         SEARCH_URL: ${{ inputs.search_url }}
+        ALLOW_PRIVATE_SEARCH_URL: ${{ inputs.allow_private_search_url }}
         TOOL_MAX_SEARCH_RESULTS: ${{ inputs.tool_max_search_results }}
         TOOL_FAILURE_ENFORCEMENT: ${{ inputs.tool_failure_enforcement }}
         TOOL_MIN_SUCCESSFUL_REQUESTS: ${{ inputs.tool_min_successful_requests }}
@@ -1060,6 +1068,7 @@ runs:
         TOOL_ALLOWED_GH_API_REPOS: ${{ inputs.tool_allowed_gh_api_repos }}
         TOOL_REQUEST_TIMEOUT_SEC: ${{ inputs.tool_request_timeout_sec }}
         SEARCH_URL: ${{ inputs.search_url }}
+        ALLOW_PRIVATE_SEARCH_URL: ${{ inputs.allow_private_search_url }}
         TOOL_MAX_SEARCH_RESULTS: ${{ inputs.tool_max_search_results }}
         TOOL_FAILURE_ENFORCEMENT: ${{ inputs.tool_failure_enforcement }}
         TOOL_MIN_SUCCESSFUL_REQUESTS: ${{ inputs.tool_min_successful_requests }}

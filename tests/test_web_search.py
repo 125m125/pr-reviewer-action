@@ -132,6 +132,36 @@ def test_search_schema_requires_endpoint_and_approved_source_policy():
     }
 
 
+def test_private_http_search_endpoint_requires_explicit_opt_in():
+    endpoint = "http://10.0.0.4:8888/search"
+    assert not SearxngSearchProvider.is_valid_endpoint(endpoint)
+    assert SearxngSearchProvider.is_valid_endpoint(
+        endpoint, allow_private_search_url=True,
+    )
+
+    transport = _SearchTransport({"results": []})
+    provider = SearxngSearchProvider(
+        endpoint,
+        allow_private_search_url=True,
+        transport=transport,
+        resolver=lambda host, port: ["10.0.0.4"],
+    )
+    provider.search("q", limit=1)
+    assert transport.urls[0].startswith("http://10.0.0.4:8888/search?")
+
+
+def test_private_http_search_schema_requires_opt_in():
+    endpoint = "http://10.0.0.4:8888/search"
+    assert "web_search" not in {
+        schema["name"] for schema in web_tool_schemas(endpoint, POLICY)
+    }
+    assert "web_search" in {
+        schema["name"] for schema in web_tool_schemas(
+            endpoint, POLICY, allow_private_search_url=True,
+        )
+    }
+
+
 @pytest.mark.parametrize("endpoint", [
     "http://search.example.com/search",
     "https://user@search.example.com/search",

@@ -147,6 +147,7 @@ jobs:
           # endpoint. An empty value leaves web_search unavailable; fetched
           # results remain constrained by the current-branch policy allowlist.
           search_url: ${{ vars.AI_REVIEW_SEARCH_URL }}
+          allow_private_search_url: "true"
           tool_max_search_results: "5"
 
           # Publish a short sticky summary and attach supported findings to the

@@ -338,6 +338,7 @@ class CliConfig:
     stream: bool
     stream_watchdog: bool
     search_url: str
+    allow_private_search_url: bool
     max_search_results: int
     tool_response_bytes: int
     tool_request_timeout_sec: int
@@ -470,6 +471,9 @@ class CliConfig:
             stream=_bool(source, "AI_STREAM", True),
             stream_watchdog=_bool(source, "SPECIALIST_STREAM_WATCHDOG", True),
             search_url=source.get("SEARCH_URL", "").strip(),
+            allow_private_search_url=_bool(
+                source, "ALLOW_PRIVATE_SEARCH_URL", False,
+            ),
             max_search_results=_positive_int(source, "TOOL_MAX_SEARCH_RESULTS", 5),
             tool_response_bytes=_positive_int(source, "TOOL_MAX_RESPONSE_BYTES", 12_000),
             tool_request_timeout_sec=_positive_int(source, "TOOL_REQUEST_TIMEOUT_SEC", 20),
@@ -1047,7 +1051,14 @@ def build_controller(
                 ).strip().lower() == "true"
             )
         )
-        tools = web_tool_schemas(config.search_url, policy) if tools_allowed else []
+        tools = (
+            web_tool_schemas(
+                config.search_url,
+                policy,
+                config.allow_private_search_url,
+            )
+            if tools_allowed else []
+        )
         if tools_allowed:
             tools.append(SPECIALIST_PR_DIFF_SCHEMA)
             tools.append(COMPACTED_EVIDENCE_SCHEMA)
@@ -1094,6 +1105,7 @@ def build_controller(
                     max_response_bytes=max(
                         config.tool_response_bytes, 64 * 1024,
                     ),
+                    allow_private_search_url=config.allow_private_search_url,
                 )
                 if tools
                 and any(item.get("name") == "web_search" for item in tools)
@@ -1105,6 +1117,7 @@ def build_controller(
                 config.tool_response_bytes, effective_timeout,
                 config.search_url, config.max_search_results,
                 source_policy=policy, search_provider=bounded_search,
+                allow_private_search_url=config.allow_private_search_url,
                 secure_fetcher=bounded_fetcher, evidence_store=evidence,
                 session_id=session_id, model_identity=config.role_models["specialist"],
                 deadline_at=deadline_at,

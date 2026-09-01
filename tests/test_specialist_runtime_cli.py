@@ -1051,6 +1051,7 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
     monkeypatch.setenv("TOOL_MAX_RESPONSE_BYTES", "5432")
     monkeypatch.setenv("TOOL_REQUEST_TIMEOUT_SEC", "7")
     monkeypatch.setenv("SEARCH_URL", "https://search.example/search")
+    monkeypatch.setenv("ALLOW_PRIVATE_SEARCH_URL", "true")
     config = cli.CliConfig.from_env(workspace=tmp_path)
 
     controller = cli.build_controller(config)
@@ -1068,6 +1069,7 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
     assert gateway.structured_chat_template_kwargs == {"enable_thinking": False}
     assert config.request_timeout_sec == 41
     assert config.max_tokens == 1234
+    assert config.allow_private_search_url is True
     assert config.recovery_max_tokens == 456
     assert config.planner_max_context_bytes == 6543
     assert config.model_context_tokens == 32000
