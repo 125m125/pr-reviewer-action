@@ -683,6 +683,21 @@ class ScriptedController:
             ],
             "publishing": {"ready": True, "mode": "review_comment", "allow_approve": False},
             "verdict": {"value": self.verdict, "source": "runtime-policy"},
+            "tool_activity": [{
+                "tool": "web_search", "advertised_sessions": 2,
+                "calls": 3, "successful": 1, "rejected": 1,
+                "deferred": 1, "errors": 0, "evidence_retained": 1,
+            }],
+            "external_access": {
+                "search_configured": True,
+                "web_search_advertised_sessions": 2,
+                "web_fetch_advertised_sessions": 1,
+                "github_api_advertised_sessions": 2,
+                "access_request_count": 1,
+                "allowed_sources": [{
+                    "host": "docs.example.com", "path_prefixes": ["/api/"],
+                }],
+            },
         }
         (self.root / "specialist-review-artifact.json").write_text(
             json.dumps(artifact), encoding="utf-8"
@@ -764,6 +779,12 @@ def test_cli_writes_structured_handoff_notes_artifact_and_compatibility_output(
     assert "fallback after &lt;timeout&gt;" in summary
     assert "Candidates: submitted 0" in summary
     assert "CI test evidence: unavailable" in summary
+    assert "## AI specialist tools" in summary
+    assert "| web\\_search | 2 | 3 | 1 | 1 | 1 | 0 | 1 |" in summary
+    assert "<summary>External access policy</summary>" in summary
+    assert "`docs\\.example\\.com`" in summary
+    assert "/api/" in summary
+    assert "Typed access requests: 1" in summary
 
 
 def test_cli_preserves_non_blocking_notice_in_compatibility_output(monkeypatch, tmp_path):
@@ -2075,6 +2096,8 @@ def test_handoff_summarizer_prompt_limits_prose_to_controller_facts(
     assert "successful_review_facts" in prompt
     assert "specialist_checkpoint_summaries" in prompt
     assert "Ground change claims only in the complete validated change_overview" in prompt
+    assert "controller owns human-review focus" in prompt_lower
+    assert "do not add unresolved areas or human-review requests" in prompt_lower
     assert "do not list files, findings, severities" in prompt
     assert "do not claim complete coverage" in prompt_lower
 

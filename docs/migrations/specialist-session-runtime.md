@@ -39,6 +39,15 @@ provider capacity are understood.
   tools-disabled synthesis turn during finalization. Rejected synthesis drafts
   receive one focused tools-disabled repair turn, and both admission attempts
   and their rejection reasons are recorded in the structured artifact.
+- `proposed_next_actions` in a checkpoint are temporary working memory for that
+  same specialist after compaction. They expire when the controller stops or
+  reschedules the session and never become scheduler authority or human-handoff
+  prose. For a concrete suspicion outside the current assignment, specialists
+  instead use `report_investigation_lead` with retained evidence, affected
+  paths, a next investigation step, and the required repository/test/web
+  capability. The controller deduplicates and routes the resulting `L#` target;
+  an assigned specialist must explicitly produce a candidate, resolve it as no
+  issue, or mark it blocked.
 - Deterministic assignments are balanced across the configured session
   capacity (targeting roughly six ordinary obligations per specialist when
   capacity permits). Assignment orientation ranks directly scoped code and
@@ -58,6 +67,11 @@ provider capacity are understood.
 - Direct budgets bound the whole run, per-session turns, read-only tool calls,
   recovery, concurrency, and the absolute deadline. The artifact records the
   budget and event accounting, policy result, head SHA, and publication state.
+- The GitHub Actions job summary, not the PR handoff, reports aggregate
+  specialist-tool availability and outcomes (successful, rejected, deferred,
+  errored, and retained evidence). A collapsible policy section shows whether
+  search was configured and which documentation hosts/GitHub repositories were
+  allowlisted. Tool arguments and queries are never included.
 - On GitHub, the action automatically discovers bounded same-head artifacts
   named like JUnit/test-results, parses their JUnit XML, and binds the normalized
   cases to the immutable repository/head. A renderer such as

@@ -496,7 +496,7 @@ class HandoffSummaryProposal:
 
     what_changed_summary: str
     ai_reviewed_summary: str
-    human_focus: str
+    human_focus: str = ""
     referenced_paths: tuple[str, ...] = ()
     referenced_component_ids: tuple[str, ...] = ()
     referenced_obligation_ids: tuple[str, ...] = ()
@@ -610,7 +610,7 @@ def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
         return value
     if not isinstance(value, Mapping):
         raise TypeError("handoff summarizer must return an object")
-    expected = {"ai_reviewed_summary", "human_focus"}
+    expected = {"ai_reviewed_summary"}
     if not expected <= set(value):
         raise ValueError("handoff summarizer required fields are missing")
 
@@ -628,6 +628,14 @@ def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
             item = item[:sentence_ends[0].end()].strip()
         elif not sentence_ends:
             item += "."
+        if key == "ai_reviewed_summary" and not re.search(
+            r"\b(?:review|reviewed|examined|traced|checked|investigated|validated)\b",
+            item,
+            flags=re.IGNORECASE,
+        ):
+            raise ValueError(
+                "handoff summarizer ai_reviewed_summary must describe review activity"
+            )
         return item
 
     def change_summary() -> str:
@@ -4322,6 +4330,17 @@ class ReviewController:
             state.blocking_obligation_ids,
             bool(state.degradations),
         )
+        unresolved_lead_focus = tuple(
+            "The AI could not resolve whether "
+            + lead.summary.rstrip(". ")
+            + "."
+            for lead in state.investigation_leads.values()
+            if lead.status is InvestigationLeadStatus.BLOCKED
+            and lead.summary.strip()
+        )[:2]
+        human_focus = tuple(dict.fromkeys((
+            *unresolved_lead_focus, *human_focus,
+        )))[:3]
         tracked_paths = tuple(dict.fromkeys((
             *state.inputs.tracked_paths,
             *state.inputs.changed_files,
@@ -4477,7 +4496,6 @@ class ReviewController:
         combined = " ".join((
             proposal.what_changed_summary,
             proposal.ai_reviewed_summary,
-            proposal.human_focus,
         ))
         # Path-looking words and the optional reference arrays are orientation
         # prose, not review authority. Findings, coverage and changed-line
@@ -4509,6 +4527,14 @@ class ReviewController:
         )
         if any(claim in normalized for claim in detailed_claims):
             raise ValueError("detailed finding claim belongs in a review note")
+        summary_words = set(re.findall(r"[a-z0-9_]+", normalized))
+        if any(
+            len(claim_words) >= 4
+            and len(summary_words.intersection(claim_words)) / len(claim_words) >= 0.7
+            for claim in detailed_claims
+            if (claim_words := set(re.findall(r"[a-z0-9_]+", claim)))
+        ):
+            raise ValueError("candidate-shaped consequence belongs in a review note")
 
         overview = str(state.change_overview.get("overview") or "").strip()
         if not overview:
@@ -4524,11 +4550,7 @@ class ReviewController:
             ai_reviewed=(proposal.ai_reviewed_summary,),
             ai_reviewed_is_validated_summary=True,
             review_emphasis_topics=(),
-            human_focus=(
-                (proposal.human_focus,)
-                if proposal.human_focus
-                else base.human_focus
-            ),
+            human_focus=base.human_focus,
         )
 
     @staticmethod
@@ -4919,9 +4941,7 @@ class ReviewController:
                     method="finalize",
                     context=handoff_request_context,
                 )
-                if isinstance(proposed, Mapping) and {
-                    "ai_reviewed_summary", "human_focus",
-                } <= set(proposed):
+                if isinstance(proposed, Mapping) and "ai_reviewed_summary" in proposed:
                     summary = _handoff_summary_proposal(proposed)
                     allowed_summary_paths = {
                         _normalize_repository_path(path)
@@ -5161,7 +5181,41 @@ class ReviewController:
                     _json_value(result.report.get("defect_synthesis", {}))
                     if result and isinstance(result.report, Mapping) else {}
                 ),
+                "advertised_tools": (
+                    list(getattr(result, "advertised_tools", ()))
+                    if result else []
+                ),
+                "tool_activity": (
+                    [_json_value(item) for item in getattr(result, "tool_activity", ())]
+                    if result else []
+                ),
             })
+        tool_activity: dict[str, dict[str, object]] = {}
+        for session in sessions:
+            advertised = set(session.get("advertised_tools", ()))
+            for tool in advertised:
+                row = tool_activity.setdefault(str(tool), {
+                    "tool": str(tool), "advertised_sessions": 0,
+                    "calls": 0, "successful": 0, "rejected": 0,
+                    "deferred": 0, "errors": 0, "evidence_retained": 0,
+                })
+                row["advertised_sessions"] = int(row["advertised_sessions"]) + 1
+            for activity in session.get("tool_activity", ()):
+                if not isinstance(activity, Mapping):
+                    continue
+                tool = str(activity.get("tool") or "").strip()
+                if not tool:
+                    continue
+                row = tool_activity.setdefault(tool, {
+                    "tool": tool, "advertised_sessions": 0,
+                    "calls": 0, "successful": 0, "rejected": 0,
+                    "deferred": 0, "errors": 0, "evidence_retained": 0,
+                })
+                for key in (
+                    "calls", "successful", "rejected", "deferred", "errors",
+                    "evidence_retained",
+                ):
+                    row[key] = int(row[key]) + int(activity.get(key, 0) or 0)
         session_budgets = {
             item["session_id"]: item["budget"] for item in sessions
         }
@@ -5353,6 +5407,43 @@ class ReviewController:
             },
             "degradation": list(state.degradations),
             "evaluation_status": self._review_status(state),
+            "investigation_leads": [
+                _json_value(state.investigation_leads[key])
+                for key in sorted(state.investigation_leads)
+            ],
+            "tool_activity": [
+                tool_activity[key] for key in sorted(tool_activity)
+            ],
+            "external_access": {
+                "search_configured": bool(
+                    state.inputs.adapter_configuration.get("search_configured", False)
+                ),
+                "allowed_sources": [
+                    {
+                        "host": item.host,
+                        "include_subdomains": item.include_subdomains,
+                        "path_prefixes": list(item.path_prefixes),
+                        "classification": item.classification,
+                        "schemes": list(item.schemes),
+                    }
+                    for item in state.inputs.policy.sources
+                ],
+                "allowed_github_repositories": list(
+                    state.inputs.adapter_configuration.get(
+                        "allowed_github_repositories", (),
+                    )
+                ),
+                "access_request_count": len(state.source_requests),
+                "web_search_advertised_sessions": int(
+                    tool_activity.get("web_search", {}).get("advertised_sessions", 0)
+                ),
+                "web_fetch_advertised_sessions": int(
+                    tool_activity.get("web_fetch", {}).get("advertised_sessions", 0)
+                ),
+                "github_api_advertised_sessions": int(
+                    tool_activity.get("gh_api", {}).get("advertised_sessions", 0)
+                ),
+            },
             "event_references": artifacts_events,
             "events": events,
             "event_journal": {
@@ -5450,6 +5541,7 @@ class ReviewController:
             "policy", "phases", "assignments", "sessions", "budgets", "evidence",
             "assignment_plan",
             "coverage", "recipes", "unknowns", "source_access_requests",
+            "investigation_leads", "tool_activity", "external_access",
             "accepted_candidates", "rejected_candidates", "handoff", "notes",
             "coverage_verification_requests", "retention_verification_requests",
             "candidate_dispositions", "candidate_unknowns",
@@ -5463,6 +5555,26 @@ class ReviewController:
             raise ValueError("terminal artifact missing fields: " + ", ".join(missing))
         if artifact.get("schema_version") != _SCHEMA_VERSION:
             raise ValueError("terminal artifact schema version is invalid")
+        tool_activity = artifact.get("tool_activity")
+        if not isinstance(tool_activity, (list, tuple)) or any(
+            not isinstance(item, Mapping)
+            or not str(item.get("tool") or "").strip()
+            or any(
+                not isinstance(item.get(key, 0), int)
+                or isinstance(item.get(key, 0), bool)
+                or item.get(key, 0) < 0
+                for key in (
+                    "advertised_sessions", "calls", "successful", "rejected",
+                    "deferred", "errors", "evidence_retained",
+                )
+            )
+            for item in tool_activity
+        ):
+            raise ValueError("terminal artifact tool activity is invalid")
+        if not isinstance(artifact.get("external_access"), Mapping):
+            raise ValueError("terminal artifact external access policy is invalid")
+        if not isinstance(artifact.get("investigation_leads"), (list, tuple)):
+            raise ValueError("terminal artifact investigation leads are invalid")
         artifact_id = artifact.get("artifact_id")
         if (
             not isinstance(artifact_id, str)
@@ -5662,6 +5774,17 @@ class ReviewController:
                 "resolution_policy": "human_review",
             }],
             "source_access_requests": [],
+            "investigation_leads": [],
+            "tool_activity": [],
+            "external_access": {
+                "search_configured": False,
+                "allowed_sources": [],
+                "allowed_github_repositories": [],
+                "access_request_count": 0,
+                "web_search_advertised_sessions": 0,
+                "web_fetch_advertised_sessions": 0,
+                "github_api_advertised_sessions": 0,
+            },
             "accepted_candidates": [],
             "rejected_candidates": [],
             "candidate_dispositions": [],
@@ -6390,6 +6513,35 @@ class ReviewController:
                 "source_access_requests": [
                     _json_value(item.as_dict()) for item in state.source_requests
                 ],
+                "investigation_leads": [
+                    _json_value(state.investigation_leads[key])
+                    for key in sorted(state.investigation_leads)
+                ],
+                "tool_activity": [],
+                "external_access": {
+                    "search_configured": bool(
+                        inputs.adapter_configuration.get("search_configured", False)
+                    ),
+                    "allowed_sources": [
+                        {
+                            "host": item.host,
+                            "include_subdomains": item.include_subdomains,
+                            "path_prefixes": list(item.path_prefixes),
+                            "classification": item.classification,
+                            "schemes": list(item.schemes),
+                        }
+                        for item in inputs.policy.sources
+                    ],
+                    "allowed_github_repositories": list(
+                        inputs.adapter_configuration.get(
+                            "allowed_github_repositories", (),
+                        )
+                    ),
+                    "access_request_count": len(state.source_requests),
+                    "web_search_advertised_sessions": 0,
+                    "web_fetch_advertised_sessions": 0,
+                    "github_api_advertised_sessions": 0,
+                },
                 "accepted_candidates": [
                     _json_value(item) for item in state.review.accepted
                 ],

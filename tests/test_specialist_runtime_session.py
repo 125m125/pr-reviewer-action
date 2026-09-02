@@ -958,6 +958,55 @@ def test_investigation_lead_feedback_authorizes_targeted_tools_and_evidence_reco
     assert recovered["status"] == "ok"
 
 
+def test_session_snapshot_projects_tool_activity_without_arguments():
+    session = make_session(ScriptedGateway([]))
+    calls = (
+        {
+            "id": "tool-ok", "name": "read_file",
+            "arguments": json.dumps({"path": "a.py"}),
+        },
+        {
+            "id": "tool-rejected", "name": "withdraw_candidate",
+            "arguments": json.dumps({"target": "C9", "reason": "Not ours."}),
+        },
+        {
+            "id": "tool-error", "name": "git_grep", "arguments": "{",
+        },
+    )
+    session.conversation.add_assistant_turn(calls=calls)
+    session._execute_calls(calls)
+
+    result = session._snapshot()
+    activity = {item["tool"]: item for item in result.tool_activity}
+
+    assert "read_file" in result.advertised_tools
+    assert activity["read_file"] == {
+        "tool": "read_file", "calls": 1, "successful": 1,
+        "rejected": 0, "deferred": 0, "errors": 0,
+        "evidence_retained": 1,
+    }
+    assert activity["withdraw_candidate"]["rejected"] == 1
+    assert activity["git_grep"]["errors"] == 1
+    assert "arguments" not in json.dumps(result.tool_activity)
+
+
+def test_tool_activity_records_every_deferred_call_before_compaction(monkeypatch):
+    session = make_session(ScriptedGateway([]))
+    monkeypatch.setattr(
+        session, "_checkpoint_pressure_due", lambda **_kwargs: True,
+    )
+    calls = (
+        {"id": "first", "name": "read_file", "arguments": "{}"},
+        {"id": "second", "name": "git_grep", "arguments": "{}"},
+    )
+
+    session._execute_calls(calls)
+    activity = {item["tool"]: item for item in session._tool_activity_snapshot()}
+
+    assert activity["read_file"]["deferred"] == 1
+    assert activity["git_grep"]["deferred"] == 1
+
+
 def test_missing_defect_assessment_cannot_resolve_obligation():
     session = make_session(ScriptedGateway([]))
     session._execute_calls(({

@@ -147,6 +147,42 @@ def test_controller_admits_and_explicitly_resolves_session_investigation_lead(tm
     assert admitted.resolution_reason.startswith("The only caller")
 
 
+def test_handoff_focus_includes_only_blocked_investigation_leads(tmp_path):
+    inputs = _inputs(tmp_path)
+    obligations = derive_obligations(
+        inputs.topology, inputs.classification, inputs.policy,
+    )
+    blocked = InvestigationLead(
+        lead_id="lead:blocked", summary="artifact upload needs another permission",
+        affected_paths=("src/worker.py",), evidence_ids=("evidence:1",),
+        next_action="Check the official permission contract.",
+        required_capability="web", origin_session_id="S1",
+        status=InvestigationLeadStatus.BLOCKED,
+        resolution_reason="The documentation host was not allowlisted.",
+    )
+    resolved = replace(
+        blocked, lead_id="lead:resolved", summary="the worker drops retries",
+        status=InvestigationLeadStatus.RESOLVED_NO_ISSUE,
+    )
+    state = _RunState(
+        inputs=inputs, journal=EventJournal(),
+        deadline=RunDeadline(0.0, 90.0, PhaseShares()),
+        evidence=EvidenceStore(), obligations=obligations,
+        coverage=CoverageLedger(obligations),
+        investigation_leads={
+            blocked.lead_id: blocked, resolved.lead_id: resolved,
+        },
+    )
+
+    handoff = _controller(tmp_path)._handoff_context(state, "degraded")
+
+    assert any(
+        "artifact upload needs another permission" in item
+        for item in handoff.human_focus
+    )
+    assert all("worker drops retries" not in item for item in handoff.human_focus)
+
+
 def test_unreachable_model_endpoint_stops_before_specialist_sessions(tmp_path):
     session_factory_calls = []
 
@@ -1009,8 +1045,10 @@ def test_handoff_accepts_direct_context_path_claim_as_non_authoritative_prose(tm
 
     result = _controller(
         tmp_path,
-        finalizer=lambda _request: {
-            "ai_reviewed_summary": "The change to src/consumer.py affects delivery.",
+            finalizer=lambda _request: {
+                "ai_reviewed_summary": (
+                    "The review traced how src/consumer.py affects delivery."
+                ),
             "human_focus": "Recheck the worker boundary.",
             "referenced_paths": ["src/consumer.py"],
             "referenced_component_ids": ["worker"],
@@ -1018,9 +1056,9 @@ def test_handoff_accepts_direct_context_path_claim_as_non_authoritative_prose(tm
         },
     ).run(inputs)
 
-    assert "The change to src/consumer.py affects delivery." in result.handoff.markdown
+    assert "The review traced how src/consumer.py affects delivery." in result.handoff.markdown
     assert result.handoff.ai_reviewed == (
-        "The change to src/consumer.py affects delivery.",
+        "The review traced how src/consumer.py affects delivery.",
     )
 
 
@@ -1258,6 +1296,13 @@ class _SuccessfulSession:
             state=SessionState.CHECKPOINT,
             checkpoint=checkpoint,
             budget=BudgetUsage(model_turns=1, tool_calls=len(evidence_ids)),
+            advertised_tools=("read_file", "web_search"),
+            tool_activity=({
+                "tool": "read_file", "calls": len(evidence_ids),
+                "successful": len(evidence_ids), "rejected": 0,
+                "deferred": 0, "errors": 0,
+                "evidence_retained": len(evidence_ids),
+            },),
         )
 
     def finalize(self):
@@ -1268,6 +1313,8 @@ class _SuccessfulSession:
             checkpoint=result.checkpoint,
             budget=result.budget,
             report={"summary": "Worker delivery reviewed", "recommendation": "approve"},
+            advertised_tools=result.advertised_tools,
+            tool_activity=result.tool_activity,
         )
 
 
@@ -1305,6 +1352,18 @@ def test_controller_runs_obligations_assignments_sessions_and_finalizer(tmp_path
     }
     assert result.artifact["budgets"]["global_remaining"]["model_turns"] >= 0
     assert result.artifact["assignments"][0]["families"]
+    tool_activity = {
+        item["tool"]: item for item in result.artifact["tool_activity"]
+    }
+    assert tool_activity["read_file"]["calls"] >= 1
+    assert tool_activity["read_file"]["evidence_retained"] >= 1
+    assert tool_activity["web_search"]["advertised_sessions"] >= 1
+    assert result.artifact["external_access"]["access_request_count"] == 0
+    assert "arguments" not in json.dumps(result.artifact["tool_activity"])
+    malformed = dict(result.artifact)
+    malformed["tool_activity"] = [{"tool": "read_file", "calls": -1}]
+    with pytest.raises(ValueError, match="tool activity"):
+        controller._validate_artifact(malformed)
     assert result.artifact_path == tmp_path / "specialist-review-artifact.json"
     assert result.artifact_path.read_bytes().startswith(b'{"accepted_candidates"')
     assert [event.payload["phase"] for event in result.events if event.kind == "phase_changed"] == [
@@ -3745,16 +3804,13 @@ def test_handoff_summarizer_writes_behavioral_review_handoff_from_validated_stat
         "The review traced retry handling in `src/worker.py` through the delivery "
         "obligation and its retained implementation evidence.",
     )
-    assert result.handoff.human_focus == (
-        "Recheck failure recovery at the worker boundary, especially behavior after "
-        "an ambiguous delivery result.",
-    )
+    assert result.handoff.human_focus == ()
     behavioral_summary = " ".join((
         *result.handoff.what_changed,
         *result.handoff.ai_reviewed,
         *result.handoff.human_focus,
     ))
-    assert len(re.findall(r"[.!?](?:\s|$)", behavioral_summary)) == 3
+    assert len(re.findall(r"[.!?](?:\s|$)", behavioral_summary)) == 2
     assert "- `src/worker.py` changes runtime implementation behavior." not in (
         result.handoff.markdown
     )
@@ -3969,7 +4025,9 @@ def test_handoff_summarizer_gets_one_focused_semantic_repair(tmp_path):
         requests.append(request)
         if len(requests) == 1:
             return {
-                "ai_reviewed_summary": "The review traced retry behavior.",
+                "ai_reviewed_summary": (
+                    "The review found the blocker at src/worker.py:8."
+                ),
                 "human_focus": "The blocker at src/worker.py:8 must be fixed.",
             }
         assert request.context["semantic_repair"]["reason"]
@@ -4094,7 +4152,7 @@ def test_handoff_summarizer_sanitizes_extra_fields_and_unknown_references(
     assert result.handoff.ai_reviewed == (
         "The review traced retry handling in `src/worker.py`.",
     )
-    assert result.handoff.human_focus == ("Recheck the worker boundary.",)
+    assert result.handoff.human_focus == ()
     assert "invented" not in result.handoff.markdown
     assert "unsupported extra field" not in result.handoff.markdown
     assert result.publishing_ready is True
@@ -4715,7 +4773,8 @@ def test_degraded_handoff_keeps_valid_model_prose_and_adds_controller_focus(
         result.artifact["change_overview"]["overview"]
     )
     assert all("retry behavior" not in item for item in result.handoff.what_changed)
-    assert result.handoff.human_focus[0] == "Recheck the model's file list."
+    assert result.handoff.human_focus == ()
+    assert "model's file list" not in result.handoff.markdown
 
 
 def test_followup_wave_can_replace_completed_initial_session_at_capacity(tmp_path):

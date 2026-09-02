@@ -181,12 +181,13 @@ _ROLE_SYSTEM = {
     "handoff_summarizer": (
         "Write two or three concise content-focused sentences for "
         "`what_changed_summary`, exactly one concise sentence for "
-        "`ai_reviewed_summary`, and one for `human_focus` (or an empty string "
-        "when no material unresolved area needs emphasis). Return "
-        "{\"what_changed_summary\":string,\"ai_reviewed_summary\":string,"
-        "\"human_focus\":string}. Ground change claims only in the complete validated "
+        "`ai_reviewed_summary`. Return "
+        "{\"what_changed_summary\":string,\"ai_reviewed_summary\":string}. "
+        "The controller owns human-review focus from terminal obligations, access "
+        "requests, degradations, and unresolved investigation leads. Ground change claims only in the complete validated "
         "change_overview. Use specialist_checkpoint_summaries to explain what the AI "
-        "actually investigated and which material area still needs human attention. "
+        "actually investigated; do not add unresolved areas or human-review requests "
+        "to that sentence. "
         "Do not turn checkpoint hypotheses or unknowns into change claims. Orient a human reviewer around "
         "behavior and review scope; do not list files, findings, severities, exact defect "
         "claims, unknowns, verification requests, verdicts, approvals, or merge safety. "
@@ -912,6 +913,16 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
             "stream": config.stream,
             "stream_watchdog": config.stream_watchdog,
             "search_configured": bool(config.search_url),
+            "allowed_github_repositories": tuple(dict.fromkeys(
+                item.strip()
+                for item in (
+                    config.environment.get("REPO", ""),
+                    *config.environment.get(
+                        "TOOL_ALLOWED_GH_API_REPOS", "",
+                    ).split(","),
+                )
+                if item.strip()
+            )),
             "tool_response_bytes": config.tool_response_bytes,
             "tool_request_timeout_sec": config.tool_request_timeout_sec,
             "system_prompt_digest": hashlib.sha256(
@@ -2329,6 +2340,71 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
         summary_lines.append(
             "- CI test evidence: unavailable — " + _summary_cell(reason, limit=240)
         )
+    tool_rows = artifact.get("tool_activity", [])
+    if isinstance(tool_rows, (list, tuple)) and tool_rows:
+        summary_lines.extend((
+            "", "## AI specialist tools", "",
+            "| Tool | Advertised sessions | Calls | Successful | Rejected | Deferred | Errors | Evidence retained |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ))
+        for row in tool_rows:
+            if not isinstance(row, Mapping):
+                continue
+            summary_lines.append(
+                "| " + _summary_cell(row.get("tool", "unknown"), limit=80)
+                + " | " + " | ".join(
+                    str(max(0, int(row.get(key, 0) or 0)))
+                    for key in (
+                        "advertised_sessions", "calls", "successful", "rejected",
+                        "deferred", "errors", "evidence_retained",
+                    )
+                ) + " |"
+            )
+    external_access = artifact.get("external_access", {})
+    if isinstance(external_access, Mapping):
+        sources = external_access.get("allowed_sources", [])
+        source_rows = sources if isinstance(sources, (list, tuple)) else ()
+        allowed_repositories = external_access.get(
+            "allowed_github_repositories", (),
+        )
+        repository_rows = (
+            allowed_repositories
+            if isinstance(allowed_repositories, (list, tuple)) else ()
+        )
+        summary_lines.extend((
+            "", "<details>", "<summary>External access policy</summary>", "",
+            "- Search configured: `"
+            + str(bool(external_access.get("search_configured", False))).lower()
+            + "`",
+            "- Advertised sessions: web search "
+            + str(external_access.get("web_search_advertised_sessions", 0))
+            + "; web fetch "
+            + str(external_access.get("web_fetch_advertised_sessions", 0))
+            + "; GitHub API "
+            + str(external_access.get("github_api_advertised_sessions", 0)),
+            "- Allowed source rules: " + str(len(source_rows)),
+            "- Typed access requests: "
+            + str(external_access.get("access_request_count", 0)),
+            "- Allowed GitHub repositories: "
+            + (
+                ", ".join(
+                    "`" + _summary_cell(item, limit=160) + "`"
+                    for item in repository_rows[:20]
+                )
+                if repository_rows else "none"
+            ),
+        ))
+        for source in source_rows[:20]:
+            if not isinstance(source, Mapping):
+                continue
+            prefixes = source.get("path_prefixes", ())
+            prefix_text = ", ".join(str(item) for item in prefixes) \
+                if isinstance(prefixes, (list, tuple)) else ""
+            summary_lines.append(
+                "  - `" + _summary_cell(source.get("host", ""), limit=120)
+                + "`" + (" — " + _summary_cell(prefix_text, limit=180) if prefix_text else "")
+            )
+        summary_lines.extend(("", "</details>"))
     if diagnostic_rows:
         summary_lines.extend((
             "",

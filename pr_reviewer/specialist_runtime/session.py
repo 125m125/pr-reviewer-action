@@ -13,7 +13,11 @@ from enum import Enum
 from pathlib import PurePosixPath
 from typing import Any, Callable, Mapping
 
-from pr_reviewer.conversation import Conversation, EpochCompactionStats
+from pr_reviewer.conversation import (
+    Conversation,
+    EpochCompactionStats,
+    TOOL_RESULT_MAX_BYTES,
+)
 from pr_reviewer.tool_loop import decode_native_tool_arguments, native_tool_request_key
 from pr_reviewer.transport import ModelRequestError
 
@@ -1153,6 +1157,8 @@ class SessionResult:
     finalization_diagnostics: tuple[Mapping[str, object], ...] = ()
     investigation_leads: tuple[InvestigationLead, ...] = ()
     investigation_lead_resolutions: tuple[LeadResolution, ...] = ()
+    advertised_tools: tuple[str, ...] = ()
+    tool_activity: tuple[Mapping[str, object], ...] = ()
 
 
 class SpecialistSession:
@@ -1285,6 +1291,9 @@ class SpecialistSession:
         self._successful_requests: dict[str, EvidenceRecord] = {}
         self._successful_collections: dict[str, str] = {}
         self._tool_call_evidence_ids: dict[str, str] = {}
+        self._tool_activity_call_names: dict[str, str] = {}
+        self._tool_activity_outcomes: dict[str, str] = {}
+        self._tool_activity_evidence: dict[str, set[str]] = {}
         self._compacted_evidence: dict[str, EvidenceRecord] = {}
         self._compacted_evidence_read_keys: set[tuple[str, str, str, int]] = set()
         self._compacted_evidence_reads = 0
@@ -2332,7 +2341,7 @@ class SpecialistSession:
     ) -> bool:
         target = str(arguments.get("target") or "").strip()
         if self._obligation_local_tool_calls >= self.OBLIGATION_LOCAL_TOOL_CALL_LIMIT:
-            self.conversation.add_tool_result(call_id, {
+            self._add_tool_result(call_id, {
                 "accepted": False,
                 "target": target,
                 "reason": "obligation bookkeeping allowance exhausted",
@@ -2374,7 +2383,7 @@ class SpecialistSession:
                     )
                     or not isinstance(defect_assessment.get("candidate_drafts"), list)
                 ):
-                    self.conversation.add_tool_result(call_id, {
+                    self._add_tool_result(call_id, {
                         "accepted": False,
                         "target": target,
                         "reason": "missing or invalid defect_assessment",
@@ -2436,7 +2445,7 @@ class SpecialistSession:
         except KeyError:
             payload = {"accepted": False, "target": target, "reason": "unknown target"}
             accepted = False
-        self.conversation.add_tool_result(call_id, payload, is_error=False)
+        self._add_tool_result(call_id, payload, is_error=False)
         return accepted
 
     def _execute_investigation_lead_tool(
@@ -2455,14 +2464,14 @@ class SpecialistSession:
                     "accepted": False, "target": target,
                     "reason": "unknown assigned investigation lead target",
                 }
-                self.conversation.add_tool_result(call_id, payload)
+                self._add_tool_result(call_id, payload)
                 return False
             if status_text not in {"resolved_no_issue", "blocked"} or not reason:
                 payload = {
                     "accepted": False, "target": target,
                     "reason": "status and concrete reason are required",
                 }
-                self.conversation.add_tool_result(call_id, payload)
+                self._add_tool_result(call_id, payload)
                 return False
             evidence_ids = tuple(dict.fromkeys(
                 item for value in _tool_string_list(arguments.get("evidence_ids"))
@@ -2473,7 +2482,7 @@ class SpecialistSession:
                 lead_id=lead_id, status=status, reason=reason,
                 evidence_ids=evidence_ids,
             )
-            self.conversation.add_tool_result(call_id, {
+            self._add_tool_result(call_id, {
                 "accepted": True, "target": target, "status": status.value,
             })
             return True
@@ -2491,20 +2500,20 @@ class SpecialistSession:
                 "accepted": False,
                 "reason": "summary and next_action are required",
             }
-            self.conversation.add_tool_result(call_id, payload)
+            self._add_tool_result(call_id, payload)
             return False
         if capability not in {"none", "repository", "tests", "web"}:
             payload = {
                 "accepted": False, "reason": "invalid required_capability",
             }
-            self.conversation.add_tool_result(call_id, payload)
+            self._add_tool_result(call_id, payload)
             return False
         if not requested_evidence or len(evidence_ids) != len(requested_evidence):
             payload = {
                 "accepted": False,
                 "reason": "all evidence_ids must reference retained evidence",
             }
-            self.conversation.add_tool_result(call_id, payload)
+            self._add_tool_result(call_id, payload)
             return False
         affected_paths = tuple(dict.fromkeys(
             path for value in _tool_string_list(arguments.get("affected_paths"))[:8]
@@ -2524,7 +2533,7 @@ class SpecialistSession:
                 "reason": "affected_paths must be changed paths or cited evidence source paths",
                 "invalid_paths": list(invalid_paths),
             }
-            self.conversation.add_tool_result(call_id, payload)
+            self._add_tool_result(call_id, payload)
             return False
         identity = hashlib.sha256(json.dumps({
             "summary": summary.casefold(),
@@ -2539,7 +2548,7 @@ class SpecialistSession:
                     "accepted": False,
                     "reason": "investigation lead allowance exhausted",
                 }
-                self.conversation.add_tool_result(call_id, payload)
+                self._add_tool_result(call_id, payload)
                 return False
             self._investigation_leads[lead_id] = InvestigationLead(
                 lead_id=lead_id, summary=summary, affected_paths=affected_paths,
@@ -2553,7 +2562,7 @@ class SpecialistSession:
                 key for key, value in self._investigation_lead_targets.items()
                 if value == lead_id
             )
-        self.conversation.add_tool_result(call_id, {
+        self._add_tool_result(call_id, {
             "accepted": True, "target": target, "duplicate": duplicate,
         })
         return not duplicate
@@ -2642,14 +2651,14 @@ class SpecialistSession:
                     "accepted": False, "target": target,
                     "reason": "unknown candidate target",
                 }
-                self.conversation.add_tool_result(call_id, payload)
+                self._add_tool_result(call_id, payload)
                 return False
             if not reason:
                 payload = {
                     "accepted": False, "target": target,
                     "reason": "withdrawal reason is required",
                 }
-                self.conversation.add_tool_result(call_id, payload)
+                self._add_tool_result(call_id, payload)
                 return False
             retained = {
                 record.id: record for record in self.evidence_store.snapshot().records
@@ -2673,13 +2682,13 @@ class SpecialistSession:
                     item.candidate_id for item in self.candidate_findings
                 ),
             )
-            self.conversation.add_tool_result(call_id, {
+            self._add_tool_result(call_id, {
                 "accepted": True, "target": target, "status": "withdrawn",
             })
             return True
 
         payload, accepted = self._admit_candidate(arguments)
-        self.conversation.add_tool_result(call_id, payload)
+        self._add_tool_result(call_id, payload)
         return accepted
 
     def _admit_candidate(
@@ -2828,12 +2837,17 @@ class SpecialistSession:
 
     def _execute_calls(self, calls: tuple[dict[str, Any], ...]) -> bool:
         progressed = False
+        for call in calls:
+            call_id = str(call.get("id") or "")
+            name = str(call.get("name") or "")
+            if call_id and name:
+                self._tool_activity_call_names[call_id] = name
         for index, call in enumerate(calls):
             call_id = str(call.get("id") or "")
             name = str(call.get("name") or "")
             if self._checkpoint_pressure_due(reserve_tool_result=True):
                 for deferred in calls[index:]:
-                    self.conversation.add_tool_result(
+                    self._add_tool_result(
                         str(deferred.get("id") or ""),
                         {
                             "status": "deferred",
@@ -2847,7 +2861,7 @@ class SpecialistSession:
                 arguments = decode_native_tool_arguments(call.get("arguments"))
             except (json.JSONDecodeError, ValueError, TypeError) as exc:
                 self.budget.record_tool_rejection("invalid tool arguments")
-                self.conversation.add_tool_result(call_id, {"error": str(exc)}, is_error=True)
+                self._add_tool_result(call_id, {"error": str(exc)}, is_error=True)
                 continue
             if name == COMPACTED_EVIDENCE_TOOL_NAME:
                 recovered = self._read_compacted_evidence(arguments)
@@ -2863,14 +2877,14 @@ class SpecialistSession:
                     # exchanges, pinning a justified recovery through the next
                     # boundary without retaining it forever.
                     self._tool_call_evidence_ids[call_id] = recovered_evidence_id
-                self.conversation.add_tool_result(
+                self._add_tool_result(
                     call_id, recovered,
                 )
                 continue
             if name in _OBLIGATION_LOCAL_TOOL_NAMES:
                 if name == TEST_RESULTS_TOOL_NAME:
                     result = self._read_test_results(arguments)
-                    self.conversation.add_tool_result(call_id, result)
+                    self._add_tool_result(call_id, result)
                     continue
                 progressed = (
                     self._execute_obligation_tool(call_id, name, arguments)
@@ -2881,7 +2895,7 @@ class SpecialistSession:
                 self.budget.record_tool_rejection(
                     "model-supplied evidence authority is forbidden"
                 )
-                self.conversation.add_tool_result(
+                self._add_tool_result(
                     call_id,
                     {"error": "evidence categories are runtime-derived"},
                     is_error=True,
@@ -2892,7 +2906,7 @@ class SpecialistSession:
                 raw_purpose = arguments.pop("purpose", "")
                 if not isinstance(raw_purpose, str):
                     self.budget.record_tool_rejection("invalid tool purpose")
-                    self.conversation.add_tool_result(
+                    self._add_tool_result(
                         call_id, {"error": "purpose must be a string"},
                         is_error=True,
                     )
@@ -2907,7 +2921,7 @@ class SpecialistSession:
                     and all(isinstance(item, str) and item.strip() for item in raw_targets)
                 ):
                     self.budget.record_tool_rejection("invalid obligation targets")
-                    self.conversation.add_tool_result(
+                    self._add_tool_result(
                         call_id, {"error": "targets must be an array of short handles"},
                         is_error=True,
                     )
@@ -2929,7 +2943,7 @@ class SpecialistSession:
                         invalid_targets.append(item)
                 if invalid_targets:
                     self.budget.record_tool_rejection("unassigned obligation targets")
-                    self.conversation.add_tool_result(
+                    self._add_tool_result(
                         call_id, {"error": "targets contain an unassigned handle"},
                         is_error=True,
                     )
@@ -2950,7 +2964,7 @@ class SpecialistSession:
                 ))
             else:
                 self.budget.record_tool_rejection("invalid obligation_ids")
-                self.conversation.add_tool_result(
+                self._add_tool_result(
                     call_id, {"error": "obligation_ids must be an array of strings"},
                     is_error=True,
                 )
@@ -2959,7 +2973,7 @@ class SpecialistSession:
                 self._assigned_obligation_ids()
             ):
                 self.budget.record_tool_rejection("unassigned obligation_ids")
-                self.conversation.add_tool_result(
+                self._add_tool_result(
                     call_id, {"error": "obligation_ids contain an unassigned id"},
                     is_error=True,
                 )
@@ -2982,7 +2996,7 @@ class SpecialistSession:
                     )
                 self._tool_call_evidence_ids[call_id] = prior.id
                 self.budget.record_tool_rejection("duplicate tool request")
-                self.conversation.add_tool_result(
+                self._add_tool_result(
                     call_id,
                     {
                         "evidence_id": prior.id,
@@ -3003,7 +3017,7 @@ class SpecialistSession:
                 self.budget.reserve_tool_calls(1)
             except BudgetExhausted:
                 self.budget.record_tool_rejection("tool call budget exhausted")
-                self.conversation.add_tool_result(
+                self._add_tool_result(
                     call_id, {"error": "tool call budget exhausted"}, is_error=True,
                 )
                 continue
@@ -3013,7 +3027,7 @@ class SpecialistSession:
                 )
             except TimeoutError:
                 self.budget.record_tool_rejection("session lease expired")
-                self.conversation.add_tool_result(
+                self._add_tool_result(
                     call_id, {"error": "session lease expired"}, is_error=True,
                 )
                 self._tool_lease_exhausted = True
@@ -3093,13 +3107,13 @@ class SpecialistSession:
                         "content": slice_record.content,
                     })
                 if representative is None or representative_collection is None:
-                    self.conversation.add_tool_result(
+                    self._add_tool_result(
                         call_id, {"error": "batch diff returned no path slices"},
                         is_error=True,
                     )
                     continue
                 self._tool_call_evidence_ids[call_id] = representative.id
-                self.conversation.add_tool_result(
+                self._add_tool_result(
                     call_id,
                     {
                         "evidence_slices": slices,
@@ -3120,7 +3134,7 @@ class SpecialistSession:
                 collection.id, record, requested_obligation_ids,
             )
             self._tool_call_evidence_ids[call_id] = record.id
-            self.conversation.add_tool_result(
+            self._add_tool_result(
                 call_id,
                 {
                     "evidence_id": record.id,
@@ -5486,6 +5500,59 @@ class SpecialistSession:
             investigation_lead_resolutions=tuple(
                 self._investigation_lead_resolutions.values()
             ),
+            advertised_tools=tuple(sorted({
+                str(item.get("name") or "").strip()
+                for item in self.conversation.tool_schemas
+                if str(item.get("name") or "").strip()
+            })),
+            tool_activity=self._tool_activity_snapshot(),
+        )
+
+    def _tool_activity_snapshot(self) -> tuple[Mapping[str, object], ...]:
+        stats: dict[str, dict[str, object]] = {}
+        for call_id, name in self._tool_activity_call_names.items():
+            row = stats.setdefault(name, {
+                "tool": name, "calls": 0, "successful": 0,
+                "rejected": 0, "deferred": 0, "errors": 0,
+                "evidence_retained": 0,
+            })
+            row["calls"] = int(row["calls"]) + 1
+            outcome = self._tool_activity_outcomes.get(call_id, "errors")
+            row[outcome] = int(row[outcome]) + 1
+        for name, evidence_ids in self._tool_activity_evidence.items():
+            if name in stats:
+                stats[name]["evidence_retained"] = len(evidence_ids)
+        return tuple(stats[name] for name in sorted(stats))
+
+    def _add_tool_result(
+        self, call_id: str, result: object, *, is_error: bool = False,
+        max_bytes: int = TOOL_RESULT_MAX_BYTES,
+    ) -> None:
+        """Persist privacy-safe tool outcome counters across transcript compaction."""
+        name = self._tool_activity_call_names.get(call_id, "")
+        if name:
+            if is_error:
+                outcome = "errors"
+            elif isinstance(result, Mapping) and result.get("status") == "deferred":
+                outcome = "deferred"
+            elif isinstance(result, Mapping) and bool(result.get("error")):
+                outcome = "errors"
+            elif isinstance(result, Mapping) and (
+                result.get("accepted") is False
+                or result.get("status") in {"error", "rejected", "blocked"}
+            ):
+                outcome = "rejected"
+            else:
+                outcome = "successful"
+            self._tool_activity_outcomes[call_id] = outcome
+            if isinstance(result, Mapping):
+                evidence_id = str(result.get("evidence_id") or "").strip()
+                if evidence_id:
+                    self._tool_activity_evidence.setdefault(name, set()).add(
+                        evidence_id
+                    )
+        self.conversation.add_tool_result(
+            call_id, result, is_error=is_error, max_bytes=max_bytes,
         )
 
     def _record_checkpoint_diagnostic(
