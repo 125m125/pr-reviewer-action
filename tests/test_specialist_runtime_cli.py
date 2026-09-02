@@ -2096,8 +2096,10 @@ def test_handoff_summarizer_prompt_limits_prose_to_controller_facts(
     assert "successful_review_facts" in prompt
     assert "specialist_checkpoint_summaries" in prompt
     assert "Ground change claims only in the complete validated change_overview" in prompt
-    assert "controller owns human-review focus" in prompt_lower
-    assert "do not add unresolved areas or human-review requests" in prompt_lower
+    assert "human_focus_facts" in prompt
+    assert "controller-authorized orientation" in prompt_lower
+    assert "do not invent work absent from the supplied state" in prompt_lower
+    assert '"human_focus":string' in prompt
     assert "do not list files, findings, severities" in prompt
     assert "do not claim complete coverage" in prompt_lower
 

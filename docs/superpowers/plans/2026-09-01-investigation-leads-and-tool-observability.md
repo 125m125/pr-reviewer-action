@@ -4,7 +4,7 @@
 
 **Goal:** Separate checkpoint continuation memory from scheduler authority, route evidence-backed cross-assignment concerns as bounded investigation leads, and expose safe per-tool runtime statistics in the GitHub Actions job summary.
 
-**Architecture:** Reuse the existing specialist session, negotiation projection, controller run state, event journal, artifact, and summary writer. Sessions admit compact lead records and tool counters; the controller deduplicates and routes leads as `L#` negotiation targets without creating obligations. Handoff focus and tool reporting are projected only from controller-owned terminal state.
+**Architecture:** Reuse the existing specialist session, negotiation projection, controller run state, event journal, artifact, and summary writer. Sessions admit compact lead records and tool counters; the controller deduplicates and routes leads as `L#` negotiation targets without creating obligations. The handoff summarizer phrases focus from bounded session summaries and controller-approved focus facts; tool reporting is projected from controller-owned terminal state.
 
 **Tech Stack:** Python 3 dataclasses/enums, pytest, existing specialist runtime event/artifact model, Bash/GitHub Actions job summary Markdown.
 
@@ -351,7 +351,7 @@ git add pr_reviewer/specialist_runtime/negotiation.py pr_reviewer/specialist_run
 git commit -m "Route controller-owned investigation leads"
 ```
 
-### Task 4: Make human focus authoritative and expose safe tool statistics
+### Task 4: Keep human focus bounded and expose safe tool statistics
 
 **Files:**
 - Modify: `pr_reviewer/specialist_runtime/session.py:1084-1300, 2622-2925, 5214-5228`
@@ -402,11 +402,11 @@ Deferred calls are recorded once and may be retried after compaction. Duplicate 
 
 - [ ] **Step 3: Write failing artifact and handoff tests**
 
-Assert the artifact contains canonical leads and aggregate tool rows, and that `_validate_artifact` rejects malformed rows. Feed the handoff summarizer a checkpoint containing a provocative proposed action and assert it never receives that field and cannot replace deterministic `human_focus`.
+Assert the artifact contains canonical leads and aggregate tool rows, and that `_validate_artifact` rejects malformed rows. Feed the handoff summarizer a checkpoint containing a provocative proposed action and assert it never receives that field. Assert its human-focus input contains only bounded checkpoint summaries and controller-approved focus facts.
 
-- [ ] **Step 4: Make `human_focus` controller-owned**
+- [ ] **Step 4: Keep `human_focus` model-authored from bounded facts**
 
-Reduce the handoff-summarizer production contract to `ai_reviewed_summary`. Ignore legacy in-process `human_focus` output rather than publishing it. Build final focus only from prepared verification notes, material terminal unknowns/degradations, typed access requests, unresolved material obligations, and open/blocked controller leads. Keep it concise and deduplicated; do not publish resolved/dropped leads.
+Keep `human_focus` in the handoff-summarizer contract, but exclude checkpoint `proposed_next_actions`. Supply bounded checkpoint summaries plus controller focus facts derived from prepared verification notes, material terminal unknowns/degradations, typed access requests, unresolved material obligations, and open/blocked controller leads. Use controller prose as the fallback when the model returns an empty focus. Keep it concise; do not publish resolved/dropped leads.
 
 - [ ] **Step 5: Aggregate tool activity and external policy in the artifact**
 
@@ -452,7 +452,7 @@ Then render `<details><summary>External access policy</summary>` with enabled fl
 
 - [ ] **Step 7: Update operator migration guidance**
 
-Document that checkpoint todos no longer schedule work, specialists can report evidence-backed cross-scope leads, only controller-routed unresolved leads affect human focus, and the Actions summary now shows tool/external-access diagnostics. No repository configuration change is required.
+Document that checkpoint todos no longer schedule work, specialists can report evidence-backed cross-scope leads, the handoff model phrases focus from bounded summaries and controller-approved focus facts, and the Actions summary now shows tool/external-access diagnostics. No repository configuration change is required.
 
 - [ ] **Step 8: Run focused suites**
 

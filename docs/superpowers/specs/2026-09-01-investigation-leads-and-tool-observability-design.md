@@ -115,10 +115,13 @@ opportunistic discoveries.
 
 The handoff summarizer may use bounded checkpoint working summaries and completed
 steps to describe what the AI reviewed, but it does not receive checkpoint
-`proposed_next_actions`. `human_focus` is assembled from authoritative final
-state only: published verification notes, retained material unknowns, degraded
-stages, unresolved material obligations, typed access requests, and unresolved
-material investigation leads.
+`proposed_next_actions`. It continues to write the concise `human_focus`
+sentence from the bounded checkpoint summaries plus controller-supplied focus
+facts. Those facts come only from authoritative final state: published
+verification notes, retained material unknowns, degraded stages, unresolved
+material obligations, typed access requests, and unresolved material
+investigation leads. If it omits the sentence, the controller-authored focus is
+used as the fallback.
 
 An open lead is not automatically a PR comment. It may contribute a concise
 human-focus sentence only when the controller retained it as material and no

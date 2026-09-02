@@ -3778,8 +3778,9 @@ def test_handoff_summarizer_writes_behavioral_review_handoff_from_validated_stat
         assert request.context["successful_review_facts"]["covered_obligation_count"]
         assert set(request.context) == {
             "change_overview", "specialist_checkpoint_summaries",
-            "successful_review_facts", "prepared_notes",
+            "successful_review_facts", "prepared_notes", "human_focus_facts",
         }
+        assert request.context["human_focus_facts"] == ()
         assert "policy" not in request.context
         assert "coverage" not in request.context
         assert "review" not in request.context
@@ -3804,13 +3805,16 @@ def test_handoff_summarizer_writes_behavioral_review_handoff_from_validated_stat
         "The review traced retry handling in `src/worker.py` through the delivery "
         "obligation and its retained implementation evidence.",
     )
-    assert result.handoff.human_focus == ()
+    assert result.handoff.human_focus == (
+        "Recheck failure recovery at the worker boundary, especially behavior "
+        "after an ambiguous delivery result.",
+    )
     behavioral_summary = " ".join((
         *result.handoff.what_changed,
         *result.handoff.ai_reviewed,
         *result.handoff.human_focus,
     ))
-    assert len(re.findall(r"[.!?](?:\s|$)", behavioral_summary)) == 2
+    assert len(re.findall(r"[.!?](?:\s|$)", behavioral_summary)) == 3
     assert "- `src/worker.py` changes runtime implementation behavior." not in (
         result.handoff.markdown
     )
@@ -4152,7 +4156,7 @@ def test_handoff_summarizer_sanitizes_extra_fields_and_unknown_references(
     assert result.handoff.ai_reviewed == (
         "The review traced retry handling in `src/worker.py`.",
     )
-    assert result.handoff.human_focus == ()
+    assert result.handoff.human_focus == ("Recheck the worker boundary.",)
     assert "invented" not in result.handoff.markdown
     assert "unsupported extra field" not in result.handoff.markdown
     assert result.publishing_ready is True
@@ -4736,7 +4740,7 @@ def test_degraded_handoff_rejects_focus_from_failed_planned_assignment(tmp_path)
     assert "Security-sensitive behavior" not in result.handoff.markdown
 
 
-def test_degraded_handoff_keeps_valid_model_prose_and_adds_controller_focus(
+def test_degraded_handoff_keeps_valid_model_prose_and_focus(
     tmp_path,
 ):
     def planner(request):
@@ -4752,7 +4756,7 @@ def test_degraded_handoff_keeps_valid_model_prose_and_adds_controller_focus(
             "ai_reviewed_summary": (
                 "The model reviewed retry behavior in `src/worker.py`."
             ),
-            "human_focus": "Recheck the model's file list.",
+            "human_focus": "Recheck retry behavior at the worker boundary.",
             "referenced_paths": ["src/worker.py"],
             "referenced_component_ids": [],
             "referenced_obligation_ids": [],
@@ -4773,8 +4777,9 @@ def test_degraded_handoff_keeps_valid_model_prose_and_adds_controller_focus(
         result.artifact["change_overview"]["overview"]
     )
     assert all("retry behavior" not in item for item in result.handoff.what_changed)
-    assert result.handoff.human_focus == ()
-    assert "model's file list" not in result.handoff.markdown
+    assert result.handoff.human_focus == (
+        "Recheck retry behavior at the worker boundary.",
+    )
 
 
 def test_followup_wave_can_replace_completed_initial_session_at_capacity(tmp_path):

@@ -610,7 +610,7 @@ def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
         return value
     if not isinstance(value, Mapping):
         raise TypeError("handoff summarizer must return an object")
-    expected = {"ai_reviewed_summary"}
+    expected = {"ai_reviewed_summary", "human_focus"}
     if not expected <= set(value):
         raise ValueError("handoff summarizer required fields are missing")
 
@@ -4496,6 +4496,7 @@ class ReviewController:
         combined = " ".join((
             proposal.what_changed_summary,
             proposal.ai_reviewed_summary,
+            proposal.human_focus,
         ))
         # Path-looking words and the optional reference arrays are orientation
         # prose, not review authority. Findings, coverage and changed-line
@@ -4550,7 +4551,11 @@ class ReviewController:
             ai_reviewed=(proposal.ai_reviewed_summary,),
             ai_reviewed_is_validated_summary=True,
             review_emphasis_topics=(),
-            human_focus=base.human_focus,
+            human_focus=(
+                (proposal.human_focus,)
+                if proposal.human_focus
+                else base.human_focus
+            ),
         )
 
     @staticmethod
@@ -4931,6 +4936,7 @@ class ReviewController:
                             for note in state.notes
                         })),
                     },
+                    "human_focus_facts": context.human_focus,
                 }
                 proposed = self._model_request(
                     state,
