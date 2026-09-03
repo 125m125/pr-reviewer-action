@@ -800,9 +800,11 @@ def _deterministic_handoff_focus(
         if item in obligation_map and str(obligation_map[item].subject).strip()
     ))
     if subjects:
+        subject_text = "; ".join(subjects[:3])
+        area = "this high-risk area" if len(subjects) == 1 else "these high-risk areas"
         return (
-            "Recheck the unresolved high-risk coverage questions in the handoff, "
-            "especially " + "; ".join(subjects[:3]) + ".",
+            f"Recheck {subject_text} because the AI did not retain enough "
+            f"evidence to resolve {area}.",
         )
     # Without a concrete unresolved obligation, keep the legacy orientation
     # labels; there is no specific human action to summarize here.

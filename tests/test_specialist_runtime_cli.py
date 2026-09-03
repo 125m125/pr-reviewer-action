@@ -2102,6 +2102,9 @@ def test_handoff_summarizer_prompt_limits_prose_to_controller_facts(
     assert '"human_focus":string' in prompt
     assert "do not list files, findings, severities" in prompt
     assert "do not claim complete coverage" in prompt_lower
+    assert "the human cannot see" in prompt_lower
+    assert "each sentence must be self-contained" in prompt_lower
+    assert "do not refer to hidden questions" in prompt_lower
 
 
 def test_specialist_prompt_requires_exact_honest_changed_locations(
@@ -2129,6 +2132,35 @@ def test_specialist_prompt_requires_exact_honest_changed_locations(
 
     assert "exact changed repository path or `path:line`" in prompt
     assert "omit the line rather than inferring" in prompt
+
+
+def test_specialist_prompt_requires_authoritative_external_contract_evidence(
+    monkeypatch, tmp_path,
+):
+    from pr_reviewer.specialist_runtime.assignments import Assignment
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger
+    from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+
+    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
+    monkeypatch.setenv("AI_MODEL", "local-model")
+
+    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
+    assignment = Assignment(
+        id="external-contract", title="External contract",
+        objective="Review one changed workflow", obligation_ids=(), recipe_ids=(),
+        lenses=(), seed_paths=(), boundary_paths=(), expected_evidence=(),
+        estimated_turns=1, priority="high",
+    )
+    session = controller._cli_session_factory(
+        assignment, SessionLease(RunPhase.INITIAL, 10**20), None,
+        EvidenceStore(), CoverageLedger(()), (), "session:test:g0",
+    )
+    prompt = session.conversation.system.casefold()
+
+    assert "external contract" in prompt
+    assert "allowlisted authoritative documentation or source" in prompt
+    assert "probably harmless" in prompt
+    assert "report_investigation_lead" in prompt
 
 
 def test_assignment_prompt_requires_diff_first_investigation(

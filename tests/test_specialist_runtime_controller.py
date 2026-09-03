@@ -651,8 +651,8 @@ def test_deterministic_handoff_focus_explains_unresolved_coverage():
     focus = _deterministic_handoff_focus((obligation,), (obligation.id,), True)
 
     assert focus == (
-        "Recheck the unresolved high-risk coverage questions in the handoff, "
-        "especially publishing hygiene.",
+        "Recheck publishing hygiene because the AI did not retain enough "
+        "evidence to resolve this high-risk area.",
     )
 
 
