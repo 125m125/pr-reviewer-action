@@ -125,6 +125,8 @@ replay and provider capacity have been demonstrated.
 | `specialist_pass_timeout_sec` | retained | `600` | `600` | Bounds an individual model request within the global deadline. |
 | `specialist_max_tokens` | retained | `4096` | `8192` for the tested local Qwen baseline | Provides room for bounded structured checkpoints and repairs without changing the lifetime turn limit. |
 | `specialist_recovery_max_tokens` | retained | `2048` | `2048` | Bounds the first reconstructed specialist model turn after a recovery. |
+| `specialist_delegated_summary_max_tokens` | added |  | Leave blank initially (derives `2 × specialist_max_tokens`) | Lets a one-shot, tools-disabled side-question summarizer reason over a large source; its one repair receives half the derived/configured allowance. |
+| `specialist_delegated_summary_max_source_bytes` | added |  | Leave blank initially | Derives a source cap from the real context window after prompt, initial response, repair, and safety reserves; set only when provider measurements justify a tighter ceiling. |
 | `specialist_max_conversation_tokens` | retained | `96000` | `60000` for a 75000-token local window | Keeps ordinary transcript pressure below the provider window while preserving checkpoint/output headroom. |
 | `specialist_temperature` | retained | `0.0` | `0.0` | Keeps exploration deterministic while replay behavior is established. |
 | `model_context_tokens` | retained |  | Set the provider's actual served window; use `75000` for the tested local Qwen configuration | Derives corpus/diff and admission budgets from the real context window. Never copy a model's advertised maximum when the server is configured lower. |

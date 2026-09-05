@@ -27,6 +27,7 @@ from pr_reviewer.specialist_runtime.model_gateway import (
 from pr_reviewer.specialist_runtime.request_attempts import RequestAttemptJournal
 from pr_reviewer.specialist_runtime.session import (
     COMPACTED_EVIDENCE_TOOL_NAME,
+    DELEGATE_TOOL_SUMMARY_NAME,
     CheckpointDisposition,
     TEST_RESULTS_TOOL_NAME,
     SpecialistSession,
@@ -620,6 +621,8 @@ def make_session(
     budget_limits=None, max_tokens=1024,
     request_timeout_sec=30.0, max_context_tokens=24_000,
     recovery_max_tokens=None, clock=time.monotonic, test_results=(),
+    tool_schemas=None, delegated_summary_max_tokens=None,
+    delegated_summary_max_source_bytes=None, max_tool_result_bytes=12_000,
 ):
     obligations = obligations or (
         CoverageObligation(
@@ -635,7 +638,14 @@ def make_session(
         assignment_id="assignment-1", objective="Review the assigned behavior",
         primary_obligation_ids=("OB-code", "OB-tests"), seed_paths=("a.py",),
     )
-    conversation = Conversation(system="Gather evidence and checkpoint progress.")
+    conversation = (
+        Conversation(system="Gather evidence and checkpoint progress.")
+        if tool_schemas is None
+        else Conversation(
+            system="Gather evidence and checkpoint progress.",
+            tool_schemas=list(tool_schemas),
+        )
+    )
     lease = lease or SessionLease(RunPhase.FOLLOWUP, time.monotonic() + 60.0)
 
     if execute_tool is None:
@@ -653,11 +663,176 @@ def make_session(
         lease=lease, request_timeout_sec=request_timeout_sec, max_tokens=max_tokens,
         max_context_tokens=max_context_tokens,
         recovery_max_tokens=recovery_max_tokens or max_tokens,
+        max_tool_result_bytes=max_tool_result_bytes,
+        delegated_summary_max_tokens=delegated_summary_max_tokens,
+        delegated_summary_max_source_bytes=delegated_summary_max_source_bytes,
         test_results=test_results,
         test_results_repository="owner/repository",
         test_results_head_sha="b" * 40,
         clock=clock,
     )
+
+
+def delegated_summary_response(
+    *, start_line=2, end_line=2, summary="The feature is enabled.",
+):
+    return ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "summary": summary,
+            "relevant_excerpts": [{
+                "start_line": start_line,
+                "end_line": end_line,
+                "relevance": "Directly answers the focused question.",
+            }],
+            "uncertainties": [],
+            "source_truncated": False,
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 30, "completion_tokens": 10},
+        request_diagnostics={},
+    )
+
+
+def test_delegated_summary_retains_raw_source_but_returns_only_focused_result():
+    gateway = ScriptedGateway([delegated_summary_response()])
+    executor_calls = []
+
+    def execute(name, arguments, **kwargs):
+        executor_calls.append((name, arguments, kwargs))
+        return {
+            "tool": name, "status": "ok",
+            "result": {"content": "irrelevant preface\nfeature=true\nirrelevant tail"},
+        }
+
+    session = make_session(
+        gateway, execute_tool=execute, max_tokens=1024,
+        tool_schemas=[{
+            "name": "read_file", "description": "read",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"},
+            }, "required": ["path"], "additionalProperties": False},
+        }],
+    )
+    assert DELEGATE_TOOL_SUMMARY_NAME in {
+        item["name"] for item in session.conversation.tool_schemas
+    }
+
+    progressed = session._execute_calls(({
+        "id": "delegate-1", "name": DELEGATE_TOOL_SUMMARY_NAME,
+        "arguments": json.dumps({
+            "tool_name": "read_file",
+            "arguments": {"path": "a.py"},
+            "target": "feature toggle",
+            "question": "Is the feature enabled?",
+        }),
+    },))
+
+    visible = json.loads(session.conversation.events[-1]["content"])
+    records = session.evidence_store.snapshot().records
+    assert progressed is True
+    assert executor_calls[0][0:2] == ("read_file", {"path": "a.py"})
+    assert executor_calls[0][2]["max_response_bytes"] > 12_000
+    assert gateway.requests[0].tools_enabled is False
+    assert gateway.requests[0].max_tokens == 2048
+    assert gateway.requests[0].messages_contain("irrelevant preface")
+    assert gateway.requests[0].messages_contain("L000002|feature=true")
+    assert visible["summary"] == "The feature is enabled."
+    assert visible["relevant_excerpts"][0]["text"] == "feature=true"
+    assert visible["relevant_excerpts"][0]["locator"] == "line 2"
+    assert visible["source_evidence_id"] == records[0].id
+    assert "irrelevant preface" not in session.conversation.events[-1]["content"]
+    assert records[0].content.startswith("irrelevant preface")
+    assert session.budget.snapshot().tool_calls == 1
+    assert session.budget.snapshot().model_turns == 1
+
+
+def test_delegated_summary_repairs_an_invalid_source_range_once():
+    gateway = ScriptedGateway([
+        delegated_summary_response(start_line=99, end_line=99),
+        delegated_summary_response(start_line=1, end_line=1),
+    ])
+    session = make_session(
+        gateway, max_tokens=1024,
+        tool_schemas=[{
+            "name": "read_file", "description": "read",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"},
+            }, "required": ["path"], "additionalProperties": False},
+        }],
+        execute_tool=lambda name, arguments, **kwargs: {
+            "tool": name, "status": "ok",
+            "result": {"content": "feature=true"},
+        },
+    )
+
+    session._execute_calls(({
+        "id": "delegate-1", "name": DELEGATE_TOOL_SUMMARY_NAME,
+        "arguments": json.dumps({
+            "tool_name": "read_file", "arguments": {"path": "a.py"},
+            "target": "feature toggle", "question": "Is it enabled?",
+        }),
+    },))
+
+    assert [request.max_tokens for request in gateway.requests] == [2048, 1024]
+    assert gateway.requests[1].messages_contain('\\"start_line\\": 99')
+    visible = json.loads(session.conversation.events[-1]["content"])
+    assert visible["relevant_excerpts"][0]["text"] == "feature=true"
+
+
+def test_delegated_summary_extracts_multiline_text_with_source_line_endings():
+    gateway = ScriptedGateway([
+        delegated_summary_response(start_line=2, end_line=3),
+    ])
+    session = make_session(
+        gateway, max_tokens=1024,
+        tool_schemas=[{
+            "name": "read_file", "description": "read",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"},
+            }, "required": ["path"], "additionalProperties": False},
+        }],
+        execute_tool=lambda name, arguments, **kwargs: {
+            "tool": name, "status": "ok",
+            "result": {"content": 'heading\r\nvalue="a\\b"\r\nnext=true\r\ntail'},
+        },
+    )
+
+    session._execute_calls(({
+        "id": "delegate-1", "name": DELEGATE_TOOL_SUMMARY_NAME,
+        "arguments": json.dumps({
+            "tool_name": "read_file", "arguments": {"path": "a.py"},
+            "target": "escaped value", "question": "What is configured?",
+        }),
+    },))
+
+    visible = json.loads(session.conversation.events[-1]["content"])
+    assert visible["relevant_excerpts"][0] == {
+        "text": 'value=\"a\\b\"\r\nnext=true',
+        "locator": "lines 2-3",
+        "relevance": "Directly answers the focused question.",
+    }
+
+
+def test_delegated_summary_rejects_recursive_or_state_changing_inner_tools():
+    session = make_session(
+        ScriptedGateway([]),
+        tool_schemas=[{
+            "name": "read_file", "description": "read",
+            "parameters": {"type": "object", "properties": {},
+                           "additionalProperties": False},
+        }],
+    )
+
+    session._execute_calls(({
+        "id": "delegate-1", "name": DELEGATE_TOOL_SUMMARY_NAME,
+        "arguments": json.dumps({
+            "tool_name": DELEGATE_TOOL_SUMMARY_NAME,
+            "arguments": {}, "target": "state", "question": "Summarize it",
+        }),
+    },))
+
+    visible = json.loads(session.conversation.events[-1]["content"])
+    assert "read-only evidence tool" in visible["error"]
+    assert session.budget.snapshot().tool_calls == 0
 
 
 def test_specialist_protocol_requires_falsifying_changed_behavior_first():

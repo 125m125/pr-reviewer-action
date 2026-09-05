@@ -299,6 +299,8 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_pass_timeout_sec` | Per-model-request timeout for specialist strategies | No | `600` |
 | `specialist_max_tokens` | Completion-token ceiling for specialist, critic, and aggregator turns | No | `4096` |
 | `specialist_recovery_max_tokens` | Completion-token ceiling for the first reconstructed specialist turn after bounded recovery | No | `2048` |
+| `specialist_delegated_summary_max_tokens` | Optional completion-token ceiling for `delegate_tool_summary`; empty derives twice `specialist_max_tokens`, with half reserved for its one repair | No | `""` |
+| `specialist_delegated_summary_max_source_bytes` | Optional source-byte ceiling for `delegate_tool_summary`; empty derives a context-safe limit after prompt, output, repair, and safety reserves | No | `""` |
 | `specialist_max_conversation_tokens` | Approximate transcript ceiling for one specialist conversation; independent of `model_context_tokens` | No | `96000` |
 | `specialist_temperature` | Sampling temperature for streamed specialist exploration turns; keep `0.0` for deterministic behavior or experiment with a modest value | No | `0.0` |
 | `specialist_stream_watchdog` | Interrupt streamed specialist output after repeated paragraphs/blocks and recover once from compact evidence | No | `true` |
@@ -333,6 +335,16 @@ ceilings. The job summary reports assignment coverage, model requests, runtime,
 and budget accounting. `specialists_evaluate` writes
 `specialist-review-artifact.json` and exposes its path as `specialist_artifact`,
 but the publish step is unconditionally skipped.
+
+When ordinary specialist evidence tools are available, sessions also expose
+`delegate_tool_summary` for a focused side question about a large web page,
+remote file, or other reference source. It is not a replacement for direct
+changed-code investigation or exact finding locations. The selected tool runs
+under its existing guards, the bounded original remains authoritative evidence,
+and only a compact summary, controller-extracted excerpts selected by numbered
+source ranges, uncertainties, truncation status, and the original evidence ID
+enter the specialist conversation. Invalid structured output receives one
+focused tools-disabled repair.
 
 `review_policy_file` is a current-branch version-2 policy. The older
 `specialist_config_file` remains a one-release version-1 migration input, but

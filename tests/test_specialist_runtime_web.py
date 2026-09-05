@@ -479,6 +479,26 @@ def test_every_redirect_is_resolved_and_connected_to_checked_ip():
     assert result.provenance.final_url == "https://docs.example.com/final"
 
 
+def test_secure_fetch_prefers_markdown_then_plain_text_then_html():
+    url = "https://docs.example.com/api"
+    transport = FakeHttpTransport({
+        url: HttpResponse(
+            200, {"Content-Type": "text/markdown; charset=utf-8"},
+            b"# API\n\nSupported.",
+        ),
+    })
+
+    result = SecureFetcher(
+        source_policy(), transport=transport, resolver=public_resolver,
+    ).fetch(url)
+
+    accept = transport.requests[0].headers["Accept"]
+    assert accept.index("text/markdown") < accept.index("text/plain")
+    assert accept.index("text/plain") < accept.index("text/html")
+    assert result.mime_type == "text/markdown"
+    assert result.content == "# API\n\nSupported."
+
+
 @pytest.mark.parametrize("resolved_ip", [
     "127.0.0.1", "10.1.2.3", "169.254.1.1", "224.0.0.1",
     "192.0.2.1", "0.0.0.0", "100.100.100.200", "::1",

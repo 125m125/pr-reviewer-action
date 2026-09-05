@@ -188,6 +188,18 @@ inputs:
     description: Maximum completion tokens for the first reconstructed specialist turn after a bounded recovery.
     required: false
     default: "2048"
+  specialist_delegated_summary_max_tokens:
+    description: >-
+      Optional completion-token ceiling for delegate_tool_summary. Empty derives
+      twice specialist_max_tokens; its single repair receives half this value.
+    required: false
+    default: ""
+  specialist_delegated_summary_max_source_bytes:
+    description: >-
+      Optional source-byte ceiling for delegate_tool_summary. Empty derives a
+      context-safe limit after summary, repair, prompt, and safety reserves.
+    required: false
+    default: ""
   specialist_max_conversation_tokens:
     description: Maximum approximate transcript tokens retained by one specialist conversation; independent of model_context_tokens.
     required: false
@@ -856,6 +868,8 @@ runs:
         SPECIALIST_PASS_TIMEOUT_SEC: ${{ inputs.specialist_pass_timeout_sec }}
         SPECIALIST_MAX_TOKENS: ${{ inputs.specialist_max_tokens }}
         SPECIALIST_RECOVERY_MAX_TOKENS: ${{ inputs.specialist_recovery_max_tokens }}
+        SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS: ${{ inputs.specialist_delegated_summary_max_tokens }}
+        SPECIALIST_DELEGATED_SUMMARY_MAX_SOURCE_BYTES: ${{ inputs.specialist_delegated_summary_max_source_bytes }}
         SPECIALIST_MAX_CONVERSATION_TOKENS: ${{ inputs.specialist_max_conversation_tokens }}
         SPECIALIST_TEMPERATURE: ${{ inputs.specialist_temperature }}
         SPECIALIST_STREAM_WATCHDOG: ${{ inputs.specialist_stream_watchdog }}
@@ -995,6 +1009,8 @@ runs:
         SPECIALIST_PASS_TIMEOUT_SEC: ${{ inputs.specialist_pass_timeout_sec }}
         SPECIALIST_MAX_TOKENS: ${{ inputs.specialist_max_tokens }}
         SPECIALIST_RECOVERY_MAX_TOKENS: ${{ inputs.specialist_recovery_max_tokens }}
+        SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS: ${{ inputs.specialist_delegated_summary_max_tokens }}
+        SPECIALIST_DELEGATED_SUMMARY_MAX_SOURCE_BYTES: ${{ inputs.specialist_delegated_summary_max_source_bytes }}
         SPECIALIST_MAX_CONVERSATION_TOKENS: ${{ inputs.specialist_max_conversation_tokens }}
         SPECIALIST_TEMPERATURE: ${{ inputs.specialist_temperature }}
         SPECIALIST_STREAM_WATCHDOG: ${{ inputs.specialist_stream_watchdog }}

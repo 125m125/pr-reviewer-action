@@ -1060,6 +1060,8 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
     monkeypatch.setenv("SPECIALIST_PASS_TIMEOUT_SEC", "41")
     monkeypatch.setenv("SPECIALIST_MAX_TOKENS", "1234")
     monkeypatch.setenv("SPECIALIST_RECOVERY_MAX_TOKENS", "456")
+    monkeypatch.setenv("SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS", "2468")
+    monkeypatch.setenv("SPECIALIST_DELEGATED_SUMMARY_MAX_SOURCE_BYTES", "98765")
     monkeypatch.setenv("SPECIALIST_PLANNER_MAX_CONTEXT_BYTES", "6543")
     monkeypatch.setenv("SPECIALIST_PLANNER_MAX_TOOL_CALLS", "7")
     monkeypatch.setenv("SPECIALIST_MAX_TRUNCATION_CONTINUATIONS", "3")
@@ -1094,6 +1096,8 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
     assert config.max_tokens == 1234
     assert config.allow_private_search_url is True
     assert config.recovery_max_tokens == 456
+    assert config.delegated_summary_max_tokens == 2468
+    assert config.delegated_summary_max_source_bytes == 98765
     assert config.planner_max_context_bytes == 6543
     assert config.model_context_tokens == 32000
     assert config.temperature == 0.2
@@ -1124,6 +1128,8 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
         "session:test:g0",
     )
     assert session.recovery_max_tokens == 456
+    assert session.delegated_summary_max_tokens == 2468
+    assert session.delegated_summary_max_source_bytes == 98765
 
 
 def test_specialist_diff_command_uses_controller_owned_review_range(

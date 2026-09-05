@@ -1314,7 +1314,10 @@ class SecureFetcher:
                 max_bytes=self.max_bytes,
                 deadline=deadline,
                 headers={
-                    "Accept": "text/plain, text/html, text/markdown, application/json, application/xml",
+                    "Accept": (
+                        "text/markdown, text/plain;q=0.9, text/html;q=0.8, "
+                        "application/json;q=0.7, application/xml;q=0.6"
+                    ),
                     "Accept-Encoding": "identity",
                     "User-Agent": "ai-pr-reviewer/secure-fetch",
                 },

@@ -269,6 +269,13 @@ def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
     return value
 
 
+def _optional_positive_int(env: Mapping[str, str], name: str) -> int | None:
+    raw = str(env.get(name, "")).strip()
+    if not raw:
+        return None
+    return _positive_int(env, name, 1)
+
+
 def _nonnegative_float(env: Mapping[str, str], name: str, default: float) -> float:
     try:
         value = float(str(env.get(name, default)).strip())
@@ -349,6 +356,8 @@ class CliConfig:
     request_timeout_sec: int
     max_tokens: int
     recovery_max_tokens: int
+    delegated_summary_max_tokens: int | None
+    delegated_summary_max_source_bytes: int | None
     planner_max_tokens: int
     planner_max_context_bytes: int
     model_context_tokens: int
@@ -480,6 +489,12 @@ class CliConfig:
             request_timeout_sec=request_timeout,
             max_tokens=_positive_int(source, "SPECIALIST_MAX_TOKENS", 4096),
             recovery_max_tokens=_positive_int(source, "SPECIALIST_RECOVERY_MAX_TOKENS", 2048),
+            delegated_summary_max_tokens=_optional_positive_int(
+                source, "SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS",
+            ),
+            delegated_summary_max_source_bytes=_optional_positive_int(
+                source, "SPECIALIST_DELEGATED_SUMMARY_MAX_SOURCE_BYTES",
+            ),
             planner_max_tokens=_positive_int(source, "SPECIALIST_PLANNER_MAX_TOKENS", 2048),
             planner_max_context_bytes=_positive_int(
                 source, "SPECIALIST_PLANNER_MAX_CONTEXT_BYTES", 60_000,
@@ -925,6 +940,12 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
             "planner_max_tokens": config.planner_max_tokens,
             "planner_max_context_bytes": config.planner_max_context_bytes,
             "recovery_max_tokens": config.recovery_max_tokens,
+            "delegated_summary_max_tokens": (
+                config.delegated_summary_max_tokens or config.max_tokens * 2
+            ),
+            "delegated_summary_max_source_bytes": (
+                config.delegated_summary_max_source_bytes or "context-derived"
+            ),
             "model_context_tokens": config.model_context_tokens,
             "temperature": config.temperature,
             "stream": config.stream,
@@ -1105,6 +1126,7 @@ def build_controller(
             *,
             timeout_sec: float | None = None,
             deadline_at: float | None = None,
+            max_response_bytes: int | None = None,
         ) -> dict[str, Any]:
             effective_timeout = max(
                 0.001,
@@ -1121,18 +1143,23 @@ def build_controller(
                     *config.environment.get("TOOL_ALLOWED_GH_API_REPOS", "").split(","),
                 ) if item.strip()
             ))
+            response_bytes = (
+                config.tool_response_bytes
+                if max_response_bytes is None
+                else max(1, int(max_response_bytes))
+            )
             bounded_fetcher = SecureFetcher(
                 policy,
                 evidence_store=evidence,
                 timeout=effective_timeout,
-                max_bytes=config.tool_response_bytes,
+                max_bytes=response_bytes,
             )
             bounded_search = (
                 SearxngSearchProvider(
                     config.search_url,
                     request_timeout=effective_timeout,
                     max_response_bytes=max(
-                        config.tool_response_bytes, 64 * 1024,
+                        response_bytes, 64 * 1024,
                     ),
                     allow_private_search_url=config.allow_private_search_url,
                 )
@@ -1143,7 +1170,7 @@ def build_controller(
             return execute_tool_request(
                 name, arguments, str(config.workspace), allowed_repos,
                 config.environment.get("REPO", ""), tuple(rule.host for rule in policy.rules),
-                config.tool_response_bytes, effective_timeout,
+                response_bytes, effective_timeout,
                 config.search_url, config.max_search_results,
                 source_policy=policy, search_provider=bounded_search,
                 allow_private_search_url=config.allow_private_search_url,
@@ -1183,6 +1210,10 @@ def build_controller(
             stream=config.stream,
             max_context_tokens=config.model_context_tokens,
             recovery_max_tokens=config.recovery_max_tokens,
+            delegated_summary_max_tokens=config.delegated_summary_max_tokens,
+            delegated_summary_max_source_bytes=(
+                config.delegated_summary_max_source_bytes
+            ),
             recovery_evidence_bytes=max(
                 1_000, config.recovery_max_tokens * 4,
             ),
@@ -1206,6 +1237,11 @@ def build_controller(
         critic=critic,
         remediator=remediator,
         finalizer=finalizer,
+        evidence_store_factory=lambda: EvidenceStore(max_content_bytes=max(
+            64 * 1024,
+            config.delegated_summary_max_source_bytes
+            or config.model_context_tokens * 4,
+        )),
         artifact_output_root=config.artifact_root,
         event_sink=event_sink,
     )

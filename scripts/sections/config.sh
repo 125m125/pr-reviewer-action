@@ -121,6 +121,8 @@ SPECIALIST_AGGREGATOR_MODEL="${SPECIALIST_AGGREGATOR_MODEL:-}"
 SPECIALIST_PASS_TIMEOUT_SEC="${SPECIALIST_PASS_TIMEOUT_SEC:-600}"
 SPECIALIST_MAX_TOKENS="${SPECIALIST_MAX_TOKENS:-4096}"
 SPECIALIST_RECOVERY_MAX_TOKENS="${SPECIALIST_RECOVERY_MAX_TOKENS:-2048}"
+SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS="${SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS-}"
+SPECIALIST_DELEGATED_SUMMARY_MAX_SOURCE_BYTES="${SPECIALIST_DELEGATED_SUMMARY_MAX_SOURCE_BYTES-}"
 SPECIALIST_MAX_CONVERSATION_TOKENS="${SPECIALIST_MAX_CONVERSATION_TOKENS:-96000}"
 SPECIALIST_TEMPERATURE="${SPECIALIST_TEMPERATURE:-0.0}"
 SPECIALIST_STREAM_WATCHDOG="${SPECIALIST_STREAM_WATCHDOG:-true}"
@@ -329,6 +331,18 @@ for _specialist_budget_name in \
   fi
 done
 unset _specialist_budget_name _specialist_budget_value
+
+for _specialist_optional_budget_name in \
+  SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS \
+  SPECIALIST_DELEGATED_SUMMARY_MAX_SOURCE_BYTES; do
+  _specialist_optional_budget_value="${!_specialist_optional_budget_name}"
+  if [[ -n "$_specialist_optional_budget_value" \
+        && ! "$_specialist_optional_budget_value" =~ ^[1-9][0-9]*$ ]]; then
+    error "Invalid ${_specialist_optional_budget_name} '${_specialist_optional_budget_value}'; expected empty or a positive integer"
+    exit 1
+  fi
+done
+unset _specialist_optional_budget_name _specialist_optional_budget_value
 
 if [[ "$REVIEW_STRATEGY" != "single" ]]; then
   if ! SPECIALIST_PHASE_SHARES="$SPECIALIST_PHASE_SHARES" python3 - <<'PY'
