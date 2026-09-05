@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Read-only tool executors for the tool harness (#304 split).
 
-The model-plannable tools (read_file, git_*, gh_api, web_fetch, web_search,
+The model-plannable tools (read_file, read_remote_file, git_*, gh_api, web_fetch, web_search,
 web_fetch_search_result, run_command) plus the path/host guards and
 result-shaping helpers they need.
 Split out of scripts/run_tool_harness.py with no behaviour change.
 """
 
+import base64
+import binascii
 import json
 import re
 import subprocess
@@ -53,6 +55,7 @@ ALLOWED_COMMANDS = {
     "git_diff_name_only": ["git", "diff", "--name-only", "HEAD"],
 }
 _GIT_OBJECT_ID_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
+_REMOTE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 def _truncate_utf8(text, max_bytes, marker="\n[truncated]"):
@@ -369,11 +372,155 @@ def gh_api(endpoint, allowed_repos, current_repo, request_timeout=25):
     transport; this shim exists only for backward compatibility with
     call sites that import the function from this module.
     """
+    # Preserve the existing repository authorization result before applying
+    # the narrower file-content rule. This keeps denied-repository requests
+    # observable as typed access requests instead of disguising them as a
+    # generic endpoint rejection.
+    from pr_reviewer.platform import _validate_endpoint
+    validated = _validate_endpoint(endpoint, allowed_repos, current_repo)
+    if "error" in validated:
+        return validated
+    normalized_endpoint = str(validated["full_path"]).lower()
+    if (
+        re.search(r"/(?:contents)(?:/|$)", normalized_endpoint)
+        or "/git/blobs/" in normalized_endpoint
+    ):
+        return {
+            "error": (
+                "gh_api does not read repository files; use read_remote_file "
+                "with an allowlisted repository and immutable ref"
+            )
+        }
     # Imported lazily so this module can still be loaded when the
     # platform seam is unavailable (e.g. in a script-only test that
     # doesn't add the package to sys.path).
     from pr_reviewer.platform import gh_api as _platform_gh_api
     return _platform_gh_api(endpoint, allowed_repos, current_repo, request_timeout)
+
+
+def _remote_repo_allowed(repository, allowed_repos, current_repo):
+    """Validate a remote repository without treating the reviewed repo as remote."""
+    candidate = str(repository or "").strip().strip("/")
+    if not _REMOTE_REPO_RE.fullmatch(candidate):
+        return False, "Remote repository must be an owner/repository name"
+    current = str(current_repo or "").strip().strip("/")
+    if not _REMOTE_REPO_RE.fullmatch(current):
+        return False, "Current repository identity is required for remote access"
+    if candidate.casefold() == current.casefold():
+        return False, "read_remote_file cannot read the current repository"
+    allowed = {
+        str(item or "").strip().strip("/").casefold()
+        for item in (allowed_repos or set())
+    }
+    # Source text is more sensitive than metadata. Unlike generic gh_api,
+    # require an explicitly named repository and never honor its wildcard.
+    if candidate.casefold() not in allowed:
+        return False, f"Repo not allowed: {candidate}"
+    return True, None
+
+
+def _remote_path(path):
+    """Return a safe repository-relative path, or an error string."""
+    value = str(path or "").strip()
+    if not value or "\x00" in value or "\\" in value:
+        return None, "Remote file path must be a non-empty slash-separated path"
+    if value.startswith("/"):
+        return None, "Remote file path must be repository-relative"
+    parts = value.split("/")
+    if any(not part or part in {".", ".."} for part in parts):
+        return None, "Remote file path contains an invalid path segment"
+    if any(char in value for char in "?#"):
+        return None, "Remote file path contains URL query or fragment characters"
+    return value, None
+
+
+def read_remote_file(
+    repository,
+    path,
+    ref,
+    allowed_repos,
+    current_repo,
+    offset=None,
+    limit=None,
+    include_line_numbers=False,
+    request_timeout=25,
+    max_response_bytes=12000,
+):
+    """Read a UTF-8 text file from an explicitly allowlisted remote SHA.
+
+    This is deliberately separate from ``gh_api``: the generic API tool must
+    not expose GitHub's base64 ``contents`` representation, and this helper
+    must never be usable for the repository currently under review.
+    """
+    allowed, err = _remote_repo_allowed(repository, allowed_repos, current_repo)
+    if not allowed:
+        return {"error": err}
+    repository = str(repository or "").strip().strip("/")
+    normalized_path, err = _remote_path(path)
+    if err:
+        return {"error": err}
+    revision = str(ref or "").strip()
+    if not _GIT_OBJECT_ID_RE.fullmatch(revision):
+        return {"error": "Remote file ref must be an immutable commit object ID"}
+    start = _opt_int(offset)
+    count = _opt_int(limit)
+    if start is not None and start < 1:
+        return {"error": "Remote file offset must be at least 1"}
+    if count is not None and not 1 <= count <= 400:
+        return {"error": "Remote file limit must be between 1 and 400 lines"}
+
+    quoted_path = urllib.parse.quote(normalized_path, safe="/:@!$&'()*+,;=-._~")
+    endpoint = f"repos/{repository}/contents/{quoted_path}?ref={revision}"
+    # Route through the shared platform seam after the stricter remote-only
+    # validation above. Generic gh_api deliberately blocks this endpoint.
+    from pr_reviewer.platform import gh_api as _platform_gh_api
+    response = _platform_gh_api(
+        endpoint, {str(repository).strip().strip("/")}, "", request_timeout,
+    )
+    if response.get("error"):
+        return {"error": str(response["error"])}
+    payload = response.get("data")
+    if not isinstance(payload, dict) or payload.get("type") != "file":
+        return {"error": "Remote path is not a single file"}
+    if payload.get("encoding") != "base64" or not isinstance(payload.get("content"), str):
+        return {"error": "Remote file is not available as base64 text content"}
+    try:
+        raw = base64.b64decode("".join(payload["content"].split()), validate=True)
+        content = raw.decode("utf-8")
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return {"error": "Remote file is binary or not valid UTF-8 text"}
+    if any(byte < 32 and byte not in (9, 10, 12, 13) for byte in raw):
+        return {"error": "Remote file is binary or contains unsupported control bytes"}
+
+    lines = content.splitlines(keepends=True)
+    line_start = max((start or 1) - 1, 0)
+    line_end = line_start + count if count is not None else len(lines)
+    selected = lines[line_start:line_end]
+    if include_line_numbers:
+        selected_text = "".join(
+            f"LINE {line_number} | {line}"
+            for line_number, line in enumerate(selected, start=line_start + 1)
+        )
+    else:
+        selected_text = "".join(selected)
+    masked_text, _redaction_count = mask_source_secrets(selected_text)
+    selected_text, byte_truncated = _truncate_utf8(
+        masked_text, max_response_bytes,
+    )
+    has_more = line_end < len(lines) or byte_truncated
+    return {
+        "content": selected_text,
+        "range": {
+            "offset": line_start + 1,
+            "lines": len(selected),
+            "total_lines": len(lines),
+            "truncated": has_more,
+            "has_more": has_more,
+        },
+        "repository": str(repository).strip().strip("/"),
+        "path": normalized_path,
+        "ref": revision,
+    }
 
 def web_fetch(
     url,
@@ -782,6 +929,35 @@ def execute_tool_request(
                 # compacting fits ~25% more real data under max_response_bytes.
                 text = json.dumps(data, separators=(",", ":"))[:max_response_bytes]
             tool_result["result"] = {"response": text}
+
+        elif tool_name == "read_remote_file":
+            repository = args.get("repository", "")
+            path = args.get("path", "")
+            ref = args.get("ref", "")
+            if not repository or not path or not ref:
+                raise ValueError("read_remote_file requires repository, path, and immutable ref")
+            res = read_remote_file(
+                repository,
+                path,
+                ref,
+                allowed_gh_repos,
+                current_repo,
+                _opt_int(args.get("offset")),
+                _opt_int(args.get("limit")),
+                args.get("include_line_numbers") is True,
+                request_timeout,
+                max_response_bytes,
+            )
+            if res.get("error"):
+                raise ValueError(res["error"])
+            content = _source_text(res.get("content", ""), max_response_bytes)
+            tool_result["result"] = {
+                "content": content,
+                "repository": res["repository"],
+                "path": res["path"],
+                "ref": res["ref"],
+                "range": res["range"],
+            }
 
         elif tool_name == "web_fetch":
             url = args.get("url", "")

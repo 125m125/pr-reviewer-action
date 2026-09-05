@@ -816,7 +816,7 @@ _REPOSITORY_ENDPOINT = re.compile(
     r"^repos/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:/.*)?$"
 )
 _COMMIT_ENDPOINT = re.compile(
-    r"^repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/commits/([0-9a-fA-F]{40})$"
+    r"^repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/commits/([0-9a-fA-F]{40,64})$"
 )
 
 

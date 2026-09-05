@@ -125,6 +125,60 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "read_remote_file",
+        "description": (
+            "Read a UTF-8 text file from an explicitly allowlisted remote "
+            "repository at an immutable commit SHA. This tool is only for "
+            "repositories other than the one under review; it rejects the "
+            "current repository, branches/tags, binary files, and unallowlisted "
+            "repositories. Use offset/limit for a bounded line window and "
+            "include_line_numbers when exact remote line references matter. "
+            "Do not use gh_api to read repository contents."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repository": {
+                    "type": "string",
+                    "description": "Allowlisted remote owner/repository name.",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Repository-relative text-file path.",
+                },
+                "ref": {
+                    "type": "string",
+                    "pattern": "^[0-9a-fA-F]{40,64}$",
+                    "description": "Immutable 40–64 character commit object ID.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional 1-based first line to read.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 400,
+                    "description": "Optional number of lines (maximum 400).",
+                },
+                "include_line_numbers": {
+                    "type": "boolean",
+                    "description": "Prefix returned lines with their remote line number.",
+                },
+                "purpose": {
+                    "type": "string",
+                    "description": (
+                        "Why this remote file is needed for the assigned review work. "
+                        "This reason is retained if repository access is denied."
+                    ),
+                },
+            },
+            "required": ["repository", "path", "ref"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "git_log",
         "description": (
             "Read-only recent commit history (oneline: hash date author "

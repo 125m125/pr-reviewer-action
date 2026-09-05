@@ -55,7 +55,10 @@ provider capacity are understood.
   recipe assignments remain isolated.
 - The current-head version-2 policy derives deterministic coverage obligations.
   Recipes record whether work is `coverage`, `dedicated`, or `independent`, so
-  the runtime can account for every selected and omitted obligation.
+  the runtime can account for every selected and omitted obligation. Each
+  specialist's compact assignment brief includes the matched recipe objective
+  and invariants up front; the model does not need a tool call merely to learn
+  what the repository policy expects it to verify.
 - Web access is controlled by the validated policy's `sources` rules. A changed
   policy or allowlist is not trusted until validation succeeds; an invalid
   policy produces a constrained/degraded result rather than broader access.
@@ -533,17 +536,23 @@ re-review label is applied.
 ### Authorize external GitHub repositories separately
 
 The review policy `sources` list controls ordinary HTTPS discovery and fetches;
-it does not authorize the `gh_api` tool. GitHub API access defaults to the
-repository under review. If a changed workflow pins an action or other dependency
-from another repository, explicitly list only the reviewed repositories:
+it does not authorize GitHub repository tools. `gh_api` defaults to metadata for
+the repository under review. If a changed workflow pins an action or other
+dependency from another repository, explicitly list only the reviewed remote
+repositories:
 
 ```yaml
 tool_allowed_gh_api_repos: "125m125/pr-reviewer-action"
 ```
 
-Do not use `*` unless unrestricted repository discovery is an intentional trust
-decision. A repository entry still permits only the action's globally safe,
-read-only endpoint prefixes and denied path segments; response byte caps,
+Do not use `*` unless unrestricted repository metadata access is an intentional
+trust decision. A specifically named repository entry permits safe read-only
+metadata through `gh_api` and UTF-8 source text through `read_remote_file`;
+the wildcard never grants source-text access. The latter requires an exact
+immutable commit SHA, rejects the repository currently under review, and rejects
+binary content. Generic `gh_api` rejects repository-content and Git-blob
+endpoints so base64 payloads never enter the model as accidental source text.
+Use `read_file` or `read_pr_diff` for the current repository. Response byte caps,
 deadlines, and session tool-call budgets remain enforced. Granting an entry does
 not preload that repository, its history, or its full diff into model context.
 

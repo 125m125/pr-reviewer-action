@@ -177,7 +177,7 @@ def _bounded_content(content: str, max_content_bytes: int) -> tuple[str, bool, b
 
 
 _REPOSITORY_SOURCE_TOOLS = frozenset({
-    "read_file", "read_pr_diff", "git_grep", "git_blame",
+    "read_file", "read_pr_diff", "read_remote_file", "git_grep", "git_blame",
 })
 
 
@@ -632,6 +632,12 @@ class EvidenceStore:
         )
         if raw_path is not None:
             source_path = _normalized_path(raw_path)
+            if str(tool).strip() == "read_remote_file":
+                repository = _normalized_path(
+                    sanitized_arguments.get("repository", "")
+                )
+                revision = str(sanitized_arguments.get("ref", "")).strip()
+                source_path = f"@remote/{repository}@{revision}/{source_path}"
         evidence_id = canonical_key
         if status not in _SUCCESS_STATUSES:
             self._failed_attempts += 1

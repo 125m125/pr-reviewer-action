@@ -2101,6 +2101,7 @@ class SpecialistSession:
                     self.state = SessionState.CHECKPOINT
                     return self._snapshot(degraded=True)
         self.state = SessionState.EXPLORING
+        tool_less_continuation_used = False
         while True:
             if self.conversation.approx_tokens() > self.max_context_tokens:
                 return self._checkpoint_and_resume("context-pressure")
@@ -2156,21 +2157,46 @@ class SpecialistSession:
                         )
                     continue
                 checkpoint = self._checkpoint_from_text(turn.content)
-                candidate_change_rejected = any(
-                    item.kind == "candidate-new"
-                    for item in self._last_checkpoint_rejections
-                ) and not (
-                    checkpoint is not None and checkpoint.candidate_finding_ids
-                )
+                checkpoint_change_rejected = bool(self._last_checkpoint_rejections)
                 if (
                     checkpoint is None
-                    or candidate_change_rejected
+                    or checkpoint_change_rejected
                     or _candidate_retention_lost(
                         self._candidate_retention_signal,
                         checkpoint,
                         accounted_candidate_ids=self._accounted_candidate_ids(),
                     )
                 ):
+                    pending_obligations = any(
+                        item.disposition.value == "pending"
+                        for item in self.obligation_assessments.assessments()
+                    )
+                    if (
+                        checkpoint is None
+                        and "{" not in turn.content
+                        and "[" not in turn.content
+                        and pending_obligations
+                        and not tool_less_continuation_used
+                        and self.budget.remaining_model_turns()
+                        > _CHECKPOINT_TURN_RESERVE
+                    ):
+                        streak = self.budget.record_no_progress()
+                        if streak < self.max_no_progress_streak:
+                            cutoff_note = (
+                                "The previous exploration response reached its "
+                                "output limit. "
+                                if str(turn.finish_reason).casefold()
+                                in {"length", "max_tokens"}
+                                else ""
+                            )
+                            self.conversation.add_user(
+                                cutoff_note
+                                + "Exploration is incomplete and tools remain enabled. "
+                                "Call the next required tool now, or return a checkpoint "
+                                "if no further tool work is needed."
+                            )
+                            tool_less_continuation_used = True
+                            continue
                     return self.request_checkpoint(
                         "model-stopped-without-valid-checkpoint",
                     )
@@ -2210,6 +2236,7 @@ class SpecialistSession:
                 return self.request_checkpoint("tool-lease-expired")
             if progressed:
                 self.budget.reset_no_progress_streak("new retained evidence")
+                tool_less_continuation_used = False
             else:
                 streak = self.budget.record_no_progress()
                 if streak >= self.max_no_progress_streak:
@@ -2903,7 +2930,8 @@ class SpecialistSession:
                 continue
             model_purpose = ""
             if name in {
-                "gh_api", "web_fetch", "web_search", "web_fetch_search_result",
+                "gh_api", "read_remote_file", "web_fetch", "web_search",
+                "web_fetch_search_result",
             }:
                 raw_purpose = arguments.pop("purpose", "")
                 if not isinstance(raw_purpose, str):
@@ -3180,7 +3208,7 @@ class SpecialistSession:
         payload = result.get("result")
         if not isinstance(payload, Mapping):
             return
-        if tool_name == "gh_api":
+        if tool_name in {"gh_api", "read_remote_file"}:
             error = str(payload.get("error") or "").strip()
             denied = re.fullmatch(
                 r"Repo not allowed: ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)",
@@ -3188,7 +3216,17 @@ class SpecialistSession:
             )
             if denied is None:
                 return
-            endpoint = str(arguments.get("endpoint") or arguments.get("path") or "")
+            if tool_name == "read_remote_file":
+                repository = str(arguments.get("repository") or "").strip().strip("/")
+                revision = str(arguments.get("ref") or "").strip()
+                endpoint = f"repos/{repository}/commits/{revision}"
+                remote_path = str(arguments.get("path") or "").strip()
+                model_purpose = " ".join(filter(None, (
+                    f"Read remote text file {remote_path} at {revision}.",
+                    model_purpose,
+                )))
+            else:
+                endpoint = str(arguments.get("endpoint") or arguments.get("path") or "")
             for obligation_id in obligation_ids:
                 try:
                     request = repository_access_request(
@@ -3364,19 +3402,17 @@ class SpecialistSession:
             )
         checkpoint_request_start = len(self.conversation.events)
         self.conversation.add_user(self._checkpoint_prompt(reason, disposition))
-        candidate_rejections = tuple(
-            item for item in self._last_checkpoint_rejections
-            if item.kind == "candidate-new"
-        )
-        if candidate_rejections:
+        prior_change_rejections = tuple(self._last_checkpoint_rejections)
+        if prior_change_rejections:
             self.conversation.add_user(
-                "Repair the previous checkpoint's rejected candidate fields "
-                "before continuing. "
+                "Repair the previous checkpoint's rejected changes. The "
+                "checkpoint was otherwise retained; correct only these changes "
+                "while preserving accepted state: "
                 + "; ".join(
                     f"{item.target}: {item.reason}"
-                    for item in candidate_rejections
+                    for item in prior_change_rejections
                 )
-                + ". Every candidate must include severity=blocker, major, or minor."
+                + "."
             )
         checkpoint_schema = (
             _COMPACTING_CHECKPOINT_SCHEMA
@@ -3915,6 +3951,10 @@ class SpecialistSession:
                 evidence_ids.append(record.id)
         evidence_ids = list(dict.fromkeys(evidence_ids))
         unresolved = _strings(raw.get("unresolved"))
+        unresolved_targets = {
+            target for value in unresolved
+            if (target := self.obligation_assessments.canonical_target(value))
+        }
         obligation_updates = raw.get("obligation_updates", [])
         if not isinstance(obligation_updates, list):
             return None
@@ -3960,6 +4000,13 @@ class SpecialistSession:
                 declared_update_targets.add(canonical_target)
                 continue
             declared_update_targets.add(canonical_target)
+            if canonical_target in unresolved_targets:
+                rejections.append(_CheckpointChangeRejection(
+                    "obligation", canonical_target,
+                    "target appears in both unresolved and obligation_updates",
+                    normalized_update,
+                ))
+                continue
             if str(normalized_update.get("disposition") or "") not in {
                 "covered", "not_applicable", "exhausted", "blocked", "unresolved",
             }:
@@ -3974,6 +4021,16 @@ class SpecialistSession:
                     "a concise reason is required", normalized_update,
                 ))
                 continue
+            disposition = str(normalized_update.get("disposition") or "")
+            if disposition in {"covered", "not_applicable"} and _strings(
+                normalized_update.get("next_actions")
+            ):
+                rejections.append(_CheckpointChangeRejection(
+                    "obligation", canonical_target,
+                    f"{disposition} cannot include next_actions",
+                    normalized_update,
+                ))
+                continue
             resolved_evidence_ids = tuple(
                 item for value in _strings(normalized_update.get("evidence_ids"))
                 if (item := _resolve_retained_evidence_id(value, retained)) is not None
@@ -3983,10 +4040,6 @@ class SpecialistSession:
         pending_targets = {
             item.target for item in self.obligation_assessments.assessments()
             if item.disposition.value == "pending"
-        }
-        unresolved_targets = {
-            target for value in unresolved
-            if (target := self.obligation_assessments.canonical_target(value))
         }
         update_targets = {
             target for update, _evidence_ids in prepared_obligation_updates

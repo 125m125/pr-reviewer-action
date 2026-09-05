@@ -869,6 +869,12 @@ def test_assignment_brief_explains_each_owned_obligation(runtime_config):
             risk_tier="high",
             scope=("worker/delivery.py", "tests/test_delivery.py"),
             seed_hints=("worker/delivery.py",),
+            recipe_id="delivery",
+            recipe_objective="Trace delivery from producer through acknowledgement.",
+            recipe_invariants=(
+                "Failed work must not be acknowledged as successful.",
+                "Duplicate delivery must not duplicate persistent effects.",
+            ),
         ),
     )
     topology = {
@@ -896,6 +902,13 @@ def test_assignment_brief_explains_each_owned_obligation(runtime_config):
     assert brief.satisfaction_predicates == (
         "The changed acknowledgement order is traced.",
         "Failure behavior is covered by a test.",
+    )
+    assert brief.recipe_objective == (
+        "Trace delivery from producer through acknowledgement."
+    )
+    assert brief.recipe_invariants == (
+        "Failed work must not be acknowledged as successful.",
+        "Duplicate delivery must not duplicate persistent effects.",
     )
 
 

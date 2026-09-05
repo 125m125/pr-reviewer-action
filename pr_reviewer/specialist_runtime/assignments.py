@@ -41,6 +41,8 @@ class ObligationBrief:
     required_evidence: tuple[str, ...]
     satisfaction_predicates: tuple[str, ...]
     scope: tuple[str, ...]
+    recipe_objective: str = ""
+    recipe_invariants: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -808,6 +810,11 @@ def _obligation_briefs(
                 for value in item.satisfaction_predicates[:12]
             ),
             scope=tuple(item.scope[:32]),
+            recipe_objective=_bounded_text(item.recipe_objective, 600),
+            recipe_invariants=tuple(
+                _bounded_text(value, 240)
+                for value in item.recipe_invariants[:12]
+            ),
         )
         for item in obligations
     )

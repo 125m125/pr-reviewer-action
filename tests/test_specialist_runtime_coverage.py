@@ -370,6 +370,35 @@ def test_matching_recipe_obligation_retains_execution_policy(execution):
     assert recipe_obligation.recipe_execution == execution
 
 
+def test_matching_recipe_obligation_carries_objective_and_invariants():
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy
+
+    policy = ReviewPolicy.minimal(recipes=(RecipePolicy(
+        id="delivery", title="Delivery",
+        objective="Trace delivery through acknowledgement and retry.",
+        invariants=(
+            "Failed work must not be acknowledged as successful.",
+            "Duplicate delivery must not duplicate persistent effects.",
+        ),
+        match={"file_roles_any": ("implementation",)},
+        expected_evidence=("consumer",),
+    ),))
+
+    obligations = derive_obligations(
+        {"changed_files": ["src/main.py"], "file_roles": ["implementation"]}, {}, policy
+    )
+
+    recipe_obligation = next(item for item in obligations if item.recipe_id == "delivery")
+    assert recipe_obligation.recipe_objective == (
+        "Trace delivery through acknowledgement and retry."
+    )
+    assert recipe_obligation.recipe_invariants == (
+        "Failed work must not be acknowledged as successful.",
+        "Duplicate delivery must not duplicate persistent effects.",
+    )
+
+
 def test_recipe_lifecycle_statuses_survive_tuple_materialization():
     from pr_reviewer.specialist_runtime.coverage import CoverageLedger, derive_obligations
     from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy

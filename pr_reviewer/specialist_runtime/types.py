@@ -121,6 +121,8 @@ class CoverageObligation:
     explanation: str = ""
     recipe_id: str | None = None
     recipe_execution: str | None = None
+    recipe_objective: str = ""
+    recipe_invariants: tuple[str, ...] = ()
     requirement_id: str | None = None
     requirement_mode: str = "required"
     mandatory: bool = True

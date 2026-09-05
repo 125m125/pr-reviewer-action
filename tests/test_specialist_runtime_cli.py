@@ -2227,6 +2227,9 @@ def test_specialist_assignment_message_serializes_semantic_brief_and_context(
         risk_tier="high",
         scope=("worker/delivery.py",),
         seed_hints=("worker/delivery.py",),
+        recipe_id="delivery",
+        recipe_objective="Trace delivery through acknowledgement and retry.",
+        recipe_invariants=("Failed work must not be acknowledged as successful.",),
     )
     assignment_item = fallback_assignment_plan(
         (obligation,),
@@ -2273,6 +2276,8 @@ def test_specialist_assignment_message_serializes_semantic_brief_and_context(
             "The acknowledgement ordering is verified.",
         ],
         "scope": ["worker/delivery.py"],
+        "recipe_objective": "Trace delivery through acknowledgement and retry.",
+        "recipe_invariants": ["Failed work must not be acknowledged as successful."],
     }]
     assert payload["changed_context"] == [{
         "path": "worker/delivery.py",

@@ -232,6 +232,14 @@ class ObligationAssessmentLedger:
         error = ""
         if not conclusion:
             error = "a concise reason is required"
+        elif proposed in {
+            ObligationDisposition.COVERED,
+            ObligationDisposition.NOT_APPLICABLE,
+        } and actions:
+            error = (
+                "closed disposition cannot carry next_actions; "
+                "use an empty next_actions array"
+            )
         elif any(item not in records for item in retained_ids):
             error = "proposal references unknown retained evidence"
         elif proposed is ObligationDisposition.COVERED and not retained_ids:

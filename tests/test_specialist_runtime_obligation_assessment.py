@@ -90,6 +90,43 @@ def test_covered_accepts_eligible_subset_and_ignores_supplemental_evidence():
     assert ledger.assessment("O1").evidence_ids == (direct.id,)
 
 
+def test_closed_disposition_rejects_next_actions():
+    for disposition in ("covered", "not_applicable"):
+        ledger = _ledger()
+        store, record = _store_with_path()
+
+        result = ledger.propose(
+            target="O1", disposition=disposition,
+            reason="The changed state closes this obligation.",
+            evidence_ids=(record.id,), next_actions=("Inspect another file.",),
+            evidence=store.snapshot(), eligible=lambda _record, _obligation: True,
+        )
+
+        assert result.accepted is False
+        assert result.reason == (
+            "closed disposition cannot carry next_actions; "
+            "use an empty next_actions array"
+        )
+
+
+def test_open_dispositions_retain_next_actions():
+    for disposition in ("unresolved", "blocked", "exhausted"):
+        ledger = _ledger(risk_tier="high")
+        store, _record = _store_with_path()
+
+        result = ledger.propose(
+            target="O1", disposition=disposition,
+            reason="Additional external evidence is required.",
+            evidence_ids=(), next_actions=("Inspect the external contract.",),
+            evidence=store.snapshot(), eligible=lambda _record, _obligation: True,
+        )
+
+        assert result.accepted is True
+        assert ledger.assessment("O1").next_actions == (
+            "Inspect the external contract.",
+        )
+
+
 def test_unresolved_requires_a_novel_concrete_next_action():
     ledger = _ledger()
     store, _record = _store_with_path()

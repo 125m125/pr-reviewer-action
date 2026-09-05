@@ -164,8 +164,8 @@ def test_source_access_request_preserves_case_normalized_https_scheme():
     assert request.candidate_url == "https://docs.example.com:8443/schema/v1"
 
 
-def test_repository_access_request_derives_exact_revision_and_safe_purpose():
-    revision = "a" * 40
+@pytest.mark.parametrize("revision", ("a" * 40, "b" * 64))
+def test_repository_access_request_derives_exact_revision_and_safe_purpose(revision):
 
     request = repository_access_request(
         f"repos/125m125/pr-reviewer-action/commits/{revision}",

@@ -426,12 +426,31 @@ def test_review_comment_lifecycle_order_and_state(tmp_path):
         "submit",
         "sticky",
     ]
-    assert [call for call in client.calls if call[0] == "submit"][0][2] == "COMMENT"
+    submit = next(call for call in client.calls if call[0] == "submit")
+    assert submit[2] == "COMMENT"
+    assert "Automated specialist review notes. Detailed findings are in managed threads." in submit[3]
     by_fp = {entry["fingerprint"]: entry for entry in state["notes"]}
     assert by_fp["fp-fixed"]["resolution"] == "resolved"
     assert by_fp["fp-line"]["anchor_type"] == "LINE"
     assert by_fp["fp-file"]["anchor_type"] == "FILE"
     assert state["publication_errors"] == []
+
+
+@pytest.mark.parametrize(
+    "notes",
+    [
+        (),
+        (_note("fp-general", file=None, line=None),),
+    ],
+)
+def test_submitted_review_omits_thread_summary_without_review_threads(tmp_path, notes):
+    client = _FakeClient()
+
+    result, _state = _publish(tmp_path, client, notes=notes)
+
+    submit = next(call for call in client.calls if call[0] == "submit")
+    assert "Automated specialist review notes." not in submit[3]
+    assert result["review_completed"] is True
 
 
 def test_publisher_materializes_current_files_once_for_all_notes(tmp_path):

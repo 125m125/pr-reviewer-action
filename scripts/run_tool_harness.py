@@ -52,6 +52,7 @@ from pr_reviewer.tool_executors import (  # noqa: E402
     mask_and_truncate,
     normalize_host,
     read_file,
+    read_remote_file,
     run_command,
     web_fetch,
     web_search,
@@ -372,8 +373,9 @@ def normalize_tool_request(raw_req):
     # Promote known top-level params when "args" wasn't nested.
     for key in (
         "path", "endpoint", "url", "pattern", "command", "query", "result_id",
+        "repository", "ref", "offset", "limit", "include_line_numbers",
     ):
-        if key not in args and isinstance(raw_req.get(key), str):
+        if key not in args and key in raw_req:
             args[key] = raw_req[key]
     # gh_api accepts "path" as an alias for "endpoint".
     if tool_name == "gh_api" and "endpoint" not in args and isinstance(args.get("path"), str):

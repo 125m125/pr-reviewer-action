@@ -607,7 +607,10 @@ def _valid_submitted_review(
         _valid_review_result(value)
         and value.get("state") == expected_state
         and isinstance(value.get("body"), str)
-        and value["body"].startswith(marker + "\n")
+        and (
+            value["body"] == marker
+            or value["body"].startswith(marker + "\n")
+        )
     )
 
 
@@ -1931,8 +1934,13 @@ class GitHubReviewPublisher:
                 self.client.submit_review,
                 review_id,
                 event,
-                review_marker + "\n"
-                "Automated specialist review notes. Detailed findings are in managed threads.",
+                review_marker
+                + (
+                    "\nAutomated specialist review notes. "
+                    "Detailed findings are in managed threads."
+                    if new_thread_notes
+                    else ""
+                ),
             )
             if submitted is not None and not _valid_submitted_review(
                 submitted, review_marker, expected_review_state

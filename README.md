@@ -470,7 +470,7 @@ for the complete schema, source-rule boundaries, and conversion checklist.
 | `tool_planning_max_context_bytes` | Maximum corpus bytes passed to planning | No | `50000` |
 | `tool_planning_max_tokens` | Maximum completion tokens for tool harness planning call | No | `400` |
 | `tool_max_response_bytes` | Maximum bytes captured from each tool response | No | `12000` |
-| `tool_allowed_gh_api_repos` | Comma-separated owner/repo allowlist for `gh_api`; use `*` to allow any repo endpoint still permitted by the tool path allowlist (empty = current repo only) | No | `""` |
+| `tool_allowed_gh_api_repos` | Comma-separated owner/repo allowlist for `gh_api` metadata and `read_remote_file` text reads. `read_remote_file` requires an explicitly named other repository plus an immutable commit SHA; it rejects both the repository under review and the `*` wildcard. `*` broadens metadata-only `gh_api` access while retaining endpoint guards (empty = current-repo `gh_api` metadata only) | No | `""` |
 | `tool_request_timeout_sec` | Timeout in seconds for each tool execution request | No | `20` |
 | `search_url` | Search-engine endpoint (e.g. a SearXNG `/search` URL) that enables the read-only `web_search` tool in the native tool loop. When set, the model can search for a page and then `web_fetch` the best result; empty leaves `web_search` un-advertised. The model supplies only the query — the host is fixed by this setting. Subject to the same fork gating as the rest of the tool harness | No | `""` |
 | `allow_private_search_url` | Explicitly allow the configured `search_url` to use private HTTP(S) endpoints and non-standard ports; intended for trusted self-hosted runners and still subject to fork gating | No | `false` |
@@ -728,6 +728,9 @@ Before synthesis and verdict, older tool results are compacted while recent evid
 
 - `gh_api` with a repo-local path like `repos/owner/repo/pulls/123/files`
 - `read_file` for files inside the checked-out repository
+- `read_remote_file` for UTF-8 text in an explicitly allowlisted *other*
+  repository at an immutable commit SHA; generic `gh_api` does not return file
+  contents or Git blobs
 - `web_fetch` for allowlisted hosts from `allowed_source_hosts`
 - `git_grep` for local repository content search
 - `run_command` for a fixed catalog of named read-only commands
@@ -1182,7 +1185,7 @@ Example `.github/ai-review-diff-priorities.json`:
 - Tool harness output is appended to the review corpus under `Tool Harness Findings`.
 - Tool harness planning treats corpus content as untrusted data and uses strict tool/path/host allowlists with output redaction. The `run_command` tool does not execute arbitrary shell text; it accepts only named read-only command definitions (`git_status_short`, `git_diff_stat`, `git_diff_name_only`) and runs them argv-only without `bash -lc`.
 - Evidence providers and tool harness are both disabled by default on cross-repository PRs (`*_enable_for_forks=false`).
-- `gh_api` defaults to current-repo scope only. Use `tool_allowed_gh_api_repos` to allow specific upstream repos, or `*` to allow any repository while keeping the path denylist and endpoint allowlist active.
+- `gh_api` defaults to current-repo metadata only. Use `tool_allowed_gh_api_repos` to allow specific upstream repositories. A specifically named entry also enables `read_remote_file`, which decodes only UTF-8 text at an immutable commit and refuses the repository under review. Generic `gh_api` rejects file-content and Git-blob endpoints. `*` broadens metadata access only and never grants remote source-text access.
 - For local models, reduce `tool_planning_max_context_bytes` and `tool_planning_max_tokens`, and increase `tool_planning_timeout_sec` as needed.
 - Set `tool_failure_enforcement=true` to fail closed when tool harness planning fails or when every tool request fails.
 - Use `tool_min_successful_requests` (for example `1`) to enforce a minimum successful tool-evidence threshold when the planner attempted tool requests.

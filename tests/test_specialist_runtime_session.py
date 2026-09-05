@@ -2378,6 +2378,7 @@ def test_exploration_budget_is_enforced_without_wire_budget_notes():
 def test_invalid_exploration_stop_forces_checkpoint_before_later_finalization():
     gateway = ScriptedGateway([
         invalid_response("plain-text conclusion"),
+        invalid_response("I still need to inspect the external contract."),
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
     ])
     session = make_session(gateway)
@@ -2387,8 +2388,31 @@ def test_invalid_exploration_stop_forces_checkpoint_before_later_finalization():
 
     assert checkpoint.state.value == "checkpoint"
     assert final.state.value == "complete"
-    assert [request.tools_enabled for request in gateway.requests] == [True, False]
-    assert gateway.requests[1].messages_contain("Checkpoint requested (not a final report)")
+    assert [request.tools_enabled for request in gateway.requests] == [True, True, False]
+    assert gateway.requests[1].messages_contain(
+        "Call the next required tool now, or return a checkpoint"
+    )
+    assert gateway.requests[2].messages_contain("Checkpoint requested (not a final report)")
+
+
+def test_length_cutoff_gets_one_tools_enabled_continuation_before_checkpoint():
+    cutoff = invalid_response("I need to inspect the downstream caller next.")
+    cutoff = ModelTurnResult(**{
+        **cutoff.__dict__, "finish_reason": "length",
+    })
+    gateway = ScriptedGateway([
+        cutoff,
+        invalid_response("No tool call was emitted."),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+
+    result = make_session(gateway).explore()
+
+    assert result.degraded is False
+    assert [request.tools_enabled for request in gateway.requests] == [True, True, False]
+    assert gateway.requests[1].messages_contain(
+        "previous exploration response reached its output limit"
+    )
 
 
 def test_finalization_closes_from_valid_checkpoint_without_model_call():
@@ -2838,6 +2862,75 @@ def test_checkpoint_partially_accepts_obligations_and_repairs_only_rejections():
     assert "Correction result" in receipt
     assert "O1 remains unresolved" in receipt
     assert "O2" in receipt and "blocked" in receipt
+
+
+def test_checkpoint_repairs_only_obligation_declared_updated_and_unresolved():
+    initial = checkpoint_response(
+        inspected=[], unresolved=["O1"],
+        obligation_updates=[
+            {
+                "target": "O1", "disposition": "covered",
+                "reason": "The implementation was inspected.",
+                "evidence_ids": [], "next_actions": [],
+            },
+            {
+                "target": "O2", "disposition": "blocked",
+                "reason": "The external fixture is unavailable.",
+                "evidence_ids": [], "next_actions": ["Obtain the fixture."],
+            },
+        ],
+    )
+    correction = ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "unresolved": ["O1"], "obligation_updates": [],
+            "candidate_updates": [], "new_candidates": [],
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    gateway = ScriptedGateway([initial, correction])
+    session = make_session(gateway)
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert len(gateway.requests) == 2
+    correction_prompt = json.loads(gateway.requests[1].messages)[-1]["content"]
+    assert (
+        "O1 rejected: target appears in both unresolved and obligation_updates"
+        in correction_prompt
+    )
+    assert "O2 rejected" not in correction_prompt
+    assert session.obligation_assessments.assessment("O2").disposition.value == (
+        "blocked"
+    )
+
+
+def test_checkpoint_rejects_terminal_obligation_update_with_next_actions():
+    initial = checkpoint_response(
+        inspected=[], unresolved=["O2"],
+        obligation_updates=[{
+            "target": "O1", "disposition": "covered",
+            "reason": "The implementation was inspected.",
+            "evidence_ids": [],
+            "next_actions": ["Verify the remaining external contract."],
+        }],
+    )
+    correction = ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "unresolved": ["O1"], "obligation_updates": [],
+            "candidate_updates": [], "new_candidates": [],
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    gateway = ScriptedGateway([initial, correction])
+
+    result = make_session(gateway).request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    correction_prompt = json.loads(gateway.requests[1].messages)[-1]["content"]
+    assert "O1 rejected: covered cannot include next_actions" in correction_prompt
 
 
 def test_checkpoint_partially_accepts_candidates_and_repairs_only_rejected_draft():
@@ -3417,7 +3510,7 @@ def test_candidate_words_with_unrelated_braces_are_not_retention_material():
 
 def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract():
     gateway = ScriptedGateway([
-        invalid_response("plain-text material issue"),
+        invalid_response('{"new_candidates": [{"claim": "material issue"}'),
         invalid_response('{"evidence_ids":["a.py"]}'),
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
     ])
@@ -4408,13 +4501,14 @@ def test_checkpoint_request_includes_compact_schema_contract():
     """The checkpoint user message describes required keys and candidate retention."""
     gateway = ScriptedGateway([
         invalid_response("plain-text conclusion"),
+        invalid_response("No further tool work was performed."),
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
     ])
     session = make_session(gateway)
 
     session.explore()
 
-    checkpoint_request = json.loads(gateway.requests[1].messages)[-1]["content"]
+    checkpoint_request = json.loads(gateway.requests[2].messages)[-1]["content"]
     assert "Required keys:" in checkpoint_request
     assert '"unresolved"' in checkpoint_request
     assert '"candidate_finding_ids"' not in checkpoint_request
@@ -4423,7 +4517,7 @@ def test_checkpoint_request_includes_compact_schema_contract():
     assert "Use the controller C# handles" in checkpoint_request
     assert (
         "evidence_by_obligation"
-        not in gateway.requests[1].response_schema["properties"]
+        not in gateway.requests[2].response_schema["properties"]
     )
 
 
@@ -4445,7 +4539,7 @@ def test_truncated_empty_candidate_checkpoint_is_not_a_material_retention_signal
 def test_malformed_checkpoint_is_repaired_before_projection():
     """One malformed structured checkpoint receives one bounded repair request."""
     gateway = ScriptedGateway([
-        invalid_response("plain-text conclusion"),
+        invalid_response('{"working_summary":'),
         invalid_response("still-malformed"),
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
     ])
@@ -4774,7 +4868,7 @@ def test_partial_candidate_retention_repairs_only_the_rejected_candidate():
         mixed_checkpoint,
         repaired,
     ])
-    session = make_session(gateway, model_turns=5)
+    session = make_session(gateway, model_turns=6)
 
     result = session.explore()
 
@@ -4782,13 +4876,10 @@ def test_partial_candidate_retention_repairs_only_the_rejected_candidate():
     assert result.degraded is False
     assert "candidate-retention-unknown" not in result.checkpoint.unknowns
     assert len(gateway.requests) == 4
-    assert any(
-        request.response_schema is not None
-        and set(request.response_schema["properties"]) == {
-            "unresolved", "obligation_updates", "candidate_updates", "new_candidates",
-        }
-        for request in gateway.requests
-    )
+    assert gateway.requests[-1].response_schema is not None
+    assert set(gateway.requests[-1].response_schema["required"]) >= {
+        "unresolved", "obligation_updates", "candidate_updates", "new_candidates",
+    }
 
 
 def test_hanging_specialist_gateways_share_global_orphan_cap():
@@ -5133,6 +5224,47 @@ def test_denied_gh_api_repo_creates_durable_repository_access_request():
     assert request.revision == revision
     assert request.obligation_id == "OB-code"
     assert "ghp_" not in request.model_purpose
+
+
+def test_denied_remote_file_creates_revision_bound_repository_access_request():
+    seen = []
+    revision = "b" * 40
+
+    def execute_tool(name, arguments, **kwargs):
+        seen.append((name, arguments, kwargs))
+        return {
+            "tool": name,
+            "status": "error",
+            "result": {"error": "Repo not allowed: vendor/action"},
+        }
+
+    session = make_session(ScriptedGateway([]), execute_tool=execute_tool)
+    session._execute_calls(({
+        "id": "remote-1",
+        "name": "read_remote_file",
+        "arguments": json.dumps({
+            "repository": "vendor/action",
+            "path": "action.yml",
+            "ref": revision,
+            "purpose": "Verify permissions required by the pinned action",
+            "targets": ["O1"],
+        }),
+    },))
+
+    assert seen[0][1] == {
+        "repository": "vendor/action",
+        "path": "action.yml",
+        "ref": revision,
+    }
+    assert len(session.source_access_requests) == 1
+    request = session.source_access_requests[0]
+    assert request.repository == "vendor/action"
+    assert request.revision == revision
+    assert request.obligation_id == "OB-code"
+    assert request.model_purpose == (
+        f"Read remote text file action.yml at {revision}. Verify permissions "
+        "required by the pinned action"
+    )
 
 
 @pytest.mark.parametrize("error", (
