@@ -56,7 +56,10 @@ from pr_reviewer.tool_executors import (  # noqa: E402
     web_fetch,
     web_search,
 )
-from pr_reviewer.specialist_runtime.web_evidence import SourcePolicy  # noqa: E402
+from pr_reviewer.specialist_runtime.web_evidence import (  # noqa: E402
+    SearchResultRegistry,
+    SourcePolicy,
+)
 from pr_reviewer.specialist_runtime.policy import load_review_policy  # noqa: E402
 
 
@@ -367,7 +370,9 @@ def normalize_tool_request(raw_req):
     if not isinstance(args, dict):
         args = {}
     # Promote known top-level params when "args" wasn't nested.
-    for key in ("path", "endpoint", "url", "pattern", "command", "query"):
+    for key in (
+        "path", "endpoint", "url", "pattern", "command", "query", "result_id",
+    ):
         if key not in args and isinstance(raw_req.get(key), str):
             args[key] = raw_req[key]
     # gh_api accepts "path" as an alias for "endpoint".
@@ -576,6 +581,7 @@ def run_native_loop(
     source_policy = load_current_source_policy(
         workspace_root, os.getenv("SPECIALIST_CONFIG_FILE", "").strip()
     )
+    search_result_registry = SearchResultRegistry()
     tool_schemas = web_tool_schemas(
         search_url, source_policy, allow_private_search_url,
     )
@@ -683,8 +689,8 @@ def run_native_loop(
         f"{', '.join(sorted(allowed_gh_api_repos)) if allowed_gh_api_repos else '(none)'}\n"
         f"Current-policy sources for web_fetch: "
         f"{', '.join(rule.host for rule in source_policy.rules) if source_policy.rules else '(none)'}\n"
-        + ("web_search is available for discovery only; web_fetch an approved "
-           "result before relying on it as evidence.\n"
+        + ("web_search is available for discovery only; fetch an approved "
+           "result with its advertised fetch method before relying on it as evidence.\n"
            if search_url and source_policy.has_approved_sources else "")
         + "\nGather the evidence needed to review this PR corpus:\n\n"
     )
@@ -800,6 +806,7 @@ def run_native_loop(
             max_search_results,
             source_policy=source_policy,
             allow_private_search_url=allow_private_search_url,
+            search_result_registry=search_result_registry,
         )
 
     # Result summarization between rounds (#197 §2): when the conversation

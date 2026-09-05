@@ -448,7 +448,9 @@ def _required_tools(capability: str) -> frozenset[str]:
         "none": frozenset(),
         "repository": frozenset({"read_file", "read_pr_diff", "git_grep"}),
         "tests": frozenset({"read_test_results"}),
-        "web": frozenset({"web_search", "web_fetch"}),
+        "web": frozenset({
+            "web_search", "web_fetch", "web_fetch_search_result",
+        }),
     }.get(capability, frozenset({"__unsupported__"}))
 
 

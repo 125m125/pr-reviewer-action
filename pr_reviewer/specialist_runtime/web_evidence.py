@@ -65,6 +65,34 @@ class SearchCandidate:
     path: str = ""
     classification: str | None = None
     denial_reason: str | None = None
+    result_id: str | None = None
+
+
+class SearchResultRegistry:
+    """Session-local mapping for fetchable search URLs hidden from the model."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._urls: dict[str, str] = {}
+        self._ids: dict[str, str] = {}
+
+    def register(self, url: str) -> str:
+        canonical = str(url).strip()
+        with self._lock:
+            result_id = self._ids.get(canonical)
+            if result_id is None:
+                result_id = f"search-result-{len(self._urls) + 1}"
+                self._urls[result_id] = canonical
+                self._ids[canonical] = result_id
+            return result_id
+
+    def resolve(self, result_id: str) -> str:
+        key = str(result_id or "").strip()
+        with self._lock:
+            url = self._urls.get(key)
+        if url is None:
+            raise SourceDenied("unknown search result ID for this session")
+        return url
 
 
 class SearchProvider(Protocol):
@@ -263,14 +291,20 @@ class SearchDiscovery:
 
     def as_dict(self) -> dict[str, object]:
         def approved(candidate: SearchCandidate) -> dict[str, object]:
-            return {
+            result = {
                 "title": candidate.title,
-                "url": candidate.url,
                 "host": candidate.host,
                 "path": candidate.path,
                 "snippet": candidate.snippet,
                 "classification": candidate.classification,
+                "fetch_allowed": True,
+                "fetch_method": "result_id" if candidate.result_id else "url",
             }
+            if candidate.result_id:
+                result["result_id"] = candidate.result_id
+            else:
+                result["url"] = candidate.url
+            return result
 
         def unapproved(candidate: SearchCandidate) -> dict[str, object]:
             # Deliberately omit the provider snippet and title: neither came
@@ -280,6 +314,7 @@ class SearchDiscovery:
                 "host": candidate.host,
                 "path": candidate.path,
                 "denial_reason": candidate.denial_reason,
+                "fetch_allowed": False,
             }
 
         return {
@@ -392,7 +427,7 @@ class SourcePolicy:
     def has_approved_sources(self) -> bool:
         return bool(self.rules)
 
-    def classify(self, url: str) -> SourceDecision:
+    def classify(self, url: str, *, allow_opaque: bool = False) -> SourceDecision:
         try:
             parsed = urlsplit(str(url).strip())
             port = parsed.port
@@ -422,7 +457,10 @@ class SourcePolicy:
         payload = f"{path}?{query_payload}"
         if mask_secrets(payload) != payload or _CREDENTIAL_QUERY_RE.search(query_payload):
             return SourceDecision(False, host, path, reason="unsafe credential-like URL payload")
-        if any(_looks_high_entropy(token) for token in _TOKEN_RE.findall(payload)):
+        if not allow_opaque and any(
+            _looks_high_entropy_url_token(token)
+            for token in _TOKEN_RE.findall(payload)
+        ):
             return SourceDecision(False, host, path, reason="unsafe high-entropy URL payload")
         canonical_url = urlunsplit((
             "https",
@@ -581,7 +619,10 @@ def _safe_discovery_url(url: str) -> tuple[str, str, str]:
         bool(path_error)
         or len(path) > 300
         or mask_secrets(path) != path
-        or any(_looks_high_entropy(token) for token in _TOKEN_RE.findall(path))
+        or any(
+            _looks_high_entropy_url_token(token)
+            for token in _TOKEN_RE.findall(path)
+        )
     )
     safe_path = "/[REDACTED]" if suspicious else _encode_path(path)[:300]
     netloc = f"[{host}]" if ":" in host else host
@@ -590,8 +631,32 @@ def _safe_discovery_url(url: str) -> tuple[str, str, str]:
     return f"https://{netloc}{safe_path}", host, safe_path
 
 
+def opaque_reference_url(url: str) -> str:
+    """Return provenance that identifies the host without exposing URL payload."""
+    try:
+        host = _normalize_hostname(urlsplit(str(url)).hostname)
+    except ValueError:
+        host = ""
+    return f"https://{host}/[opaque-search-result]" if host else "[opaque-search-result]"
+
+
+def _redact_opaque_url_content(text: str, *urls: str) -> str:
+    redacted = text
+    for url in urls:
+        redacted = redacted.replace(url, "[OPAQUE_SEARCH_RESULT_URL]")
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            continue
+        for token in re.split(r"[/&=?]", f"{parsed.path}?{parsed.query}"):
+            if _looks_high_entropy(token):
+                redacted = redacted.replace(token, "[OPAQUE_URL_TOKEN]")
+    return redacted
+
+
 _CREDENTIAL_QUERY_RE = re.compile(
-    r"(?i)(?:authorization\s*:|bearer\s+|(?:api[_-]?key|access[_-]?token|password|secret|token)\s*[=:])"
+    r"(?i)(?:authorization\s*:|bearer\s+|(?:api[_-]?key|access[_-]?token|"
+    r"password|secret|token|signature|sig|credential)\s*[=:])"
 )
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_+/=-]{32,}")
 
@@ -610,6 +675,19 @@ def _looks_high_entropy(token: str) -> bool:
     # lowercase base36 tokens, uppercase tokens, and hexadecimal hashes are all
     # common.  Length, symbol diversity, and measured entropy form the boundary.
     return len(token) >= 32 and len(set(token)) >= 12 and _entropy(token) >= 3.5
+
+
+_WORD_LIKE_PATH_SEGMENT_RE = re.compile(r"[a-z]{1,20}(?:-[a-z]{1,20})*")
+
+
+def _looks_high_entropy_url_token(token: str) -> bool:
+    """Keep natural documentation slugs while rejecting opaque URL tokens."""
+    segments = tuple(item for item in token.strip("/").split("/") if item)
+    if segments and all(
+        _WORD_LIKE_PATH_SEGMENT_RE.fullmatch(item) for item in segments
+    ):
+        return False
+    return _looks_high_entropy(token)
 
 
 def _validated_query(query: str) -> str:
@@ -634,6 +712,7 @@ def discover(
     *,
     search_scan_limit: int = DEFAULT_SEARCH_SCAN_LIMIT,
     tool_max_search_results: int = DEFAULT_MAX_SEARCH_RESULTS,
+    result_registry: SearchResultRegistry | None = None,
 ) -> SearchDiscovery:
     if search_scan_limit <= 0 or tool_max_search_results <= 0:
         raise ValueError("search result limits must be positive")
@@ -643,7 +722,6 @@ def discover(
     ]
     approved: list[SearchCandidate] = []
     unapproved: list[SearchCandidate] = []
-    suppressed = 0
     for candidate in candidates:
         decision = source_policy.classify(candidate.url)
         if decision.approved:
@@ -658,12 +736,38 @@ def discover(
                 path=decision.path,
                 classification=decision.classification,
                 denial_reason=None,
+                result_id=None,
             )
-            if len(approved) < tool_max_search_results:
-                approved.append(normalized)
-            else:
-                suppressed += 1
+            approved.append(normalized)
         else:
+            opaque_decision = None
+            if (
+                result_registry is not None
+                and decision.reason == "unsafe high-entropy URL payload"
+            ):
+                opaque_decision = source_policy.classify(
+                    candidate.url, allow_opaque=True,
+                )
+            if (
+                opaque_decision is not None
+                and opaque_decision.approved
+                and opaque_decision.canonical_url
+            ):
+                _, _, safe_path = _safe_discovery_url(candidate.url)
+                title, _ = mask_and_truncate(str(candidate.title or ""), 300)
+                snippet, _ = mask_and_truncate(str(candidate.snippet or ""), 500)
+                approved.append(SearchCandidate(
+                    title=title,
+                    url="",
+                    snippet=snippet,
+                    host=opaque_decision.host,
+                    path=safe_path,
+                    classification=opaque_decision.classification,
+                    result_id=result_registry.register(
+                        opaque_decision.canonical_url,
+                    ),
+                ))
+                continue
             # Never retain provider-controlled content for unapproved sources.
             safe_url, safe_host, safe_path = _safe_discovery_url(candidate.url)
             unapproved.append(SearchCandidate(
@@ -674,6 +778,10 @@ def discover(
                 path=safe_path,
                 denial_reason=decision.reason,
             ))
+    approved = approved[:tool_max_search_results]
+    remaining = tool_max_search_results - len(approved)
+    unapproved = unapproved[:remaining]
+    suppressed = len(candidates) - len(approved) - len(unapproved)
     return SearchDiscovery(
         redacted_query=clean_query,
         approved=tuple(approved),
@@ -1171,6 +1279,10 @@ class SecureFetcher:
         session_id: str = "web-fetch",
         model_identity: str = "",
         deadline_at: float | None = None,
+        allow_opaque_url: bool = False,
+        public_reference: str | None = None,
+        evidence_tool: str = "web_fetch",
+        evidence_arguments: Mapping[str, object] | None = None,
     ) -> FetchedEvidence:
         original_url = str(url).strip()
         current_url = original_url
@@ -1180,7 +1292,9 @@ class SecureFetcher:
         final_decision: SourceDecision | None = None
         response: HttpResponse | None = None
         for redirect_count in range(self.max_redirects + 1):
-            decision = self.policy.classify(current_url)
+            decision = self.policy.classify(
+                current_url, allow_opaque=allow_opaque_url,
+            )
             if not decision.approved:
                 boundary = "redirect" if redirect_count else "source"
                 raise SourceDenied(f"{boundary} denied: {decision.reason}")
@@ -1240,15 +1354,23 @@ class SecureFetcher:
             parser.feed(text)
             parser.close()
             text = parser.text()
+        if public_reference is not None:
+            text = _redact_opaque_url_content(text, original_url, current_url)
         bounded, normalized_truncated = mask_and_truncate(text, self.max_bytes)
         truncated = raw_truncated or normalized_truncated
         content_hash = hashlib.sha256(bounded.encode("utf-8")).hexdigest()
+        public_original_url = public_reference or original_url
+        public_final_url = (
+            opaque_reference_url(current_url)
+            if public_reference is not None
+            else current_url
+        )
         provenance = EvidenceProvenance(
             policy_hash=self.policy.policy_hash,
             policy_rule_id=final_decision.rule_id,
             source_classification=final_decision.classification,
-            original_url=original_url,
-            final_url=current_url,
+            original_url=public_original_url,
+            final_url=public_final_url,
             retrieved_at=float(self.clock()),
             max_age_hours=final_decision.max_age_hours,
         )
@@ -1256,12 +1378,12 @@ class SecureFetcher:
         if self.evidence_store is not None:
             record = self.evidence_store.add_tool_result(
                 session_id=session_id,
-                tool="web_fetch",
-                arguments={"url": original_url},
+                tool=evidence_tool,
+                arguments=dict(evidence_arguments or {"url": original_url}),
                 result={"status": "ok", "content": bounded},
                 category="external-source",
                 model_identity=model_identity,
-                source=current_url,
+                source=public_final_url,
                 mime_type=mime_type,
                 provenance=provenance,
                 now=provenance.retrieved_at,

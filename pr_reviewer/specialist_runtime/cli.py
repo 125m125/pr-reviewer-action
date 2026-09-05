@@ -53,7 +53,12 @@ from .session import (
 )
 from .test_results import load_test_results
 from .types import BudgetLimits, ReviewHandoff, ReviewNote, ReviewNoteKind
-from .web_evidence import SecureFetcher, SearxngSearchProvider, SourcePolicy
+from .web_evidence import (
+    SearchResultRegistry,
+    SecureFetcher,
+    SearxngSearchProvider,
+    SourcePolicy,
+)
 
 
 _DEFAULT_POLICY = ".github/ai-review-policy.json"
@@ -1093,6 +1098,7 @@ def build_controller(
             assignment,
             change_overview=change_overview,
         ))
+        search_result_registry = SearchResultRegistry()
         def execute(
             name: str,
             arguments: dict[str, Any],
@@ -1147,6 +1153,7 @@ def build_controller(
                 base_sha=immutable_diff_range[0] if immutable_diff_range else None,
                 head_sha=immutable_diff_range[1] if immutable_diff_range else None,
                 allowed_diff_paths=allowed_diff_paths,
+                search_result_registry=search_result_registry,
             )
 
         return SpecialistSession(
@@ -2267,12 +2274,15 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
         critic_action_text = " (" + ", ".join(
             f"{key}={value}" for key, value in sorted(critic_actions.items())
         ) + ")"
+    detail_note_count = sum(
+        note.kind is not ReviewNoteKind.SOURCE_ACCESS_REQUEST for note in notes
+    )
     summary_lines = [
         "# Specialist review",
         "",
         f"- Evaluation: `{artifact.get('evaluation_status', 'degraded')}`",
         f"- Verdict: `{result.verdict}` (`{result.verdict_source}`)",
-        f"- Review notes: {len(notes)}",
+        f"- Detail review notes: {detail_note_count}",
         f"- Publishing ready: `{str(result.publishing_ready).lower()}`",
         f"- Assignment plan: `{plan_source}` (repaired: `{planner_repaired}`)",
         "- Candidates: submitted "

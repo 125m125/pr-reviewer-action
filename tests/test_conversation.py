@@ -13,6 +13,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 from pr_reviewer.conversation import (  # noqa: E402
     APPROX_BYTES_PER_TOKEN,
     TOOL_SCHEMAS,
+    WEB_FETCH_SEARCH_RESULT_SCHEMA,
     WEB_SEARCH_SCHEMA,
     Conversation,
     normalize_assistant_tool_calls_openai,
@@ -64,10 +65,15 @@ class TestToolSchemas:
 
     def test_external_access_tools_accept_optional_bounded_purpose(self):
         schemas = {
-            item["name"]: item for item in (*TOOL_SCHEMAS, WEB_SEARCH_SCHEMA)
+            item["name"]: item
+            for item in (
+                *TOOL_SCHEMAS, WEB_SEARCH_SCHEMA, WEB_FETCH_SEARCH_RESULT_SCHEMA,
+            )
         }
 
-        for name in ("gh_api", "web_fetch", "web_search"):
+        for name in (
+            "gh_api", "web_fetch", "web_search", "web_fetch_search_result",
+        ):
             purpose = schemas[name]["parameters"]["properties"]["purpose"]
             assert purpose["type"] == "string"
             assert purpose["maxLength"] == 300

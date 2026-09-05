@@ -146,6 +146,7 @@ def test_web_policy_replay_keeps_discovery_non_evidentiary_and_denies_redirect_e
         "host": "evil.example.net",
         "path": "/leaked",
         "denial_reason": "source is not allowlisted by current policy",
+        "fetch_allowed": False,
     }
     assert "UNAPPROVED-SNIPPET-MUST-STAY-HIDDEN" not in serialized
     assert "REDIRECT-ESCAPE-BODY-MUST-STAY-HIDDEN" not in serialized

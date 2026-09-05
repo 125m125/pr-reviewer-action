@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import random
 import string
 import threading
@@ -17,6 +18,7 @@ from pr_reviewer.specialist_runtime.web_evidence import (
     HttpRequest,
     HttpResponse,
     SearchCandidate,
+    SearchResultRegistry,
     SearxngSearchProvider,
     SecureFetcher,
     SourceDenied,
@@ -59,6 +61,24 @@ def test_search_returns_snippets_only_for_approved_sources():
     assert result.unapproved[0].host == "blog.invalid"
     assert result.unapproved[0].snippet is None
     assert "unapproved content" not in result.to_tool_result()
+    assert result.as_dict()["approved"][0]["fetch_allowed"] is True
+    assert result.as_dict()["unapproved"][0]["fetch_allowed"] is False
+
+
+def test_search_provider_cannot_invent_an_opaque_result_handle():
+    result = discover(
+        "api behavior",
+        FakeSearchProvider([SearchCandidate(
+            "Official", "https://docs.example.com/api", "trusted snippet",
+            result_id="search-result-999",
+        )]),
+        source_policy(),
+        result_registry=SearchResultRegistry(),
+    ).as_dict()["approved"][0]
+
+    assert result["fetch_method"] == "url"
+    assert result["url"] == "https://docs.example.com/api"
+    assert "result_id" not in result
 
 
 def test_unapproved_candidate_creates_request_without_fetching():
@@ -198,6 +218,40 @@ def test_discovery_scans_bounded_results_and_caps_approved_output():
     assert result.suppressed_result_count == 2
 
 
+def test_discovery_caps_unapproved_output_with_the_public_result_limit():
+    provider = FakeSearchProvider([
+        SearchCandidate(str(index), f"https://blog{index}.invalid/post", "snippet")
+        for index in range(6)
+    ])
+
+    result = discover(
+        "release support", provider, source_policy(),
+        search_scan_limit=6, tool_max_search_results=2,
+    )
+
+    assert len(result.approved) == 0
+    assert len(result.unapproved) == 2
+    assert result.suppressed_result_count == 4
+
+
+def test_discovery_prioritizes_approved_results_over_denied_metadata():
+    provider = FakeSearchProvider([
+        SearchCandidate("Blog", "https://blog.invalid/post", "untrusted"),
+        SearchCandidate("Official", "https://docs.example.com/api", "trusted"),
+    ])
+
+    result = discover(
+        "release support", provider, source_policy(),
+        search_scan_limit=2, tool_max_search_results=1,
+    )
+
+    assert [item.url for item in result.approved] == [
+        "https://docs.example.com/api"
+    ]
+    assert result.unapproved == ()
+    assert result.suppressed_result_count == 1
+
+
 def test_source_policy_requires_explicit_subdomain_and_path_match():
     exact = source_policy(SourceRule(
         host="example.com", path_prefixes=("/docs",), classification="documentation"
@@ -211,6 +265,20 @@ def test_source_policy_requires_explicit_subdomain_and_path_match():
     assert exact.classify("https://api.example.com/docs/api").approved is False
     assert exact.classify("https://example.com/docs-evil").approved is False
     assert subdomains.classify("https://api.example.com/docs/api").approved is True
+
+
+def test_source_policy_accepts_word_like_documentation_slugs():
+    policy = source_policy(SourceRule(
+        host="docs.github.com", path_prefixes=("/en/actions",),
+        classification="official-github-documentation",
+    ))
+
+    decision = policy.classify(
+        "https://docs.github.com/en/actions/how-tos/customize-your-workflow/"
+        "save-workflow-data-as-an-artifact"
+    )
+
+    assert decision.approved is True
 
 
 @pytest.mark.parametrize("encoded_parent", ["%2e%2e", "%252e%252e"])
@@ -283,6 +351,53 @@ def test_entropy_detection_is_independent_of_alphabet_composition(token):
     ).unapproved[0]
     assert token not in denied.path
     assert denied.path == "/[REDACTED]"
+
+
+def test_allowlisted_opaque_search_result_uses_session_handle_without_exposing_url():
+    token = "0123456789abcdef" * 4
+    url = f"https://docs.example.com/api/{token}?page=2&cursor={token}"
+    registry = SearchResultRegistry()
+
+    discovery = discover(
+        "api behavior",
+        FakeSearchProvider([SearchCandidate("Official docs", url, "trusted snippet")]),
+        source_policy(),
+        result_registry=registry,
+    )
+    payload = discovery.as_dict()
+
+    assert len(payload["approved"]) == 1
+    candidate = payload["approved"][0]
+    assert candidate["result_id"] == "search-result-1"
+    assert candidate["fetch_method"] == "result_id"
+    assert candidate["fetch_allowed"] is True
+    assert candidate["snippet"] == "trusted snippet"
+    assert "url" not in candidate
+    assert token not in json.dumps(payload)
+    assert registry.resolve("search-result-1") == url
+
+
+@pytest.mark.parametrize("query", (
+    "token=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "X-Amz-Signature=" + "a" * 64,
+))
+def test_credential_bearing_search_result_never_receives_fetch_handle(query):
+    registry = SearchResultRegistry()
+    url = f"https://docs.example.com/api?{query}"
+
+    discovery = discover(
+        "api behavior",
+        FakeSearchProvider([SearchCandidate("Private link", url, "do not retain")]),
+        source_policy(),
+        result_registry=registry,
+    )
+    payload = discovery.as_dict()
+
+    assert payload["approved"] == []
+    assert payload["unapproved"][0]["fetch_allowed"] is False
+    assert "result_id" not in payload["unapproved"][0]
+    with pytest.raises(SourceDenied, match="unknown search result"):
+        registry.resolve("search-result-1")
 
 
 def test_discovery_rejects_overlong_query():

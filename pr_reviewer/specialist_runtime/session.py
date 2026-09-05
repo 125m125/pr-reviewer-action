@@ -2902,7 +2902,9 @@ class SpecialistSession:
                 )
                 continue
             model_purpose = ""
-            if name in {"gh_api", "web_fetch", "web_search"}:
+            if name in {
+                "gh_api", "web_fetch", "web_search", "web_fetch_search_result",
+            }:
                 raw_purpose = arguments.pop("purpose", "")
                 if not isinstance(raw_purpose, str):
                     self.budget.record_tool_rejection("invalid tool purpose")
@@ -3208,37 +3210,30 @@ class SpecialistSession:
                 retained[key] for key in sorted(retained)
             )
             return
-        if tool_name != "web_search" or str(
-            result.get("status", "")
-        ).lower() not in {"ok", "success", "completed"}:
+        if tool_name != "web_fetch":
             return
-        unapproved = payload.get("unapproved")
-        if not isinstance(unapproved, list):
+        error = str(payload.get("error") or "").strip()
+        if error != "source denied: source is not allowlisted by current policy":
             return
-        for raw in unapproved:
-            if not isinstance(raw, Mapping):
+        candidate = SearchCandidate(
+            title=None,
+            snippet=None,
+            url=str(arguments.get("url") or ""),
+            denial_reason="source is not allowlisted by current policy",
+        )
+        for obligation_id in obligation_ids:
+            try:
+                request = source_access_request(
+                    candidate,
+                    obligation_id,
+                    "Retrieve the selected authoritative source to verify the "
+                    "assigned review obligation.",
+                    candidate.denial_reason,
+                    model_purpose,
+                )
+            except ValueError:
                 continue
-            candidate = SearchCandidate(
-                title=None,
-                snippet=None,
-                url=str(raw.get("url") or ""),
-                host=str(raw.get("host") or ""),
-                path=str(raw.get("path") or ""),
-                denial_reason=str(raw.get("denial_reason") or ""),
-            )
-            for obligation_id in obligation_ids:
-                try:
-                    request = source_access_request(
-                        candidate,
-                        obligation_id,
-                        "Retrieve the discovered source to verify the assigned "
-                        "review obligation.",
-                        candidate.denial_reason or "source policy did not approve it",
-                        model_purpose,
-                    )
-                except ValueError:
-                    continue
-                retained[self._source_access_request_key(request)] = request
+            retained.setdefault(self._source_access_request_key(request), request)
         self.source_access_requests = tuple(
             retained[key] for key in sorted(retained)
         )
@@ -3247,6 +3242,11 @@ class SpecialistSession:
     def _source_access_request_key(
         item: SourceAccessRequest | RepositoryAccessRequest,
     ) -> tuple[str, ...]:
+        if isinstance(item, SourceAccessRequest):
+            research_question = " ".join(
+                (item.model_purpose or item.purpose).casefold().split()
+            )
+            return "source-research", item.obligation_id, research_question
         return access_request_identity(item)
 
     def _associate_collection(

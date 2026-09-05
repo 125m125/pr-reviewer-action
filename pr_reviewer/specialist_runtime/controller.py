@@ -92,6 +92,7 @@ from .types import (
     ObligationStatus,
     ReviewHandoff,
     ReviewNote,
+    ReviewNoteKind,
     RunPhase,
 )
 from .web_evidence import (
@@ -4286,8 +4287,12 @@ class ReviewController:
             *relationship_topics,
             *unresolved_topics,
         )))[:3]
+        detail_notes = tuple(
+            note for note in state.notes
+            if note.kind is not ReviewNoteKind.SOURCE_ACCESS_REQUEST
+        )
         prepared_finding_severities = tuple(
-            note.severity for note in state.notes
+            note.severity for note in detail_notes
             if note.severity in {"info", "minor", "major", "blocker"}
         )
 
@@ -4377,7 +4382,7 @@ class ReviewController:
             specialist_topics=specialist_topics,
             recipe_ids=recipe_ids,
             coverage_boundary_topics=coverage_boundary_topics,
-            unresolved_thread_count=len(state.notes),
+            unresolved_thread_count=len(detail_notes),
             highest_thread_severity=max(
                 prepared_finding_severities, default=None,
                 key=lambda value: {"info": 0, "minor": 1, "major": 2, "blocker": 3}.get(value, 0),
@@ -4932,10 +4937,11 @@ class ReviewController:
                         "component_ids": context.component_ids,
                     },
                     "prepared_notes": {
-                        "count": len(state.notes),
+                        "count": context.unresolved_thread_count,
                         "themes": tuple(sorted({
                             note.severity or note.kind.value
                             for note in state.notes
+                            if note.kind is not ReviewNoteKind.SOURCE_ACCESS_REQUEST
                         })),
                     },
                     "human_focus_facts": context.human_focus,

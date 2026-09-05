@@ -2,7 +2,8 @@
 """Read-only tool executors for the tool harness (#304 split).
 
 The model-plannable tools (read_file, git_*, gh_api, web_fetch, web_search,
-run_command) plus the path/host guards and result-shaping helpers they need.
+web_fetch_search_result, run_command) plus the path/host guards and
+result-shaping helpers they need.
 Split out of scripts/run_tool_harness.py with no behaviour change.
 """
 
@@ -29,10 +30,12 @@ from redact import mask_and_truncate, mask_secrets, mask_source_secrets  # noqa:
 from pr_reviewer.platform import GH_DENY_SUBSTRINGS  # noqa: E402
 from pr_reviewer.specialist_runtime.web_evidence import (  # noqa: E402
     SearchProvider,
+    SearchResultRegistry,
     SecureFetcher,
     SearxngSearchProvider,
     SourcePolicy,
     discover,
+    opaque_reference_url,
 )
 
 
@@ -383,6 +386,10 @@ def web_fetch(
     session_id="tool-harness",
     model_identity="",
     deadline_at=None,
+    allow_opaque_url=False,
+    public_reference=None,
+    evidence_tool="web_fetch",
+    evidence_arguments=None,
 ):
     """Retrieve typed evidence through the redirect- and DNS-safe boundary."""
     try:
@@ -395,6 +402,10 @@ def web_fetch(
             session_id=session_id,
             model_identity=model_identity,
             deadline_at=deadline_at,
+            allow_opaque_url=allow_opaque_url,
+            public_reference=public_reference,
+            evidence_tool=evidence_tool,
+            evidence_arguments=evidence_arguments,
         ).as_dict()
     except Exception as exc:
         return {"error": str(exc)}
@@ -409,6 +420,7 @@ def web_search(
     provider: SearchProvider | None = None,
     search_scan_limit=25,
     allow_private_search_url=False,
+    search_result_registry: SearchResultRegistry | None = None,
 ):
     """Return policy-filtered discovery metadata, never raw search output."""
     if not search_url:
@@ -426,6 +438,7 @@ def web_search(
             policy,
             search_scan_limit=search_scan_limit,
             tool_max_search_results=max_results,
+            result_registry=search_result_registry,
         ).as_dict()
     except Exception as exc:
         return {"error": str(exc)}
@@ -522,6 +535,7 @@ def execute_tool_request(
     head_sha=None,
     allowed_diff_paths=(),
     allow_private_search_url=False,
+    search_result_registry=None,
 ):
     """Execute a single tool request and return the result dict.
 
@@ -809,6 +823,7 @@ def execute_tool_request(
                 provider=search_provider,
                 search_scan_limit=search_scan_limit,
                 allow_private_search_url=allow_private_search_url,
+                search_result_registry=search_result_registry,
             )
             if res.get("error"):
                 raise ValueError(res["error"])
@@ -816,6 +831,39 @@ def execute_tool_request(
             if len(encoded.encode("utf-8")) > max_response_bytes:
                 raise ValueError("Filtered search discovery exceeds tool response limit")
             tool_result["result"] = res
+
+        elif tool_name == "web_fetch_search_result":
+            result_id = args.get("result_id", "")
+            if not result_id:
+                raise ValueError("Missing 'result_id' argument")
+            if search_result_registry is None:
+                raise ValueError("search result registry is unavailable")
+            url = search_result_registry.resolve(result_id)
+            res = web_fetch(
+                url,
+                allowed_hosts,
+                request_timeout,
+                source_policy=source_policy,
+                secure_fetcher=secure_fetcher,
+                evidence_store=evidence_store,
+                session_id=session_id,
+                model_identity=model_identity,
+                deadline_at=deadline_at,
+                allow_opaque_url=True,
+                public_reference=opaque_reference_url(url),
+                evidence_tool="web_fetch_search_result",
+                evidence_arguments={"result_id": result_id},
+            )
+            if res.get("error"):
+                raise ValueError(res["error"])
+            content_text, truncated = mask_and_truncate(
+                res.get("content", ""), max_response_bytes
+            )
+            tool_result["result"] = {
+                **res,
+                "content": content_text,
+                "truncated": bool(res.get("truncated")) or truncated,
+            }
 
         elif tool_name == "run_command":
             command = args.get("command", "")

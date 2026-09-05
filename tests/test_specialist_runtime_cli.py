@@ -768,6 +768,8 @@ def test_cli_writes_structured_handoff_notes_artifact_and_compatibility_output(
     assert controller.inputs.head_sha == "h" * 40
     assert controller.inputs.changed_files == ("src/app.py",)
     summary = (tmp_path / "specialist-review-summary.md").read_text()
+    assert "- Detail review notes: 1" in summary
+    assert "- Review notes:" not in summary
     assert "- Assignment plan: `deterministic_fallback` (repaired: `false`)" in summary
     assert "| planner | invalid \\| plan \\#\\#\\# injected heading " in summary
     assert "\n### injected heading" not in summary

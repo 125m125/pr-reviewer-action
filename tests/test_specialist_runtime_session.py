@@ -4982,22 +4982,30 @@ def test_model_cannot_self_declare_evidence_category():
     assert dict(result.checkpoint.obligation_statuses)["OB-code"].value != "covered"
 
 
-def test_denied_discovery_creates_durable_source_access_request():
+def test_denied_discovery_requires_one_explicit_fetch_for_access_request():
     def execute_tool(name, arguments, **kwargs):
-        assert name == "web_search"
+        if name == "web_search":
+            return {
+                "tool": name,
+                "status": "ok",
+                "result": {
+                    "kind": "search_discovery",
+                    "approved": [],
+                    "unapproved": [{
+                        "url": "https://docs.example.com/private",
+                        "host": "docs.example.com",
+                        "path": "/private",
+                        "denial_reason": "source is not allowlisted by current policy",
+                    }],
+                    "evidentiary": False,
+                },
+            }
+        assert name == "web_fetch"
         return {
             "tool": name,
-            "status": "ok",
+            "status": "error",
             "result": {
-                "kind": "search_discovery",
-                "approved": [],
-                "unapproved": [{
-                    "url": "https://docs.example.com/private",
-                    "host": "docs.example.com",
-                    "path": "/private",
-                    "denial_reason": "host not approved",
-                }],
-                "evidentiary": False,
+                "error": "source denied: source is not allowlisted by current policy"
             },
         }
 
@@ -5005,6 +5013,14 @@ def test_denied_discovery_creates_durable_source_access_request():
         tool_call_response(
             "web_search",
             {"query": "API behavior", "obligation_ids": ["OB-code"]},
+        ),
+        tool_call_response(
+            "web_fetch",
+            {
+                "url": "https://docs.example.com/private",
+                "purpose": "Verify the external API contract",
+                "obligation_ids": ["OB-code"],
+            },
         ),
         checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
     ])
@@ -5017,6 +5033,68 @@ def test_denied_discovery_creates_durable_source_access_request():
     assert request.host == "docs.example.com"
     assert request.candidate_url == "https://docs.example.com/private"
     assert request.obligation_id == "OB-code"
+    assert request.model_purpose == "Verify the external API contract"
+
+
+def test_unsafe_or_failed_fetch_does_not_create_access_request():
+    errors = iter((
+        "source denied: unsafe high-entropy URL payload",
+        "secure fetch returned HTTP 404",
+    ))
+
+    def execute_tool(name, arguments, **kwargs):
+        return {
+            "tool": name, "status": "error",
+            "result": {"error": next(errors)},
+        }
+
+    session = make_session(ScriptedGateway([]), execute_tool=execute_tool)
+    for index, url in enumerate((
+        "https://docs.example.com/" + "a" * 64,
+        "https://docs.example.com/missing",
+    )):
+        session._execute_calls(({
+            "id": f"web-{index}",
+            "name": "web_fetch",
+            "arguments": json.dumps({
+                "url": url,
+                "purpose": "Verify the external API contract",
+                "targets": ["O1"],
+            }),
+        },))
+
+    assert session.source_access_requests == ()
+
+
+def test_repeated_denied_fetches_for_one_question_keep_one_access_request():
+    def execute_tool(name, arguments, **kwargs):
+        return {
+            "tool": name,
+            "status": "error",
+            "result": {
+                "error": "source denied: source is not allowlisted by current policy"
+            },
+        }
+
+    session = make_session(ScriptedGateway([]), execute_tool=execute_tool)
+    for index, url in enumerate((
+        "https://official.example/reference",
+        "https://blog.example/explanation",
+    )):
+        session._execute_calls(({
+            "id": f"denied-{index}",
+            "name": "web_fetch",
+            "arguments": json.dumps({
+                "url": url,
+                "purpose": "Verify the external API contract",
+                "targets": ["O1"],
+            }),
+        },))
+
+    assert len(session.source_access_requests) == 1
+    assert session.source_access_requests[0].candidate_url == (
+        "https://official.example/reference"
+    )
 
 
 def test_denied_gh_api_repo_creates_durable_repository_access_request():

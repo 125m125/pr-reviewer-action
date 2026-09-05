@@ -5500,6 +5500,10 @@ def test_controller_retains_and_emits_typed_source_access_requests(tmp_path):
 
     assert result.artifact["source_access_requests"][0]["host"] == "docs.example.com"
     assert any(event.kind == "source_access_request" for event in result.events)
+    assert result.handoff.thread_status == (
+        "1 detail review note prepared for publication; "
+        "highest proposed finding severity: minor."
+    )
 
 
 def test_controller_retains_repository_access_request_in_artifact_and_event(tmp_path):

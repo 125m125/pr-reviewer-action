@@ -185,7 +185,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "release/compare page (HTML often 404s or is JS-rendered): for "
             "github.com use gh_api; for a Gitea/Forgejo host fetch its "
             "/api/v1/... JSON (e.g. .../releases/tags/TAG or "
-            ".../compare/BASE...HEAD), not the web page."
+            ".../compare/BASE...HEAD), not the web page. Do not probe URLs "
+            "marked fetch_allowed=false by web_search. If external access is "
+            "materially necessary, select at most one clearly authoritative "
+            "unapproved result; that denied fetch records a human access "
+            "request instead of retrieving content."
         ),
         "parameters": {
             "type": "object",
@@ -303,16 +307,20 @@ SPECIALIST_PR_DIFF_SCHEMA: dict[str, Any] = {
 }
 
 # Opt-in tool: advertised only when a search endpoint is configured (see
-# run_native_loop). web_fetch needs the exact URL up front; web_search lets a
-# weaker model DISCOVER the right URL (e.g. a moved docs site) and then
-# web_fetch it — the two-step that closes multi-hop verification chains.
+# run_native_loop). web_search lets a weaker model discover the right source;
+# it then uses web_fetch for a visible URL or web_fetch_search_result when the
+# controller hid an opaque URL payload.
 WEB_SEARCH_SCHEMA: dict[str, Any] = {
     "name": "web_search",
     "description": (
         "Discover URLs through the action's fixed search provider. Search is "
         "not evidence: approved-source results may include bounded snippets, "
-        "while unapproved results contain metadata only. Use web_fetch on an "
-        "approved result before relying on it for any claim."
+        "while unapproved results contain metadata only. Every result states "
+        "fetch_allowed and its fetch_method. Use web_fetch for a visible URL "
+        "or web_fetch_search_result for an opaque result ID before relying on "
+        "it. Never probe unavailable alternatives; request access only for at "
+        "most one result that appears to be an authoritative primary source "
+        "and is materially necessary."
     ),
     "parameters": {
         "type": "object",
@@ -331,6 +339,37 @@ WEB_SEARCH_SCHEMA: dict[str, Any] = {
             },
         },
         "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+
+
+WEB_FETCH_SEARCH_RESULT_SCHEMA: dict[str, Any] = {
+    "name": "web_fetch_search_result",
+    "description": (
+        "Fetch one approved web_search result whose URL was hidden because it "
+        "contained an opaque path or query value. Pass only the result_id "
+        "returned by web_search. The controller resolves the session-scoped "
+        "URL, preserves safe navigation parameters, revalidates every redirect, "
+        "and keeps the hidden URL out of model context and artifacts."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "result_id": {
+                "type": "string",
+                "description": "Opaque session-scoped ID returned by web_search.",
+            },
+            "purpose": {
+                "type": "string",
+                "maxLength": 300,
+                "description": (
+                    "Optional concise reason for the lookup. This is untrusted "
+                    "explanatory context, not authorization."
+                ),
+            },
+        },
+        "required": ["result_id"],
         "additionalProperties": False,
     },
 }
@@ -355,7 +394,7 @@ def web_tool_schemas(
         str(search_url or "").strip(),
         allow_private_search_url=allow_private_search_url,
     ):
-        schemas.append(WEB_SEARCH_SCHEMA)
+        schemas.extend((WEB_SEARCH_SCHEMA, WEB_FETCH_SEARCH_RESULT_SCHEMA))
     return schemas
 
 # Per-tool result cap applied when re-adding tool output to the conversation
