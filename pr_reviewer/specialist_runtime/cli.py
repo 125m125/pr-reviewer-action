@@ -1817,6 +1817,15 @@ def _summary_cell(value: object, *, limit: int = 240) -> str:
     )
 
 
+def _junit_summary_artifact(report: Mapping[str, object]) -> str:
+    raw_artifact = str(report.get("artifact") or "").strip()
+    raw_name = str(report.get("name") or "JUnit").strip()
+    if not raw_artifact:
+        marker = raw_name.casefold().find(".zip:")
+        raw_artifact = raw_name[:marker + 4] if marker >= 0 else raw_name
+    return _summary_cell(raw_artifact, limit=160)
+
+
 def _runtime_event_line(
     event: RunEvent,
     *,
@@ -2374,21 +2383,34 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
             report for report in reports
             if isinstance(report, Mapping)
             and isinstance(report.get("statistics"), Mapping)
-        )[:12] if isinstance(reports, list) else ()
+        ) if isinstance(reports, list) else ()
         if report_rows:
+            grouped: dict[str, dict[str, int]] = {}
+            for report in report_rows:
+                source_artifact = _junit_summary_artifact(report)
+                group = grouped.setdefault(source_artifact, {
+                    "reports": 0, "total": 0, "indexed": 0,
+                    "passed": 0, "failed": 0, "skipped": 0, "errored": 0,
+                })
+                stats = report["statistics"]
+                group["reports"] += 1
+                for key in ("total", "indexed", "passed", "failed", "skipped", "errored"):
+                    try:
+                        group[key] += max(0, int(stats.get(key, 0) or 0))
+                    except (TypeError, ValueError):
+                        continue
             summary_lines.extend((
                 "", "## CI test evidence", "",
-                "| Source report | Total | Indexed | Passed | Failed | Skipped | Errors |",
-                "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+                "| Source artifact | Reports | Total | Indexed | Passed | Failed | Skipped | Errors |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ))
-            for report in report_rows:
-                stats = report["statistics"]
+            for source_artifact, group_stats in tuple(grouped.items())[:12]:
                 summary_lines.append(
-                    "| " + _summary_cell(report.get("name", "JUnit"), limit=160)
+                    "| " + source_artifact
                     + " | " + " | ".join(
-                        str(stats.get(key, 0))
+                        str(group_stats.get(key, 0))
                         for key in (
-                            "total", "indexed", "passed", "failed", "skipped", "errored",
+                            "reports", "total", "indexed", "passed", "failed", "skipped", "errored",
                         )
                     ) + " |"
                 )

@@ -836,7 +836,59 @@ def test_cli_summary_reports_junit_sources_and_counts(monkeypatch, tmp_path):
 
     summary = (tmp_path / "specialist-review-summary.md").read_text()
     assert "3 tests from 2 JUnit reports; 1 failed; 3 indexed" in summary
-    assert "| junit\\.zip:python/pytest\\.xml | 2 | 2 | 1 | 1 | 0 | 0 |" in summary
+    assert "| junit\\.zip | 1 | 2 | 2 | 1 | 1 | 0 | 0 |" in summary
+
+
+def test_cli_summary_groups_junit_members_by_source_archive(monkeypatch, tmp_path):
+    write_review_workspace(tmp_path)
+    manifest = tmp_path / "test-results.json"
+    manifest.write_text(json.dumps({
+        "repository": "owner/repo", "head_sha": "h" * 40,
+        "statistics": {
+            "source_reports": 3, "total": 6, "indexed": 6,
+            "passed": 4, "failed": 1, "skipped": 1, "errored": 0,
+        },
+        "reports": [
+            {
+                "name": "junit.zip:java/TestClassA.xml", "tests": [],
+                "statistics": {
+                    "total": 2, "indexed": 2, "passed": 2,
+                    "failed": 0, "skipped": 0, "errored": 0,
+                },
+            },
+            {
+                "name": "junit.zip:java/TestClassB.xml", "tests": [],
+                "statistics": {
+                    "total": 3, "indexed": 3, "passed": 2,
+                    "failed": 1, "skipped": 0, "errored": 0,
+                },
+            },
+            {
+                "name": "pytest.xml", "tests": [],
+                "statistics": {
+                    "total": 1, "indexed": 1, "passed": 0,
+                    "failed": 0, "skipped": 1, "errored": 0,
+                },
+            },
+        ],
+    }), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REVIEW_STRATEGY", "specialists")
+    monkeypatch.setenv("REPO", "owner/repo")
+    monkeypatch.setenv("SPECIALIST_TEST_RESULTS_FILE", "test-results.json")
+    monkeypatch.setattr(cli, "_git_changed_files", lambda *_: ("src/app.py",))
+    monkeypatch.setattr(
+        cli, "build_controller", lambda config, **_kwargs: ScriptedController(tmp_path)
+    )
+
+    assert cli.main() == 0
+
+    summary = (tmp_path / "specialist-review-summary.md").read_text()
+    assert "| Source artifact | Reports | Total | Indexed | Passed | Failed | Skipped | Errors |" in summary
+    assert "| junit\\.zip | 2 | 5 | 5 | 4 | 1 | 0 | 0 |" in summary
+    assert "| pytest\\.xml | 1 | 1 | 1 | 0 | 0 | 1 | 0 |" in summary
+    assert "junit\\.zip:java/TestClassA.xml" not in summary
+    assert "junit\\.zip:java/TestClassB.xml" not in summary
 
 
 def test_degradation_summary_exposes_specialist_root_causes_without_model_dump():
