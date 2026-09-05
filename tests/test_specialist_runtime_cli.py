@@ -1114,6 +1114,8 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
     from pr_reviewer.specialist_runtime.coverage import CoverageLedger
     from pr_reviewer.specialist_runtime.evidence import EvidenceStore
 
+    assert isinstance(controller._evidence_store_factory(), EvidenceStore)
+
     session = controller._cli_session_factory(
         Assignment(
             id="a", title="A", objective="Review", obligation_ids=(),
