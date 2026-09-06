@@ -1437,8 +1437,11 @@ class SpecialistSession:
                 schemas.append({
                     "name": DELEGATE_TOOL_SUMMARY_NAME,
                     "description": (
-                        "Run one existing read-only evidence tool against a large "
-                        "reference source and return only a focused, bounded summary. "
+                        "Fetch a large reference source and answer a focused side "
+                        "question without putting the full result into your conversation. "
+                        "Specify the read-only tool and arguments needed to retrieve it; "
+                        "no prior fetch is required. The controller retrieves and retains "
+                        "the source, then returns a bounded summary and extracted excerpts. "
                         "Use this for side questions or large web/remote-file sources, "
                         "not to outsource the main changed-code investigation, infer "
                         "exact changed-line locations, or replace direct evidence for a "

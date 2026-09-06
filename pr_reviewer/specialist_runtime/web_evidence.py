@@ -457,11 +457,6 @@ class SourcePolicy:
         payload = f"{path}?{query_payload}"
         if mask_secrets(payload) != payload or _CREDENTIAL_QUERY_RE.search(query_payload):
             return SourceDecision(False, host, path, reason="unsafe credential-like URL payload")
-        if not allow_opaque and any(
-            _looks_high_entropy_url_token(token)
-            for token in _TOKEN_RE.findall(payload)
-        ):
-            return SourceDecision(False, host, path, reason="unsafe high-entropy URL payload")
         canonical_url = urlunsplit((
             "https",
             host,
@@ -480,6 +475,11 @@ class SourcePolicy:
                 for prefix in rule.path_prefixes
             ):
                 continue
+            if not allow_opaque and (
+                _looks_high_entropy_url_token(path)
+                or any(_looks_high_entropy(token) for token in _TOKEN_RE.findall(query_payload))
+            ):
+                return SourceDecision(False, host, path, reason="unsafe high-entropy URL payload")
             return SourceDecision(
                 True,
                 host,
@@ -619,10 +619,7 @@ def _safe_discovery_url(url: str) -> tuple[str, str, str]:
         bool(path_error)
         or len(path) > 300
         or mask_secrets(path) != path
-        or any(
-            _looks_high_entropy_url_token(token)
-            for token in _TOKEN_RE.findall(path)
-        )
+        or _looks_high_entropy_url_token(path)
     )
     safe_path = "/[REDACTED]" if suspicious else _encode_path(path)[:300]
     netloc = f"[{host}]" if ":" in host else host
@@ -677,17 +674,17 @@ def _looks_high_entropy(token: str) -> bool:
     return len(token) >= 32 and len(set(token)) >= 12 and _entropy(token) >= 3.5
 
 
-_WORD_LIKE_PATH_SEGMENT_RE = re.compile(r"[a-z]{1,20}(?:-[a-z]{1,20})*")
+_WORD_LIKE_PATH_SEGMENT_RE = re.compile(r"[A-Za-z]{1,20}(?:[-_.][A-Za-z]{1,20})*")
 
 
 def _looks_high_entropy_url_token(token: str) -> bool:
     """Keep natural documentation slugs while rejecting opaque URL tokens."""
     segments = tuple(item for item in token.strip("/").split("/") if item)
-    if segments and all(
-        _WORD_LIKE_PATH_SEGMENT_RE.fullmatch(item) for item in segments
-    ):
-        return False
-    return _looks_high_entropy(token)
+    return any(
+        not _WORD_LIKE_PATH_SEGMENT_RE.fullmatch(segment)
+        and any(_looks_high_entropy(value) for value in _TOKEN_RE.findall(segment))
+        for segment in segments
+    )
 
 
 def _validated_query(query: str) -> str:

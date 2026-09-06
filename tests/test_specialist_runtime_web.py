@@ -267,18 +267,40 @@ def test_source_policy_requires_explicit_subdomain_and_path_match():
     assert subdomains.classify("https://api.example.com/docs/api").approved is True
 
 
-def test_source_policy_accepts_word_like_documentation_slugs():
+@pytest.mark.parametrize("path", [
+    "/en/actions/how-tos/customize-your-workflow/save-workflow-data-as-an-artifact",
+    "/en/actions/writing-workflows/choosing-what-your-workflow-does/permissions-for-the-github_token",
+    "/en/actions/using-jobs/assigning-permissions-to-jobs",
+    "/en/actions/security-guides/automatic-token-authentication",
+    "/en/actions/reference/README.md",
+])
+def test_source_policy_accepts_word_like_documentation_slugs(path):
     policy = source_policy(SourceRule(
         host="docs.github.com", path_prefixes=("/en/actions",),
         classification="official-github-documentation",
     ))
 
-    decision = policy.classify(
-        "https://docs.github.com/en/actions/how-tos/customize-your-workflow/"
-        "save-workflow-data-as-an-artifact"
-    )
+    decision = policy.classify("https://docs.github.com" + path)
 
     assert decision.approved is True
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.github.com/repos/actions/upload-artifact/contents/README.md",
+    "https://raw.githubusercontent.com/actions/upload-artifact/ea165f8d65b6e75b540449e92b4886f43607fa02/README.md",
+])
+def test_foreign_web_sources_report_allowlist_denial_before_entropy(url):
+    decision = source_policy().classify(url)
+    assert decision.approved is False
+    assert decision.reason == "source is not allowlisted by current policy"
+
+
+def test_query_payload_does_not_receive_documentation_slug_exemption():
+    decision = source_policy().classify(
+        "https://docs.example.com/api?value=" + "abcdefghijklmnopqrstuvwxyz" * 2
+    )
+    assert decision.approved is False
+    assert decision.reason == "unsafe high-entropy URL payload"
 
 
 @pytest.mark.parametrize("encoded_parent", ["%2e%2e", "%252e%252e"])
@@ -497,6 +519,27 @@ def test_secure_fetch_prefers_markdown_then_plain_text_then_html():
     assert accept.index("text/plain") < accept.index("text/html")
     assert result.mime_type == "text/markdown"
     assert result.content == "# API\n\nSupported."
+
+
+def test_documentation_redirect_accepts_underscore_slug_without_relaxing_host_policy():
+    start = "https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs"
+    destination = (
+        "https://docs.github.com/en/actions/writing-workflows/"
+        "choosing-what-your-workflow-does/permissions-for-the-github_token"
+    )
+    transport = FakeHttpTransport({
+        start: HttpResponse(301, {"Location": destination}, b""),
+        destination: HttpResponse(200, {"Content-Type": "text/markdown"}, b"# Permissions"),
+    })
+    policy = source_policy(SourceRule(
+        host="docs.github.com", path_prefixes=("/en/actions",),
+        classification="official-github-documentation",
+    ))
+    result = SecureFetcher(
+        policy, transport=transport, resolver=public_resolver,
+    ).fetch(start)
+    assert result.content == "# Permissions"
+    assert result.provenance.final_url == destination
 
 
 @pytest.mark.parametrize("resolved_ip", [
