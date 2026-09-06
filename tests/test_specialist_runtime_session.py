@@ -692,7 +692,12 @@ def delegated_summary_response(
     )
 
 
-def test_delegated_summary_retains_raw_source_but_returns_only_focused_result():
+@pytest.mark.parametrize("source_range", (
+    {"offset": 1, "lines": 3, "total_lines": 3, "has_more": False, "truncated": False},
+    {"offset": 800, "lines": 3, "total_lines": 1440, "has_more": True, "truncated": True},
+))
+@pytest.mark.parametrize("source_limit", (None, 80))
+def test_delegated_summary_retains_raw_source_but_returns_only_focused_result(source_range, source_limit):
     gateway = ScriptedGateway([delegated_summary_response()])
     executor_calls = []
 
@@ -700,11 +705,15 @@ def test_delegated_summary_retains_raw_source_but_returns_only_focused_result():
         executor_calls.append((name, arguments, kwargs))
         return {
             "tool": name, "status": "ok",
-            "result": {"content": "irrelevant preface\nfeature=true\nirrelevant tail"},
+            "result": {
+                "content": "irrelevant preface\nfeature=true\nirrelevant tail" + " filler" * 20,
+                "range": source_range,
+            },
         }
 
     session = make_session(
         gateway, execute_tool=execute, max_tokens=1024,
+        delegated_summary_max_source_bytes=source_limit,
         tool_schemas=[{
             "name": "read_file", "description": "read",
             "parameters": {"type": "object", "properties": {
@@ -737,11 +746,18 @@ def test_delegated_summary_retains_raw_source_but_returns_only_focused_result():
     records = session.evidence_store.snapshot().records
     assert progressed is True
     assert executor_calls[0][0:2] == ("read_file", {"path": "a.py"})
-    assert executor_calls[0][2]["max_response_bytes"] > 12_000
+    if source_limit is None:
+        assert executor_calls[0][2]["max_response_bytes"] > 12_000
+    else:
+        assert executor_calls[0][2]["max_response_bytes"] == 80
     assert gateway.requests[0].tools_enabled is False
     assert gateway.requests[0].max_tokens == 2048
     assert gateway.requests[0].messages_contain("irrelevant preface")
     assert gateway.requests[0].messages_contain("L000002|feature=true")
+    prompt = json.loads(json.loads(gateway.requests[0].messages)[0]["content"])
+    assert prompt["source_metadata"]["range"] == source_range
+    assert prompt["source_metadata"]["source_truncated"] == source_range["truncated"]
+    assert prompt["source_metadata"]["prompt_truncated"] == (source_limit is not None)
     assert visible["summary"] == "The feature is enabled."
     assert visible["relevant_excerpts"][0]["text"] == "feature=true"
     assert visible["relevant_excerpts"][0]["locator"] == "line 2"
@@ -781,8 +797,25 @@ def test_delegated_summary_repairs_an_invalid_source_range_once():
 
     assert [request.max_tokens for request in gateway.requests] == [2048, 1024]
     assert gateway.requests[1].messages_contain('\\"start_line\\": 99')
+    assert gateway.requests[1].messages_contain("99-99")
+    assert gateway.requests[1].messages_contain("1-1")
     visible = json.loads(session.conversation.events[-1]["content"])
     assert visible["relevant_excerpts"][0]["text"] == "feature=true"
+
+
+def test_delegated_excerpt_repair_reports_inclusive_count_and_keeps_valid_boundary():
+    source = "\n".join(f"line {i}" for i in range(1, 401))
+    parsed, error = SpecialistSession._validated_delegated_summary(
+        delegated_summary_response(start_line=360, end_line=400).text, source,
+    )
+    assert parsed is None
+    assert "360-400 contains 41 lines" in error
+    assert "maximum 40" in error
+    parsed, error = SpecialistSession._validated_delegated_summary(
+        delegated_summary_response(start_line=361, end_line=400).text, source,
+    )
+    assert not error
+    assert parsed["relevant_excerpts"][0]["text"].startswith("line 361\n")
 
 
 def test_delegated_summary_extracts_multiline_text_with_source_line_endings():
