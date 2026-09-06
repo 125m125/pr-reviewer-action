@@ -34,6 +34,7 @@ from .evidence import EvidenceCollection, EvidenceRecord, EvidenceStore
 from .model_gateway import ModelGateway, ModelTurnRequest, ModelTurnResult
 from .obligation_assessment import ObligationAssessmentLedger
 from .request_attempts import RequestAttemptJournal
+from .performance import request_performance
 from .test_results import retain_test_result
 from .types import (
     BudgetUsage,
@@ -1437,8 +1438,11 @@ class SpecialistSession:
                 schemas.append({
                     "name": DELEGATE_TOOL_SUMMARY_NAME,
                     "description": (
-                        "Fetch a large reference source and answer a focused side "
-                        "question without putting the full result into your conversation. "
+                        "Fetch a large reference source and summarize or extract precise "
+                        "information with exact relevant source excerpts, without putting "
+                        "the full result into your conversation. "
+                        "You can request exact input names, defaults, permission "
+                        "requirements, or declarations; this is not limited to prose summaries. "
                         "Specify the read-only tool and arguments needed to retrieve it; "
                         "no prior fetch is required. The controller retrieves and retains "
                         "the source, then returns a bounded summary and extracted excerpts. "
@@ -2146,6 +2150,7 @@ class SpecialistSession:
                 tool_call_count=len(result.tool_calls),
                 actual_prompt_tokens=actual_prompt_tokens,
                 actual_completion_tokens=actual_completion_tokens,
+                **request_performance(result.usage, result.response.get("timings")),
             )
         self._request_events.append(SpecialistRequestEvent(
             request_id, "completed", tools_enabled, schema_name,

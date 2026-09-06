@@ -715,6 +715,13 @@ def test_delegated_summary_retains_raw_source_but_returns_only_focused_result():
     assert DELEGATE_TOOL_SUMMARY_NAME in {
         item["name"] for item in session.conversation.tool_schemas
     }
+    description = next(
+        item["description"] for item in session.conversation.tool_schemas
+        if item["name"] == DELEGATE_TOOL_SUMMARY_NAME
+    )
+    assert "exact relevant source excerpts" in description.split(". ", 1)[0]
+    assert "exact input names, defaults, permission requirements" in description
+    assert "no prior fetch is required" in description
 
     progressed = session._execute_calls(({
         "id": "delegate-1", "name": DELEGATE_TOOL_SUMMARY_NAME,
@@ -2099,6 +2106,45 @@ def test_provider_prompt_usage_calibrates_next_same_mode_admission():
     assert terminal.admission_source == "provider-calibrated"
     assert terminal.actual_prompt_tokens == 8_000
     assert terminal.actual_completion_tokens == 80
+
+
+@pytest.mark.parametrize("streamed", (False, True))
+def test_provider_performance_reaches_attempts_and_checkpoint_resume_report(streamed):
+    from dataclasses import asdict
+    from pr_reviewer.sse_reassembler import reassemble_sse
+    from pr_reviewer.specialist_runtime.performance import performance_summary
+
+    response = {
+        "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1000, "completion_tokens": 20,
+                  "prompt_tokens_details": {"cached_tokens": 900}},
+        "timings": {"prompt_n": 100, "prompt_ms": 250, "predicted_n": 20,
+                    "predicted_ms": 1000, "draft_n": 30, "draft_n_accepted": 15},
+    }
+    if streamed:
+        response = reassemble_sse(
+            'data: {"choices":[{"delta":{"content":"{}"}}]}\n'
+            + "data: " + json.dumps({**response, "choices": []}) + "\ndata: [DONE]", "openai",
+        )
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1", api_key="", default_model="local",
+        transport=lambda *_args, **_kwargs: response,
+    )
+    session = make_session(gateway)
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
+    for purpose, tools in (("exploration", True), ("checkpoint", False), ("exploration", True)):
+        session._request(tools_enabled=tools, schema=None, purpose=purpose)
+    rows = [asdict(item) for item in attempts.close_since(0)]
+    assert [row["performance_category"] for row in rows] == [
+        "exploration", "checkpoint", "checkpoint-resume",
+    ]
+    assert rows[-1]["cached_prompt_tokens"] == 900
+    assert rows[-1]["prefill_tokens"] == 100
+    assert rows[-1]["prefill_ms"] == 250
+    report = "\n".join(performance_summary(rows))
+    assert "Checkpoint resumes | 1 | 90.0% (1/1)" in report
+    assert "400.0 | 20.0 | 50.0%" in report
 
 
 @pytest.mark.parametrize("usage", (

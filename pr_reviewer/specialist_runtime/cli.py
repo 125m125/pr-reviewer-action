@@ -39,6 +39,7 @@ from .controller import (
 from .evidence import EvidenceStore
 from .events import RunEvent
 from .model_gateway import ModelTurnRequest, OpenAIModelGateway
+from .performance import performance_summary
 from .policy import (
     PolicyAuthorization,
     ReviewPolicy,
@@ -2340,6 +2341,11 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
         + "; verification " + str(candidate_stats.get("verification", 0))
         + "; rejected " + str(candidate_stats.get("rejected", 0)),
     ]
+    budgets = artifact.get("budgets", {})
+    attempts = budgets.get("request_attempts", ()) if isinstance(budgets, Mapping) else ()
+    summary_lines.extend(performance_summary([
+        item for item in attempts if isinstance(item, Mapping)
+    ] if isinstance(attempts, (list, tuple)) else []))
     test_manifest: Mapping[str, object] = {}
     if config.test_results_file is not None and config.test_results_file.is_file():
         try:

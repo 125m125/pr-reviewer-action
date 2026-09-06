@@ -664,6 +664,14 @@ class ScriptedController:
         artifact = {
             "schema_version": 2,
             "evaluation_status": "degraded",
+            "budgets": {"request_attempts": [{
+                "status": "completed", "performance_category": "checkpoint-resume",
+                "actual_prompt_tokens": 1000, "measured_prompt_tokens": 1000,
+                "cached_prompt_tokens": 900,
+                "prefill_tokens": 100, "prefill_ms": 250,
+                "generated_tokens": 20, "generation_ms": 1000,
+                "draft_tokens": 30, "accepted_draft_tokens": 15,
+            }]},
             "assignment_plan": {
                 "source": "deterministic_fallback",
                 "planner_repaired": False,
@@ -769,6 +777,9 @@ def test_cli_writes_structured_handoff_notes_artifact_and_compatibility_output(
     assert controller.inputs.changed_files == ("src/app.py",)
     summary = (tmp_path / "specialist-review-summary.md").read_text()
     assert "- Detail review notes: 1" in summary
+    assert "## Model cache and performance" in summary
+    assert "Checkpoint resumes | 1 | 90.0% (1/1) | 900 / 1,000" in summary
+    assert "400.0 | 20.0 | 50.0%" in summary
     assert "- Review notes:" not in summary
     assert "- Assignment plan: `deterministic_fallback` (repaired: `false`)" in summary
     assert "| planner | invalid \\| plan \\#\\#\\# injected heading " in summary

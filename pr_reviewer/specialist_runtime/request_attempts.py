@@ -8,6 +8,8 @@ from threading import Lock
 import time
 from typing import Callable
 
+from .performance import performance_category
+
 
 @dataclass(frozen=True)
 class RequestAttempt:
@@ -32,6 +34,15 @@ class RequestAttempt:
     actual_prompt_tokens: int = 0
     actual_completion_tokens: int = 0
     error: str = ""
+    performance_category: str = "other"
+    measured_prompt_tokens: int | None = None
+    cached_prompt_tokens: int | None = None
+    prefill_tokens: int | None = None
+    prefill_ms: float | None = None
+    generated_tokens: int | None = None
+    generation_ms: float | None = None
+    draft_tokens: int | None = None
+    accepted_draft_tokens: int | None = None
 
 
 class RequestAttemptJournal:
@@ -77,6 +88,10 @@ class RequestAttemptJournal:
             if request_id in self._records:
                 raise ValueError(f"duplicate request attempt ID {request_id}")
             self._sequence += 1
+            previous_purpose = next((
+                item.purpose for item in reversed(self._records.values())
+                if item.session_id == session_id
+            ), "")
             attempt = RequestAttempt(
                 sequence=self._sequence,
                 request_id=request_id,
@@ -90,6 +105,7 @@ class RequestAttemptJournal:
                 admission_source=str(admission_source or "unknown"),
                 started_at=self._now(),
                 purpose=str(purpose or "unknown"),
+                performance_category=performance_category(purpose, previous_purpose),
             )
             self._records[request_id] = attempt
         if self._transition_sink is not None:
@@ -107,6 +123,14 @@ class RequestAttemptJournal:
         actual_prompt_tokens: int = 0,
         actual_completion_tokens: int = 0,
         error: str = "",
+        cached_prompt_tokens: int | None = None,
+        measured_prompt_tokens: int | None = None,
+        prefill_tokens: int | None = None,
+        prefill_ms: float | None = None,
+        generated_tokens: int | None = None,
+        generation_ms: float | None = None,
+        draft_tokens: int | None = None,
+        accepted_draft_tokens: int | None = None,
     ) -> bool:
         if status not in {"completed", "failed", "timed_out"}:
             raise ValueError("invalid request terminal status")
@@ -131,6 +155,14 @@ class RequestAttemptJournal:
                     if status == "completed" else 0
                 ),
                 error=str(error or ""),
+                cached_prompt_tokens=cached_prompt_tokens if status == "completed" else None,
+                measured_prompt_tokens=measured_prompt_tokens if status == "completed" else None,
+                prefill_tokens=prefill_tokens if status == "completed" else None,
+                prefill_ms=prefill_ms if status == "completed" else None,
+                generated_tokens=generated_tokens if status == "completed" else None,
+                generation_ms=generation_ms if status == "completed" else None,
+                draft_tokens=draft_tokens if status == "completed" else None,
+                accepted_draft_tokens=accepted_draft_tokens if status == "completed" else None,
             )
             self._records[request_id] = updated
         if self._transition_sink is not None:

@@ -5144,9 +5144,11 @@ def test_exhausted_schema_repair_cannot_inflate_artifact_model_turns(tmp_path):
             else:
                 text = "invalid-final-json"
             return ModelTurnResult(
-                response={}, tool_calls=(), text=text, text_source="content",
+                response={"timings": {"prompt_n": 1, "prompt_ms": 10}},
+                tool_calls=(), text=text, text_source="content",
                 finish_reason="stop",
-                usage={"prompt_tokens": 3, "completion_tokens": 2},
+                usage={"prompt_tokens": 3, "completion_tokens": 2,
+                       "prompt_tokens_details": {"cached_tokens": 2}},
                 request_diagnostics={},
             )
 
@@ -5209,6 +5211,11 @@ def test_exhausted_schema_repair_cannot_inflate_artifact_model_turns(tmp_path):
 
     assert len(gateway.requests) == 1, result.artifact["degradation"]
     assert len(attempts) == 1
+    assert attempts[0]["cached_prompt_tokens"] == 2
+    assert attempts[0]["measured_prompt_tokens"] == 3
+    assert attempts[0]["prefill_tokens"] == 1
+    assert attempts[0]["prefill_ms"] == 10
+    assert attempts[0]["generation_ms"] is None
     assert all(item["status"] == "completed" for item in attempts)
     request_id = attempts[0]["request_id"]
     request_events = tuple(

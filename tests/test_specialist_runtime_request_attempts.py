@@ -70,3 +70,19 @@ def test_failed_attempt_retains_admission_and_has_zero_actual_usage():
     assert attempt.admission_source == "provider-calibrated"
     assert attempt.actual_prompt_tokens == 0
     assert attempt.actual_completion_tokens == 0
+
+
+def test_performance_categories_follow_each_session_across_checkpoint_repairs():
+    journal = RequestAttemptJournal()
+    purposes = ["exploration", "delegated-tool-summary", "delegated-tool-summary-repair",
+                "exploration", "checkpoint", "checkpoint-repair", "exploration", "exploration"]
+    categories = []
+    for i, purpose in enumerate(purposes):
+        record = start_attempt(journal, request_id=f"S1:{i}", turn=i + 1, purpose=purpose)
+        categories.append(record.performance_category)
+        journal.finish(record.request_id, "completed")
+        # Interleaved sessions must not change S1's transition category.
+        start_attempt(journal, request_id=f"S2:{i}", session_id="S2", purpose="exploration")
+    assert categories == ["exploration", "delegated-summary", "delegated-summary",
+                          "delegation-resume", "checkpoint", "checkpoint",
+                          "checkpoint-resume", "exploration"]

@@ -346,6 +346,21 @@ source ranges, uncertainties, truncation status, and the original evidence ID
 enter the specialist conversation. Invalid structured output receives one
 focused tools-disabled repair.
 
+The specialist job summary (`specialist-review-summary.md`) includes provider-reported
+cache and performance statistics, grouped by exploration, delegated summaries,
+the first exploration request after delegation, checkpoints (including repairs),
+and the first exploration request after a checkpoint with tools re-enabled.
+It shows cached/prompt tokens, cache-hit percentage and measurement coverage,
+prefill tokens/time/speed, generation speed, and speculative draft acceptance
+when available. Rates use summed tokens and time; missing measurements remain
+unavailable rather than counting as cache misses. These statistics cover the final
+provider response of each completed logical specialist request, not retry costs
+or separate controller-role calls. Per-request measurements and categories are
+retained under `budgets.request_attempts` in `specialist-review-artifact.json`.
+Low cache reuse after a transition helps identify expensive reprocessing but
+does not establish whether cache eviction, prompt/template changes, or another
+server behavior caused it. No llama-specific request options are required.
+
 `review_policy_file` is a current-branch version-2 policy. The older
 `specialist_config_file` remains a one-release version-1 migration input, but
 version-2 recipes/policy control deterministic obligations and specialist
