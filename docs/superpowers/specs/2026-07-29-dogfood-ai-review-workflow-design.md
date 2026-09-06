@@ -36,7 +36,8 @@ investigation, and no reasoning for strict verdict serialization.
 - Use `.github/ai-review-policy.json` as the authoritative version-2 policy.
 - Replace deprecated pass and packet inputs with direct lifetime limits:
   8 initial sessions, 2 follow-up sessions, 64 model turns per session,
-  20 tool calls per session, and 1 recovery.
+  128 tool calls per session, and 1 recovery. The higher tool capacity permits
+  multi-call evidence turns without silently extending the 64-turn lifetime.
 - Use the 7,200-second review deadline and default 10/60/20/10 phase shares.
 - Give the enclosing job a 150-minute timeout so checkout, corpus construction,
   artifact production, and publishing have headroom around the runtime deadline.

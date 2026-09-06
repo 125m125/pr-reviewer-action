@@ -1,7 +1,8 @@
 import json
 import threading
 import time
-from dataclasses import dataclass
+from concurrent.futures import CancelledError
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -19,15 +20,75 @@ from pr_reviewer.specialist_runtime.evidence import (
     EvidenceStore,
     canonical_evidence_key,
 )
-from pr_reviewer.specialist_runtime.model_gateway import ModelTurnResult
+from pr_reviewer.specialist_runtime.model_gateway import (
+    ModelTurnResult,
+    OpenAIModelGateway,
+)
 from pr_reviewer.specialist_runtime.request_attempts import RequestAttemptJournal
-from pr_reviewer.specialist_runtime.session import SpecialistSession
+from pr_reviewer.specialist_runtime.session import (
+    COMPACTED_EVIDENCE_TOOL_NAME,
+    DELEGATE_TOOL_SUMMARY_NAME,
+    CheckpointDisposition,
+    TEST_RESULTS_TOOL_NAME,
+    SpecialistSession,
+    _candidate_retention_signal,
+    _is_context_limit_error,
+    _resolve_retained_evidence_id,
+    _rewrite_rationale_evidence_ids,
+    specialist_assignment_prompt,
+)
 from pr_reviewer.specialist_runtime.types import (
     BudgetLimits,
     CoverageObligation,
+    InvestigationLead,
+    InvestigationLeadStatus,
     RunPhase,
+    SessionCheckpoint,
+    SessionState,
     SpecialistAssignment,
 )
+from pr_reviewer.transport import ModelRequestError
+
+
+@pytest.mark.parametrize(
+    "message, body",
+    (
+        ("provider rejected context_length_exceeded", ""),
+        ("provider rejected request", '{"error":"Context Size is too large"}'),
+        ("Maximum Context reached", ""),
+        ("provider rejected request", '{"message":"PROMPT TOO LONG"}'),
+        ("Too Many Tokens for this model", ""),
+    ),
+)
+def test_context_limit_error_classifies_only_approved_provider_signals(
+    message, body,
+):
+    error = ModelRequestError(message, status=400, body=body)
+
+    assert _is_context_limit_error(error) is True
+
+
+def test_context_limit_error_rejects_unrelated_http_500():
+    error = ModelRequestError(
+        "model provider rejected request with HTTP 500",
+        status=500,
+        body='{"error":"internal server error"}',
+    )
+
+    assert _is_context_limit_error(error) is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        ModelRequestError("prompt too long", timeout=True),
+        ModelRequestError("prompt too long", status=401, body="too many tokens"),
+        TimeoutError("prompt too long"),
+        CancelledError("maximum context"),
+    ),
+)
+def test_context_limit_error_does_not_reclassify_timeout_auth_or_cancellation(error):
+    assert _is_context_limit_error(error) is False
 
 
 def tool_call_response(name, arguments, call_id=None):
@@ -40,21 +101,505 @@ def tool_call_response(name, arguments, call_id=None):
     )
 
 
-def checkpoint_response(*, inspected, unresolved):
-    text = json.dumps({
+def reachable_consequence_support(
+    *, input="changed state", condition="state reaches invalid branch",
+    outcome="operation returns the wrong state",
+):
+    return {
+        "kind": "reachable_input_path",
+        "input": input,
+        "condition": condition,
+        "outcome": outcome,
+    }
+
+
+def checkpoint_response(*, inspected, unresolved, **overrides):
+    payload = {
         "inspected": inspected,
         "unresolved": unresolved,
         "hypotheses": [],
-        "candidate_finding_ids": [],
+        "candidate_updates": [],
+        "new_candidates": [],
         "invariants_evaluated": [],
         "unknowns": unresolved,
-        "proposed_next_actions": [],
+        "proposed_next_actions": (
+            ["Inspect the remaining obligation with retained repository evidence."]
+            if unresolved else []
+        ),
+        "working_summary": "The checkpoint retains the current working state.",
+        "completed_steps": ["Reviewed the assigned checkpoint scope."],
+    }
+    payload.update(overrides)
+    text = json.dumps(payload)
+    return ModelTurnResult(
+        response={}, tool_calls=(), text=text, text_source="content",
+        finish_reason="stop", usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+
+
+def candidate_checkpoint_response(candidate_ids):
+    executor_result = {
+        "tool": "read_file",
+        "status": "ok",
+        "result": {"content": "contents:a.py"},
+    }
+    evidence_id = canonical_evidence_key(
+        "read_file", {"path": "a.py"}, executor_result,
+    )
+    text = json.dumps({
+        "inspected": ["a.py"],
+        "unresolved": ["OB-tests"],
+        "candidate_updates": [],
+        "new_candidates": [{
+            "candidate_id": candidate_id,
+            "root_cause_fingerprint": f"root:{candidate_id}",
+            "claim": f"The changed branch exposes issue {candidate_id}.",
+            "affected_location": "a.py:4",
+            "causal_chain": "The changed state reaches invalid branch.",
+            "severity": "major",
+            "category": "correctness",
+            "supporting_evidence_ids": [evidence_id],
+            "related_obligation_ids": ["OB-code"],
+            "consequence_support": reachable_consequence_support(),
+            "user_visible_consequence": "The operation returns the wrong state.",
+            "manual_validation": "Run the state transition test.",
+        } for candidate_id in candidate_ids],
+        "unknowns": ["OB-tests"],
+        "proposed_next_actions": [
+            "Inspect the remaining behavioral test obligation.",
+        ],
+        "working_summary": "The candidate checkpoint retains the working state.",
+        "completed_steps": ["Collected and assessed the candidate evidence."],
     })
     return ModelTurnResult(
         response={}, tool_calls=(), text=text, text_source="content",
         finish_reason="stop", usage={"prompt_tokens": 3, "completion_tokens": 2},
         request_diagnostics={},
     )
+
+
+def candidate_update_checkpoint_response(*, updates=(), new_candidates=(), unresolved=("OB-tests",)):
+    """Build the compact lifecycle checkpoint shape used by new protocol tests."""
+    text = json.dumps({
+        "inspected": [],
+        "unresolved": list(unresolved),
+        "candidate_updates": list(updates),
+        "new_candidates": list(new_candidates),
+        "unknowns": list(unresolved),
+        "proposed_next_actions": (
+            ["Inspect the remaining behavioral test obligation."]
+            if unresolved else []
+        ),
+        "working_summary": "The candidate lifecycle state remains cumulative.",
+        "completed_steps": ["Reviewed the active candidate lifecycle updates."],
+    })
+    return ModelTurnResult(
+        response={}, tool_calls=(), text=text, text_source="content",
+        finish_reason="stop", usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+
+
+def test_shortened_evidence_ids_are_expanded_only_when_unambiguous():
+    retained = {
+        "evidence:abcdef0123456789": object(),
+        "evidence:fedcba9876543210": object(),
+    }
+
+    assert (
+        _resolve_retained_evidence_id("evidence:abcdef01...", retained)
+        == "evidence:abcdef0123456789"
+    )
+    assert _resolve_retained_evidence_id("evidence:abc...", retained) is None
+    assert _rewrite_rationale_evidence_ids(
+        "consequence_support:reachable_input_path; evidence_ids=evidence:abcdef01...",
+        retained,
+    ).endswith("evidence_ids=evidence:abcdef0123456789")
+
+
+def test_validated_compaction_registers_replaced_results_for_bounded_retrieval():
+    session = make_session(
+        ScriptedGateway([
+            checkpoint_response(inspected=["0.py"], unresolved=["OB-tests"]),
+        ]),
+        max_context_tokens=100_000,
+    )
+    records = [
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"call-{index}",
+            path=f"{index}.py",
+            content="important-tail\n" + (str(index) * 5_000),
+        )
+        for index in range(3)
+    ]
+
+    session.request_checkpoint("context-pressure", disposition="compact_resume")
+
+    record = records[0]
+    assert record.id in session._compacted_evidence
+    assert any(
+        event.get("epoch_continuation") and record.id in event["content"]
+        for event in session.conversation.events
+    )
+
+
+def test_compacted_evidence_reader_is_strict_and_deduplicated():
+    session = make_session(ScriptedGateway([]))
+    record, _collection = session.evidence_store.add_tool_result_with_collection(
+        session_id=session.session_id,
+        tool="read_file",
+        arguments={"path": "a.py"},
+        result={"status": "ok", "content": "retained source"},
+    )
+    session._compacted_evidence[record.id] = record
+
+    first = {
+        "id": "read-1",
+        "name": COMPACTED_EVIDENCE_TOOL_NAME,
+        "arguments": json.dumps({
+            "evidence_id": record.id, "target": "OB-code",
+            "purpose": "obligation_resolution", "offset": 0, "limit": 100,
+        }),
+    }
+    assert session._execute_calls((first,)) is False
+    assert "retained source" in session.conversation.events[-1]["content"]
+    assert session.budget.snapshot().tool_calls == 0
+    assert session._tool_call_evidence_ids["read-1"] == record.id
+
+    repeated = {
+        **first,
+        "id": "read-2",
+        "arguments": json.dumps({
+            "evidence_id": record.id, "target": "OB-code",
+            "purpose": "obligation_resolution", "offset": 5, "limit": 10,
+        }),
+    }
+    session._execute_calls((repeated,))
+    assert "replayed_compacted" in session.conversation.events[-1]["content"]
+
+    rejected = {
+        "id": "read-3",
+        "name": COMPACTED_EVIDENCE_TOOL_NAME,
+        "arguments": json.dumps({
+            "evidence_id": "evidence:not-compacted", "target": "OB-code",
+            "purpose": "obligation_resolution",
+        }),
+    }
+    session._execute_calls((rejected,))
+    assert "not marked as compacted" in session.conversation.events[-1]["content"]
+
+
+def test_compacted_evidence_requires_authorized_target_and_purpose():
+    session = make_session(ScriptedGateway([]))
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "content": "retained"},
+    )
+    session._compacted_evidence[record.id] = record
+
+    missing = session._read_compacted_evidence({"evidence_id": record.id})
+    unknown = session._read_compacted_evidence({
+        "evidence_id": record.id, "target": "invented",
+        "purpose": "candidate_support",
+    })
+
+    assert missing["status"] == "error"
+    assert unknown["status"] == "error"
+
+
+def test_test_results_tool_materializes_only_matching_indexed_cases_as_evidence():
+    indexed = ({
+        "name": "tests.test_notes::test_request_changes",
+        "status": "failed", "file": "tests/test_notes.py", "line": 12,
+        "message": "expected REQUEST_CHANGES",
+        "report": "pytest.xml", "workflow": "validate", "job": "pytest",
+    }, {
+        "name": "tests.test_notes::test_comment",
+        "status": "passed", "file": "tests/test_notes.py", "line": 20,
+        "message": "", "report": "pytest.xml",
+        "workflow": "validate", "job": "pytest",
+    })
+    session = make_session(
+        ScriptedGateway([]),
+        test_results=indexed,
+    )
+    assert session.test_results is indexed
+    assert session.evidence_store.snapshot().records == ()
+
+    session._execute_calls(({
+        "id": "tests-1",
+        "name": TEST_RESULTS_TOOL_NAME,
+        "arguments": json.dumps({"name_contains": "request_changes"}),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["status"] == "ok"
+    assert result["count"] == 1
+    assert result["tests"][0]["name"].endswith("test_request_changes")
+    evidence_id = result["tests"][0]["evidence_id"]
+    records = session.evidence_store.snapshot().records
+    assert [record.id for record in records] == [evidence_id]
+    assert records[0].category == "test-result"
+
+
+def test_test_results_tool_is_not_advertised_without_seeded_cases():
+    session = make_session(ScriptedGateway([]))
+
+    assert TEST_RESULTS_TOOL_NAME not in {
+        schema["name"] for schema in session.conversation.tool_schemas
+    }
+
+
+def test_context_pressure_defers_tool_calls_without_charging_or_deduplicating():
+    session = make_session(ScriptedGateway([]), tool_calls=4)
+    session._checkpoint_pressure_due = lambda *args, **kwargs: True
+    call = {
+        "id": "deferred-read",
+        "name": "read_file",
+        "arguments": json.dumps({"path": "a.py"}),
+    }
+
+    progressed = session._execute_calls((call,))
+
+    payload = json.loads(session.conversation.events[-1]["content"])
+    assert progressed is False
+    assert payload == {
+        "status": "deferred",
+        "reason": "checkpoint_required",
+        "retry_after_compaction": True,
+    }
+    assert session.budget.snapshot().tool_calls == 0
+    assert session._successful_requests == {}
+    assert session._tool_calls_deferred_for_checkpoint is True
+
+
+def test_candidate_admission_rejects_the_same_consequence_gap_as_adjudication():
+    session = make_session(ScriptedGateway([]))
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id,
+        tool="read_file",
+        arguments={"path": "a.py"},
+        result={"status": "ok", "content": "changed implementation"},
+        category="implementation",
+        source="a.py",
+    )
+
+    payload, admitted = session._admit_candidate({
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches the invalid branch.",
+        "severity": "major",
+        "category": "correctness",
+        "supporting_evidence_ids": [record.id],
+        "contradicting_evidence_ids": [],
+        "related_targets": ["O1"],
+        "consequence_support": {
+            "kind": "reachable_input_path",
+            "input": "request timeout",
+            "outcome": "The operation returns the wrong state",
+        },
+        "user_visible_consequence": "The operation returns the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    })
+
+    assert admitted is False
+    assert payload["failed_check"] == "reachable_input_path.condition"
+    assert any("input, condition, and outcome" in hint for hint in payload["repair_hints"])
+
+
+def test_affected_consumer_support_uses_evidence_ids_and_derives_paths():
+    obligations = (CoverageObligation(
+        obligation_id="OB-redaction", origin="test", subject="source redaction",
+        required_evidence_categories=("implementation",),
+        scope=("scripts/redact.py", "pr_reviewer/tool_executors.py"),
+    ),)
+    assignment = SpecialistAssignment(
+        assignment_id="assignment-redaction", objective="Review source redaction",
+        primary_obligation_ids=("OB-redaction",), seed_paths=("scripts/redact.py",),
+    )
+    session = make_session(
+        ScriptedGateway([]), obligations=obligations, assignment=assignment,
+    )
+    producer = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file",
+        arguments={"path": "scripts/redact.py"},
+        result={"status": "ok", "content": "password was removed from the key regex"},
+        category="implementation", source="scripts/redact.py",
+    )
+    consumer = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file",
+        arguments={"path": "pr_reviewer/tool_executors.py"},
+        result={"status": "ok", "content": "return mask_source_secrets(content)"},
+        category="implementation", source="pr_reviewer/tool_executors.py",
+    )
+
+    payload, admitted = session._admit_candidate({
+        "claim": "Literal password assignments are no longer redacted.",
+        "affected_location": "scripts/redact.py:40",
+        "causal_chain": "The source redactor feeds tool output without matching password keys.",
+        "severity": "major", "category": "security",
+        "supporting_evidence_ids": [producer.id, consumer.id],
+        "contradicting_evidence_ids": [], "related_targets": ["O1"],
+        "consequence_support": {
+            "kind": "affected_consumer",
+            "producer_evidence_id": producer.id,
+            "consumer_evidence_id": consumer.id,
+        },
+        "user_visible_consequence": "Literal passwords reach the review model unredacted.",
+        "manual_validation": "Read a source fixture containing password=secret.",
+    })
+
+    assert admitted is True
+    assert payload == {"accepted": True, "target": "C1"}
+    rationale = session.candidate_findings[0].confidence_rationale
+    assert "producer=scripts/redact.py" in rationale
+    assert "consumer=pr_reviewer/tool_executors.py" in rationale
+    assert "outcome=Literal passwords reach the review model unredacted." in rationale
+
+
+def test_candidate_rejection_identifies_acceptable_evidence_and_failed_predicate():
+    session = make_session(ScriptedGateway([]))
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file",
+        arguments={"path": "a.py"},
+        result={"status": "ok", "content": "changed implementation"},
+        category="implementation", source="a.py",
+    )
+
+    payload, admitted = session._admit_candidate({
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches the invalid branch.",
+        "severity": "major", "category": "correctness",
+        "supporting_evidence_ids": [record.id],
+        "contradicting_evidence_ids": [], "related_targets": ["O1"],
+        "consequence_support": {
+            "kind": "affected_consumer",
+            "producer_evidence_id": record.id,
+            "consumer_evidence_id": "evidence:not-retained",
+            "outcome": "The operation returns the wrong state.",
+        },
+        "user_visible_consequence": "The operation returns the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    })
+
+    assert admitted is False
+    assert payload["failed_check"] == "affected_consumer.consumer_evidence_id"
+    assert payload["acceptable_evidence"] == [{
+        "evidence_id": record.id, "source_path": "a.py",
+    }]
+    assert any(record.id in hint and "a.py" in hint for hint in payload["repair_hints"])
+
+
+def test_reworded_checkpoint_does_not_count_as_semantic_progress():
+    session = make_session(ScriptedGateway([]))
+    first = SessionCheckpoint(
+        session_id=session.session_id, state=SessionState.CHECKPOINT,
+        working_summary="Checked delivery behavior.", completed_steps=("Read a.py",),
+        proposed_next_actions=("Inspect the consumer",),
+    )
+    second = replace(
+        first, working_summary="Delivery behavior was checked in detail.",
+        completed_steps=("Inspected a.py",),
+        proposed_next_actions=("Read the downstream consumer next",),
+    )
+
+    assert session._checkpoint_progress_fingerprint(first) == (
+        session._checkpoint_progress_fingerprint(second)
+    )
+
+
+def test_stop_disposition_pass_keeps_checkpoint_and_accepts_valid_siblings():
+    gateway = ScriptedGateway([invalid_response(json.dumps({
+        "obligation_updates": [
+            {"target": "O1", "disposition": "blocked", "reason": "Source unavailable",
+             "evidence_ids": [], "next_actions": []},
+            {"target": "O2", "disposition": "covered", "reason": "Looks fine",
+             "evidence_ids": [], "next_actions": []},
+        ],
+    }))])
+    session = make_session(gateway)
+    checkpoint = session._checkpoint_from_text(json.dumps({
+        "unresolved": ["O1", "O2"], "obligation_updates": [],
+        "working_summary": "Checked the changed behavior.",
+        "completed_steps": ["Read the changed implementation"],
+        "proposed_next_actions": ["Check the missing source"],
+    }))
+    assert checkpoint is not None
+    session.latest_checkpoint = session._last_valid_checkpoint = checkpoint
+
+    session.settle_for_scheduling()
+    # A scheduler retry that cannot start exploration must not buy another
+    # accounting attempt during finalization.
+    lease = session.lease
+    session.lease = SessionLease(RunPhase.FOLLOWUP, deadline_at=0.0)
+    with pytest.raises(TimeoutError):
+        session.explore()
+    session.lease = lease
+    session._settle_pending_obligations("completion")
+
+    assert len(gateway.requests) == 1
+    assert gateway.requests[0].tools_enabled is False
+    assert session.obligation_assessments.assessment("O1").disposition.value == "blocked"
+    assert session.obligation_assessments.assessment("O2").disposition.value == "pending"
+    assert session.latest_checkpoint.working_summary == checkpoint.working_summary
+    assert session.latest_checkpoint.completed_steps == checkpoint.completed_steps
+    assert session.latest_checkpoint.evidence_ids == checkpoint.evidence_ids
+    assert session.latest_checkpoint.candidate_finding_ids == checkpoint.candidate_finding_ids
+    diagnostic = session._disposition_pass_diagnostics[-1]
+    assert diagnostic["results"][0]["accepted"] is True
+    assert "evidence" in diagnostic["results"][1]["reason"]
+    assert gateway.requests[0].response_schema["required"] == ["obligation_updates"]
+
+
+def test_invalid_stop_disposition_response_preserves_checkpoint():
+    gateway = ScriptedGateway([invalid_response("<tool_call>")])
+    session = make_session(gateway)
+    checkpoint = replace(session.latest_checkpoint, working_summary="Retain this memory")
+    session.latest_checkpoint = session._last_valid_checkpoint = checkpoint
+
+    session._settle_pending_obligations("completion")
+
+    assert session.latest_checkpoint is checkpoint
+    assert all(item.disposition.value == "pending"
+               for item in session.obligation_assessments.assessments())
+    assert session._disposition_pass_diagnostics[-1]["status"] == "invalid"
+
+
+def test_stop_disposition_pass_preserves_retained_candidates_and_evidence():
+    session, gateway = _session_with_retained_candidate([
+        invalid_response(json.dumps({"obligation_updates": [
+            {"target": "O2", "disposition": "blocked", "reason": "Test source unavailable",
+             "evidence_ids": [], "next_actions": []},
+        ]})),
+    ])
+    previous = session.latest_checkpoint
+    candidates = session.candidate_findings
+    session.latest_checkpoint = replace(previous, unknowns=(*previous.unknowns, "retained-warning"))
+
+    result = session.settle_for_scheduling()
+    session.finalize()
+
+    assert len(gateway.requests) == 3
+    assert result.checkpoint.candidate_finding_ids == previous.candidate_finding_ids
+    assert result.checkpoint.evidence_ids == previous.evidence_ids
+    assert session.candidate_findings == candidates
+    assert "retained-warning" in result.checkpoint.unknowns
+    assert result.checkpoint.working_summary == previous.working_summary
+    assert session.obligation_assessments.assessment("O2").disposition.value == "blocked"
+
+
+def test_compaction_without_valid_checkpoint_keeps_assistant_analysis():
+    session = make_session(ScriptedGateway([]), max_context_tokens=1_000)
+    session.conversation.add_assistant_text("old conclusion: " + ("x" * 5_000))
+    session.conversation.add_assistant_text("new conclusion: " + ("y" * 5_000))
+    before = json.loads(json.dumps(session.conversation.events))
+
+    session._compact_conversation()
+
+    assert session.conversation.events == before
 
 
 @dataclass(frozen=True)
@@ -64,6 +609,8 @@ class RecordedRequest:
     deadline_at: float | None
     max_tokens: int
     ephemeral_user_note: str | None
+    reasoning_effort: str | None
+    response_schema: dict | None
 
     def messages_contain(self, value):
         return value in self.messages
@@ -81,11 +628,31 @@ class ScriptedGateway:
             deadline_at=request.deadline_at,
             max_tokens=request.max_tokens,
             ephemeral_user_note=request.ephemeral_user_note,
+            reasoning_effort=request.reasoning_effort,
+            response_schema=request.response_schema,
         ))
         assert self.responses, "model called more times than scripted"
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
+        return response
+
+
+class EstimatingGateway(ScriptedGateway):
+    def __init__(self, responses, *, rendered_bytes, usages=()):
+        super().__init__(responses)
+        self.rendered_bytes = rendered_bytes
+        self.usages = list(usages)
+        self.rendered_requests = []
+
+    def rendered_request_bytes(self, request):
+        self.rendered_requests.append(request)
+        return self.rendered_bytes
+
+    def complete(self, request):
+        response = super().complete(request)
+        if self.usages:
+            response = replace(response, usage=self.usages.pop(0))
         return response
 
 
@@ -114,12 +681,29 @@ def invalid_response(text="not-json"):
     )
 
 
+def reasoning_only_response(value):
+    reasoning = json.dumps(value) if not isinstance(value, str) else value
+    return ModelTurnResult(
+        response={},
+        tool_calls=(),
+        text=reasoning,
+        text_source="reasoning_fallback",
+        finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+        content="",
+        reasoning=reasoning,
+    )
+
+
 def make_session(
     gateway, *, tool_calls=4, model_turns=8, recoveries=1,
     execute_tool=None, lease=None, assignment=None, obligations=None,
     budget_limits=None, max_tokens=1024,
     request_timeout_sec=30.0, max_context_tokens=24_000,
-    recovery_max_tokens=None, clock=time.monotonic,
+    recovery_max_tokens=None, clock=time.monotonic, test_results=(),
+    tool_schemas=None, delegated_summary_max_tokens=None,
+    delegated_summary_max_source_bytes=None, max_tool_result_bytes=12_000,
 ):
     obligations = obligations or (
         CoverageObligation(
@@ -135,7 +719,14 @@ def make_session(
         assignment_id="assignment-1", objective="Review the assigned behavior",
         primary_obligation_ids=("OB-code", "OB-tests"), seed_paths=("a.py",),
     )
-    conversation = Conversation(system="Gather evidence and checkpoint progress.")
+    conversation = (
+        Conversation(system="Gather evidence and checkpoint progress.")
+        if tool_schemas is None
+        else Conversation(
+            system="Gather evidence and checkpoint progress.",
+            tool_schemas=list(tool_schemas),
+        )
+    )
     lease = lease or SessionLease(RunPhase.FOLLOWUP, time.monotonic() + 60.0)
 
     if execute_tool is None:
@@ -153,13 +744,1665 @@ def make_session(
         lease=lease, request_timeout_sec=request_timeout_sec, max_tokens=max_tokens,
         max_context_tokens=max_context_tokens,
         recovery_max_tokens=recovery_max_tokens or max_tokens,
+        max_tool_result_bytes=max_tool_result_bytes,
+        delegated_summary_max_tokens=delegated_summary_max_tokens,
+        delegated_summary_max_source_bytes=delegated_summary_max_source_bytes,
+        test_results=test_results,
+        test_results_repository="owner/repository",
+        test_results_head_sha="b" * 40,
         clock=clock,
     )
+
+
+def delegated_summary_response(
+    *, start_line=2, end_line=2, summary="The feature is enabled.",
+):
+    return ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "summary": summary,
+            "relevant_excerpts": [{
+                "start_line": start_line,
+                "end_line": end_line,
+                "relevance": "Directly answers the focused question.",
+            }],
+            "uncertainties": [],
+            "source_truncated": False,
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 30, "completion_tokens": 10},
+        request_diagnostics={},
+    )
+
+
+@pytest.mark.parametrize("source_range", (
+    {"offset": 1, "lines": 3, "total_lines": 3, "has_more": False, "truncated": False},
+    {"offset": 800, "lines": 3, "total_lines": 1440, "has_more": True, "truncated": True},
+))
+@pytest.mark.parametrize("source_limit", (None, 80))
+def test_delegated_summary_retains_raw_source_but_returns_only_focused_result(source_range, source_limit):
+    gateway = ScriptedGateway([delegated_summary_response()])
+    executor_calls = []
+
+    def execute(name, arguments, **kwargs):
+        executor_calls.append((name, arguments, kwargs))
+        return {
+            "tool": name, "status": "ok",
+            "result": {
+                "content": "irrelevant preface\nfeature=true\nirrelevant tail" + " filler" * 20,
+                "range": source_range,
+            },
+        }
+
+    session = make_session(
+        gateway, execute_tool=execute, max_tokens=1024,
+        delegated_summary_max_source_bytes=source_limit,
+        tool_schemas=[{
+            "name": "read_file", "description": "read",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"},
+            }, "required": ["path"], "additionalProperties": False},
+        }],
+    )
+    assert DELEGATE_TOOL_SUMMARY_NAME in {
+        item["name"] for item in session.conversation.tool_schemas
+    }
+    description = next(
+        item["description"] for item in session.conversation.tool_schemas
+        if item["name"] == DELEGATE_TOOL_SUMMARY_NAME
+    )
+    assert "exact relevant source excerpts" in description.split(". ", 1)[0]
+    assert "exact input names, defaults, permission requirements" in description
+    assert "no prior fetch is required" in description
+
+    progressed = session._execute_calls(({
+        "id": "delegate-1", "name": DELEGATE_TOOL_SUMMARY_NAME,
+        "arguments": json.dumps({
+            "tool_name": "read_file",
+            "arguments": {"path": "a.py"},
+            "target": "feature toggle",
+            "question": "Is the feature enabled?",
+        }),
+    },))
+
+    visible = json.loads(session.conversation.events[-1]["content"])
+    records = session.evidence_store.snapshot().records
+    assert progressed is True
+    assert executor_calls[0][0:2] == ("read_file", {"path": "a.py"})
+    if source_limit is None:
+        assert executor_calls[0][2]["max_response_bytes"] > 12_000
+    else:
+        assert executor_calls[0][2]["max_response_bytes"] == 80
+    assert gateway.requests[0].tools_enabled is False
+    assert gateway.requests[0].max_tokens == 2048
+    assert gateway.requests[0].messages_contain("irrelevant preface")
+    assert gateway.requests[0].messages_contain("L000002|feature=true")
+    prompt = json.loads(json.loads(gateway.requests[0].messages)[0]["content"])
+    assert prompt["source_metadata"]["range"] == source_range
+    assert prompt["source_metadata"]["source_truncated"] == source_range["truncated"]
+    assert prompt["source_metadata"]["prompt_truncated"] == (source_limit is not None)
+    assert visible["summary"] == "The feature is enabled."
+    assert visible["relevant_excerpts"][0]["text"] == "feature=true"
+    assert visible["relevant_excerpts"][0]["locator"] == "line 2"
+    assert visible["source_evidence_id"] == records[0].id
+    assert "irrelevant preface" not in session.conversation.events[-1]["content"]
+    assert records[0].content.startswith("irrelevant preface")
+    assert session.budget.snapshot().tool_calls == 1
+    assert session.budget.snapshot().model_turns == 1
+
+
+def test_delegated_summary_repairs_an_invalid_source_range_once():
+    gateway = ScriptedGateway([
+        delegated_summary_response(start_line=99, end_line=99),
+        delegated_summary_response(start_line=1, end_line=1),
+    ])
+    session = make_session(
+        gateway, max_tokens=1024,
+        tool_schemas=[{
+            "name": "read_file", "description": "read",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"},
+            }, "required": ["path"], "additionalProperties": False},
+        }],
+        execute_tool=lambda name, arguments, **kwargs: {
+            "tool": name, "status": "ok",
+            "result": {"content": "feature=true"},
+        },
+    )
+
+    session._execute_calls(({
+        "id": "delegate-1", "name": DELEGATE_TOOL_SUMMARY_NAME,
+        "arguments": json.dumps({
+            "tool_name": "read_file", "arguments": {"path": "a.py"},
+            "target": "feature toggle", "question": "Is it enabled?",
+        }),
+    },))
+
+    assert [request.max_tokens for request in gateway.requests] == [2048, 1024]
+    assert gateway.requests[1].messages_contain('\\"start_line\\": 99')
+    assert gateway.requests[1].messages_contain("99-99")
+    assert gateway.requests[1].messages_contain("1-1")
+    visible = json.loads(session.conversation.events[-1]["content"])
+    assert visible["relevant_excerpts"][0]["text"] == "feature=true"
+
+
+def test_delegated_excerpt_repair_reports_inclusive_count_and_keeps_valid_boundary():
+    source = "\n".join(f"line {i}" for i in range(1, 401))
+    parsed, error = SpecialistSession._validated_delegated_summary(
+        delegated_summary_response(start_line=360, end_line=400).text, source,
+    )
+    assert parsed is None
+    assert "360-400 contains 41 lines" in error
+    assert "maximum 40" in error
+    parsed, error = SpecialistSession._validated_delegated_summary(
+        delegated_summary_response(start_line=361, end_line=400).text, source,
+    )
+    assert not error
+    assert parsed["relevant_excerpts"][0]["text"].startswith("line 361\n")
+
+
+def test_delegated_summary_extracts_multiline_text_with_source_line_endings():
+    gateway = ScriptedGateway([
+        delegated_summary_response(start_line=2, end_line=3),
+    ])
+    session = make_session(
+        gateway, max_tokens=1024,
+        tool_schemas=[{
+            "name": "read_file", "description": "read",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"},
+            }, "required": ["path"], "additionalProperties": False},
+        }],
+        execute_tool=lambda name, arguments, **kwargs: {
+            "tool": name, "status": "ok",
+            "result": {"content": 'heading\r\nvalue="a\\b"\r\nnext=true\r\ntail'},
+        },
+    )
+
+    session._execute_calls(({
+        "id": "delegate-1", "name": DELEGATE_TOOL_SUMMARY_NAME,
+        "arguments": json.dumps({
+            "tool_name": "read_file", "arguments": {"path": "a.py"},
+            "target": "escaped value", "question": "What is configured?",
+        }),
+    },))
+
+    visible = json.loads(session.conversation.events[-1]["content"])
+    assert visible["relevant_excerpts"][0] == {
+        "text": 'value=\"a\\b\"\r\nnext=true',
+        "locator": "lines 2-3",
+        "relevance": "Directly answers the focused question.",
+    }
+
+
+def test_delegated_summary_rejects_recursive_or_state_changing_inner_tools():
+    session = make_session(
+        ScriptedGateway([]),
+        tool_schemas=[{
+            "name": "read_file", "description": "read",
+            "parameters": {"type": "object", "properties": {},
+                           "additionalProperties": False},
+        }],
+    )
+
+    session._execute_calls(({
+        "id": "delegate-1", "name": DELEGATE_TOOL_SUMMARY_NAME,
+        "arguments": json.dumps({
+            "tool_name": DELEGATE_TOOL_SUMMARY_NAME,
+            "arguments": {}, "target": "state", "question": "Summarize it",
+        }),
+    },))
+
+    visible = json.loads(session.conversation.events[-1]["content"])
+    assert "read-only evidence tool" in visible["error"]
+    assert session.budget.snapshot().tool_calls == 0
+
+
+@pytest.mark.parametrize("invalid_first", (False, True))
+def test_delegated_summary_preserves_answer_when_optional_quotes_overflow(invalid_first):
+    source = "header\n" + "é" * 1500 + "\ntail"
+    responses = [delegated_summary_response()]
+    if invalid_first:
+        responses.insert(0, delegated_summary_response(start_line=999, end_line=999))
+    gateway = ScriptedGateway(responses)
+    session = make_session(
+        gateway, max_tokens=1024, max_tool_result_bytes=1000,
+        tool_schemas=[{"name": "read_file", "parameters": {"type": "object"}}],
+        execute_tool=lambda name, args, **kwargs: {
+            "tool": name, "status": "ok", "result": {"content": source},
+        },
+    )
+    payload, record, _ = session._execute_delegated_summary(
+        {"tool_name": "read_file", "arguments": {"path": "a.py"},
+         "target": "feature", "question": "Is it enabled?"},
+        timeout=10, requested_obligation_ids=(), requested_targets=(),
+    )
+    assert payload["status"] == "ok"
+    assert payload["summary"] == "The feature is enabled."
+    assert payload["relevant_excerpts"] == []
+    assert payload["omitted_excerpt_count"] == 1
+    assert payload["source_evidence_id"] == record.id
+    assert record.content == source
+    assert len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) <= 1000
+    assert len(gateway.requests) == (2 if invalid_first else 1)
+
+
+def test_delegated_summary_repairs_range_and_required_body_size_together():
+    gateway = ScriptedGateway([
+        delegated_summary_response(start_line=360, end_line=400, summary="é" * 1200),
+        delegated_summary_response(start_line=1, end_line=1),
+    ])
+    session = make_session(
+        gateway, max_tokens=1024, max_tool_result_bytes=1000,
+        tool_schemas=[{"name": "read_file", "parameters": {"type": "object"}}],
+        execute_tool=lambda name, args, **kwargs: {
+            "tool": name, "status": "ok", "result": {"content": "x\n" * 400},
+        },
+    )
+    payload, _, _ = session._execute_delegated_summary(
+        {"tool_name": "read_file", "arguments": {"path": "a.py"},
+         "target": "feature", "question": "Is it enabled?"},
+        timeout=10, requested_obligation_ids=(), requested_targets=(),
+    )
+    assert payload["status"] == "ok"
+    initial = json.loads(json.loads(gateway.requests[0].messages)[0]["content"])
+    assert initial["result_budget_bytes"] == 1000
+    repair = json.loads(gateway.requests[1].messages)[-1]["content"]
+    assert "360-400 contains 41" in repair
+    assert "1000 bytes" in repair
+    assert "exceeds" in repair
+    assert "reduce by at least" in repair
+
+
+def test_specialist_protocol_requires_falsifying_changed_behavior_first():
+    assignment = SpecialistAssignment(
+        assignment_id="assignment-1", objective="Review the assigned behavior",
+        primary_obligation_ids=("OB-code",), seed_paths=("a.py",),
+    )
+
+    prompt = specialist_assignment_prompt(assignment)
+
+    assert "attempt to falsify the changed behavior" in prompt
+    assert "before resolving an obligation" in prompt
+
+
+def seed_successful_tool_exchange(
+    session, *, call_id, path, content, reasoning="private analysis",
+):
+    result = {"status": "ok", "content": content}
+    record, _collection = session.evidence_store.add_tool_result_with_collection(
+        session_id=session.session_id,
+        tool="read_file",
+        arguments={"path": path},
+        result=result,
+    )
+    session._tool_call_evidence_ids[call_id] = record.id
+    session.conversation.add_assistant_turn(
+        reasoning=reasoning,
+        calls=[{
+            "id": call_id,
+            "name": "read_file",
+            "arguments": json.dumps({"path": path}),
+        }],
+    )
+    session.conversation.add_tool_result(
+        call_id,
+        {
+            "evidence_id": record.id,
+            "status": record.status,
+            "content": record.content,
+        },
+    )
+    return record
+
+
+def test_obligation_state_tools_use_short_handles_without_repository_budget():
+    session = make_session(ScriptedGateway([]))
+    tool_names = {item["name"] for item in session.conversation.tool_schemas}
+    before = session.budget.snapshot().tool_calls
+
+    progressed = session._execute_calls(({
+        "id": "explain-1", "name": "explain_obligation",
+        "arguments": json.dumps({"target": "O1"}),
+    },))
+
+    assert {
+        "explain_obligation", "get_obligation_status",
+        "propose_obligation_resolution",
+    }.issubset(tool_names)
+    assert progressed is True
+    assert session.budget.snapshot().tool_calls == before
+    assert '"target": "O1"' in session.conversation.events[-1]["content"]
+    assert "OB-code" not in session.conversation.events[-1]["content"]
+
+
+def test_obligation_resolution_schema_requires_bounded_candidate_assessment():
+    session = make_session(ScriptedGateway([]))
+    schema = next(
+        item["parameters"] for item in session.conversation.tool_schemas
+        if item["name"] == "propose_obligation_resolution"
+    )
+
+    assessment = schema["properties"]["defect_assessment"]
+
+    assert "defect_assessment" in schema["required"]
+    assert assessment["properties"]["result"]["enum"] == [
+        "none_observed", "candidates", "needs_followup",
+    ]
+    assert assessment["properties"]["candidate_drafts"]["maxItems"] == 3
+
+
+def test_concrete_candidate_schema_excludes_non_actionable_info_severity():
+    session = make_session(ScriptedGateway([]))
+    schema = next(
+        item["parameters"] for item in session.conversation.tool_schemas
+        if item["name"] == "report_candidate"
+    )
+
+    assert schema["properties"]["severity"]["enum"] == [
+        "minor", "major", "blocker",
+    ]
+    assert "confidence_rationale" not in schema["properties"]
+    support = schema["properties"]["consequence_support"]
+    assert support["properties"]["kind"]["enum"] == [
+        "reachable_input_path", "failing_behavioral_test",
+        "violated_invariant", "affected_consumer", "contradicting_evidence",
+    ]
+
+
+def test_investigation_lead_tool_is_bounded_and_resolution_is_assignment_scoped():
+    ordinary = make_session(ScriptedGateway([]))
+    ordinary_tools = {
+        item["name"]: item["parameters"]
+        for item in ordinary.conversation.tool_schemas
+    }
+
+    assert "report_investigation_lead" in ordinary_tools
+    assert "resolve_investigation_lead" not in ordinary_tools
+    report_schema = ordinary_tools["report_investigation_lead"]
+    assert report_schema["properties"]["evidence_ids"]["maxItems"] == 8
+    assert report_schema["properties"]["affected_paths"]["maxItems"] == 8
+    assert report_schema["properties"]["required_capability"]["enum"] == [
+        "none", "repository", "tests", "web",
+    ]
+
+    assignment = SpecialistAssignment(
+        assignment_id="lead-assignment",
+        objective="Investigate the routed lead",
+        investigation_leads=(InvestigationLead(
+            lead_id="lead:abc123",
+            summary="A caller may rely on the changed fallback.",
+            affected_paths=("a.py",),
+            evidence_ids=(),
+            next_action="Trace the affected caller.",
+            required_capability="repository",
+            origin_session_id="S0",
+        ),),
+    )
+    assigned = make_session(ScriptedGateway([]), assignment=assignment)
+    assigned_tools = {item["name"] for item in assigned.conversation.tool_schemas}
+
+    assert "resolve_investigation_lead" in assigned_tools
+    prompt = json.loads(assigned._assignment_prompt().split("\n", 1)[1])
+    assert prompt["investigation_lead_targets"] == [{
+        "target": "L1",
+        "lead_id": "lead:abc123",
+        "summary": "A caller may rely on the changed fallback.",
+        "affected_paths": ["a.py"],
+        "evidence_ids": [],
+        "next_action": "Trace the affected caller.",
+        "required_capability": "repository",
+    }]
+
+
+def test_report_investigation_lead_retains_evidence_and_deduplicates():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-lead", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    arguments = {
+        "summary": "The changed fallback may be relied on by another component.",
+        "affected_paths": ["a.py"],
+        "evidence_ids": [evidence_id],
+        "next_action": "Trace consumers of the changed fallback.",
+        "required_capability": "repository",
+    }
+
+    first_progress = session._execute_calls(({
+        "id": "lead-1", "name": "report_investigation_lead",
+        "arguments": json.dumps(arguments),
+    },))
+    first = json.loads(session.conversation.events[-1]["content"])
+    second_progress = session._execute_calls(({
+        "id": "lead-2", "name": "report_investigation_lead",
+        "arguments": json.dumps(arguments),
+    },))
+    second = json.loads(session.conversation.events[-1]["content"])
+
+    assert first_progress is True
+    assert first == {"accepted": True, "target": "L1", "duplicate": False}
+    assert second_progress is False
+    assert second == {"accepted": True, "target": "L1", "duplicate": True}
+    result = session._snapshot()
+    assert len(result.investigation_leads) == 1
+    assert result.investigation_leads[0].evidence_ids == (evidence_id,)
+
+
+def test_report_investigation_lead_rejects_unretained_evidence_and_unscoped_path():
+    session = make_session(ScriptedGateway([]))
+
+    progressed = session._execute_calls(({
+        "id": "lead-invalid", "name": "report_investigation_lead",
+        "arguments": json.dumps({
+            "summary": "An unrelated path might have a problem.",
+            "affected_paths": ["outside.py"],
+            "evidence_ids": ["evidence:missing"],
+            "next_action": "Inspect the unrelated path.",
+            "required_capability": "repository",
+        }),
+    },))
+
+    assert progressed is False
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["accepted"] is False
+    assert "retained evidence" in result["reason"]
+    assert session._snapshot().investigation_leads == ()
+
+
+def test_assigned_investigation_lead_can_be_explicitly_resolved():
+    lead = InvestigationLead(
+        lead_id="lead:abc123",
+        summary="The changed fallback may be relied on elsewhere.",
+        affected_paths=("a.py",), evidence_ids=(),
+        next_action="Trace the caller.", required_capability="repository",
+        origin_session_id="S0",
+    )
+    assignment = SpecialistAssignment(
+        assignment_id="lead-assignment", objective="Investigate routed lead",
+        investigation_leads=(lead,),
+    )
+    session = make_session(ScriptedGateway([]), assignment=assignment)
+
+    progressed = session._execute_calls(({
+        "id": "resolve-lead", "name": "resolve_investigation_lead",
+        "arguments": json.dumps({
+            "target": "L1", "status": "resolved_no_issue",
+            "reason": "The only caller supplies the required fallback explicitly.",
+            "evidence_ids": [],
+        }),
+    },))
+
+    assert progressed is True
+    assert json.loads(session.conversation.events[-1]["content"]) == {
+        "accepted": True, "target": "L1", "status": "resolved_no_issue",
+    }
+    resolution = session._snapshot().investigation_lead_resolutions[0]
+    assert resolution.lead_id == "lead:abc123"
+    assert resolution.status is InvestigationLeadStatus.RESOLVED_NO_ISSUE
+
+
+def test_single_assigned_lead_is_resolved_when_it_produces_a_candidate():
+    lead = InvestigationLead(
+        lead_id="lead:candidate", summary="The changed branch may fail.",
+        affected_paths=("a.py",), evidence_ids=(),
+        next_action="Prove the changed consequence.", required_capability="repository",
+        origin_session_id="S0",
+    )
+    assignment = SpecialistAssignment(
+        assignment_id="lead-assignment", objective="Investigate routed lead",
+        primary_obligation_ids=("OB-code",), investigation_leads=(lead,),
+    )
+    session = make_session(ScriptedGateway([]), assignment=assignment)
+    session._execute_calls(({
+        "id": "read-lead-candidate", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["L1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+
+    session._execute_calls(({
+        "id": "report-lead-candidate", "name": "report_candidate",
+        "arguments": json.dumps({
+            "claim": "The changed branch returns the wrong state.",
+            "affected_location": "a.py:4",
+            "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
+            "severity": "major", "category": "correctness",
+            "supporting_evidence_ids": [evidence_id],
+            "contradicting_evidence_ids": [], "related_targets": ["O1"],
+            "consequence_support": reachable_consequence_support(),
+            "user_visible_consequence": "The operation returns the wrong state.",
+            "manual_validation": "Run the changed state-transition test.",
+        }),
+    },))
+
+    resolution = session._snapshot().investigation_lead_resolutions[0]
+    assert resolution.status is InvestigationLeadStatus.RESOLVED_CANDIDATE
+    assert resolution.candidate_ids == (session.candidate_findings[0].candidate_id,)
+
+
+def test_investigation_lead_feedback_authorizes_targeted_tools_and_evidence_recovery():
+    session = make_session(ScriptedGateway([]))
+    lead = InvestigationLead(
+        lead_id="lead:later", summary="A later controller lead.",
+        affected_paths=("a.py",), evidence_ids=(),
+        next_action="Inspect its consumer.", required_capability="repository",
+        origin_session_id="S0",
+    )
+
+    session.apply_investigation_lead_feedback("L7", lead)
+    progressed = session._execute_calls(({
+        "id": "read-lead-target", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["L7"]}),
+    },))
+
+    assert progressed is True
+    assert "resolve_investigation_lead" in {
+        item["name"] for item in session.conversation.tool_schemas
+    }
+    assert "A later controller lead" in session.conversation.events[-2]["content"]
+    record = seed_successful_tool_exchange(
+        session, call_id="old-lead-read", path="a.py", content="old evidence",
+    )
+    session._compacted_evidence[record.id] = record
+    recovered = session._read_compacted_evidence({
+        "evidence_id": record.id, "target": "L7",
+        "purpose": "contradiction_check", "offset": 0, "limit": 100,
+    })
+    assert recovered["status"] == "ok"
+
+
+def test_session_snapshot_projects_tool_activity_without_arguments():
+    session = make_session(ScriptedGateway([]))
+    calls = (
+        {
+            "id": "tool-ok", "name": "read_file",
+            "arguments": json.dumps({"path": "a.py"}),
+        },
+        {
+            "id": "tool-rejected", "name": "withdraw_candidate",
+            "arguments": json.dumps({"target": "C9", "reason": "Not ours."}),
+        },
+        {
+            "id": "tool-error", "name": "git_grep", "arguments": "{",
+        },
+    )
+    session.conversation.add_assistant_turn(calls=calls)
+    session._execute_calls(calls)
+
+    result = session._snapshot()
+    activity = {item["tool"]: item for item in result.tool_activity}
+
+    assert "read_file" in result.advertised_tools
+    assert activity["read_file"] == {
+        "tool": "read_file", "calls": 1, "successful": 1,
+        "rejected": 0, "deferred": 0, "errors": 0,
+        "evidence_retained": 1,
+    }
+    assert activity["withdraw_candidate"]["rejected"] == 1
+    assert activity["git_grep"]["errors"] == 1
+    assert "arguments" not in json.dumps(result.tool_activity)
+
+
+def test_tool_activity_records_every_deferred_call_before_compaction(monkeypatch):
+    session = make_session(ScriptedGateway([]))
+    monkeypatch.setattr(
+        session, "_checkpoint_pressure_due", lambda **_kwargs: True,
+    )
+    calls = (
+        {"id": "first", "name": "read_file", "arguments": "{}"},
+        {"id": "second", "name": "git_grep", "arguments": "{}"},
+    )
+
+    session._execute_calls(calls)
+    activity = {item["tool"]: item for item in session._tool_activity_snapshot()}
+
+    assert activity["read_file"]["deferred"] == 1
+    assert activity["git_grep"]["deferred"] == 1
+
+
+def test_missing_defect_assessment_cannot_resolve_obligation():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-before-unassessed-resolution", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+
+    session._execute_calls(({
+        "id": "unassessed-resolution", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O1", "disposition": "covered",
+            "reason": "The changed implementation was inspected.",
+            "evidence_ids": [evidence_id], "next_actions": [],
+        }),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["accepted"] is False
+    assert result["reason"] == "missing or invalid defect_assessment"
+    assert session.obligation_assessments.assessment("O1").disposition.value == "pending"
+
+
+def test_later_assessment_supersedes_one_lead_without_reusing_its_handle():
+    session = make_session(ScriptedGateway([]))
+    base = {"candidate_drafts": [], "summary": "Inspect the changed consequence."}
+
+    session._process_defect_assessment(
+        target="O1", arguments={"defect_assessment": {
+            **base, "result": "needs_followup",
+        }}, evidence_ids=(),
+    )
+    assert [item["lead"] for item in session._defect_leads] == ["L1"]
+
+    session._process_defect_assessment(
+        target="O1", arguments={"defect_assessment": {
+            **base, "result": "none_observed",
+        }}, evidence_ids=(),
+    )
+    assert session._defect_leads == []
+
+    session._process_defect_assessment(
+        target="O1", arguments={"defect_assessment": {
+            **base, "result": "needs_followup",
+        }}, evidence_ids=(),
+    )
+    assert [item["lead"] for item in session._defect_leads] == ["L2"]
+
+
+def test_obligation_resolution_accepts_valid_candidate_siblings_independently():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-candidate-drafts", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    valid = {
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
+        "severity": "major", "category": "correctness",
+        "supporting_evidence_ids": [evidence_id],
+        "contradicting_evidence_ids": [], "related_targets": ["O1"],
+        "consequence_support": reachable_consequence_support(),
+        "user_visible_consequence": "The operation returns the wrong state.",
+        "manual_validation": "Run the changed state-transition test.",
+    }
+    invalid = dict(valid)
+    invalid.pop("user_visible_consequence")
+
+    session._execute_calls(({
+        "id": "resolve-with-drafts", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O1", "disposition": "covered",
+            "reason": "The assigned implementation was inspected.",
+            "evidence_ids": [evidence_id], "next_actions": [],
+            "defect_assessment": {
+                "result": "candidates", "summary": "One concrete defect found.",
+                "candidate_drafts": [valid, invalid],
+            },
+        }),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["accepted"] is True
+    assert [item["accepted"] for item in result["candidate_results"]] == [True, False]
+    assert len(session.candidate_findings) == 1
+
+
+def test_candidate_draft_survives_rejected_obligation_resolution():
+    session = make_session(ScriptedGateway([]))
+    session._process_defect_assessment(
+        target="O2", arguments={"defect_assessment": {
+            "result": "needs_followup",
+            "summary": "A separate O2 defect lead still needs investigation.",
+            "candidate_drafts": [],
+        }}, evidence_ids=(),
+    )
+    session._execute_calls(({
+        "id": "read-independent-candidate", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    draft = {
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
+        "severity": "major", "category": "correctness",
+        "supporting_evidence_ids": [evidence_id],
+        "contradicting_evidence_ids": [], "related_targets": ["O1"],
+        "consequence_support": reachable_consequence_support(),
+        "user_visible_consequence": "The operation returns the wrong state.",
+        "manual_validation": "Run the changed state-transition test.",
+    }
+
+    session._execute_calls(({
+        "id": "reject-obligation-keep-candidate",
+        "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O2", "disposition": "covered",
+            "reason": "The tests were allegedly covered.",
+            "evidence_ids": [evidence_id], "next_actions": [],
+            "defect_assessment": {
+                "result": "candidates", "summary": "A separate defect was found.",
+                "candidate_drafts": [draft],
+            },
+        }),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["accepted"] is False
+    assert result["candidate_results"] == [{"accepted": True, "target": "C1"}]
+    assert tuple(item.claim for item in session.candidate_findings) == (
+        "The changed branch returns the wrong state.",
+    )
+    assert [item["target"] for item in session._defect_leads] == ["O2"]
+
+
+def test_followup_defect_lead_survives_memory_and_gets_one_final_synthesis_turn():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-defect-lead", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    final_candidate = {
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
+        "severity": "major", "category": "correctness",
+        "supporting_evidence_ids": [evidence_id],
+        "contradicting_evidence_ids": [], "related_targets": ["O1"],
+        "consequence_support": reachable_consequence_support(),
+        "user_visible_consequence": "The operation returns the wrong state.",
+        "manual_validation": "Run the changed state-transition test.",
+    }
+    gateway = ScriptedGateway([ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "candidate_drafts": [final_candidate], "dismissed_leads": [],
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 10, "completion_tokens": 20},
+        request_diagnostics={},
+    )])
+    session.gateway = gateway
+    session._execute_calls(({
+        "id": "retain-defect-lead", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O1", "disposition": "covered",
+            "reason": "The assigned implementation was inspected.",
+            "evidence_ids": [evidence_id], "next_actions": [],
+            "defect_assessment": {
+                "result": "needs_followup",
+                "summary": "The return-state consequence needs one synthesis pass.",
+                "candidate_drafts": [],
+            },
+        }),
+    },))
+
+    assert session._model_checkpoint_memory()["defect_leads"]
+
+    result = session.finalize()
+
+    assert len(gateway.requests) == 1
+    assert gateway.requests[0].tools_enabled is False
+    assert tuple(item.claim for item in session.candidate_findings) == (
+        "The changed branch returns the wrong state.",
+    )
+    assert result.report["candidate_finding_ids"]
+
+
+def test_final_synthesis_repairs_rejected_candidates_once_with_tools_disabled():
+    session = make_session(ScriptedGateway([]), model_turns=4)
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file",
+        arguments={"path": "a.py"},
+        result={"status": "ok", "content": "changed implementation"},
+        category="implementation", source="a.py",
+    )
+    base = {
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches the invalid branch.",
+        "severity": "major", "category": "correctness",
+        "supporting_evidence_ids": [record.id],
+        "contradicting_evidence_ids": [], "related_targets": ["O1"],
+        "user_visible_consequence": "The operation returns the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    }
+    rejected = {**base, "consequence_support": {
+        "kind": "affected_consumer",
+        "producer_evidence_id": record.id,
+        "consumer_evidence_id": "evidence:not-retained",
+        "outcome": "The operation returns the wrong state.",
+    }}
+    repaired = {**base, "consequence_support": {
+        "kind": "reachable_input_path",
+        "input": "changed state",
+        "condition": "invalid branch",
+        "outcome": "The operation returns the wrong state.",
+    }}
+    gateway = ScriptedGateway([
+        ModelTurnResult(
+            response={}, tool_calls=(), text=json.dumps({
+                "candidate_drafts": [rejected], "dismissed_leads": [],
+            }), text_source="content", finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 20},
+            request_diagnostics={},
+        ),
+        ModelTurnResult(
+            response={}, tool_calls=(), text=json.dumps({
+                "candidate_drafts": [repaired],
+            }), text_source="content", finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 20},
+            request_diagnostics={},
+        ),
+    ])
+    session.gateway = gateway
+    session._defect_leads = [{
+        "lead": "L1", "target": "O1", "summary": "Wrong-state lead",
+        "evidence_ids": [record.id],
+    }]
+
+    session._synthesize_defect_leads()
+
+    assert len(gateway.requests) == 2
+    assert all(request.tools_enabled is False for request in gateway.requests)
+    assert gateway.requests[1].messages_contain(
+        "affected_consumer.consumer_evidence_id"
+    )
+    assert len(session.candidate_findings) == 1
+    diagnostic = session._defect_synthesis_diagnostic
+    assert diagnostic["repair_attempted"] is True
+    assert diagnostic["initial_candidate_results"][0]["accepted"] is False
+    assert diagnostic["repair_candidate_results"] == [
+        {"accepted": True, "target": "C1"},
+    ]
+
+
+def test_final_synthesis_repairs_rejected_candidates_independently():
+    session = make_session(ScriptedGateway([]), model_turns=6)
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file",
+        arguments={"path": "a.py"},
+        result={"status": "ok", "content": "changed implementation"},
+        category="implementation", source="a.py",
+    )
+
+    def draft(claim):
+        return {
+            "claim": claim,
+            "affected_location": "a.py:4",
+            "causal_chain": "The changed state reaches the invalid branch.",
+            "severity": "major", "category": "correctness",
+            "supporting_evidence_ids": [record.id],
+            "contradicting_evidence_ids": [], "related_targets": ["O1"],
+            "consequence_support": {
+                "kind": "affected_consumer",
+                "producer_evidence_id": record.id,
+                "consumer_evidence_id": "evidence:not-retained",
+            },
+            "user_visible_consequence": "The operation returns the wrong state.",
+            "manual_validation": "Run the state transition test.",
+        }
+
+    first = draft("First rejected defect.")
+    second = draft("Second rejected defect.")
+    repaired = {
+        **first,
+        "consequence_support": {
+            "kind": "reachable_input_path",
+            "input": "changed state", "condition": "invalid branch",
+            "outcome": "The operation returns the wrong state.",
+        },
+    }
+    gateway = ScriptedGateway([
+        ModelTurnResult(
+            response={}, tool_calls=(), text=json.dumps({
+                "candidate_drafts": [first, second], "dismissed_leads": [],
+            }), text_source="content", finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 20},
+            request_diagnostics={},
+        ),
+        ModelTurnResult(
+            response={}, tool_calls=(), text=json.dumps({
+                "candidate_drafts": [repaired],
+            }), text_source="content", finish_reason="stop",
+            usage={"prompt_tokens": 10, "completion_tokens": 20},
+            request_diagnostics={},
+        ),
+        ModelTurnResult(
+            response={}, tool_calls=(), text='{"candidate_drafts":[',
+            text_source="content", finish_reason="length",
+            usage={"prompt_tokens": 10, "completion_tokens": 2_048},
+            request_diagnostics={},
+        ),
+    ])
+    session.gateway = gateway
+    session._defect_leads = [{
+        "lead": "L1", "target": "O1", "summary": "Wrong-state leads",
+        "evidence_ids": [record.id],
+    }]
+
+    session._synthesize_defect_leads()
+
+    assert len(gateway.requests) == 3
+    first_repair = json.loads(gateway.requests[1].messages)[-1]["content"]
+    second_repair = json.loads(gateway.requests[2].messages)[-1]["content"]
+    assert "First rejected defect" in first_repair
+    assert "Second rejected defect" not in first_repair
+    assert "Second rejected defect" in second_repair
+    assert "First rejected defect" not in second_repair
+    assert tuple(item.claim for item in session.candidate_findings) == (
+        "First rejected defect.",
+    )
+    diagnostic = session._defect_synthesis_diagnostic
+    assert diagnostic["repair_status"] == "partial"
+    assert diagnostic["repair_attempts"][0]["status"] == "valid"
+    assert diagnostic["repair_attempts"][1]["status"] == "output_limit"
+
+
+def test_candidate_tools_report_and_withdraw_with_short_session_handles():
+    session = make_session(ScriptedGateway([]))
+    tool_names = {item["name"] for item in session.conversation.tool_schemas}
+    before = session.budget.snapshot().tool_calls
+    session._execute_calls(({
+        "id": "read-candidate", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+
+    progressed = session._execute_calls(({
+        "id": "report-1", "name": "report_candidate",
+        "arguments": json.dumps({
+            "claim": "The changed branch returns the wrong state.",
+            "affected_location": "a.py:4",
+            "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
+            "severity": "major",
+            "category": "correctness",
+            "supporting_evidence_ids": [evidence_id],
+            "contradicting_evidence_ids": [],
+            "related_targets": ["O1"],
+            "consequence_support": reachable_consequence_support(),
+            "user_visible_consequence": "The operation returns the wrong state.",
+            "manual_validation": "Run the changed state-transition test.",
+        }),
+    },))
+
+    report = json.loads(session.conversation.events[-1]["content"])
+    assert {"report_candidate", "withdraw_candidate"}.issubset(tool_names)
+    assert progressed is True
+    assert report == {"accepted": True, "target": "C1"}
+    assert len(session.candidate_findings) == 1
+    candidate_id = session.candidate_findings[0].candidate_id
+    assert candidate_id != "C1"
+    assert session.budget.snapshot().tool_calls == before + 1
+
+    progressed = session._execute_calls(({
+        "id": "withdraw-1", "name": "withdraw_candidate",
+        "arguments": json.dumps({
+            "target": "C1",
+            "reason": "The later consumer evidence disproves reachability.",
+            "evidence_ids": [evidence_id],
+        }),
+    },))
+
+    withdrawal = json.loads(session.conversation.events[-1]["content"])
+    assert progressed is True
+    assert withdrawal == {"accepted": True, "target": "C1", "status": "withdrawn"}
+    assert session.candidate_findings == ()
+    payload = session._cumulative_checkpoint_payload()
+    assert payload["candidate_statuses"] == {"C1": "withdrawn"}
+    assert payload["candidate_withdrawals"]["C1"]["reason"].startswith(
+        "The later consumer evidence"
+    )
+
+
+def test_withdraw_candidate_rejects_unknown_or_foreign_handle():
+    session = make_session(ScriptedGateway([]))
+
+    progressed = session._execute_calls(({
+        "id": "withdraw-unknown", "name": "withdraw_candidate",
+        "arguments": json.dumps({"target": "C9", "reason": "Not this session."}),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert progressed is False
+    assert result == {
+        "accepted": False,
+        "target": "C9",
+        "reason": "unknown candidate target",
+    }
+
+
+def test_specialist_assignment_exposes_controller_obligation_handles():
+    assignment = SpecialistAssignment(
+        assignment_id="assignment-1",
+        objective="Review the assigned behavior",
+        primary_obligation_ids=("OB-code", "OB-tests"),
+        seed_paths=("a.py",),
+    )
+
+    prompt = specialist_assignment_prompt(assignment)
+    payload = json.loads(prompt.split("\n", 1)[1])
+
+    assert payload["obligation_targets"] == [
+        {"target": "O1", "obligation_id": "OB-code"},
+        {"target": "O2", "obligation_id": "OB-tests"},
+    ]
+    assert "Use the short target handles" in payload["obligation_protocol"]
+
+
+def test_checkpoint_repairs_only_missing_obligation_dispositions():
+    session = make_session(ScriptedGateway([
+        checkpoint_response(
+            inspected=[], unresolved=[],
+            obligation_updates=[], candidate_updates=[], new_candidates=[],
+        ),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ]))
+
+    result = session.request_checkpoint("checkpoint-retention-reserve")
+
+    assert result.degraded is False
+    repair_prompt = next(
+        event["content"] for event in session.conversation.events
+        if event.get("kind") == "user" and "Repair the previous checkpoint" in event["content"]
+    )
+    assert "Missing obligation decisions: O1, O2" in repair_prompt
+    assert '"pending_obligations"' in repair_prompt
+    assert '"target": "O1"' in repair_prompt
+    assert '"target": "O2"' in repair_prompt
+
+
+def test_checkpoint_repairs_partially_declared_pending_obligations():
+    session = make_session(ScriptedGateway([
+        checkpoint_response(
+            inspected=[], unresolved=["OB-code"],
+            obligation_updates=[], candidate_updates=[], new_candidates=[],
+        ),
+        checkpoint_response(
+            inspected=[], unresolved=["OB-code", "OB-tests"],
+            obligation_updates=[], candidate_updates=[], new_candidates=[],
+        ),
+    ]))
+
+    result = session.request_checkpoint("checkpoint-retention-reserve")
+
+    assert result.degraded is False
+    repair_prompt = next(
+        event["content"] for event in session.conversation.events
+        if event.get("kind") == "user" and "Repair the previous checkpoint" in event["content"]
+    )
+    assert "Missing obligation decisions: O2" in repair_prompt
+
+
+def test_checkpoint_normalizes_safe_obligation_update_aliases_and_defaults():
+    session = make_session(ScriptedGateway([]))
+    payload = {
+        "unresolved": [],
+        "obligation_updates": [
+            {"target": "O1", "status": "blocked", "notes": "Needs a consumer trace."},
+            {"target": "O2", "disposition": "blocked", "conclusion": "Tests remain unread."},
+        ],
+        "candidate_updates": [],
+        "new_candidates": [],
+        "unknowns": [],
+    }
+
+    checkpoint = session._checkpoint_from_text(json.dumps(payload))
+
+    assert checkpoint is not None
+    assessments = session.obligation_assessments.assessments()
+    assert [item.disposition.value for item in assessments] == ["blocked", "blocked"]
+    assert assessments[0].reason == "Needs a consumer trace."
+    assert assessments[0].evidence_ids == ()
+    assert assessments[0].next_actions == ()
+
+
+def test_checkpoint_records_precise_rejection_for_invalid_update():
+    session = make_session(ScriptedGateway([]))
+    payload = {
+        "unresolved": ["O2"],
+        "obligation_updates": [{"target": "O1", "status": "maybe"}],
+        "candidate_updates": [], "new_candidates": [], "unknowns": [],
+        "proposed_next_actions": ["Inspect the remaining test obligation."],
+    }
+
+    assert session._checkpoint_from_text(json.dumps(payload)) is not None
+    assert tuple(
+        (item.target, item.reason)
+        for item in session._last_checkpoint_rejections
+    ) == (("O1", "invalid or missing disposition"),)
+
+
+def test_checkpoint_schema_can_account_for_large_combined_assignment():
+    obligations = tuple(
+        CoverageObligation(
+            obligation_id=f"OB-{index}", origin="test", subject=f"src/{index}.py",
+            required_evidence_categories=("implementation",),
+            scope=(f"src/{index}.py",),
+        )
+        for index in range(16)
+    )
+    assignment = SpecialistAssignment(
+        assignment_id="large-assignment",
+        objective="Review the combined behavior",
+        primary_obligation_ids=tuple(item.id for item in obligations),
+    )
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=[], unresolved=[item.id for item in obligations],
+        ),
+    ])
+    session = make_session(
+        gateway, assignment=assignment, obligations=obligations,
+    )
+
+    session.request_checkpoint("checkpoint-retention-reserve")
+
+    schema = gateway.requests[0].response_schema
+    assert schema["properties"]["obligation_updates"]["maxItems"] >= 16
+
+
+def test_resolution_accepts_owned_full_id_and_stringified_array_arguments():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-1", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    read_result = json.loads(session.conversation.events[-1]["content"])
+
+    session._execute_calls(({
+        "id": "resolve-1", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "OB-code",
+            "disposition": "covered",
+            "reason": "The changed implementation preserves the contract.",
+            "evidence_ids": json.dumps([read_result["evidence_id"]]),
+            "next_actions": "[]",
+            "defect_assessment": {
+                "result": "none_observed", "summary": "No defect observed.",
+                "candidate_drafts": [],
+            },
+        }),
+    },))
+
+    proposal = json.loads(session.conversation.events[-1]["content"])
+    assert proposal == {
+        "accepted": True,
+        "target": "O1",
+        "disposition": "covered",
+        "reason": "accepted",
+        "eligible_evidence_ids": [read_result["evidence_id"]],
+        "ignored_supplemental_evidence_ids": [],
+        "candidate_results": [],
+        "defect_assessment": {
+            "result": "none_observed", "lead_retained": False,
+        },
+    }
+
+
+def test_repeated_identical_obligation_rejection_pauses_instead_of_compacting():
+    rejected = tool_call_response(
+        "propose_obligation_resolution",
+        {
+            "target": "not-assigned",
+            "disposition": "covered",
+            "reason": "The implementation was inspected.",
+            "evidence_ids": [],
+            "next_actions": [],
+            "defect_assessment": {
+                "result": "none_observed", "summary": "No defect observed.",
+                "candidate_drafts": [],
+            },
+        },
+        call_id="reject-1",
+    )
+    rejected_again = replace(
+        rejected,
+        tool_calls=({**rejected.tool_calls[0], "id": "reject-2"},),
+    )
+    gateway = ScriptedGateway([
+        rejected,
+        rejected_again,
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway, model_turns=6)
+
+    result = session.explore()
+
+    assert len(gateway.requests) == 3
+    assert result.state.value == "checkpoint"
+    assert session._finalization_diagnostics[-1]["reason"] == (
+        "repeated-obligation-rejection"
+    )
+    assert session._finalization_diagnostics[-1]["disposition"] == "pause"
+
+
+def test_targeted_read_retains_neutral_evidence_until_resolution_is_accepted():
+    session = make_session(ScriptedGateway([]))
+    read = {
+        "id": "read-1", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    }
+
+    session._execute_calls((read,))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["coverage_effect"] == "neutral_evidence_retained"
+    assert result["eligible_targets"] == ["O1"]
+    assert session.coverage.obligation_statuses()["OB-code"].value == "pending"
+
+    session._execute_calls(({
+        "id": "resolve-1", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O1", "disposition": "covered",
+            "reason": "The changed implementation preserves the contract.",
+            "evidence_ids": [result["evidence_id"]], "next_actions": [],
+            "defect_assessment": {
+                "result": "none_observed", "summary": "No defect observed.",
+                "candidate_drafts": [],
+            },
+        }),
+    },))
+
+    proposal = json.loads(session.conversation.events[-1]["content"])
+    assert proposal["accepted"] is True
+    assert session.coverage.obligation_statuses()["OB-code"].value == "pending"
+    assert session.obligation_assessments.assessment("O1").disposition.value == "covered"
+
+
+def test_untargeted_read_is_not_associated_with_every_current_gap():
+    session = make_session(ScriptedGateway([]))
+
+    session._execute_calls(({
+        "id": "read-1", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py"}),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["eligible_targets"] == []
+    assert session.evidence_store.snapshot().associations == ()
+
+
+def test_resolution_can_bind_untargeted_retained_evidence_when_scope_matches():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-1", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py"}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])[
+        "evidence_id"
+    ]
+
+    session._execute_calls(({
+        "id": "resolve-1", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O1", "disposition": "covered",
+            "reason": "The retained implementation matches the assigned scope.",
+            "evidence_ids": [evidence_id], "next_actions": [],
+            "defect_assessment": {
+                "result": "none_observed", "summary": "No defect observed.",
+                "candidate_drafts": [],
+            },
+        }),
+    },))
+
+    proposal = json.loads(session.conversation.events[-1]["content"])
+    assert proposal["accepted"] is True
+    assert session.obligation_assessments.assessment("O1").disposition.value == (
+        "covered"
+    )
+    assert session.evidence_store.snapshot().associations_for(
+        evidence_id, "OB-code",
+    )
+
+
+def test_resolution_does_not_bind_untargeted_evidence_outside_scope():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-1", "name": "read_file",
+        "arguments": json.dumps({"path": "tests/test_a.py"}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])[
+        "evidence_id"
+    ]
+
+    session._execute_calls(({
+        "id": "resolve-1", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O1", "disposition": "covered",
+            "reason": "Unrelated retained evidence should not prove the implementation.",
+            "evidence_ids": [evidence_id], "next_actions": [],
+            "defect_assessment": {
+                "result": "none_observed", "summary": "No defect observed.",
+                "candidate_drafts": [],
+            },
+        }),
+    },))
+
+    proposal = json.loads(session.conversation.events[-1]["content"])
+    assert proposal["accepted"] is False
+    assert proposal["reason"] == "covered requires eligible retained evidence"
+    assert not session.evidence_store.snapshot().associations_for(
+        evidence_id, "OB-code",
+    )
+
+
+def test_duplicate_targeted_read_reports_target_metadata_without_new_budget():
+    session = make_session(ScriptedGateway([]))
+    before = session.budget.snapshot().tool_calls
+    session._execute_calls(({
+        "id": "read-1", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py"}),
+    },))
+    session._execute_calls(({
+        "id": "read-2", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["replayed_duplicate"] is True
+    assert result["eligible_targets"] == ["O1"]
+    assert result["coverage_effect"] == "neutral_evidence_retained"
+    assert session.budget.snapshot().tool_calls == before + 1
+
+
+def test_obligation_state_tools_have_a_separate_bounded_allowance():
+    session = make_session(ScriptedGateway([]))
+
+    for index in range(session.OBLIGATION_LOCAL_TOOL_CALL_LIMIT + 1):
+        session._execute_calls(({
+            "id": f"explain-{index}", "name": "explain_obligation",
+            "arguments": json.dumps({"target": "O1"}),
+        },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["accepted"] is False
+    assert "allowance exhausted" in result["reason"]
+
+
+def test_checkpoint_obligation_update_uses_same_resolution_validator():
+    executor_result = {
+        "tool": "read_file", "status": "ok",
+        "result": {"content": "contents:a.py"},
+    }
+    evidence_id = canonical_evidence_key(
+        "read_file", {"path": "a.py"}, executor_result,
+    )
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py", "targets": ["O1"]}),
+        checkpoint_response(
+            inspected=["a.py"], unresolved=["OB-tests"],
+            obligation_updates=[{
+                "target": "O1", "disposition": "covered",
+                "reason": "The changed implementation preserves the contract.",
+                "evidence_ids": [evidence_id], "next_actions": [],
+            }],
+        ),
+    ])
+    session = make_session(gateway)
+
+    result = session.explore()
+
+    assessment = result.checkpoint.obligation_assessments[0]
+    assert assessment.disposition.value == "covered"
+    assert "OB-code" not in result.checkpoint.unknowns
+
+
+def test_checkpoint_resolution_associates_direct_evidence_and_ignores_supplement():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-direct", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py"}),
+    },))
+    direct_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    session._execute_calls(({
+        "id": "read-test", "name": "read_file",
+        "arguments": json.dumps({"path": "tests/test_a.py"}),
+    },))
+    supplemental_id = json.loads(session.conversation.events[-1]["content"])[
+        "evidence_id"
+    ]
+
+    checkpoint = session._checkpoint_from_text(json.dumps({
+        "unresolved": ["OB-tests"],
+        "obligation_updates": [{
+            "target": "O1", "disposition": "covered",
+            "reason": "The changed implementation preserves the contract.",
+            "evidence_ids": [direct_id, supplemental_id], "next_actions": [],
+        }],
+        "candidate_updates": [],
+        "new_candidates": [],
+        "proposed_next_actions": ["Inspect the remaining test obligation."],
+    }))
+
+    assert checkpoint is not None
+    assessment = session.obligation_assessments.assessment("O1")
+    assert assessment.disposition.value == "covered"
+    assert assessment.evidence_ids == (direct_id,)
+    assert session._last_checkpoint_evidence_receipts == ({
+        "target": "O1",
+        "eligible_evidence_ids": (direct_id,),
+        "ignored_supplemental_evidence_ids": (supplemental_id,),
+    },)
+
+
+def test_checkpoint_request_reports_ignored_supplemental_evidence_to_specialist():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-direct", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py"}),
+    },))
+    direct_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    session._execute_calls(({
+        "id": "read-test", "name": "read_file",
+        "arguments": json.dumps({"path": "tests/test_a.py"}),
+    },))
+    supplemental_id = json.loads(session.conversation.events[-1]["content"])[
+        "evidence_id"
+    ]
+    session.gateway = ScriptedGateway([checkpoint_response(
+        inspected=["a.py", "tests/test_a.py"],
+        unresolved=["OB-tests"],
+        obligation_updates=[{
+            "target": "O1", "disposition": "covered",
+            "reason": "The changed implementation preserves the contract.",
+            "evidence_ids": [direct_id, supplemental_id], "next_actions": [],
+        }],
+    )])
+
+    session.request_checkpoint()
+
+    receipts = [
+        event["content"] for event in session.conversation.events
+        if event["kind"] == "user"
+        and str(event["content"]).startswith("Checkpoint evidence receipt")
+    ]
+    assert len(receipts) == 1
+    assert direct_id in receipts[0]
+    assert supplemental_id in receipts[0]
+
+
+def test_invalid_checkpoint_obligation_batch_rolls_back_earlier_updates():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-1", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    payload = {
+        "unresolved": ["OB-tests"],
+        "obligation_updates": [{
+            "target": "O1", "disposition": "covered", "reason": "Covered.",
+            "evidence_ids": [evidence_id], "next_actions": [],
+        }, {
+            "target": "O99", "disposition": "blocked", "reason": "Unknown.",
+            "evidence_ids": [], "next_actions": [],
+        }],
+    }
+
+    checkpoint = session._checkpoint_from_text(json.dumps(payload))
+
+    assert checkpoint is None
+    assert session.obligation_assessments.assessment("O1").disposition.value == "pending"
+
+
+def test_provider_prompt_usage_calibrates_next_same_mode_admission():
+    gateway = EstimatingGateway(
+        [
+            checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+            checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        ],
+        rendered_bytes=32_000,
+        usages=(
+            {"prompt_tokens": 12_000, "completion_tokens": 100},
+            {"prompt_tokens": 8_000, "completion_tokens": 80},
+        ),
+    )
+    session = make_session(gateway, max_context_tokens=20_000)
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
+
+    session.request_checkpoint("controller-request")
+    session.request_checkpoint("controller-request")
+    estimate = session._estimate_admission(
+        tools_enabled=False, max_tokens=2_048,
+    )
+
+    assert estimate.source == "provider-calibrated"
+    assert estimate.input_tokens >= 12_000
+    assert session._admission_calibration["structured"].last_completion_tokens == 80
+    terminal = attempts.close_since(0)[-1]
+    assert terminal.admission_source == "provider-calibrated"
+    assert terminal.actual_prompt_tokens == 8_000
+    assert terminal.actual_completion_tokens == 80
+
+
+@pytest.mark.parametrize("streamed", (False, True))
+def test_provider_performance_reaches_attempts_and_checkpoint_resume_report(streamed):
+    from dataclasses import asdict
+    from pr_reviewer.sse_reassembler import reassemble_sse
+    from pr_reviewer.specialist_runtime.performance import performance_summary
+
+    response = {
+        "choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1000, "completion_tokens": 20,
+                  "prompt_tokens_details": {"cached_tokens": 900}},
+        "timings": {"prompt_n": 100, "prompt_ms": 250, "predicted_n": 20,
+                    "predicted_ms": 1000, "draft_n": 30, "draft_n_accepted": 15},
+    }
+    if streamed:
+        response = reassemble_sse(
+            'data: {"choices":[{"delta":{"content":"{}"}}]}\n'
+            + "data: " + json.dumps({**response, "choices": []}) + "\ndata: [DONE]", "openai",
+        )
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1", api_key="", default_model="local",
+        transport=lambda *_args, **_kwargs: response,
+    )
+    session = make_session(gateway)
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
+    for purpose, tools in (("exploration", True), ("checkpoint", False), ("exploration", True)):
+        session._request(tools_enabled=tools, schema=None, purpose=purpose)
+    rows = [asdict(item) for item in attempts.close_since(0)]
+    assert [row["performance_category"] for row in rows] == [
+        "exploration", "checkpoint", "checkpoint-resume",
+    ]
+    assert rows[-1]["cached_prompt_tokens"] == 900
+    assert rows[-1]["prefill_tokens"] == 100
+    assert rows[-1]["prefill_ms"] == 250
+    report = "\n".join(performance_summary(rows))
+    assert "Checkpoint resumes | 1 | 90.0% (1/1)" in report
+    assert "400.0 | 20.0 | 50.0%" in report
+
+
+@pytest.mark.parametrize("usage", (
+    {},
+    {"prompt_tokens": 0, "completion_tokens": 0},
+    {"prompt_tokens": -10, "completion_tokens": -2},
+    {"prompt_tokens": "12000", "completion_tokens": "100"},
+))
+def test_rendered_admission_falls_back_without_valid_provider_usage(usage):
+    gateway = EstimatingGateway(
+        [checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])],
+        rendered_bytes=6_001,
+        usages=(usage,),
+    )
+    session = make_session(gateway, max_context_tokens=20_000)
+
+    session.request_checkpoint("controller-request")
+    estimate = session._estimate_admission(
+        tools_enabled=True, max_tokens=2_048,
+    )
+
+    assert estimate.source == "rendered-fallback"
+    assert estimate.input_tokens == 2_001
+    assert estimate.admission_tokens == 2_001 + 2_048 + 256
+
+
+def test_provider_calibration_carries_from_structured_to_tools_mode():
+    gateway = EstimatingGateway(
+        [checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])],
+        rendered_bytes=32_000,
+        usages=({"prompt_tokens": 12_000, "completion_tokens": 100},),
+    )
+    session = make_session(gateway, max_context_tokens=20_000)
+
+    session.request_checkpoint("controller-request")
+    structured = session._estimate_admission(
+        tools_enabled=False, max_tokens=2_048,
+    )
+    tools = session._estimate_admission(
+        tools_enabled=True, max_tokens=2_048,
+    )
+
+    assert structured.source == "provider-calibrated"
+    assert tools.source == "provider-calibrated"
+    assert tools.input_tokens >= 12_000
+
+
+def test_actual_tool_prompt_usage_replaces_full_history_byte_fallback_for_checkpoint():
+    gateway = EstimatingGateway(
+        [checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])],
+        rendered_bytes=190_000,
+        usages=({"prompt_tokens": 46_459, "completion_tokens": 58},),
+    )
+    session = make_session(gateway, max_context_tokens=80_056)
+
+    session._request(
+        tools_enabled=True, schema=None, purpose="exploration",
+    )
+    gateway.rendered_bytes = 194_161
+    estimate = session._estimate_admission(
+        tools_enabled=False, max_tokens=8_192,
+    )
+
+    assert estimate.source == "provider-calibrated"
+    assert estimate.input_tokens < 52_000
+    assert estimate.input_tokens < 64_721
+
+
+def test_fractional_provider_usage_is_rounded_up_for_calibration():
+    gateway = EstimatingGateway(
+        [checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])],
+        rendered_bytes=32_000,
+        usages=({"prompt_tokens": 12_000.5, "completion_tokens": 100.25},),
+    )
+    session = make_session(gateway, max_context_tokens=20_000)
+
+    session.request_checkpoint("controller-request")
+
+    calibration = session._admission_calibration["structured"]
+    assert calibration.last_prompt_tokens == 12_001
+    assert calibration.last_completion_tokens == 101
 
 
 def test_model_gateway_exception_still_charges_reserved_turn():
     gateway = ScriptedGateway([RuntimeError("provider unavailable")])
     session = make_session(gateway)
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
 
     with pytest.raises(RuntimeError, match="provider unavailable"):
         session.explore()
@@ -170,12 +2413,324 @@ def test_model_gateway_exception_still_charges_reserved_turn():
         "started", "failed",
     )
     assert session._request_events[0].request_id == session._request_events[1].request_id
+    terminal = attempts.close_since(0)[0]
+    assert terminal.admission_tokens > terminal.input_tokens
+    assert terminal.actual_prompt_tokens == 0
+    assert terminal.actual_completion_tokens == 0
+
+
+def test_emergency_checkpoint_recovers_one_exploration_context_error():
+    provider_error = ModelRequestError(
+        "provider rejected request with HTTP 400: "
+        "api_key=super-secret context_length_exceeded",
+        status=400,
+        body='{"code":"context_length_exceeded"}',
+    )
+    gateway = ScriptedGateway([
+        provider_error,
+        checkpoint_response(
+            inspected=["0.py", "1.py", "2.py"],
+            unresolved=["OB-tests"],
+            working_summary="Recovered the accepted exploration state.",
+            proposed_next_actions=["Continue with the remaining test obligation."],
+        ),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    records = [
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"accepted-{index}",
+            path=f"{index}.py",
+            content=f"accepted evidence {index}",
+        )
+        for index in range(3)
+    ]
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
+
+    result = session.explore()
+
+    assert result.state.value == "checkpoint"
+    assert result.degraded is False
+    assert len(gateway.requests) == 2
+    assert [request.tools_enabled for request in gateway.requests] == [True, False]
+    assert gateway.requests[1].max_tokens == min(session.checkpoint_max_tokens, 2_048)
+    assert gateway.requests[1].reasoning_effort == "none"
+    first_messages = json.loads(gateway.requests[0].messages)
+    emergency_messages = json.loads(gateway.requests[1].messages)
+    assert emergency_messages[:-1] == first_messages
+    assert "Checkpoint reason: provider-context-limit." in emergency_messages[-1]["content"]
+    assert session._checkpoint_spans[-1].compacted is True
+    assert records[0].id in session._compacted_evidence
+    terminal_attempts = attempts.close_since(0)
+    assert [attempt.status for attempt in terminal_attempts] == ["failed", "completed"]
+    assert "context_length_exceeded" in terminal_attempts[0].error
+    assert "super-secret" not in terminal_attempts[0].error
+    assert result.budget.model_turns == 2
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["disposition"] == "compact_resume"
+    assert diagnostic["compaction_level"] == "emergency"
+    assert diagnostic["emergency_outcome"] == "checkpoint_succeeded"
+
+
+def test_report_candidate_rejection_returns_repair_hints_and_retains_lead():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-candidate", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    session._execute_calls(({
+        "id": "report-invalid", "name": "report_candidate",
+        "arguments": json.dumps({
+            "claim": "The changed branch returns the wrong state.",
+            "affected_location": "a.py:4",
+            "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
+            "severity": "major", "category": "correctness",
+            "supporting_evidence_ids": [evidence_id],
+            "contradicting_evidence_ids": [], "related_targets": ["O1"],
+            "consequence_support": {"kind": "reachable_input_path"},
+            "user_visible_consequence": "The operation returns the wrong state.",
+            "manual_validation": "Run the state transition test.",
+        }),
+    },))
+
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["accepted"] is False
+    assert result["retryable"] is True
+    assert result["failed_check"] == "reachable_input_path.input"
+    assert result["lead"].startswith("L-candidate-")
+    assert session._model_checkpoint_memory()["defect_leads"]
+
+
+def test_emergency_checkpoint_context_error_stops_without_a_third_request():
+    gateway = ScriptedGateway([
+        ModelRequestError("prompt too long", status=400),
+        ModelRequestError("maximum context exceeded", status=400),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+
+    result = session.explore()
+
+    assert len(gateway.requests) == 2
+    assert [request.tools_enabled for request in gateway.requests] == [True, False]
+    assert result.state.value == "checkpoint"
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+    assert result.budget.model_turns == 2
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["compaction_level"] == "none"
+    assert diagnostic["emergency_outcome"] == "failed_no_checkpoint"
+
+
+def test_emergency_checkpoint_context_error_uses_two_physical_provider_calls():
+    physical_payloads = []
+
+    def counting_transport(base_url, api_format, payload, api_key, timeout_sec):
+        physical_payloads.append(payload)
+        raise ModelRequestError(
+            "model provider rejected request: context_length_exceeded",
+            status=400,
+            body='{"code":"context_length_exceeded"}',
+        )
+
+    gateway = OpenAIModelGateway(
+        base_url="http://provider.test/v1",
+        api_key="test-key",
+        default_model="test-model",
+        transport=counting_transport,
+    )
+    session = make_session(gateway, max_context_tokens=100_000)
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
+
+    result = session.explore()
+
+    assert len(physical_payloads) == 2
+    assert "tools" in physical_payloads[0]
+    assert "tools" not in physical_payloads[1]
+    assert "response_format" in physical_payloads[1]
+    assert result.degraded is True
+    assert result.budget.model_turns == 2
+    assert [attempt.status for attempt in attempts.close_since(0)] == [
+        "failed", "failed",
+    ]
+
+
+def test_invalid_emergency_checkpoint_does_not_request_repair():
+    gateway = ScriptedGateway([
+        ModelRequestError("prompt too long", status=400),
+        invalid_response("not a valid checkpoint"),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+
+    result = session.explore()
+
+    assert len(gateway.requests) == 2
+    assert [request.tools_enabled for request in gateway.requests] == [True, False]
+    assert result.state.value == "checkpoint"
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+    assert result.budget.model_turns == 2
+
+
+def test_rejected_emergency_checkpoint_rolls_back_all_tentative_state():
+    rejected_candidate = (
+        '{"new_candidates":[{"candidate_id":"phantom-candidate",'
+        '"claim":"rejected emergency output"}]}'
+    )
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["a.py"],
+            unresolved=["OB-tests"],
+            working_summary="Prior validated state.",
+        ),
+        ModelRequestError("prompt too long", status=400),
+        invalid_response(rejected_candidate),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
+    session.request_checkpoint("controller-request", disposition="pause")
+    prior_signal = session._candidate_retention_signal
+
+    emergency_result = session.explore()
+
+    assert session._candidate_retention_signal == prior_signal
+    transcript = json.dumps(session.conversation.events, sort_keys=True)
+    assert "phantom-candidate" not in transcript
+    assert "rejected emergency output" not in transcript
+    assert "Checkpoint reason: provider-context-limit." not in transcript
+    emergency_diagnostic = emergency_result.finalization_diagnostics[-1]
+    assert emergency_diagnostic["initial_parse"] == "invalid"
+    assert emergency_diagnostic["fallback_projection"] is False
+    assert emergency_diagnostic["retention_unknown"] is False
+    failed_exploration = attempts.close_since(0)[1]
+    assert failed_exploration.purpose == "exploration"
+    assert failed_exploration.status == "failed"
+    assert "prompt too long" in failed_exploration.error
+
+    later_result = session.request_checkpoint("controller-request")
+
+    assert later_result.degraded is False
+    assert len(gateway.requests) == 4
+    assert [attempt.purpose for attempt in attempts.close_since(0)] == [
+        "checkpoint", "exploration", "checkpoint", "checkpoint",
+    ]
+
+
+def test_retention_losing_emergency_without_prior_reports_projected_fallback():
+    candidate_turn = tool_call_response(
+        "read_file", {"path": "a.py"}, call_id="candidate-before-pressure",
+    )
+    candidate_turn = ModelTurnResult(**{
+        **candidate_turn.__dict__,
+        "text": (
+                '{"new_candidates":[{"candidate_id":"candidate-unretained",'
+            '"claim":"material candidate before context pressure"}]}'
+        ),
+        "text_source": "content",
+    })
+    gateway = ScriptedGateway([
+        candidate_turn,
+        ModelRequestError("maximum context exceeded", status=400),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+
+    result = session.explore()
+
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+    assert len(gateway.requests) == 3
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["reason"] == "provider-context-limit"
+    assert diagnostic["initial_parse"] == "valid"
+    assert diagnostic["repair_attempted"] is False
+    assert diagnostic["repair_parse"] == "not_attempted"
+    assert diagnostic["fallback_projection"] is True
+    assert diagnostic["retention_unknown"] is True
+
+
+def test_failed_emergency_checkpoint_reconstructs_previous_valid_checkpoint():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["a.py"],
+            unresolved=["OB-tests"],
+            working_summary="Prior validated state.",
+        ),
+        ModelRequestError("too many tokens", status=400),
+        ModelRequestError("context size exceeded", status=400),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.request_checkpoint("controller-request", disposition="pause")
+    previous_checkpoint = session.latest_checkpoint
+
+    result = session.explore()
+
+    assert len(gateway.requests) == 3
+    assert [request.tools_enabled for request in gateway.requests] == [
+        False, True, False,
+    ]
+    assert result.state.value == "checkpoint"
+    assert result.degraded is False
+    assert result.checkpoint == previous_checkpoint
+    assert any(
+        event.get("emergency_reconstruction")
+        for event in session.conversation.events
+    )
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["compaction_level"] == "emergency_reconstruction"
+    assert diagnostic["emergency_outcome"] == "fallback_reconstructed"
+    assert diagnostic["compaction_input_tokens_before"] > 0
+    assert diagnostic["compaction_input_tokens_after"] > 0
+    assert session.finalize().degraded is False
+
+
+def test_rejected_emergency_projection_does_not_poison_prior_checkpoint_finalization():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["a.py"], unresolved=["OB-tests"],
+            working_summary="Prior validated state.",
+        ),
+        ModelRequestError("too many tokens", status=400),
+        invalid_response("not a checkpoint"),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.request_checkpoint("controller-request", disposition="pause")
+
+    recovered = session.explore()
+
+    assert recovered.degraded is False
+    assert session.finalize().degraded is False
+
+
+def test_emergency_checkpoint_guard_is_session_lifetime():
+    gateway = ScriptedGateway([
+        ModelRequestError("prompt too long", status=400),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        ModelRequestError("too many tokens", status=400),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+
+    first = session.explore()
+    second = session.explore()
+
+    assert first.degraded is False
+    assert second.state.value == "checkpoint"
+    assert len(gateway.requests) == 3
+    assert [request.tools_enabled for request in gateway.requests] == [
+        True, False, True,
+    ]
 
 
 def test_session_result_reports_each_actual_request_transition_once():
     gateway = ScriptedGateway([
         checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
-        final_response(),
+        invalid_response('{"obligation_updates":[]}'),
     ])
     session = make_session(gateway)
 
@@ -193,12 +2748,10 @@ def test_session_result_reports_each_actual_request_transition_once():
     request_pairs = {}
     for event in final.request_events:
         request_pairs.setdefault(event.request_id, []).append(event.status)
-    assert tuple(request_pairs.values()) == (
-        ["started", "completed"], ["started", "completed"],
-    )
+    assert tuple(request_pairs.values()) == (["started", "completed"],) * 2
 
 
-def test_exploration_budget_note_is_ephemeral_and_updates_per_turn():
+def test_exploration_budget_is_enforced_without_wire_budget_notes():
     gateway = ScriptedGateway([
         tool_call_response("read_file", {"path": "a.py"}),
         checkpoint_response(inspected=["a.py"], unresolved=[]),
@@ -208,22 +2761,17 @@ def test_exploration_budget_note_is_ephemeral_and_updates_per_turn():
     session.explore()
 
     first, second = gateway.requests
-    assert first.ephemeral_user_note == (
-        "Exploration budget before this turn: 4 model turns and 4 tool calls remain. "
-        "Prioritize unresolved correctness risks. Do not repeat completed checks."
-    )
-    assert second.ephemeral_user_note == (
-        "Exploration budget before this turn: 3 model turns and 3 tool calls remain. "
-        "Prioritize unresolved correctness risks. Do not repeat completed checks."
-    )
+    assert first.ephemeral_user_note is None
+    assert second.ephemeral_user_note is None
     assert "Exploration budget before this turn" not in json.dumps(session.conversation.events)
 
 
 def test_invalid_exploration_stop_forces_checkpoint_before_later_finalization():
     gateway = ScriptedGateway([
         invalid_response("plain-text conclusion"),
+        invalid_response("I still need to inspect the external contract."),
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
-        final_response(),
+        invalid_response('{"obligation_updates":[]}'),
     ])
     session = make_session(gateway)
 
@@ -232,14 +2780,1132 @@ def test_invalid_exploration_stop_forces_checkpoint_before_later_finalization():
 
     assert checkpoint.state.value == "checkpoint"
     assert final.state.value == "complete"
-    assert [request.tools_enabled for request in gateway.requests] == [True, False, False]
-    assert gateway.requests[1].messages_contain("Checkpoint requested (not a final report)")
-    assert gateway.requests[2].messages_contain("Finalize this specialist assessment once")
+    assert [request.tools_enabled for request in gateway.requests] == [True, True, False, False]
+    assert gateway.requests[1].messages_contain(
+        "Call the next required tool now, or return a checkpoint"
+    )
+    assert gateway.requests[2].messages_contain("Checkpoint requested (not a final report)")
+
+
+def test_length_cutoff_gets_one_tools_enabled_continuation_before_checkpoint():
+    cutoff = invalid_response("I need to inspect the downstream caller next.")
+    cutoff = ModelTurnResult(**{
+        **cutoff.__dict__, "finish_reason": "length",
+    })
+    gateway = ScriptedGateway([
+        cutoff,
+        invalid_response("No tool call was emitted."),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+
+    result = make_session(gateway).explore()
+
+    assert result.degraded is False
+    assert [request.tools_enabled for request in gateway.requests] == [True, True, False]
+    assert gateway.requests[1].messages_contain(
+        "previous exploration response reached its output limit"
+    )
+
+
+def test_finalization_closes_from_valid_checkpoint_without_model_call():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=[], obligation_updates=[
+            {"target": target, "disposition": "blocked", "reason": "Source unavailable",
+             "evidence_ids": [], "next_actions": []} for target in ("O1", "O2")
+        ]),
+    ])
+    session = make_session(gateway)
+
+    session.explore()
+    result = session.finalize()
+
+    assert result.degraded is False
+    assert result.report["source"] == "checkpoint-finalization"
+    assert len(gateway.requests) == 1
+
+
+def test_finalization_recovers_checkpoint_after_interrupted_exploration():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        invalid_response('{"obligation_updates":[]}'),
+    ])
+    session = make_session(gateway)
+    session.mark_exploration_interrupted()
+
+    result = session.finalize()
+
+    assert result.state is SessionState.COMPLETE
+    assert result.report["source"] == "checkpoint-finalization"
+    assert len(gateway.requests) == 2
+    assert gateway.requests[0].tools_enabled is False
+    assert gateway.requests[0].messages_contain("interrupted-exploration")
+
+
+def test_checkpoint_derives_candidate_ids_from_candidate_objects():
+    response = candidate_checkpoint_response(["candidate-code"])
+    payload = json.loads(response.text)
+    payload.pop("candidate_finding_ids", None)
+    response = ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps(payload),
+        text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    session = make_session(ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        response,
+    ]))
+
+    result = session.explore()
+
+    assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
+
+
+def test_checkpoint_repairs_candidate_missing_actionable_severity():
+    invalid = json.loads(candidate_checkpoint_response(("candidate-code",)).text)
+    invalid["new_candidates"][0].pop("severity")
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        ModelTurnResult(
+            response={}, tool_calls=(), text=json.dumps(invalid),
+            text_source="content", finish_reason="stop",
+            usage={"prompt_tokens": 3, "completion_tokens": 2},
+            request_diagnostics={},
+        ),
+        candidate_checkpoint_response(("candidate-code",)),
+    ])
+    session = make_session(gateway)
+
+    result = session.explore()
+
+    assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
+    assert session.candidate_findings[0].severity == "major"
+    repair_prompts = [
+        event["content"] for event in session.conversation.events
+        if event.get("kind") == "user"
+        and "Repair the previous checkpoint" in event.get("content", "")
+    ]
+    assert repair_prompts
+    assert "severity" in repair_prompts[-1]
+
+
+def test_checkpoint_carries_forward_candidates_when_update_arrays_are_empty():
+    """Unchanged candidates remain active without replaying their full objects."""
+    initial = candidate_checkpoint_response(("candidate-code",))
+    second = candidate_update_checkpoint_response(updates=(), new_candidates=())
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        second,
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    first = session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    second_result = session.explore()
+
+    assert first.checkpoint.candidate_finding_ids == ("candidate-code",)
+    assert second_result.checkpoint.candidate_finding_ids == ("candidate-code",)
+    assert second_result.degraded is False
+
+
+def test_checkpoint_retains_bounded_cumulative_working_state():
+    """Recovery working state survives checkpoint parsing within hard bounds."""
+    gateway = ScriptedGateway([checkpoint_response(
+        inspected=["a.py"],
+        unresolved=["OB-tests"],
+        working_summary=(
+            "The input reaches the controller through config validation. "
+            + "x" * 2_000
+        ),
+        completed_steps=[
+            "Compared action input and config fallback; values agree.",
+            *[f"step-{index}: " + "y" * 600 for index in range(12)],
+        ],
+        hypotheses=[
+            "Recovery authorization still needs a boundary test.",
+            *[f"hypothesis-{index}" for index in range(12)],
+        ],
+        invariants_evaluated=[
+            "Lifetime budget is not reset by follow-up.",
+        ],
+        proposed_next_actions=[
+            "Inspect the recovery authorization test.",
+        ],
+    )])
+
+    result = make_session(gateway).request_checkpoint("controller-request")
+
+    assert result.checkpoint.working_summary.startswith("The input reaches")
+    assert len(result.checkpoint.working_summary) == 2_000
+    assert result.checkpoint.completed_steps == (
+        "Compared action input and config fallback; values agree.",
+        ("step-0: " + "y" * 492),
+        ("step-1: " + "y" * 492),
+        ("step-2: " + "y" * 492),
+        ("step-3: " + "y" * 492),
+        ("step-4: " + "y" * 492),
+        ("step-5: " + "y" * 492),
+        ("step-6: " + "y" * 492),
+        ("step-7: " + "y" * 492),
+        ("step-8: " + "y" * 492),
+        ("step-9: " + "y" * 492),
+        ("step-10: " + "y" * 491),
+    )
+    assert result.checkpoint.hypotheses == (
+        "Recovery authorization still needs a boundary test.",
+        *[f"hypothesis-{index}" for index in range(11)],
+    )
+    assert result.checkpoint.invariants_evaluated == (
+        "Lifetime budget is not reset by follow-up.",
+    )
+    assert result.checkpoint.proposed_next_actions == (
+        "Inspect the recovery authorization test.",
+    )
+
+
+def test_cumulative_checkpoint_payload_materializes_omitted_candidates():
+    """Reconstruction gets controller-owned state without candidate replay."""
+    initial = candidate_checkpoint_response(("candidate-code",))
+    updated = candidate_update_checkpoint_response(
+        updates=(), new_candidates=(),
+    )
+    updated_payload = json.loads(updated.text)
+    updated_payload.update({
+        "working_summary": "The retained candidate still needs a boundary test.",
+        "completed_steps": ["Collected implementation evidence for a.py."],
+        "hypotheses": ["The candidate remains reachable."],
+        "invariants_evaluated": ["Coverage evidence remains retained."],
+        "proposed_next_actions": ["Inspect the boundary test."],
+    })
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        ModelTurnResult(**{**updated.__dict__, "text": json.dumps(updated_payload)}),
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    session.request_checkpoint("controller-request")
+    payload = session._cumulative_checkpoint_payload()
+
+    assert payload["latest_checkpoint"]["working_summary"] == (
+        "The retained candidate still needs a boundary test."
+    )
+    assert payload["latest_checkpoint"]["completed_steps"] == [
+        "Collected implementation evidence for a.py.",
+    ]
+    assert payload["candidate_findings"][0]["candidate_id"] == "C1"
+    assert payload["candidate_statuses"] == {"C1": "active"}
+    assert payload["latest_checkpoint"]["evidence_ids"]
+    assert payload["coverage"]["obligation_statuses"]["OB-code"] == "pending"
+    assert payload["evidence_metadata"][0]["id"].startswith("evidence:")
+    assert "content" not in payload["evidence_metadata"][0]
+
+
+def test_sparse_checkpoint_preserves_prior_cumulative_working_state():
+    """Omitting optional working fields cannot erase continuation memory."""
+    initial = checkpoint_response(
+        inspected=[],
+        unresolved=["OB-tests"],
+        working_summary="The controller input was validated.",
+        completed_steps=["Compared action input and config fallback."],
+        hypotheses=["The fallback remains reachable."],
+        invariants_evaluated=["Lifetime budget is cumulative."],
+        proposed_next_actions=["Inspect the authorization boundary."],
+    )
+    sparse_payload = json.loads(checkpoint_response(
+        inspected=[], unresolved=["OB-tests"],
+    ).text)
+    for field in (
+        "working_summary", "completed_steps", "hypotheses",
+        "invariants_evaluated", "proposed_next_actions",
+    ):
+        sparse_payload.pop(field, None)
+    sparse = ModelTurnResult(**{
+        **initial.__dict__, "text": json.dumps(sparse_payload),
+    })
+    session = make_session(ScriptedGateway([initial, sparse]), model_turns=4)
+
+    first = session.request_checkpoint("controller-request")
+    second = session.request_checkpoint("controller-request")
+
+    assert second.checkpoint.working_summary == first.checkpoint.working_summary
+    assert second.checkpoint.completed_steps == first.checkpoint.completed_steps
+    assert second.checkpoint.hypotheses == first.checkpoint.hypotheses
+    assert second.checkpoint.invariants_evaluated == first.checkpoint.invariants_evaluated
+    assert second.checkpoint.proposed_next_actions == first.checkpoint.proposed_next_actions
+
+
+def test_invalid_late_checkpoint_and_recovery_preserve_prior_working_state():
+    """An invalid late checkpoint pauses on the prior validated state."""
+    initial = checkpoint_response(
+        inspected=[],
+        unresolved=["OB-tests"],
+        working_summary="The controller input was validated.",
+        completed_steps=["Compared action input and config fallback."],
+        hypotheses=["The fallback remains reachable."],
+        invariants_evaluated=["Lifetime budget is cumulative."],
+        proposed_next_actions=["Inspect the authorization boundary."],
+    )
+    session = make_session(ScriptedGateway([
+        initial,
+        invalid_response(),
+        invalid_response(),
+    ]), model_turns=4)
+
+    first = session.request_checkpoint("controller-request")
+    fallback = session.request_checkpoint("controller-request")
+    session.recover("repetitive-transcript")
+
+    assert fallback.degraded is False
+    assert fallback.finalization_diagnostics[-1]["retained_prior_checkpoint"] is True
+    assert fallback.checkpoint.working_summary == first.checkpoint.working_summary
+    assert fallback.checkpoint.completed_steps == first.checkpoint.completed_steps
+    assert fallback.checkpoint.hypotheses == first.checkpoint.hypotheses
+    assert fallback.checkpoint.invariants_evaluated == first.checkpoint.invariants_evaluated
+    assert fallback.checkpoint.proposed_next_actions == first.checkpoint.proposed_next_actions
+    assert "The controller input was validated." in json.dumps(session.conversation.events)
+
+
+def test_checkpoint_withdraws_known_candidate_only_with_explicit_update():
+    """Omission does not withdraw a candidate; an explicit update does."""
+    initial = candidate_checkpoint_response(("candidate-code",))
+    withdrawn = candidate_update_checkpoint_response(updates=({
+        "candidate_id": "candidate-code",
+        "status": "withdrawn",
+        "reason": "The suspected path is unreachable.",
+        "evidence_ids": [],
+    },))
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        withdrawn,
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    result = session.explore()
+
+    assert result.checkpoint.candidate_finding_ids == ()
+    assert session.candidate_findings == ()
+    assert result.degraded is False
+
+
+def test_checkpoint_accepts_new_candidates_separately_from_updates():
+    """New candidates use the dedicated array and become active state."""
+    initial = candidate_update_checkpoint_response()
+    candidate_payload = json.loads(candidate_checkpoint_response(("candidate-new",)).text)
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        ModelTurnResult(**{
+            **initial.__dict__,
+            "text": json.dumps({
+                "inspected": ["a.py"],
+                "unresolved": ["OB-tests"],
+                "candidate_updates": [],
+                "new_candidates": candidate_payload["new_candidates"],
+                "unknowns": ["OB-tests"],
+                "proposed_next_actions": [
+                    "Inspect the remaining behavioral test obligation.",
+                ],
+            }),
+        }),
+    ])
+    session = make_session(gateway, model_turns=5)
+
+    session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    result = session.explore()
+
+    assert result.checkpoint.candidate_finding_ids == ("candidate-new",)
+    assert result.degraded is False
+
+
+def test_checkpoint_prompt_contains_compact_active_candidate_register():
+    """Checkpoint requests expose short handles instead of requiring full replay."""
+    gateway = ScriptedGateway([
+        candidate_update_checkpoint_response(),
+    ])
+    session = make_session(gateway)
+
+    session.request_checkpoint("controller-request")
+
+    prompt = gateway.requests[0].messages
+    assert "candidate_updates" in prompt
+    assert "new_candidates" in prompt
+    assert "Active candidates" in prompt
+
+
+def test_checkpoint_prompt_lists_controller_owned_obligation_state():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway)
+    session._execute_calls(({
+        "id": "resolve-1", "name": "propose_obligation_resolution",
+        "arguments": json.dumps({
+            "target": "O1",
+            "disposition": "unresolved",
+            "reason": "A consumer trace is still required.",
+            "evidence_ids": [],
+            "next_actions": ["Trace the changed producer into its consumer."],
+            "defect_assessment": {
+                "result": "needs_followup",
+                "summary": "The consumer consequence still needs investigation.",
+                "candidate_drafts": [],
+            },
+        }),
+    },))
+
+    session.request_checkpoint("controller-request")
+
+    prompt = json.loads(gateway.requests[0].messages)[-1]["content"]
+    assert '"pending_obligations": [{"required_evidence": ["tests"], ' in prompt
+    assert '"subject": "tests/test_a.py", "target": "O2"' in prompt
+    assert '"accepted_obligations": [{"disposition": "unresolved", ' in prompt
+    assert '"target": "O1"' in prompt
+    assert '"disposition":"not_applicable"' in prompt
+    assert '"state"' not in prompt
+
+
+def test_checkpoint_generation_schema_omits_legacy_candidate_findings():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway)
+
+    session.request_checkpoint("controller-request")
+
+    schema = gateway.requests[0].response_schema
+    assert "candidate_findings" not in schema["properties"]
+    assert "new_candidates" in schema["properties"]
+    prompt = json.loads(gateway.requests[0].messages)[-1]["content"]
+    assert 'legacy "candidate_findings"' not in prompt
+
+
+def test_checkpoint_parser_drops_unadvertised_candidate_findings():
+    session = make_session(ScriptedGateway([]))
+    payload = {
+        "unresolved": ["OB-code", "OB-tests"],
+        "candidate_findings": [],
+        "candidate_updates": [],
+        "new_candidates": [],
+        "unknowns": [],
+        "proposed_next_actions": [
+            "Inspect the remaining implementation and test obligations.",
+        ],
+    }
+
+    checkpoint = session._checkpoint_from_text(json.dumps(payload))
+
+    assert checkpoint is not None
+    assert "candidate_findings" in session._last_checkpoint_dropped_keys
+
+
+def test_checkpoint_partially_accepts_obligations_and_repairs_only_rejections():
+    initial = checkpoint_response(
+        inspected=[], unresolved=[],
+        obligation_updates=[
+            {
+                "target": "O1", "disposition": "covered",
+                "reason": "Claimed without eligible evidence.",
+                "evidence_ids": [], "next_actions": [],
+            },
+            {
+                "target": "O2", "disposition": "blocked",
+                "reason": "The required external fixture is unavailable.",
+                "evidence_ids": [], "next_actions": [],
+            },
+        ],
+        candidate_updates=[], new_candidates=[], unknowns=[],
+        working_summary="The implementation and tests were inspected.",
+        completed_steps=["Inspected both assigned paths."],
+    )
+    correction = ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "unresolved": ["O1"],
+            "obligation_updates": [],
+            "candidate_updates": [],
+            "new_candidates": [],
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    gateway = ScriptedGateway([initial, correction])
+    session = make_session(gateway)
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert result.checkpoint.working_summary == "The implementation and tests were inspected."
+    assessments = session.obligation_assessments.assessments()
+    assert assessments[0].disposition.value == "pending"
+    assert assessments[1].disposition.value == "blocked"
+    assert len(gateway.requests) == 2
+    correction_request = gateway.requests[1]
+    assert set(correction_request.response_schema["properties"]) == {
+        "unresolved", "obligation_updates", "candidate_updates", "new_candidates",
+    }
+    correction_prompt = json.loads(correction_request.messages)[-1]["content"]
+    assert "Checkpoint memory accepted" in correction_prompt
+    assert "O1 rejected: covered requires retained evidence" in correction_prompt
+    assert "O2 rejected" not in correction_prompt
+    receipt = session.conversation.events[-1]["content"]
+    assert "Correction result" in receipt
+    assert "O1 remains unresolved" in receipt
+    assert "O2" in receipt and "blocked" in receipt
+
+
+def test_checkpoint_repairs_only_obligation_declared_updated_and_unresolved():
+    initial = checkpoint_response(
+        inspected=[], unresolved=["O1"],
+        obligation_updates=[
+            {
+                "target": "O1", "disposition": "covered",
+                "reason": "The implementation was inspected.",
+                "evidence_ids": [], "next_actions": [],
+            },
+            {
+                "target": "O2", "disposition": "blocked",
+                "reason": "The external fixture is unavailable.",
+                "evidence_ids": [], "next_actions": ["Obtain the fixture."],
+            },
+        ],
+    )
+    correction = ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "unresolved": ["O1"], "obligation_updates": [],
+            "candidate_updates": [], "new_candidates": [],
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    gateway = ScriptedGateway([initial, correction])
+    session = make_session(gateway)
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert len(gateway.requests) == 2
+    correction_prompt = json.loads(gateway.requests[1].messages)[-1]["content"]
+    assert (
+        "O1 rejected: target appears in both unresolved and obligation_updates"
+        in correction_prompt
+    )
+    assert "O2 rejected" not in correction_prompt
+    assert session.obligation_assessments.assessment("O2").disposition.value == (
+        "blocked"
+    )
+
+
+def test_checkpoint_rejects_terminal_obligation_update_with_next_actions():
+    initial = checkpoint_response(
+        inspected=[], unresolved=["O2"],
+        obligation_updates=[{
+            "target": "O1", "disposition": "covered",
+            "reason": "The implementation was inspected.",
+            "evidence_ids": [],
+            "next_actions": ["Verify the remaining external contract."],
+        }],
+    )
+    correction = ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "unresolved": ["O1"], "obligation_updates": [],
+            "candidate_updates": [], "new_candidates": [],
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    gateway = ScriptedGateway([initial, correction])
+
+    result = make_session(gateway).request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    correction_prompt = json.loads(gateway.requests[1].messages)[-1]["content"]
+    assert "O1 rejected: covered cannot include next_actions" in correction_prompt
+
+
+def test_checkpoint_partially_accepts_candidates_and_repairs_only_rejected_draft():
+    session = make_session(ScriptedGateway([]))
+    record = seed_successful_tool_exchange(
+        session, call_id="candidate-evidence", path="a.py",
+        content="The changed branch returns the wrong state.",
+    )
+    base_candidate = {
+        "candidate_id": "candidate-good",
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
+        "severity": "major",
+        "supporting_evidence_ids": [record.id],
+        "related_obligation_ids": ["O1"],
+        "consequence_support": reachable_consequence_support(
+            outcome="caller receives the wrong state",
+        ),
+        "user_visible_consequence": "The caller receives the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    }
+    rejected_candidate = {**base_candidate, "candidate_id": "candidate-bad"}
+    rejected_candidate.pop("user_visible_consequence")
+    initial = checkpoint_response(
+        inspected=[], unresolved=["OB-code", "OB-tests"],
+        obligation_updates=[], candidate_updates=[],
+        new_candidates=[base_candidate, rejected_candidate], unknowns=[],
+    )
+    correction = ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "unresolved": [], "obligation_updates": [],
+            "candidate_updates": [], "new_candidates": [],
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    gateway = ScriptedGateway([initial, correction])
+    session.gateway = gateway
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert tuple(item.candidate_id for item in session.candidate_findings) == (
+        "candidate-good",
+    )
+    assert session.candidate_findings[0].related_obligation_ids == ("OB-code",)
+    assert len(gateway.requests) == 2
+    correction_prompt = json.loads(gateway.requests[1].messages)[-1]["content"]
+    assert "candidate-bad rejected" in correction_prompt
+    assert "missing required candidate fields: user_visible_consequence" in correction_prompt
+    assert '"failed_check": "candidate.user_visible_consequence"' in correction_prompt
+    assert record.id in correction_prompt
+    assert "candidate-good rejected" not in correction_prompt
+    assert any(
+        "candidate-bad" in str(event.get("content") or "")
+        for event in session.conversation.events
+    )
+
+
+def test_checkpoint_repairs_each_rejected_candidate_in_a_focused_turn():
+    session = make_session(ScriptedGateway([]), model_turns=5)
+    record = seed_successful_tool_exchange(
+        session, call_id="candidate-evidence", path="a.py",
+        content="The changed branch returns the wrong state.",
+    )
+    base = {
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
+        "severity": "major",
+        "supporting_evidence_ids": [record.id],
+        "related_obligation_ids": ["O1"],
+        "consequence_support": reachable_consequence_support(
+            outcome="caller receives the wrong state",
+        ),
+        "manual_validation": "Run the state transition test.",
+    }
+    rejected_one = {**base, "candidate_id": "candidate-one"}
+    rejected_two = {**base, "candidate_id": "candidate-two"}
+    corrected_one = {
+        **rejected_one,
+        "user_visible_consequence": "The caller receives the wrong state.",
+    }
+    corrected_two = {
+        **rejected_two,
+        "claim": "The changed branch returns a stale state.",
+        "user_visible_consequence": "The caller receives a stale state.",
+    }
+    initial = checkpoint_response(
+        inspected=[], unresolved=["OB-code", "OB-tests"],
+        obligation_updates=[], candidate_updates=[],
+        new_candidates=[rejected_one, rejected_two], unknowns=[],
+    )
+
+    def correction(candidate):
+        return ModelTurnResult(
+            response={}, tool_calls=(), text=json.dumps({
+                "unresolved": [], "obligation_updates": [],
+                "candidate_updates": [], "new_candidates": [candidate],
+            }), text_source="content", finish_reason="stop",
+            usage={"prompt_tokens": 3, "completion_tokens": 2},
+            request_diagnostics={},
+        )
+
+    gateway = ScriptedGateway([
+        initial, correction(corrected_one), correction(corrected_two),
+    ])
+    session.gateway = gateway
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert len(gateway.requests) == 3
+    first_prompt = json.loads(gateway.requests[1].messages)[-1]["content"]
+    second_prompt = json.loads(gateway.requests[2].messages)[-1]["content"]
+    assert "candidate-one rejected" in first_prompt
+    assert "candidate-two rejected" not in first_prompt
+    assert "candidate-two rejected" in second_prompt
+    assert "candidate-one rejected" not in second_prompt
+    assert {item.candidate_id for item in session.candidate_findings} == {
+        "candidate-one", "candidate-two",
+    }
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["change_correction_attempt_count"] == 2
+    assert diagnostic["change_correction_valid_count"] == 2
+    assert diagnostic["change_correction_parse"] == "valid"
+
+
+def test_checkpoint_receipt_explains_a_rejected_candidate_correction():
+    session = make_session(ScriptedGateway([]), model_turns=3)
+    record = seed_successful_tool_exchange(
+        session, call_id="candidate-evidence", path="a.py",
+        content="The changed branch returns the wrong state.",
+    )
+    candidate = {
+        "candidate_id": "candidate-one",
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
+        "severity": "major",
+        "supporting_evidence_ids": [record.id],
+        "related_obligation_ids": ["O1"],
+        "consequence_support": {
+            "kind": "affected_consumer",
+            "producer_evidence_id": record.id,
+            "consumer_evidence_id": "evidence:not-retained",
+        },
+        "user_visible_consequence": "The caller receives the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    }
+    initial_candidate = dict(candidate)
+    initial_candidate.pop("user_visible_consequence")
+    initial = checkpoint_response(
+        inspected=[], unresolved=["OB-code", "OB-tests"],
+        obligation_updates=[], candidate_updates=[],
+        new_candidates=[initial_candidate], unknowns=[],
+    )
+    correction = ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "unresolved": [], "obligation_updates": [],
+            "candidate_updates": [], "new_candidates": [candidate],
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    session.gateway = ScriptedGateway([initial, correction])
+
+    result = session.request_checkpoint("controller-request")
+
+    receipt = session.conversation.events[-1]["content"]
+    assert "candidate-one remains rejected and inactive" in receipt
+    assert "affected_consumer.consumer_evidence_id" in receipt
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["change_correction_parse"] == "valid"
+    assert diagnostic["change_correction_rejected_count"] == 1
+    assert any(
+        "affected_consumer.consumer_evidence_id" in item
+        for item in diagnostic["rejected_correction_changes"]
+    )
+
+
+def test_rejected_candidate_update_preserves_and_reports_current_state():
+    session = make_session(ScriptedGateway([]))
+    record = seed_successful_tool_exchange(
+        session, call_id="candidate-update-evidence", path="a.py",
+        content="The changed branch returns the wrong state.",
+    )
+    candidate = {
+        "candidate_id": "candidate-good",
+        "claim": "The changed branch returns the wrong state.",
+        "affected_location": "a.py:4",
+        "causal_chain": "The changed state reaches invalid branch through the invalid return branch.",
+        "severity": "major",
+        "supporting_evidence_ids": [record.id],
+        "related_obligation_ids": ["OB-code"],
+        "consequence_support": reachable_consequence_support(
+            outcome="caller receives the wrong state",
+        ),
+        "user_visible_consequence": "The caller receives the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    }
+    established = session._checkpoint_from_text(json.dumps({
+        "unresolved": ["OB-code", "OB-tests"],
+        "obligation_updates": [], "candidate_updates": [],
+        "new_candidates": [candidate],
+        "proposed_next_actions": [
+            "Inspect the remaining implementation and test obligations.",
+        ],
+    }))
+    assert established is not None
+    session.latest_checkpoint = established
+    initial = checkpoint_response(
+        inspected=[], unresolved=["OB-code", "OB-tests"],
+        obligation_updates=[],
+        candidate_updates=[{
+            "candidate_id": "candidate-good",
+            "status": "superseded",
+        }],
+        new_candidates=[], unknowns=[],
+    )
+    correction = ModelTurnResult(
+        response={}, tool_calls=(), text=json.dumps({
+            "unresolved": [], "obligation_updates": [],
+            "candidate_updates": [], "new_candidates": [],
+        }), text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    gateway = ScriptedGateway([initial, correction])
+    session.gateway = gateway
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False, result.finalization_diagnostics
+    assert tuple(item.candidate_id for item in session.candidate_findings) == (
+        "candidate-good",
+    )
+    receipts = "\n".join(
+        str(event.get("content") or "") for event in session.conversation.events
+    )
+    assert "C1 update rejected" in receipts
+    assert "remains active" in receipts
+    assert "candidate-good remains rejected and inactive" not in receipts
+
+
+def test_checkpoint_turn_disables_reasoning_to_reserve_output_for_json():
+    gateway = ScriptedGateway([candidate_update_checkpoint_response()])
+    session = make_session(gateway)
+
+    session.request_checkpoint("controller-request")
+
+    assert gateway.requests[0].reasoning_effort == "none"
+
+
+def test_textual_tool_markup_gets_repaired_before_checkpointing():
+    malformed = ModelTurnResult(
+        response={}, tool_calls=(),
+        text=(
+            "[read_pr_diff]\n<parameter=path>\na.py\n"
+            "</function>\n</tool_call>"
+        ),
+        text_source="content", finish_reason="stop", usage={"prompt_tokens": 3},
+        request_diagnostics={}, content=(
+            "[read_pr_diff]\n<parameter=path>\na.py\n"
+            "</function>\n</tool_call>"
+        ),
+    )
+    gateway = ScriptedGateway([
+        malformed,
+        tool_call_response("read_file", {"path": "a.py"}),
+        checkpoint_response(inspected=["a.py"], unresolved=[]),
+    ])
+    session = make_session(gateway, model_turns=5)
+
+    result = session.explore()
+
+    assert result.degraded is False
+    assert any(
+        "textual tool-call markup" in request.messages
+        for request in gateway.requests
+    )
+
+
+def test_repeated_textual_tool_markup_checkpoints_and_pauses():
+    malformed = ModelTurnResult(
+        response={}, tool_calls=(),
+        text="[tool]<parameter=path>a.py</parameter>[/tool]",
+        text_source="content", finish_reason="stop",
+        usage={"prompt_tokens": 3, "completion_tokens": 2},
+        request_diagnostics={},
+    )
+    gateway = ScriptedGateway([
+        malformed,
+        malformed,
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    result = session.explore()
+
+    assert result.state.value == "checkpoint"
+    assert len(gateway.requests) == 4
+    assert gateway.requests[2].tools_enabled is False
+    assert gateway.requests[2].messages_contain(
+        "Checkpoint reason: malformed-textual-tool-call."
+    )
+    assert gateway.requests[2].messages_contain(
+        "Immediate compaction after validation: no."
+    )
+    assert gateway.requests[3].tools_enabled is False
+    assert gateway.requests[3].messages_contain("Exploration is stopping, not restarting")
+
+
+def test_checkpoint_register_uses_exact_candidate_ids_without_unmapped_aliases():
+    """The register must not advertise aliases the controller cannot resolve."""
+    initial = candidate_checkpoint_response(("finding:long-stable-id",))
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        candidate_update_checkpoint_response(),
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    session.explore()
+
+    prompt = gateway.requests[-1].messages
+    assert "finding:long-stable-id" in prompt
+    assert "short IDs" not in prompt
+
+
+def test_superseded_update_requires_known_replacement_candidate():
+    """Superseding a candidate must identify an active replacement."""
+    initial = candidate_checkpoint_response(("candidate-code",))
+    invalid = candidate_update_checkpoint_response(updates=({
+        "candidate_id": "candidate-code",
+        "status": "superseded",
+        "reason": "Replaced by a narrower issue.",
+    },))
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        invalid,
+        candidate_update_checkpoint_response(),
+        candidate_update_checkpoint_response(),
+    ])
+    session = make_session(gateway, model_turns=6)
+
+    session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    result = session.explore()
+
+    assert result.degraded is False
+    assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
+
+
+def test_checkpoint_candidate_handles_can_supersede_active_candidate():
+    session = make_session(ScriptedGateway([]))
+    seed_successful_tool_exchange(
+        session, call_id="candidate-handle-evidence", path="a.py",
+        content="contents:a.py",
+    )
+    established = session._checkpoint_from_text(
+        candidate_checkpoint_response(("candidate-old", "candidate-new")).text
+    )
+    assert established is not None
+    assert session._candidate_target("candidate-old") == "C1"
+    assert session._candidate_target("candidate-new") == "C2"
+
+    updated = session._checkpoint_from_text(
+        candidate_update_checkpoint_response(updates=({
+            "candidate_id": "C1",
+            "status": "superseded",
+            "superseded_by": "C2",
+            "reason": "The narrower candidate has the corrected location.",
+        },)).text
+    )
+
+    assert updated is not None
+    assert updated.candidate_finding_ids == ("candidate-new",)
+    assert session._candidate_statuses["candidate-old"] == "superseded"
+
+
+def test_candidate_handle_assignment_is_announced_once_and_model_state_is_canonical():
+    session = make_session(ScriptedGateway([]))
+    seed_successful_tool_exchange(
+        session, call_id="candidate-alias-evidence", path="a.py",
+        content="contents:a.py",
+    )
+    established = session._checkpoint_from_text(
+        candidate_checkpoint_response(("candidate-old",)).text
+    )
+    assert established is not None
+    session.latest_checkpoint = established
+
+    receipt = session._candidate_alias_receipt()
+    memory = session._model_checkpoint_memory()
+    cumulative = session._cumulative_checkpoint_payload()
+
+    assert "candidate-old → C1" in receipt
+    assert "Use C# handles for all subsequent candidate updates" in receipt
+    assert session._candidate_alias_receipt() == ""
+    assert memory["active_candidates"][0]["candidate_id"] == "C1"
+    assert cumulative["candidate_findings"][0]["candidate_id"] == "C1"
+    assert cumulative["latest_checkpoint"]["candidate_finding_ids"] == ["C1"]
+    assert cumulative["candidate_statuses"] == {"C1": "active"}
+
+
+def test_checkpoint_feedback_announces_new_candidate_handle():
+    gateway = ScriptedGateway([
+        candidate_checkpoint_response(("candidate-old",)),
+    ])
+    session = make_session(gateway)
+    seed_successful_tool_exchange(
+        session, call_id="candidate-feedback-evidence", path="a.py",
+        content="contents:a.py",
+    )
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert any(
+        event.get("kind") == "user"
+        and "candidate-old → C1" in str(event.get("content") or "")
+        for event in session.conversation.events
+    )
+
+
+def test_candidate_handle_rejection_receipt_reports_canonical_current_state():
+    session = make_session(ScriptedGateway([]))
+    seed_successful_tool_exchange(
+        session, call_id="candidate-receipt-evidence", path="a.py",
+        content="contents:a.py",
+    )
+    established = session._checkpoint_from_text(
+        candidate_checkpoint_response(("candidate-old",)).text
+    )
+    assert established is not None
+    assert session._candidate_target("candidate-old") == "C1"
+
+    rejected = session._checkpoint_from_text(
+        candidate_update_checkpoint_response(updates=({
+            "candidate_id": "C1",
+            "status": "superseded",
+            "superseded_by": "C1",
+        },)).text
+    )
+    assert rejected is not None
+
+    receipt = session._checkpoint_correction_receipt(
+        session._last_checkpoint_rejections,
+        disposition=CheckpointDisposition.PAUSE,
+    )
+
+    assert "C1 update rejected or omitted; current state remains active" in receipt
+    assert "Current active candidates: C1" in receipt
+
+
+def test_plain_prose_candidate_words_do_not_trigger_retention_unknown():
+    """Candidate vocabulary in ordinary prose is not structured candidate state."""
+    gateway = ScriptedGateway([
+        invalid_response(
+            "I reviewed candidate_findings and the candidate_id/claim wording "
+            "is not applicable to this specialist."
+        ),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    result = make_session(gateway).explore()
+
+    assert result.degraded is False
+    assert "candidate-retention-unknown" not in result.checkpoint.unknowns
+
+
+def test_superseded_update_rejects_self_reference_and_preserves_active_state():
+    """Invalid self-supersede cannot mutate the prior candidate registry."""
+    initial = candidate_checkpoint_response(("candidate-code",))
+    invalid = candidate_update_checkpoint_response(updates=({
+        "candidate_id": "candidate-code",
+        "status": "superseded",
+        "superseded_by": "candidate-code",
+    },))
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        invalid,
+        candidate_update_checkpoint_response(),
+        candidate_update_checkpoint_response(),
+    ])
+    session = make_session(gateway, model_turns=7)
+
+    session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    result = session.explore()
+
+    assert result.degraded is False
+    assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
+    assert tuple(item.candidate_id for item in session.candidate_findings) == (
+        "candidate-code",
+    )
+
+
+def test_invalid_supersession_preserves_source_but_accepts_valid_withdrawal():
+    """Reject one invalid update without rolling back its valid sibling."""
+    initial = candidate_checkpoint_response(("candidate-code",))
+    payload = json.loads(candidate_checkpoint_response(("candidate-new",)).text)
+    invalid = candidate_update_checkpoint_response(
+        updates=(
+            {
+                "candidate_id": "candidate-code",
+                "status": "superseded",
+                "superseded_by": "candidate-new",
+            },
+            {
+                "candidate_id": "candidate-new",
+                "status": "withdrawn",
+            },
+        ),
+        new_candidates=payload["new_candidates"],
+    )
+    valid_new = candidate_update_checkpoint_response(
+        new_candidates=payload["new_candidates"],
+    )
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        initial,
+        valid_new,
+    ])
+    session = make_session(gateway, model_turns=5)
+
+    session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    session.explore()
+    checkpoint = session._checkpoint_from_text(invalid.text)
+
+    assert checkpoint is not None
+    assert tuple(item.candidate_id for item in session.candidate_findings) == (
+        "candidate-code",
+    )
+    assert tuple(item.target for item in session._last_checkpoint_rejections) == (
+        "C1",
+    )
+
+
+def test_embedded_malformed_candidate_json_is_retention_material():
+    """Truncated candidate JSON after prose remains conservatively degraded."""
+    gateway = ScriptedGateway([
+        invalid_response(
+            'Here is the checkpoint draft: {"new_candidates": '
+            '[{"candidate_id":"candidate-lost","claim":"issue"}'
+        ),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    result = make_session(gateway).explore()
+
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+
+
+def test_candidate_words_with_unrelated_braces_are_not_retention_material():
+    """Candidate vocabulary plus non-JSON braces remains ordinary prose."""
+    gateway = ScriptedGateway([
+        invalid_response(
+            "I reviewed candidate_findings and candidate_id/claim wording in {docs}."
+        ),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    result = make_session(gateway).explore()
+
+    assert result.degraded is False
+    assert "candidate-retention-unknown" not in result.checkpoint.unknowns
 
 
 def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract():
     gateway = ScriptedGateway([
-        invalid_response("plain-text material issue"),
+        invalid_response('{"new_candidates": [{"claim": "material issue"}'),
         invalid_response('{"evidence_ids":["a.py"]}'),
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
     ])
@@ -250,10 +3916,1365 @@ def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract()
     checkpoint_request = gateway.requests[1].messages
     repair_request = gateway.requests[2].messages
     for prompt in (checkpoint_request, repair_request):
-        assert "candidate_findings" in prompt
-        assert "candidate_finding_ids" in prompt
+        assert "candidate_findings" not in prompt
+        assert "new_candidates" in prompt
+        assert "candidate_finding_ids" not in prompt
         assert "exact retained evidence IDs" in prompt
         assert "repository paths are not evidence IDs" in prompt
+
+
+@pytest.mark.parametrize(("disposition", "compaction", "lifecycle"), (
+    (
+        "compact_resume",
+        "Immediate compaction after validation: yes.",
+        "After validation, resume the specialist session.",
+    ),
+    (
+        "pause",
+        "Immediate compaction after validation: no.",
+        "After validation, pause for controller evaluation.",
+    ),
+    (
+        "finalize",
+        "Immediate compaction after validation: no.",
+        "After validation, finalize without resuming the specialist session.",
+    ),
+))
+def test_checkpoint_disposition_is_explicit_in_cumulative_prompt(
+    disposition, compaction, lifecycle,
+):
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    session = make_session(gateway)
+
+    session.request_checkpoint(
+        "rendered request pressure", disposition=disposition,
+    )
+
+    prompt = json.loads(gateway.requests[0].messages)[-1]["content"]
+    assert "Checkpoint reason: rendered request pressure." in prompt
+    assert compaction in prompt
+    assert lifecycle in prompt
+    assert (
+        "This checkpoint must be cumulative and self-contained because it may "
+        "become a future epoch boundary."
+    ) in prompt
+    assert "remaining budget" not in prompt.lower()
+    assert "Tool access is disabled for this checkpoint turn." in prompt
+    assert "Do not emit native tool calls or XML/function-call markup." in prompt
+    if disposition == "compact_resume":
+        assert "tool access will be re-enabled" in prompt
+    required = set(gateway.requests[0].response_schema["required"])
+    if disposition == "compact_resume":
+        assert required >= {"unresolved", "working_summary", "completed_steps"}
+    else:
+        assert required == {
+            "unresolved", "obligation_updates", "candidate_updates",
+            "new_candidates", "unknowns", "proposed_next_actions",
+        }
+
+
+def test_initial_compact_resume_repairs_missing_working_memory_before_compaction():
+    sparse = checkpoint_response(
+        inspected=["old.py"], unresolved=["OB-tests"],
+        working_summary="", completed_steps=[],
+    )
+    repaired = checkpoint_response(
+        inspected=["old.py"],
+        unresolved=["OB-tests"],
+        working_summary="The prior epoch established the controller data flow.",
+        completed_steps=["Read old.py and confirmed the reachable branch."],
+    )
+    gateway = ScriptedGateway([sparse, repaired])
+    session = make_session(gateway, max_context_tokens=100_000)
+    seed_successful_tool_exchange(
+        session,
+        call_id="working-memory-repair",
+        path="old.py",
+        content="full evidence retained until repair validates",
+        reasoning="material conclusion retained until repair validates",
+    )
+
+    result = session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+
+    assert len(gateway.requests) == 2
+    initial_prompt = json.loads(gateway.requests[0].messages)[-1]["content"]
+    repair_prompt = json.loads(gateway.requests[1].messages)[-1]["content"]
+    for prompt in (initial_prompt, repair_prompt):
+        assert "non-empty working_summary" in prompt
+        assert "non-empty completed_steps" in prompt
+    assert set(gateway.requests[0].response_schema["required"]) >= {
+        "unresolved", "working_summary", "completed_steps",
+    }
+    compact_properties = gateway.requests[0].response_schema["properties"]
+    assert compact_properties["working_summary"]["minLength"] == 1
+    assert compact_properties["completed_steps"]["minItems"] == 1
+    assert result.degraded is False
+    assert result.checkpoint.working_summary.startswith("The prior epoch")
+    assert result.checkpoint.completed_steps == (
+        "Read old.py and confirmed the reachable branch.",
+    )
+    assert any(
+        event.get("epoch_continuation")
+        for event in session.conversation.events
+    )
+    continuation = next(
+        event["content"] for event in session.conversation.events
+        if event.get("epoch_continuation")
+    )
+    assert "Tool access is re-enabled for exploration." in continuation
+    continuation_payload = json.loads(continuation.split("catalogued IDs:\n", 1)[1])
+    checkpoint_memory = continuation_payload["cumulative_checkpoint"]
+    assert "coverage" not in checkpoint_memory
+    assert "evidence_metadata" not in checkpoint_memory
+    assert "obligation_statuses" not in checkpoint_memory
+    assert "candidate_statuses" not in checkpoint_memory
+
+
+def test_context_pressure_checkpoint_compacts_and_resumes_same_specialist():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["old.py"], unresolved=["OB-tests"],
+            proposed_next_actions=["Inspect the remaining behavioral test."],
+        ),
+        checkpoint_response(inspected=["old.py"], unresolved=[]),
+    ])
+    session = make_session(
+        gateway, max_context_tokens=100_000, max_tokens=1_024,
+        model_turns=8, tool_calls=8,
+    )
+    pressure_checks = iter((True, False, False))
+    session._checkpoint_pressure_due = lambda: next(pressure_checks, False)
+
+    result = session.explore()
+
+    assert result.degraded is False
+    assert result.state.value == "checkpoint"
+    assert [request.tools_enabled for request in gateway.requests] == [False, True]
+    assert gateway.requests[1].messages_contain(
+        "Tool access is re-enabled for exploration."
+    )
+
+
+def test_checkpoint_wrapper_is_accepted_without_repair():
+    nested = json.loads(checkpoint_response(
+        inspected=["a.py"], unresolved=["OB-tests"],
+    ).text)
+    gateway = ScriptedGateway([
+        invalid_response(json.dumps({"checkpoint": nested})),
+    ])
+    session = make_session(gateway)
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert len(gateway.requests) == 1
+    assert "OB-tests" in result.checkpoint.unknowns
+
+
+def test_no_tools_checkpoint_reports_model_emitted_tool_call():
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway)
+
+    result = session.request_checkpoint("context-pressure")
+
+    assert [request.tools_enabled for request in gateway.requests] == [False, False]
+    assert "tool calls returned while checkpoint tools were disabled" in (
+        result.finalization_diagnostics[-1]["initial_error"]
+    )
+
+
+def test_checkpoint_projection_degradation_survives_finalization():
+    gateway = ScriptedGateway([
+        invalid_response("not-json"),
+        invalid_response("still-not-json"),
+    ])
+    session = make_session(gateway)
+
+    checkpoint = session.request_checkpoint("context-pressure")
+    finalized = session.finalize()
+
+    assert checkpoint.degraded is True
+    assert finalized.degraded is True
+
+
+def test_late_invalid_checkpoint_retains_prior_valid_state_without_degradation():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["a.py"], unresolved=["OB-tests"],
+            working_summary="Validated review state.",
+        ),
+        invalid_response("plain-text conclusion"),
+        invalid_response("still-malformed"),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    first = session.request_checkpoint("controller-request", disposition="pause")
+    prior_checkpoint = first.checkpoint
+
+    result = session.request_checkpoint(
+        "no-progress-guard", disposition="compact_resume",
+    )
+
+    assert result.state.value == "checkpoint"
+    assert result.checkpoint == prior_checkpoint
+    assert result.degraded is False
+    assert session.finalize().degraded is False
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["initial_parse"] == "invalid"
+    assert diagnostic["repair_parse"] == "invalid"
+    assert diagnostic["retained_prior_checkpoint"] is True
+    assert diagnostic["disposition"] == "pause"
+
+
+def test_late_unavailable_checkpoint_retains_prior_valid_state_without_degradation():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["a.py"], unresolved=["OB-tests"],
+            working_summary="Validated review state.",
+        ),
+        TimeoutError("checkpoint request timed out"),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    prior_checkpoint = session.request_checkpoint(
+        "controller-request", disposition="pause",
+    ).checkpoint
+
+    result = session.request_checkpoint(
+        "no-progress-guard", disposition="compact_resume",
+    )
+
+    assert result.checkpoint == prior_checkpoint
+    assert result.degraded is False
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["initial_parse"] == "unavailable"
+    assert diagnostic["retained_prior_checkpoint"] is True
+    assert diagnostic["disposition"] == "pause"
+
+
+def test_recovery_span_does_not_make_initial_invalid_checkpoint_valid():
+    session = make_session(ScriptedGateway([
+        invalid_response("plain-text conclusion"),
+        invalid_response("still-malformed"),
+    ]), max_context_tokens=100_000)
+    session.recover("context-pressure")
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is True
+    assert result.finalization_diagnostics[-1]["fallback_projection"] is True
+    assert result.finalization_diagnostics[-1].get(
+        "retained_prior_checkpoint", False,
+    ) is False
+
+
+def test_late_failure_retains_actual_valid_checkpoint_not_newer_projection():
+    lost_candidate = json.dumps({
+        "new_candidates": [{
+            "candidate_id": "lost-candidate",
+            "claim": "A candidate-shaped response that was never admitted.",
+        }],
+    })
+    session = make_session(ScriptedGateway([
+        checkpoint_response(
+            inspected=["a.py"], unresolved=["OB-tests"],
+            working_summary="Validated review state.",
+        ),
+        invalid_response(lost_candidate),
+        invalid_response("still-malformed"),
+        invalid_response("plain-text conclusion"),
+        invalid_response("still-malformed"),
+    ]), max_context_tokens=100_000)
+    valid_checkpoint = session.request_checkpoint("controller-request").checkpoint
+    projected = session.request_checkpoint("controller-request")
+    assert projected.degraded is True
+    assert projected.checkpoint != valid_checkpoint
+    session._rejected_candidate_ids.add("lost-candidate")
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert result.checkpoint == valid_checkpoint
+    assert result.finalization_diagnostics[-1]["retained_prior_checkpoint"] is True
+
+
+def test_initial_compact_resume_without_working_memory_never_compacts():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["old.py"], unresolved=["OB-tests"],
+            working_summary="", completed_steps=[],
+        ),
+        checkpoint_response(
+            inspected=["old.py"], unresolved=["OB-tests"],
+            working_summary="", completed_steps=[],
+        ),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    seed_successful_tool_exchange(
+        session,
+        call_id="missing-working-memory",
+        path="old.py",
+        content="irreplaceable evidence before invalid checkpoint",
+        reasoning="irreplaceable working conclusion before invalid checkpoint",
+    )
+
+    result = session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+
+    transcript = json.dumps(session.conversation.events, sort_keys=True)
+    assert len(gateway.requests) == 2
+    assert result.degraded is True
+    assert "irreplaceable evidence before invalid checkpoint" in transcript
+    assert "irreplaceable working conclusion before invalid checkpoint" in transcript
+    assert session._checkpoint_spans == []
+    assert not any(
+        event.get("epoch_continuation")
+        for event in session.conversation.events
+    )
+
+
+def test_sparse_pause_checkpoint_cannot_be_reused_for_destructive_compaction():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["0.py", "1.py", "2.py"],
+            unresolved=["OB-tests"],
+            working_summary="",
+            completed_steps=[],
+        ),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    for index in range(3):
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"sparse-pause-{index}",
+            path=f"{index}.py",
+            content=f"full sparse-pause evidence {index}",
+            reasoning=f"unexternalized sparse-pause reasoning {index}",
+        )
+    paused = session.explore()
+    before = json.loads(json.dumps(session.conversation.events))
+
+    stats = session._compact_validated_epoch()
+
+    assert paused.degraded is False
+    assert stats.removed_reasoning == 0
+    assert stats.replaced_results == 0
+    assert session.conversation.events == before
+    assert session._checkpoint_spans[-1].compacted is False
+    assert paused.finalization_diagnostics[-1]["reason"] == "normal-completion"
+    assert paused.finalization_diagnostics[-1]["compaction_level"] == "none"
+
+
+def test_pause_checkpoint_retains_full_epoch_after_validation():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=["old.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    record = seed_successful_tool_exchange(
+        session,
+        call_id="call-old",
+        path="old.py",
+        content="full prior evidence",
+    )
+
+    result = session.request_checkpoint("normal-completion", disposition="pause")
+
+    transcript = json.dumps(session.conversation.events, sort_keys=True)
+    assert result.degraded is False
+    assert "private analysis" in transcript
+    assert "full prior evidence" in transcript
+    assert '"status": "compacted"' not in transcript
+    assert record.id not in session._compacted_evidence
+    assert len(session._checkpoint_spans) == 1
+
+
+def test_epoch_compaction_runs_only_after_compact_resume_checkpoint_validates():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=["0.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    records = [
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"call-{index}",
+            path=f"{index}.py",
+            content=f"complete evidence {index}",
+            reasoning=f"private analysis {index}",
+        )
+        for index in range(4)
+    ]
+
+    session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+
+    request_messages = gateway.requests[0].messages
+    assert "private analysis 0" in request_messages
+    assert "complete evidence 0" in request_messages
+    transcript = json.dumps(session.conversation.events, sort_keys=True)
+    assert "private analysis 0" not in transcript
+    assert "complete evidence 0" not in transcript
+    assert "complete evidence 2" in transcript
+    assert "complete evidence 3" in transcript
+    assert records[0].id in session._compacted_evidence
+    assert records[1].id in session._compacted_evidence
+    assert records[2].id not in session._compacted_evidence
+    assert records[3].id not in session._compacted_evidence
+    continuation = [
+        event for event in session.conversation.events
+        if event.get("epoch_continuation")
+    ]
+    assert len(continuation) == 1
+    assert records[0].id in continuation[0]["content"]
+    assert '"proposed_next_actions"' in continuation[0]["content"]
+
+
+def test_later_controller_feedback_expires_checkpoint_todos():
+    session = make_session(ScriptedGateway([]))
+    session.latest_checkpoint = replace(
+        session.latest_checkpoint,
+        proposed_next_actions=("Read an unrelated historical file.",),
+    )
+
+    session.apply_coverage_feedback(("OB-tests",))
+
+    message = session.conversation.events[-1]["content"]
+    assert "previous checkpoint proposed_next_actions have expired" in message
+    assert "Read an unrelated historical file." not in message
+
+
+def test_checkpoint_diagnostic_projects_admission_and_regular_compaction_counts():
+    gateway = EstimatingGateway(
+        [
+            checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+            checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+        ],
+        rendered_bytes=24_000,
+        usages=(
+            {"prompt_tokens": 9_000, "completion_tokens": 200},
+            {"prompt_tokens": 8_500, "completion_tokens": 180},
+        ),
+    )
+    session = make_session(gateway, max_context_tokens=100_000)
+    seed_successful_tool_exchange(
+        session,
+        call_id="diagnostic-prior-epoch",
+        path="prior.py",
+        content="prior diagnostic evidence",
+        reasoning="prior private diagnostic reasoning",
+    )
+    session.request_checkpoint("controller-request", disposition="pause")
+    for index in range(4):
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"diagnostic-{index}",
+            path=f"{index}.py",
+            content=f"diagnostic evidence {index}",
+            reasoning=f"private diagnostic reasoning {index}",
+        )
+
+    result = session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+    diagnostic = result.finalization_diagnostics[-1]
+
+    assert diagnostic["reason"] == "context-pressure"
+    assert diagnostic["disposition"] == "compact_resume"
+    assert diagnostic["estimated_input_tokens"] >= 9_000
+    assert diagnostic["provider_calibrated_input_tokens"] >= 9_000
+    assert diagnostic["response_reserve_tokens"] == session.checkpoint_max_tokens
+    assert diagnostic["repair_response_reserve_tokens"] == session.checkpoint_max_tokens
+    assert diagnostic["admission_source"] == "provider-calibrated"
+    assert diagnostic["compaction_level"] == "regular"
+    assert diagnostic["compaction_input_tokens_before"] > 0
+    assert diagnostic["compaction_input_tokens_after"] > 0
+    assert diagnostic["removed_reasoning_messages"] == 5
+    assert diagnostic["placeholder_replaced_results"] == 2
+    assert diagnostic["removed_old_exchanges"] >= 1
+    assert diagnostic["retained_full_results"] == 2
+    assert diagnostic["emergency_outcome"] == "not_attempted"
+    serialized = json.dumps(diagnostic, sort_keys=True)
+    assert "private diagnostic reasoning" not in serialized
+    assert "diagnostic evidence" not in serialized
+
+
+def test_direct_completion_diagnostic_owns_later_pressure_compaction():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=[],
+            unresolved=["OB-tests"],
+            working_summary="The initial controller checkpoint is complete.",
+            completed_steps=["Recorded the initial controller boundary."],
+        ),
+        checkpoint_response(
+            inspected=["0.py", "1.py", "2.py", "3.py"],
+            unresolved=["OB-tests"],
+            working_summary="The direct model completion retained the new epoch.",
+            completed_steps=["Read four implementation paths and compared them."],
+        ),
+        checkpoint_response(
+            inspected=["0.py", "1.py", "2.py", "3.py"],
+            unresolved=["OB-tests"],
+            working_summary="The resumed model completion retained the compacted epoch.",
+            completed_steps=["Resumed from the compacted checkpoint boundary."],
+        ),
+    ])
+    session = make_session(
+        gateway, max_context_tokens=100_000, model_turns=8, tool_calls=8,
+    )
+    session.request_checkpoint("controller-request", disposition="pause")
+    for index in range(4):
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"direct-diagnostic-{index}",
+            path=f"{index}.py",
+            content="large direct-completion evidence " + (str(index) * 2_000),
+            reasoning=f"large direct-completion reasoning {index} " + ("r" * 2_000),
+        )
+
+    first_completion = session.explore()
+
+    assert [item["reason"] for item in first_completion.finalization_diagnostics] == [
+        "controller-request", "normal-completion",
+    ]
+    assert first_completion.finalization_diagnostics[0]["compaction_level"] == "none"
+    assert first_completion.finalization_diagnostics[1]["disposition"] == "pause"
+
+    session.max_context_tokens = 8_000
+    resumed = session.explore()
+    diagnostics = resumed.finalization_diagnostics
+
+    assert [item["reason"] for item in diagnostics] == [
+        "controller-request", "normal-completion", "normal-completion",
+    ]
+    assert diagnostics[0]["compaction_level"] == "none"
+    assert diagnostics[1]["disposition"] == "pause"
+    assert diagnostics[1]["compaction_level"] == "regular"
+    assert diagnostics[1]["compaction_input_tokens_before"] > 0
+    assert diagnostics[1]["compaction_input_tokens_after"] > 0
+    assert diagnostics[2]["disposition"] == "pause"
+    assert diagnostics[2]["compaction_level"] == "none"
+
+
+def test_checkpoint_diagnostic_admission_keeps_initial_and_repair_reserves():
+    gateway = EstimatingGateway(
+        [
+            invalid_response("invalid initial checkpoint"),
+            checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+        ],
+        rendered_bytes=12_000,
+    )
+    session = make_session(gateway, max_context_tokens=100_000)
+
+    result = session.request_checkpoint("controller-request")
+    diagnostic = result.finalization_diagnostics[-1]
+
+    assert diagnostic["repair_attempted"] is True
+    assert diagnostic["response_reserve_tokens"] == session.checkpoint_max_tokens
+    assert diagnostic["repair_response_reserve_tokens"] == session.checkpoint_max_tokens
+
+
+def test_reasoning_only_checkpoint_retries_without_retaining_failed_response():
+    long_reasoning = "I should emit the checkpoint next. " * 1_100
+    gateway = EstimatingGateway(
+        [
+            replace(
+                reasoning_only_response(long_reasoning),
+                usage={"prompt_tokens": 57_595, "completion_tokens": 8_192},
+            ),
+            checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+        ],
+        rendered_bytes=12_000,
+    )
+    session = make_session(
+        gateway,
+        max_tokens=8_192,
+        max_context_tokens=75_000,
+        model_turns=4,
+    )
+
+    result = session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+
+    assert result.degraded is False
+    assert len(gateway.requests) == 2
+    assert long_reasoning not in gateway.requests[1].messages
+    assert "Keep internal reasoning brief" in gateway.requests[1].messages
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["repair_attempted"] is True
+    assert diagnostic["repair_parse"] == "valid"
+
+
+def test_epoch_compaction_rejects_invalid_checkpoint_and_failed_repair():
+    gateway = ScriptedGateway([
+        invalid_response("invalid checkpoint"),
+        invalid_response("invalid repair"),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    seed_successful_tool_exchange(
+        session,
+        call_id="call-old",
+        path="old.py",
+        content="irreplaceable full evidence",
+    )
+    epoch_before = json.loads(json.dumps(session.conversation.events))
+
+    result = session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+
+    assert result.degraded is True
+    assert session.conversation.events[:len(epoch_before)] == epoch_before
+    assert "irreplaceable full evidence" in json.dumps(session.conversation.events)
+    assert session._checkpoint_spans == []
+    assert not any(
+        event.get("epoch_continuation")
+        for event in session.conversation.events
+    )
+
+
+def test_resumed_safe_pause_checkpoint_keeps_full_prior_epoch():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=["old.py"], unresolved=["OB-tests"]),
+        checkpoint_response(inspected=["old.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    seed_successful_tool_exchange(
+        session,
+        call_id="call-old",
+        path="old.py",
+        content="full paused evidence",
+    )
+    session.request_checkpoint("controller-request", disposition="pause")
+
+    session.explore()
+
+    assert len(gateway.requests) == 2
+    assert gateway.requests[1].tools_enabled is True
+    assert "full paused evidence" in json.dumps(session.conversation.events)
+    assert not any(
+        event.get("epoch_continuation")
+        for event in session.conversation.events
+    )
+
+
+def test_resumed_pressure_pause_checkpoint_compacts_existing_boundary():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=["0.py"], unresolved=["OB-tests"]),
+        checkpoint_response(inspected=["0.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    for index in range(4):
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"call-{index}",
+            path=f"{index}.py",
+            content="large paused evidence " + (str(index) * 2_000),
+            reasoning=f"large private analysis {index} " + ("r" * 2_000),
+        )
+    session.request_checkpoint("controller-request", disposition="pause")
+    request_count = len(gateway.requests)
+    session.max_context_tokens = 8_000
+
+    session.explore()
+
+    assert len(gateway.requests) == request_count + 1
+    assert gateway.requests[-1].tools_enabled is True
+    assert any(
+        event.get("epoch_continuation")
+        for event in session.conversation.events
+    )
+    assert len(session._checkpoint_spans) >= 1
+
+
+def test_resumed_compacted_checkpoint_does_not_bypass_unrelieved_repair_reserve():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+    assert session._checkpoint_spans[-1].compacted is True
+    request_count = len(gateway.requests)
+    continuation = session._estimate_admission(
+        tools_enabled=True,
+        max_tokens=session.max_tokens,
+    )
+    session.max_context_tokens = continuation.admission_tokens + 1
+    assert continuation.admission_tokens < session.max_context_tokens
+    assert session._checkpoint_pressure_due() is True
+
+    result = session.explore()
+
+    assert len(gateway.requests) == request_count
+    assert result.state.value == "checkpoint"
+    assert result.degraded is True
+    assert session._checkpoint_pressure_due() is True
+
+
+def test_epoch_compaction_prunes_only_noncheckpoint_events_before_prior_boundary():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["first.py"],
+            unresolved=["OB-tests"],
+            working_summary="first cumulative checkpoint",
+        ),
+        checkpoint_response(
+            inspected=["second.py"],
+            unresolved=["OB-tests"],
+            working_summary="second cumulative checkpoint",
+        ),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.conversation.add_user("discardable epoch-zero note")
+    removed_record = seed_successful_tool_exchange(
+        session,
+        call_id="call-epoch-zero",
+        path="epoch-zero.py",
+        content="evidence removed with the oldest epoch",
+    )
+    session.request_checkpoint("first-boundary", disposition="pause")
+    session.conversation.add_user("previous epoch investigation")
+    seed_successful_tool_exchange(
+        session,
+        call_id="call-between",
+        path="between.py",
+        content="previous epoch full evidence",
+    )
+
+    session.request_checkpoint("second-boundary", disposition="compact_resume")
+
+    transcript = json.dumps(session.conversation.events, sort_keys=True)
+    assert "discardable epoch-zero note" not in transcript
+    assert "Immutable specialist assignment" in transcript
+    assert "Checkpoint reason: first-boundary." in transcript
+    assert "first cumulative checkpoint" in transcript
+    assert "Checkpoint reason: second-boundary." in transcript
+    assert "second cumulative checkpoint" in transcript
+    assert removed_record.id in session._compacted_evidence
+    assert session.conversation.open_tool_call_ids() == set()
+    assert len(session._checkpoint_spans) == 2
+    for span in session._checkpoint_spans:
+        protected = session.conversation.events[
+            span.request_start:span.response_end
+        ]
+        assert protected[0]["kind"] == "user"
+        assert protected[-1]["kind"] == "assistant_turn_boundary"
+
+
+def test_emergency_reconstruction_keeps_checkpoint_ledger_and_newest_exchange():
+    seed_paths = ("a.py", "1.py", "2.py", "3.py")
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": path}, call_id=f"seed-{index}")
+        for index, path in enumerate(seed_paths)
+    ] + [
+        candidate_checkpoint_response(("candidate-code",)),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(
+        gateway,
+        tool_calls=8,
+        model_turns=10,
+        max_context_tokens=100_000,
+    )
+    session.explore()
+    filler_record = session.evidence_store.snapshot().records[0]
+    for index in range(20):
+        session._compacted_evidence[f"evidence:000-filler-{index:02d}"] = filler_record
+    omitted_record = seed_successful_tool_exchange(
+        session,
+        call_id="post-checkpoint-old",
+        path="oversized.py",
+        content="oversized result " + ("y" * 8_000),
+        reasoning="oversized new epoch reasoning " + ("x" * 40_000),
+    )
+    session.conversation.add_assistant_turn(
+        content="newest complete analysis",
+        calls=[{
+            "id": "post-checkpoint-new",
+            "name": "git_grep",
+            "arguments": '{"pattern":"latest"}',
+        }],
+    )
+    session.conversation.add_tool_result(
+        "post-checkpoint-new", "newest fitting result",
+    )
+    session.max_context_tokens = 8_000
+
+    session.explore()
+
+    rendered = gateway.requests[-1].messages
+    assert gateway.requests[-1].tools_enabled is True
+    assert "Gather evidence and checkpoint progress." == session.conversation.system
+    assert "Immutable specialist assignment" in rendered
+    assert "candidate-code" in rendered
+    assert "The changed branch exposes issue candidate-code." in rendered
+    assert "compacted_evidence" in rendered
+    assert "evidence:" in rendered
+    assert "post-checkpoint-new" in rendered
+    assert "newest fitting result" in rendered
+    assert "post-checkpoint-old" not in rendered
+    assert omitted_record.id in session._compacted_evidence
+    assert omitted_record.id in rendered
+    assert rendered.index("candidate-code") < rendered.index("post-checkpoint-new")
+    assert rendered.index("post-checkpoint-new") < rendered.index(
+        "Continue the same specialist assignment"
+    )
+    assert sum(
+        bool(event.get("emergency_reconstruction"))
+        for event in session.conversation.events
+    ) == 1
+
+
+def test_emergency_reconstruction_bounds_retained_evidence_metadata():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.request_checkpoint("controller-request", disposition="pause")
+    for index in range(30):
+        session.evidence_store.add_tool_result_with_collection(
+            session_id=session.session_id,
+            tool="read_file",
+            arguments={"path": f"retained-{index}.py"},
+            result={"status": "ok", "content": f"retained metadata {index}"},
+        )
+    session.recovery_evidence_bytes = 500
+
+    assert session._reconstruct_from_valid_checkpoint() is True
+
+    snapshot_event = next(
+        event
+        for event in session.conversation.events
+        if event.get("kind") == "assistant_text"
+        and '"cumulative_checkpoint"' in event.get("content", "")
+    )
+    snapshot = json.loads(snapshot_event["content"])
+    metadata = snapshot["cumulative_checkpoint"]["evidence_metadata"]
+    assert len(json.dumps(metadata, sort_keys=True).encode("utf-8")) <= 500
+    assert len(metadata) < 30
+
+
+def test_emergency_catalogue_prioritizes_newest_of_many_omitted_results():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.request_checkpoint("controller-request", disposition="pause")
+    omitted_records = [
+        seed_successful_tool_exchange(
+            session,
+            call_id=f"omitted-{index:02d}",
+            path=f"omitted-{index:02d}.py",
+            content=f"successful omitted evidence {index}",
+            reasoning=f"oversized omitted reasoning {index} " + ("x" * 9_000),
+        )
+        for index in range(25)
+    ]
+
+    assert session._reconstruct_from_valid_checkpoint() is True
+
+    snapshot_event = next(
+        event
+        for event in session.conversation.events
+        if event.get("kind") == "assistant_text"
+        and '"compacted_evidence"' in event.get("content", "")
+    )
+    snapshot = json.loads(snapshot_event["content"])
+    catalogue_ids = [
+        item["evidence_id"] for item in snapshot["compacted_evidence"]
+    ]
+    expected_newest_first = [
+        record.id for record in reversed(omitted_records[-20:])
+    ]
+    assert catalogue_ids == expected_newest_first
+    assert len(catalogue_ids) == 20
+    assert omitted_records[-1].id in catalogue_ids
+    assert all(
+        record.id not in catalogue_ids for record in omitted_records[:5]
+    )
+
+
+def test_exploration_reserves_checkpoint_and_repair_turns():
+    """Exploration cannot consume the turns reserved for structured retention."""
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}, call_id="first"),
+        tool_call_response("read_file", {"path": "tests/test_a.py"}, call_id="second"),
+        invalid_response("malformed-checkpoint"),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    result = session.explore()
+
+    assert result.state.value == "checkpoint"
+    assert result.degraded is False
+    assert [request.tools_enabled for request in gateway.requests] == [
+        True, True, False, False,
+    ]
+    assert result.budget.model_turns == 4
+
+
+def test_pressure_requests_checkpoint_before_exploration():
+    gateway = EstimatingGateway(
+        [
+            checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+            checkpoint_response(inspected=[], unresolved=[]),
+        ],
+        rendered_bytes=12_000,
+    )
+    session = make_session(
+        gateway,
+        max_tokens=2_048,
+        recovery_max_tokens=1_024,
+        max_context_tokens=7_500,
+    )
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
+
+    old_coarse_admission = (
+        session.conversation.approx_tokens()
+        + session.max_tokens
+        + session.wire_safety_tokens
+    )
+    exploration_admission = session._estimate_admission(
+        tools_enabled=True, max_tokens=session.max_tokens,
+    )
+    assert old_coarse_admission < session.max_context_tokens
+    assert exploration_admission.admission_tokens < session.max_context_tokens
+
+    result = session.explore()
+
+    assert result.state.value == "checkpoint"
+    assert len(gateway.requests) == 2
+    assert gateway.requests[0].tools_enabled is False
+    assert gateway.requests[1].tools_enabled is True
+    assert gateway.requests[0].max_tokens == 2_048
+    assert gateway.requests[0].reasoning_effort == "none"
+    assert gateway.requests[0].messages_contain(
+        "After validation, resume the specialist session."
+    )
+    assert [item.purpose for item in attempts.close_since(0)] == [
+        "checkpoint", "exploration",
+    ]
+
+
+def test_coarse_context_overflow_preserves_history_until_checkpoint_validates():
+    session = make_session(
+        ScriptedGateway([]), max_context_tokens=300, max_tokens=256,
+    )
+    retained_content = "coarse-overflow conclusion: " + ("x" * 5_000)
+    session.conversation.add_assistant_text(retained_content)
+
+    result = session.explore()
+
+    assert result.degraded is True
+    assert any(
+        event.get("kind") == "assistant_text"
+        and event.get("content") == retained_content
+        for event in session.conversation.events
+    )
+    assert not any(
+        event.get("compaction_note")
+        for event in session.conversation.events
+    )
+    checkpoint_prompt = session.conversation.events[-1]["content"]
+    assert "Checkpoint reason: context-pressure." in checkpoint_prompt
+    assert "Immediate compaction after validation: yes." in checkpoint_prompt
+    assert "After validation, resume the specialist session." in checkpoint_prompt
+
+
+def test_checkpoint_request_includes_compact_schema_contract():
+    """The checkpoint user message describes required keys and candidate retention."""
+    gateway = ScriptedGateway([
+        invalid_response("plain-text conclusion"),
+        invalid_response("No further tool work was performed."),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    session = make_session(gateway)
+
+    session.explore()
+
+    checkpoint_request = json.loads(gateway.requests[2].messages)[-1]["content"]
+    assert "Required keys:" in checkpoint_request
+    assert '"unresolved"' in checkpoint_request
+    assert '"candidate_finding_ids"' not in checkpoint_request
+    assert '"candidate_findings"' not in checkpoint_request
+    assert 'new_candidates' in checkpoint_request
+    assert "Use the controller C# handles" in checkpoint_request
+    assert (
+        "evidence_by_obligation"
+        not in gateway.requests[2].response_schema["properties"]
+    )
+
+
+def test_truncated_empty_candidate_checkpoint_is_not_a_material_retention_signal():
+    text = json.dumps({
+        "new_candidates": [],
+        "candidate_updates": [],
+        "new_candidates": [],
+        "completed_steps": [
+            "Reviewed contributor_candidate_ids propagation in adjudication.py",
+        ],
+    })[:-1]
+
+    signal = _candidate_retention_signal(text)
+
+    assert signal.is_material is False
+
+
+def test_malformed_checkpoint_is_repaired_before_projection():
+    """One malformed structured checkpoint receives one bounded repair request."""
+    gateway = ScriptedGateway([
+        invalid_response('{"working_summary":'),
+        invalid_response("still-malformed"),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    session = make_session(gateway)
+
+    result = session.explore()
+
+    assert result.degraded is False
+    assert len(gateway.requests) == 3
+    assert gateway.requests[1].tools_enabled is False
+    assert gateway.requests[2].tools_enabled is False
+    assert gateway.requests[2].messages_contain("Repair the previous checkpoint")
+
+
+@pytest.mark.parametrize("invalid_actions", ([], ["OB-code"], ["O1"]))
+def test_unresolved_checkpoint_repairs_missing_concrete_next_action(invalid_actions):
+    incomplete = checkpoint_response(
+        inspected=[], unresolved=["OB-code", "OB-tests"],
+        proposed_next_actions=invalid_actions,
+    )
+    repaired = checkpoint_response(
+        inspected=[], unresolved=["OB-code", "OB-tests"],
+        proposed_next_actions=[
+            "Trace the changed producer into its downstream consumer.",
+        ],
+    )
+    gateway = ScriptedGateway([incomplete, repaired])
+
+    result = make_session(gateway).request_checkpoint("controller-request")
+
+    assert result.degraded is False
+    assert len(gateway.requests) == 2
+    assert result.checkpoint.proposed_next_actions == (
+        "Trace the changed producer into its downstream consumer.",
+    )
+    assert gateway.requests[1].messages_contain(
+        "Unresolved obligations require at least one concrete proposed_next_actions"
+    )
+
+
+def test_exploration_reasoning_json_is_not_admitted_or_candidate_signaled():
+    private_checkpoint = {
+        "inspected": ["a.py"],
+        "unresolved": [],
+        "new_candidates": [{
+            "candidate_id": "private-candidate",
+            "claim": "private draft only",
+        }],
+        "unknowns": [],
+    }
+    gateway = ScriptedGateway([
+        reasoning_only_response(private_checkpoint),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+
+    result = make_session(gateway).explore()
+
+    assert len(gateway.requests) == 2
+    assert result.degraded is False
+    assert result.checkpoint.candidate_finding_ids == ()
+    assert "candidate-retention-unknown" not in result.checkpoint.unknowns
+    assert gateway.requests[1].messages_contain("reasoning_content")
+    assert gateway.requests[1].messages_contain("private-candidate")
+
+
+def test_checkpoint_request_repairs_reasoning_only_json_from_retained_history():
+    gateway = ScriptedGateway([
+        reasoning_only_response({
+            "inspected": ["a.py"],
+            "unresolved": [],
+            "new_candidates": [],
+            "unknowns": [],
+        }),
+        checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway)
+
+    result = session.request_checkpoint("controller-request")
+
+    assert len(gateway.requests) == 2
+    assert result.degraded is False
+    assert "OB-tests" in result.checkpoint.unknowns
+    assert gateway.requests[1].messages_contain("reasoning_content")
+    assert gateway.requests[1].messages_contain("Repair the previous checkpoint")
+
+
+def test_checkpoint_reasoning_only_repair_degrades_to_projection():
+    gateway = ScriptedGateway([
+        invalid_response("not a checkpoint"),
+        reasoning_only_response({
+            "inspected": ["a.py"],
+            "unresolved": [],
+            "new_candidates": [],
+            "unknowns": [],
+        }),
+    ])
+    session = make_session(gateway)
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.degraded is True
+    assert set(result.checkpoint.unknowns) == {"OB-code", "OB-tests"}
+
+
+def test_checkpoint_context_admission_failure_records_actionable_diagnostics():
+    session = make_session(
+        ScriptedGateway([]), max_context_tokens=300, max_tokens=256,
+    )
+
+    result = session.request_checkpoint("context-pressure")
+
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["initial_error"].startswith(
+        "BudgetExhausted: model context limit"
+    )
+    assert diagnostic["context_tokens_before"] >= diagnostic["context_tokens_after"]
+    assert diagnostic["max_context_tokens"] == 300
+    assert diagnostic["requested_output_tokens"] == 256
+
+
+def test_unrecoverable_candidate_text_is_reported_as_retention_unknown():
+    """Fallback state cannot look like a trustworthy zero-findings checkpoint."""
+    gateway = ScriptedGateway([
+        invalid_response(
+            '{"unresolved": [], "new_candidates": '
+            '[{"candidate_id": "candidate-lost", "claim": "material issue"}]'
+        ),
+        invalid_response("still-not-json"),
+    ])
+    session = make_session(gateway, model_turns=2)
+
+    result = session.explore()
+
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+    assert result.checkpoint.candidate_finding_ids == ()
+    assert result.finalization_diagnostics
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["reason"] == "checkpoint-retention-reserve"
+    assert diagnostic["initial_parse"] == "invalid"
+    assert diagnostic["repair_attempted"] is True
+    assert diagnostic["repair_parse"] == "invalid"
+    assert diagnostic["material_candidate_signal"] is True
+    assert "response" not in diagnostic
+
+
+def test_exploration_candidate_text_survives_checkpoint_handoff_as_unknown():
+    """A later clean checkpoint cannot erase an earlier malformed candidate."""
+    gateway = ScriptedGateway([
+        invalid_response(
+            '{"unresolved": [], "new_candidates": '
+            '[{"candidate_id": "candidate-lost", "claim": "material issue"}]'
+        ),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    result = session.explore()
+
+    assert [request.tools_enabled for request in gateway.requests] == [
+        True, False, False,
+    ]
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+
+
+def test_tool_turn_candidate_signal_survives_resume_and_clean_checkpoint():
+    """Text beside a tool call remains a lifetime retention obligation."""
+    candidate_turn = tool_call_response(
+        "read_file", {"path": "a.py"}, call_id="candidate-tool",
+    )
+    candidate_turn = ModelTurnResult(**{
+        **candidate_turn.__dict__,
+        "text": (
+                '{"new_candidates":[{"candidate_id":"candidate-tool-loss",'
+            '"claim":"material issue"}]}'
+        ),
+        "text_source": "content",
+    })
+    clean = checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])
+    gateway = ScriptedGateway([
+        candidate_turn,
+        clean,
+        clean,
+        clean,
+        clean,
+        clean,
+        clean,
+    ])
+    session = make_session(gateway, model_turns=7)
+
+    first = session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    resumed = session.explore()
+
+    assert first.degraded is True
+    assert resumed.degraded is True
+    assert "candidate-retention-unknown" in first.checkpoint.unknowns
+    assert "candidate-retention-unknown" in resumed.checkpoint.unknowns
+    assert resumed.checkpoint.candidate_finding_ids == ()
+    assert len(gateway.requests) == 7
+
+
+def test_anonymous_candidate_signal_cannot_be_cleared_by_unrelated_admission():
+    """An unidentified material shape remains unknown after a named admission."""
+    anonymous_turn = tool_call_response(
+        "read_file", {"path": "a.py"}, call_id="anonymous-tool",
+    )
+    anonymous_turn = ModelTurnResult(**{
+        **anonymous_turn.__dict__,
+        "text": '{"new_candidates":[{"claim":"unidentified issue"}]}',
+        "text_source": "content",
+    })
+    named = candidate_checkpoint_response(("candidate-named",))
+    gateway = ScriptedGateway([anonymous_turn, named, named, named])
+    session = make_session(gateway, model_turns=4)
+
+    result = session.explore()
+
+    assert result.checkpoint.candidate_finding_ids == ("candidate-named",)
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+
+
+def test_candidate_id_overflow_cannot_be_cleared_by_bounded_admissions():
+    """IDs beyond the retention bound keep the conservative loss warning."""
+    declared_ids = tuple(f"candidate-{index:02d}" for index in range(21))
+    overflow_turn = tool_call_response(
+        "read_file", {"path": "a.py"}, call_id="overflow-tool",
+    )
+    overflow_turn = ModelTurnResult(**{
+        **overflow_turn.__dict__,
+        "text": json.dumps({
+            "new_candidates": [
+                {"candidate_id": candidate_id, "claim": "material issue"}
+                for candidate_id in declared_ids
+            ],
+        }),
+        "text_source": "content",
+    })
+    bounded = candidate_checkpoint_response(declared_ids[:20])
+    clean = checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])
+    gateway = ScriptedGateway([
+        overflow_turn,
+        bounded,
+        bounded,
+        bounded,
+        clean,
+        clean,
+        clean,
+    ])
+    session = make_session(gateway, model_turns=7)
+
+    first = session.explore()
+    session.apply_coverage_feedback(["OB-tests"])
+    resumed = session.explore()
+
+    assert len(first.checkpoint.candidate_finding_ids) == 20
+    assert first.degraded is True
+    assert resumed.degraded is True
+    assert "candidate-retention-unknown" in resumed.checkpoint.unknowns
+
+
+def test_checkpoint_admission_failure_preserves_exploration_candidate_unknown():
+    """A failed checkpoint request cannot erase prior malformed candidate material."""
+    gateway = ScriptedGateway([
+        invalid_response(
+            '{"unresolved": [], "new_candidates": '
+            '[{"candidate_id": "candidate-lost", "claim": "material issue"}]'
+        ),
+        TimeoutError("checkpoint provider timed out"),
+    ])
+    session = make_session(gateway, model_turns=4)
+
+    result = session.explore()
+
+    assert result.degraded is True
+    assert "candidate-retention-unknown" in result.checkpoint.unknowns
+    assert len(gateway.requests) == 2
+
+
+def test_partial_candidate_retention_repairs_only_the_rejected_candidate():
+    """One invalid candidate does not discard its admitted sibling."""
+    executor_result = {
+        "tool": "read_file", "status": "ok",
+        "result": {"content": "contents:a.py"},
+    }
+    evidence_id = canonical_evidence_key(
+        "read_file", {"path": "a.py"}, executor_result,
+    )
+    checkpoint = checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])
+    raw = json.loads(checkpoint.text)
+    raw["new_candidates"] = [
+        {
+            "candidate_id": "candidate-code",
+            "root_cause_fingerprint": "root:candidate-code",
+            "claim": "The changed branch skips the cancellation state.",
+            "affected_location": "a.py:4",
+            "causal_chain": "The changed state reaches invalid branch in a switch without a matching arm.",
+            "severity": "major",
+            "category": "correctness",
+            "supporting_evidence_ids": [evidence_id],
+            "related_obligation_ids": ["OB-code"],
+            "consequence_support": reachable_consequence_support(
+                outcome="Cancelled work is shown as active",
+            ),
+            "user_visible_consequence": "Cancelled work is shown as active.",
+            "manual_validation": "Run the cancellation-state test.",
+        },
+        {"candidate_id": "candidate-lost", "claim": "incomplete candidate"},
+    ]
+    mixed_checkpoint = ModelTurnResult(**{
+        **checkpoint.__dict__, "text": json.dumps(raw),
+    })
+    repaired = ModelTurnResult(**{
+        **checkpoint.__dict__,
+        "text": json.dumps({
+            **raw,
+                "new_candidates": [raw["new_candidates"][0]],
+        }),
+    })
+    gateway = ScriptedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        invalid_response("plain-text conclusion"),
+        mixed_checkpoint,
+        repaired,
+    ])
+    session = make_session(gateway, model_turns=6)
+
+    result = session.explore()
+
+    assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
+    assert result.degraded is False
+    assert "candidate-retention-unknown" not in result.checkpoint.unknowns
+    assert len(gateway.requests) == 4
+    assert gateway.requests[-1].response_schema is not None
+    assert set(gateway.requests[-1].response_schema["required"]) >= {
+        "unresolved", "obligation_updates", "candidate_updates", "new_candidates",
+    }
 
 
 def test_hanging_specialist_gateways_share_global_orphan_cap():
@@ -397,18 +5418,29 @@ def test_controller_derived_tool_association_covers_typed_obligation():
             "result": {"content": "implementation"},
         }
 
+    evidence_id = canonical_evidence_key(
+        "read_file", {"path": "a.py"},
+        {"tool": "read_file", "status": "ok", "result": {"content": "implementation"}},
+    )
     gateway = ScriptedGateway([
         tool_call_response(
             "read_file",
             {"path": "a.py", "obligation_ids": ["OB-code"]},
         ),
-        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+        checkpoint_response(
+            inspected=["a.py"], unresolved=["OB-tests"],
+            obligation_updates=[{
+                "target": "O1", "disposition": "covered", "reason": "Verified.",
+                "evidence_ids": [evidence_id], "next_actions": [],
+            }],
+        ),
     ])
 
     result = make_session(gateway, execute_tool=execute_tool).explore()
 
     assert seen[0][1] == {"path": "a.py"}
-    assert dict(result.checkpoint.obligation_statuses)["OB-code"].value == "covered"
+    assert dict(result.checkpoint.obligation_statuses)["OB-code"].value == "pending"
+    assert result.checkpoint.obligation_assessments[0].disposition.value == "covered"
     assert result.checkpoint.evidence_ids
 
 
@@ -436,22 +5468,30 @@ def test_model_cannot_self_declare_evidence_category():
     assert dict(result.checkpoint.obligation_statuses)["OB-code"].value != "covered"
 
 
-def test_denied_discovery_creates_durable_source_access_request():
+def test_denied_discovery_requires_one_explicit_fetch_for_access_request():
     def execute_tool(name, arguments, **kwargs):
-        assert name == "web_search"
+        if name == "web_search":
+            return {
+                "tool": name,
+                "status": "ok",
+                "result": {
+                    "kind": "search_discovery",
+                    "approved": [],
+                    "unapproved": [{
+                        "url": "https://docs.example.com/private",
+                        "host": "docs.example.com",
+                        "path": "/private",
+                        "denial_reason": "source is not allowlisted by current policy",
+                    }],
+                    "evidentiary": False,
+                },
+            }
+        assert name == "web_fetch"
         return {
             "tool": name,
-            "status": "ok",
+            "status": "error",
             "result": {
-                "kind": "search_discovery",
-                "approved": [],
-                "unapproved": [{
-                    "url": "https://docs.example.com/private",
-                    "host": "docs.example.com",
-                    "path": "/private",
-                    "denial_reason": "host not approved",
-                }],
-                "evidentiary": False,
+                "error": "source denied: source is not allowlisted by current policy"
             },
         }
 
@@ -459,6 +5499,14 @@ def test_denied_discovery_creates_durable_source_access_request():
         tool_call_response(
             "web_search",
             {"query": "API behavior", "obligation_ids": ["OB-code"]},
+        ),
+        tool_call_response(
+            "web_fetch",
+            {
+                "url": "https://docs.example.com/private",
+                "purpose": "Verify the external API contract",
+                "obligation_ids": ["OB-code"],
+            },
         ),
         checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
     ])
@@ -471,6 +5519,169 @@ def test_denied_discovery_creates_durable_source_access_request():
     assert request.host == "docs.example.com"
     assert request.candidate_url == "https://docs.example.com/private"
     assert request.obligation_id == "OB-code"
+    assert request.model_purpose == "Verify the external API contract"
+
+
+def test_unsafe_or_failed_fetch_does_not_create_access_request():
+    errors = iter((
+        "source denied: unsafe high-entropy URL payload",
+        "secure fetch returned HTTP 404",
+    ))
+
+    def execute_tool(name, arguments, **kwargs):
+        return {
+            "tool": name, "status": "error",
+            "result": {"error": next(errors)},
+        }
+
+    session = make_session(ScriptedGateway([]), execute_tool=execute_tool)
+    for index, url in enumerate((
+        "https://docs.example.com/" + "a" * 64,
+        "https://docs.example.com/missing",
+    )):
+        session._execute_calls(({
+            "id": f"web-{index}",
+            "name": "web_fetch",
+            "arguments": json.dumps({
+                "url": url,
+                "purpose": "Verify the external API contract",
+                "targets": ["O1"],
+            }),
+        },))
+
+    assert session.source_access_requests == ()
+
+
+def test_repeated_denied_fetches_for_one_question_keep_one_access_request():
+    def execute_tool(name, arguments, **kwargs):
+        return {
+            "tool": name,
+            "status": "error",
+            "result": {
+                "error": "source denied: source is not allowlisted by current policy"
+            },
+        }
+
+    session = make_session(ScriptedGateway([]), execute_tool=execute_tool)
+    for index, url in enumerate((
+        "https://official.example/reference",
+        "https://blog.example/explanation",
+    )):
+        session._execute_calls(({
+            "id": f"denied-{index}",
+            "name": "web_fetch",
+            "arguments": json.dumps({
+                "url": url,
+                "purpose": "Verify the external API contract",
+                "targets": ["O1"],
+            }),
+        },))
+
+    assert len(session.source_access_requests) == 1
+    assert session.source_access_requests[0].candidate_url == (
+        "https://official.example/reference"
+    )
+
+
+def test_denied_gh_api_repo_creates_durable_repository_access_request():
+    seen = []
+    revision = "a" * 40
+
+    def execute_tool(name, arguments, **kwargs):
+        seen.append((name, arguments, kwargs))
+        return {
+            "tool": name,
+            "status": "error",
+            "result": {"error": "Repo not allowed: 125m125/pr-reviewer-action"},
+        }
+
+    session = make_session(ScriptedGateway([]), execute_tool=execute_tool)
+    call = lambda call_id: {
+        "id": call_id,
+        "name": "gh_api",
+        "arguments": json.dumps({
+            "endpoint": (
+                f"repos/125m125/pr-reviewer-action/commits/{revision}"
+            ),
+            "purpose": "Verify token ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+            "targets": ["O1"],
+        }),
+    }
+
+    session._execute_calls((call("gh-1"),))
+    session._execute_calls((call("gh-2"),))
+
+    assert len(seen) == 2
+    assert all("purpose" not in arguments for _name, arguments, _kw in seen)
+    assert len(session.source_access_requests) == 1
+    request = session.source_access_requests[0]
+    assert request.repository == "125m125/pr-reviewer-action"
+    assert request.revision == revision
+    assert request.obligation_id == "OB-code"
+    assert "ghp_" not in request.model_purpose
+
+
+def test_denied_remote_file_creates_revision_bound_repository_access_request():
+    seen = []
+    revision = "b" * 40
+
+    def execute_tool(name, arguments, **kwargs):
+        seen.append((name, arguments, kwargs))
+        return {
+            "tool": name,
+            "status": "error",
+            "result": {"error": "Repo not allowed: vendor/action"},
+        }
+
+    session = make_session(ScriptedGateway([]), execute_tool=execute_tool)
+    session._execute_calls(({
+        "id": "remote-1",
+        "name": "read_remote_file",
+        "arguments": json.dumps({
+            "repository": "vendor/action",
+            "path": "action.yml",
+            "ref": revision,
+            "purpose": "Verify permissions required by the pinned action",
+            "targets": ["O1"],
+        }),
+    },))
+
+    assert seen[0][1] == {
+        "repository": "vendor/action",
+        "path": "action.yml",
+        "ref": revision,
+    }
+    assert len(session.source_access_requests) == 1
+    request = session.source_access_requests[0]
+    assert request.repository == "vendor/action"
+    assert request.revision == revision
+    assert request.obligation_id == "OB-code"
+    assert request.model_purpose == (
+        f"Read remote text file action.yml at {revision}. Verify permissions "
+        "required by the pinned action"
+    )
+
+
+@pytest.mark.parametrize("error", (
+    "Missing GH_TOKEN",
+    "Endpoint prefix not allowed: /repos/a/b/actions",
+    "HTTP 404: not found",
+))
+def test_non_allowlist_gh_api_errors_do_not_create_access_requests(error):
+    def execute_tool(name, arguments, **kwargs):
+        return {"tool": name, "status": "error", "result": {"error": error}}
+
+    session = make_session(ScriptedGateway([]), execute_tool=execute_tool)
+    session._execute_calls(({
+        "id": "gh-1",
+        "name": "gh_api",
+        "arguments": json.dumps({
+            "endpoint": "repos/a/b/commits/" + "a" * 40,
+            "targets": ["O1"],
+        }),
+    },))
+
+    assert session.source_access_requests == ()
 
 
 def test_tool_timeout_is_recomputed_from_absolute_lease_before_each_call():
@@ -550,6 +5761,50 @@ def test_recovery_reconstructs_context_without_resetting_lifetime_state():
     assert "OB-tests" in json.dumps(session.conversation.events)
 
 
+def test_recovery_rebases_checkpoint_span_before_later_pressure_compaction():
+    gateway = ScriptedGateway([
+        checkpoint_response(
+            inspected=["a.py"],
+            unresolved=["OB-tests"],
+            working_summary="checkpoint before recovery",
+        ),
+        checkpoint_response(
+            inspected=["after.py"],
+            unresolved=["OB-tests"],
+            working_summary="checkpoint after recovery",
+        ),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.request_checkpoint("controller-request", disposition="pause")
+
+    session.recover("repetitive-transcript")
+
+    assert len(session._checkpoint_spans) == 1
+    recovered_span = session._checkpoint_spans[0]
+    assert recovered_span.response_end <= len(session.conversation.events)
+    protected = session.conversation.events[
+        recovered_span.request_start:recovered_span.response_end
+    ]
+    assert len(protected) == 1
+    assert protected[0]["kind"] == "user"
+    assert protected[0]["content"].startswith("Recovery reconstruction.")
+
+    seed_successful_tool_exchange(
+        session,
+        call_id="after-recovery",
+        path="after.py",
+        content="evidence collected after recovery",
+    )
+    session.request_checkpoint(
+        "context-pressure", disposition="compact_resume",
+    )
+
+    assert len(session._checkpoint_spans) == 2
+    transcript = json.dumps(session.conversation.events, sort_keys=True)
+    assert "Recovery reconstruction." in transcript
+    assert "checkpoint after recovery" in transcript
+
+
 def test_recovery_next_turn_uses_recovery_output_ceiling():
     gateway = ScriptedGateway([
         checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
@@ -624,6 +5879,7 @@ def test_no_progress_guard_requests_checkpoint_instead_of_final_report():
         repeated,
         repeated,
         checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+        invalid_response('{"obligation_updates":[]}'),
     ])
     session = make_session(gateway, tool_calls=4, model_turns=8)
 
@@ -631,9 +5887,17 @@ def test_no_progress_guard_requests_checkpoint_instead_of_final_report():
 
     assert result.state.value == "checkpoint"
     assert result.budget.tool_calls == 1
-    assert result.budget.model_turns == 4
-    assert gateway.requests[-1].tools_enabled is False
-    assert "not a final report" in gateway.requests[-1].messages.lower()
+    assert result.budget.model_turns == 5
+    assert gateway.requests[3].tools_enabled is False
+    assert "not a final report" in gateway.requests[3].messages.lower()
+    assert gateway.requests[3].messages_contain(
+        "Immediate compaction after validation: no."
+    )
+    assert len(gateway.requests) == 5
+    assert gateway.requests[4].tools_enabled is False
+    assert gateway.requests[4].messages_contain("Exploration is stopping, not restarting")
+    session.finalize()
+    assert len(gateway.requests) == 5
 
 
 def test_no_progress_guard_projects_checkpoint_when_no_model_turn_remains():
@@ -681,19 +5945,20 @@ def test_checkpoint_collects_only_evidence_backed_candidate_objects():
     )
     checkpoint = checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])
     raw = json.loads(checkpoint.text)
-    raw["candidate_finding_ids"] = ["candidate-code", "candidate-forged"]
-    raw["candidate_findings"] = [
+    raw["new_candidates"] = [
         {
             "candidate_id": "candidate-code",
             "root_cause_fingerprint": "root:candidate-code",
             "claim": "The changed branch skips the cancellation state.",
             "affected_location": "a.py:4",
-            "causal_chain": "The new state reaches a switch without a matching arm.",
+            "causal_chain": "The changed state reaches invalid branch in a switch without a matching arm.",
             "severity": "major",
             "category": "correctness",
             "supporting_evidence_ids": [evidence_id],
             "related_obligation_ids": ["OB-code"],
-            "confidence_rationale": "Direct retained file evidence.",
+            "consequence_support": reachable_consequence_support(
+                outcome="Cancelled work is shown as active",
+            ),
             "user_visible_consequence": "Cancelled work is shown as active.",
             "manual_validation": "Run the cancellation-state test.",
         },
@@ -711,9 +5976,18 @@ def test_checkpoint_collects_only_evidence_backed_candidate_objects():
         **checkpoint.__dict__,
         "text": json.dumps(raw),
     })
+    repaired = ModelTurnResult(**{
+        **checkpoint.__dict__,
+        "text": json.dumps({
+            **raw,
+                "new_candidates": [raw["new_candidates"][0]],
+        }),
+    })
     gateway = ScriptedGateway([
         tool_call_response("read_file", {"path": "a.py"}),
         checkpoint,
+        repaired,
+        repaired,
     ])
     session = make_session(gateway)
 
@@ -727,6 +6001,8 @@ def test_checkpoint_collects_only_evidence_backed_candidate_objects():
     assert candidate.supporting_evidence_ids == (evidence_id,)
     assert candidate.related_obligation_ids == ("OB-code",)
     assert candidate.collector_session_id == "S1"
+    assert "candidate-retention-unknown" not in result.checkpoint.unknowns
+    assert result.degraded is False
 
 
 def test_tool_result_enters_conversation_only_after_evidence_redaction():
@@ -749,7 +6025,34 @@ def test_tool_result_enters_conversation_only_after_evidence_redaction():
 
     retained = json.dumps(session.conversation.events) + repr(session.evidence_store.snapshot())
     assert secret not in retained
-    assert "[REDACTED]" in retained
+    assert "[REDACTED_VALUE]" in retained
+
+
+def test_multi_path_diff_retains_separate_path_evidence_slices():
+    def execute_tool(name, arguments):
+        return {
+            "tool": name,
+            "status": "ok",
+            "result": {"patches": [
+                {"path": path, "status": "ok", "patch": f"+changed {path}"}
+                for path in arguments["paths"]
+            ]},
+        }
+
+    gateway = ScriptedGateway([
+        tool_call_response("read_pr_diff", {"paths": ["a.py", "tests/test_a.py"]}),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, execute_tool=execute_tool)
+
+    session.explore()
+
+    records = session.evidence_store.snapshot().records
+    assert {record.source_path for record in records} == {"a.py", "tests/test_a.py"}
+    tool_events = [
+        item for item in session.conversation.events if item.get("kind") == "tool_result"
+    ]
+    assert len(json.loads(tool_events[-1]["content"])["evidence_slices"]) == 2
 
 
 def test_tool_deduplication_retains_only_sanitized_evidence_records():
@@ -776,7 +6079,7 @@ def test_tool_deduplication_retains_only_sanitized_evidence_records():
     assert secret not in repr(retained)
 
 
-def test_inspected_path_cannot_cover_an_unrelated_obligation_scope():
+def test_inspected_path_alone_cannot_cover_any_obligation_scope():
     gateway = ScriptedGateway([
         tool_call_response("read_file", {"path": "a.py"}),
         checkpoint_response(inspected=["a.py"], unresolved=[]),
@@ -786,7 +6089,7 @@ def test_inspected_path_cannot_cover_an_unrelated_obligation_scope():
     result = session.explore()
     statuses = dict(result.checkpoint.obligation_statuses)
 
-    assert statuses["OB-code"].value == "covered"
+    assert statuses["OB-code"].value == "pending"
     assert statuses["OB-tests"].value == "pending"
 
 
@@ -842,7 +6145,10 @@ def test_unscoped_obligation_requires_matching_evidence_category():
     )
     checkpoint = checkpoint_response(inspected=[], unresolved=[])
     raw = json.loads(checkpoint.text)
-    raw["evidence_by_obligation"] = {"OB-unscoped": [evidence_id]}
+    raw["obligation_updates"] = [{
+        "target": "O1", "disposition": "covered", "reason": "Verified.",
+        "evidence_ids": [evidence_id], "next_actions": [],
+    }]
     checkpoint = ModelTurnResult(**{**checkpoint.__dict__, "text": json.dumps(raw)})
     gateway = ScriptedGateway([
         tool_call_response(
@@ -855,8 +6161,8 @@ def test_unscoped_obligation_requires_matching_evidence_category():
         gateway, obligations=(obligation,), assignment=assignment,
     ).explore()
 
-    assert dict(result.checkpoint.obligation_statuses)["OB-unscoped"].value == "covered"
-    assert result.checkpoint.unknowns == ()
+    assert dict(result.checkpoint.obligation_statuses)["OB-unscoped"].value == "pending"
+    assert result.checkpoint.obligation_assessments[0].disposition.value == "covered"
 
 
 def test_session_consumes_task_three_assignment_contract():
@@ -878,43 +6184,21 @@ def test_session_consumes_task_three_assignment_contract():
     assert "correctness" in gateway.requests[0].messages
 
 
-def test_finalize_disables_tools_repairs_schema_once_and_is_once_only():
-    gateway = ScriptedGateway([
-        tool_call_response("read_file", {"path": "a.py"}),
-        checkpoint_response(inspected=["a.py"], unresolved=[]),
-        invalid_response(),
-        final_response(summary="repaired"),
-    ])
-    session = make_session(gateway, model_turns=8)
-    session.explore()
-
-    first = session.finalize()
-    second = session.finalize()
-
-    assert first is second
-    assert first.state.value == "complete"
-    assert first.report["summary"] == "repaired"
-    assert first.budget.model_turns == 4
-    assert len(gateway.requests) == 4
-    assert gateway.requests[2].tools_enabled is False
-    assert gateway.requests[3].tools_enabled is False
-
-
-def test_finalize_falls_back_to_structured_checkpoint_after_one_repair():
+def test_finalization_preserves_checkpoint_when_disposition_response_invalid():
     gateway = ScriptedGateway([
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
-        invalid_response("bad-one"),
-        invalid_response("bad-two"),
+        invalid_response("invalid accounting"),
     ])
-    session = make_session(gateway, model_turns=6)
+    session = make_session(gateway)
     session.explore()
 
     result = session.finalize()
 
-    assert result.state.value == "complete"
-    assert result.degraded is True
-    assert result.report["source"] == "checkpoint-fallback"
+    assert result.degraded is False
+    assert result.report["source"] == "checkpoint-finalization"
     assert result.report["unknowns"] == ["OB-code", "OB-tests"]
+    assert len(gateway.requests) == 2
+    assert result.report["obligation_disposition_passes"][0]["status"] == "invalid"
 
 
 def _session_with_retained_candidate(final_responses):
@@ -928,18 +6212,19 @@ def _session_with_retained_candidate(final_responses):
     )
     checkpoint = checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])
     raw = json.loads(checkpoint.text)
-    raw["candidate_finding_ids"] = ["candidate-code"]
-    raw["candidate_findings"] = [{
+    raw["new_candidates"] = [{
         "candidate_id": "candidate-code",
         "root_cause_fingerprint": "root:candidate-code",
         "claim": "The changed branch skips the cancellation state.",
         "affected_location": "a.py:4",
-        "causal_chain": "The new state reaches a switch without a matching arm.",
+        "causal_chain": "The changed state reaches invalid branch in a switch without a matching arm.",
         "severity": "major",
         "category": "correctness",
         "supporting_evidence_ids": [evidence_id],
         "related_obligation_ids": ["OB-code"],
-        "confidence_rationale": "Direct retained file evidence.",
+        "consequence_support": reachable_consequence_support(
+            outcome="Cancelled work is shown as active",
+        ),
         "user_visible_consequence": "Cancelled work is shown as active.",
         "manual_validation": "Run the cancellation-state test.",
     }]
@@ -957,142 +6242,29 @@ def _session_with_retained_candidate(final_responses):
     return session, gateway
 
 
-def test_finalization_repairs_dangling_candidate_references_without_dropping_valid_ids():
-    session, gateway = _session_with_retained_candidate([
-        final_response(candidate_finding_ids=["candidate-code", "candidate-forged"]),
-        final_response(summary="repaired", candidate_finding_ids=["candidate-code"]),
-    ])
-
-    result = session.finalize()
-
-    assert result.degraded is False
-    assert result.report["summary"] == "repaired"
-    assert result.report["candidate_finding_ids"] == ["candidate-code"]
-    assert result.finalization_diagnostics == ({
-        "code": "invalid_candidate_finding_references",
-        "attempt": "initial",
-        "candidate_finding_ids": ("candidate-forged",),
-        "omitted_count": 0,
-    },)
-    assert gateway.requests[3].messages_contain("candidate-forged")
-    assert gateway.requests[3].messages_contain("latest checkpoint")
-
-
-def test_repeated_dangling_candidate_references_degrade_with_bounded_diagnostics():
-    forged_ids = [f"candidate-forged-{index}" for index in range(25)]
+def test_checkpoint_admission_failure_keeps_already_admitted_candidate():
+    """A transport fallback does not turn a retained candidate into loss."""
     session, _gateway = _session_with_retained_candidate([
-        final_response(candidate_finding_ids=["candidate-code", *forged_ids]),
-        final_response(candidate_finding_ids=forged_ids),
+        TimeoutError("checkpoint provider timed out"),
     ])
+
+    result = session.request_checkpoint("controller-request")
+
+    assert result.checkpoint.candidate_finding_ids == ("candidate-code",)
+    assert "candidate-retention-unknown" not in result.checkpoint.unknowns
+
+
+def test_finalization_preserves_retention_unknown_as_degraded_checkpoint_state():
+    session, _gateway = _session_with_retained_candidate([])
+    session.latest_checkpoint = session._checkpoint_with_retention_unknown(
+        session.latest_checkpoint,
+    )
 
     result = session.finalize()
 
     assert result.degraded is True
-    assert result.report["source"] == "checkpoint-fallback"
-    assert result.report["candidate_finding_ids"] == ["candidate-code"]
-    assert tuple(
-        item["attempt"] for item in result.finalization_diagnostics
-    ) == ("initial", "repair")
-    assert all(
-        len(item["candidate_finding_ids"]) == 20
-        and item["omitted_count"] == 5
-        for item in result.finalization_diagnostics
-    )
-
-
-def test_finalize_falls_back_when_schema_repair_has_no_lifetime_turn_left():
-    gateway = ScriptedGateway([
-        checkpoint_response(inspected=[], unresolved=["OB-code"]),
-        invalid_response("last-turn-was-invalid"),
-    ])
-    session = make_session(gateway, model_turns=2)
-    session.explore()
-
-    result = session.finalize()
-
-    assert result.state.value == "complete"
-    assert result.degraded is True
-    assert result.report["source"] == "checkpoint-fallback"
-    assert result.budget.model_turns == 2
-    assert len(gateway.requests) == 2
-
-
-def test_exhausted_finalization_repair_records_no_unadmitted_request_attempt():
-    gateway = ScriptedGateway([
-        checkpoint_response(inspected=[], unresolved=["OB-code"]),
-        invalid_response("last-admitted-turn-was-invalid"),
-    ])
-    session = make_session(gateway, model_turns=2)
-    attempts = RequestAttemptJournal()
-    session.bind_request_attempt_journal(attempts, "assignment-1")
-    session.explore()
-
-    result = session.finalize()
-    recorded = attempts.close_since(0)
-
-    assert result.report["source"] == "checkpoint-fallback"
-    assert result.budget.model_turns == 2
-    assert len(gateway.requests) == 2
-    assert tuple(item.status for item in recorded) == ("completed", "completed")
-    assert tuple(event.status for event in result.request_events) == (
-        "started", "completed", "started", "completed",
-    )
-
-
-def test_initial_finalization_budget_exhaustion_caches_one_fallback():
-    gateway = ScriptedGateway([
-        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
-    ])
-    session = make_session(gateway, model_turns=1)
-    session.explore()
-
-    first = session.finalize()
-    second = session.finalize()
-
-    assert first is second
-    assert first.state.value == "complete"
-    assert first.degraded is True
-    assert first.report["source"] == "checkpoint-fallback"
-    assert len(gateway.requests) == 1
-
-
-def test_provider_exception_during_initial_finalization_caches_fallback():
-    gateway = ScriptedGateway([
-        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
-        RuntimeError("provider unavailable"),
-    ])
-    session = make_session(gateway)
-    session.explore()
-
-    first = session.finalize()
-    second = session.finalize()
-
-    assert first is second
-    assert first.state.value == "complete"
-    assert first.degraded is True
-    assert first.report["source"] == "checkpoint-fallback"
-    assert first.budget.model_turns == 2
-    assert len(gateway.requests) == 2
-
-
-def test_provider_exception_during_finalization_repair_caches_fallback():
-    gateway = ScriptedGateway([
-        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
-        invalid_response(),
-        RuntimeError("repair provider unavailable"),
-    ])
-    session = make_session(gateway)
-    session.explore()
-
-    first = session.finalize()
-    second = session.finalize()
-
-    assert first is second
-    assert first.state.value == "complete"
-    assert first.degraded is True
-    assert first.report["source"] == "checkpoint-fallback"
-    assert first.budget.model_turns == 3
-    assert len(gateway.requests) == 3
+    assert result.report["source"] == "checkpoint-finalization"
+    assert "candidate-retention-unknown" in result.report["unknowns"]
 
 
 def test_expired_lease_refuses_exploration_and_finalization_requests():
@@ -1105,12 +6277,8 @@ def test_expired_lease_refuses_exploration_and_finalization_requests():
 
     finalize_gateway = ScriptedGateway([])
     finalize_session = make_session(finalize_gateway, lease=lease)
-    first = finalize_session.finalize()
-    second = finalize_session.finalize()
+    with pytest.raises(TimeoutError, match="session lease expired"):
+        finalize_session.finalize()
 
     assert explore_gateway.requests == []
     assert finalize_gateway.requests == []
-    assert first is second
-    assert first.state.value == "complete"
-    assert first.degraded is True
-    assert first.report["source"] == "checkpoint-fallback"

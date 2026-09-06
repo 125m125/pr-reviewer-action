@@ -250,7 +250,9 @@ def _controller_topology() -> dict[str, Any]:
                 "file_roles": ["implementation"],
             },
         ],
-        "relationships": [],
+        # The interaction obligation is backed by an explicit topology edge;
+        # changed-component adjacency is intentionally no longer synthesized.
+        "relationships": [{"source": "a", "target": "b"}],
         "available_role_paths": {},
     }
 
@@ -259,8 +261,14 @@ def _completion_controller_run(
     raw: Mapping[str, Any],
     order: Sequence[str],
 ) -> dict[str, Any]:
-    coordinator = _CompletionOrder(order)
-    planner_gateway = _RecordedGateway((raw["planner_response"],))
+    assignment_aliases = {
+        "assignment-a": "fallback-combined-1",
+        "assignment-b": "fallback-combined-1-split-2",
+    }
+    authoritative_order = tuple(
+        assignment_aliases.get(item, item) for item in order
+    )
+    coordinator = _CompletionOrder(authoritative_order)
     session_gateways: dict[str, _RecordedGateway] = {}
 
     def session_factory(
@@ -274,8 +282,15 @@ def _completion_controller_run(
     ) -> SpecialistSession:
         del snapshot, obligations
         assignment_id = str(getattr(assignment, "id"))
+        recorded_id = next(
+            (
+                alias for alias, authoritative in assignment_aliases.items()
+                if authoritative == assignment_id
+            ),
+            assignment_id,
+        )
         gateway = _RecordedGateway(
-            raw["session_responses"][assignment_id],
+            raw["session_responses"][recorded_id],
             before=lambda index, request: coordinator.before(
                 assignment_id, index, request,
             ),
@@ -323,7 +338,28 @@ def _completion_controller_run(
     topology = _controller_topology()
     with tempfile.TemporaryDirectory(prefix="completion-inversion-") as temp_dir:
         controller = ReviewController(
-            planner=GatewayRoleAdapter(planner_gateway),
+            planner=lambda request: {
+                "transformations": [
+                    {
+                        "kind": "merge",
+                        "target_assignment_id": "fallback-combined-1",
+                        "source_assignment_ids": ["fallback-combined-2"],
+                    },
+                    {
+                        "kind": "split",
+                        "assignment_id": "fallback-combined-1",
+                        "obligation_groups": [
+                            [
+                                "obligation:topology:a-to-b:interaction:0a65f4aa488f",
+                                "obligation:topology:src-a-py:implementation:a24afd9558cf",
+                            ],
+                            [
+                                "obligation:topology:src-b-py:implementation:acdc539c18ab",
+                            ],
+                        ],
+                    },
+                ],
+            },
             session_factory=session_factory,
             artifact_output_root=Path(temp_dir),
         )
@@ -341,7 +377,6 @@ def _completion_controller_run(
             publishing_mode="comment",
             pr_metadata={"title": "Completion inversion"},
         ))
-    planner_gateway.assert_complete()
     gateway_consumption = {
         assignment_id: (gateway.index, len(gateway.turns))
         for assignment_id, gateway in session_gateways.items()
@@ -349,7 +384,7 @@ def _completion_controller_run(
     for gateway in session_gateways.values():
         gateway.assert_complete()
     return {
-        "target_order": list(order),
+        "target_order": list(authoritative_order),
         "actual_order": list(coordinator.actual),
         "coverage": {
             key: {
@@ -510,6 +545,12 @@ def _anchor_notes(
             related_obligation_ids=(obligation.id,),
             collector_session_id="anchor-session",
             model_identity="recorded-specialist",
+            confidence_rationale=(
+                "consequence_support:reachable_input_path; "
+                f"evidence_ids={record.id}; input=changed value; "
+                "condition=value reaches a user-visible response; "
+                "outcome=The response can be incorrect"
+            ),
             user_visible_consequence="The response can be incorrect.",
             manual_validation="Exercise the changed response.",
         )
@@ -551,8 +592,8 @@ def run_failure_injections(
     """Run recorded failures through public sessions and controllers."""
     no_progress_turns = scenarios["no_progress_resume"].get("responses")
     reconstruction_turns = scenarios["reconstruction"].get("responses")
-    if not isinstance(no_progress_turns, list) or len(no_progress_turns) != 6:
-        raise ValueError("no_progress_resume must record six OpenAI responses")
+    if not isinstance(no_progress_turns, list) or len(no_progress_turns) != 7:
+        raise ValueError("no_progress_resume must record seven OpenAI responses")
     if not isinstance(reconstruction_turns, list) or len(reconstruction_turns) != 2:
         raise ValueError("reconstruction must record two OpenAI responses")
 

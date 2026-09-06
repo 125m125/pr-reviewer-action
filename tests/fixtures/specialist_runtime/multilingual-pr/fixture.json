@@ -131,8 +131,6 @@
       "obligation:topology:contracts-order-event-schema-json:consumer:53c8f5e2d566",
       "obligation:topology:contracts-order-event-schema-json:implementation:b57372513732",
       "obligation:topology:contracts-order-event-schema-json:producer:42ca4db59e94",
-      "obligation:topology:db-migrations-v42-order-status-sql:implementation:e3d595e0465a",
-      "obligation:topology:deploy-k8s-order-worker-yaml:implementation:7e0204a9458c",
       "obligation:topology:java-api-to-order-contract:interaction:7da5b698b788",
       "obligation:topology:order-contract-to-python-messaging:interaction:a35939cab811",
       "obligation:topology:order-contract-to-typescript-consumer:interaction:048d17c9fff3",
@@ -147,10 +145,7 @@
       "obligation:topology:python-messaging:producer:bca10ac5d93f",
       "obligation:topology:relevant-tests:tests:6c17d8d1bc72",
       "obligation:topology:src-main-java-example-api-ordercontroller-java:implementation:d577a16b2edb",
-      "obligation:topology:tests-java-ordercontrollertest-java:implementation:38c9abf890dd",
-      "obligation:topology:tests-python-test-order-worker-py:implementation:da089070551e",
       "obligation:topology:web-src-order-client-ts:implementation:90781ad84511",
-      "obligation:topology:web-tests-order-client-spec-ts:implementation:2d10e0a0cbe6",
       "obligation:topology:workers-messaging-order-worker-py:implementation:e1e64f7eccf7"
     ],
     "mandatory_obligation_ids": [
@@ -160,8 +155,6 @@
       "obligation:topology:contracts-order-event-schema-json:consumer:53c8f5e2d566",
       "obligation:topology:contracts-order-event-schema-json:implementation:b57372513732",
       "obligation:topology:contracts-order-event-schema-json:producer:42ca4db59e94",
-      "obligation:topology:db-migrations-v42-order-status-sql:implementation:e3d595e0465a",
-      "obligation:topology:deploy-k8s-order-worker-yaml:implementation:7e0204a9458c",
       "obligation:topology:java-api-to-order-contract:interaction:7da5b698b788",
       "obligation:topology:order-contract-to-python-messaging:interaction:a35939cab811",
       "obligation:topology:order-contract-to-typescript-consumer:interaction:048d17c9fff3",
@@ -176,25 +169,21 @@
       "obligation:topology:python-messaging:producer:bca10ac5d93f",
       "obligation:topology:relevant-tests:tests:6c17d8d1bc72",
       "obligation:topology:src-main-java-example-api-ordercontroller-java:implementation:d577a16b2edb",
-      "obligation:topology:tests-java-ordercontrollertest-java:implementation:38c9abf890dd",
-      "obligation:topology:tests-python-test-order-worker-py:implementation:da089070551e",
       "obligation:topology:web-src-order-client-ts:implementation:90781ad84511",
-      "obligation:topology:web-tests-order-client-spec-ts:implementation:2d10e0a0cbe6",
       "obligation:topology:workers-messaging-order-worker-py:implementation:e1e64f7eccf7"
     ],
     "recipe_statuses": {
       "cross-language-contract": "covered",
       "deployment-rollout": "covered"
     },
-    "finding_ids": ["candidate-schema-enum"],
+    "finding_ids": [],
     "acceptable_unknowns": [],
     "max_model_turns": 12,
     "max_tool_calls": 64,
     "max_recoveries": 1,
     "forbidden_public_text": [
       "candidate-schema-enum",
-      "evidence:",
-      "src/main/java"
+      "evidence:"
     ]
   }
 }

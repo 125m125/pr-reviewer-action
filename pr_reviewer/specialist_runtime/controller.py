@@ -7,6 +7,7 @@ terminal artifact; it does not reproduce their policy decisions.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from enum import Enum
 import hashlib
@@ -15,14 +16,19 @@ import json
 from math import isfinite
 import os
 from pathlib import Path
+import re
 import secrets
 import tempfile
+from threading import Event
 import time
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Protocol
+from urllib.parse import urlsplit
 
 from pr_reviewer.conversation import Conversation
+from pr_reviewer.specialists import classify_file_roles
 from .adjudication import (
+    AcceptedFinding,
     AdjudicatedReview,
     ReviewHandoffContext,
     ReviewOrientationTopic,
@@ -30,13 +36,16 @@ from .adjudication import (
     apply_runtime_verdict_policy,
     build_review_handoff,
     build_review_notes,
+    build_source_access_request_notes,
+    consolidate_candidates,
+    normalize_candidate_severity,
+    review_orientation_label,
 )
 from .assignments import (
     Assignment,
     AssignmentPlan,
-    AssignmentPlanError,
+    apply_planner_transformations,
     fallback_assignment_plan,
-    repair_prompt,
     validate_assignment_plan,
 )
 from .budget import BudgetLedger, RunDeadline, SessionLease
@@ -62,7 +71,9 @@ from .negotiation import (
     NegotiationError,
     NegotiationState,
     SessionResources,
+    compact_negotiation_context,
     fallback_next_action,
+    validate_compact_negotiation,
     validate_negotiation,
 )
 from .model_gateway import ModelGateway, ModelTurnRequest
@@ -72,18 +83,301 @@ from .scheduler import SessionScheduler, WaveResult, WaveSnapshot
 from .types import (
     BudgetUsage,
     CandidateFinding,
+    FindingRemediation,
+    change_overview_orientation,
     CoverageObligation,
+    InvestigationLead,
+    InvestigationLeadStatus,
+    LeadResolution,
     ObligationStatus,
     ReviewHandoff,
     ReviewNote,
+    ReviewNoteKind,
     RunPhase,
 )
-from .web_evidence import SourceAccessRequest
+from .web_evidence import (
+    RepositoryAccessRequest,
+    SourceAccessRequest,
+    access_request_identity,
+)
+from pr_reviewer.transport import is_model_endpoint_unavailable
+
+
+# The remediator's model prompt is intentionally bounded.  Anchor validation
+# is controller-owned, however, and needs its own immutable diff budget so a
+# large set of cited evidence cannot hide the changed lines required to verify
+# an exact suggestion.
+_REMEDIATION_EVIDENCE_LIMIT = 16_000
+_REMEDIATION_RECORD_LIMIT = 6_000
+_REMEDIATION_VALIDATION_DIFF_LIMIT = 16_000
 
 
 _SCHEMA_VERSION = 2
 _MAX_ARTIFACT_STRING = 16 * 1024
 _MAX_ARTIFACT_ITEMS = 2_000
+_MAX_CHANGE_OVERVIEW_ITEMS = 5
+_PROHIBITED_OVERVIEW_CLAIM = re.compile(
+    r"(?i)\b(?:unsafe|safe\s+to\s+merge|ready\s+to\s+merge|merge[- ]safe|"
+    r"(?:introduces?|causes?|creates?|contains?|has)\s+(?:an?\s+)?"
+    r"(?:blocker|bugs?|defects?|vulnerabilit(?:y|ies))|"
+    r"(?:verdict|recommendation|review\s+result)\s*(?:is|=|:)\s*"
+    r"(?:approve|approval|request[_ -]?changes)|"
+    r"coverage\s+(?:is\s+)?(?:complete|sufficient|verified)|"
+    r"(?:is|are|was|were|has\s+been|have\s+been)\s+"
+    r"(?:fully\s+)?(?:verified|validated|tested|covered)|"
+    r"every\s+(?:branch|path|case)\s+(?:is\s+)?tested|"
+    r"(?:all|fully|completely)\b.{0,40}\b(?:covered|reviewed|verified|tested))\b"
+)
+_PATH_WITH_DIRECTORY = re.compile(
+    r"(?<![A-Za-z0-9_./:-])"
+    r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+"
+)
+_ROOT_FILE_REFERENCE = re.compile(
+    r"(?<![A-Za-z0-9_./:-])"
+    r"(?:[A-Za-z0-9_-]+\.[A-Za-z][A-Za-z0-9_-]{0,62}"
+    r"|\.[A-Za-z0-9_-]+)\b"
+)
+_PROSE_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9_./-])[A-Za-z0-9_.-]+"
+    r"(?:/[A-Za-z0-9_.-]+)*(?![A-Za-z0-9_./-])"
+)
+_URL_CANDIDATE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_.-])(?:"
+    r"https?://[^\s<>()]+|"
+    r"www\.(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}(?:/[^\s<>()]*)?|"
+    r"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}/[^\s<>()]*|"
+    r"(?:[A-Za-z0-9-]+\.){2,}[A-Za-z]{2,63}"
+    r")"
+)
+_DETERMINISTIC_CONTEXT_KEYS = frozenset({
+    "context_paths", "related_paths", "affected_paths", "affected_consumers",
+    "affected_producers", "affected_callees", "affected_callers",
+    "consumer_paths", "producer_paths", "callee_paths", "caller_paths",
+    "retained_evidence_paths", "evidence_paths", "dependency_paths",
+})
+_RELATION_PATH_KEYS = frozenset({
+    "path", "paths", "source_path", "target_path", "producer_path",
+    "consumer_path", "callee_path", "caller_path", "related_paths",
+    "affected_paths", "context_paths", "consumer_paths", "producer_paths",
+    "callee_paths", "caller_paths",
+})
+_SIGNAL_ORIENTATION_TOPICS = {
+    "implementation": (ReviewOrientationTopic.IMPLEMENTATION,),
+    "documentation": (ReviewOrientationTopic.DOCUMENTATION,),
+    "other": (ReviewOrientationTopic.REPOSITORY_BEHAVIOR,),
+    "test": (ReviewOrientationTopic.TEST_COVERAGE,),
+    "tests": (ReviewOrientationTopic.TEST_COVERAGE,),
+    "schema_contract": (ReviewOrientationTopic.API_CONTRACTS,),
+    "producer": (ReviewOrientationTopic.API_CONTRACTS,),
+    "consumer": (ReviewOrientationTopic.API_CONTRACTS,),
+    "generated": (ReviewOrientationTopic.GENERATED_ARTIFACTS,),
+    "migration": (ReviewOrientationTopic.DATABASE,),
+    "persistence": (ReviewOrientationTopic.DATABASE,),
+    "messaging": (ReviewOrientationTopic.CROSS_COMPONENT_CONTRACTS,),
+    "delivery": (ReviewOrientationTopic.FAILURE_RECOVERY,),
+    "deployment": (ReviewOrientationTopic.DEPLOYMENT,),
+    "deployment_artifact": (ReviewOrientationTopic.DEPLOYMENT,),
+    "build_manifest": (ReviewOrientationTopic.DEPLOYMENT,),
+    "configuration": (ReviewOrientationTopic.DEPLOYMENT,),
+    "trust_boundary": (
+        ReviewOrientationTopic.AUTHORIZATION,
+        ReviewOrientationTopic.SECURITY,
+    ),
+    "interaction": (ReviewOrientationTopic.CROSS_COMPONENT_CONTRACTS,),
+    "auth_changes": (
+        ReviewOrientationTopic.AUTHORIZATION,
+        ReviewOrientationTopic.SECURITY,
+    ),
+    "public_route_changes": (
+        ReviewOrientationTopic.AUTHORIZATION,
+        ReviewOrientationTopic.API_CONTRACTS,
+    ),
+    "file_serving_changes": (ReviewOrientationTopic.SECURITY,),
+    "path_handling_changes": (ReviewOrientationTopic.SECURITY,),
+    "secret_handling_changes": (ReviewOrientationTopic.SECURITY,),
+    "linked_security_issue": (ReviewOrientationTopic.SECURITY,),
+    "linked_audit_issue": (ReviewOrientationTopic.SECURITY,),
+    "dependency_changes": (ReviewOrientationTopic.DEPLOYMENT,),
+}
+
+_HANDOFF_RISK_ORDER = {
+    "critical": 0,
+    "high": 1,
+    "normal": 2,
+    "low": 3,
+}
+
+_CANDIDATE_RETENTION_UNKNOWN = "candidate-retention-unknown"
+
+
+def _behavioral_handoff_candidates(
+    *,
+    changed_files: Iterable[str],
+    topology: Mapping[str, Any],
+    obligations: Iterable[CoverageObligation],
+    evidence_records: Iterable[object],
+    reviewed_obligation_ids: Iterable[str],
+    allow_role_fallback: bool = False,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Build bounded, controller-backed behavioral summaries across the full PR."""
+    changed = tuple(dict.fromkeys(str(path) for path in changed_files if str(path)))
+    changed_set = set(changed)
+    obligation_items = tuple(obligations)
+    reviewed_ids = set(reviewed_obligation_ids)
+    facts_value = topology.get("changed_contract_facts", {})
+    facts = facts_value if isinstance(facts_value, Mapping) else {}
+    evidence_paths = {
+        str(getattr(record, "source_path", "") or "")
+        for record in evidence_records
+        if bool(getattr(record, "is_usable_for_coverage", False))
+    }
+
+    by_path: dict[str, list[CoverageObligation]] = {path: [] for path in changed}
+    for obligation in obligation_items:
+        paths = {
+            path for path in (*obligation.scope, *obligation.seed_hints)
+            if path in changed_set
+        }
+        if obligation.subject in changed_set:
+            paths.add(obligation.subject)
+        for path in paths:
+            by_path[path].append(obligation)
+
+    def file_kind(path: str) -> int:
+        roles = set(classify_file_roles(path))
+        if "documentation" in roles:
+            return 2
+        if "test" in roles:
+            return 1
+        return 0
+
+    def behavior_priority(path: str) -> int:
+        roles = set(classify_file_roles(path))
+        if "trust-boundary" in roles:
+            return 0
+        if {"deployment", "build-manifest", "configuration"} & roles:
+            return 2
+        if "implementation" in roles and "test" not in roles:
+            return 1
+        return 2
+
+    def path_priority(path: str) -> tuple[int, int, int, str]:
+        return (
+            file_kind(path),
+            behavior_priority(path),
+            min(
+                (
+                    _HANDOFF_RISK_ORDER.get(item.risk_tier, 2)
+                    for item in by_path[path]
+                ),
+                default=2,
+            ),
+            path,
+        )
+
+    def fact_values(path: str, key: str) -> tuple[str, ...]:
+        item = facts.get(path)
+        if not isinstance(item, Mapping):
+            return ()
+        values = item.get(key, ())
+        if not isinstance(values, (list, tuple)):
+            return ()
+        normalized = []
+        for value in values:
+            safe = re.sub(r"[^A-Za-z0-9 .:/+_-]+", " ", str(value))
+            safe = " ".join(safe.split())[:120]
+            if safe and safe not in normalized:
+                normalized.append(safe)
+        return tuple(normalized[:5])
+
+    def change_type(path: str) -> str:
+        item = facts.get(path)
+        value = item.get("change_type") if isinstance(item, Mapping) else None
+        return value if value in {"adds", "removes", "modifies", "changes"} else "changes"
+
+    def contract_label(path: str) -> str | None:
+        candidates = sorted(
+            (
+                item for item in by_path[path]
+                if item.subject and item.subject != path
+            ),
+            key=lambda item: (
+                _HANDOFF_RISK_ORDER.get(item.risk_tier, 2),
+                item.subject,
+            ),
+        )
+        return candidates[0].subject if candidates else None
+
+    what_changed: list[str] = []
+    ai_reviewed: list[str] = []
+    summarized_paths: set[str] = set()
+
+    def add_summary(path: str, *, fallback: bool) -> None:
+        used_role_fallback = fallback
+        verb = change_type(path)
+        symbols = fact_values(path, "symbols")
+        action_inputs = fact_values(path, "action_inputs")
+        workflow_steps = fact_values(path, "workflow_steps")
+        if action_inputs:
+            summary = f"`{path}` {verb} the `{action_inputs[0]}` action input contract."
+            reviewed_behavior = f"the `{action_inputs[0]}` action input contract"
+        elif workflow_steps:
+            summary = f"`{path}` {verb} the `{workflow_steps[0]}` workflow step."
+            reviewed_behavior = f"the `{workflow_steps[0]}` workflow step contract"
+        elif symbols:
+            summary = f"`{path}` {verb} `{symbols[0]}()` behavior."
+            reviewed_behavior = f"the `{symbols[0]}()` behavior"
+        elif fallback:
+            topics = _orientation_topics(classify_file_roles(path))
+            topic = topics[0] if topics else ReviewOrientationTopic.REPOSITORY_BEHAVIOR
+            label = (
+                review_orientation_label(topic)
+                or "Repository behavior and integration"
+            ).lower()
+            summary = f"`{path}` {verb} {label}."
+            reviewed_behavior = f"{label} in `{path}`"
+        else:
+            return
+        if len(what_changed) < 5:
+            what_changed.append(summary)
+            summarized_paths.add(path)
+        path_reviewed = (
+            path in evidence_paths
+            or any(item.id in reviewed_ids for item in by_path[path])
+        )
+        if path_reviewed and len(ai_reviewed) < 5:
+            contract = None if used_role_fallback else contract_label(path)
+            suffix = f" and {contract} contract" if contract else ""
+            location = "" if f"`{path}`" in reviewed_behavior else f" in `{path}`"
+            ai_reviewed.append(
+                f"Reviewed {reviewed_behavior}{location}{suffix}."
+            )
+
+    ordered_paths = sorted(changed, key=path_priority)
+    for path in ordered_paths:
+        add_summary(path, fallback=False)
+    minimum = min(2, len(changed))
+    if allow_role_fallback or len(what_changed) < minimum:
+        for path in ordered_paths:
+            if path not in summarized_paths and len(what_changed) < max(minimum, 5 if allow_role_fallback else minimum):
+                add_summary(path, fallback=True)
+    return tuple(what_changed), tuple(ai_reviewed)
+
+
+def _orientation_topics(values: Iterable[object]) -> tuple[ReviewOrientationTopic, ...]:
+    selected: set[ReviewOrientationTopic] = set()
+    for value in values:
+        normalized = str(value or "").strip().casefold().replace("-", "_")
+        if not normalized:
+            continue
+        try:
+            selected.add(ReviewOrientationTopic(normalized))
+        except ValueError:
+            pass
+        selected.update(_SIGNAL_ORIENTATION_TOPICS.get(normalized, ()))
+    return tuple(topic for topic in ReviewOrientationTopic if topic in selected)
+
+
 class _FrozenArtifactDict(dict):
     """JSON-serializable mapping with an immutable public mutation surface."""
 
@@ -144,7 +438,7 @@ class ControllerPhase(str, Enum):
 class PlannerRequestBudget:
     """Controller-owned cap for all provider requests in one planning attempt."""
 
-    remaining: int = 3
+    remaining: int = 4
 
     def consume(self) -> None:
         if self.remaining <= 0:
@@ -193,6 +487,20 @@ class FinalizerProposal:
     coverage_boundary_topics: tuple[ReviewOrientationTopic, ...] = ()
     review_emphasis_topics: tuple[ReviewOrientationTopic, ...] = ()
     recommendation: str | None = None
+    what_changed: tuple[str, ...] = ()
+    ai_reviewed: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class HandoffSummaryProposal:
+    """Bounded reviewer-facing prose with explicit controller-owned references."""
+
+    what_changed_summary: str
+    ai_reviewed_summary: str
+    human_focus: str = ""
+    referenced_paths: tuple[str, ...] = ()
+    referenced_component_ids: tuple[str, ...] = ()
+    referenced_obligation_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -293,12 +601,304 @@ def _finalizer_proposal(value: object) -> FinalizerProposal:
         coverage_boundary_topics=topics("coverage_boundary_topics"),
         review_emphasis_topics=topics("review_emphasis_topics"),
         recommendation=recommendation,
+        what_changed=identifiers("what_changed"),
+        ai_reviewed=identifiers("ai_reviewed"),
+    )
+
+
+def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
+    if isinstance(value, HandoffSummaryProposal):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("handoff summarizer must return an object")
+    expected = {"ai_reviewed_summary", "human_focus"}
+    if not expected <= set(value):
+        raise ValueError("handoff summarizer required fields are missing")
+
+    def text(key: str, *, allow_empty: bool = False) -> str:
+        item = " ".join(str(value.get(key) or "").split())
+        if not item and allow_empty:
+            return ""
+        if not item or len(item) > 600:
+            raise ValueError(f"handoff summarizer {key} is invalid")
+        # Keep each section a summary rather than a hidden finding list.
+        sentence_ends = list(re.finditer(r"[.!?](?:\s|$)", item))
+        if len(sentence_ends) > 1:
+            # Preserve the useful first sentence instead of discarding the
+            # complete handoff when a compatible model appends explanation.
+            item = item[:sentence_ends[0].end()].strip()
+        elif not sentence_ends:
+            item += "."
+        if key == "ai_reviewed_summary" and not re.search(
+            r"\b(?:review|reviewed|examined|traced|checked|investigated|validated)\b",
+            item,
+            flags=re.IGNORECASE,
+        ):
+            raise ValueError(
+                "handoff summarizer ai_reviewed_summary must describe review activity"
+            )
+        return item
+
+    def change_summary() -> str:
+        item = " ".join(str(value.get("what_changed_summary") or "").split())
+        if not item:
+            return ""
+        if len(item) > 600:
+            raise ValueError("handoff summarizer what_changed_summary is invalid")
+        sentence_ends = list(re.finditer(r"[.!?](?:\s|$)", item))
+        if len(sentence_ends) > 3:
+            item = item[:sentence_ends[2].end()].strip()
+        elif not sentence_ends:
+            item += "."
+        return item
+
+    def identifiers(key: str) -> tuple[str, ...]:
+        raw = value.get(key, ())
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, (tuple, list)):
+            raise TypeError(f"handoff summarizer {key} must be an array")
+        selected = tuple(dict.fromkeys(
+            str(item).strip() for item in raw if str(item).strip()
+        ))
+        # Reference lists are orientation metadata, not an authorization
+        # surface. Keep the bounded prefix when a model over-produces them;
+        # rejecting the whole handoff loses otherwise valid prose.
+        return selected[:12]
+
+    return HandoffSummaryProposal(
+        what_changed_summary=change_summary(),
+        ai_reviewed_summary=text("ai_reviewed_summary"),
+        human_focus=text("human_focus", allow_empty=True),
+        referenced_paths=identifiers("referenced_paths"),
+        referenced_component_ids=identifiers("referenced_component_ids"),
+        referenced_obligation_ids=identifiers("referenced_obligation_ids"),
     )
 
 
 _VALID_CRITIC_ACTIONS = frozenset({
     "keep", "reject", "merge", "request_verification", "downgrade_unknown",
 })
+
+
+def _critic_response_diagnostics(value: object) -> dict[str, object]:
+    """Return bounded attachment-only diagnostics for a critic response.
+
+    The model response itself can contain evidence text and is deliberately
+    not copied into the workflow log.  These shape diagnostics are enough to
+    explain a normalization or validation decision in the report artifact.
+    """
+    top_level_keys = (
+        tuple(sorted(str(key) for key in value))
+        if isinstance(value, Mapping) else ()
+    )
+    rows: object = (
+        value.get("actions", value.get("decisions"))
+        if isinstance(value, Mapping) else value
+    )
+    extra_fields: set[str] = set()
+    action_count = 0
+    if isinstance(rows, Iterable) and not isinstance(rows, (str, bytes, Mapping)):
+        for row in rows:
+            if isinstance(row, Mapping):
+                action_count += 1
+                extra_fields.update(
+                    str(key) for key in row
+                    if key not in {"candidate_id", "action", "target_id"}
+                )
+    return {
+        "response_digest": _digest(value),
+        "top_level_keys": top_level_keys,
+        "action_count": action_count,
+        "ignored_fields": tuple(sorted(extra_fields)),
+    }
+
+
+def _critic_rows(value: object) -> tuple[Mapping[str, object], ...]:
+    """Extract mapping-shaped critic rows without trusting their contents."""
+    rows: object = value
+    if isinstance(value, Mapping):
+        rows = value.get("actions", value.get("decisions"))
+    if isinstance(rows, (str, bytes)) or not isinstance(rows, Iterable):
+        return ()
+    return tuple(item for item in rows if isinstance(item, Mapping))
+
+
+def _partial_critic_result(
+    value: object,
+    candidates: Iterable[CandidateFinding],
+) -> tuple[tuple[Mapping[str, str], ...], tuple[str, ...]]:
+    """Keep valid rows and identify candidate IDs needing a bounded repair."""
+    allowed = {item.candidate_id for item in candidates}
+    seen: set[str] = set()
+    rows: list[Mapping[str, str]] = []
+    for row in _critic_rows(value):
+        candidate_id = str(row.get("candidate_id") or "").strip()
+        action = str(row.get("action") or "").strip().lower()
+        target_id = str(row.get("target_id") or "").strip()
+        if candidate_id not in allowed or candidate_id in seen:
+            continue
+        if action not in _VALID_CRITIC_ACTIONS:
+            continue
+        if action == "merge":
+            if target_id not in allowed or target_id == candidate_id:
+                continue
+        elif target_id:
+            continue
+        seen.add(candidate_id)
+        rows.append({
+            "candidate_id": candidate_id,
+            "action": action,
+            "target_id": target_id,
+        })
+    return tuple(rows), tuple(sorted(allowed - seen))
+
+
+def _coverage_verification_requests(
+    obligations: Iterable[CoverageObligation],
+    blocking_obligation_ids: Iterable[str],
+) -> tuple[Mapping[str, object], ...]:
+    """Create explicit human checks for policy-blocking coverage gaps."""
+    obligation_map = {item.id: item for item in obligations}
+    unresolved: list[tuple[CoverageObligation, str, str]] = []
+    for obligation_id in sorted({str(item).strip() for item in blocking_obligation_ids}):
+        obligation = obligation_map.get(obligation_id)
+        if obligation is None:
+            continue
+        subject = " ".join(str(obligation.subject).split()) or obligation.id
+        reason = " ".join(str(obligation.explanation).split()) or (
+            "The specialist review did not retain enough evidence to resolve "
+            "this mandatory high-risk obligation."
+        )
+        unresolved.append((obligation, subject, reason))
+    if not unresolved:
+        return ()
+    subjects = "; ".join(item[1] for item in unresolved[:6])
+    reasons = " ".join(
+        f"{subject}: {reason}"
+        for _obligation, subject, reason in unresolved[:4]
+    )
+    if len(unresolved) > 4:
+        reasons += f" (+{len(unresolved) - 4} additional coverage gaps.)"
+    return ({
+        "question": (
+            "Can a human recheck the unresolved high-risk coverage areas "
+            f"before merging? Focus areas: {subjects}."
+        ),
+        "reason": reasons,
+        "related_obligation_ids": tuple(item[0].id for item in unresolved),
+    },)
+
+
+def _deterministic_handoff_focus(
+    obligations: Iterable[CoverageObligation],
+    blocking_obligation_ids: Iterable[str],
+    degraded: bool,
+) -> tuple[str, ...]:
+    del degraded
+    obligation_map = {item.id: item for item in obligations}
+    subjects = tuple(dict.fromkeys(
+        " ".join(str(obligation_map[item].subject).split())
+        for item in sorted({str(value).strip() for value in blocking_obligation_ids})
+        if item in obligation_map and str(obligation_map[item].subject).strip()
+    ))
+    if subjects:
+        subject_text = "; ".join(subjects[:3])
+        area = "this high-risk area" if len(subjects) == 1 else "these high-risk areas"
+        return (
+            f"Recheck {subject_text} because the AI did not retain enough "
+            f"evidence to resolve {area}.",
+        )
+    # Without a concrete unresolved obligation, keep the legacy orientation
+    # labels; there is no specific human action to summarize here.
+    return ()
+
+
+def _deterministic_reviewed_summary(
+    *,
+    evidence_paths: Iterable[str],
+    component_ids: Iterable[str],
+    reviewed_obligations: Iterable[CoverageObligation],
+) -> tuple[str, ...]:
+    if not tuple(reviewed_obligations):
+        return ()
+    components = tuple(dict.fromkeys(
+        " ".join(str(item).split())
+        for item in component_ids
+        if str(item).strip()
+    ))
+    scope = " and ".join(components[:4]) or "the affected components"
+    paths = tuple(dict.fromkeys(
+        str(path).replace("\\", "/")
+        for path in evidence_paths
+        if str(path).strip()
+    ))
+    if not paths:
+        return ()
+    path_text = ", ".join(f"`{path}`" for path in paths[:3])
+    return (
+        "The AI examined assigned behavior across " + scope
+        + " using retained changed evidence from " + path_text + ".",
+    )
+
+
+def _deterministic_handoff_change_summary(
+    change_overview: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Render bounded behavioral prose when a run cannot trust model prose."""
+    def bounded_fact(value: object, limit: int) -> str:
+        text = " ".join(str(value or "").split())
+        if len(text) <= limit:
+            return text
+        prefix = text[:limit - 1].rsplit(" ", 1)[0].rstrip(" ,;:.")
+        return prefix + "…"
+
+    overview = " ".join(str(change_overview.get("overview") or "").split())
+    if not overview:
+        return ()
+    result = [overview[:600]]
+    key_changes = change_overview.get("key_changes", ())
+    summaries: list[str] = []
+    if isinstance(key_changes, (list, tuple)):
+        for item in key_changes:
+            if not isinstance(item, Mapping):
+                continue
+            summary = " ".join(str(item.get("summary") or "").split())
+            if summary.casefold() in {"changes", "modifies"}:
+                continue
+            if summary and summary not in summaries:
+                summaries.append(bounded_fact(summary, 180))
+            if len(summaries) == 3:
+                break
+    if summaries:
+        result.append(
+            "The main behavioral changes include "
+            + "; ".join(summaries)
+            + "."
+        )
+    effects = change_overview.get("cross_component_effects", ())
+    effect_text: list[str] = []
+    if isinstance(effects, (list, tuple)):
+        for item in effects:
+            if isinstance(item, Mapping):
+                text = " ".join(str(item.get("summary") or "").split())
+            else:
+                text = " ".join(str(item).split())
+            if text and text not in effect_text:
+                effect_text.append(bounded_fact(text, 180))
+            if len(effect_text) == 2:
+                break
+    if effect_text and len(result) < 3:
+        suffix = "" if effect_text[-1].endswith((".", "!", "?")) else "."
+        result.append(
+            "Cross-component effects to recheck include "
+            + "; ".join(effect_text)
+            + suffix
+        )
+    if len(result) == 1:
+        result.append(
+            "The bounded summary focuses on the behavioral areas represented by "
+            "the retained change facts."
+        )
+    return tuple(result[:3])
 
 
 def _validated_critic_result(
@@ -333,21 +933,104 @@ def _validated_critic_result(
         elif target_id:
             raise ValueError("critic target_id is only valid for merge")
         seen.add(candidate_id)
-        admitted.append(row)
+        # Models commonly add rationale/evidence fields despite the compact
+        # decision schema.  Those fields cannot change adjudication and are
+        # intentionally ignored; only the validated decision is admitted.
+        admitted.append({
+            "candidate_id": candidate_id,
+            "action": action,
+            "target_id": target_id,
+        })
     if seen != allowed_ids:
         raise ValueError("critic omitted candidate decisions")
     return {"actions": admitted}
 
 
 def _json_object(text: str) -> Mapping[str, object]:
-    candidate = str(text or "").strip()
-    if candidate.startswith("```"):
-        lines = candidate.splitlines()
-        candidate = "\n".join(lines[1:-1]).strip() if len(lines) >= 3 else candidate
-    value = json.loads(candidate)
-    if not isinstance(value, Mapping):
-        raise ValueError("role model response must be one JSON object")
-    return value
+    """Extract one unambiguous JSON object from a structured-role response.
+
+    Compatible endpoints do not consistently honor response-format hints and
+    may wrap an otherwise valid object in a fence or append a short
+    explanation.  Scan balanced top-level object spans while respecting JSON
+    strings, but fail closed if the response contains zero or multiple valid
+    objects.
+    """
+    source = str(text or "")
+    objects: list[Mapping[str, object]] = []
+    start: int | None = None
+    depth = 0
+    array_depth = 0
+    in_string = False
+    escaped = False
+    for index, character in enumerate(source):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+            continue
+        if start is not None:
+            if character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        value = json.loads(source[start:index + 1])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        pass
+                    else:
+                        if isinstance(value, Mapping):
+                            objects.append(value)
+                    start = None
+            continue
+        if character == "[":
+            array_depth += 1
+        elif character == "]":
+            array_depth = max(0, array_depth - 1)
+        elif character == "{" and array_depth == 0:
+            start = index
+            depth = 1
+    if len(objects) != 1:
+        raise ValueError("role model response must contain exactly one JSON object")
+    return objects[0]
+
+
+_TEXTUAL_TOOL_MARKER_RE = re.compile(
+    r"</?(?:tool_call|function|parameter)(?:=[^>]*)?>",
+    re.IGNORECASE,
+)
+
+
+def _structured_repetition_reason(text: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if len(_TEXTUAL_TOOL_MARKER_RE.findall(normalized)) >= 3:
+        return "repeated-textual-tool-marker"
+    paragraphs = [
+        re.sub(r"\s+", " ", part).strip().lower()
+        for part in re.split(r"\n\s*\n", str(text or ""))
+        if len(re.sub(r"\s+", " ", part).strip()) >= 80
+    ]
+    if any(paragraphs.count(item) >= 3 for item in set(paragraphs)):
+        return "repeated-paragraph"
+    words = normalized.split()
+    block_size = 18
+    positions: dict[tuple[str, ...], list[int]] = {}
+    for start in range(max(0, len(words) - block_size + 1)):
+        block = tuple(words[start:start + block_size])
+        if len(set(block)) < max(3, block_size // 4):
+            continue
+        occurrences = positions.setdefault(block, [])
+        if not occurrences or start - occurrences[-1] >= block_size:
+            occurrences.append(start)
+        if len(occurrences) >= 3:
+            return "repeated-block"
+    return None
 
 
 @dataclass(frozen=True)
@@ -357,28 +1040,176 @@ class GatewayRoleAdapter:
     gateway: ModelGateway
     system_prompt: str = "Return only the requested structured JSON object."
     response_format_override: str | None = None
+    attempt_logger: Callable[[str], None] | None = None
+    stream: bool = False
 
     def complete(self, request: RoleRequest) -> object:
-        conversation = Conversation(system=self.system_prompt)
-        conversation.add_user(json.dumps(
+        return self._complete_recoverable_structured_role(request)
+
+    def _complete_recoverable_structured_role(
+        self,
+        request: RoleRequest,
+        *,
+        max_attempts: int = 2,
+        before_attempt: Callable[[int], None] | None = None,
+        force_final: Callable[[int], bool] | None = None,
+    ) -> object:
+        """Continue one bounded structured role without losing private state."""
+        if max_attempts <= 0:
+            raise ValueError("max_attempts must be positive")
+        serialized_context = json.dumps(
             _json_value(request.context),
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
-        ))
-        result = self.gateway.complete(ModelTurnRequest(
-            role=request.role,
-            conversation=conversation,
-            max_tokens=request.max_tokens,
-            response_schema=None,
-            tools_enabled=False,
-            timeout_sec=request.timeout_sec,
-            deadline_at=request.lease.deadline_at,
-            stream=False,
-            response_schema_name=f"specialist_{request.role}",
-            response_format_override=self.response_format_override,
-        ))
-        return _json_object(result.text)
+        )
+
+        def fresh_conversation() -> Conversation:
+            value = Conversation(system=self.system_prompt)
+            value.add_user(serialized_context)
+            return value
+
+        conversation = fresh_conversation()
+        clean_retry_pending: str | None = None
+        for attempt in range(max_attempts):
+            clean_retry_reason = clean_retry_pending
+            clean_retry = clean_retry_reason is not None
+            finalization = (
+                clean_retry
+                or force_final(attempt)
+                if force_final is not None
+                else clean_retry or attempt == max_attempts - 1
+            )
+            if self.attempt_logger is not None:
+                self.attempt_logger(
+                    f"role {request.role} attempt {attempt + 1}/{max_attempts} "
+                    f"mode={'strict-json' if finalization else 'reasoning'}"
+                )
+            if before_attempt is not None:
+                before_attempt(attempt)
+            result = self.gateway.complete(ModelTurnRequest(
+                role=request.role,
+                conversation=conversation,
+                max_tokens=(
+                    min(request.max_tokens, 2_048)
+                    if clean_retry else request.max_tokens
+                ),
+                response_schema=None,
+                tools_enabled=False,
+                timeout_sec=request.timeout_sec,
+                deadline_at=request.lease.deadline_at,
+                stream=self.stream,
+                response_schema_name=f"specialist_{request.role}",
+                response_format_override=self.response_format_override,
+                reasoning_effort="none" if finalization else None,
+                ephemeral_user_note=(
+                    (
+                        "The previous output was rejected for a controller-role "
+                        f"mode violation ({clean_retry_reason}). Tools are unavailable. "
+                        "Return only the required JSON object."
+                    )
+                    if clean_retry
+                    else (
+                        "Return only the required JSON object."
+                        if finalization else None
+                    )
+                ),
+            ))
+            content = result.content
+            if not content and result.text_source == "content":
+                # Compatibility for test/provider adapters built before
+                # ModelTurnResult gained explicit ordinary-content state.
+                content = result.text
+            repetition_reason = (
+                result.stream_watchdog_reason
+                if result.stream_watchdog_triggered
+                else _structured_repetition_reason(
+                    content + "\n" + str(result.reasoning or "")
+                )
+            )
+            mode_violation_reason = None
+            if result.tool_calls:
+                mode_violation_reason = "native-tool-call"
+            elif _TEXTUAL_TOOL_MARKER_RE.search(
+                content + "\n" + str(result.reasoning or "")
+            ):
+                mode_violation_reason = "textual-tool-markup"
+            elif content.strip() and "{" not in content:
+                mode_violation_reason = "non-json-prose"
+            if mode_violation_reason:
+                if self.attempt_logger is not None:
+                    self.attempt_logger(
+                        f"role {request.role} mode violation rejected; "
+                        f"attempt={attempt + 1}/{max_attempts}; "
+                        f"reason={mode_violation_reason}; content_chars={len(content)}; "
+                        "malformed_content_retained=false"
+                    )
+                if clean_retry or attempt == max_attempts - 1:
+                    raise ValueError(
+                        f"{request.role} response rejected: {mode_violation_reason}"
+                    )
+                conversation = fresh_conversation()
+                clean_retry_pending = mode_violation_reason
+                continue
+            if request.role == "planner" and repetition_reason:
+                if self.attempt_logger is not None:
+                    self.attempt_logger(
+                        f"role planner repetitive response rejected; "
+                        f"attempt={attempt + 1}/{max_attempts}; "
+                        f"reason={repetition_reason}; content_chars={len(content)}; "
+                        "malformed_content_retained=false"
+                    )
+                if clean_retry or attempt == max_attempts - 1:
+                    raise ValueError(
+                        f"planner response rejected: {repetition_reason}"
+                    )
+                conversation = fresh_conversation()
+                clean_retry_pending = repetition_reason
+                continue
+            try:
+                return _json_object(content)
+            except (TypeError, ValueError) as exc:
+                # Provider finish reasons are not trustworthy enough to decide
+                # whether malformed structured output deserves its one bounded
+                # repair.  In particular, local endpoints can report ``stop``
+                # after filling the output budget with reasoning and cutting the
+                # JSON content mid-object.
+                continuation_allowed = attempt < max_attempts - 1
+                if self.attempt_logger is not None:
+                    status = (
+                        "continuation scheduled"
+                        if continuation_allowed
+                        and attempt < max_attempts - 1
+                        else "no continuation available"
+                    )
+                    self.attempt_logger(
+                        f"role {request.role} structured response invalid; "
+                        f"attempt={attempt + 1}/{max_attempts}; "
+                        f"finish_reason={result.finish_reason or 'unknown'}; "
+                        f"content_chars={len(content)}; "
+                        f"reasoning_chars={len(result.reasoning)}; "
+                        f"parse_error={type(exc).__name__}: {str(exc)[:160]}; "
+                        f"{status}"
+                    )
+                if (
+                    clean_retry
+                    or
+                    attempt == max_attempts - 1
+                    or not continuation_allowed
+                ):
+                    raise
+                conversation.add_assistant_turn(
+                    reasoning=(
+                        result.reasoning[:8_000]
+                        if request.role == "planner" else result.reasoning
+                    ),
+                    content=(
+                        content[:8_000]
+                        if request.role == "planner" else content
+                    ),
+                    calls=result.tool_calls,
+                )
+        raise AssertionError("structured-role continuation loop exhausted")
 
 
 @dataclass(frozen=True)
@@ -392,16 +1223,544 @@ class ReviewInputs:
     policy: ReviewPolicy
     config: RuntimeConfig
     changed_files: tuple[str, ...]
+    tracked_paths: tuple[str, ...] = ()
     artifact_path: Path | str = Path("specialist-review-artifact.json")
     allow_approve: bool = False
     publishing_mode: str = "review_comment"
     model_verdict: str = "approve"
     candidate_findings: tuple[CandidateFinding, ...] = ()
-    source_access_requests: tuple[SourceAccessRequest, ...] = ()
+    source_access_requests: tuple[
+        SourceAccessRequest | RepositoryAccessRequest, ...
+    ] = ()
     verification_requests: tuple[Mapping[str, Any], ...] = ()
+    test_results: tuple[Mapping[str, Any], ...] = ()
     pr_metadata: Mapping[str, Any] = field(default_factory=dict)
     configuration_warnings: tuple[str, ...] = ()
     adapter_configuration: Mapping[str, Any] = field(default_factory=dict)
+
+
+def _change_components(
+    inputs: ReviewInputs,
+) -> tuple[set[str], dict[str, str]]:
+    component_ids: set[str] = set()
+    path_components: dict[str, str] = {}
+    explicit = inputs.topology.get("path_components", {})
+    if isinstance(explicit, Mapping):
+        for path, component in explicit.items():
+            clean_path = str(path).replace("\\", "/").strip("/")
+            clean_component = str(component).strip()
+            if clean_path and clean_component:
+                path_components[clean_path] = clean_component
+                component_ids.add(clean_component)
+    for item in inputs.topology.get("components", ()):
+        if not isinstance(item, Mapping):
+            continue
+        component = str(item.get("id") or "").strip()
+        if not component:
+            continue
+        component_ids.add(component)
+        for path in item.get("changed_files", ()):
+            clean_path = str(path).replace("\\", "/").strip("/")
+            if clean_path:
+                path_components.setdefault(clean_path, component)
+    return component_ids, path_components
+
+
+def _overview_text(value: object, label: str, *, limit: int) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"change overview {label} must be non-empty text")
+    text = " ".join(value.split())
+    if len(text) > limit:
+        raise ValueError(f"change overview {label} exceeds its bound")
+    if _PROHIBITED_OVERVIEW_CLAIM.search(text):
+        raise ValueError(
+            f"change overview {label} claims verdict, findings, or coverage"
+        )
+    if label == "overview" and len(re.findall(r"[.!?](?:\s|$)", text)) != 1:
+        raise ValueError("change overview must be exactly one sentence")
+    return text
+
+
+def _domain_name(value: str) -> bool:
+    labels = value.rstrip(".").split(".")
+    if len(labels) < 2 or not 2 <= len(labels[-1]) <= 63:
+        return False
+    if not labels[-1].isalpha():
+        return False
+    label_pattern = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    return all(bool(re.fullmatch(label_pattern, label)) for label in labels)
+
+
+def _url_reference_spans(value: str) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    for match in _URL_CANDIDATE.finditer(value):
+        candidate = match.group(0).rstrip(".,;:!?)]}")
+        parsed = urlsplit(
+            candidate if "://" in candidate else f"https://{candidate}",
+        )
+        hostname = parsed.hostname or ""
+        if hostname == "localhost" or _domain_name(hostname):
+            spans.append((match.start(), match.start() + len(candidate)))
+    return tuple(spans)
+
+
+def _prose_path_references(
+    value: str,
+    tracked_paths: Iterable[str] = (),
+) -> tuple[str, ...]:
+    normalized = value.replace("\\", "/")
+    references: list[str] = []
+    occupied: list[tuple[int, int]] = []
+    url_spans = _url_reference_spans(normalized)
+
+    def is_url_span(start: int) -> bool:
+        return any(span_start <= start < span_end for span_start, span_end in url_spans)
+
+    tracked = {
+        str(path).replace("\\", "/").strip("/")
+        for path in tracked_paths
+        if str(path).strip()
+    }
+    for match in _PROSE_TOKEN.finditer(normalized):
+        if is_url_span(match.start()):
+            continue
+        reference = match.group(0).rstrip(".,;:!?)]}")
+        if reference in tracked:
+            if reference not in references:
+                references.append(reference)
+            occupied.append(match.span())
+    for match in _PATH_WITH_DIRECTORY.finditer(normalized):
+        if is_url_span(match.start()):
+            continue
+        reference = match.group(0).rstrip(".,;:!?)]}")
+        if reference and reference not in references:
+            references.append(reference)
+        occupied.append(match.span())
+    for match in _ROOT_FILE_REFERENCE.finditer(normalized):
+        if any(start <= match.start() < end for start, end in occupied):
+            continue
+        if is_url_span(match.start()):
+            continue
+        reference = match.group(0).rstrip(".,;:!?)]}")
+        if reference.lower().startswith("www."):
+            continue
+        if reference and reference not in references:
+            references.append(reference)
+    return tuple(references)
+
+
+def _normalize_repository_path(value: object) -> str:
+    return str(value or "").replace("\\", "/").strip("/")
+
+
+def _path_values(value: object) -> tuple[str, ...]:
+    """Extract path-shaped values from a controller-owned context field."""
+    if isinstance(value, str):
+        path = _normalize_repository_path(value)
+        return (path,) if path else ()
+    if isinstance(value, Mapping):
+        paths: list[str] = []
+        for item in value.values():
+            paths.extend(_path_values(item))
+        return tuple(dict.fromkeys(paths))
+    if isinstance(value, (tuple, list, set, frozenset)):
+        paths: list[str] = []
+        for item in value:
+            paths.extend(_path_values(item))
+        return tuple(dict.fromkeys(paths))
+    return ()
+
+
+def _deterministic_context_paths(
+    topology: Mapping[str, Any],
+    tracked_paths: Iterable[str],
+    *,
+    extra_paths: Iterable[str] = (),
+) -> frozenset[str]:
+    """Return unchanged paths explicitly supplied as deterministic context.
+
+    This intentionally does not treat every tracked path as context.  Only
+    controller-owned context fields and path-bearing topology relationships are
+    admitted, and the result is bounded to the repository paths known to the
+    controller.
+    """
+    tracked = {
+        _normalize_repository_path(path)
+        for path in tracked_paths
+        if _normalize_repository_path(path)
+    }
+    candidates: list[str] = []
+    for key in _DETERMINISTIC_CONTEXT_KEYS:
+        candidates.extend(_path_values(topology.get(key)))
+    for relationship in topology.get("relationships", ()):
+        if not isinstance(relationship, Mapping):
+            continue
+        for key in _RELATION_PATH_KEYS:
+            candidates.extend(_path_values(relationship.get(key)))
+    for component in topology.get("components", ()):
+        if not isinstance(component, Mapping):
+            continue
+        for key in _DETERMINISTIC_CONTEXT_KEYS | {"paths", "files"}:
+            candidates.extend(_path_values(component.get(key)))
+    for artifact in topology.get("generated_artifacts", ()):
+        if not isinstance(artifact, Mapping):
+            continue
+        for key in ("source_of_truth", "generator_config", "output_paths"):
+            candidates.extend(_path_values(artifact.get(key)))
+    candidates.extend(_normalize_repository_path(path) for path in extra_paths)
+    # Context must still refer to a known repository path.  This keeps an
+    # arbitrary model-invented path from becoming authoritative merely because
+    # it appeared in a topology-shaped object.
+    return frozenset(path for path in candidates if path and path in tracked)
+
+
+def _direct_change_references(
+    value: str,
+    references: Iterable[str],
+) -> frozenset[str]:
+    """Find references used as direct change claims, not contextual effects."""
+    normalized = value.replace("\\", "/")
+    direct: set[str] = set()
+    for reference in references:
+        path = _normalize_repository_path(reference)
+        if not path:
+            continue
+        start = 0
+        while True:
+            index = normalized.find(path, start)
+            if index < 0:
+                break
+            before = normalized[max(0, index - 40):index]
+            after = normalized[index + len(path):index + len(path) + 64]
+            before = before.rstrip(" `'\"(")
+            after = after.lstrip(" `'\")(")
+            before_claim = re.search(
+                r"(?:^|[\s,;])(?:"
+                r"(?:the\s+)?(?:add|change|modif(?:y|ies|ied)|update|"
+                r"remov(?:e|es|ed)|introduc(?:e|es|ed)|"
+                r"rewrit(?:e|es|ten)|refactor(?:s|ed|ing)?|renam(?:e|es|ed))"
+                r"(?:s|d)?\s+(?:in|to|of)"
+                r"|add(?:s|ed)?\s+(?:behavior|changes?)\s+(?:in|to|of)"
+                r"|(?:the\s+)?(?:add|change|modif(?:y|ies|ied)|update|"
+                r"remov(?:e|es|ed)|introduc(?:e|es|ed)|"
+                r"rewrit(?:e|es|ten)|refactor(?:s|ed|ing)?|renam(?:e|es|ed))"
+                r"(?:s|d)?"
+                r")(?:\s+(?:the|its|a|an|new|updated|changed))?$",
+                before,
+                re.IGNORECASE,
+            )
+            after_claim = re.match(
+                r"(?:(?:the\s+)?file\s+)?"
+                r"(?:is|are|was|were|has been|have been)?\s*"
+                r"(?:add(?:s|ed)?|change(?:s|d)?|modif(?:y|ies|ied)|"
+                r"update(?:s|d)?|remov(?:e|es|ed)|introduc(?:e|es|ed)|"
+                r"rewrit(?:e|es|ten)|refactor(?:s|ed)?|renam(?:e|es|ed))\b",
+                after,
+                re.IGNORECASE,
+            )
+            if before_claim or after_claim:
+                direct.add(path)
+                break
+            start = index + len(path)
+    return frozenset(direct)
+
+
+def _authoritative_change_facts(
+    topology: Mapping[str, Any],
+) -> tuple[Mapping[str, object], Mapping[str, object] | None]:
+    value = topology.get("change_facts")
+    if isinstance(value, Mapping) and "facts" in value:
+        facts = value.get("facts")
+        return (
+            facts if isinstance(facts, Mapping) else {},
+            value,
+        )
+    if isinstance(value, Mapping):
+        return value, None
+    compatibility = topology.get("changed_contract_facts", {})
+    return (
+        compatibility if isinstance(compatibility, Mapping) else {},
+        None,
+    )
+
+
+def _validated_change_overview(
+    value: object,
+    inputs: ReviewInputs,
+) -> dict[str, object]:
+    """Admit only bounded orientation backed by changed paths/components."""
+    if not isinstance(value, Mapping):
+        raise ValueError("change overview must be an object")
+    fields = {
+        "overview", "key_changes", "cross_component_effects", "uncertainties",
+    }
+    if not set(value).issubset(fields) or "overview" not in value:
+        raise ValueError("change overview fields are invalid")
+    changed_paths = {
+        str(path).replace("\\", "/").strip("/")
+        for path in inputs.changed_files
+        if str(path).strip()
+    }
+    tracked_paths = {
+        _normalize_repository_path(path)
+        for path in (*inputs.tracked_paths, *inputs.changed_files)
+        if _normalize_repository_path(path)
+    }
+    context_paths = _deterministic_context_paths(
+        inputs.topology,
+        tracked_paths,
+    )
+    component_ids, path_components = _change_components(inputs)
+
+    def admitted_text(raw: object, label: str, *, limit: int) -> str:
+        text = _overview_text(raw, label, limit=limit)
+        prose_paths = _prose_path_references(text, tracked_paths)
+        for reference in prose_paths:
+            path = _normalize_repository_path(reference)
+            if path not in changed_paths and path not in context_paths:
+                raise ValueError(
+                    "change overview contains an unchanged path reference "
+                    f"in {label}: {path}"
+                )
+        direct_context_paths = _direct_change_references(
+            text, context_paths - changed_paths,
+        )
+        if direct_context_paths:
+            raise ValueError(
+                "change overview contains an unchanged path reference "
+                f"in {label}: {sorted(direct_context_paths)[0]}"
+            )
+        return text
+
+    overview = admitted_text(value.get("overview"), "overview", limit=1000)
+
+    raw_changes = value.get("key_changes", ())
+    if (
+        isinstance(raw_changes, (str, bytes))
+        or not isinstance(raw_changes, (tuple, list))
+        or len(raw_changes) > _MAX_CHANGE_OVERVIEW_ITEMS
+    ):
+        raise ValueError("change overview key_changes must be a bounded array")
+    key_changes: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    for row in raw_changes:
+        if not isinstance(row, Mapping) or set(row) != {
+            "path", "component", "summary",
+        }:
+            raise ValueError("change overview key change fields are invalid")
+        path = str(row.get("path") or "").replace("\\", "/").strip("/")
+        component = str(row.get("component") or "").strip()
+        if path not in changed_paths or path in seen_paths:
+            raise ValueError("change overview contains unchanged or duplicate path")
+        if component not in component_ids:
+            raise ValueError("change overview contains unknown component")
+        expected_component = path_components.get(path)
+        if expected_component and component != expected_component:
+            raise ValueError("change overview path/component binding is invalid")
+        summary = admitted_text(
+            row.get("summary"), f"summary for {path}", limit=500,
+        )
+        key_changes.append({
+            "path": path,
+            "component": component,
+            "summary": summary,
+        })
+        seen_paths.add(path)
+
+    raw_effects = value.get("cross_component_effects", ())
+    if (
+        isinstance(raw_effects, (str, bytes))
+        or not isinstance(raw_effects, (tuple, list))
+        or len(raw_effects) > 8
+    ):
+        raise ValueError(
+            "change overview cross_component_effects must be a bounded array"
+        )
+    effects: list[dict[str, object]] = []
+    for row in raw_effects:
+        if not isinstance(row, Mapping) or set(row) != {"components", "summary"}:
+            raise ValueError("change overview cross-component fields are invalid")
+        components = row.get("components")
+        if (
+            isinstance(components, (str, bytes))
+            or not isinstance(components, (tuple, list))
+        ):
+            raise ValueError("change overview components must be an array")
+        selected = tuple(dict.fromkeys(
+            str(component).strip() for component in components
+            if str(component).strip()
+        ))
+        if len(selected) < 2 or len(selected) > 6:
+            raise ValueError("change overview cross-component effect is invalid")
+        if any(component not in component_ids for component in selected):
+            raise ValueError("change overview contains unknown component")
+        effects.append({
+            "components": selected,
+            "summary": admitted_text(
+                row.get("summary"), "cross-component summary", limit=500,
+            ),
+        })
+
+    raw_uncertainties = value.get("uncertainties", ())
+    if (
+        isinstance(raw_uncertainties, (str, bytes))
+        or not isinstance(raw_uncertainties, (tuple, list))
+        or len(raw_uncertainties) > 8
+    ):
+        raise ValueError("change overview uncertainties must be a bounded array")
+    uncertainties = tuple(
+        admitted_text(item, "uncertainty", limit=400)
+        for item in raw_uncertainties
+    )
+    return {
+        "overview": overview,
+        "key_changes": tuple(key_changes),
+        "cross_component_effects": tuple(effects),
+        "uncertainties": uncertainties,
+    }
+
+
+def _deterministic_change_overview(inputs: ReviewInputs) -> dict[str, object]:
+    facts, metadata = _authoritative_change_facts(inputs.topology)
+    component_ids, path_components = _change_components(inputs)
+    fallback_component = sorted(component_ids)[0] if len(component_ids) == 1 else ""
+    changes: list[dict[str, str]] = []
+    for path in inputs.changed_files[:_MAX_CHANGE_OVERVIEW_ITEMS]:
+        fact_value = facts.get(path, {})
+        fact = fact_value if isinstance(fact_value, Mapping) else {}
+        signals: list[str] = []
+        for field_name, label in (
+            ("symbols", "symbols"),
+            ("action_inputs", "action inputs"),
+            ("workflow_steps", "workflow steps"),
+            ("workflow_keys", "workflow keys"),
+            ("headings", "headings"),
+            ("change_excerpts", "documentation excerpts"),
+            ("hunk_summaries", "hunks"),
+        ):
+            values = fact.get(field_name, ())
+            if (
+                isinstance(values, (tuple, list))
+                and values
+                and len(signals) < 3
+            ):
+                selected = ", ".join(
+                    " ".join(str(item).split())[:100]
+                    for item in values[:3]
+                    if str(item).strip()
+                )
+                if selected:
+                    signals.append(f"{label}: {selected}")
+        change_type = str(fact.get("change_type") or "changes").strip()
+        summary = change_type.capitalize()
+        if signals:
+            summary += " " + "; ".join(signals)
+        component = path_components.get(path, fallback_component)
+        if not component:
+            component = "repository"
+            component_ids.add(component)
+        changes.append({
+            "path": path,
+            "component": component,
+            "summary": summary[:500],
+        })
+    omitted = max(0, len(inputs.changed_files) - len(changes))
+    # A count is useful metadata but is not a human handoff. Build a bounded
+    # behavioral sentence from the same immutable facts when the model
+    # summarizer is unavailable or its proposal fails validation.
+    changed_paths = tuple(str(path).replace("\\", "/") for path in inputs.changed_files)
+    path_roles = {
+        path: set(classify_file_roles(path)) for path in changed_paths
+    }
+    themes: list[str] = []
+
+    def add_theme(value: str) -> None:
+        if value not in themes:
+            themes.append(value)
+
+    if any(
+        path == "action.yml" or ".github/workflows/" in path
+        for path in changed_paths
+    ):
+        add_theme("workflow/action configuration")
+    if any(
+        "implementation" in path_roles[path] or path.startswith("pr_reviewer/")
+        for path in changed_paths
+    ):
+        add_theme("review-runtime behavior")
+    if any(
+        "github_review_notes" in path or "publish" in path
+        for path in changed_paths
+    ):
+        add_theme("publishing and handoff behavior")
+    if any("test" in path_roles[path] or path.startswith("evals/") for path in changed_paths):
+        add_theme("regression/evaluation coverage")
+    if any("documentation" in path_roles[path] for path in changed_paths):
+        add_theme("operator documentation")
+    if not themes:
+        themes.append("repository behavior")
+
+    specifics: list[str] = []
+
+    def add_specific(value: str) -> None:
+        if value not in specifics:
+            specifics.append(value)
+
+    workflow_keys = {
+        str(key).casefold()
+        for fact in facts.values()
+        if isinstance(fact, Mapping)
+        for key in fact.get("workflow_keys", ())
+        if isinstance(fact.get("workflow_keys", ()), (list, tuple))
+    }
+    if "specialist_max_tool_calls_per_session" in workflow_keys:
+        add_specific("specialist tool-call budgeting")
+    if any(
+        path.endswith("conversation.py") or "reasoning" in path.casefold()
+        for path in changed_paths
+    ):
+        add_specific("reasoning/session continuity")
+    if any(
+        path.endswith("controller.py") or path.endswith("session.py")
+        for path in changed_paths
+    ):
+        add_specific("specialist-session recovery and candidate retention")
+    if any(
+        "github_review_notes" in path or "publish" in path
+        for path in changed_paths
+    ):
+        add_specific("review handoff publishing")
+    if any("test" in path_roles[path] or path.startswith("evals/") for path in changed_paths):
+        add_specific("regression verification")
+    if not specifics:
+        specifics.append("the changed components and their integration contracts")
+
+    component_text = ", ".join(sorted(component_ids)[:5]) or "the changed components"
+    overview = (
+        f"This change updates {component_text}; it covers "
+        + ", ".join(themes[:5])
+        + "; the main behavioral areas are "
+        + ", ".join(specifics[:4])
+        + "."
+    )
+    uncertainties: list[str] = []
+    if omitted:
+        uncertainties.append(
+            f"{omitted} additional changed paths are omitted from this bounded overview."
+        )
+    if metadata is not None:
+        fact_omitted = metadata.get("omitted_path_count", 0)
+        if isinstance(fact_omitted, int) and fact_omitted > 0:
+            uncertainties.append(
+                f"Immutable semantic facts are unavailable for {fact_omitted} changed "
+                f"{'path' if fact_omitted == 1 else 'paths'}."
+            )
+    return {
+        "overview": overview,
+        "key_changes": tuple(changes),
+        "cross_component_effects": (),
+        "uncertainties": tuple(uncertainties),
+    }
 
 
 @dataclass(frozen=True)
@@ -433,6 +1792,8 @@ class _RunState:
     plan: AssignmentPlan = field(default_factory=lambda: AssignmentPlan(()))
     plan_source: str = "deterministic_fallback"
     planner_repaired: bool = False
+    planner_diagnostics: list[str] = field(default_factory=list)
+    change_overview: Mapping[str, object] = field(default_factory=dict)
     assignments: dict[str, Assignment] = field(default_factory=dict)
     ownership: dict[str, SessionOwnership] = field(default_factory=dict)
     sessions: dict[str, object] = field(default_factory=dict)
@@ -448,10 +1809,18 @@ class _RunState:
     candidates: dict[str, CandidateFinding] = field(default_factory=dict)
     candidate_occurrences: dict[str, CandidateFinding] = field(default_factory=dict)
     collision_dispositions: list[dict[str, object]] = field(default_factory=list)
-    source_requests: list[SourceAccessRequest] = field(default_factory=list)
+    critic_actions: dict[str, str] = field(default_factory=dict)
+    source_requests: list[
+        SourceAccessRequest | RepositoryAccessRequest
+    ] = field(default_factory=list)
+    investigation_leads: dict[str, InvestigationLead] = field(default_factory=dict)
+    retention_verification_requests: tuple[Mapping[str, object], ...] = ()
+    coverage_verification_requests: tuple[Mapping[str, object], ...] = ()
     unknowns: list[dict[str, object]] = field(default_factory=list)
     degradations: list[dict[str, str]] = field(default_factory=list)
     review: AdjudicatedReview = field(default_factory=AdjudicatedReview)
+    remediations: dict[str, FindingRemediation] = field(default_factory=dict)
+    remediation_diagnostics: list[dict[str, object]] = field(default_factory=list)
     handoff: ReviewHandoff = field(default_factory=ReviewHandoff)
     notes: tuple[ReviewNote, ...] = ()
     verdict: str = "notice"
@@ -473,6 +1842,7 @@ class _IsolatedSessionHandle:
     lease: SessionLease
     baseline_evidence_ids: frozenset[str] = frozenset()
     latest_result: object | None = None
+    exploration_done: Event = field(default_factory=Event, repr=False)
 
     @property
     def candidate_findings(self) -> tuple[CandidateFinding, ...]:
@@ -490,22 +1860,43 @@ class _IsolatedSessionHandle:
         return tuple(getattr(self.session, "request_events", ()))
 
     @property
-    def source_access_requests(self) -> tuple[SourceAccessRequest, ...]:
+    def source_access_requests(self) -> tuple[
+        SourceAccessRequest | RepositoryAccessRequest, ...
+    ]:
         return tuple(
             item for item in getattr(
                 self.session, "source_access_requests", (),
             )
-            if isinstance(item, SourceAccessRequest)
+            if isinstance(item, (SourceAccessRequest, RepositoryAccessRequest))
         )
 
     def explore(self) -> object:
-        result = self.session.explore()
-        self._validate_result(result)
-        if result.state.value == "exploring":
-            raise RuntimeError("specialist returned while still exploring")
-        self._validate_owned_outputs(result)
-        self.latest_result = result
-        return result
+        self.exploration_done.clear()
+        try:
+            result = self.session.explore()
+            self._validate_result(result)
+            if result.state.value == "exploring":
+                raise RuntimeError("specialist returned while still exploring")
+            # Settle pending accounting before the negotiator sees the stopped
+            # session, not only at finalization when scheduling is already over.
+            settle = getattr(self.session, "settle_for_scheduling", None)
+            if callable(settle) and not result.degraded:
+                result = settle()
+                self._validate_result(result)
+            self._validate_owned_outputs(result)
+            self.latest_result = result
+            return result
+        finally:
+            self.exploration_done.set()
+
+    def wait_for_exploration(self, timeout: float) -> bool:
+        """Wait for an abandoned exploration callback before reusing its state."""
+        return self.exploration_done.wait(max(0.0, float(timeout)))
+
+    def mark_exploration_interrupted(self) -> None:
+        callback = getattr(self.session, "mark_exploration_interrupted", None)
+        if callable(callback):
+            callback()
 
     def apply_coverage_feedback(self, gaps: Iterable[str]) -> None:
         callback = getattr(self.session, "apply_coverage_feedback", None)
@@ -530,8 +1921,6 @@ class _IsolatedSessionHandle:
         self.lease = lease
 
     def finalize(self) -> object:
-        if self.latest_result is None or self.latest_result.state.value == "exploring":
-            raise RuntimeError("an exploring or uncheckpointed session cannot be finalized")
         result = self.session.finalize()
         self._validate_result(result)
         self._validate_owned_outputs(result)
@@ -628,6 +2017,99 @@ def _artifact_value(value: object, *, depth: int = 0) -> object:
         return "[unserializable]"
 
 
+def _project_complete_event_journal(events: object) -> dict[str, object]:
+    """Sanitize every journal event without applying the generic list cap."""
+    if not isinstance(events, (list, tuple)):
+        raise TypeError("artifact event journal must be an array")
+    projected_events: list[dict[str, object]] = []
+    for event in events:
+        projected = _artifact_value(event)
+        if not isinstance(projected, dict):
+            raise TypeError("artifact event journal entries must be objects")
+        projected_events.append(projected)
+    return {
+        "events": projected_events,
+        "event_references": [
+            {"sequence": item.get("sequence"), "kind": item.get("kind")}
+            for item in projected_events
+        ],
+        "event_journal": {
+            "count": len(projected_events),
+            "digest": _digest(projected_events),
+        },
+    }
+
+
+_CHECKPOINT_DIAGNOSTIC_SCALARS = frozenset({
+    "code", "attempt", "reason", "disposition", "initial_parse",
+    "repair_attempted", "repair_parse", "initial_finish_reason",
+    "repair_finish_reason", "fallback_projection", "retention_unknown",
+    "material_candidate_signal", "candidate_ids_seen",
+    "unidentified_candidate_shapes", "omitted_count", "initial_error",
+    "repair_error", "context_tokens_before", "context_tokens_after",
+    "estimated_input_tokens", "coarse_input_tokens",
+    "provider_calibrated_input_tokens", "max_context_tokens",
+    "requested_output_tokens", "response_reserve_tokens",
+    "repair_response_reserve_tokens", "wire_safety_tokens",
+    "rendered_request_bytes", "admission_tokens", "admission_source",
+    "actual_prompt_tokens", "actual_completion_tokens",
+    "compacted_evidence_count", "assistant_messages_compacted",
+    "compaction_level", "compaction_input_tokens_before",
+    "compaction_input_tokens_after", "removed_reasoning_messages",
+    "placeholder_replaced_results", "removed_old_exchanges",
+    "retained_full_results", "emergency_outcome",
+    "change_correction_attempted", "change_correction_parse",
+    "change_correction_error", "change_correction_attempt_count",
+    "change_correction_valid_count", "change_correction_invalid_count",
+    "change_correction_output_limited_count", "change_correction_rejected_count",
+})
+_CHECKPOINT_DIAGNOSTIC_TUPLES = frozenset({
+    "candidate_ids", "omitted_candidate_ids", "candidate_finding_ids",
+    "rejected_checkpoint_changes",
+    "rejected_correction_changes",
+})
+
+
+def _checkpoint_diagnostic_projection(value: object) -> dict[str, object]:
+    """Allowlist bounded scalar/tuple lifecycle telemetry only."""
+    if not isinstance(value, Mapping):
+        return {}
+    projected: dict[str, object] = {}
+    for key in sorted(_CHECKPOINT_DIAGNOSTIC_SCALARS):
+        item = value.get(key)
+        if item is None or isinstance(item, bool):
+            if key in value:
+                projected[key] = item
+        elif isinstance(item, int):
+            projected[key] = max(-1_000_000_000_000, min(item, 1_000_000_000_000))
+        elif isinstance(item, float) and isfinite(item):
+            projected[key] = max(-1_000_000_000_000.0, min(item, 1_000_000_000_000.0))
+        elif isinstance(item, (str, Enum)):
+            projected[key] = _mask_runtime_text(str(
+                item.value if isinstance(item, Enum) else item
+            ))[:300]
+    for key in sorted(_CHECKPOINT_DIAGNOSTIC_TUPLES):
+        item = value.get(key)
+        if not isinstance(item, (tuple, list)):
+            continue
+        projected[key] = tuple(
+            _mask_runtime_text(str(member))[:120]
+            for member in item[:16]
+            if isinstance(member, (bool, int, float, str, Enum))
+        )
+    return projected
+
+
+def _checkpoint_diagnostics_projection(value: object) -> tuple[dict[str, object], ...]:
+    if not isinstance(value, (tuple, list)):
+        return ()
+    return tuple(
+        projected
+        for item in value[:8]
+        if (projected := _checkpoint_diagnostic_projection(item))
+    )
+
+
 def _checkpoint_projection(checkpoint: object) -> dict[str, object]:
     statuses = getattr(checkpoint, "obligation_statuses", ())
     return {
@@ -639,6 +2121,10 @@ def _checkpoint_projection(checkpoint: object) -> dict[str, object]:
         "obligation_statuses": [
             [str(obligation_id), getattr(status, "value", str(status))]
             for obligation_id, status in statuses
+        ],
+        "obligation_assessments": [
+            _json_value(item)
+            for item in getattr(checkpoint, "obligation_assessments", ())
         ],
     }
 
@@ -667,6 +2153,7 @@ def _evidence_projection(record: object) -> dict[str, object]:
         "mime_type": getattr(record, "mime_type"),
         "truncated": getattr(record, "truncated"),
         "redacted": getattr(record, "redacted"),
+        "redaction_types": list(getattr(record, "redaction_types", ())),
         "imported_by": list(getattr(record, "imported_by")),
         "supersedes": list(getattr(record, "supersedes")),
         "contradicts": list(getattr(record, "contradicts")),
@@ -837,11 +2324,14 @@ class ReviewController:
     def __init__(
         self,
         *,
+        change_summarizer: object | None = None,
         planner: object | None = None,
         planner_gateway: object | None = None,
         session_factory: Callable[..., object] | None = None,
         negotiator: object | None = None,
         critic: object | None = None,
+        repairer: object | None = None,
+        remediator: object | None = None,
         finalizer: object | None = None,
         evidence_store: EvidenceStore | None = None,
         evidence_seed: EvidenceSeed | None = None,
@@ -860,6 +2350,7 @@ class ReviewController:
             raise ValueError(
                 "non-empty evidence_store is unbound; provide an EvidenceSeed"
             )
+        self.change_summarizer = change_summarizer
         self.planner = (
             planner if planner is not None
             else GatewayRoleAdapter(planner_gateway) if planner_gateway is not None
@@ -868,6 +2359,12 @@ class ReviewController:
         self.session_factory = session_factory
         self.negotiator = negotiator
         self.critic = critic
+        # Kept as a source-compatible constructor argument. Candidate proof
+        # repair now happens at report/checkpoint admission, while the critic
+        # remains the final adjudicator. The separate remediator can only add
+        # presentation guidance after acceptance; it cannot repair proof.
+        self.repairer = repairer
+        self.remediator = remediator
         self.finalizer = finalizer
         self._provided_evidence_store = evidence_store
         self._evidence_seed = evidence_seed
@@ -927,8 +2424,10 @@ class ReviewController:
     ) -> None:
         if state.phase is None:
             raise RuntimeError("cannot complete a phase before it is entered")
-        if status not in {"complete", "degraded"}:
-            raise ValueError("completed phase status must be complete or degraded")
+        if status not in {"complete", "incomplete", "degraded"}:
+            raise ValueError(
+                "completed phase status must be complete, incomplete, or degraded"
+            )
         state.phase_outcomes[state.phase] = status
         state.journal.emit("phase_completed", {
             "phase": state.phase, "status": status,
@@ -973,11 +2472,21 @@ class ReviewController:
 
     @staticmethod
     def _required_note_count(state: _RunState) -> int:
+        source_note_count = 0
+        if state.source_requests:
+            obligation_map = {
+                obligation.id: obligation
+                for obligation in getattr(state, "obligations", ())
+            }
+            source_note_count = len(build_source_access_request_notes(
+                state.source_requests, obligations=obligation_map,
+            ))
         return (
             len(state.review.accepted)
             + len(state.review.verification_requests)
             + len(state.inputs.verification_requests)
-            + len(state.source_requests)
+            + len(state.retention_verification_requests)
+            + source_note_count
         )
 
     @staticmethod
@@ -1001,16 +2510,127 @@ class ReviewController:
         assignment_id: str,
         result: object,
     ) -> None:
-        if not bool(getattr(result, "degraded", False)):
+        checkpoint = getattr(result, "checkpoint", None)
+        retention_unknown = _CANDIDATE_RETENTION_UNKNOWN in tuple(
+            getattr(checkpoint, "unknowns", ())
+        )
+        if not bool(getattr(result, "degraded", False)) and not retention_unknown:
             return
         component = f"specialist:{assignment_id}"
         if any(item.get("component") == component for item in state.degradations):
             return
+        state.journal.emit("specialist_result_degraded", {
+            "assignment_id": assignment_id,
+            "session_id": str(getattr(result, "session_id", "")),
+            "result_degraded": bool(getattr(result, "degraded", False)),
+            "candidate_retention_unknown": retention_unknown,
+            "checkpoint_state": str(
+                getattr(checkpoint, "state", "")
+            ),
+            "candidate_count": len(tuple(
+                getattr(checkpoint, "candidate_finding_ids", ())
+            )),
+        })
         self._degrade(
             state,
             component,
             "specialist completed with degraded retained state",
         )
+
+    @staticmethod
+    def _candidate_retention_limited(state: _RunState) -> bool:
+        return any(
+            _CANDIDATE_RETENTION_UNKNOWN
+            in tuple(getattr(result.checkpoint, "unknowns", ()))
+            for result in state.session_results.values()
+        )
+
+    @staticmethod
+    def _review_status(state: _RunState) -> str:
+        if state.degradations:
+            return "degraded"
+        if state.blocking_obligation_ids:
+            return "incomplete"
+        return "complete"
+
+    def _candidate_retention_verification_requests(
+        self,
+        state: _RunState,
+    ) -> tuple[Mapping[str, object], ...]:
+        """Return one non-defect verification note for locatable retention loss."""
+        changed = set(state.inputs.changed_files)
+        snapshot = state.evidence.snapshot()
+        records = {
+            record.id: record
+            for record in snapshot.records
+            if record.is_usable_for_coverage
+        }
+        obligation_ids = {item.id for item in state.obligations}
+        candidates: dict[
+            tuple[str, str],
+            tuple[set[str], set[str]],
+        ] = {}
+        for result in state.session_results.values():
+            checkpoint = result.checkpoint
+            if (
+                _CANDIDATE_RETENTION_UNKNOWN
+                not in tuple(getattr(checkpoint, "unknowns", ()))
+            ):
+                continue
+            ownership = state.ownership.get(result.session_id)
+            assignment = (
+                state.assignments.get(ownership.assignment_id)
+                if ownership is not None
+                else None
+            )
+            assignment_obligation_ids = tuple(
+                item for item in getattr(assignment, "obligation_ids", ())
+                if item in obligation_ids
+            )
+            if not assignment_obligation_ids:
+                continue
+            for evidence_id in getattr(checkpoint, "evidence_ids", ()):
+                record = records.get(evidence_id)
+                path = str(getattr(record, "source_path", "") or "")
+                if record is None or path not in changed:
+                    continue
+                associated_obligation_ids = {
+                    obligation_id
+                    for obligation_id in assignment_obligation_ids
+                    if any(
+                        collection.session_id == result.session_id
+                        for collection, _association
+                        in snapshot.associations_for(
+                            evidence_id,
+                            obligation_id,
+                        )
+                    )
+                }
+                if not associated_obligation_ids:
+                    continue
+                associated, evidence = candidates.setdefault(
+                    (path, result.session_id),
+                    (set(), set()),
+                )
+                associated.update(associated_obligation_ids)
+                evidence.add(evidence_id)
+        if not candidates:
+            return ()
+        path, session_id = sorted(candidates)[0]
+        associated, evidence = candidates[(path, session_id)]
+        return ({
+            "question": (
+                f"Verify the reviewed behavior in `{path}` because candidate "
+                "retention was incomplete."
+            ),
+            "reason": (
+                "A specialist reported material candidate-retention loss. "
+                "This is a coverage check, not a confirmed defect."
+            ),
+            "related_obligation_ids": tuple(sorted(associated)),
+            "evidence_ids": tuple(sorted(evidence)),
+            "file": path,
+        },)
 
     def _quarantine_session(
         self, state: _RunState, session_id: str, reason: str,
@@ -1044,6 +2664,9 @@ class ReviewController:
                 "session_id": getattr(source, "session_id", ""),
                 "tools_enabled": bool(getattr(event, "tools_enabled", False)),
                 "response_schema_name": getattr(event, "response_schema_name", None),
+                "finish_reason": getattr(event, "finish_reason", ""),
+                "text_source": getattr(event, "text_source", ""),
+                "tool_call_count": int(getattr(event, "tool_call_count", 0) or 0),
                 **({"error": getattr(event, "error", "")} if status == "failed" else {}),
             })
 
@@ -1064,6 +2687,8 @@ class ReviewController:
                 "turn": attempt.turn,
                 "input_tokens": attempt.input_tokens,
                 "max_output_tokens": attempt.max_output_tokens,
+                "admission_tokens": attempt.admission_tokens,
+                "admission_source": attempt.admission_source,
                 "started_at": attempt.started_at,
             }
             if start_key not in state.admitted_specialist_request_events:
@@ -1079,7 +2704,39 @@ class ReviewController:
                     **payload,
                     "terminal_at": attempt.terminal_at,
                     "in_flight": attempt.in_flight,
+                    "actual_prompt_tokens": attempt.actual_prompt_tokens,
+                    "actual_completion_tokens": attempt.actual_completion_tokens,
                 })
+
+    @staticmethod
+    def _request_attempt_event_payload(attempt: RequestAttempt) -> dict[str, object]:
+        payload: dict[str, object] = {
+            # Keep this separate from the admitted specialist_request_* event
+            # identity so older artifact consumers do not double-count the
+            # immediate gateway telemetry as another specialist transition.
+            "gateway_request_id": attempt.request_id,
+            "session_id": attempt.session_id,
+            "assignment_id": attempt.assignment_id,
+            "phase": attempt.phase,
+            "turn": attempt.turn,
+            "input_tokens": attempt.input_tokens,
+            "max_output_tokens": attempt.max_output_tokens,
+            "admission_tokens": attempt.admission_tokens,
+            "admission_source": attempt.admission_source,
+            "status": attempt.status,
+            "in_flight": attempt.in_flight,
+            "purpose": attempt.purpose,
+            "finish_reason": attempt.finish_reason,
+            "text_source": attempt.text_source,
+            "tool_call_count": attempt.tool_call_count,
+            "error": attempt.error,
+        }
+        if attempt.status != "started":
+            payload.update({
+                "actual_prompt_tokens": attempt.actual_prompt_tokens,
+                "actual_completion_tokens": attempt.actual_completion_tokens,
+            })
+        return payload
 
     def _session_hook(
         self,
@@ -1217,10 +2874,12 @@ class ReviewController:
 
     def _plan(self, state: _RunState) -> AssignmentPlan:
         inputs = state.inputs
+        base_plan = fallback_assignment_plan(
+            state.obligations, inputs.topology, inputs.config,
+        )
+        state.plan_source = "deterministic_base"
         if self.planner is None or self.clock() >= state.deadline.cutoff_for(RunPhase.PLANNING):
-            self._degrade(state, "planner", "deterministic assignment fallback")
-            return fallback_assignment_plan(state.obligations, inputs.topology, inputs.config)
-        raw: object
+            return base_plan
         request_budget = PlannerRequestBudget()
         try:
             raw = self._model_request(
@@ -1232,60 +2891,133 @@ class ReviewController:
                 method="plan",
                 planner_request_budget=request_budget,
                 context={
+                    "base_plan": base_plan,
                     "obligations": state.obligations,
                     "topology": inputs.topology,
                     "config": inputs.config,
                     "pr_metadata": inputs.pr_metadata,
                     "policy": inputs.policy,
+                    "change_overview": change_overview_orientation(
+                        state.change_overview,
+                    ),
                 },
             )
-            if not isinstance(raw, Mapping):
-                raise AssignmentPlanError("planner result must be an object")
-            plan = self.assignment_validator(
-                raw, state.obligations, inputs.topology, inputs.config,
+            result = apply_planner_transformations(
+                raw if isinstance(raw, Mapping) else {},
+                base_plan,
+                state.obligations,
+                inputs.config,
+                topology=inputs.topology,
             )
-            state.plan_source = "model_validated"
-            return plan
-        except AssignmentPlanError as first_error:
-            if request_budget.remaining <= 0:
-                self._degrade(state, "planner", _bounded_error(first_error))
-            else:
-                try:
-                    repair = repair_prompt(first_error.errors, raw if isinstance(raw, Mapping) else {})
-                    repaired = self._model_request(
-                        state,
-                        role="planner",
-                        request_id="planner:repair:1",
-                        phase=RunPhase.PLANNING,
-                        component=self.planner,
-                        method="repair",
-                        planner_request_budget=request_budget,
-                        context={
-                            "obligations": state.obligations,
-                            "topology": inputs.topology,
-                            "config": inputs.config,
-                            "repair": repair,
-                            "pr_metadata": inputs.pr_metadata,
-                            "policy": inputs.policy,
-                        },
-                    )
-                    if not isinstance(repaired, Mapping):
-                        raise AssignmentPlanError("planner repair must be an object")
-                    plan = self.assignment_validator(
-                        repaired, state.obligations, inputs.topology, inputs.config,
-                    )
-                    state.plan_source = "model_repaired_validated"
-                    state.planner_repaired = True
-                    return plan
-                except Exception as exc:
-                    self._degrade(state, "planner", _bounded_error(exc))
+            state.planner_diagnostics.extend(result.ignored)
+            if result.plan != base_plan:
+                state.plan_source = "deterministic_base_transformed"
+            for diagnostic in result.ignored:
+                state.journal.emit("planner_transformation_ignored", {
+                    "reason": diagnostic,
+                })
+            return result.plan
         except Exception as exc:
-            self._degrade(state, "planner", _bounded_error(exc))
-        state.journal.emit("recovery", {
-            "component": "planner", "action": "deterministic_assignment_plan",
-        })
-        state.plan_source = "deterministic_fallback"
-        return fallback_assignment_plan(state.obligations, inputs.topology, inputs.config)
+            if is_model_endpoint_unavailable(exc):
+                raise
+            diagnostic = _bounded_error(exc)
+            state.planner_diagnostics.append(diagnostic)
+            state.journal.emit("planner_transformation_ignored", {
+                "reason": diagnostic,
+            })
+            return base_plan
+
+    def _summarize_changes(self, state: _RunState) -> Mapping[str, object]:
+        fallback = _deterministic_change_overview(state.inputs)
+        change_facts = state.inputs.topology.get("change_facts")
+        if (
+            isinstance(change_facts, Mapping)
+            and change_facts.get("status") == "degraded"
+        ):
+            failures = change_facts.get("failures", ())
+            first = (
+                failures[0]
+                if isinstance(failures, (tuple, list)) and failures
+                else {}
+            )
+            reason = (
+                str(first.get("reason") or "").strip()
+                if isinstance(first, Mapping)
+                else ""
+            ) or "immutable local diff facts are unavailable"
+            self._degrade(state, "change_facts", reason)
+            return fallback
+        if (
+            self.change_summarizer is None
+            or self.clock() >= state.deadline.cutoff_for(RunPhase.PLANNING)
+        ):
+            return fallback
+        try:
+            context = {
+                "change_facts": (
+                    change_facts
+                    if isinstance(change_facts, Mapping)
+                    else state.inputs.topology.get(
+                        "changed_contract_facts", {},
+                    )
+                ),
+                "changed_files": state.inputs.changed_files,
+                "components": state.inputs.topology.get("components", ()),
+                "path_components": state.inputs.topology.get(
+                    "path_components", {},
+                ),
+                "relationships": state.inputs.topology.get(
+                    "relationships", (),
+                ),
+                "pr_metadata": {
+                    key: state.inputs.pr_metadata.get(key, "")
+                    for key in ("title", "body")
+                },
+            }
+            proposed = self._model_request(
+                state,
+                role="change_summarizer",
+                request_id="change_summarizer:1",
+                phase=RunPhase.PLANNING,
+                component=self.change_summarizer,
+                method="summarize",
+                context=context,
+            )
+            try:
+                return _validated_change_overview(proposed, state.inputs)
+            except ValueError as validation_error:
+                if self.clock() >= state.deadline.cutoff_for(RunPhase.PLANNING):
+                    raise
+                repaired = self._model_request(
+                    state,
+                    role="change_summarizer",
+                    request_id="change_summarizer:repair:1",
+                    phase=RunPhase.PLANNING,
+                    component=self.change_summarizer,
+                    method="summarize",
+                    context={
+                        **context,
+                        "repair": {
+                            "reason": _bounded_error(validation_error),
+                            "invalid_response": _json_value(proposed),
+                            "instruction": (
+                                "Repair only the rejected structured summary. "
+                                "Each key_changes.path must be one exact changed "
+                                "path; never join paths in one string."
+                            ),
+                        },
+                    },
+                )
+                return _validated_change_overview(repaired, state.inputs)
+        except Exception as exc:
+            if is_model_endpoint_unavailable(exc):
+                raise
+            state.journal.emit("recovery", {
+                "component": "change_summarizer",
+                "action": "deterministic-fallback",
+                "reason": _bounded_error(exc),
+            })
+            return fallback
 
     def _ownership(self, assignment: Assignment, session_id: str, state: _RunState) -> SessionOwnership:
         return session_ownership_for_assignment(
@@ -1344,7 +3076,8 @@ class ReviewController:
         )
         args = (
             assignment, lease, snapshot, local_evidence, local_coverage,
-            state.obligations, expected_session_id,
+            state.obligations, expected_session_id, state.change_overview,
+            state.inputs.test_results,
         )
         session = factory(*args if any(
             item.kind is inspect.Parameter.VAR_POSITIONAL
@@ -1356,7 +3089,7 @@ class ReviewController:
         binder = getattr(session, "bind_request_attempt_journal", None)
         if callable(binder) and state.request_attempt_journal is not None:
             binder(state.request_attempt_journal, assignment.id)
-        return _IsolatedSessionHandle(
+        handle = _IsolatedSessionHandle(
             assignment=assignment,
             session=session,
             session_id=session_id,
@@ -1365,6 +3098,11 @@ class ReviewController:
             lease=lease,
             baseline_evidence_ids=frozenset(snapshot.evidence.evidence_ids),
         )
+        # Register immediately so a worker that is interrupted at the phase
+        # cutoff still has a durable handle for finalization recovery.
+        state.sessions[session_id] = handle
+        state.assignment_sessions[assignment.id] = session_id
+        return handle
 
     def _run_wave(
         self,
@@ -1383,6 +3121,15 @@ class ReviewController:
             assignment.id: state.sessions.get(expected_ids[assignment.id])
             for assignment in assignment_items
         }
+        for assignment in assignment_items:
+            state.journal.emit("specialist_initializing", {
+                "assignment_id": assignment.id,
+                "session_id": expected_ids[assignment.id],
+                "phase": phase.value,
+                "resumed": isinstance(
+                    existing_handles[assignment.id], _IsolatedSessionHandle,
+                ),
+            })
         scheduler = self.scheduler_type(
             deadline=state.deadline,
             session_factory=lambda assignment, lease, snapshot: self._create_isolated_session(
@@ -1415,9 +3162,7 @@ class ReviewController:
             state.sessions[expected_session_id] = item.session
             state.assignment_sessions[item.assignment_id] = expected_session_id
             state.session_results[(item.assignment_id, expected_session_id)] = item.session_result
-            self._promote_degraded_session_result(
-                state, item.assignment_id, item.session_result,
-            )
+            self._admit_investigation_lead_state(state, item.session_result)
             self._admit_specialist_request_events(state, item.session_result)
             state.ownership[item.session_result.session_id] = self._ownership(
                 assignment, item.session_result.session_id, state,
@@ -1467,13 +3212,26 @@ class ReviewController:
                 "action": "bounded_followup_or_unknown",
             })
         for assignment_id in result.in_flight_assignment_ids:
-            session_id = state.assignment_sessions.pop(assignment_id, None)
-            if session_id is not None:
-                state.sessions.pop(session_id, None)
-            state.journal.emit("session_quarantined", {
+            session_id = state.assignment_sessions.get(assignment_id)
+            handle = state.sessions.get(session_id) if session_id else None
+            if isinstance(handle, _IsolatedSessionHandle):
+                handle.mark_exploration_interrupted()
+            state.journal.emit("session_interrupted", {
                 "assignment_id": assignment_id,
-                "reason": "in_flight_after_wave_cutoff",
+                "session_id": session_id or "",
+                "reason": "in_flight_after_wave_cutoff; retained_for_checkpoint_recovery",
             })
+        retained_assignments = {
+            item.assignment_id
+            for item in result.results
+        } | set(result.in_flight_assignment_ids)
+        for assignment in assignment_items:
+            if assignment.id in retained_assignments or existing_handles[assignment.id] is not None:
+                continue
+            session_id = expected_ids[assignment.id]
+            state.sessions.pop(session_id, None)
+            if state.assignment_sessions.get(assignment.id) == session_id:
+                state.assignment_sessions.pop(assignment.id, None)
         before_ids = set(wave_snapshot.evidence.evidence_ids)
         for record in state.evidence.snapshot().records:
             if record.id not in before_ids:
@@ -1485,6 +3243,56 @@ class ReviewController:
                     "status": record.status,
                 })
         return result, wave_snapshot
+
+    def _admit_investigation_lead_state(
+        self, state: _RunState, session_result: object,
+    ) -> None:
+        """Merge detached lead reports and explicit resolutions into run state."""
+        for lead in tuple(getattr(session_result, "investigation_leads", ())):
+            if not isinstance(lead, InvestigationLead):
+                continue
+            if lead.lead_id in state.investigation_leads:
+                continue
+            if len(state.investigation_leads) >= 32:
+                state.journal.emit("investigation_lead_rejected", {
+                    "lead_id": lead.lead_id,
+                    "reason": "run investigation lead allowance exhausted",
+                })
+                continue
+            state.investigation_leads[lead.lead_id] = lead
+            state.journal.emit("investigation_lead_reported", {
+                "lead_id": lead.lead_id,
+                "origin_session_id": lead.origin_session_id,
+                "required_capability": lead.required_capability,
+                "affected_paths": lead.affected_paths,
+                "evidence_ids": lead.evidence_ids,
+            })
+        for resolution in tuple(getattr(
+            session_result, "investigation_lead_resolutions", (),
+        )):
+            if not isinstance(resolution, LeadResolution):
+                continue
+            lead = state.investigation_leads.get(resolution.lead_id)
+            if lead is None:
+                state.journal.emit("investigation_lead_resolution_rejected", {
+                    "lead_id": resolution.lead_id,
+                    "reason": "unknown controller lead",
+                })
+                continue
+            state.investigation_leads[resolution.lead_id] = replace(
+                lead,
+                status=resolution.status,
+                assigned_session_id=session_result.session_id,
+                resolution_reason=resolution.reason,
+                candidate_ids=resolution.candidate_ids,
+            )
+            state.journal.emit("investigation_lead_resolved", {
+                "lead_id": resolution.lead_id,
+                "status": resolution.status.value,
+                "session_id": session_result.session_id,
+                "candidate_ids": resolution.candidate_ids,
+                "evidence_ids": resolution.evidence_ids,
+            })
 
     def _reconcile(
         self,
@@ -1540,6 +3348,7 @@ class ReviewController:
         state: _RunState,
         reconciliation: CoverageReconciliation,
         followup_started: int,
+        excluded_obligation_ids: Iterable[str] = (),
     ) -> NegotiationState:
         resources: list[SessionResources] = []
         for session_id, ownership in sorted(state.ownership.items()):
@@ -1550,14 +3359,28 @@ class ReviewController:
             ledger = getattr(session, "budget", None)
             if isinstance(ledger, BudgetLedger):
                 remaining_turns = ledger.remaining_model_turns()
+                remaining_tools = ledger.remaining_tool_calls()
             else:
                 remaining_turns = max(
                     0, state.inputs.config.session_limits.model_turns - result.budget.model_turns,
                 )
+                remaining_tools = max(
+                    0, state.inputs.config.session_limits.tool_calls - result.budget.tool_calls,
+                )
             resources.append(SessionResources(
                 session_id=session_id,
                 remaining_model_turns=remaining_turns,
+                remaining_tool_calls=remaining_tools,
                 lease_remaining_sec=session.lease.remaining(now=self.clock()),
+                retained_evidence_count=len(session.evidence.snapshot().records),
+                advertised_tools=tuple(sorted(
+                    str(item.get("name") or "").strip()
+                    for item in getattr(
+                        getattr(session.session, "conversation", None),
+                        "tool_schemas", (),
+                    )
+                    if str(item.get("name") or "").strip()
+                )),
             ))
         checkpoints = tuple(
             state.session_results[key].checkpoint for key in sorted(state.session_results)
@@ -1572,7 +3395,12 @@ class ReviewController:
             remaining_deadline_sec=state.deadline.remaining_for_exploration(now=self.clock()),
             seconds_per_turn=float(state.inputs.config.model_request_timeout_sec),
             current_session_count=len(state.assignments),
-            max_sessions=state.inputs.config.max_sessions,
+            # Follow-up sessions run after the initial wave and have their own
+            # explicit cap, so include those bounded slots in lifetime capacity.
+            max_sessions=(
+                state.inputs.config.max_sessions
+                + state.inputs.config.max_followup_sessions
+            ),
             followup_sessions_started=followup_started,
             max_followup_sessions=state.inputs.config.max_followup_sessions,
             new_session_turns_remaining=max(
@@ -1581,46 +3409,140 @@ class ReviewController:
                 * state.inputs.config.session_limits.model_turns,
             ),
             new_session_turn_cap=state.inputs.config.session_limits.model_turns,
+            new_session_tool_call_cap=state.inputs.config.session_limits.tool_calls,
             new_session_lease_remaining_sec=state.deadline.remaining_for_exploration(
                 now=self.clock(),
+            ),
+            excluded_obligation_ids=tuple(sorted(set(excluded_obligation_ids))),
+            investigation_leads=tuple(
+                state.investigation_leads[key]
+                for key in sorted(state.investigation_leads)
             ),
         )
 
     def _negotiate(
         self, state: _RunState, reconciliation: CoverageReconciliation,
+        *, attempt: int = 1, excluded_obligation_ids: Iterable[str] = (),
     ) -> tuple[NegotiationAction, ...]:
-        if not reconciliation.uncovered_obligation_ids:
+        if (
+            not reconciliation.uncovered_obligation_ids
+            and not any(
+                item.status in {
+                    InvestigationLeadStatus.OPEN,
+                    InvestigationLeadStatus.SCHEDULED,
+                }
+                for item in state.investigation_leads.values()
+            )
+        ):
             return ()
-        negotiation_state = self._negotiation_state(state, reconciliation, 0)
+        followup_started = sum(
+            1 for assignment in state.assignments.values()
+            if "-followup-" in assignment.id
+        )
+        negotiation_state = self._negotiation_state(
+            state, reconciliation, followup_started, excluded_obligation_ids,
+        )
         if not state.deadline.exploration_allowed(now=self.clock()):
             self._degrade(state, "deadline", "exploration cutoff reached before follow-up")
             try:
                 return (fallback_next_action(negotiation_state),)
             except NegotiationError:
                 return ()
+        if (
+            negotiation_state.remaining_deadline_sec
+            < negotiation_state.seconds_per_turn
+        ):
+            state.journal.emit("negotiation_adjustment", {
+                "component": "negotiator",
+                "action": "stop",
+                "reason": "no model turn fits the remaining exploration deadline",
+            })
+            return ()
         if self.negotiator is not None:
             try:
+                compact_context = compact_negotiation_context(negotiation_state)
+                role_context: dict[str, object] = {
+                    "negotiation_state": compact_context,
+                    "negotiation_targets": compact_context["targets"],
+                    "pr_metadata": state.inputs.pr_metadata,
+                    "policy": state.inputs.policy,
+                    "change_overview": change_overview_orientation(
+                        state.change_overview,
+                    ),
+                }
+                # Keep the typed state available to in-process integrations for
+                # backwards compatibility.  Gateway-backed model roles receive
+                # only the compact target projection above.
+                if not isinstance(self.negotiator, GatewayRoleAdapter):
+                    role_context["negotiation_state"] = negotiation_state
                 raw = self._model_request(
                     state,
                     role="negotiator",
-                    request_id="negotiator:1",
+                    request_id=f"negotiator:{max(1, attempt)}",
                     phase=RunPhase.FOLLOWUP,
                     component=self.negotiator,
                     method="propose",
-                    context={
-                        "negotiation_state": negotiation_state,
-                        "pr_metadata": state.inputs.pr_metadata,
-                        "policy": state.inputs.policy,
-                    },
+                    context=role_context,
                 )
                 if not isinstance(raw, Mapping):
                     raise NegotiationError("negotiator result must be an object")
-                return validate_negotiation(raw, negotiation_state).actions
+                raw_kind = raw.get("kind")
+                if raw_kind is None and isinstance(raw.get("actions"), list):
+                    action_items = raw["actions"]
+                    if len(action_items) == 1 and isinstance(action_items[0], Mapping):
+                        raw_kind = action_items[0].get("kind")
+                if isinstance(raw_kind, str) and raw_kind in {"record-unknown", "new-session"}:
+                    state.journal.emit("negotiation_alias_normalized", {
+                        "from": raw_kind,
+                        "to": {"record-unknown": "record_unknown", "new-session": "new_session"}[raw_kind],
+                    })
+                if isinstance(self.negotiator, GatewayRoleAdapter):
+                    proposal = validate_compact_negotiation(raw, negotiation_state)
+                else:
+                    # Trusted in-process adapters may still return the legacy
+                    # shape, but never more than one action is executable.
+                    if "actions" in raw and isinstance(raw.get("actions"), list) \
+                            and len(raw["actions"]) != 1:
+                        raise NegotiationError(
+                            "negotiator proposal must contain exactly one action"
+                        )
+                    proposal = validate_negotiation(raw, negotiation_state)
+                actions = proposal.actions
+                if (
+                    len(actions) == 1
+                    and actions[0].kind == "record_unknown"
+                    and any(
+                        item.id in actions[0].obligation_ids
+                        and item.risk_tier in {"high", "critical"}
+                        for item in negotiation_state.obligations
+                    )
+                ):
+                    alternative = fallback_next_action(negotiation_state)
+                    if alternative.kind != "record_unknown":
+                        state.journal.emit("negotiation_adjustment", {
+                            "component": "negotiator",
+                            "action": alternative.kind,
+                            "reason": (
+                                "high-risk target retained a feasible bounded "
+                                "investigation"
+                            ),
+                            "obligation_ids": alternative.obligation_ids,
+                        })
+                        return (alternative,)
+                return actions
             except Exception as exc:
-                self._degrade(state, "negotiator", _bounded_error(exc))
+                # Negotiation is an optimization layer. The deterministic
+                # fallback below can still produce a bounded follow-up, so a
+                # malformed optional proposal must not make the whole review
+                # appear materially degraded.
+                state.journal.emit("recovery", {
+                    "component": "negotiator",
+                    "action": "deterministic-fallback",
+                    "reason": _bounded_error(exc),
+                })
         try:
             action = fallback_next_action(negotiation_state)
-            state.journal.emit("recovery", {
+            state.journal.emit("negotiation_adjustment", {
                 "component": "negotiator", "action": action.kind,
                 "obligation_ids": action.obligation_ids,
             })
@@ -1639,35 +3561,131 @@ class ReviewController:
                 "kind": action.kind,
                 "session_id": action.session_id,
                 "obligation_ids": action.obligation_ids,
+                "lead_ids": action.lead_ids,
                 "estimated_turns": action.estimated_turns,
+                "reason": action.reason,
             })
             if action.kind == "record_unknown":
                 for obligation_id in action.obligation_ids:
                     assert state.coverage is not None
-                    state.coverage.mark_unresolved(obligation_id)
+                    state.coverage.close_obligation(
+                        obligation_id, ObligationStatus.EXHAUSTED,
+                    )
                     state.unknowns.append({
                         "obligation_id": obligation_id,
-                        "reason": "bounded investigation recorded no further feasible evidence",
+                        "reason": "bounded investigation exhausted all concrete novel actions",
                         "resolution_policy": dict(action.resolution_policies).get(obligation_id),
                     })
+                for lead_id in action.lead_ids:
+                    lead = state.investigation_leads.get(lead_id)
+                    if lead is None:
+                        continue
+                    state.investigation_leads[lead_id] = replace(
+                        lead,
+                        status=InvestigationLeadStatus.BLOCKED,
+                        resolution_reason=action.reason,
+                    )
+                state.journal.emit("negotiation_action_applied", {
+                    "kind": action.kind,
+                    "obligation_ids": action.obligation_ids,
+                    "lead_ids": action.lead_ids,
+                    "outcome": "recorded_exhausted",
+                })
                 continue
             if action.kind in {"resume", "consult"} and action.session_id:
                 ownership = state.ownership.get(action.session_id)
                 if ownership is None:
+                    state.journal.emit("negotiation_action_applied", {
+                        "kind": action.kind,
+                        "session_id": action.session_id,
+                        "outcome": "skipped_unknown_session",
+                    })
                     continue
                 assignment = state.assignments[ownership.assignment_id]
                 session = state.sessions.get(action.session_id)
                 if session is None:
+                    state.journal.emit("negotiation_action_applied", {
+                        "kind": action.kind,
+                        "session_id": action.session_id,
+                        "outcome": "skipped_missing_session",
+                    })
                     continue
-                succeeded, _ = self._session_hook(
-                    state,
-                    action.session_id,
-                    "apply_coverage_feedback",
-                    RunPhase.FOLLOWUP,
-                    action.obligation_ids,
-                )
+                if action.lead_ids:
+                    lead_id = action.lead_ids[0]
+                    lead = state.investigation_leads.get(lead_id)
+                    lead_target = self._investigation_lead_target(state, lead_id)
+                    succeeded, _ = self._session_hook(
+                        state, action.session_id,
+                        "apply_investigation_lead_feedback",
+                        RunPhase.FOLLOWUP, lead_target, lead,
+                    ) if lead is not None else (False, None)
+                    if succeeded and lead is not None:
+                        state.investigation_leads[lead_id] = replace(
+                            lead,
+                            status=InvestigationLeadStatus.SCHEDULED,
+                            assigned_session_id=action.session_id,
+                        )
+                else:
+                    succeeded, _ = self._session_hook(
+                        state,
+                        action.session_id,
+                        "apply_coverage_feedback",
+                        RunPhase.FOLLOWUP,
+                        action.obligation_ids,
+                    )
                 if succeeded:
                     result.append(assignment)
+                    outcome = "scheduled"
+                else:
+                    outcome = "skipped_feedback_failed"
+                state.journal.emit("negotiation_action_applied", {
+                    "kind": action.kind,
+                    "session_id": action.session_id,
+                    "obligation_ids": action.obligation_ids,
+                    "lead_ids": action.lead_ids,
+                    "outcome": outcome,
+                })
+                continue
+            if action.lead_ids:
+                lead_id = action.lead_ids[0]
+                lead = state.investigation_leads.get(lead_id)
+                if lead is None:
+                    continue
+                assignment = Assignment(
+                    id=f"investigation-lead-followup-{index}",
+                    title=f"Investigation lead follow-up {index}",
+                    objective=lead.next_action,
+                    obligation_ids=(), recipe_ids=(),
+                    lenses=("investigation-lead",),
+                    seed_paths=lead.affected_paths,
+                    boundary_paths=lead.affected_paths,
+                    expected_evidence=(lead.required_capability,),
+                    estimated_turns=max(2, action.estimated_turns),
+                    priority="high",
+                    model_turn_limit=state.inputs.config.session_limits.model_turns,
+                    tool_call_limit=state.inputs.config.session_limits.tool_calls,
+                    investigation_leads=(lead,),
+                )
+                state.assignments[assignment.id] = assignment
+                expected_session_id = self._session_identity(state, assignment)
+                state.assignment_sessions[assignment.id] = expected_session_id
+                scheduled = replace(
+                    lead,
+                    status=InvestigationLeadStatus.SCHEDULED,
+                    assigned_session_id=expected_session_id,
+                )
+                assignment = replace(
+                    assignment, investigation_leads=(scheduled,),
+                )
+                state.assignments[assignment.id] = assignment
+                state.investigation_leads[lead_id] = scheduled
+                result.append(assignment)
+                state.journal.emit("negotiation_action_applied", {
+                    "kind": action.kind,
+                    "lead_ids": action.lead_ids,
+                    "assignment_id": assignment.id,
+                    "outcome": "scheduled",
+                })
                 continue
             selected = tuple(
                 obligation_by_id[item] for item in action.obligation_ids
@@ -1683,16 +3701,75 @@ class ReviewController:
                     })
                     assert state.coverage is not None
                     state.coverage.mark_unresolved(obligation.id)
+                state.journal.emit("negotiation_action_applied", {
+                    "kind": action.kind,
+                    "obligation_ids": action.obligation_ids,
+                    "outcome": "recorded_infeasible",
+                })
+                continue
+            latest_usage: dict[str, BudgetUsage] = {}
+            for session_result in state.session_results.values():
+                usage = getattr(session_result, "budget", BudgetUsage())
+                existing = latest_usage.get(session_result.session_id, BudgetUsage())
+                latest_usage[session_result.session_id] = BudgetUsage(
+                    model_turns=max(existing.model_turns, usage.model_turns),
+                    tool_calls=max(existing.tool_calls, usage.tool_calls),
+                    recoveries=max(existing.recoveries, usage.recoveries),
+                )
+            for session_id, usage in state.failed_session_budgets.items():
+                existing = latest_usage.get(session_id, BudgetUsage())
+                latest_usage[session_id] = BudgetUsage(
+                    model_turns=max(existing.model_turns, usage.model_turns),
+                    tool_calls=max(existing.tool_calls, usage.tool_calls),
+                    recoveries=max(existing.recoveries, usage.recoveries),
+                )
+            remaining_turns = max(
+                0,
+                state.inputs.config.max_total_model_turns
+                - sum(item.model_turns for item in latest_usage.values()),
+            )
+            remaining_tools = max(
+                0,
+                state.inputs.config.max_total_tool_calls
+                - sum(item.tool_calls for item in latest_usage.values()),
+            )
+            if remaining_turns <= 0 or remaining_tools <= 0:
+                for obligation in selected:
+                    state.unknowns.append({
+                        "obligation_id": obligation.id,
+                        "reason": "global specialist lease exhausted before follow-up admission",
+                        "resolution_policy": obligation.unresolved_policy,
+                    })
+                    assert state.coverage is not None
+                    state.coverage.mark_unresolved(obligation.id)
+                state.journal.emit("negotiation_action_applied", {
+                    "kind": action.kind,
+                    "obligation_ids": action.obligation_ids,
+                    "outcome": "global_lease_exhausted",
+                })
                 continue
             assignment = replace(
                 plan.assignments[0],
                 id=f"{plan.assignments[0].id}-followup-{index}",
                 title=f"{plan.assignments[0].title} follow-up {index}",
                 estimated_turns=min(action.estimated_turns, plan.assignments[0].estimated_turns),
+                model_turn_limit=min(plan.assignments[0].model_turn_limit, remaining_turns),
+                tool_call_limit=min(plan.assignments[0].tool_call_limit, remaining_tools),
             )
             state.assignments[assignment.id] = assignment
             result.append(assignment)
+            state.journal.emit("negotiation_action_applied", {
+                "kind": action.kind,
+                "obligation_ids": action.obligation_ids,
+                "assignment_id": assignment.id,
+                "outcome": "scheduled",
+            })
         return tuple(result)
+
+    @staticmethod
+    def _investigation_lead_target(state: _RunState, lead_id: str) -> str:
+        ordered = tuple(sorted(state.investigation_leads))
+        return f"L{ordered.index(lead_id) + 1}"
 
     def _collect_candidates(self, state: _RunState) -> tuple[CandidateFinding, ...]:
         for index, candidate in enumerate(state.inputs.candidate_findings):
@@ -1704,24 +3781,72 @@ class ReviewController:
             )
         state.candidates.clear()
         state.collision_dispositions.clear()
+        unique_candidates: list[CandidateFinding] = []
         for candidate_id in sorted(grouped):
             occurrences = grouped[candidate_id]
             if len(occurrences) == 1:
-                state.candidates[candidate_id] = occurrences[0][1]
+                unique_candidates.append(occurrences[0][1])
                 continue
             for occurrence_ref, candidate in occurrences:
+                # Candidate IDs are model-local handles.  Independent
+                # specialists commonly emit simple IDs such as ``c1``; a
+                # collision must not discard every occurrence before the
+                # critic can compare them.  Scope only the colliding IDs so
+                # ordinary model IDs remain readable and stable.
+                scope_seed = (
+                    f"{candidate.collector_session_id}|{occurrence_ref}"
+                ).encode("utf-8", "replace")
+                scope_suffix = hashlib.sha256(scope_seed).hexdigest()[:12]
+                scoped_id = f"{candidate_id}@{scope_suffix}"
+                scoped = replace(
+                    candidate,
+                    candidate_id=scoped_id,
+                    contributor_candidate_ids=tuple(dict.fromkeys((
+                        *candidate.contributor_candidate_ids,
+                        candidate_id,
+                    ))),
+                )
+                unique_candidates.append(scoped)
                 disposition = {
-                    "candidate_id": candidate_id,
+                    "candidate_id": scoped_id,
+                    "original_candidate_id": candidate_id,
                     "occurrence_ref": occurrence_ref,
-                    "action": "reject",
-                    "reason": "duplicate-candidate-id",
+                    "action": "scope",
+                    "reason": "candidate-id-scoped",
                     "target_id": None,
                     "collector_session_id": candidate.collector_session_id,
                     "model_identity": candidate.model_identity,
                 }
                 state.collision_dispositions.append(disposition)
                 state.journal.emit("candidate_disposition", disposition)
+        change_facts, _metadata = _authoritative_change_facts(
+            state.inputs.topology,
+        )
+        consolidated = consolidate_candidates(
+            unique_candidates,
+            changed_files=state.inputs.changed_files,
+            change_facts=change_facts,
+            obligations={item.id: item for item in state.obligations},
+            evidence=state.evidence.snapshot(),
+        )
+        for candidate in consolidated.candidates:
+            state.candidates[candidate.candidate_id] = candidate
+        for disposition in consolidated.dispositions:
+            projected = _json_value(disposition)
+            state.collision_dispositions.append(projected)
+            state.journal.emit("candidate_disposition", projected)
         return tuple(state.candidates[key] for key in sorted(state.candidates))
+
+    @staticmethod
+    def _refresh_session_candidate_occurrences(state: _RunState) -> None:
+        """Re-project the final candidate set owned by each specialist session."""
+        for occurrence_ref in tuple(state.candidate_occurrences):
+            if occurrence_ref.startswith("session:"):
+                del state.candidate_occurrences[occurrence_ref]
+        for session_id, session in state.sessions.items():
+            prefix = f"session:{session_id}:"
+            for index, candidate in enumerate(session.candidate_findings):
+                state.candidate_occurrences[f"{prefix}{index}"] = candidate
 
     @staticmethod
     def _conservative_critic(candidates: Iterable[CandidateFinding]) -> dict[str, object]:
@@ -1734,7 +3859,7 @@ class ReviewController:
             ))
             decisions.append({
                 "candidate_id": item.candidate_id,
-                "action": "keep" if unambiguous else "reject",
+                "action": "request_verification" if unambiguous else "reject",
             })
         return {"decisions": decisions}
 
@@ -1744,11 +3869,54 @@ class ReviewController:
             state.review = AdjudicatedReview()
             return
         critic_result: object
+        critic_context: dict[str, object] | None = None
         if self.critic is None:
             self._degrade(state, "critic", "deterministic conservative critic fallback")
             critic_result = self._conservative_critic(candidates)
         else:
             try:
+                retained = {
+                    record.id: record
+                    for record in state.evidence.snapshot().records
+                    if record.is_usable_for_coverage
+                }
+                candidate_evidence = {}
+                for candidate in candidates:
+                    excerpts = []
+                    for evidence_id in (
+                        *candidate.supporting_evidence_ids,
+                        *candidate.contradicting_evidence_ids,
+                    ):
+                        record = retained.get(evidence_id)
+                        if record is None:
+                            continue
+                        excerpt = record.content.encode("utf-8")[:1200].decode(
+                            "utf-8", errors="replace",
+                        )
+                        excerpts.append({
+                            "evidence_id": record.id,
+                            "path": record.source_path,
+                            "category": record.category,
+                            "tool": record.tool,
+                            "status": record.status,
+                            "content_hash": record.content_hash,
+                            "content_excerpt": excerpt,
+                            "truncated": record.truncated,
+                            "redacted": record.redacted,
+                            "contradicts": record.contradicts,
+                        })
+                    candidate_evidence[candidate.candidate_id] = tuple(excerpts)
+                critic_context = {
+                    "candidates": candidates,
+                    "candidate_evidence": candidate_evidence,
+                    "obligations": obligation_map,
+                    "changed_files": state.inputs.changed_files,
+                    "pr_metadata": state.inputs.pr_metadata,
+                    "policy": state.inputs.policy,
+                    "change_overview": change_overview_orientation(
+                        state.change_overview,
+                    ),
+                }
                 critic_result = self._model_request(
                     state,
                     role="critic",
@@ -1756,75 +3924,491 @@ class ReviewController:
                     phase=RunPhase.FINALIZATION,
                     component=self.critic,
                     method="adjudicate",
-                    context={
-                        "candidates": candidates,
-                        "obligations": obligation_map,
-                        "changed_files": state.inputs.changed_files,
-                        "pr_metadata": state.inputs.pr_metadata,
-                        "policy": state.inputs.policy,
-                    },
+                    context=critic_context,
                 )
-                critic_result = _validated_critic_result(
-                    critic_result, candidates,
-                )
+                diagnostics = _critic_response_diagnostics(critic_result)
+                if diagnostics["ignored_fields"]:
+                    state.journal.emit("critic_response_normalized", diagnostics)
+                try:
+                    critic_result = _validated_critic_result(
+                        critic_result, candidates,
+                    )
+                except ValueError as exc:
+                    if "omitted candidate decisions" not in str(exc):
+                        raise
+                    partial_rows, missing_ids = _partial_critic_result(
+                        critic_result, candidates,
+                    )
+                    if not missing_ids:
+                        raise
+                    missing_candidates = tuple(
+                        item for item in candidates
+                        if item.candidate_id in set(missing_ids)
+                    )
+                    state.journal.emit("critic_repair_requested", {
+                        "missing_candidate_ids": missing_ids,
+                        "accepted_decision_count": len(partial_rows),
+                    })
+                    try:
+                        repaired = self._model_request(
+                            state,
+                            role="critic",
+                            request_id="critic:repair",
+                            phase=RunPhase.FINALIZATION,
+                            component=self.critic,
+                            method="adjudicate",
+                            context={
+                                **critic_context,
+                                "critic_repair": {
+                                    "missing_candidate_ids": missing_ids,
+                                    "accepted_decisions": partial_rows,
+                                    "instruction": (
+                                        "Return decisions only for the missing candidate IDs; "
+                                        "do not repeat accepted decisions."
+                                    ),
+                                },
+                            },
+                        )
+                        repaired_rows, still_missing = _partial_critic_result(
+                            repaired, missing_candidates,
+                        )
+                        if still_missing:
+                            raise ValueError(
+                                "critic repair omitted candidate decisions"
+                            )
+                        critic_result = _validated_critic_result(
+                            {"actions": (*partial_rows, *repaired_rows)},
+                            candidates,
+                        )
+                        state.journal.emit("critic_repair_completed", {
+                            "repaired_candidate_ids": tuple(
+                                item["candidate_id"] for item in repaired_rows
+                            ),
+                        })
+                    except Exception as repair_exc:
+                        # Preserve valid initial decisions and apply the
+                        # evidence-gated fallback only to IDs still missing.
+                        self._degrade(state, "critic", _bounded_error(repair_exc))
+                        fallback = self._conservative_critic(missing_candidates)
+                        critic_result = {
+                            "actions": (
+                                *partial_rows,
+                                *fallback.get("decisions", ()),
+                            ),
+                        }
             except Exception as exc:
-                self._degrade(state, "critic", _bounded_error(exc))
+                if not any(
+                    str(item.get("component", "")) == "critic"
+                    for item in state.degradations
+                ):
+                    self._degrade(state, "critic", _bounded_error(exc))
                 critic_result = self._conservative_critic(candidates)
         try:
             state.review = adjudicate_candidates(
                 candidates, critic_result, state.evidence,
                 obligations=obligation_map, changed_files=state.inputs.changed_files,
             )
+            invalid_merge_ids = tuple(
+                item.candidate_id
+                for item in state.review.dispositions
+                if item.reason == "invalid-merge-target-kept"
+            )
+            if (
+                invalid_merge_ids
+                and self.critic is not None
+                and critic_context is not None
+            ):
+                invalid_id_set = set(invalid_merge_ids)
+                original_rows, _missing = _partial_critic_result(
+                    critic_result, candidates,
+                )
+                original_by_id = {
+                    item["candidate_id"]: item for item in original_rows
+                }
+                state.journal.emit("critic_merge_repair_requested", {
+                    "invalid_candidate_ids": invalid_merge_ids,
+                    "rejected_merges": tuple(
+                        original_by_id[item]
+                        for item in invalid_merge_ids
+                        if item in original_by_id
+                    ),
+                })
+                try:
+                    repaired = self._model_request(
+                        state,
+                        role="critic",
+                        request_id="critic:merge-repair",
+                        phase=RunPhase.FINALIZATION,
+                        component=self.critic,
+                        method="adjudicate",
+                        context={
+                            "candidates": tuple(
+                                item for item in candidates
+                                if item.candidate_id in invalid_id_set
+                            ),
+                            "candidate_evidence": {
+                                candidate_id: critic_context[
+                                    "candidate_evidence"
+                                ][candidate_id]
+                                for candidate_id in invalid_merge_ids
+                            },
+                            "eligible_merge_targets": tuple(
+                                item for item in candidates
+                                if item.candidate_id not in invalid_id_set
+                            ),
+                            "critic_merge_repair": {
+                                "invalid_candidate_ids": invalid_merge_ids,
+                                "rejected_merges": tuple(
+                                    original_by_id[item]
+                                    for item in invalid_merge_ids
+                                    if item in original_by_id
+                                ),
+                                "instruction": (
+                                    "The requested merges were not deterministically "
+                                    "compatible. Return one corrected action for each listed "
+                                    "candidate ID. Keep the candidate unless another listed "
+                                    "action is justified; merge only into an eligible target."
+                                ),
+                            },
+                        },
+                    )
+                    repaired_rows, _ignored_missing = _partial_critic_result(
+                        repaired, candidates,
+                    )
+                    repaired_by_id = {
+                        item["candidate_id"]: item
+                        for item in repaired_rows
+                        if item["candidate_id"] in invalid_id_set
+                    }
+                    still_missing = tuple(
+                        item for item in invalid_merge_ids
+                        if item not in repaired_by_id
+                    )
+                    if still_missing:
+                        raise ValueError(
+                            "critic merge repair omitted candidate decisions"
+                        )
+                    combined_rows = tuple(
+                        repaired_by_id.get(
+                            item.candidate_id,
+                            original_by_id[item.candidate_id],
+                        )
+                        for item in candidates
+                    )
+                    critic_result = _validated_critic_result(
+                        {"actions": combined_rows}, candidates,
+                    )
+                    state.review = adjudicate_candidates(
+                        candidates, critic_result, state.evidence,
+                        obligations=obligation_map,
+                        changed_files=state.inputs.changed_files,
+                    )
+                    state.journal.emit("critic_merge_repair_completed", {
+                        "repaired_candidate_ids": invalid_merge_ids,
+                    })
+                except Exception as repair_exc:
+                    state.journal.emit("critic_merge_repair_failed", {
+                        "candidate_ids": invalid_merge_ids,
+                        "reason": _bounded_error(repair_exc),
+                    })
+            critic_rows, _missing = _partial_critic_result(
+                critic_result, candidates,
+            )
+            state.critic_actions = {
+                item["candidate_id"]: item["action"] for item in critic_rows
+            }
         except Exception as exc:
             self._degrade(state, "adjudication", _bounded_error(exc))
             state.review = AdjudicatedReview()
         for disposition in state.review.dispositions:
             state.journal.emit("candidate_disposition", _json_value(disposition))
+    @staticmethod
+    def _rejected_candidate_diagnostics(
+        state: _RunState,
+    ) -> list[dict[str, str]]:
+        diagnostics: list[dict[str, str]] = []
+        for disposition in state.review.rejected:
+            candidate = state.candidates.get(disposition.candidate_id)
+            if candidate is None:
+                continue
+            severity = normalize_candidate_severity(candidate.severity)
+            diagnostics.append({
+                "candidate_id": disposition.candidate_id,
+                "claim": mask_runtime_text(candidate.claim, limit=500),
+                "affected_location": mask_runtime_text(
+                    candidate.affected_location, limit=300,
+                ),
+                "severity": severity,
+                "critic_action": state.critic_actions.get(
+                    disposition.candidate_id, "missing",
+                ),
+                "final_reason": mask_runtime_text(
+                    disposition.reason, limit=200,
+                ),
+            })
+        return diagnostics
+
+    @staticmethod
+    def _specialist_checkpoint_summaries(
+        state: _RunState,
+    ) -> tuple[dict[str, object], ...]:
+        """Project one bounded latest checkpoint per admitted specialist."""
+        assert state.coverage is not None
+        obligation_map = {item.id: item for item in state.obligations}
+        statuses = dict(state.coverage.snapshot().obligation_statuses)
+        latest: dict[str, tuple[str, object]] = {}
+        for (assignment_id, session_id), result in state.session_results.items():
+            if session_id not in state.quarantined_session_ids:
+                latest[session_id] = (assignment_id, result)
+
+        def strings(
+            values: Iterable[object], *, limit: int = 240,
+        ) -> tuple[str, ...]:
+            return tuple(
+                text
+                for value in tuple(values)[:5]
+                if (text := mask_runtime_text(value, limit=limit).strip())
+            )
+
+        projected: list[dict[str, object]] = []
+        for session_id in sorted(latest)[:12]:
+            assignment_id, result = latest[session_id]
+            assignment = state.assignments.get(assignment_id)
+            checkpoint = getattr(result, "checkpoint", None)
+            if assignment is None or checkpoint is None:
+                continue
+            assigned_ids = tuple(dict.fromkeys((
+                *getattr(assignment, "primary_obligation_ids", ()),
+                *getattr(assignment, "obligation_ids", ()),
+                *getattr(assignment, "independent_obligation_ids", ()),
+            )))
+            covered_subjects = strings(
+                obligation_map[item].subject
+                for item in assigned_ids
+                if item in obligation_map
+                and statuses.get(item) is ObligationStatus.COVERED
+            )
+            unresolved_subjects = strings(
+                obligation_map[item].subject
+                for item in assigned_ids
+                if item in obligation_map
+                and statuses.get(item) not in {
+                    ObligationStatus.COVERED,
+                    ObligationStatus.NOT_APPLICABLE,
+                }
+            )
+            projected.append({
+                "assignment_id": mask_runtime_text(assignment_id, limit=160),
+                "objective": mask_runtime_text(
+                    getattr(assignment, "objective", ""), limit=300,
+                ),
+                "working_summary": mask_runtime_text(
+                    getattr(checkpoint, "working_summary", ""), limit=600,
+                ),
+                "completed_steps": strings(
+                    getattr(checkpoint, "completed_steps", ()),
+                ),
+                "covered_subjects": covered_subjects,
+                "unresolved_subjects": unresolved_subjects,
+                "unknowns": strings(getattr(checkpoint, "unknowns", ())),
+            })
+        return tuple(projected)
 
     def _handoff_context(self, state: _RunState, status: str) -> ReviewHandoffContext:
+        assert state.coverage is not None
+        coverage = state.coverage.snapshot()
+        obligation_statuses = dict(coverage.obligation_statuses)
+        evidence_by_obligation = dict(coverage.evidence_by_obligation)
+        reviewed_obligations = tuple(
+            item for item in state.obligations
+            if evidence_by_obligation.get(item.id)
+            or obligation_statuses.get(item.id) is ObligationStatus.COVERED
+        )
+        completed_assignments = tuple(
+            state.assignments[assignment_id]
+            for assignment_id in sorted(state.assignment_sessions)
+            if assignment_id in state.assignments
+        )
+        change_topics = _orientation_topics(
+            state.inputs.topology.get("file_roles", ())
+        )
+        if not change_topics and state.inputs.changed_files:
+            change_topics = (ReviewOrientationTopic.REPOSITORY_BEHAVIOR,)
+        specialist_topics = _orientation_topics(
+            lens
+            for assignment in completed_assignments
+            for lens in assignment.lenses
+        )
+        coverage_boundary_topics = _orientation_topics(
+            signal
+            for obligation in reviewed_obligations
+            for signal in (
+                obligation.origin,
+                *obligation.required_evidence_categories,
+                *(
+                    (obligation.subject,)
+                    if obligation.origin == "risk-rule"
+                    else ()
+                ),
+            )
+        )
         recipe_ids = tuple(sorted(
             item.id for item in state.inputs.policy.recipes
-            if state.coverage is not None
-            and state.coverage.recipe_statuses().get(item.id) != "not_applicable"
+            if state.coverage.recipe_statuses().get(item.id)
+            in {"covered", "partially_covered"}
         ))
+        unresolved_obligations = tuple(
+            item for item in state.obligations
+            if item.mandatory
+            and obligation_statuses.get(item.id) in {
+                ObligationStatus.PENDING,
+                ObligationStatus.UNRESOLVED,
+                ObligationStatus.EXHAUSTED,
+                ObligationStatus.BLOCKED,
+            }
+        )
+        finding_topics = _orientation_topics(
+            item.category for item in state.review.accepted
+        )
+        risk_topics = _orientation_topics(
+            state.inputs.classification.get("risk_flags", ())
+        )
+        unresolved_topics = _orientation_topics(
+            signal
+            for obligation in unresolved_obligations
+            for signal in (
+                obligation.origin,
+                obligation.subject,
+                *obligation.required_evidence_categories,
+            )
+        )
+        relationship_topics = (
+            (ReviewOrientationTopic.CROSS_COMPONENT_CONTRACTS,)
+            if state.inputs.topology.get("relationships")
+            else ()
+        )
+        review_emphasis_topics = tuple(dict.fromkeys((
+            *finding_topics,
+            *risk_topics,
+            *relationship_topics,
+            *unresolved_topics,
+        )))[:3]
+        detail_notes = tuple(
+            note for note in state.notes
+            if note.kind is not ReviewNoteKind.SOURCE_ACCESS_REQUEST
+        )
+        prepared_finding_severities = tuple(
+            note.severity for note in detail_notes
+            if note.severity in {"info", "minor", "major", "blocker"}
+        )
+
+        what_changed, ai_reviewed = _behavioral_handoff_candidates(
+            changed_files=state.inputs.changed_files,
+            topology=state.inputs.topology,
+            obligations=state.obligations,
+            evidence_records=state.evidence.snapshot().records,
+            reviewed_obligation_ids=tuple(item.id for item in reviewed_obligations),
+            allow_role_fallback=(
+                status == "degraded"
+                or "changed_contract_facts" not in state.inputs.topology
+            ),
+        )
+        overview = str(state.change_overview.get("overview") or "").strip()
+        if overview:
+            what_changed = (
+                _deterministic_handoff_change_summary(state.change_overview)
+                if status == "degraded"
+                else (overview,)
+            )
+        component_ids = tuple(sorted(
+            str(item.get("id", ""))
+            for item in state.inputs.topology.get("components", ())
+            if isinstance(item, Mapping) and str(item.get("id", "")).strip()
+        ))
+        summarized_review = _deterministic_reviewed_summary(
+            evidence_paths=(
+                record.source_path
+                for record in state.evidence.snapshot().records
+                if record.is_usable_for_coverage and record.source_path
+            ),
+            component_ids=component_ids,
+            reviewed_obligations=reviewed_obligations,
+        )
+        if summarized_review and not ai_reviewed:
+            ai_reviewed = summarized_review
+        else:
+            ai_reviewed = ai_reviewed[:3]
+        human_focus = _deterministic_handoff_focus(
+            state.obligations,
+            state.blocking_obligation_ids,
+            bool(state.degradations),
+        )
+        unresolved_lead_focus = tuple(
+            "The AI could not resolve whether "
+            + lead.summary.rstrip(". ")
+            + "."
+            for lead in state.investigation_leads.values()
+            if lead.status is InvestigationLeadStatus.BLOCKED
+            and lead.summary.strip()
+        )[:2]
+        human_focus = tuple(dict.fromkeys((
+            *unresolved_lead_focus, *human_focus,
+        )))[:3]
+        tracked_paths = tuple(dict.fromkeys((
+            *state.inputs.tracked_paths,
+            *state.inputs.changed_files,
+        )))
+        context_paths = _deterministic_context_paths(
+            state.inputs.topology,
+            tracked_paths,
+            extra_paths=(
+                *(
+                    record.source_path
+                    for record in state.evidence.snapshot().records
+                    if record.is_usable_for_coverage and record.source_path
+                ),
+                *(
+                    path
+                    for obligation in reviewed_obligations
+                    for path in (*obligation.scope, *obligation.seed_hints)
+                ),
+            ),
+        )
         return ReviewHandoffContext(
-            recommendation=state.verdict,
+            recommendation=(
+                "no_blocking_findings"
+                if state.verdict_source == "approval-disabled"
+                and not state.blocking_finding_ids
+                and not state.blocking_obligation_ids
+                else state.verdict
+            ),
             status=status,
-            component_ids=tuple(sorted(
-                str(item.get("id", "")) for item in state.inputs.topology.get("components", ())
-                if isinstance(item, Mapping) and str(item.get("id", "")).strip()
-            )),
+            change_topics=change_topics,
+            component_ids=component_ids,
+            specialist_topics=specialist_topics,
             recipe_ids=recipe_ids,
-            unresolved_thread_count=len(state.review.accepted),
+            coverage_boundary_topics=coverage_boundary_topics,
+            unresolved_thread_count=len(detail_notes),
             highest_thread_severity=max(
-                (item.severity for item in state.review.accepted), default=None,
+                prepared_finding_severities, default=None,
                 key=lambda value: {"info": 0, "minor": 1, "major": 2, "blocker": 3}.get(value, 0),
             ),
-            material_coverage_limited=bool(state.degradations),
+            review_emphasis_topics=review_emphasis_topics,
+            material_coverage_limited=bool(
+                state.degradations or state.blocking_obligation_ids
+            ),
+            candidate_retention_limited=self._candidate_retention_limited(state),
             degraded_stages=tuple(
                 str(item.get("component", ""))
                 for item in state.degradations
                 if str(item.get("component", "")).strip()
             ),
             source_access_requests=tuple(state.source_requests),
-        )
-
-    @staticmethod
-    def _allowed_orientation_topics(
-        state: _RunState,
-    ) -> frozenset[ReviewOrientationTopic]:
-        values: list[str] = []
-        values.extend(str(item) for item in state.inputs.classification.get("risk_flags", ()))
-        values.extend(str(item) for item in state.inputs.topology.get("file_roles", ()))
-        for assignment in state.assignments.values():
-            values.extend(assignment.lenses)
-        for obligation in state.obligations:
-            values.extend((obligation.origin, obligation.subject, *obligation.required_evidence))
-        values.extend(item.category for item in state.review.accepted)
-        normalized = " ".join(values).lower().replace("-", "_")
-        return frozenset(
-            topic for topic in ReviewOrientationTopic
-            if topic.value in normalized
+            what_changed=what_changed,
+            what_changed_is_validated_overview=bool(overview),
+            ai_reviewed=ai_reviewed,
+            human_focus=human_focus,
+            context_paths=tuple(sorted(context_paths)),
         )
 
     def _apply_finalizer_proposal(
@@ -1833,24 +4417,158 @@ class ReviewController:
         base: ReviewHandoffContext,
         proposal: FinalizerProposal,
     ) -> ReviewHandoffContext:
-        allowed_topics = self._allowed_orientation_topics(state)
         allowed_components = set(base.component_ids)
         allowed_recipes = set(base.recipe_ids)
 
-        def topics(values: Iterable[ReviewOrientationTopic]) -> tuple[ReviewOrientationTopic, ...]:
+        def topics(
+            values: Iterable[ReviewOrientationTopic],
+            allowed: Iterable[ReviewOrientationTopic],
+        ) -> tuple[ReviewOrientationTopic, ...]:
+            allowed_topics = set(allowed)
             return tuple(sorted(
                 {item for item in values if item in allowed_topics},
                 key=lambda item: item.value,
             ))
 
+        def selected_summaries(
+            proposed: Iterable[str],
+            allowed: tuple[str, ...],
+            *,
+            minimum: int = 0,
+        ) -> tuple[str, ...]:
+            selected = tuple(
+                dict.fromkeys(item for item in proposed if item in set(allowed))
+            )[:5]
+            return selected if len(selected) >= minimum else allowed[:5]
+
+        selected = replace(
+            base,
+            change_topics=topics(proposal.change_topics, base.change_topics),
+            component_ids=tuple(sorted(set(proposal.component_ids) & allowed_components)),
+            specialist_topics=topics(
+                proposal.specialist_topics,
+                base.specialist_topics,
+            ),
+            recipe_ids=tuple(sorted(set(proposal.recipe_ids) & allowed_recipes)),
+            coverage_boundary_topics=topics(
+                proposal.coverage_boundary_topics,
+                base.coverage_boundary_topics,
+            ),
+            review_emphasis_topics=topics(
+                proposal.review_emphasis_topics,
+                base.review_emphasis_topics,
+            ),
+            what_changed=selected_summaries(
+                proposal.what_changed,
+                base.what_changed,
+                minimum=min(2, len(base.what_changed)),
+            ),
+            ai_reviewed=selected_summaries(
+                proposal.ai_reviewed, base.ai_reviewed,
+                minimum=min(1, len(base.ai_reviewed)),
+            ),
+        )
+        if not state.degradations:
+            return selected
+        return replace(
+            selected,
+            change_topics=tuple(sorted(
+                {*base.change_topics, *selected.change_topics},
+                key=lambda item: item.value,
+            )),
+            component_ids=tuple(sorted({
+                *base.component_ids, *selected.component_ids,
+            })),
+            specialist_topics=tuple(sorted(
+                {*base.specialist_topics, *selected.specialist_topics},
+                key=lambda item: item.value,
+            )),
+            recipe_ids=tuple(sorted({
+                *base.recipe_ids, *selected.recipe_ids,
+            })),
+            coverage_boundary_topics=tuple(sorted(
+                {
+                    *base.coverage_boundary_topics,
+                    *selected.coverage_boundary_topics,
+                },
+                key=lambda item: item.value,
+            )),
+            review_emphasis_topics=tuple(dict.fromkeys((
+                *selected.review_emphasis_topics,
+                *base.review_emphasis_topics,
+            )))[:3],
+        )
+
+    def _apply_handoff_summary_proposal(
+        self,
+        state: _RunState,
+        base: ReviewHandoffContext,
+        proposal: HandoffSummaryProposal,
+    ) -> ReviewHandoffContext:
+        """Admit concise presentation prose without treating words as authority."""
+        combined = " ".join((
+            proposal.what_changed_summary,
+            proposal.ai_reviewed_summary,
+            proposal.human_focus,
+        ))
+        # Path-looking words and the optional reference arrays are orientation
+        # prose, not review authority. Findings, coverage and changed-line
+        # locations remain controller-validated elsewhere; rejecting a human
+        # summary because ``tool/secret`` resembles a path causes more harm
+        # than accepting an imprecise component name here.
+        normalized = " ".join(combined.casefold().split())
+        if re.search(
+            r"(?:^|\s)(?:blocker|major|minor|finding|defect)\b|"
+            r"(?:^|[\s`])[^`\s]+:\d+(?:\b|`)",
+            normalized,
+        ):
+            raise ValueError("detailed findings belong in review notes")
+
+        # Do not let a candidate claim leak into the sticky handoff even when it
+        # happens to use valid changed paths and components.
+        detailed_claims = tuple(
+            " ".join(str(value).casefold().split())
+            for candidate in (
+                *state.review.accepted,
+                *state.review.unknowns,
+                *state.review.verification_requests,
+            )
+            for value in (
+                getattr(candidate, "claim", ""),
+                getattr(candidate, "user_visible_consequence", ""),
+            )
+            if len(" ".join(str(value).split())) >= 16
+        )
+        if any(claim in normalized for claim in detailed_claims):
+            raise ValueError("detailed finding claim belongs in a review note")
+        summary_words = set(re.findall(r"[a-z0-9_]+", normalized))
+        if any(
+            len(claim_words) >= 4
+            and len(summary_words.intersection(claim_words)) / len(claim_words) >= 0.7
+            for claim in detailed_claims
+            if (claim_words := set(re.findall(r"[a-z0-9_]+", claim)))
+        ):
+            raise ValueError("candidate-shaped consequence belongs in a review note")
+
+        overview = str(state.change_overview.get("overview") or "").strip()
+        if not overview:
+            raise ValueError("validated change overview is unavailable")
         return replace(
             base,
-            change_topics=topics(proposal.change_topics),
-            component_ids=tuple(sorted(set(proposal.component_ids) & allowed_components)),
-            specialist_topics=topics(proposal.specialist_topics),
-            recipe_ids=tuple(sorted(set(proposal.recipe_ids) & allowed_recipes)),
-            coverage_boundary_topics=topics(proposal.coverage_boundary_topics),
-            review_emphasis_topics=topics(proposal.review_emphasis_topics),
+            what_changed=(
+                (proposal.what_changed_summary,)
+                if proposal.what_changed_summary
+                else base.what_changed
+            ),
+            what_changed_is_validated_overview=True,
+            ai_reviewed=(proposal.ai_reviewed_summary,),
+            ai_reviewed_is_validated_summary=True,
+            review_emphasis_topics=(),
+            human_focus=(
+                (proposal.human_focus,)
+                if proposal.human_focus
+                else base.human_focus
+            ),
         )
 
     @staticmethod
@@ -1875,13 +4593,271 @@ class ReviewController:
             status=status,
         )
 
+    @staticmethod
+    def _remediation_evidence_context(
+        state: _RunState,
+        finding: AcceptedFinding,
+        *,
+        max_chars: int = _REMEDIATION_EVIDENCE_LIMIT,
+    ) -> tuple[dict[str, object], ...]:
+        cited = set(finding.supporting_evidence_ids).union(
+            finding.contradicting_evidence_ids
+        )
+        selected = []
+        used = 0
+        for record in state.evidence.snapshot().records:
+            if record.id not in cited:
+                continue
+            content = str(record.content or "")
+            remaining = max_chars - used
+            if remaining <= 0:
+                break
+            excerpt = content[:min(_REMEDIATION_RECORD_LIMIT, remaining)]
+            used += len(excerpt)
+            selected.append({
+                "evidence_id": record.id,
+                "category": record.category,
+                "tool": record.tool,
+                "path": record.source_path,
+                "content": excerpt,
+                "truncated": record.truncated or len(excerpt) < len(content),
+            })
+        return tuple(selected)
+
+    @staticmethod
+    def _remediation_validation_context(
+        state: _RunState,
+        finding: AcceptedFinding,
+        evidence_context: tuple[dict[str, object], ...],
+    ) -> tuple[dict[str, object], ...]:
+        """Add immutable path diffs needed to validate a safe suggestion.
+
+        Candidate consolidation may retain only the evidence cited by the
+        winning candidate.  Anchor validation must still use the controller's
+        authoritative PR diff for the affected path, otherwise a valid
+        suggestion can be rejected merely because another candidate performed
+        the diff read.
+        """
+        selected = list(evidence_context)
+        selected_ids = {str(item.get("evidence_id") or "") for item in selected}
+        # Keep authoritative diff material in a separate budget.  The cited
+        # evidence above is sized for the remediator prompt and may already
+        # consume its full cap before the diff record is encountered.
+        diff_used = sum(
+            len(str(item.get("content") or ""))
+            for item in selected
+            if (
+                item.get("tool") == "read_pr_diff"
+                and item.get("path") == finding.affected_file
+            )
+        )
+        for record in state.evidence.snapshot().records:
+            if (
+                record.id in selected_ids
+                or record.tool != "read_pr_diff"
+                or record.source_path != finding.affected_file
+            ):
+                continue
+            remaining = _REMEDIATION_VALIDATION_DIFF_LIMIT - diff_used
+            if remaining <= 0:
+                break
+            excerpt = record.content[:min(_REMEDIATION_RECORD_LIMIT, remaining)]
+            diff_used += len(excerpt)
+            selected.append({
+                "evidence_id": record.id,
+                "category": record.category,
+                "tool": record.tool,
+                "path": record.source_path,
+                "content": excerpt,
+                "truncated": record.truncated or len(excerpt) < len(record.content),
+            })
+        return tuple(selected)
+
+    @staticmethod
+    def _remediation_diff_lines(
+        evidence_context: Iterable[Mapping[str, object]], path: str,
+        *, added_only: bool = False,
+    ) -> set[int]:
+        lines: set[int] = set()
+        hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+        numbered = re.compile(
+            r"^([ +-]) \[LEFT (?:\d+|-) \| RIGHT (\d+|-)\]"
+        )
+        for item in evidence_context:
+            if item.get("tool") != "read_pr_diff" or item.get("path") != path:
+                continue
+            current: int | None = None
+            for raw in str(item.get("content") or "").splitlines():
+                if raw.startswith(("diff --git ", "--- ", "+++ ")):
+                    current = None
+                    continue
+                match = hunk.match(raw)
+                if match:
+                    current = int(match.group(1))
+                elif (numbered_match := numbered.match(raw)):
+                    right_line = numbered_match.group(2)
+                    if right_line != "-":
+                        is_added = numbered_match.group(1) == "+"
+                        if not added_only or is_added:
+                            lines.add(int(right_line))
+                elif current is not None and raw.startswith("-"):
+                    continue
+                elif current is not None and not raw.startswith("\\"):
+                    if not added_only or raw.startswith("+"):
+                        lines.add(current)
+                    current += 1
+        return lines
+
+    @classmethod
+    def _validate_remediation(
+        cls,
+        value: object,
+        finding: AcceptedFinding,
+        evidence_context: tuple[dict[str, object], ...],
+    ) -> FindingRemediation | None:
+        if not isinstance(value, Mapping):
+            raise ValueError("remediation response must be an object")
+        kind = str(value.get("kind") or "").strip().lower()
+        if kind == "skip":
+            if set(value) - {"kind", "reason"}:
+                raise ValueError("skip remediation contains unsupported fields")
+            return None
+        if kind == "guidance":
+            if set(value) - {"kind", "guidance"}:
+                raise ValueError("guidance remediation contains unsupported fields")
+            guidance = " ".join(str(value.get("guidance") or "").split())
+            if not guidance:
+                raise ValueError("guidance remediation requires guidance")
+            return FindingRemediation(
+                kind="guidance", guidance=_mask_runtime_text(guidance)[:1000],
+            )
+        if kind != "exact":
+            raise ValueError("remediation kind must be exact, guidance, or skip")
+        if set(value) - {"kind", "start_line", "end_line", "replacement"}:
+            raise ValueError("exact remediation contains unsupported fields")
+        start = value.get("start_line")
+        end = value.get("end_line")
+        replacement = str(value.get("replacement") or "").rstrip("\n")
+        if (
+            not isinstance(start, int) or isinstance(start, bool)
+            or not isinstance(end, int) or isinstance(end, bool)
+            or start <= 0 or end < start or end - start >= 20
+        ):
+            raise ValueError("exact remediation requires a valid range of at most 20 lines")
+        if (
+            finding.line is None
+            or start < max(1, finding.line - 10)
+            or end > finding.line + 10
+        ):
+            raise ValueError("exact remediation range must stay within ten lines of the finding")
+        diff_lines = cls._remediation_diff_lines(evidence_context, finding.affected_file)
+        if not diff_lines or any(line not in diff_lines for line in range(start, end + 1)):
+            raise ValueError("exact remediation range is not present in retained PR diff evidence")
+        added_lines = cls._remediation_diff_lines(
+            evidence_context, finding.affected_file, added_only=True,
+        )
+        if end not in added_lines:
+            raise ValueError("exact remediation must end on an added right-side diff line")
+        if (
+            not replacement or len(replacement.encode("utf-8")) > 4_000
+            or len(replacement.splitlines()) > 40
+            or "```" in replacement
+            or "<!-- ai-pr-review" in replacement.lower()
+            or _mask_runtime_text(replacement) != replacement
+        ):
+            raise ValueError("exact remediation replacement is unsafe or exceeds its bound")
+        return FindingRemediation(
+            kind="exact", replacement=replacement,
+            start_line=start, end_line=end,
+        )
+
+    def _generate_remediations(self, state: _RunState) -> None:
+        if self.remediator is None:
+            return
+        for finding in state.review.accepted:
+            evidence_context = self._remediation_evidence_context(
+                state,
+                finding,
+                max_chars=state.inputs.config.remediator_max_evidence_chars,
+            )
+            validation_context = self._remediation_validation_context(
+                state, finding, evidence_context,
+            )
+            diagnostic: dict[str, object] = {
+                "finding_id": finding.root_cause_fingerprint,
+                "status": "started",
+            }
+            state.journal.emit("remediation_started", diagnostic)
+            if state.deadline.remaining(now=self.clock()) <= 0:
+                diagnostic.update({
+                    "status": "skipped",
+                    "reason": "no finalization time remained after the human handoff",
+                })
+                state.remediation_diagnostics.append(diagnostic)
+                state.journal.emit("remediation_completed", diagnostic)
+                continue
+            try:
+                value = self._model_request(
+                    state,
+                    role="remediator",
+                    request_id=f"remediator:{finding.root_cause_fingerprint[:24]}",
+                    phase=RunPhase.FINALIZATION,
+                    component=self.remediator,
+                    method="generate",
+                    context={
+                        "finding": {
+                            "finding_id": finding.root_cause_fingerprint,
+                            "claim": finding.claim,
+                            "user_visible_consequence": finding.user_visible_consequence,
+                            "causal_chain": finding.causal_chain,
+                            "severity": finding.severity,
+                            "category": finding.category,
+                            "affected_path": finding.affected_file,
+                            "affected_line": finding.line,
+                            "manual_validation": finding.manual_validation,
+                        },
+                        "evidence_context": evidence_context,
+                        "output_contract": ({
+                            "exact": {
+                                "kind": "exact", "start_line": "integer",
+                                "end_line": "integer", "replacement": "string",
+                            },
+                            "guidance": {"kind": "guidance", "guidance": "string"},
+                            "skip": {"kind": "skip", "reason": "string"},
+                        } if finding.line is not None else {
+                            "guidance": {"kind": "guidance", "guidance": "string"},
+                            "skip": {"kind": "skip", "reason": "string"},
+                        }),
+                    },
+                )
+                remediation = self._validate_remediation(
+                    value, finding, validation_context,
+                )
+                if remediation is not None:
+                    state.remediations[finding.root_cause_fingerprint] = remediation
+                    diagnostic.update({"status": "generated", "kind": remediation.kind})
+                else:
+                    diagnostic.update({"status": "skipped", "reason": _mask_runtime_text(
+                        str(value.get("reason") or "model declined remediation")
+                        if isinstance(value, Mapping) else "model declined remediation"
+                    )[:300]})
+            except BaseException as exc:
+                diagnostic.update({"status": "rejected", "reason": _bounded_error(exc)})
+            state.remediation_diagnostics.append(diagnostic)
+            state.journal.emit("remediation_completed", diagnostic)
+
     def _finalize_products(self, state: _RunState) -> None:
         assert state.coverage is not None
         obligation_map = {item.id: item for item in state.obligations}
         statuses = state.coverage.obligation_statuses()
         unresolved = tuple(
             item for item in state.obligations
-            if item.mandatory and statuses.get(item.id) is not ObligationStatus.COVERED
+            if item.mandatory and statuses.get(item.id) in {
+                ObligationStatus.PENDING,
+                ObligationStatus.UNRESOLVED,
+                ObligationStatus.EXHAUSTED,
+                ObligationStatus.BLOCKED,
+            }
         )
         policy_result = apply_runtime_verdict_policy(
             model_verdict=state.inputs.model_verdict,
@@ -1903,10 +4879,79 @@ class ReviewController:
             "blocking_finding_ids": state.blocking_finding_ids,
             "blocking_obligation_ids": state.blocking_obligation_ids,
         })
-        status = "degraded" if state.degradations else "complete"
+        try:
+            state.retention_verification_requests = (
+                self._candidate_retention_verification_requests(state)
+            )
+            coverage_verification_requests = _coverage_verification_requests(
+                state.obligations,
+                state.blocking_obligation_ids,
+            )
+            state.coverage_verification_requests = coverage_verification_requests
+            state.notes = build_review_notes(
+                state.review, state.evidence, state.effective_publishing_mode,
+                obligations=obligation_map, changed_files=state.inputs.changed_files,
+                verification_requests=(
+                    *state.inputs.verification_requests,
+                    *state.retention_verification_requests,
+                ),
+                source_access_requests=state.source_requests,
+                remediations=state.remediations,
+            )
+        except Exception as exc:
+            self._degrade(state, "review_notes", _bounded_error(exc))
+            state.notes = ()
+        status = self._review_status(state)
         context = self._handoff_context(state, status)
+        # Keep the controller-owned prose as the safe fallback for degraded
+        # runs.  A finalizer response can be structurally valid while still
+        # collapsing into a file/method inventory; that is precisely the
+        # situation the deterministic handoff is meant to cover.  The model
+        # may still contribute authorized topics below, but it must not replace
+        # the human-facing behavioral overview or the explicit recheck focus.
+        deterministic_context = context
         if self.finalizer is not None and state.deadline.remaining(now=self.clock()) > 0:
             try:
+                coverage_snapshot = state.coverage.snapshot()
+                covered_obligation_ids = tuple(
+                    obligation_id
+                    for obligation_id, obligation_status
+                    in coverage_snapshot.obligation_statuses
+                    if obligation_status is ObligationStatus.COVERED
+                )
+                handoff_request_context = {
+                    "change_overview": _json_value(state.change_overview),
+                    "specialist_checkpoint_summaries": (
+                        self._specialist_checkpoint_summaries(state)
+                    ),
+                    "successful_review_facts": {
+                        "covered_subjects": tuple(
+                            obligation.subject
+                            for obligation in state.obligations
+                            if obligation.id in covered_obligation_ids
+                        )[:8],
+                        "covered_obligation_count": len(covered_obligation_ids),
+                        "retained_evidence_count": len(
+                            state.evidence.snapshot().records
+                        ),
+                        "reviewed_components": context.component_ids,
+                        "note_themes": tuple(sorted({
+                            note.severity for note in state.notes
+                            if note.severity
+                        })),
+                        "degraded_stages": context.degraded_stages,
+                        "component_ids": context.component_ids,
+                    },
+                    "prepared_notes": {
+                        "count": context.unresolved_thread_count,
+                        "themes": tuple(sorted({
+                            note.severity or note.kind.value
+                            for note in state.notes
+                            if note.kind is not ReviewNoteKind.SOURCE_ACCESS_REQUEST
+                        })),
+                    },
+                    "human_focus_facts": context.human_focus,
+                }
                 proposed = self._model_request(
                     state,
                     role="finalizer",
@@ -1914,62 +4959,187 @@ class ReviewController:
                     phase=RunPhase.FINALIZATION,
                     component=self.finalizer,
                     method="finalize",
-                    context={
-                        "review": state.review,
-                        "coverage": state.coverage.snapshot(),
-                        "verdict": state.verdict,
-                        "verdict_source": state.verdict_source,
-                        "unknowns": tuple(state.unknowns),
-                        "policy": state.inputs.policy,
-                        "pr_metadata": state.inputs.pr_metadata,
-                    },
+                    context=handoff_request_context,
                 )
-                proposal = _finalizer_proposal(proposed)
-                context = self._apply_finalizer_proposal(state, context, proposal)
-                state.journal.emit("finalizer_proposal_applied", {
-                    "recommendation": proposal.recommendation,
-                    "change_topics": tuple(
-                        item.value for item in context.change_topics
-                    ),
-                    "component_ids": context.component_ids,
-                    "specialist_topics": tuple(
-                        item.value for item in context.specialist_topics
-                    ),
-                    "recipe_ids": context.recipe_ids,
-                    "coverage_boundary_topics": tuple(
-                        item.value for item in context.coverage_boundary_topics
-                    ),
-                    "review_emphasis_topics": tuple(
-                        item.value for item in context.review_emphasis_topics
-                    ),
-                })
+                if isinstance(proposed, Mapping) and "ai_reviewed_summary" in proposed:
+                    summary = _handoff_summary_proposal(proposed)
+                    allowed_summary_paths = {
+                        _normalize_repository_path(path)
+                        for path in (
+                            *state.inputs.changed_files, *context.context_paths,
+                        )
+                        if _normalize_repository_path(path)
+                    }
+                    summary = replace(
+                        summary,
+                        referenced_paths=tuple(sorted(allowed_summary_paths))[:12],
+                        referenced_component_ids=context.component_ids[:12],
+                        referenced_obligation_ids=covered_obligation_ids[:12],
+                    )
+                    try:
+                        context = self._apply_handoff_summary_proposal(
+                            state, context, summary,
+                        )
+                    except ValueError as exc:
+                        repaired = self._model_request(
+                            state,
+                            role="finalizer",
+                            request_id="finalizer:repair:1",
+                            phase=RunPhase.FINALIZATION,
+                            component=self.finalizer,
+                            method="finalize",
+                            context={
+                                **handoff_request_context,
+                                "semantic_repair": {
+                                    "reason": _bounded_error(exc),
+                                    "instruction": (
+                                        "Rewrite only the concise human handoff. Do not "
+                                        "state a verdict, coverage conclusion, finding, "
+                                        "severity, or exact defect location."
+                                    ),
+                                },
+                            },
+                        )
+                        summary = _handoff_summary_proposal(repaired)
+                        summary = replace(
+                            summary,
+                            referenced_paths=tuple(sorted(allowed_summary_paths))[:12],
+                            referenced_component_ids=context.component_ids[:12],
+                            referenced_obligation_ids=covered_obligation_ids[:12],
+                        )
+                        context = self._apply_handoff_summary_proposal(
+                            state, context, summary,
+                        )
+                    state.journal.emit("handoff_summary_applied", {
+                        "referenced_paths": summary.referenced_paths,
+                        "referenced_component_ids": (
+                            summary.referenced_component_ids
+                        ),
+                        "referenced_obligation_ids": (
+                            summary.referenced_obligation_ids
+                        ),
+                        "change_topics": tuple(
+                            item.value for item in context.change_topics
+                        ),
+                        "component_ids": context.component_ids,
+                        "specialist_topics": tuple(
+                            item.value for item in context.specialist_topics
+                        ),
+                        "recipe_ids": context.recipe_ids,
+                        "coverage_boundary_topics": tuple(
+                            item.value for item in context.coverage_boundary_topics
+                        ),
+                        "review_emphasis_topics": (),
+                        "what_changed": context.what_changed,
+                        "what_changed_is_validated_overview": True,
+                        "ai_reviewed": context.ai_reviewed,
+                        "human_focus": context.human_focus,
+                    })
+                else:
+                    # Typed in-process integrations using the pre-v2 selector
+                    # remain readable; production adapters request authored prose.
+                    proposal = _finalizer_proposal(proposed)
+                    context = self._apply_finalizer_proposal(
+                        state, context, proposal,
+                    )
+                    state.journal.emit("finalizer_proposal_applied", {
+                        "recommendation": proposal.recommendation,
+                        "change_topics": tuple(
+                            item.value for item in context.change_topics
+                        ),
+                        "component_ids": context.component_ids,
+                        "specialist_topics": tuple(
+                            item.value for item in context.specialist_topics
+                        ),
+                        "recipe_ids": context.recipe_ids,
+                        "coverage_boundary_topics": tuple(
+                            item.value for item in context.coverage_boundary_topics
+                        ),
+                        "review_emphasis_topics": tuple(
+                            item.value for item in context.review_emphasis_topics
+                        ),
+                        "what_changed": context.what_changed,
+                        "what_changed_is_validated_overview": (
+                            context.what_changed_is_validated_overview
+                        ),
+                        "ai_reviewed": context.ai_reviewed,
+                    })
             except Exception as exc:
-                self._degrade(state, "finalizer", _bounded_error(exc))
-                context = self._handoff_context(state, "degraded")
+                state.journal.emit("recovery", {
+                    "component": "handoff_summarizer",
+                    "action": "deterministic-fallback",
+                    "reason": _bounded_error(exc),
+                })
+                context = self._handoff_context(
+                    state, self._review_status(state),
+                )
         elif self.finalizer is None:
-            self._degrade(state, "finalizer", "deterministic sparse handoff fallback")
-            context = self._handoff_context(state, "degraded")
+            state.journal.emit("recovery", {
+                "component": "handoff_summarizer",
+                "action": "deterministic-fallback",
+                "reason": "no optional handoff summarizer configured",
+            })
+            context = self._handoff_context(
+                state, self._review_status(state),
+            )
         else:
-            self._degrade(state, "deadline", "finalizer model skipped after absolute deadline")
-            context = self._handoff_context(state, "degraded")
+            state.journal.emit("recovery", {
+                "component": "handoff_summarizer",
+                "action": "deterministic-fallback",
+                "reason": "handoff summarizer skipped after absolute deadline",
+            })
+            context = self._handoff_context(
+                state, self._review_status(state),
+            )
+        # Recompute after the optional finalizer so a degraded run can append
+        # controller-owned coverage warnings without discarding prose that has
+        # already passed the handoff validator.
+        deterministic_context = self._handoff_context(
+            state, self._review_status(state),
+        )
+        if state.degradations:
+            context = replace(
+                context,
+                human_focus=tuple(dict.fromkeys((
+                    *context.human_focus,
+                    *deterministic_context.human_focus,
+                ))),
+            )
+            state.journal.emit("handoff_summary_guarded", {
+                "reason": "degraded-run-appends-controller-coverage-focus",
+            })
         try:
             state.handoff = build_review_handoff(
                 context, review=state.review, evidence=state.evidence,
                 obligations=obligation_map, changed_files=state.inputs.changed_files,
             )
         except Exception as exc:
-            self._degrade(state, "finalizer", _bounded_error(exc))
-            state.handoff = self._minimal_handoff(state.verdict, True)
-        try:
-            state.notes = build_review_notes(
-                state.review, state.evidence, state.effective_publishing_mode,
-                obligations=obligation_map, changed_files=state.inputs.changed_files,
-                verification_requests=state.inputs.verification_requests,
-                source_access_requests=state.source_requests,
+            state.journal.emit("recovery", {
+                "component": "handoff_summarizer",
+                "action": "deterministic-fallback",
+                "reason": _bounded_error(exc),
+            })
+            state.handoff = self._minimal_handoff(
+                state.verdict, bool(state.degradations),
             )
-        except Exception as exc:
-            self._degrade(state, "review_notes", _bounded_error(exc))
-            state.notes = ()
+        self._generate_remediations(state)
+        if state.remediations:
+            try:
+                state.notes = build_review_notes(
+                    state.review, state.evidence, state.effective_publishing_mode,
+                    obligations=obligation_map,
+                    changed_files=state.inputs.changed_files,
+                    verification_requests=(
+                        *state.inputs.verification_requests,
+                        *state.retention_verification_requests,
+                    ),
+                    source_access_requests=state.source_requests,
+                    remediations=state.remediations,
+                )
+            except Exception as exc:
+                state.journal.emit("remediation_note_render_failed", {
+                    "reason": _bounded_error(exc),
+                })
 
     def _phase_allocations(self, state: _RunState) -> list[dict[str, object]]:
         shares = state.inputs.config.phase_shares
@@ -1998,6 +5168,14 @@ class ReviewController:
         recipe_states = state.coverage.recipe_statuses()
         for recipe in state.inputs.policy.recipes:
             recipe_states.setdefault(recipe.id, "not_applicable")
+
+        def projected_status(item: CoverageObligation) -> str:
+            if item.id in statuses:
+                return statuses[item.id].value
+            if item.origin == "recipe-accounting" and item.recipe_id:
+                return ObligationStatus(recipe_states[item.recipe_id]).value
+            return statuses[item.id].value
+
         unique_sessions: dict[str, object] = {}
         for result in state.session_results.values():
             unique_sessions[result.session_id] = result
@@ -2014,10 +5192,50 @@ class ReviewController:
                 "budget": _budget_projection(result.budget) if result else _budget_projection(BudgetUsage()),
                 "degraded": bool(result.degraded) if result else True,
                 "finalization_diagnostics": (
-                    _json_value(getattr(result, "finalization_diagnostics", ()))
+                    _checkpoint_diagnostics_projection(getattr(
+                        result, "finalization_diagnostics", (),
+                    ))
+                    if result else []
+                ),
+                "defect_synthesis": (
+                    _json_value(result.report.get("defect_synthesis", {}))
+                    if result and isinstance(result.report, Mapping) else {}
+                ),
+                "advertised_tools": (
+                    list(getattr(result, "advertised_tools", ()))
+                    if result else []
+                ),
+                "tool_activity": (
+                    [_json_value(item) for item in getattr(result, "tool_activity", ())]
                     if result else []
                 ),
             })
+        tool_activity: dict[str, dict[str, object]] = {}
+        for session in sessions:
+            advertised = set(session.get("advertised_tools", ()))
+            for tool in advertised:
+                row = tool_activity.setdefault(str(tool), {
+                    "tool": str(tool), "advertised_sessions": 0,
+                    "calls": 0, "successful": 0, "rejected": 0,
+                    "deferred": 0, "errors": 0, "evidence_retained": 0,
+                })
+                row["advertised_sessions"] = int(row["advertised_sessions"]) + 1
+            for activity in session.get("tool_activity", ()):
+                if not isinstance(activity, Mapping):
+                    continue
+                tool = str(activity.get("tool") or "").strip()
+                if not tool:
+                    continue
+                row = tool_activity.setdefault(tool, {
+                    "tool": tool, "advertised_sessions": 0,
+                    "calls": 0, "successful": 0, "rejected": 0,
+                    "deferred": 0, "errors": 0, "evidence_retained": 0,
+                })
+                for key in (
+                    "calls", "successful", "rejected", "deferred", "errors",
+                    "evidence_retained",
+                ):
+                    row[key] = int(row[key]) + int(activity.get(key, 0) or 0)
         session_budgets = {
             item["session_id"]: item["budget"] for item in sessions
         }
@@ -2062,6 +5280,29 @@ class ReviewController:
             "candidate_dispositions": [
                 _json_value(item) for item in state.review.dispositions
             ] + list(state.collision_dispositions),
+            "candidate_statistics": {
+                "submitted": len(state.candidates),
+                "critic_decisions": len(state.critic_actions),
+                "critic_actions": dict(sorted(Counter(
+                    state.critic_actions.values()
+                ).items())),
+                "accepted": len(state.review.accepted),
+                "merged": sum(
+                    item.action == "merge" for item in state.review.dispositions
+                ),
+                "verification": len(state.review.verification_requests),
+                "rejected": len(state.review.rejected),
+                "final_reasons": dict(sorted(Counter(
+                    item.reason for item in state.review.dispositions
+                ).items())),
+            },
+            "rejected_candidate_diagnostics": (
+                self._rejected_candidate_diagnostics(state)
+            ),
+            "remediation": {
+                "generated": len(state.remediations),
+                "diagnostics": list(state.remediation_diagnostics),
+            },
             "artifact_id": run_id,
             "artifact_write": {
                 "status": "ready" if path is not None else "failed",
@@ -2072,12 +5313,33 @@ class ReviewController:
             "assignment_plan": {
                 "source": state.plan_source,
                 "planner_repaired": state.planner_repaired,
+                "ignored_transformations": list(state.planner_diagnostics),
                 "unassigned_obligation_ids": list(state.plan.unassigned_obligation_ids),
+                "unassigned_obligation_reasons": dict(
+                    state.plan.unassigned_obligation_reasons
+                ),
             },
+            "change_overview": _json_value(state.change_overview),
             "assignments": [_json_value(state.assignments[key]) for key in sorted(state.assignments)],
             "base_sha": state.inputs.base_sha,
             "budgets": {
                 "sessions": session_budgets,
+                "global_limits": {
+                    "model_turns": state.inputs.config.max_total_model_turns,
+                    "tool_calls": state.inputs.config.max_total_tool_calls,
+                },
+                "global_remaining": {
+                    "model_turns": max(
+                        0,
+                        state.inputs.config.max_total_model_turns
+                        - sum(item["model_turns"] for item in session_budgets.values()),
+                    ),
+                    "tool_calls": max(
+                        0,
+                        state.inputs.config.max_total_tool_calls
+                        - sum(item["tool_calls"] for item in session_budgets.values()),
+                    ),
+                },
                 "request_attempts": [
                     _json_value(state.request_attempts[key])
                     for key in sorted(state.request_attempts)
@@ -2143,7 +5405,7 @@ class ReviewController:
             },
             "coverage": {
                 item.id: {
-                    "status": statuses[item.id].value,
+                    "status": projected_status(item),
                     "mandatory": item.mandatory,
                     "risk_tier": item.risk_tier,
                     "unresolved_policy": item.unresolved_policy,
@@ -2164,7 +5426,44 @@ class ReviewController:
                 "adapter": _json_value(state.inputs.adapter_configuration),
             },
             "degradation": list(state.degradations),
-            "evaluation_status": "degraded" if state.degradations else "complete",
+            "evaluation_status": self._review_status(state),
+            "investigation_leads": [
+                _json_value(state.investigation_leads[key])
+                for key in sorted(state.investigation_leads)
+            ],
+            "tool_activity": [
+                tool_activity[key] for key in sorted(tool_activity)
+            ],
+            "external_access": {
+                "search_configured": bool(
+                    state.inputs.adapter_configuration.get("search_configured", False)
+                ),
+                "allowed_sources": [
+                    {
+                        "host": item.host,
+                        "include_subdomains": item.include_subdomains,
+                        "path_prefixes": list(item.path_prefixes),
+                        "classification": item.classification,
+                        "schemes": list(item.schemes),
+                    }
+                    for item in state.inputs.policy.sources
+                ],
+                "allowed_github_repositories": list(
+                    state.inputs.adapter_configuration.get(
+                        "allowed_github_repositories", (),
+                    )
+                ),
+                "access_request_count": len(state.source_requests),
+                "web_search_advertised_sessions": int(
+                    tool_activity.get("web_search", {}).get("advertised_sessions", 0)
+                ),
+                "web_fetch_advertised_sessions": int(
+                    tool_activity.get("web_fetch", {}).get("advertised_sessions", 0)
+                ),
+                "github_api_advertised_sessions": int(
+                    tool_activity.get("gh_api", {}).get("advertised_sessions", 0)
+                ),
+            },
             "event_references": artifacts_events,
             "events": events,
             "event_journal": {
@@ -2183,6 +5482,12 @@ class ReviewController:
                 }
                 for item in state.notes
             ],
+            "coverage_verification_requests": _json_value(
+                state.coverage_verification_requests
+            ),
+            "retention_verification_requests": _json_value(
+                state.retention_verification_requests
+            ),
             "phases": self._phase_allocations(state),
             "policy": {
                 "version": state.inputs.policy.version,
@@ -2219,7 +5524,9 @@ class ReviewController:
             "repository": state.inputs.repository,
             "schema_version": _SCHEMA_VERSION,
             "sessions": sessions,
-            "source_access_requests": [_json_value(item) for item in state.source_requests],
+            "source_access_requests": [
+                _json_value(item.as_dict()) for item in state.source_requests
+            ],
             "timing": {
                 "deadline_seconds": state.inputs.config.review_deadline_sec,
                 "phase_shares": _json_value(state.inputs.config.phase_shares),
@@ -2240,9 +5547,11 @@ class ReviewController:
                 "blocking_obligation_ids": list(state.blocking_obligation_ids),
             },
         }
+        complete_event_journal = _project_complete_event_journal(events)
         projected = _artifact_value(artifact)
         if not isinstance(projected, dict):
             raise TypeError("artifact projection must be an object")
+        projected.update(complete_event_journal)
         return projected
 
     @staticmethod
@@ -2252,8 +5561,11 @@ class ReviewController:
             "policy", "phases", "assignments", "sessions", "budgets", "evidence",
             "assignment_plan",
             "coverage", "recipes", "unknowns", "source_access_requests",
+            "investigation_leads", "tool_activity", "external_access",
             "accepted_candidates", "rejected_candidates", "handoff", "notes",
+            "coverage_verification_requests", "retention_verification_requests",
             "candidate_dispositions", "candidate_unknowns",
+            "rejected_candidate_diagnostics",
             "verdict", "degradation", "publishing", "event_references",
             "evaluation_status", "artifact_write", "timing",
             "events", "event_journal",
@@ -2263,6 +5575,26 @@ class ReviewController:
             raise ValueError("terminal artifact missing fields: " + ", ".join(missing))
         if artifact.get("schema_version") != _SCHEMA_VERSION:
             raise ValueError("terminal artifact schema version is invalid")
+        tool_activity = artifact.get("tool_activity")
+        if not isinstance(tool_activity, (list, tuple)) or any(
+            not isinstance(item, Mapping)
+            or not str(item.get("tool") or "").strip()
+            or any(
+                not isinstance(item.get(key, 0), int)
+                or isinstance(item.get(key, 0), bool)
+                or item.get(key, 0) < 0
+                for key in (
+                    "advertised_sessions", "calls", "successful", "rejected",
+                    "deferred", "errors", "evidence_retained",
+                )
+            )
+            for item in tool_activity
+        ):
+            raise ValueError("terminal artifact tool activity is invalid")
+        if not isinstance(artifact.get("external_access"), Mapping):
+            raise ValueError("terminal artifact external access policy is invalid")
+        if not isinstance(artifact.get("investigation_leads"), (list, tuple)):
+            raise ValueError("terminal artifact investigation leads are invalid")
         artifact_id = artifact.get("artifact_id")
         if (
             not isinstance(artifact_id, str)
@@ -2274,9 +5606,12 @@ class ReviewController:
         recipes = artifact.get("recipes")
         terminal_obligation_statuses = {
             "covered", "partially_covered", "unresolved", "not_applicable",
+            "exhausted", "blocked", "suppressed_by_policy",
+        }
+        terminal_recipe_statuses = {
+            "covered", "partially_covered", "unresolved", "not_applicable",
             "suppressed_by_policy",
         }
-        terminal_recipe_statuses = terminal_obligation_statuses
         if not isinstance(coverage, Mapping) or any(
             not isinstance(value, Mapping)
             or value.get("status") not in terminal_obligation_statuses
@@ -2318,7 +5653,7 @@ class ReviewController:
             for item in phases if isinstance(item, Mapping)
         }
         if set(phase_statuses) != set(_PHASES) or any(
-            status not in {"complete", "degraded", "skipped"}
+            status not in {"complete", "incomplete", "degraded", "skipped"}
             for status in phase_statuses.values()
         ):
             raise ValueError("terminal artifact phases require terminal outcomes")
@@ -2459,6 +5794,17 @@ class ReviewController:
                 "resolution_policy": "human_review",
             }],
             "source_access_requests": [],
+            "investigation_leads": [],
+            "tool_activity": [],
+            "external_access": {
+                "search_configured": False,
+                "allowed_sources": [],
+                "allowed_github_repositories": [],
+                "access_request_count": 0,
+                "web_search_advertised_sessions": 0,
+                "web_fetch_advertised_sessions": 0,
+                "github_api_advertised_sessions": 0,
+            },
             "accepted_candidates": [],
             "rejected_candidates": [],
             "candidate_dispositions": [],
@@ -2478,6 +5824,9 @@ class ReviewController:
                 "coverage_warning": None,
                 "access_request_count": 0,
                 "access_request_url": None,
+                "what_changed": [],
+                "ai_reviewed": [],
+                "human_focus": [],
             },
             "notes": [],
             "verdict": {
@@ -2531,6 +5880,8 @@ class ReviewController:
         try:
             return self._run_impl(inputs, terminal_capture)
         except BaseException as exc:
+            if is_model_endpoint_unavailable(exc):
+                raise
             return self._last_resort_result(identity, terminal_capture, exc)
 
     def _run_impl(
@@ -2554,12 +5905,24 @@ class ReviewController:
             initialization_error = exc
         deadline = RunDeadline(started_at, inputs.config.review_deadline_sec, inputs.config.phase_shares)
         evidence = EvidenceStore()
+        # Request-attempt transitions are emitted immediately at the gateway
+        # boundary.  The richer specialist request events are still admitted
+        # after each wave, but these bounded events make in-flight LLM work
+        # visible in the job log instead of appearing only after a wave ends.
+        def request_transition(attempt: RequestAttempt) -> None:
+            journal.emit(
+                f"llm_request_{attempt.status}",
+                self._request_attempt_event_payload(attempt),
+            )
+
         state = _RunState(
             inputs=inputs,
             journal=journal,
             deadline=deadline,
             evidence=evidence,
-            request_attempt_journal=RequestAttemptJournal(self.clock),
+            request_attempt_journal=RequestAttemptJournal(
+                self.clock, transition_sink=request_transition,
+            ),
         )
         path: Path | None = None
         path_error: str | None = None
@@ -2589,6 +5952,10 @@ class ReviewController:
                     raise TypeError(
                         "evidence_store_factory must return EvidenceStore"
                     )
+            if inputs.test_results:
+                journal.emit("test_results_indexed", {
+                    "count": len(inputs.test_results),
+                })
             journal.emit("run_started", {
                 "repository": inputs.repository,
                 "pr_number": inputs.pr_number,
@@ -2627,6 +5994,7 @@ class ReviewController:
                 for item in state.obligations
             )
             state.coverage = CoverageLedger(state.obligations)
+            state.change_overview = self._summarize_changes(state)
             state.plan = self._plan(state)
             state.assignments = {
                 item.id: item for item in state.plan.assignments
@@ -2637,12 +6005,16 @@ class ReviewController:
                     "obligation_ids": item.obligation_ids,
                     "source": state.plan_source,
                 })
+            unassigned_reasons = dict(state.plan.unassigned_obligation_reasons)
             for obligation_id in state.plan.unassigned_obligation_ids:
                 state.coverage.mark_unresolved(obligation_id)
                 obligation = state.coverage.obligation(obligation_id)
                 state.unknowns.append({
                     "obligation_id": obligation_id,
-                    "reason": "deterministic assignment capacity exhausted",
+                    "reason": unassigned_reasons.get(
+                        obligation_id,
+                        "deterministic assignment capacity exhausted",
+                    ),
                     "resolution_policy": obligation.unresolved_policy,
                 })
 
@@ -2661,12 +6033,119 @@ class ReviewController:
                     state, session_id, "update_lease", RunPhase.FOLLOWUP,
                     followup_lease,
                 )
-            actions = self._negotiate(state, reconciliation)
-            followups = self._followup_assignments(state, actions)
-            followup, followup_snapshot = self._run_wave(
-                state, followups, RunPhase.FOLLOWUP,
+            # Negotiation is deliberately one-action-at-a-time.  Recompute the
+            # authoritative state after each bounded wave so the next proposal
+            # cannot rely on stale obligations, leases, or coverage gains.
+            max_rounds = max(
+                1,
+                state.inputs.config.max_followup_sessions
+                + len(state.obligations),
+                state.inputs.config.max_followup_sessions
+                + len(state.obligations)
+                + min(32, len(state.investigation_leads)),
             )
-            reconciliation = self._reconcile(state, followup, followup_snapshot)
+            unproductive_obligation_ids: set[str] = set()
+            for round_index in range(max_rounds):
+                open_lead_ids = {
+                    item.lead_id for item in state.investigation_leads.values()
+                    if item.status in {
+                        InvestigationLeadStatus.OPEN,
+                        InvestigationLeadStatus.SCHEDULED,
+                    }
+                }
+                if not reconciliation.uncovered_obligation_ids and not open_lead_ids:
+                    break
+                if (
+                    not (
+                        set(reconciliation.uncovered_obligation_ids)
+                        - unproductive_obligation_ids
+                    )
+                    and not open_lead_ids
+                ):
+                    break
+                before_uncovered = set(reconciliation.uncovered_obligation_ids)
+                before_covered = {
+                    obligation_id
+                    for obligation_id, status in reconciliation.snapshot.obligation_statuses
+                    if status is ObligationStatus.COVERED
+                }
+                before_evidence = frozenset(state.evidence.snapshot().evidence_ids)
+                before_lead_statuses = {
+                    key: value.status
+                    for key, value in state.investigation_leads.items()
+                }
+                journal.emit("negotiation_round", {
+                    "round": round_index + 1,
+                    "uncovered_count": len(before_uncovered),
+                    "open_lead_count": len(open_lead_ids),
+                })
+                actions = self._negotiate(
+                    state,
+                    reconciliation,
+                    attempt=round_index + 1,
+                    excluded_obligation_ids=unproductive_obligation_ids,
+                )
+                if not actions:
+                    break
+                followups = self._followup_assignments(state, actions)
+                followup, followup_snapshot = self._run_wave(
+                    state, followups, RunPhase.FOLLOWUP,
+                )
+                next_reconciliation = self._reconcile(
+                    state, followup, followup_snapshot,
+                )
+                # Evidence collection counts as progress even before it satisfies
+                # an obligation. A scheduled exploration that adds neither evidence
+                # nor coverage retires only its target so another gap can be tried;
+                # explicit closure and unscheduled proposals still stop cleanly.
+                reconciliation = next_reconciliation
+                after_covered = {
+                    obligation_id
+                    for obligation_id, status in reconciliation.snapshot.obligation_statuses
+                    if status is ObligationStatus.COVERED
+                }
+                after_evidence = frozenset(state.evidence.snapshot().evidence_ids)
+                after_lead_statuses = {
+                    key: value.status
+                    for key, value in state.investigation_leads.items()
+                }
+                made_progress = (
+                    bool(after_covered - before_covered)
+                    or before_evidence != after_evidence
+                    or before_lead_statuses != after_lead_statuses
+                )
+                if not made_progress:
+                    if not followups or any(
+                        action.kind == "record_unknown" for action in actions
+                    ):
+                        break
+                    retired = {
+                        obligation_id
+                        for action in actions
+                        for obligation_id in action.obligation_ids
+                        if obligation_id in before_uncovered
+                    }
+                    unproductive_obligation_ids.update(retired)
+                    retired_leads = {
+                        lead_id
+                        for action in actions
+                        for lead_id in action.lead_ids
+                        if lead_id in open_lead_ids
+                    }
+                    for lead_id in retired_leads:
+                        lead = state.investigation_leads[lead_id]
+                        state.investigation_leads[lead_id] = replace(
+                            lead,
+                            status=InvestigationLeadStatus.BLOCKED,
+                            resolution_reason="follow-up added no evidence or explicit resolution",
+                        )
+                    journal.emit("negotiation_adjustment", {
+                        "component": "negotiator",
+                        "action": "retire-unproductive-target",
+                        "obligation_ids": tuple(sorted(retired)),
+                        "lead_ids": tuple(sorted(retired_leads)),
+                        "reason": "follow-up added no evidence or coverage",
+                    })
             for obligation_id in reconciliation.uncovered_obligation_ids:
                 if not any(item.get("obligation_id") == obligation_id for item in state.unknowns):
                     obligation = state.coverage.obligation(obligation_id)
@@ -2676,6 +6155,18 @@ class ReviewController:
                         "reason": "mandatory coverage remained unresolved after bounded follow-up",
                         "resolution_policy": obligation.unresolved_policy,
                     })
+            for lead_id, lead in tuple(state.investigation_leads.items()):
+                if lead.status in {
+                    InvestigationLeadStatus.OPEN,
+                    InvestigationLeadStatus.SCHEDULED,
+                }:
+                    state.investigation_leads[lead_id] = replace(
+                        lead,
+                        status=InvestigationLeadStatus.BLOCKED,
+                        resolution_reason=(
+                            "investigation lead remained unresolved after bounded follow-up"
+                        ),
+                    )
 
             self._complete_phase(state)
             self._transition(state, "finalization")
@@ -2687,6 +6178,17 @@ class ReviewController:
                         "absolute deadline reached; specialist finalization used retained checkpoint",
                     )
                     break
+                wait_for_exploration = getattr(session, "wait_for_exploration", None)
+                if callable(wait_for_exploration):
+                    remaining = state.deadline.remaining(now=self.clock())
+                    if not wait_for_exploration(remaining):
+                        reason = (
+                            "interrupted specialist exploration did not stop before "
+                            "the finalization deadline"
+                        )
+                        self._degrade(state, f"specialist:{session.assignment.id}", reason)
+                        self._quarantine_session(state, session.session_id, reason)
+                        continue
                 updated, _ = self._session_hook(
                     state,
                     key,
@@ -2700,11 +6202,96 @@ class ReviewController:
                     state, key, "finalize", RunPhase.FINALIZATION,
                 )
                 if succeeded and result is not None:
+                    state.evidence.merge_completed_snapshot(
+                        session.evidence.snapshot(),
+                    )
                     state.session_results[(session.assignment.id, result.session_id)] = result
+                    self._admit_investigation_lead_state(state, result)
                     self._promote_degraded_session_result(
                         state, session.assignment.id, result,
                     )
                     self._admit_specialist_request_events(state, result)
+                    checkpoint = getattr(result, "checkpoint", None)
+                    report = getattr(result, "report", None)
+                    journal.emit("specialist_finalized", {
+                        "assignment_id": session.assignment.id,
+                        "session_id": result.session_id,
+                        "source": (
+                            report.get("source")
+                            if isinstance(report, Mapping) else "unknown"
+                        ),
+                        "degraded": bool(getattr(result, "degraded", False)),
+                        "candidate_count": len(tuple(
+                            getattr(session, "candidate_findings", ())
+                        )),
+                        "evidence_count": len(tuple(
+                            getattr(checkpoint, "evidence_ids", ())
+                        )),
+                        "retention_unknown": bool(
+                            checkpoint is not None
+                            and _CANDIDATE_RETENTION_UNKNOWN in tuple(
+                                getattr(checkpoint, "unknowns", ())
+                            )
+                        ),
+                    })
+                    diagnostics = tuple(getattr(
+                        result, "finalization_diagnostics", (),
+                    ))
+                    if diagnostics:
+                        journal.emit("specialist_checkpoint_diagnostics", {
+                            "assignment_id": session.assignment.id,
+                            "session_id": result.session_id,
+                            "diagnostics": _checkpoint_diagnostics_projection(
+                                diagnostics,
+                            ),
+                        })
+                    synthesis = (
+                        report.get("defect_synthesis", {})
+                        if isinstance(report, Mapping) else {}
+                    )
+                    if isinstance(synthesis, Mapping) and synthesis.get("attempted"):
+                        candidate_results = tuple(
+                            item for key in (
+                                "initial_candidate_results",
+                                "repair_candidate_results",
+                            )
+                            for item in (
+                                synthesis.get(key, ())
+                                if isinstance(synthesis.get(key), (list, tuple))
+                                else ()
+                            )
+                            if isinstance(item, Mapping)
+                        )
+                        repair_attempts = tuple(
+                            item for item in synthesis.get("repair_attempts", ())
+                            if isinstance(item, Mapping)
+                        ) if isinstance(
+                            synthesis.get("repair_attempts"), (list, tuple)
+                        ) else ()
+                        journal.emit("specialist_defect_synthesis", {
+                            "assignment_id": session.assignment.id,
+                            "session_id": result.session_id,
+                            "status": str(synthesis.get("status") or ""),
+                            "accepted_candidates": sum(
+                                item.get("accepted") is True
+                                for item in candidate_results
+                            ),
+                            "rejected_candidates": sum(
+                                item.get("accepted") is False
+                                for item in candidate_results
+                            ),
+                            "repair_status": str(
+                                synthesis.get("repair_status") or ""
+                            ),
+                            "repair_attempt_count": len(repair_attempts),
+                            "repair_output_limited_count": sum(
+                                item.get("status") == "output_limit"
+                                for item in repair_attempts
+                            ),
+                            "repair_error": _mask_runtime_text(str(
+                                synthesis.get("repair_error") or ""
+                            ))[:300],
+                        })
                     journal.emit("session_transition", {
                         "session_id": result.session_id,
                         "state": result.state.value,
@@ -2719,28 +6306,33 @@ class ReviewController:
                             "specialist finalization completed at the absolute deadline",
                         )
                         break
+            # A checkpoint can be marked degraded while the worker is still
+            # recoverable.  Only promote the final retained result (or a
+            # session that could not be finalized) to the run-level status;
+            # otherwise a transient initial flag permanently poisons an
+            # otherwise successful finalization.
+            for (assignment_id, _session_id), result in tuple(
+                state.session_results.items()
+            ):
+                self._promote_degraded_session_result(state, assignment_id, result)
+            self._refresh_session_candidate_occurrences(state)
             candidates = self._collect_candidates(state)
             self._adjudicate(state, candidates)
             state.source_requests.extend(inputs.source_access_requests)
             state.source_requests = list({
-                (
-                    item.obligation_id,
-                    item.host,
-                    item.candidate_url,
-                    item.purpose,
-                    item.authority_reason,
-                ): item
+                access_request_identity(item): item
                 for item in state.source_requests
             }.values())
             state.source_requests.sort(
-                key=lambda item: (
-                    item.obligation_id, item.host, item.candidate_url, item.purpose,
-                ),
+                key=access_request_identity,
             )
             for request in state.source_requests:
+                request_payload = request.as_dict()
                 journal.emit("source_access_request", {
-                    "fingerprint": _digest(request.as_dict())[:32],
-                    "host": request.host,
+                    "fingerprint": _digest(request_payload)[:32],
+                    "request_kind": request_payload["kind"],
+                    "host": request_payload.get("host", "github.com"),
+                    "repository": request_payload.get("repository", ""),
                     "obligation_id": request.obligation_id,
                 })
             self._finalize_products(state)
@@ -2769,9 +6361,11 @@ class ReviewController:
             self._transition(state, "complete")
             self._complete_phase(
                 state,
-                status="degraded" if state.degradations else "complete",
+                status=self._review_status(state),
             )
         except BaseException as exc:  # terminal artifact survives every controlled failure
+            if is_model_endpoint_unavailable(exc):
+                raise
             self._finish_after_unexpected(state, exc)
             if state.coverage is None:
                 state.coverage = CoverageLedger(())
@@ -2815,11 +6409,20 @@ class ReviewController:
                     ),
                     "budget": _budget_projection(emergency_results[session_id].budget),
                     "degraded": bool(emergency_results[session_id].degraded),
-                    "finalization_diagnostics": _json_value(getattr(
-                        emergency_results[session_id],
-                        "finalization_diagnostics",
-                        (),
-                    )),
+                    "finalization_diagnostics": _checkpoint_diagnostics_projection(
+                        getattr(
+                            emergency_results[session_id],
+                            "finalization_diagnostics",
+                            (),
+                        ),
+                    ),
+                    "defect_synthesis": (
+                        _json_value(emergency_results[session_id].report.get(
+                            "defect_synthesis", {},
+                        ))
+                        if isinstance(emergency_results[session_id].report, Mapping)
+                        else {}
+                    ),
                 }
                 for session_id in sorted(emergency_results)
             ]
@@ -2856,8 +6459,12 @@ class ReviewController:
                 "assignment_plan": {
                     "source": state.plan_source,
                     "planner_repaired": state.planner_repaired,
+                    "ignored_transformations": list(state.planner_diagnostics),
                     "unassigned_obligation_ids": list(
                         state.plan.unassigned_obligation_ids,
+                    ),
+                    "unassigned_obligation_reasons": dict(
+                        state.plan.unassigned_obligation_reasons
                     ),
                 },
                 "assignments": [
@@ -2924,8 +6531,37 @@ class ReviewController:
                 },
                 "unknowns": list(state.unknowns),
                 "source_access_requests": [
-                    _json_value(item) for item in state.source_requests
+                    _json_value(item.as_dict()) for item in state.source_requests
                 ],
+                "investigation_leads": [
+                    _json_value(state.investigation_leads[key])
+                    for key in sorted(state.investigation_leads)
+                ],
+                "tool_activity": [],
+                "external_access": {
+                    "search_configured": bool(
+                        inputs.adapter_configuration.get("search_configured", False)
+                    ),
+                    "allowed_sources": [
+                        {
+                            "host": item.host,
+                            "include_subdomains": item.include_subdomains,
+                            "path_prefixes": list(item.path_prefixes),
+                            "classification": item.classification,
+                            "schemes": list(item.schemes),
+                        }
+                        for item in inputs.policy.sources
+                    ],
+                    "allowed_github_repositories": list(
+                        inputs.adapter_configuration.get(
+                            "allowed_github_repositories", (),
+                        )
+                    ),
+                    "access_request_count": len(state.source_requests),
+                    "web_search_advertised_sessions": 0,
+                    "web_fetch_advertised_sessions": 0,
+                    "github_api_advertised_sessions": 0,
+                },
                 "accepted_candidates": [
                     _json_value(item) for item in state.review.accepted
                 ],
@@ -2935,6 +6571,13 @@ class ReviewController:
                 "candidate_dispositions": [
                     _json_value(item) for item in state.review.dispositions
                 ] + list(state.collision_dispositions),
+                "rejected_candidate_diagnostics": (
+                    self._rejected_candidate_diagnostics(state)
+                ),
+                "remediation": {
+                    "generated": len(state.remediations),
+                    "diagnostics": list(state.remediation_diagnostics),
+                },
                 "candidate_unknowns": [
                     _json_value(item) for item in state.review.unknowns
                 ],
@@ -2948,6 +6591,12 @@ class ReviewController:
                     }
                     for item in state.notes
                 ],
+                "coverage_verification_requests": _json_value(
+                    state.coverage_verification_requests
+                ),
+                "retention_verification_requests": _json_value(
+                    state.retention_verification_requests
+                ),
                 "verdict": {
                     "value": state.verdict,
                     "source": state.verdict_source,
@@ -2985,9 +6634,13 @@ class ReviewController:
                 },
                 "timing": {"deadline_seconds": inputs.config.review_deadline_sec, "phase_shares": _json_value(inputs.config.phase_shares), "finalization_reserve_seconds": inputs.config.review_deadline_sec * inputs.config.phase_shares.finalization / 100},
             }
+            complete_event_journal = _project_complete_event_journal(
+                artifact.get("events", ()),
+            )
             projected = _artifact_value(artifact)
             if not isinstance(projected, dict):
                 raise TypeError("emergency artifact projection must be an object")
+            projected.update(complete_event_journal)
             artifact = projected
             self._validate_artifact(artifact)
         if path is None:

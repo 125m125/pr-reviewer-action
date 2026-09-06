@@ -14,9 +14,12 @@ import run_tool_harness as rth  # noqa: E402
 from pr_reviewer.conversation import web_tool_schemas  # noqa: E402
 from pr_reviewer.specialist_runtime.web_evidence import (  # noqa: E402
     HttpResponse,
+    SearchResultRegistry,
     SearxngSearchProvider,
+    SecureFetcher,
     SourcePolicy,
 )
+from pr_reviewer.specialist_runtime.evidence import EvidenceStore  # noqa: E402
 
 
 SEARCH = "https://search.example.com/search"
@@ -63,8 +66,8 @@ def test_returns_capped_policy_filtered_discovery():
     assert res["kind"] == "search_discovery"
     assert len(res["approved"]) == 2
     assert res["approved"][0]["snippet"] == "snip a"
-    assert res["unapproved"][0]["host"] == "c.example"
-    assert "snippet" not in res["unapproved"][0]
+    assert res["unapproved"] == []
+    assert res["suppressed_result_count"] == 1
     assert "snip c" not in json.dumps(res)
     # query + json format are sent to the configured endpoint
     assert "format=json" in transport.urls[0] and "q=talos" in transport.urls[0]
@@ -105,6 +108,73 @@ def test_execute_tool_request_dispatches_web_search():
     assert tr["result"]["evidentiary"] is False
 
 
+def test_opaque_allowlisted_result_can_be_fetched_by_handle_without_url_disclosure():
+    token = "0123456789abcdef" * 4
+    url = f"https://u.example/docs/{token}?page=2&cursor={token}"
+    provider, _ = _provider(SEARCH, {
+        "results": [{"title": "T", "url": url, "content": "discovered"}],
+    })
+    registry = SearchResultRegistry()
+    policy = SourcePolicy.from_hosts(["u.example"])
+    search = rth.execute_tool_request(
+        "web_search", {"query": "opaque docs"},
+        ".", set(), "o/r", ["u.example"], 12000, 20, SEARCH, 5,
+        source_policy=policy,
+        search_provider=provider,
+        search_result_registry=registry,
+    )
+    result_id = search["result"]["approved"][0]["result_id"]
+    fetch_transport = _SearchTransport()
+    fetch_transport.payload = None
+    fetch_transport.request = lambda request: (
+        fetch_transport.urls.append(request.url)
+        or HttpResponse(
+            200,
+            {"content-type": "text/plain"},
+            f"fetched {token} {url}".encode(),
+        )
+    )
+    evidence_store = EvidenceStore()
+    fetcher = SecureFetcher(
+        policy,
+        transport=fetch_transport,
+        resolver=lambda host, port: ["93.184.216.34"],
+        evidence_store=evidence_store,
+    )
+
+    fetched = rth.execute_tool_request(
+        "web_fetch_search_result", {"result_id": result_id},
+        ".", set(), "o/r", ["u.example"], 12000, 20, SEARCH, 5,
+        source_policy=policy,
+        secure_fetcher=fetcher,
+        search_result_registry=registry,
+    )
+
+    assert fetched["status"] == "ok"
+    assert fetched["result"]["content"].startswith("fetched")
+    assert fetch_transport.urls == [url]
+    assert token not in json.dumps(fetched)
+    assert fetched["result"]["provenance"]["original_url"].endswith(
+        "/[opaque-search-result]"
+    )
+    retained = evidence_store.snapshot().records[0]
+    assert token not in retained.arguments
+    assert token not in retained.source_identity
+    assert retained.tool == "web_fetch_search_result"
+
+
+def test_fetch_search_result_rejects_unknown_session_handle():
+    tr = rth.execute_tool_request(
+        "web_fetch_search_result", {"result_id": "search-result-99"},
+        ".", set(), "o/r", ["u.example"], 12000, 20, SEARCH, 5,
+        source_policy=SourcePolicy.from_hosts(["u.example"]),
+        search_result_registry=SearchResultRegistry(),
+    )
+
+    assert tr["status"] == "error"
+    assert "unknown search result" in tr["result"]["error"]
+
+
 def test_execute_tool_request_web_search_missing_query():
     tr = rth.execute_tool_request(
         "web_search", {}, ".", set(), "o/r", [], 12000, 20, SEARCH, 5,
@@ -129,6 +199,39 @@ def test_search_schema_requires_endpoint_and_approved_source_policy():
     }
     assert "web_search" in {
         schema["name"] for schema in web_tool_schemas(SEARCH, POLICY)
+    }
+    assert "web_fetch_search_result" in {
+        schema["name"] for schema in web_tool_schemas(SEARCH, POLICY)
+    }
+
+
+def test_private_http_search_endpoint_requires_explicit_opt_in():
+    endpoint = "http://10.0.0.4:8888/search"
+    assert not SearxngSearchProvider.is_valid_endpoint(endpoint)
+    assert SearxngSearchProvider.is_valid_endpoint(
+        endpoint, allow_private_search_url=True,
+    )
+
+    transport = _SearchTransport({"results": []})
+    provider = SearxngSearchProvider(
+        endpoint,
+        allow_private_search_url=True,
+        transport=transport,
+        resolver=lambda host, port: ["10.0.0.4"],
+    )
+    provider.search("q", limit=1)
+    assert transport.urls[0].startswith("http://10.0.0.4:8888/search?")
+
+
+def test_private_http_search_schema_requires_opt_in():
+    endpoint = "http://10.0.0.4:8888/search"
+    assert "web_search" not in {
+        schema["name"] for schema in web_tool_schemas(endpoint, POLICY)
+    }
+    assert "web_search" in {
+        schema["name"] for schema in web_tool_schemas(
+            endpoint, POLICY, allow_private_search_url=True,
+        )
     }
 
 

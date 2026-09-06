@@ -1,10 +1,30 @@
 import io
+import json
 import subprocess
 import threading
 from pathlib import Path
 
 from pr_reviewer import tool_executors
 from scripts import run_tool_harness
+
+
+def test_source_tools_preserve_dynamic_secret_references(tmp_path):
+    path = "src/config.py"
+    (tmp_path / "src").mkdir()
+    (tmp_path / path).write_text(
+        "api_token={api_token}\npassword=settings.api_token\n"
+        "secret=abcdefghijklmnopqrstuvwxyz\n",
+        encoding="utf-8",
+    )
+
+    result = tool_executors.execute_tool_request(
+        "read_file", {"path": path}, str(tmp_path), set(), "", (), 12000, 15,
+    )
+
+    assert result["status"] == "ok"
+    assert "api_token={api_token}" in result["result"]["content"]
+    assert "password=settings.api_token" in result["result"]["content"]
+    assert "secret=[REDACTED_VALUE]" in result["result"]["content"]
 
 
 def test_run_command_rejects_raw_shell_text(tmp_path):
@@ -163,6 +183,131 @@ def test_read_pr_diff_uses_bounded_file_scoped_merge_base_argv(
         "--",
         "src/app.py",
     ]
+
+
+def test_read_pr_diff_can_render_explicit_left_and_right_coordinates(
+    monkeypatch, tmp_path,
+):
+    base_sha = "1" * 40
+    head_sha = "2" * 40
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("same\nnew\n", encoding="utf-8")
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdout = io.BytesIO(
+                b"diff --git a/src/app.py b/src/app.py\n"
+                b"--- a/src/app.py\n+++ b/src/app.py\n"
+                b"@@ -4,3 +4,3 @@\n same\n-old\n+new\n"
+            )
+            self.returncode = 0
+
+        def wait(self, timeout):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(
+        tool_executors.subprocess, "Popen", lambda *args, **kwargs: FakeProcess()
+    )
+
+    result = tool_executors.execute_tool_request(
+        "read_pr_diff",
+        {"path": "src/app.py", "include_line_numbers": True},
+        str(tmp_path), {"owner/repo"}, "owner/repo", (), 12000, 15,
+        base_sha=base_sha, head_sha=head_sha,
+        allowed_diff_paths=("src/app.py",),
+    )
+
+    patch = result["result"]["patch"]
+    assert "  [LEFT 4 | RIGHT 4] same" in patch
+    assert "- [LEFT 5 | RIGHT -] old" in patch
+    assert "+ [LEFT - | RIGHT 5] new" in patch
+
+
+def test_read_pr_diff_batches_authorized_paths_under_one_shared_cap(
+    monkeypatch, tmp_path,
+):
+    base_sha = "1" * 40
+    head_sha = "2" * 40
+    for path in ("src/a.py", "tests/test_a.py"):
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("head\n", encoding="utf-8")
+
+    class FakeProcess:
+        def __init__(self, args, **_kwargs):
+            path = args[-1]
+            self.stdout = io.BytesIO((f"diff --git a/{path} b/{path}\n-old\n+new\n").encode())
+            self.returncode = 0
+
+        def wait(self, timeout):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+    monkeypatch.setattr(tool_executors.subprocess, "Popen", FakeProcess)
+
+    result = tool_executors.execute_tool_request(
+        "read_pr_diff", {"paths": ["src/a.py", "tests/test_a.py"]},
+        str(tmp_path), set(), "", (), 180, 15,
+        base_sha=base_sha, head_sha=head_sha,
+        allowed_diff_paths=("src/a.py", "tests/test_a.py"),
+    )
+
+    assert result["status"] == "ok"
+    assert [item["path"] for item in result["result"]["patches"]] == [
+        "src/a.py", "tests/test_a.py",
+    ]
+    assert len(json.dumps(result["result"], separators=(",", ":")).encode()) <= 180
+
+
+def test_read_pr_diff_rejects_oversized_or_unauthorized_batches(tmp_path):
+    common = dict(
+        workspace_root=str(tmp_path), allowed_gh_repos=set(), current_repo="",
+        allowed_hosts=(), max_response_bytes=100, request_timeout=15,
+        base_sha="1" * 40, head_sha="2" * 40, allowed_diff_paths=("a.py",),
+    )
+    too_many = tool_executors.execute_tool_request(
+        "read_pr_diff", {"paths": [f"{index}.py" for index in range(9)]}, **common,
+    )
+    outside = tool_executors.execute_tool_request(
+        "read_pr_diff", {"paths": ["a.py", "outside.py"]}, **common,
+    )
+
+    assert too_many["status"] == "error"
+    assert "at most 8" in too_many["result"]["error"]
+    assert outside["status"] == "error"
+    assert "assignment" in outside["result"]["error"]
+
+
+def test_read_pr_diff_batch_uses_minimal_marker_when_metadata_cannot_fit(
+    monkeypatch, tmp_path,
+):
+    path = "src/" + "very-long-" * 20 + "file.py"
+    target = tmp_path / path
+    target.parent.mkdir(parents=True)
+    target.write_text("head\n", encoding="utf-8")
+
+    class FakeProcess:
+        def __init__(self, *_args, **_kwargs):
+            self.stdout = io.BytesIO(b"+changed\n")
+            self.returncode = 0
+        def kill(self):
+            self.returncode = -9
+        def wait(self, timeout):
+            return self.returncode
+
+    monkeypatch.setattr(tool_executors.subprocess, "Popen", FakeProcess)
+    result = tool_executors.execute_tool_request(
+        "read_pr_diff", {"paths": [path]}, str(tmp_path), set(), "", (), 50, 15,
+        base_sha="1" * 40, head_sha="2" * 40, allowed_diff_paths=(path,),
+    )
+
+    assert len(json.dumps(result["result"], separators=(",", ":")).encode()) <= 50
+    assert result["result"] == {"truncated": True}
 
 
 def test_read_pr_diff_treats_magic_looking_assigned_filename_literally(

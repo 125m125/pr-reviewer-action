@@ -90,6 +90,15 @@ def test_malformed_and_short_repeated_input_is_ignored():
     assert watchdog.triggered is False
 
 
+def test_repeated_textual_tool_markers_trigger_online_watchdog():
+    watchdog = StreamWatchdog("openai", min_repetitions=3)
+
+    assert watchdog.feed_sse_line(_openai_text("<tool_call>\n")) is False
+    assert watchdog.feed_sse_line(_openai_text("<tool_call>\n")) is False
+    assert watchdog.feed_sse_line(_openai_text("<tool_call>\n")) is True
+    assert watchdog.reason == "repeated-textual-tool-marker"
+
+
 def test_watchdog_is_callable_for_stream_transport():
     watchdog = StreamWatchdog("openai", min_repetitions=2)
 

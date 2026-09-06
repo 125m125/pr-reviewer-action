@@ -12,16 +12,23 @@ from pr_reviewer.specialist_runtime.coverage import (
     reconcile_wave,
 )
 from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+from pr_reviewer.specialist_runtime.obligation_assessment import (
+    ObligationAssessment,
+    ObligationDisposition,
+)
 from pr_reviewer.specialist_runtime.negotiation import (
     NegotiationError,
     NegotiationState,
     SessionResources,
+    compact_negotiation_context,
     fallback_next_action,
+    validate_compact_negotiation,
     validate_negotiation,
 )
 from pr_reviewer.specialist_runtime.policy import RuntimeConfig
 from pr_reviewer.specialist_runtime.types import (
     CoverageObligation,
+    InvestigationLead,
     ObligationStatus,
     SessionCheckpoint,
     SessionState,
@@ -81,10 +88,13 @@ def state_for(
     max_followup_sessions: int = 1,
     new_session_turns_remaining: int = 4,
     new_session_turn_cap: int = 2,
+    new_session_tool_call_cap: int = 3,
     new_session_lease_remaining_sec: float = 100.0,
     remaining_deadline_sec: float = 100.0,
     assignments: tuple[Assignment | SpecialistAssignment, ...] | None = None,
     session_ownership: tuple[SessionOwnership, ...] | None = None,
+    checkpoints: tuple[SessionCheckpoint, ...] = (),
+    investigation_leads: tuple[InvestigationLead, ...] = (),
 ) -> NegotiationState:
     obligations = (
         obligation("OB1", risk="high"),
@@ -99,14 +109,20 @@ def state_for(
         assignments=assignments or (
             assignment("A1", ("OB1",)), assignment("A2", ("OB2",)),
         ),
-        checkpoints=(),
+        checkpoints=checkpoints,
         session_ownership=session_ownership or (
             SessionOwnership("S1", "A1", primary_obligation_ids=("OB1",)),
             SessionOwnership("S2", "A2", primary_obligation_ids=("OB2",)),
         ),
         session_resources=resources or (
-            SessionResources("S1", remaining_model_turns=3, lease_remaining_sec=100.0),
-            SessionResources("S2", remaining_model_turns=3, lease_remaining_sec=100.0),
+            SessionResources(
+                "S1", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0,
+            ),
         ),
         remaining_deadline_sec=remaining_deadline_sec,
         seconds_per_turn=10.0,
@@ -116,8 +132,84 @@ def state_for(
         max_followup_sessions=max_followup_sessions,
         new_session_turns_remaining=new_session_turns_remaining,
         new_session_turn_cap=new_session_turn_cap,
+        new_session_tool_call_cap=new_session_tool_call_cap,
         new_session_lease_remaining_sec=new_session_lease_remaining_sec,
+        investigation_leads=investigation_leads,
     )
+
+
+def test_compact_negotiation_routes_open_lead_to_capable_existing_session():
+    lead = InvestigationLead(
+        lead_id="lead:web", summary="The external contract may have changed.",
+        affected_paths=("src/a.py",), evidence_ids=("evidence:1",),
+        next_action="Check the official contract documentation.",
+        required_capability="web", origin_session_id="S1",
+    )
+    resources = (
+        SessionResources(
+            "S1", remaining_model_turns=4, remaining_tool_calls=3,
+            lease_remaining_sec=100.0, advertised_tools=("read_file",),
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=4, remaining_tool_calls=3,
+            lease_remaining_sec=100.0,
+            advertised_tools=("read_file", "web_search", "web_fetch"),
+        ),
+    )
+    state = state_for(
+        covered=("OB1", "OB2"), resources=resources,
+        investigation_leads=(lead,),
+    )
+
+    context = compact_negotiation_context(state)
+    assert context["targets"] == ({
+        "handle": "L1",
+        "risk_tier": "normal",
+        "subject": "src/a.py",
+        "summary": "The external contract may have changed.",
+        "allowed_actions": ("consult", "new_session", "record_unknown"),
+        "last_conclusion": "",
+        "attempt_count": 0,
+        "evidence_delta": 0,
+        "retained_evidence_count": 1,
+        "next_actions": ("Check the official contract documentation.",),
+        "required_capability": "web",
+    },)
+    action = validate_compact_negotiation({
+        "kind": "consult", "target": "L1",
+        "reason": "Use the existing web-capable specialist.",
+    }, state).actions[0]
+    assert action.lead_ids == ("lead:web",)
+    assert action.obligation_ids == ()
+    assert action.session_id == "S2"
+
+
+def test_fallback_records_blocked_lead_when_no_capable_investigation_is_feasible():
+    lead = InvestigationLead(
+        lead_id="lead:web", summary="The external contract may have changed.",
+        affected_paths=("src/a.py",), evidence_ids=("evidence:1",),
+        next_action="Check the official contract documentation.",
+        required_capability="web", origin_session_id="S1",
+    )
+    state = state_for(
+        covered=("OB1", "OB2"), max_sessions=2,
+        max_followup_sessions=0, new_session_turns_remaining=0,
+        investigation_leads=(lead,),
+        resources=(
+            SessionResources(
+                "S1", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0, advertised_tools=("read_file",),
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0, advertised_tools=("read_file",),
+            ),
+        ),
+    )
+
+    action = fallback_next_action(state)
+    assert action.kind == "record_unknown"
+    assert action.lead_ids == ("lead:web",)
 
 
 def resume_raw(**updates):
@@ -133,7 +225,290 @@ def resume_raw(**updates):
     return {"actions": [raw]}
 
 
-def test_reconcile_wave_uses_evidence_predicates_not_declared_coverage():
+def test_compact_negotiation_uses_controller_target_handle_and_derives_authority():
+    state = state_for()
+    context = compact_negotiation_context(state)
+
+    assert context["targets"]
+    target = next(item for item in context["targets"] if item["risk_tier"] == "critical")
+    assert target["handle"] == "U1"
+    assert "obligation_id" not in target
+    proposal = validate_compact_negotiation({
+        "kind": "resume",
+        "target": target["handle"],
+        "reason": "The durable owner needs one bounded implementation check.",
+    }, state)
+
+    assert proposal.actions[0].obligation_ids == ("OB2",)
+    assert proposal.actions[0].session_id == "S2"
+    assert proposal.actions[0].expected_evidence == ("implementation",)
+    assert proposal.actions[0].estimated_turns == 1
+
+
+def test_compact_negotiation_offers_resume_only_for_novel_checkpoint_action():
+    assessment = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.UNRESOLVED,
+        reason="The downstream consumer remains unchecked.",
+        next_actions=("read src/consumer.py diff",),
+    )
+    state = state_for(checkpoints=(SessionCheckpoint(
+        session_id="S2", state=SessionState.CHECKPOINT,
+        obligation_assessments=(assessment,),
+    ),))
+
+    target = compact_negotiation_context(state)["targets"][0]
+
+    assert target["last_conclusion"] == "The downstream consumer remains unchecked."
+    assert target["next_actions"] == ("read src/consumer.py diff",)
+    assert target["attempt_count"] == 0
+    assert "resume" in target["allowed_actions"]
+
+
+def test_compact_negotiation_does_not_promote_checkpoint_todos_to_scheduler_actions():
+    checkpoint = SessionCheckpoint(
+        session_id="S2",
+        state=SessionState.CHECKPOINT,
+        working_summary=(
+            "The changed redactor no longer masks literal passwords; the "
+            "consumer path still needs one bounded trace."
+        ),
+        unknowns=("OB2",),
+        proposed_next_actions=(
+            "Trace mask_source_secrets through the retained consumer call sites.",
+        ),
+        obligation_assessments=(ObligationAssessment(
+            target="O1",
+            obligation_id="OB2",
+            disposition=ObligationDisposition.PENDING,
+        ),),
+    )
+
+    state = state_for(
+        checkpoints=(checkpoint,),
+        resources=(
+            SessionResources(
+                "S1", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0, retained_evidence_count=17,
+            ),
+        ),
+    )
+    context = compact_negotiation_context(state)
+
+    assert all(item["subject"] != "src/a.py" for item in context["targets"])
+    assert checkpoint.proposed_next_actions[0] not in str(context)
+
+
+def test_compact_negotiation_only_advertises_globally_admissible_high_risk_actions():
+    blocked = ObligationAssessment(
+        target="O1", obligation_id="OB1",
+        disposition=ObligationDisposition.PENDING,
+    )
+    actionable = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.UNRESOLVED,
+        reason="Inspect the remaining consumer.",
+        next_actions=("read src/consumer.py diff",),
+    )
+    state = state_for(checkpoints=(
+        SessionCheckpoint(
+            session_id="S1", state=SessionState.CHECKPOINT,
+            obligation_assessments=(blocked,),
+        ),
+        SessionCheckpoint(
+            session_id="S2", state=SessionState.CHECKPOINT,
+            obligation_assessments=(actionable,),
+        ),
+    ))
+
+    targets = compact_negotiation_context(state)["targets"]
+
+    assert len(targets) == 1
+    target = targets[0]
+    assert target["subject"] == "src/a.py"
+    assert "resume" in target["allowed_actions"]
+    assert "record_unknown" not in target["allowed_actions"]
+
+
+def test_fallback_skips_infeasible_critical_target_for_actionable_high_target():
+    critical_blocked = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.PENDING,
+    )
+    high_actionable = ObligationAssessment(
+        target="O1", obligation_id="OB1",
+        disposition=ObligationDisposition.UNRESOLVED,
+        reason="Inspect the remaining workflow test.",
+        next_actions=("read tests/test_a.py diff",),
+    )
+    state = state_for(checkpoints=(
+        SessionCheckpoint(
+            session_id="S2", state=SessionState.CHECKPOINT,
+            obligation_assessments=(critical_blocked,),
+        ),
+        SessionCheckpoint(
+            session_id="S1", state=SessionState.CHECKPOINT,
+            obligation_assessments=(high_actionable,),
+        ),
+    ))
+
+    action = fallback_next_action(state)
+
+    assert action.kind == "resume"
+    assert action.obligation_ids == ("OB1",)
+    assert action.session_id == "S1"
+
+
+def test_compact_negotiation_omits_closed_assessment():
+    assessment = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.EXHAUSTED,
+        reason="All bounded sources were inspected.",
+    )
+    state = state_for(checkpoints=(SessionCheckpoint(
+        session_id="S2", state=SessionState.CHECKPOINT,
+        obligation_assessments=(assessment,),
+    ),))
+
+    targets = compact_negotiation_context(state)["targets"]
+
+    assert all(item["subject"] != "src/a.py" for item in targets)
+
+
+def test_compact_negotiation_rejects_resume_without_novel_action():
+    assessment = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.PENDING,
+    )
+    state = state_for(checkpoints=(SessionCheckpoint(
+        session_id="S2", state=SessionState.CHECKPOINT,
+        obligation_assessments=(assessment,),
+    ),))
+
+    with pytest.raises(NegotiationError, match="not currently admissible"):
+        validate_compact_negotiation({
+            "kind": "resume", "target": "U1", "reason": "Keep reading.",
+        }, state)
+
+
+def test_compact_negotiation_does_not_advertise_new_session_at_hard_capacity():
+    context = compact_negotiation_context(
+        state_for(current_session_count=3, max_sessions=3),
+    )
+
+    assert context["targets"]
+    assert all("new_session" not in item["allowed_actions"] for item in context["targets"])
+
+
+def test_compact_negotiation_rejects_multi_action_payloads():
+    state = state_for()
+    with pytest.raises(NegotiationError, match="exactly one action"):
+        validate_compact_negotiation({
+            "actions": [
+                {"kind": "resume", "target": "U1", "reason": "first"},
+                {"kind": "record_unknown", "target": "U2", "reason": "second"},
+            ],
+        }, state)
+
+
+def test_compact_negotiation_normalizes_unambiguous_kind_alias():
+    state = state_for(
+        resources=(
+            SessionResources(
+                "S1", remaining_model_turns=3, remaining_tool_calls=0,
+                lease_remaining_sec=100.0,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=3, remaining_tool_calls=0,
+                lease_remaining_sec=100.0,
+            ),
+        ),
+        current_session_count=2,
+        max_sessions=2,
+        max_followup_sessions=0,
+        new_session_turns_remaining=0,
+    )
+    proposal = validate_compact_negotiation({
+        "kind": "record-unknown",
+        "target": "U1",
+        "reason": "No bounded evidence remains.",
+    }, state)
+
+    assert proposal.actions[0].kind == "record_unknown"
+
+
+def test_legacy_negotiation_normalizes_unambiguous_kind_alias():
+    proposal = validate_negotiation({
+        "actions": [{
+            "kind": "record-unknown",
+            "obligation_ids": ["OB1"],
+            "expected_evidence": ["tests"],
+            "estimated_turns": 0,
+            "reason": "No bounded evidence remains.",
+        }],
+    }, state_for())
+
+    assert proposal.actions[0].kind == "record_unknown"
+
+
+def test_tool_exhausted_durable_session_cannot_resume_but_new_session_can():
+    state = state_for(resources=(
+        SessionResources(
+            "S1", remaining_model_turns=3, remaining_tool_calls=0,
+            lease_remaining_sec=100.0,
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=3, remaining_tool_calls=3,
+            lease_remaining_sec=100.0,
+        ),
+    ))
+
+    with pytest.raises(
+        NegotiationError, match="session 'S1' has no remaining tool-call budget",
+    ):
+        validate_negotiation(resume_raw(), state)
+
+    proposal = validate_negotiation({
+        "actions": [{
+            "kind": "new_session",
+            "obligation_ids": ["OB1"],
+            "expected_evidence": ["tests"],
+            "estimated_turns": 2,
+            "reason": "The durable owner exhausted its evidence tools.",
+        }],
+    }, state)
+
+    assert proposal.actions[0].kind == "new_session"
+
+
+def test_tool_exhausted_session_can_record_unknown_when_no_new_session_is_available():
+    state = state_for(
+        resources=(
+            SessionResources(
+                "S1", remaining_model_turns=3, remaining_tool_calls=0,
+                lease_remaining_sec=100.0,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=3, remaining_tool_calls=0,
+                lease_remaining_sec=100.0,
+            ),
+        ),
+        current_session_count=2,
+        max_sessions=2,
+        max_followup_sessions=0,
+        new_session_turns_remaining=0,
+    )
+
+    action = fallback_next_action(state)
+
+    assert action.kind == "record_unknown"
+
+
+def test_reconcile_wave_requires_accepted_semantic_assessment_for_coverage():
     obligations = (
         obligation("OB1"),
         obligation("OB2", category="implementation", path="src/a.py"),
@@ -152,6 +527,10 @@ def test_reconcile_wave_uses_evidence_predicates_not_declared_coverage():
         state=SessionState.CHECKPOINT,
         evidence_ids=(evidence.id,),
         obligation_statuses=(("OB2", ObligationStatus.COVERED),),
+        obligation_assessments=(
+            ObligationAssessment("O1", "OB1"),
+            ObligationAssessment("O2", "OB2"),
+        ),
     )
 
     result = reconcile_wave(
@@ -168,11 +547,79 @@ def test_reconcile_wave_uses_evidence_predicates_not_declared_coverage():
     )
 
     assert result.snapshot.obligation_statuses == (
-        ("OB1", ObligationStatus.COVERED),
+        ("OB1", ObligationStatus.PENDING),
         ("OB2", ObligationStatus.PENDING),
     )
-    assert result.newly_covered_obligation_ids == ("OB1",)
-    assert result.uncovered_obligation_ids == ("OB2",)
+    assert result.newly_covered_obligation_ids == ()
+    assert result.uncovered_obligation_ids == ("OB1", "OB2")
+
+
+def test_reconcile_wave_accepts_covered_assessment_with_eligible_evidence():
+    required = obligation("OB1")
+    ledger = CoverageLedger((required,))
+    store = EvidenceStore()
+    evidence = store.add_tool_result(
+        session_id="S1", tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "assert behavior"},
+        category="tests",
+    )
+    checkpoint = SessionCheckpoint(
+        session_id="S1", state=SessionState.CHECKPOINT,
+        evidence_ids=(evidence.id,),
+        obligation_assessments=(ObligationAssessment(
+            target="O1", obligation_id="OB1",
+            disposition=ObligationDisposition.COVERED,
+            reason="The changed behavior is exercised by the retained test.",
+            evidence_ids=(evidence.id,),
+        ),),
+    )
+
+    result = reconcile_wave(
+        ledger, wave_start_coverage=ledger.snapshot(),
+        checkpoints=(checkpoint,), evidence=store.snapshot(),
+        assignments=(assignment("S1", ("OB1",)),),
+        session_ownership=(SessionOwnership(
+            session_id="S1", assignment_id="S1",
+            primary_obligation_ids=("OB1",),
+        ),),
+    )
+
+    assert result.snapshot.obligation_statuses == (
+        ("OB1", ObligationStatus.COVERED),
+    )
+
+
+@pytest.mark.parametrize("disposition, expected", [
+    (ObligationDisposition.NOT_APPLICABLE, ObligationStatus.NOT_APPLICABLE),
+    (ObligationDisposition.EXHAUSTED, ObligationStatus.EXHAUSTED),
+    (ObligationDisposition.BLOCKED, ObligationStatus.BLOCKED),
+])
+def test_reconcile_wave_preserves_non_negotiable_closure_status(
+    disposition, expected,
+):
+    required = obligation("OB1", risk="high")
+    ledger = CoverageLedger((required,))
+    checkpoint = SessionCheckpoint(
+        session_id="S1", state=SessionState.CHECKPOINT,
+        obligation_assessments=(ObligationAssessment(
+            target="O1", obligation_id="OB1", disposition=disposition,
+            reason="Bounded review reached a terminal coverage conclusion.",
+        ),),
+    )
+
+    result = reconcile_wave(
+        ledger, wave_start_coverage=ledger.snapshot(),
+        checkpoints=(checkpoint,), evidence=EvidenceStore().snapshot(),
+        assignments=(assignment("S1", ("OB1",)),),
+        session_ownership=(SessionOwnership(
+            session_id="S1", assignment_id="S1",
+            primary_obligation_ids=("OB1",),
+        ),),
+    )
+
+    assert result.snapshot.obligation_statuses == (("OB1", expected),)
+    assert result.uncovered_obligation_ids == ()
 
 
 def test_shared_path_with_wrong_evidence_category_does_not_satisfy_obligation():
@@ -455,8 +902,14 @@ def test_planner_secondary_owner_can_be_selected_for_consultation():
         assignments=assignments,
         session_ownership=ownership,
         resources=(
-            SessionResources("S1", remaining_model_turns=3, lease_remaining_sec=100.0),
-            SessionResources("S2", remaining_model_turns=3, lease_remaining_sec=100.0),
+            SessionResources(
+                "S1", remaining_model_turns=3, lease_remaining_sec=100.0,
+                remaining_tool_calls=3,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=3, lease_remaining_sec=100.0,
+                remaining_tool_calls=3,
+            ),
         ),
     )
     raw = resume_raw(kind="consult", session_id="S2", estimated_turns=1)
@@ -620,7 +1073,7 @@ def test_valid_resume_preserves_owner_and_returns_immutable_typed_proposal():
     [
         (resume_raw(obligation_ids=["OB2"]), "primary owner"),
         (resume_raw(expected_evidence=["implementation"]), "expected new evidence"),
-        (resume_raw(estimated_turns=4), "remaining model-turn budget"),
+        (resume_raw(estimated_turns=4), "checkpoint reserve"),
     ],
 )
 def test_resume_requires_ownership_evidence_gain_and_budget(raw, message):
@@ -633,8 +1086,14 @@ def test_proposals_cannot_repeat_covered_work_or_exceed_lease_or_deadline():
         validate_negotiation(resume_raw(), state_for(covered=("OB1",)))
 
     resources = (
-        SessionResources("S1", remaining_model_turns=3, lease_remaining_sec=15.0),
-        SessionResources("S2", remaining_model_turns=3, lease_remaining_sec=100.0),
+        SessionResources(
+            "S1", remaining_model_turns=3, lease_remaining_sec=15.0,
+            remaining_tool_calls=3,
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=3, lease_remaining_sec=100.0,
+            remaining_tool_calls=3,
+        ),
     )
     with pytest.raises(NegotiationError, match="lease"):
         validate_negotiation(resume_raw(), state_for(resources=resources))
@@ -699,7 +1158,8 @@ def test_negotiation_uses_explicit_session_to_specialist_assignment_ownership():
             primary_obligation_ids=("OB1",),
         ),),
         resources=(SessionResources(
-            "durable-session-9", remaining_model_turns=3, lease_remaining_sec=100.0,
+            "durable-session-9", remaining_model_turns=4, lease_remaining_sec=100.0,
+            remaining_tool_calls=3,
         ),),
     )
 
@@ -720,6 +1180,7 @@ def test_multiple_actions_cannot_target_same_durable_session_even_when_disjoint(
         ),),
         resources=(SessionResources(
             "S1", remaining_model_turns=4, lease_remaining_sec=100.0,
+            remaining_tool_calls=3,
         ),),
     )
     raw = {"actions": [
@@ -806,8 +1267,14 @@ def test_fallback_resumes_useful_primary_owner_for_highest_risk_gap():
 
 def test_fallback_creates_one_narrow_session_when_primary_owner_is_infeasible():
     resources = (
-        SessionResources("S1", remaining_model_turns=3, lease_remaining_sec=100.0),
-        SessionResources("S2", remaining_model_turns=0, lease_remaining_sec=100.0),
+        SessionResources(
+            "S1", remaining_model_turns=3, lease_remaining_sec=100.0,
+            remaining_tool_calls=3,
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=0, lease_remaining_sec=100.0,
+            remaining_tool_calls=0,
+        ),
     )
 
     action = fallback_next_action(state_for(resources=resources))
@@ -817,10 +1284,45 @@ def test_fallback_creates_one_narrow_session_when_primary_owner_is_infeasible():
     assert action.obligation_ids == ("OB2",)
 
 
+def test_fallback_does_not_resume_owner_with_only_checkpoint_reserve():
+    resources = (
+        SessionResources("S1", remaining_model_turns=3,
+                         remaining_tool_calls=3, lease_remaining_sec=100.0),
+        SessionResources("S2", remaining_model_turns=2,
+                         remaining_tool_calls=3, lease_remaining_sec=100.0),
+    )
+
+    action = fallback_next_action(state_for(resources=resources))
+
+    assert action.kind == "new_session"
+    assert action.obligation_ids == ("OB2",)
+
+
+def test_trusted_resume_cannot_spend_checkpoint_reserve_turns():
+    resources = (
+        SessionResources("S1", remaining_model_turns=2,
+                         remaining_tool_calls=3, lease_remaining_sec=100.0),
+        SessionResources("S2", remaining_model_turns=3,
+                         remaining_tool_calls=3, lease_remaining_sec=100.0),
+    )
+
+    with pytest.raises(NegotiationError, match="checkpoint reserve"):
+        validate_negotiation(
+            resume_raw(estimated_turns=1),
+            state_for(resources=resources),
+        )
+
+
 def test_fallback_records_policy_governed_unknown_when_no_work_is_feasible():
     resources = (
-        SessionResources("S1", remaining_model_turns=0, lease_remaining_sec=0.0),
-        SessionResources("S2", remaining_model_turns=0, lease_remaining_sec=0.0),
+        SessionResources(
+            "S1", remaining_model_turns=0, lease_remaining_sec=0.0,
+            remaining_tool_calls=0,
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=0, lease_remaining_sec=0.0,
+            remaining_tool_calls=0,
+        ),
     )
 
     action = fallback_next_action(

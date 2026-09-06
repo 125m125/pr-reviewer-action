@@ -99,6 +99,56 @@ def test_evidence_retains_redaction_and_truncation_state():
     assert "supersecretvalue" not in record.content
 
 
+def test_diff_evidence_retains_executor_range_truncation():
+    store = EvidenceStore()
+
+    record = store.add_tool_result(
+        session_id="S1", tool="read_pr_diff", arguments={"path": "src/app.py"},
+        result={
+            "status": "ok",
+            "result": {
+                "path": "src/app.py", "patch": "@@ -1 +1 @@\n-old\n+new\n",
+                "range": {"truncated": True},
+            },
+        },
+    )
+
+    assert record.truncated is True
+
+
+def test_repository_evidence_preserves_dynamic_secret_reference_semantics():
+    store = EvidenceStore()
+    source = 'return f"Webhook failed; api_token={api_token}"'
+
+    record = store.add_tool_result(
+        session_id="S1",
+        tool="read_pr_diff",
+        arguments={"path": "evals/dogfood_canaries/repository_access.py"},
+        result={"status": "ok", "result": {"content": source}},
+    )
+
+    assert record.content == source
+    assert record.redacted is False
+
+
+def test_repository_evidence_marks_controller_source_redaction():
+    store = EvidenceStore()
+
+    record = store.add_tool_result(
+        session_id="S1",
+        tool="read_file",
+        arguments={"path": "config.py"},
+        result={
+            "status": "ok",
+            "result": {"content": 'api_token="super_secret_literal_value_12345"'},
+        },
+    )
+
+    assert record.content == 'api_token="[REDACTED_VALUE]"'
+    assert record.redacted is True
+    assert record.redaction_types == ("controller-source-value",)
+
+
 def test_wave_snapshot_does_not_change_when_store_grows():
     store = EvidenceStore()
     store.add_tool_result(
@@ -117,6 +167,18 @@ def test_wave_snapshot_does_not_change_when_store_grows():
     )
 
     assert snapshot.get_by_path("b.py") == ()
+
+
+def test_snapshot_preserves_content_ceiling_and_allows_explicit_override():
+    snapshot = EvidenceStore(max_content_bytes=100).snapshot()
+    for override, expected_prefix in ((None, 100), (40, 40)):
+        store = EvidenceStore.from_snapshot(snapshot, max_content_bytes=override)
+        record = store.add_tool_result(
+            session_id="S1", tool="read_file", arguments={"path": "a.py"},
+            result={"status": "ok", "result": {"content": "x" * 200}},
+        )
+        assert record.truncated
+        assert record.content == "x" * expected_prefix + "\n[truncated]"
 
 
 def test_snapshot_remains_immutable_when_later_session_imports_existing_evidence():

@@ -191,6 +191,17 @@ def test_specialist_watchdog_inputs_are_declared_and_wired():
         assert f"{env_name}: ${{{{ inputs.{name} }}}}" in content
 
 
+def test_structured_specialist_template_kwargs_are_declared_and_wired():
+    content = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
+    inputs = parse_action_inputs()
+
+    assert "specialist_structured_chat_template_kwargs" in inputs
+    assert (
+        "SPECIALIST_STRUCTURED_CHAT_TEMPLATE_KWARGS: "
+        "${{ inputs.specialist_structured_chat_template_kwargs }}"
+    ) in content
+
+
 def _action_defaults() -> dict[str, str]:
     content = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
     defaults: dict[str, str] = {}
@@ -214,7 +225,10 @@ def test_specialist_session_runtime_inputs_have_exact_defaults_and_wiring():
         "specialist_max_sessions": "8",
         "specialist_max_followup_sessions": "2",
         "specialist_max_model_turns_per_session": "64",
-        "specialist_max_tool_calls_per_session": "20",
+        "specialist_max_tool_calls_per_session": "128",
+        "specialist_max_total_model_turns": "320",
+        "specialist_max_total_tool_calls": "640",
+        "specialist_remediator_max_evidence_chars": "32000",
         "specialist_max_recoveries_per_session": "1",
     }
     content = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")

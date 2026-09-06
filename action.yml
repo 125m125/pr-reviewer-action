@@ -84,6 +84,10 @@ inputs:
     description: Current-branch version-2 specialist review policy; its source and publishing restrictions are authoritative.
     required: false
     default: ".github/ai-review-policy.json"
+  review_diff_priority_file:
+    description: Optional current-branch file defining ordering and byte quotas for changed diff sections.
+    required: false
+    default: ".github/ai-review-diff-priorities.json"
   specialist_review_deadline_sec:
     description: Absolute specialist review deadline in seconds, including finalization and artifact production.
     required: false
@@ -111,7 +115,19 @@ inputs:
   specialist_max_tool_calls_per_session:
     description: Lifetime read-only tool-call limit for one logical specialist session.
     required: false
-    default: "20"
+    default: "128"
+  specialist_max_total_model_turns:
+    description: Global model-turn lease shared by all specialist sessions in one review run.
+    required: false
+    default: "320"
+  specialist_max_total_tool_calls:
+    description: Global read-only tool-call lease shared by all specialist sessions in one review run.
+    required: false
+    default: "640"
+  specialist_remediator_max_evidence_chars:
+    description: Maximum cited-evidence characters supplied to each accepted-finding remediation request.
+    required: false
+    default: "32000"
   specialist_max_recoveries_per_session:
     description: Lifetime reconstruction limit for one logical specialist session.
     required: false
@@ -139,7 +155,7 @@ inputs:
   specialist_max_tool_calls_per_pass:
     description: Deprecated one-release alias for specialist_max_tool_calls_per_session.
     required: false
-    default: "20"
+    default: "128"
   specialist_tool_mode:
     description: Specialist evidence mode. native_loop is used; packet is deprecated and emits a migration warning.
     required: false
@@ -172,6 +188,18 @@ inputs:
     description: Maximum completion tokens for the first reconstructed specialist turn after a bounded recovery.
     required: false
     default: "2048"
+  specialist_delegated_summary_max_tokens:
+    description: >-
+      Optional completion-token ceiling for delegate_tool_summary. Empty derives
+      twice specialist_max_tokens; its single repair receives half this value.
+    required: false
+    default: ""
+  specialist_delegated_summary_max_source_bytes:
+    description: >-
+      Optional source-byte ceiling for delegate_tool_summary. Empty derives a
+      context-safe limit after summary, repair, prompt, and safety reserves.
+    required: false
+    default: ""
   specialist_max_conversation_tokens:
     description: Maximum approximate transcript tokens retained by one specialist conversation; independent of model_context_tokens.
     required: false
@@ -184,6 +212,14 @@ inputs:
     description: Interrupt streamed specialist turns that repeat paragraphs or blocks and recover once from compact evidence.
     required: false
     default: "true"
+  specialist_structured_chat_template_kwargs:
+    description: >-
+      Optional JSON object added as chat_template_kwargs only to specialist-runtime
+      structured turns. Leave empty for provider portability; llama.cpp-compatible
+      Qwen deployments can use {"enable_thinking":false} so checkpoints spend their
+      output budget on the required JSON instead of private reasoning.
+    required: false
+    default: ""
   specialist_max_truncation_continuations:
     description: Deprecated no-op retained for one release; durable sessions checkpoint instead of issuing truncation-continuation turns.
     required: false
@@ -444,6 +480,10 @@ inputs:
     description: Optional JSON file in the reviewed repository that defines evidence providers to run before review
     required: false
     default: ""
+  specialist_test_results_file:
+    description: Optional repository-local normalized CI test manifest; when empty on GitHub, same-head JUnit/test-results artifacts are discovered and normalized automatically
+    required: false
+    default: ""
   evidence_provider_timeout_sec:
     description: Default timeout in seconds for each evidence provider command
     required: false
@@ -555,7 +595,7 @@ inputs:
     required: false
     default: "12000"
   tool_allowed_gh_api_repos:
-    description: Comma-separated owner/repo list allowed for gh_api tool requests; use * to allow any repo still permitted by the path allowlist (empty means current repo only)
+    description: Comma-separated owner/repo list allowed for gh_api metadata and read_remote_file text requests; read_remote_file requires a specifically named other repository, while * broadens metadata-only gh_api access (empty means current-repo gh_api metadata only)
     required: false
     default: ""
   tool_request_timeout_sec:
@@ -573,6 +613,13 @@ inputs:
       the same fork gating as the rest of the tool harness.
     required: false
     default: ""
+  allow_private_search_url:
+    description: >-
+      Allow the explicitly configured search_url to use private HTTP(S)
+      endpoints and non-standard ports. Keep false unless running on a trusted
+      self-hosted runner; fork pull requests remain tool-gated separately.
+    required: false
+    default: "false"
   tool_max_search_results:
     description: Maximum results returned per web_search call
     required: false
@@ -697,7 +744,7 @@ inputs:
 outputs:
 
   verdict:
-    description: AI verdict, approve or request_changes
+    description: "AI verdict: approve, request_changes, or notice (specialist coverage incomplete without a confirmed defect)"
     value: ${{ steps.review.outputs.verdict }}
   verdict_source:
     description: Where the final verdict came from ('model' or 'findings' per verdict_policy, or 'carry_forward' when a carried-forward blocker survived an incremental review)
@@ -799,6 +846,7 @@ runs:
         AI_TOKENS_PARAM: ${{ inputs.ai_tokens_param }}
         REVIEW_STRATEGY: ${{ inputs.review_strategy }}
         REVIEW_POLICY_FILE: ${{ inputs.review_policy_file }}
+        REVIEW_DIFF_PRIORITY_FILE: ${{ inputs.review_diff_priority_file }}
         SPECIALIST_REVIEW_DEADLINE_SEC: ${{ inputs.specialist_review_deadline_sec }}
         SPECIALIST_PHASE_SHARES: ${{ inputs.specialist_phase_shares }}
         SPECIALIST_CONCURRENCY: ${{ inputs.specialist_concurrency }}
@@ -806,6 +854,9 @@ runs:
         SPECIALIST_MAX_FOLLOWUP_SESSIONS: ${{ inputs.specialist_max_followup_sessions }}
         SPECIALIST_MAX_MODEL_TURNS_PER_SESSION: ${{ inputs.specialist_max_model_turns_per_session }}
         SPECIALIST_MAX_TOOL_CALLS_PER_SESSION: ${{ inputs.specialist_max_tool_calls_per_session }}
+        SPECIALIST_MAX_TOTAL_MODEL_TURNS: ${{ inputs.specialist_max_total_model_turns }}
+        SPECIALIST_MAX_TOTAL_TOOL_CALLS: ${{ inputs.specialist_max_total_tool_calls }}
+        SPECIALIST_REMEDIATOR_MAX_EVIDENCE_CHARS: ${{ inputs.specialist_remediator_max_evidence_chars }}
         SPECIALIST_MAX_RECOVERIES_PER_SESSION: ${{ inputs.specialist_max_recoveries_per_session }}
         SPECIALIST_CONFIG_FILE: ${{ inputs.specialist_config_file }}
         SPECIALIST_PLANNER_MAX_TOOL_CALLS: ${{ inputs.specialist_planner_max_tool_calls }}
@@ -817,9 +868,12 @@ runs:
         SPECIALIST_PASS_TIMEOUT_SEC: ${{ inputs.specialist_pass_timeout_sec }}
         SPECIALIST_MAX_TOKENS: ${{ inputs.specialist_max_tokens }}
         SPECIALIST_RECOVERY_MAX_TOKENS: ${{ inputs.specialist_recovery_max_tokens }}
+        SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS: ${{ inputs.specialist_delegated_summary_max_tokens }}
+        SPECIALIST_DELEGATED_SUMMARY_MAX_SOURCE_BYTES: ${{ inputs.specialist_delegated_summary_max_source_bytes }}
         SPECIALIST_MAX_CONVERSATION_TOKENS: ${{ inputs.specialist_max_conversation_tokens }}
         SPECIALIST_TEMPERATURE: ${{ inputs.specialist_temperature }}
         SPECIALIST_STREAM_WATCHDOG: ${{ inputs.specialist_stream_watchdog }}
+        SPECIALIST_STRUCTURED_CHAT_TEMPLATE_KWARGS: ${{ inputs.specialist_structured_chat_template_kwargs }}
         SPECIALIST_MAX_TRUNCATION_CONTINUATIONS: ${{ inputs.specialist_max_truncation_continuations }}
         SPECIALIST_PLANNER_MAX_CONTEXT_BYTES: ${{ inputs.specialist_planner_max_context_bytes }}
         SPECIALIST_PACKET_MAX_BYTES: ${{ inputs.specialist_packet_max_bytes }}
@@ -847,6 +901,7 @@ runs:
         CONTEXT_LIMIT_MODE: ${{ inputs.context_limit_mode }}
         MODEL_CONTEXT_TOKENS: ${{ inputs.model_context_tokens }}
         EVIDENCE_PROVIDERS_FILE: ${{ inputs.evidence_providers_file }}
+        SPECIALIST_TEST_RESULTS_FILE: ${{ inputs.specialist_test_results_file }}
         EVIDENCE_PROVIDER_TIMEOUT_SEC: ${{ inputs.evidence_provider_timeout_sec }}
         EVIDENCE_PROVIDER_MAX_OUTPUT_BYTES: ${{ inputs.evidence_provider_max_output_bytes }}
         EVIDENCE_BLOCKER_ENFORCEMENT: ${{ inputs.evidence_blocker_enforcement }}
@@ -870,6 +925,7 @@ runs:
         TOOL_ALLOWED_GH_API_REPOS: ${{ inputs.tool_allowed_gh_api_repos }}
         TOOL_REQUEST_TIMEOUT_SEC: ${{ inputs.tool_request_timeout_sec }}
         SEARCH_URL: ${{ inputs.search_url }}
+        ALLOW_PRIVATE_SEARCH_URL: ${{ inputs.allow_private_search_url }}
         TOOL_MAX_SEARCH_RESULTS: ${{ inputs.tool_max_search_results }}
         TOOL_FAILURE_ENFORCEMENT: ${{ inputs.tool_failure_enforcement }}
         TOOL_MIN_SUCCESSFUL_REQUESTS: ${{ inputs.tool_min_successful_requests }}
@@ -924,6 +980,7 @@ runs:
         AI_TOKENS_PARAM: ${{ inputs.ai_tokens_param }}
         REVIEW_STRATEGY: ${{ inputs.review_strategy }}
         REVIEW_POLICY_FILE: ${{ inputs.review_policy_file }}
+        REVIEW_DIFF_PRIORITY_FILE: ${{ inputs.review_diff_priority_file }}
         SPECIALIST_REVIEW_DEADLINE_SEC: ${{ inputs.specialist_review_deadline_sec }}
         SPECIALIST_PHASE_SHARES: ${{ inputs.specialist_phase_shares }}
         SPECIALIST_CONCURRENCY: ${{ inputs.specialist_concurrency }}
@@ -931,6 +988,9 @@ runs:
         SPECIALIST_MAX_FOLLOWUP_SESSIONS: ${{ inputs.specialist_max_followup_sessions }}
         SPECIALIST_MAX_MODEL_TURNS_PER_SESSION: ${{ inputs.specialist_max_model_turns_per_session }}
         SPECIALIST_MAX_TOOL_CALLS_PER_SESSION: ${{ inputs.specialist_max_tool_calls_per_session }}
+        SPECIALIST_MAX_TOTAL_MODEL_TURNS: ${{ inputs.specialist_max_total_model_turns }}
+        SPECIALIST_MAX_TOTAL_TOOL_CALLS: ${{ inputs.specialist_max_total_tool_calls }}
+        SPECIALIST_REMEDIATOR_MAX_EVIDENCE_CHARS: ${{ inputs.specialist_remediator_max_evidence_chars }}
         SPECIALIST_MAX_RECOVERIES_PER_SESSION: ${{ inputs.specialist_max_recoveries_per_session }}
         PUBLISH_MODE: ${{ inputs.publish_mode != '' && inputs.publish_mode || (inputs.review_strategy == 'single' && 'comment' || 'review_comment') }}
         ALLOW_APPROVE: ${{ inputs.allow_approve }}
@@ -949,9 +1009,12 @@ runs:
         SPECIALIST_PASS_TIMEOUT_SEC: ${{ inputs.specialist_pass_timeout_sec }}
         SPECIALIST_MAX_TOKENS: ${{ inputs.specialist_max_tokens }}
         SPECIALIST_RECOVERY_MAX_TOKENS: ${{ inputs.specialist_recovery_max_tokens }}
+        SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS: ${{ inputs.specialist_delegated_summary_max_tokens }}
+        SPECIALIST_DELEGATED_SUMMARY_MAX_SOURCE_BYTES: ${{ inputs.specialist_delegated_summary_max_source_bytes }}
         SPECIALIST_MAX_CONVERSATION_TOKENS: ${{ inputs.specialist_max_conversation_tokens }}
         SPECIALIST_TEMPERATURE: ${{ inputs.specialist_temperature }}
         SPECIALIST_STREAM_WATCHDOG: ${{ inputs.specialist_stream_watchdog }}
+        SPECIALIST_STRUCTURED_CHAT_TEMPLATE_KWARGS: ${{ inputs.specialist_structured_chat_template_kwargs }}
         SPECIALIST_MAX_TRUNCATION_CONTINUATIONS: ${{ inputs.specialist_max_truncation_continuations }}
         SPECIALIST_PLANNER_MAX_CONTEXT_BYTES: ${{ inputs.specialist_planner_max_context_bytes }}
         SPECIALIST_PACKET_MAX_BYTES: ${{ inputs.specialist_packet_max_bytes }}
@@ -996,6 +1059,7 @@ runs:
         ENRICHMENT_BUDGET_SEC: ${{ inputs.enrichment_budget_sec }}
         IMAGE_DIGEST_BUDGET_SEC: ${{ inputs.image_digest_budget_sec }}
         EVIDENCE_PROVIDERS_FILE: ${{ inputs.evidence_providers_file }}
+        SPECIALIST_TEST_RESULTS_FILE: ${{ inputs.specialist_test_results_file }}
         EVIDENCE_PROVIDER_TIMEOUT_SEC: ${{ inputs.evidence_provider_timeout_sec }}
         EVIDENCE_PROVIDER_MAX_OUTPUT_BYTES: ${{ inputs.evidence_provider_max_output_bytes }}
         EVIDENCE_PROVIDER_PARALLELISM: ${{ inputs.evidence_provider_parallelism }}
@@ -1020,6 +1084,7 @@ runs:
         TOOL_ALLOWED_GH_API_REPOS: ${{ inputs.tool_allowed_gh_api_repos }}
         TOOL_REQUEST_TIMEOUT_SEC: ${{ inputs.tool_request_timeout_sec }}
         SEARCH_URL: ${{ inputs.search_url }}
+        ALLOW_PRIVATE_SEARCH_URL: ${{ inputs.allow_private_search_url }}
         TOOL_MAX_SEARCH_RESULTS: ${{ inputs.tool_max_search_results }}
         TOOL_FAILURE_ENFORCEMENT: ${{ inputs.tool_failure_enforcement }}
         TOOL_MIN_SUCCESSFUL_REQUESTS: ${{ inputs.tool_min_successful_requests }}

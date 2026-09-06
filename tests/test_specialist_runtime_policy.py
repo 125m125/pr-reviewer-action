@@ -50,6 +50,105 @@ def test_v2_recipe_accepts_each_supported_execution_mode(tmp_path, execution):
     assert load_review_policy(path).recipes[0].execution == execution
 
 
+def test_v2_recipe_normalizes_conditional_evidence_requirements(tmp_path):
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({
+        "version": 2,
+        "recipes": [{
+            "id": "delivery", "title": "Delivery", "objective": "Trace",
+            "evidence_requirements": [{
+                "id": "build-manifest",
+                "category": "build manifest",
+                "when": {"paths_any": ["pom.xml", "**/pom.xml"]},
+                "seed_paths": ["pom.xml", "**/pom.xml"],
+                "mode": "required",
+            }, {
+                "id": "runtime-artifact",
+                "category": "generated output",
+                "when": {"file_roles_any": ["generated-artifact"]},
+                "mode": "one_of:artifact-proof",
+            }],
+        }],
+    }), encoding="utf-8")
+
+    recipe = load_review_policy(path).recipes[0]
+
+    assert tuple(item.id for item in recipe.evidence_requirements) == (
+        "build-manifest", "runtime-artifact",
+    )
+    assert recipe.evidence_requirements[0].when == {
+        "paths_any": ("pom.xml", "**/pom.xml"),
+    }
+    assert recipe.evidence_requirements[1].mode == "one_of:artifact-proof"
+
+
+@pytest.mark.parametrize("mutation, message", [
+    ({"unknown": True}, "unknown"),
+    ({"mode": "sometimes"}, "mode"),
+    ({"seed_paths": ["../pom.xml"]}, "repository-relative"),
+])
+def test_v2_recipe_rejects_invalid_evidence_requirement(tmp_path, mutation, message):
+    requirement = {"id": "manifest", "category": "build manifest", **mutation}
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({
+        "version": 2,
+        "recipes": [{
+            "id": "delivery", "title": "Delivery", "objective": "Trace",
+            "evidence_requirements": [requirement],
+        }],
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_review_policy(path)
+
+
+def test_v2_recipe_rejects_duplicate_evidence_requirement_ids(tmp_path):
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({
+        "version": 2,
+        "recipes": [{
+            "id": "delivery", "title": "Delivery", "objective": "Trace",
+            "evidence_requirements": [
+                {"id": "manifest", "category": "build manifest"},
+                {"id": "manifest", "category": "workflow"},
+            ],
+        }],
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate"):
+        load_review_policy(path)
+
+
+def test_topology_projection_retains_coverage_rules_for_relevant_seed_selection(
+    tmp_path,
+):
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps({
+        "version": 2,
+        "recipes": [{
+            "id": "delivery", "title": "Delivery", "objective": "Trace",
+            "related_paths": ["integration/tests/**"],
+        }],
+        "coverage_rules": [{
+            "id": "delivery-risk",
+            "paths_any": ["worker/**"],
+            "required_recipe_ids": ["delivery"],
+            "risk_tier": "high",
+            "unresolved_policy": "block_when_unresolved",
+        }],
+    }), encoding="utf-8")
+
+    projection = load_review_policy(path).legacy_projection()
+
+    assert projection["coverage_rules"] == [{
+        "id": "delivery-risk",
+        "paths_any": ["worker/**"],
+        "required_recipe_ids": ["delivery"],
+        "risk_tier": "high",
+        "unresolved_policy": "block_when_unresolved",
+    }]
+
+
 def test_v2_policy_rejects_unknown_top_level_key(tmp_path):
     path = tmp_path / "policy.json"
     path.write_text(json.dumps({"version": 2, "sources": [], "unsafe": True}), encoding="utf-8")
@@ -312,7 +411,27 @@ def test_runtime_config_uses_direct_defaults_and_legacy_aliases():
     assert config.concurrency == 1
     assert config.model_request_timeout_sec == 42
     assert config.session_limits.tool_calls == 17
+    assert config.max_total_model_turns == 320
+    assert config.max_total_tool_calls == 640
     assert config.deprecation_warnings == ("specialist_max_tool_calls_per_pass",)
+
+
+def test_runtime_config_accepts_controller_owned_global_leases():
+    config = RuntimeConfig.from_env({
+        "SPECIALIST_MAX_TOTAL_MODEL_TURNS": "111",
+        "SPECIALIST_MAX_TOTAL_TOOL_CALLS": "333",
+    })
+
+    assert config.max_total_model_turns == 111
+    assert config.max_total_tool_calls == 333
+
+
+def test_runtime_config_controls_remediator_evidence_budget():
+    assert RuntimeConfig.from_env({}).remediator_max_evidence_chars == 32_000
+    config = RuntimeConfig.from_env({
+        "SPECIALIST_REMEDIATOR_MAX_EVIDENCE_CHARS": "48000",
+    })
+    assert config.remediator_max_evidence_chars == 48_000
 
 
 def load_review_policy_from_value(value):

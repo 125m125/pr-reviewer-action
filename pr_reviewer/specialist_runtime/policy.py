@@ -31,7 +31,10 @@ _COMPONENT_KEYS = frozenset({
 _RECIPE_KEYS = frozenset({
     "id", "title", "objective", "execution", "match", "lenses",
     "seed_paths", "related_paths", "invariants", "expected_evidence",
-    "priority", "source",
+    "evidence_requirements", "priority", "source",
+})
+_EVIDENCE_REQUIREMENT_KEYS = frozenset({
+    "id", "category", "when", "seed_paths", "related_paths", "mode",
 })
 _SOURCE_KEYS = frozenset({
     "host", "include_subdomains", "path_prefixes", "classification",
@@ -149,6 +152,18 @@ class SourceRule:
 
 
 @dataclass(frozen=True)
+class EvidenceRequirementPolicy:
+    id: str
+    category: str
+    when: Mapping[str, tuple[str, ...]] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    seed_paths: tuple[str, ...] = ()
+    related_paths: tuple[str, ...] = ()
+    mode: str = "required"
+
+
+@dataclass(frozen=True)
 class RecipePolicy:
     id: str
     title: str
@@ -160,6 +175,7 @@ class RecipePolicy:
     related_paths: tuple[str, ...] = ()
     invariants: tuple[str, ...] = ()
     expected_evidence: tuple[str, ...] = ()
+    evidence_requirements: tuple[EvidenceRequirementPolicy, ...] = ()
     priority: str = "normal"
 
 
@@ -195,6 +211,17 @@ class ReviewPolicy:
                 "related_paths": list(recipe.related_paths),
                 "invariants": list(recipe.invariants),
                 "expected_evidence": list(recipe.expected_evidence),
+                "evidence_requirements": [
+                    {
+                        "id": item.id,
+                        "category": item.category,
+                        "when": {key: list(value) for key, value in item.when.items()},
+                        "seed_paths": list(item.seed_paths),
+                        "related_paths": list(item.related_paths),
+                        "mode": item.mode,
+                    }
+                    for item in recipe.evidence_requirements
+                ],
                 "priority": recipe.priority,
                 "source": "recipe",
             })
@@ -202,6 +229,7 @@ class ReviewPolicy:
             "version": 1,
             "components": [_thaw(item) for item in self.components],
             "recipes": recipes,
+            "coverage_rules": [_thaw(item) for item in self.coverage_rules],
             "generated_artifacts": [_thaw(item) for item in self.generated_artifacts],
             "exclude": {key: list(value) for key, value in self.exclude.items()},
         }
@@ -227,8 +255,11 @@ class RuntimeConfig:
     concurrency: int = 1
     max_sessions: int = 8
     max_followup_sessions: int = 2
+    max_total_model_turns: int = 320
+    max_total_tool_calls: int = 640
+    remediator_max_evidence_chars: int = 32_000
     session_limits: BudgetLimits = field(
-        default_factory=lambda: BudgetLimits(model_turns=64, tool_calls=20, recoveries=1)
+        default_factory=lambda: BudgetLimits(model_turns=64, tool_calls=128, recoveries=1)
     )
     deprecation_warnings: tuple[str, ...] = ()
 
@@ -276,10 +307,19 @@ class RuntimeConfig:
             max_followup_sessions=setting(
                 "SPECIALIST_MAX_FOLLOWUP_SESSIONS", 2, alias="SPECIALIST_MAX_FOLLOWUP_PASSES"
             ),
+            max_total_model_turns=setting(
+                "SPECIALIST_MAX_TOTAL_MODEL_TURNS", 320,
+            ),
+            max_total_tool_calls=setting(
+                "SPECIALIST_MAX_TOTAL_TOOL_CALLS", 640,
+            ),
+            remediator_max_evidence_chars=setting(
+                "SPECIALIST_REMEDIATOR_MAX_EVIDENCE_CHARS", 32_000,
+            ),
             session_limits=BudgetLimits(
                 model_turns=setting("SPECIALIST_MAX_MODEL_TURNS_PER_SESSION", 64),
                 tool_calls=setting(
-                    "SPECIALIST_MAX_TOOL_CALLS_PER_SESSION", 20,
+                    "SPECIALIST_MAX_TOOL_CALLS_PER_SESSION", 128,
                     alias="SPECIALIST_MAX_TOOL_CALLS_PER_PASS",
                 ),
                 recoveries=setting("SPECIALIST_MAX_RECOVERIES_PER_SESSION", 1),
@@ -333,6 +373,53 @@ def _component_policy(raw: Mapping[str, Any]) -> Mapping[str, Any]:
     })
 
 
+def _evidence_requirement(raw: Mapping[str, Any]) -> EvidenceRequirementPolicy:
+    unknown = set(raw) - _EVIDENCE_REQUIREMENT_KEYS
+    if unknown:
+        raise ValueError(
+            "evidence requirement contains unknown keys: "
+            + ", ".join(sorted(unknown))
+        )
+    if not raw.get("id") or not str(raw.get("category") or "").strip():
+        raise ValueError("evidence requirement requires id and category")
+    when = _mapping(raw.get("when"), field_name="evidence requirement when")
+    unknown_match = set(when) - _MATCH_KEYS
+    if unknown_match:
+        raise ValueError(
+            "evidence requirement when contains unknown keys: "
+            + ", ".join(sorted(unknown_match))
+        )
+    normalized_when: dict[str, tuple[str, ...]] = {}
+    for key in _MATCH_KEYS:
+        if key not in when:
+            continue
+        values = _strings(when[key], field_name=f"evidence requirement when {key}")
+        if key == "paths_any":
+            values = _repository_paths(
+                list(values), field_name=f"evidence requirement when {key}",
+            )
+        elif key == "component_ids_any":
+            values = tuple(_slug(item) for item in values)
+        normalized_when[key] = values
+    mode = str(raw.get("mode", "required")).strip().lower()
+    if mode not in {"required", "optional"} and not re.fullmatch(
+        r"one_of:[a-z0-9][a-z0-9-]*", mode
+    ):
+        raise ValueError("evidence requirement mode is invalid")
+    return EvidenceRequirementPolicy(
+        id=_slug(raw["id"]),
+        category=str(raw["category"]).strip()[:160],
+        when=MappingProxyType(normalized_when),
+        seed_paths=_repository_paths(
+            raw.get("seed_paths", []), field_name="evidence requirement seed_paths",
+        ),
+        related_paths=_repository_paths(
+            raw.get("related_paths", []), field_name="evidence requirement related_paths",
+        ),
+        mode=mode,
+    )
+
+
 def _recipe_policy(raw: Mapping[str, Any]) -> RecipePolicy:
     unknown = set(raw) - _RECIPE_KEYS
     if unknown:
@@ -360,6 +447,16 @@ def _recipe_policy(raw: Mapping[str, Any]) -> RecipePolicy:
     priority = str(raw.get("priority", "normal")).strip().lower()
     if priority not in {"critical", "high", "normal", "low"}:
         priority = "normal"
+    evidence_requirements = tuple(
+        _evidence_requirement(item)
+        for item in _entries(
+            raw.get("evidence_requirements"),
+            field_name="recipe evidence_requirements",
+        )
+    )
+    requirement_ids = tuple(item.id for item in evidence_requirements)
+    if len(set(requirement_ids)) != len(requirement_ids):
+        raise ValueError("recipe contains duplicate evidence requirement ids")
     return RecipePolicy(
         id=_slug(raw["id"]),
         title=str(raw.get("title") or raw["id"]).strip()[:160],
@@ -371,6 +468,7 @@ def _recipe_policy(raw: Mapping[str, Any]) -> RecipePolicy:
         related_paths=_repository_paths(raw.get("related_paths", []), field_name="recipe related_paths"),
         invariants=_strings(raw.get("invariants", []), field_name="recipe invariants"),
         expected_evidence=_strings(raw.get("expected_evidence", []), field_name="recipe expected_evidence"),
+        evidence_requirements=evidence_requirements,
         priority=priority,
     )
 

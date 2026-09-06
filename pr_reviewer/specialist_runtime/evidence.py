@@ -18,7 +18,7 @@ _SCRIPTS_DIR = str(Path(__file__).parents[2] / "scripts")
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from redact import mask_and_truncate, mask_secrets  # noqa: E402
+from redact import mask_and_truncate, mask_secrets, mask_source_secrets  # noqa: E402
 
 
 _SUCCESS_STATUSES = frozenset({"ok", "success", "completed"})
@@ -123,6 +123,8 @@ def _result_content(result: Mapping[str, Any]) -> str:
     nested = result.get("result")
     if isinstance(nested, Mapping) and "content" in nested:
         content = nested["content"]
+    elif isinstance(nested, Mapping) and "patch" in nested:
+        content = nested["patch"]
     elif "content" in result:
         content = result["content"]
     elif "error" in result:
@@ -132,6 +134,17 @@ def _result_content(result: Mapping[str, Any]) -> str:
     else:
         content = result
     return content if isinstance(content, str) else _canonical_json(content)
+
+
+def _result_truncated(result: Mapping[str, Any]) -> bool:
+    nested = result.get("result")
+    if not isinstance(nested, Mapping):
+        return False
+    value = nested.get("range")
+    return bool(
+        isinstance(value, Mapping)
+        and (value.get("truncated") is True or value.get("has_more") is True)
+    )
 
 
 def _source_identity(arguments: Mapping[str, Any], source: str | None = None) -> str:
@@ -161,6 +174,27 @@ def _bounded_content(content: str, max_content_bytes: int) -> tuple[str, bool, b
     redacted_content = mask_secrets(content)
     bounded, truncated = mask_and_truncate(content, max_content_bytes)
     return bounded, redacted_content != content, truncated
+
+
+_REPOSITORY_SOURCE_TOOLS = frozenset({
+    "read_file", "read_pr_diff", "read_remote_file", "git_grep", "git_blame",
+})
+
+
+def _bounded_tool_content(
+    tool: str, content: str, max_content_bytes: int,
+) -> tuple[str, bool, bool, tuple[str, ...]]:
+    if tool not in _REPOSITORY_SOURCE_TOOLS:
+        bounded, redacted, truncated = _bounded_content(content, max_content_bytes)
+        return bounded, redacted, truncated, (("controller-generic",) if redacted else ())
+    if max_content_bytes <= 0:
+        raise ValueError("max_content_bytes must be positive")
+    masked, count = mask_source_secrets(content)
+    raw = masked.encode("utf-8", errors="replace")
+    truncated = len(raw) > max_content_bytes
+    if truncated:
+        masked = raw[:max_content_bytes].decode("utf-8", errors="replace") + "\n[truncated]"
+    return masked, bool(count), truncated, (("controller-source-value",) if count else ())
 
 
 @dataclass(frozen=True)
@@ -237,7 +271,9 @@ def canonical_evidence_key(
     max_content_bytes: int = 64 * 1024,
 ) -> str:
     """Return a deterministic identity for a bounded, safely stored result."""
-    content, _, _ = _bounded_content(_result_content(result), max_content_bytes)
+    content, _, _, _ = _bounded_tool_content(
+        str(tool).strip(), _result_content(result), max_content_bytes,
+    )
     sanitized_provenance, _ = _sanitize_provenance(provenance)
     sanitized_source, _ = _sanitize_source(source)
     identity = {
@@ -273,6 +309,7 @@ class EvidenceRecord:
     truncated: bool
     redacted: bool
     imported_by: tuple[str, ...]
+    redaction_types: tuple[str, ...] = ()
     supersedes: tuple[str, ...] = ()
     contradicts: tuple[str, ...] = ()
 
@@ -308,6 +345,7 @@ class EvidenceSnapshot:
     records: tuple[EvidenceRecord, ...]
     collections: tuple[EvidenceCollection, ...] = ()
     associations: tuple[EvidenceAssociation, ...] = ()
+    max_content_bytes: int = 64 * 1024
 
     @property
     def evidence_ids(self) -> tuple[str, ...]:
@@ -364,12 +402,14 @@ class EvidenceStore:
         cls,
         snapshot: EvidenceSnapshot,
         *,
-        max_content_bytes: int = 64 * 1024,
+        max_content_bytes: int | None = None,
     ) -> "EvidenceStore":
         """Create an isolated mutable store seeded from one immutable snapshot."""
         if not isinstance(snapshot, EvidenceSnapshot):
             raise TypeError("snapshot must be an EvidenceSnapshot")
-        store = cls(max_content_bytes=max_content_bytes)
+        store = cls(max_content_bytes=(
+            snapshot.max_content_bytes if max_content_bytes is None else max_content_bytes
+        ))
         for record in snapshot.records:
             if record.id in store._records:
                 raise ValueError(f"duplicate evidence id in snapshot: {record.id}")
@@ -571,8 +611,8 @@ class EvidenceStore:
         sanitized_source, source_redacted = _sanitize_source(source)
         canonical_supersedes = self._canonical_relationship_ids(supersedes)
         canonical_contradicts = self._canonical_relationship_ids(contradicts)
-        content, redacted, truncated = _bounded_content(
-            _result_content(result), self._max_content_bytes
+        content, redacted, truncated, redaction_types = _bounded_tool_content(
+            str(tool).strip(), _result_content(result), self._max_content_bytes,
         )
         canonical_key = canonical_evidence_key(
             tool, sanitized_arguments, result, source=sanitized_source, provenance=sanitized_provenance,
@@ -595,6 +635,12 @@ class EvidenceStore:
         )
         if raw_path is not None:
             source_path = _normalized_path(raw_path)
+            if str(tool).strip() == "read_remote_file":
+                repository = _normalized_path(
+                    sanitized_arguments.get("repository", "")
+                )
+                revision = str(sanitized_arguments.get("ref", "")).strip()
+                source_path = f"@remote/{repository}@{revision}/{source_path}"
         evidence_id = canonical_key
         if status not in _SUCCESS_STATUSES:
             self._failed_attempts += 1
@@ -617,9 +663,10 @@ class EvidenceStore:
             content=content,
             content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
             mime_type=str(mime_type).strip() if mime_type else None,
-            truncated=truncated,
+            truncated=truncated or _result_truncated(result),
             redacted=redacted or arguments_redacted or provenance_redacted or source_redacted,
             imported_by=(session_id,),
+            redaction_types=redaction_types,
             supersedes=canonical_supersedes,
             contradicts=canonical_contradicts,
         )
@@ -744,4 +791,5 @@ class EvidenceStore:
                 self._associations[key]
                 for key in sorted(self._associations)
             ),
+            max_content_bytes=self._max_content_bytes,
         )

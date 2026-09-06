@@ -15,8 +15,11 @@ from typing import Any, Callable, Mapping, Protocol
 
 from pr_reviewer.conversation import Conversation
 from pr_reviewer.stream_watchdog import StreamWatchdog
-from pr_reviewer.tool_loop import extract_intermediate_turn
-from pr_reviewer.transport import run_chat_request
+from pr_reviewer.tool_loop import (
+    effective_intermediate_text,
+    extract_intermediate_turn_parts,
+)
+from pr_reviewer.transport import is_model_endpoint_unavailable, run_chat_request
 
 # ``transport`` adds scripts/ to sys.path before importing this module's
 # dependencies, so this is the same redaction implementation used by the
@@ -47,6 +50,7 @@ class ModelTurnRequest:
     keep_full_history_on_verdict: bool = True
     response_format_override: str | None = None
     ephemeral_user_note: str | None = None
+    allow_fallbacks: bool = True
 
 
 @dataclass(frozen=True)
@@ -62,6 +66,15 @@ class ModelTurnResult:
     request_diagnostics: dict[str, Any]
     stream_watchdog_triggered: bool = False
     stream_watchdog_reason: str = ""
+    content: str = ""
+    reasoning: str = ""
+
+    def __post_init__(self) -> None:
+        # Backward compatibility for in-process gateways that predate the
+        # explicit content field. Reasoning fallbacks are intentionally never
+        # promoted to declared content.
+        if self.text_source == "content" and self.content != self.text:
+            object.__setattr__(self, "content", self.text)
 
 
 class ModelGateway(Protocol):
@@ -82,6 +95,7 @@ class OpenAIModelGateway:
     api_format: str = "openai"
     response_format: str = "json_schema"
     stream_watchdog: bool = True
+    structured_chat_template_kwargs: Mapping[str, Any] = field(default_factory=dict)
     transport: Transport | None = None
 
     def __post_init__(self) -> None:
@@ -105,16 +119,10 @@ class OpenAIModelGateway:
         """Return the configured override, otherwise the deterministic default."""
         return self.role_models.get(role, self.default_model)
 
-    def complete(self, request: ModelTurnRequest) -> ModelTurnResult:
-        """Render and issue exactly one logical model turn.
-
-        Structured-output and streaming retries may cause multiple physical
-        requests, but each uses the same absolute request deadline.
-        """
+    def render_request(self, request: ModelTurnRequest) -> dict[str, Any]:
+        """Render the exact provider payload used for a model turn."""
         if request.max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
-        if request.timeout_sec <= 0:
-            raise ValueError("timeout_sec must be positive")
         response_format = (
             request.response_format_override
             if request.response_format_override is not None
@@ -138,6 +146,34 @@ class OpenAIModelGateway:
             tokens_param=request.tokens_param,
             cache_prefix=request.cache_prefix,
         )
+        if not request.tools_enabled and self.structured_chat_template_kwargs:
+            payload["chat_template_kwargs"] = dict(
+                self.structured_chat_template_kwargs
+            )
+        return payload
+
+    def rendered_request_bytes(self, request: ModelTurnRequest) -> int:
+        """Return the compact UTF-8 size of the exact provider payload."""
+        return len(json.dumps(
+            self.render_request(request),
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8"))
+
+    def complete(self, request: ModelTurnRequest) -> ModelTurnResult:
+        """Render and issue exactly one logical model turn.
+
+        Structured-output and streaming retries may cause multiple physical
+        requests, but each uses the same absolute request deadline.
+        """
+        if request.timeout_sec <= 0:
+            raise ValueError("timeout_sec must be positive")
+        response_format = (
+            request.response_format_override
+            if request.response_format_override is not None
+            else self.response_format
+        )
+        payload = self.render_request(request)
         response, diagnostics = self.complete_payload(
             payload,
             request.role,
@@ -145,8 +181,15 @@ class OpenAIModelGateway:
             deadline_at=request.deadline_at,
             requested_response_format=response_format,
             stream_watchdog=(StreamWatchdog("openai") if request.stream and self.stream_watchdog else None),
+            allow_fallbacks=request.allow_fallbacks,
         )
-        calls, text, text_source, finish_reason = extract_intermediate_turn(response, "openai")
+        calls, content, reasoning, finish_reason = extract_intermediate_turn_parts(
+            response, "openai"
+        )
+        text, text_source = effective_intermediate_text(
+            {"content": content, "reasoning_content": reasoning},
+            "openai",
+        )
         usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
         return ModelTurnResult(
             response=response,
@@ -158,6 +201,8 @@ class OpenAIModelGateway:
             request_diagnostics=diagnostics,
             stream_watchdog_triggered=bool(response.get("stream_watchdog_triggered")),
             stream_watchdog_reason=str(response.get("stream_watchdog_reason") or ""),
+            content=content,
+            reasoning=reasoning,
         )
 
     def complete_payload(
@@ -170,6 +215,7 @@ class OpenAIModelGateway:
         requested_response_format: str | None = None,
         compact_fallback_payload: dict[str, Any] | None = None,
         stream_watchdog: StreamWatchdog | None = None,
+        allow_fallbacks: bool = True,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Send an already-rendered OpenAI payload with hardened fallbacks.
 
@@ -215,6 +261,8 @@ class OpenAIModelGateway:
             try:
                 return post(candidate)
             except Exception as final_exc:
+                if is_model_endpoint_unavailable(final_exc):
+                    raise
                 final_error = mask_secrets(str(final_exc))[:1000]
                 raise RuntimeError(
                     f"structured output request failed: {original_error}; "
@@ -229,6 +277,10 @@ class OpenAIModelGateway:
         except Exception as exc:
             usable = False
             original_error = mask_secrets(str(exc))[:1000]
+            if is_model_endpoint_unavailable(exc):
+                raise
+            if not allow_fallbacks:
+                raise
             provider_rejected = bool(getattr(exc, "provider_rejected", False))
             if not payload.get("stream") or provider_rejected:
                 if "response_format" not in payload:
@@ -237,6 +289,11 @@ class OpenAIModelGateway:
                 usable = True
 
         if not usable:
+            if not allow_fallbacks:
+                raise RuntimeError(
+                    "model provider returned an unusable response: "
+                    + original_error
+                )
             fallback = {key: value for key, value in payload.items() if key != "stream_options"}
             fallback["stream"] = False
             try:

@@ -66,7 +66,9 @@ def test_migration_document_covers_required_repository_files():
         ".github/ai-review-specialists.json",
         ".github/ai-review-prompt.md",
         ".github/ai-review-policy.json",
+        ".github/ai-review-diff-priorities.json",
         "review_policy_file",
+        "review_diff_priority_file",
         "specialist_review_deadline_sec",
         "publish_mode",
     ):
@@ -97,6 +99,17 @@ def test_inert_legacy_limits_are_explicitly_deprecated_while_live_limits_remain_
     text = MIGRATION.read_text(encoding="utf-8").lower()
     assert "planner role does not expose tools" in text
     assert "durable sessions do not issue truncation-continuation turns" in text
+
+
+def test_migration_recommends_tool_capacity_for_multi_call_turns():
+    table = parse_migration_input_table()
+    text = MIGRATION.read_text(encoding="utf-8")
+
+    assert table["specialist_max_tool_calls_per_session"]["default"] == "128"
+    assert table["specialist_max_tool_calls_per_pass"]["default"] == "128"
+    assert "specialist_max_tool_calls_per_session: \"128\"" in text
+    assert "multi-call evidence turns" in text
+    assert "controller-accounted" in text
 
 
 def test_documented_v2_policy_parses_with_real_policy_api_and_is_source_safe(tmp_path):
@@ -169,3 +182,35 @@ def test_migration_explains_handoff_outputs_manual_label_safety_and_troubleshoot
         "Policy/source access is constrained or degraded",
     ):
         assert required in text
+
+
+def test_migration_contains_copy_ready_tested_qwen_baseline():
+    text = MIGRATION.read_text(encoding="utf-8")
+    normalized = " ".join(text.split())
+    for required in (
+        "125m125/pr-reviewer-action@9091b940f9f64081dcf64070b71f2a3552e36318",
+        'ai_model: qwen/qwen3.6-35b-a3b',
+        'ai_max_tokens: "8192"',
+        'model_context_tokens: "75000"',
+        'specialist_max_conversation_tokens: "60000"',
+        'specialist_structured_chat_template_kwargs:',
+        'specialist_planner_max_tokens: "8192"',
+        'specialist_max_tokens: "8192"',
+        "types: [labeled]",
+        "github.event.label.name == 'ai-review'",
+        "review_scope: full",
+        "standards_file: .github/ai-review-rules.md",
+        "## Downstream adaptation checklist",
+        "Keep these values initially",
+        "Change these repository-specific values",
+        "Tool access is disabled for checkpoint and repair turns",
+        "controller-owned coverage and evidence metadata",
+        "Structurally valid checkpoints are accepted in parts",
+        "authoritative receipt",
+        "candidate_drafts",
+        "needs_followup",
+        "independently",
+        "one bounded synthesis",
+        "Fresh version-2 adopters should not create this file",
+    ):
+        assert required in normalized

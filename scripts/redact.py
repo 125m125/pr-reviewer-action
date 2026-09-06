@@ -36,6 +36,53 @@ _RE_KUBE_CRED = re.compile(
     r"certificate-authority-data|bearer[_-]?token)\s*:\s*\S+"
 )
 
+_RE_SOURCE_KV_SECRET = re.compile(
+    r"(?i)(?P<key>api[_-]?key|api[_-]?token|auth[_-]?token|access[_-]?key|"
+    r"token|password|secret)"
+    r"(?P<separator>\s*[:=]\s*)"
+    r"(?P<quote>['\"]?)(?P<value>[^\s'\"]{8,})(?P=quote)"
+)
+_RE_DYNAMIC_REFERENCE = re.compile(
+    r"^(?:\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|"
+    r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|%[A-Za-z_][A-Za-z0-9_]*%|"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*\.)+(?:api[_-]?key|api[_-]?token|auth[_-]?token|"
+    r"access[_-]?key|token|password|secret))$"
+)
+
+
+def mask_source_secrets(text: str | None) -> tuple[str, int]:
+    """Mask literal source credentials without rewriting dynamic references.
+
+    The returned count describes controller-applied replacements. It is safe to
+    expose as metadata; it never implies that the reviewed application masked
+    the value itself.
+    """
+    if not text:
+        return text or "", 0
+
+    count = 0
+
+    def replace_key_value(match: re.Match[str]) -> str:
+        nonlocal count
+        key = match.group("key")
+        value = match.group("value")
+        normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
+        if _RE_DYNAMIC_REFERENCE.fullmatch(value):
+            return match.group(0)
+        if not match.group("quote") and re.sub(
+            r"[^a-z0-9]", "", value.lower()
+        ) == normalized_key:
+            return match.group(0)
+        count += 1
+        quote = match.group("quote")
+        return f"{key}{match.group('separator')}{quote}[REDACTED_VALUE]{quote}"
+
+    redacted = _RE_SOURCE_KV_SECRET.sub(replace_key_value, text)
+    for pattern in (_RE_GHP, _RE_GITHUB_PAT, _RE_BEARER, _RE_BASIC, _RE_AWS_KEY):
+        redacted, replacements = pattern.subn("[REDACTED_VALUE]", redacted)
+        count += replacements
+    return redacted, count
+
 
 def mask_secrets(text: str | None) -> str:
     """Return *text* with credential-like values replaced by ``[REDACTED]``.

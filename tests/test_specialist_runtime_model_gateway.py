@@ -26,6 +26,122 @@ def stop_response(content: str):
     }
 
 
+def turn_request(value, *, tools_enabled, response_schema=None):
+    return ModelTurnRequest(
+        role="specialist",
+        conversation=value,
+        max_tokens=512,
+        response_schema=response_schema,
+        tools_enabled=tools_enabled,
+        timeout_sec=20,
+        stream=False,
+    )
+
+
+def test_rendered_request_bytes_matches_compact_wire_payload_for_tools():
+    value = conversation("inspect the change")
+    value.tool_schemas = [{
+        "name": "read_file",
+        "description": "Read a repository file",
+        "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        },
+    }]
+    calls = []
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1", api_key="wire-secret", default_model="main",
+        transport=lambda *args, **kwargs: calls.append((args, kwargs)) or stop_response("{}"),
+    )
+    request = turn_request(value, tools_enabled=True)
+
+    payload = gateway.render_request(request)
+
+    assert payload["tools"][0]["function"]["name"] == "read_file"
+    assert "response_format" not in payload
+    assert "wire-secret" not in json.dumps(payload)
+    assert gateway.rendered_request_bytes(request) == len(json.dumps(
+        payload, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8"))
+    gateway.complete(request)
+    assert calls[0][0][2] == payload
+
+
+def test_rendered_request_bytes_uses_structured_schema_without_tools():
+    value = conversation("checkpoint now")
+    value.tool_schemas = [{
+        "name": "read_file",
+        "description": "Read a repository file",
+        "parameters": {"type": "object", "properties": {}},
+    }]
+    schema = {
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "required": ["summary"],
+    }
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1", api_key="", default_model="main",
+        response_format="json_schema",
+    )
+    request = turn_request(
+        value, tools_enabled=False, response_schema=schema,
+    )
+
+    payload = gateway.render_request(request)
+
+    assert "tools" not in payload
+    assert payload["response_format"]["type"] == "json_schema"
+    assert payload["response_format"]["json_schema"]["schema"] == schema
+    assert gateway.rendered_request_bytes(request) == len(json.dumps(
+        payload, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8"))
+
+
+def test_unreachable_endpoint_does_not_retry_without_structured_output():
+    calls = []
+
+    def unavailable(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise ModelRequestError("connection refused")
+
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1",
+        api_key="",
+        default_model="main",
+        response_format="json_schema",
+        transport=unavailable,
+    )
+
+    with pytest.raises(ModelRequestError, match="connection refused"):
+        gateway.complete(turn_request(
+            conversation("checkpoint"),
+            tools_enabled=False,
+            response_schema={"type": "object", "properties": {}},
+        ))
+
+    assert len(calls) == 1
+
+
+def test_structured_template_kwargs_apply_only_when_tools_are_disabled():
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1",
+        api_key="",
+        default_model="main",
+        structured_chat_template_kwargs={"enable_thinking": False},
+    )
+
+    structured = gateway.render_request(turn_request(
+        conversation("checkpoint"), tools_enabled=False,
+    ))
+    exploration = gateway.render_request(turn_request(
+        conversation("explore"), tools_enabled=True,
+    ))
+
+    assert structured["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "chat_template_kwargs" not in exploration
+
+
 def test_role_model_override_and_deadline_bound_timeout():
     calls = []
     gateway = OpenAIModelGateway(

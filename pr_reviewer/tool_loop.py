@@ -191,20 +191,35 @@ def extract_intermediate_turn(
     response: dict[str, Any], api_format: str
 ) -> tuple[list[dict[str, Any]], str, str, str]:
     """Return calls, effective text, text source, and provider finish reason."""
-    calls, text = extract_tool_calls(response, api_format)
-    finish_reason = ""
-    source = "content" if text.strip() else "none"
+    calls, content, reasoning, finish_reason = extract_intermediate_turn_parts(
+        response, api_format
+    )
+    text, source = effective_intermediate_text(
+        {"content": content, "reasoning_content": reasoning},
+        api_format,
+    )
+    return calls, text, source, finish_reason
+
+
+def extract_intermediate_turn_parts(
+    response: dict[str, Any], api_format: str
+) -> tuple[list[dict[str, Any]], str, str, str]:
+    """Return calls, ordinary content, private reasoning, and finish reason."""
+    calls, content = extract_tool_calls(response, api_format)
+    reasoning = ""
     if api_format == "openai":
         choices = response.get("choices")
         choice = choices[0] if isinstance(choices, list) and choices else {}
         message = choice.get("message") if isinstance(choice, dict) else {}
         if not isinstance(message, dict):
             message = {}
-        text, source = effective_intermediate_text(message, api_format)
+        raw_reasoning = message.get("reasoning_content")
+        if isinstance(raw_reasoning, str):
+            reasoning = raw_reasoning
         finish_reason = str(choice.get("finish_reason") or "")
     else:
         finish_reason = str(response.get("stop_reason") or "")
-    return calls, text, source, finish_reason
+    return calls, content, reasoning, finish_reason
 
 
 def extract_tool_calls(
@@ -334,6 +349,21 @@ def repetitive_assistant_text(text: str, previous: str = "") -> bool:
     return repeated >= int(len(current) * 0.6)
 
 
+def _append_intermediate_assistant(
+    conversation: Conversation,
+    *,
+    reasoning: str,
+    content: str,
+    calls: list[dict[str, Any]] | None = None,
+) -> None:
+    """Retain one provider turn without conflating private and visible text."""
+    conversation.add_assistant_turn(
+        reasoning=reasoning,
+        content=content,
+        calls=calls or (),
+    )
+
+
 def drive_tool_loop(
     conversation: Conversation,
     post_fn: Callable[[dict[str, Any]], dict[str, Any]],
@@ -405,6 +435,10 @@ def drive_tool_loop(
                     budgets.truncated_result_bytes
                 )
             if conversation.approx_tokens() > budgets.max_conversation_tokens:
+                conversation.truncate_oldest_assistant_reasoning(
+                    1000, keep_newest=budgets.summarize_keep_newest
+                )
+            if conversation.approx_tokens() > budgets.max_conversation_tokens:
                 conversation.truncate_oldest_assistant_text(
                     1000, keep_newest=budgets.summarize_keep_newest
                 )
@@ -430,26 +464,17 @@ def drive_tool_loop(
                 outcome.compaction_runs += 1
                 outcome.compaction_tokens_removed += removed
 
-        remaining_calls = max(0, budgets.max_tool_calls - calls_executed)
-        remaining_turns = max(0, budgets.max_rounds - outcome.planning_rounds)
-        budget_note = (
-            f"Exploration budget before this turn: {remaining_calls} tool calls "
-            f"and {remaining_turns} planning turns remain. Prioritize unresolved "
-            "correctness risks. Do not repeat completed checks. Stop requesting "
-            "tools when the evidence is sufficient so you can synthesize it."
-        )
-        if consecutive_no_progress:
-            allowance = max(0, budgets.max_consecutive_no_progress_rounds - consecutive_no_progress)
-            budget_note += (
-                f" No-progress allowance remaining: {allowance} round(s); another "
-                "duplicate cycle may end exploration."
-            )
+        # Budget values remain controller-owned state and are enforced below;
+        # do not inject them as an unsolicited user turn.  Some chat templates
+        # use the latest user turn to reconstruct reasoning state, so a
+        # transient status note can discard or distort prior reasoning.
+        repair_note = None
         if (
             textual_repair_pending
             and consecutive_textual_tool_repairs < budgets.max_textual_tool_repairs
             and outcome.textual_tool_repair_attempts < budgets.max_total_textual_tool_repairs
         ):
-            budget_note = _TEXTUAL_TOOL_REPAIR_NOTE + "\n\n" + budget_note
+            repair_note = _TEXTUAL_TOOL_REPAIR_NOTE
             outcome.textual_tool_repair_attempts += 1
             consecutive_textual_tool_repairs += 1
             outcome.consecutive_textual_tool_repair_attempts = consecutive_textual_tool_repairs
@@ -463,7 +488,7 @@ def drive_tool_loop(
             reasoning_effort=reasoning_effort,
             tokens_param=tokens_param,
             cache_prefix=cache_prefix,
-            ephemeral_user_note=budget_note,
+            ephemeral_user_note=repair_note,
         )
         try:
             response = post_fn(payload)
@@ -473,8 +498,12 @@ def drive_tool_loop(
             break
 
         outcome.rounds += 1
-        calls, text, text_source, finish_reason = extract_intermediate_turn(
+        calls, content, reasoning, finish_reason = extract_intermediate_turn_parts(
             response, api_format
+        )
+        text, text_source = effective_intermediate_text(
+            {"content": content, "reasoning_content": reasoning},
+            api_format,
         )
         if calls:
             outcome.tool_only_rounds += 1
@@ -508,8 +537,11 @@ def drive_tool_loop(
             if markers:
                 outcome.textual_tool_intent_detected = True
                 outcome.textual_tool_intent_markers.extend(markers)
-                if text:
-                    conversation.add_assistant_text(text)
+                _append_intermediate_assistant(
+                    conversation,
+                    reasoning=reasoning,
+                    content=content,
+                )
                 if (
                     not textual_repair_pending
                     and consecutive_textual_tool_repairs < budgets.max_textual_tool_repairs
@@ -527,8 +559,11 @@ def drive_tool_loop(
                 )
                 break
             if repetitive:
-                if text:
-                    conversation.add_assistant_text(text)
+                _append_intermediate_assistant(
+                    conversation,
+                    reasoning=reasoning,
+                    content=content,
+                )
                 conversation.add_system_note(_STAGNATION_NOTE)
                 outcome.final_text = text
                 outcome.final_text_source = text_source
@@ -537,7 +572,11 @@ def drive_tool_loop(
                 break
             if finish_reason == "length":
                 if text:
-                    conversation.add_assistant_text(text)
+                    _append_intermediate_assistant(
+                        conversation,
+                        reasoning=reasoning,
+                        content=content,
+                    )
                     outcome.final_text = text
                     outcome.final_text_source = text_source
                     outcome.preserved_truncated_bytes = len(text.encode("utf-8"))
@@ -566,12 +605,12 @@ def drive_tool_loop(
             )
             break
 
-        if text:
-            # Interleaved reasoning text rides along inside the same
-            # assistant turn on the wire; Conversation stores it as a
-            # separate event, which both renderers merge correctly.
-            conversation.add_assistant_text(text)
-        conversation.add_assistant_tool_calls(calls)
+        _append_intermediate_assistant(
+            conversation,
+            reasoning=reasoning,
+            content=content,
+            calls=calls,
+        )
         outcome.tool_calls_issued += len(calls)
 
         # Decide each call's disposition SEQUENTIALLY — dedup (seen_keys) and

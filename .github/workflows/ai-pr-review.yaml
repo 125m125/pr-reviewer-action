@@ -2,7 +2,6 @@ name: AI PR Review
 
 on:
   pull_request:
-    branches: ["main"]
     # Reviews are requested explicitly by a maintainer adding `ai-review`.
     types: [labeled]
 
@@ -11,6 +10,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
   packages: read
   pull-requests: write
@@ -81,7 +81,7 @@ jobs:
       - name: Review pull request
         # Fork of pr-reviewer-action v2.0.0 with generic, model-planned specialist
         # reviews and LM Studio reasoning-channel compatibility; pinned for safety.
-        uses: 125m125/pr-reviewer-action@e1a3f548d54945158c9a9bff8aa960a3b31b891d
+        uses: 125m125/pr-reviewer-action@c6766550980bda28857561e02873245eface1865 # Fix documentation URL screening
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -97,7 +97,7 @@ jobs:
           ai_verdict_reasoning_effort: none
           ai_stream: "true"
           ai_max_tokens: "8192"
-          model_context_tokens: "262144"
+          model_context_tokens: "75000"
           ai_request_timeout_sec: "1200"
           standards_file: .github/ai-review-rules.md
           system_prompt_file: .github/ai-review-prompt.md
@@ -116,23 +116,26 @@ jobs:
           specialist_review_deadline_sec: "7200"
           specialist_phase_shares: '{"planning":10,"initial":60,"followup":20,"finalization":10}'
           specialist_concurrency: "1"
-          specialist_max_sessions: "8"
+          specialist_max_sessions: "12"
           specialist_max_followup_sessions: "2"
           specialist_max_model_turns_per_session: "64"
-          specialist_max_tool_calls_per_session: "20"
+          specialist_max_tool_calls_per_session: "128"
+          specialist_max_total_model_turns: "320"
+          specialist_max_total_tool_calls: "640"
           specialist_max_recoveries_per_session: "1"
 
           specialist_planner_max_tokens: "8192"
-          specialist_planner_max_context_bytes: "400000"
+          specialist_planner_max_context_bytes: "180000"
 
           specialist_pass_timeout_sec: "1200"
           specialist_max_tokens: "8192"
           # Keep the larger project-specific budgets; the new watchdog still
           # interrupts repetitive streamed output before it consumes them.
           specialist_recovery_max_tokens: "4096"
-          specialist_max_conversation_tokens: "200000"
+          specialist_max_conversation_tokens: "60000"
           specialist_temperature: "0.6"
           specialist_stream_watchdog: "true"
+          specialist_structured_chat_template_kwargs: '{"enable_thinking":false}'
 
           # Specialist calls reuse the existing read-only executor restrictions.
           tool_max_response_bytes: "12000"
@@ -144,6 +147,7 @@ jobs:
           # endpoint. An empty value leaves web_search unavailable; fetched
           # results remain constrained by the current-branch policy allowlist.
           search_url: ${{ vars.AI_REVIEW_SEARCH_URL }}
+          allow_private_search_url: "true"
           tool_max_search_results: "5"
 
           # Publish a short sticky summary and attach supported findings to the

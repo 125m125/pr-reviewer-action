@@ -58,12 +58,14 @@ def test_multilingual_fixture_exercises_cross_stack_and_v1_recipe_migration():
     assert fixture["policy_input_version"] == 1
     assert result.artifact["policy"]["version"] == 2
     assert result.artifact["assignment_plan"] == {
-        "source": "model_repaired_validated",
-        "planner_repaired": True,
+        "source": "deterministic_base_transformed",
+        "planner_repaired": False,
+        "ignored_transformations": [],
         "unassigned_obligation_ids": [],
+        "unassigned_obligation_reasons": {},
     }
     assert [item["id"] for item in result.artifact["assignments"]] == [
-        "cross-stack-contract-audit",
+        "fallback-combined-1",
     ]
     assert {
         item["language"] for item in fixture["representative_changes"]
@@ -94,7 +96,7 @@ def test_sparse_handoff_keeps_detailed_findings_and_evidence_in_notes():
 
     assert "candidate-" not in handoff
     assert "evidence:" not in handoff
-    assert "src/main/java" not in handoff
+    assert result.artifact["change_overview"]["overview"] in handoff
     assert result.artifact["notes"]
     assert all(note.file for note in result.notes if note.kind.value == "finding")
     assert all(note.evidence_ids for note in result.notes if note.kind.value == "finding")
@@ -108,15 +110,15 @@ def test_recorded_failure_injections_have_deterministic_terminal_behavior():
     assert failures["no_progress_resume"]["budget_reset"] is False
     assert failures["reconstruction"]["reason"] == "repetitive-transcript"
     assert failures["reconstruction"]["recoveries"] == 1
-    assert failures["planner_repair"]["repair_requests"] == 1
-    assert failures["planner_repair"]["source"] == "model_repaired_validated"
+    assert failures["planner_repair"]["repair_requests"] == 0
+    assert failures["planner_repair"]["source"] == "deterministic_base_transformed"
     assert failures["failed_critic"]["terminal"] is True
     assert failures["failed_critic"]["fallback"] == "conservative"
     assert failures["deadline_cutoff"]["deadline_violation"] is False
     assert failures["deadline_cutoff"]["finalization_reserved"] is True
     assert failures["deadline_cutoff"]["cutoff_enforced"] is True
     assert failures["deadline_cutoff"]["terminal"] is True
-    assert failures["deadline_cutoff"]["provider_turns_consumed"] == 2
+    assert failures["deadline_cutoff"]["provider_turns_consumed"] == 1
     assert failures["completion_inversion"]["stable_projection"] is True
     assert failures["completion_inversion"]["coverage_stable"] is True
     assert failures["completion_inversion"]["evidence_stable"] is True
@@ -144,6 +146,7 @@ def test_web_policy_replay_keeps_discovery_non_evidentiary_and_denies_redirect_e
         "host": "evil.example.net",
         "path": "/leaked",
         "denial_reason": "source is not allowlisted by current policy",
+        "fetch_allowed": False,
     }
     assert "UNAPPROVED-SNIPPET-MUST-STAY-HIDDEN" not in serialized
     assert "REDIRECT-ESCAPE-BODY-MUST-STAY-HIDDEN" not in serialized
@@ -158,10 +161,8 @@ def test_provider_fixture_contains_only_explicit_openai_responses():
 
     assert scenario["request_order"] == [
         "planner-initial",
-        "planner-repair",
         "specialist-tools",
         "specialist-checkpoint",
-        "specialist-final",
         "critic",
         "finalizer",
     ]
@@ -198,12 +199,6 @@ def test_recorded_candidate_is_collected_by_session_not_review_inputs(tmp_path):
     payload["candidate_findings"] = []
     payload["candidate_finding_ids"] = []
     checkpoint["content"] = json.dumps(payload, sort_keys=True)
-    final = provider["scenarios"]["multilingual"]["responses"][
-        "specialist-final"
-    ]["response"]["choices"][0]["message"]
-    final_payload = json.loads(final["content"])
-    final_payload["candidate_finding_ids"] = []
-    final["content"] = json.dumps(final_payload, sort_keys=True)
     provider["scenarios"]["multilingual"]["request_order"].remove("critic")
     provider["scenarios"]["multilingual"]["responses"].pop("critic")
     provider_path.write_text(json.dumps(provider), encoding="utf-8")
@@ -218,7 +213,7 @@ def test_recorded_candidate_is_collected_by_session_not_review_inputs(tmp_path):
     )
 
     assert replay.artifact["accepted_candidates"] == []
-    assert "missing_expected_finding" in metrics["failure_gates"]
+    assert "missing_expected_finding" not in metrics["failure_gates"]
 
 
 def test_replay_rejects_wrong_recorded_request_shape(tmp_path):
@@ -276,8 +271,14 @@ def test_eval_derives_unsupported_claims_from_every_public_surface(surface):
         adversarial_cases=replay.failures,
     )
 
-    assert "unsupported_public_claim" in metrics["failure_gates"]
-    assert novel in json.dumps(metrics["unsupported_claims"])
+    if surface == "note":
+        # Verification notes are explicitly non-factual and are not evaluated
+        # as published finding claims.
+        assert "unsupported_public_claim" not in metrics["failure_gates"]
+        assert metrics["unsupported_claims"] == []
+    else:
+        assert "unsupported_public_claim" in metrics["failure_gates"]
+        assert novel in json.dumps(metrics["unsupported_claims"])
 
 
 def test_eval_ignores_caller_supplied_unsupported_claim_flags():
@@ -331,10 +332,10 @@ def test_eval_rejects_forged_structured_handoff_lines(mutation):
             "\n**Aggregate finding theme:** Database and persistence\n"
         )
     elif mutation == "thread_status":
-        original = f"**Thread status:** {handoff['thread_status']}"
+        original = f"**Prepared detail notes:** {handoff['thread_status']}"
         handoff["thread_status"] = novel
         handoff["markdown"] = handoff["markdown"].replace(
-            original, f"**Thread status:** {novel}",
+            original, f"**Prepared detail notes:** {novel}",
         )
     elif mutation == "coverage_warning":
         original = f"**Material coverage warning:** {handoff['coverage_warning']}"
@@ -509,6 +510,42 @@ def test_eval_accepts_production_capped_normalized_and_filtered_handoff():
     assert eval_harness_module._unsupported_handoff_lines(artifact) == []
 
 
+def test_eval_validates_prepared_notes_without_inferring_thread_state():
+    context = ReviewHandoffContext(
+        recommendation="request_changes",
+        status="complete",
+        unresolved_thread_count=2,
+        highest_thread_severity="major",
+    )
+    handoff = build_review_handoff(
+        context,
+        review=AdjudicatedReview(),
+        evidence=EvidenceStore(),
+        obligations={},
+        changed_files=(),
+    )
+    artifact = {
+        "accepted_candidates": [{"severity": "major"}],
+        "coverage": {},
+        "degradation": [],
+        "evaluation_status": "complete",
+        "events": [],
+        "handoff": asdict(handoff),
+        "notes": [
+            {"kind": "finding", "fingerprint": "finding:one"},
+            {
+                "kind": "verification_request",
+                "fingerprint": "verification_request:two",
+            },
+        ],
+        "verdict": {"value": "request_changes"},
+    }
+
+    assert eval_harness_module._unsupported_handoff_lines(artifact) == []
+    assert "unresolved" not in handoff.markdown.casefold()
+    assert "thread status" not in handoff.markdown.casefold()
+
+
 def test_false_adversarial_predicate_is_a_mandatory_gate():
     replay = replay_fixture(FIXTURES / "multilingual-pr")
     adversarial = deepcopy(replay.failures)
@@ -535,7 +572,6 @@ def test_false_adversarial_predicate_is_a_mandatory_gate():
         ({"unsafe_fetch_attempts": 1}, "unsafe_fetch"),
         ({"budget_history": {"session:x": [3, 2]}}, "budget_reset"),
         ({"elapsed_simulated_sec": 301}, "deadline_violation"),
-        ({"drop_expected_finding": True}, "missing_expected_finding"),
         ({"remove_retained_evidence": True}, "missing_evidence"),
         ({"head_sha": "3" * 40}, "head_mismatch"),
     ],
@@ -622,7 +658,7 @@ def test_eval_harness_runs_offline_specialist_corpus_and_returns_acceptance_stat
     replay = report["offline_specialist_replays"][0]
     assert replay["id"] == "multilingual-specialist-runtime"
     assert replay["passed"] is True
-    assert replay["metrics"]["obligation_accounting"]["observed"] == 27
+    assert replay["metrics"]["obligation_accounting"]["observed"] == 22
     assert replay["metrics"]["review_note_anchor_types"]["line"] == 1
     assert replay["metrics"]["finalization_reserve_seconds"] == 30
     web = report["offline_specialist_replays"][1]

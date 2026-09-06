@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import random
 import string
 import threading
@@ -17,12 +18,14 @@ from pr_reviewer.specialist_runtime.web_evidence import (
     HttpRequest,
     HttpResponse,
     SearchCandidate,
+    SearchResultRegistry,
     SearxngSearchProvider,
     SecureFetcher,
     SourceDenied,
     SourcePolicy,
     StdlibHttpTransport,
     discover,
+    repository_access_request,
     source_access_request,
 )
 
@@ -58,6 +61,24 @@ def test_search_returns_snippets_only_for_approved_sources():
     assert result.unapproved[0].host == "blog.invalid"
     assert result.unapproved[0].snippet is None
     assert "unapproved content" not in result.to_tool_result()
+    assert result.as_dict()["approved"][0]["fetch_allowed"] is True
+    assert result.as_dict()["unapproved"][0]["fetch_allowed"] is False
+
+
+def test_search_provider_cannot_invent_an_opaque_result_handle():
+    result = discover(
+        "api behavior",
+        FakeSearchProvider([SearchCandidate(
+            "Official", "https://docs.example.com/api", "trusted snippet",
+            result_id="search-result-999",
+        )]),
+        source_policy(),
+        result_registry=SearchResultRegistry(),
+    ).as_dict()["approved"][0]
+
+    assert result["fetch_method"] == "url"
+    assert result["url"] == "https://docs.example.com/api"
+    assert "result_id" not in result
 
 
 def test_unapproved_candidate_creates_request_without_fetching():
@@ -143,6 +164,44 @@ def test_source_access_request_preserves_case_normalized_https_scheme():
     assert request.candidate_url == "https://docs.example.com:8443/schema/v1"
 
 
+@pytest.mark.parametrize("revision", ("a" * 40, "b" * 64))
+def test_repository_access_request_derives_exact_revision_and_safe_purpose(revision):
+
+    request = repository_access_request(
+        f"repos/125m125/pr-reviewer-action/commits/{revision}",
+        "OB-workflow",
+        "Verify changed workflow dependencies.",
+        "Check token ghp_abcdefghijklmnopqrstuvwxyz1234567890 and pinned behavior.",
+        "Repo not allowed: 125m125/pr-reviewer-action",
+    )
+
+    assert request.repository == "125m125/pr-reviewer-action"
+    assert request.endpoint == (
+        f"repos/125m125/pr-reviewer-action/commits/{revision}"
+    )
+    assert request.revision == revision
+    assert request.obligation_id == "OB-workflow"
+    assert "exact pinned repository revision" in request.purpose
+    assert "Verify changed workflow dependencies" in request.purpose
+    assert "ghp_" not in request.model_purpose
+    assert "[REDACTED]" in request.model_purpose
+    assert request.as_dict()["kind"] == "repository_access_request"
+
+
+@pytest.mark.parametrize("endpoint", (
+    "https://api.github.com/repos/a/b/commits/" + "a" * 40,
+    "repos/a/../b/commits/" + "a" * 40,
+    "repos/a/b/actions/secrets",
+    "search/code?q=repo:a/b",
+    "repos/a/b/commits/" + "a" * 40 + "#fragment",
+))
+def test_repository_access_request_rejects_noncanonical_or_unsafe_endpoint(endpoint):
+    with pytest.raises(ValueError, match="repository API endpoint"):
+        repository_access_request(
+            endpoint, "OB-workflow", "Verify dependency.", "", "Repo not allowed",
+        )
+
+
 def test_discovery_scans_bounded_results_and_caps_approved_output():
     provider = FakeSearchProvider([
         SearchCandidate(str(index), f"https://docs.example.com/{index}", "snippet")
@@ -159,6 +218,40 @@ def test_discovery_scans_bounded_results_and_caps_approved_output():
     assert result.suppressed_result_count == 2
 
 
+def test_discovery_caps_unapproved_output_with_the_public_result_limit():
+    provider = FakeSearchProvider([
+        SearchCandidate(str(index), f"https://blog{index}.invalid/post", "snippet")
+        for index in range(6)
+    ])
+
+    result = discover(
+        "release support", provider, source_policy(),
+        search_scan_limit=6, tool_max_search_results=2,
+    )
+
+    assert len(result.approved) == 0
+    assert len(result.unapproved) == 2
+    assert result.suppressed_result_count == 4
+
+
+def test_discovery_prioritizes_approved_results_over_denied_metadata():
+    provider = FakeSearchProvider([
+        SearchCandidate("Blog", "https://blog.invalid/post", "untrusted"),
+        SearchCandidate("Official", "https://docs.example.com/api", "trusted"),
+    ])
+
+    result = discover(
+        "release support", provider, source_policy(),
+        search_scan_limit=2, tool_max_search_results=1,
+    )
+
+    assert [item.url for item in result.approved] == [
+        "https://docs.example.com/api"
+    ]
+    assert result.unapproved == ()
+    assert result.suppressed_result_count == 1
+
+
 def test_source_policy_requires_explicit_subdomain_and_path_match():
     exact = source_policy(SourceRule(
         host="example.com", path_prefixes=("/docs",), classification="documentation"
@@ -172,6 +265,42 @@ def test_source_policy_requires_explicit_subdomain_and_path_match():
     assert exact.classify("https://api.example.com/docs/api").approved is False
     assert exact.classify("https://example.com/docs-evil").approved is False
     assert subdomains.classify("https://api.example.com/docs/api").approved is True
+
+
+@pytest.mark.parametrize("path", [
+    "/en/actions/how-tos/customize-your-workflow/save-workflow-data-as-an-artifact",
+    "/en/actions/writing-workflows/choosing-what-your-workflow-does/permissions-for-the-github_token",
+    "/en/actions/using-jobs/assigning-permissions-to-jobs",
+    "/en/actions/security-guides/automatic-token-authentication",
+    "/en/actions/reference/README.md",
+])
+def test_source_policy_accepts_word_like_documentation_slugs(path):
+    policy = source_policy(SourceRule(
+        host="docs.github.com", path_prefixes=("/en/actions",),
+        classification="official-github-documentation",
+    ))
+
+    decision = policy.classify("https://docs.github.com" + path)
+
+    assert decision.approved is True
+
+
+@pytest.mark.parametrize("url", [
+    "https://api.github.com/repos/actions/upload-artifact/contents/README.md",
+    "https://raw.githubusercontent.com/actions/upload-artifact/ea165f8d65b6e75b540449e92b4886f43607fa02/README.md",
+])
+def test_foreign_web_sources_report_allowlist_denial_before_entropy(url):
+    decision = source_policy().classify(url)
+    assert decision.approved is False
+    assert decision.reason == "source is not allowlisted by current policy"
+
+
+def test_query_payload_does_not_receive_documentation_slug_exemption():
+    decision = source_policy().classify(
+        "https://docs.example.com/api?value=" + "abcdefghijklmnopqrstuvwxyz" * 2
+    )
+    assert decision.approved is False
+    assert decision.reason == "unsafe high-entropy URL payload"
 
 
 @pytest.mark.parametrize("encoded_parent", ["%2e%2e", "%252e%252e"])
@@ -244,6 +373,53 @@ def test_entropy_detection_is_independent_of_alphabet_composition(token):
     ).unapproved[0]
     assert token not in denied.path
     assert denied.path == "/[REDACTED]"
+
+
+def test_allowlisted_opaque_search_result_uses_session_handle_without_exposing_url():
+    token = "0123456789abcdef" * 4
+    url = f"https://docs.example.com/api/{token}?page=2&cursor={token}"
+    registry = SearchResultRegistry()
+
+    discovery = discover(
+        "api behavior",
+        FakeSearchProvider([SearchCandidate("Official docs", url, "trusted snippet")]),
+        source_policy(),
+        result_registry=registry,
+    )
+    payload = discovery.as_dict()
+
+    assert len(payload["approved"]) == 1
+    candidate = payload["approved"][0]
+    assert candidate["result_id"] == "search-result-1"
+    assert candidate["fetch_method"] == "result_id"
+    assert candidate["fetch_allowed"] is True
+    assert candidate["snippet"] == "trusted snippet"
+    assert "url" not in candidate
+    assert token not in json.dumps(payload)
+    assert registry.resolve("search-result-1") == url
+
+
+@pytest.mark.parametrize("query", (
+    "token=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "X-Amz-Signature=" + "a" * 64,
+))
+def test_credential_bearing_search_result_never_receives_fetch_handle(query):
+    registry = SearchResultRegistry()
+    url = f"https://docs.example.com/api?{query}"
+
+    discovery = discover(
+        "api behavior",
+        FakeSearchProvider([SearchCandidate("Private link", url, "do not retain")]),
+        source_policy(),
+        result_registry=registry,
+    )
+    payload = discovery.as_dict()
+
+    assert payload["approved"] == []
+    assert payload["unapproved"][0]["fetch_allowed"] is False
+    assert "result_id" not in payload["unapproved"][0]
+    with pytest.raises(SourceDenied, match="unknown search result"):
+        registry.resolve("search-result-1")
 
 
 def test_discovery_rejects_overlong_query():
@@ -323,6 +499,47 @@ def test_every_redirect_is_resolved_and_connected_to_checked_ip():
     assert [request.resolved_ip for request in transport.requests] == [PUBLIC_IP, PUBLIC_IP]
     assert result.content == "supported"
     assert result.provenance.final_url == "https://docs.example.com/final"
+
+
+def test_secure_fetch_prefers_markdown_then_plain_text_then_html():
+    url = "https://docs.example.com/api"
+    transport = FakeHttpTransport({
+        url: HttpResponse(
+            200, {"Content-Type": "text/markdown; charset=utf-8"},
+            b"# API\n\nSupported.",
+        ),
+    })
+
+    result = SecureFetcher(
+        source_policy(), transport=transport, resolver=public_resolver,
+    ).fetch(url)
+
+    accept = transport.requests[0].headers["Accept"]
+    assert accept.index("text/markdown") < accept.index("text/plain")
+    assert accept.index("text/plain") < accept.index("text/html")
+    assert result.mime_type == "text/markdown"
+    assert result.content == "# API\n\nSupported."
+
+
+def test_documentation_redirect_accepts_underscore_slug_without_relaxing_host_policy():
+    start = "https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs"
+    destination = (
+        "https://docs.github.com/en/actions/writing-workflows/"
+        "choosing-what-your-workflow-does/permissions-for-the-github_token"
+    )
+    transport = FakeHttpTransport({
+        start: HttpResponse(301, {"Location": destination}, b""),
+        destination: HttpResponse(200, {"Content-Type": "text/markdown"}, b"# Permissions"),
+    })
+    policy = source_policy(SourceRule(
+        host="docs.github.com", path_prefixes=("/en/actions",),
+        classification="official-github-documentation",
+    ))
+    result = SecureFetcher(
+        policy, transport=transport, resolver=public_resolver,
+    ).fetch(start)
+    assert result.content == "# Permissions"
+    assert result.provenance.final_url == destination
 
 
 @pytest.mark.parametrize("resolved_ip", [

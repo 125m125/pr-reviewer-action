@@ -14,9 +14,9 @@ def test_specialist_runner_is_only_a_path_bootstrap_and_cli_wrapper():
     assert len(script.splitlines()) <= 18
 
 
-def test_specialist_result_bypasses_whole_pr_model_for_complete_or_degraded_runs():
+def test_specialist_result_bypasses_whole_pr_model_for_terminal_runtime_runs():
     review = (ROOT / "scripts" / "sections" / "review.sh").read_text(encoding="utf-8")
-    assert '[[ "$SPECIALIST_EVALUATION_STATUS" == "complete" || "$SPECIALIST_EVALUATION_STATUS" == "degraded" ]]' in review
+    assert '[[ "$SPECIALIST_EVALUATION_STATUS" == "complete" || "$SPECIALIST_EVALUATION_STATUS" == "degraded" || "$SPECIALIST_EVALUATION_STATUS" == "incomplete" ]]' in review
     assert "cp specialist-ai-output.json ai-output.json" in review
 
 

@@ -398,7 +398,12 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
 
     proposal: Mapping[str, Any] = {}
     for event in artifact.get("events", ()):
-        if isinstance(event, Mapping) and event.get("kind") == "finalizer_proposal_applied":
+        if (
+            isinstance(event, Mapping)
+            and event.get("kind") in {
+                "finalizer_proposal_applied", "handoff_summary_applied",
+            }
+        ):
             payload = event.get("payload")
             if isinstance(payload, Mapping):
                 proposal = payload
@@ -443,26 +448,65 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
         source_requests, (str, bytes)
     ):
         source_requests = ()
+    authorized_changed_paths = {
+        str(value.get("path") or "").strip()
+        for value in artifact.get("evidence", ())
+        if isinstance(value, Mapping) and str(value.get("path") or "").strip()
+    }
+    for assignment in artifact.get("assignments", ()):
+        if not isinstance(assignment, Mapping):
+            continue
+        for key in ("seed_paths", "boundary_paths"):
+            raw_paths = assignment.get(key, ())
+            if isinstance(raw_paths, Sequence) and not isinstance(raw_paths, (str, bytes)):
+                authorized_changed_paths.update(
+                    str(path).strip() for path in raw_paths if str(path).strip()
+                )
     degradations = artifact.get("degradation", ())
     if not isinstance(degradations, Sequence) or isinstance(
         degradations, (str, bytes)
     ):
         degradations = ()
+    prepared_notes = artifact.get("notes", ())
+    if not isinstance(prepared_notes, Sequence) or isinstance(
+        prepared_notes, (str, bytes)
+    ):
+        prepared_notes = ()
+    prepared_note_count = sum(
+        1 for item in prepared_notes if isinstance(item, Mapping)
+    )
+    verdict_projection = artifact.get("verdict", {})
+    verdict_source = (
+        str(verdict_projection.get("source") or "")
+        if isinstance(verdict_projection, Mapping) else ""
+    )
     context = ReviewHandoffContext(
-        recommendation=verdict_value,
+        recommendation=(
+            "no_blocking_findings"
+            if verdict_source == "approval-disabled"
+            and not tuple(
+                verdict_projection.get("blocking_finding_ids", ())
+                if isinstance(verdict_projection, Mapping) else ()
+            )
+            and not tuple(
+                verdict_projection.get("blocking_obligation_ids", ())
+                if isinstance(verdict_projection, Mapping) else ()
+            )
+            else verdict_value
+        ),
         status=str(artifact.get("evaluation_status") or ""),
         change_topics=topics("change_topics"),
         component_ids=values("component_ids"),
         specialist_topics=topics("specialist_topics"),
         recipe_ids=values("recipe_ids"),
         coverage_boundary_topics=topics("coverage_boundary_topics"),
-        unresolved_thread_count=len(accepted),
+        unresolved_thread_count=prepared_note_count,
         highest_thread_severity=(
             max(
                 (str(item.get("severity") or "info") for item in accepted),
                 key=lambda value: severity_rank.get(value, 0),
             )
-            if accepted else None
+            if accepted and prepared_note_count else None
         ),
         review_emphasis_topics=topics("review_emphasis_topics"),
         material_coverage_limited=bool(artifact.get("degradation")),
@@ -473,6 +517,12 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
             and str(item.get("component", "")).strip()
         ),
         source_access_requests=tuple(source_requests),
+        what_changed=values("what_changed"),
+        what_changed_is_validated_overview=bool(
+            proposal.get("what_changed_is_validated_overview", False)
+        ),
+        ai_reviewed=values("ai_reviewed"),
+        human_focus=values("human_focus"),
     )
     expected = project_review_handoff(
         context,
@@ -484,6 +534,7 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
             artifact.get("evidence", ()),
         ),
         obligations=obligations,
+        changed_files=tuple(sorted(authorized_changed_paths)),
     )
 
     structured_fields = (
@@ -500,6 +551,9 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
         "coverage_warning",
         "access_request_count",
         "access_request_url",
+        "what_changed",
+        "ai_reviewed",
+        "human_focus",
     )
     sequence_fields = {
         "change_map",
@@ -508,6 +562,9 @@ def _unsupported_handoff_lines(artifact: Mapping[str, Any]) -> list[str]:
         "recipe_focuses",
         "coverage_boundaries",
         "review_emphasis",
+        "what_changed",
+        "ai_reviewed",
+        "human_focus",
     }
     unsupported = [
         f"handoff has invalid projection value: {value}"
@@ -538,14 +595,68 @@ def _expected_finding_note(finding: Mapping[str, Any]) -> str:
     def citation_lines(values: object) -> list[str]:
         if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
             return []
-        return [
-            "- ID " + _quoted_note(item.get("evidence_id"), limit=160)
-            + "; category " + _quoted_note(item.get("category"), limit=100)
-            + "; tool " + _quoted_note(item.get("tool"), limit=100)
-            + "; source " + _quoted_note(item.get("source"))
-            + "; content hash " + _quoted_note(item.get("content_hash"), limit=80)
-            for item in values if isinstance(item, Mapping)
-        ]
+        source_kinds: dict[str, set[str]] = {}
+        for item in values:
+            if not isinstance(item, Mapping):
+                continue
+            source = str(item.get("source") or "").strip() or "retained-tool-result"
+            if source.startswith("path:"):
+                source = source[5:]
+            path = source.replace("\\", "/").casefold()
+            tool = str(item.get("tool") or "").strip().casefold()
+            category = str(item.get("category") or "").strip().casefold()
+            if tool == "ci_test_results" or category in {
+                "test-result", "test-results", "behavioral-test",
+            }:
+                kind = "ci"
+            elif tool == "read_pr_diff":
+                kind = "diff"
+            elif (
+                category in {"test", "tests"}
+                or path.startswith(("test/", "tests/"))
+                or "/test/" in path
+                or "/tests/" in path
+            ):
+                kind = "test"
+            elif tool in {"read_file", "git_grep", "git_blame"}:
+                kind = "implementation"
+            else:
+                kind = "other"
+            source_kinds.setdefault(source, set()).add(kind)
+        grouped: dict[str, list[str]] = {}
+        generic: set[str] = set()
+        for source, kinds in source_kinds.items():
+            if "ci" in kinds:
+                label = "CI test result"
+            elif "diff" in kinds and "implementation" in kinds:
+                label = "Changed implementation and PR diff"
+            elif "diff" in kinds:
+                label = "Changed PR diff"
+            elif "test" in kinds:
+                label = "Related test code"
+            elif "implementation" in kinds:
+                label = "Implementation"
+            else:
+                label = "Other retained evidence"
+            if source == "retained-tool-result":
+                generic.add(label)
+            else:
+                grouped.setdefault(label, []).append(source)
+        lines = []
+        for label in (
+            "Changed implementation and PR diff", "Changed PR diff",
+            "Implementation", "Related test code", "CI test result",
+            "Other retained evidence",
+        ):
+            sources = sorted(set(grouped.get(label, ())))
+            if sources:
+                lines.append(
+                    f"- {label}: "
+                    + ", ".join(_quoted_note(source) for source in sources)
+                )
+            if label in generic:
+                lines.append(f"- {label} retained.")
+        return lines
 
     consequences = tuple(finding.get("user_visible_consequences", ())) or (
         finding.get("user_visible_consequence", ""),
@@ -561,12 +672,12 @@ def _expected_finding_note(finding: Mapping[str, Any]) -> str:
         + "\n\n**User-visible consequence:**\n"
         + "\n".join("- " + _quoted_note(item) for item in consequences)
         + "\n\n**Causal chain:** " + _quoted_note(finding.get("causal_chain"))
-        + "\n\n**Supporting evidence provenance / citations:**\n"
+        + "\n\n**Evidence checked:**\n"
         + "\n".join(supporting)
     )
     if contradicting:
         markdown += (
-            "\n\n**Contradicting evidence provenance / citations:**\n"
+            "\n\n**Contradicting evidence checked:**\n"
             + "\n".join(contradicting)
         )
     return (
@@ -626,8 +737,8 @@ _ADVERSARIAL_PREDICATES = {
     "reconstruction.reason": "repetitive-transcript",
     "reconstruction.recoveries": 1,
     "reconstruction.checkpoint_retained": True,
-    "planner_repair.repair_requests": 1,
-    "planner_repair.source": "model_repaired_validated",
+    "planner_repair.repair_requests": 0,
+    "planner_repair.source": "deterministic_base_transformed",
     "failed_critic.terminal": True,
     "failed_critic.fallback": "conservative",
     "deadline_cutoff.deadline_violation": False,

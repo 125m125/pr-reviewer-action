@@ -119,7 +119,12 @@ def derive_runtime_verdict(
 
     if blocking_obligations:
         return RuntimeVerdictPolicyResult(
-            verdict="request_changes",
+            # Missing coverage is a review-status signal, not a confirmed
+            # defect.  Keep the obligation IDs and incomplete source for
+            # policy/reporting consumers, but do not publish a defect-style
+            # request-changes verdict unless an evidence-backed finding also
+            # exists.
+            verdict="request_changes" if blocking_findings else "notice",
             source="incomplete-high-risk-coverage",
             blocking_finding_ids=blocking_findings,
             blocking_obligation_ids=tuple(sorted(set(blocking_obligations))),
@@ -134,7 +139,7 @@ def derive_runtime_verdict(
         )
     if not allow_approve:
         return RuntimeVerdictPolicyResult(
-            verdict="request_changes",
+            verdict="notice",
             source="approval-disabled",
             unknown_obligation_ids=tuple(sorted(set(unknown_obligations))),
         )

@@ -9,8 +9,11 @@ from typing import Any
 
 from .assignments import Assignment
 from .coverage import CoverageSnapshot, SessionOwnership
+from .obligation_assessment import ObligationAssessment, ObligationDisposition
 from .types import (
     CoverageObligation,
+    InvestigationLead,
+    InvestigationLeadStatus,
     ObligationStatus,
     SessionCheckpoint,
     SpecialistAssignment,
@@ -18,9 +21,14 @@ from .types import (
 
 
 _ACTION_KINDS = frozenset({"resume", "consult", "new_session", "record_unknown"})
+_ACTION_ALIASES = {
+    "record-unknown": "record_unknown",
+    "new-session": "new_session",
+}
 _ACTION_RANK = {"resume": 0, "consult": 1, "new_session": 2, "record_unknown": 3}
+_CHECKPOINT_TURN_RESERVE = 2
 _ACTION_FIELDS = frozenset({
-    "kind", "session_id", "obligation_ids", "expected_evidence",
+    "kind", "session_id", "obligation_ids", "lead_ids", "expected_evidence",
     "estimated_turns", "reason",
 })
 _RISK_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
@@ -72,6 +80,9 @@ class SessionResources:
     session_id: str
     remaining_model_turns: int
     lease_remaining_sec: float
+    remaining_tool_calls: int
+    retained_evidence_count: int = 0
+    advertised_tools: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -82,8 +93,22 @@ class SessionResources:
             or self.remaining_model_turns < 0
         ):
             raise ValueError("remaining_model_turns must be a non-negative integer")
+        if (
+            isinstance(self.remaining_tool_calls, bool)
+            or not isinstance(self.remaining_tool_calls, int)
+            or self.remaining_tool_calls < 0
+        ):
+            raise ValueError("remaining_tool_calls must be a non-negative integer")
+        if (
+            isinstance(self.retained_evidence_count, bool)
+            or not isinstance(self.retained_evidence_count, int)
+            or self.retained_evidence_count < 0
+        ):
+            raise ValueError("retained_evidence_count must be a non-negative integer")
         if not isfinite(self.lease_remaining_sec) or self.lease_remaining_sec < 0:
             raise ValueError("lease_remaining_sec must be non-negative and finite")
+        if any(not isinstance(item, str) or not item.strip() for item in self.advertised_tools):
+            raise ValueError("advertised_tools must contain non-empty strings")
 
 
 @dataclass(frozen=True)
@@ -105,6 +130,9 @@ class NegotiationState:
     new_session_turns_remaining: int
     new_session_turn_cap: int
     new_session_lease_remaining_sec: float
+    new_session_tool_call_cap: int
+    excluded_obligation_ids: tuple[str, ...] = ()
+    investigation_leads: tuple[InvestigationLead, ...] = ()
 
     def __post_init__(self) -> None:
         obligation_ids = [item.id for item in self.obligations]
@@ -122,12 +150,20 @@ class NegotiationState:
             raise ValueError("session resource ids must be unique")
         if len(set(checkpoint_ids)) != len(checkpoint_ids):
             raise ValueError("checkpoint session ids must be unique")
+        lead_ids = [item.lead_id for item in self.investigation_leads]
+        if len(set(lead_ids)) != len(lead_ids):
+            raise ValueError("investigation lead ids must be unique")
         coverage_ids = [item[0] for item in self.coverage.obligation_statuses]
         if len(set(coverage_ids)) != len(coverage_ids):
             raise ValueError("coverage obligation ids must be unique")
         unknown_coverage = sorted(set(coverage_ids) - set(obligation_ids))
         if unknown_coverage:
             raise ValueError("coverage contains unknown obligations: " + ", ".join(unknown_coverage))
+        unknown_exclusions = sorted(set(self.excluded_obligation_ids) - set(obligation_ids))
+        if unknown_exclusions:
+            raise ValueError(
+                "excluded obligations are unknown: " + ", ".join(unknown_exclusions)
+            )
         assignment_by_id = {
             _assignment_id(item): item for item in self.assignments
         }
@@ -154,6 +190,7 @@ class NegotiationState:
             self.followup_sessions_started, self.max_followup_sessions,
             self.new_session_turns_remaining,
             self.new_session_turn_cap,
+            self.new_session_tool_call_cap,
         )
         if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in numeric_counts):
             raise ValueError("session counts and remaining turns must be non-negative integers")
@@ -183,6 +220,7 @@ class NegotiationAction:
     estimated_turns: int
     reason: str
     expected_coverage_gain: int
+    lead_ids: tuple[str, ...] = ()
     session_id: str | None = None
     resolution_policies: tuple[tuple[str, str], ...] = ()
 
@@ -197,6 +235,242 @@ class NegotiationProposal:
     """Stable immutable collection of validated follow-up actions."""
 
     actions: tuple[NegotiationAction, ...]
+
+
+def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
+    """Project controller state into a small, model-facing target catalogue.
+
+    The model only needs to choose *which* unresolved target and *what kind* of
+    bounded action to take.  Obligation/session IDs, evidence categories and
+    budgets remain controller-owned and are deliberately omitted from this
+    projection.
+    """
+    obligations = _negotiable_obligations(state)
+    assessments = _assessment_by_obligation(state)
+    ownership = tuple(state.session_ownership)
+    resources = {item.session_id: item for item in state.session_resources}
+    checkpoints = {item.session_id: item for item in state.checkpoints}
+    targets: list[dict[str, object]] = []
+    for index, item in enumerate(obligations, start=1):
+        assessment = assessments.get(item.id)
+        owners = tuple(
+            owner for owner in ownership if item.id in owner.obligation_ids
+        )
+        owner_checkpoints = tuple(
+            checkpoints[owner.session_id]
+            for owner in owners if owner.session_id in checkpoints
+        )
+        next_actions = (
+            tuple(dict.fromkeys(assessment.next_actions))
+            if assessment is not None else ()
+        )
+        has_novel_action = (
+            assessment is None
+            or (
+                assessment.disposition in {
+                    ObligationDisposition.PENDING,
+                    ObligationDisposition.UNRESOLVED,
+                }
+                and bool(next_actions)
+            )
+        )
+        primary = any(item.id in owner.primary_obligation_ids for owner in owners)
+        actions = ["record_unknown"]
+        if has_novel_action and state.current_session_count < state.max_sessions and (
+            state.followup_sessions_started < state.max_followup_sessions
+            and state.new_session_turns_remaining > 0
+            and state.new_session_tool_call_cap > 0
+        ):
+            actions.append("new_session")
+        owner_actions = []
+        for owner in owners if has_novel_action else ():
+            resource = resources.get(owner.session_id)
+            if (
+                resource is None
+                or resource.remaining_model_turns <= _CHECKPOINT_TURN_RESERVE
+            ):
+                continue
+            if resource.remaining_tool_calls <= 0:
+                continue
+            if resource.lease_remaining_sec < state.seconds_per_turn:
+                continue
+            owner_actions.append(
+                "resume" if item.id in owner.primary_obligation_ids else "consult"
+            )
+        for action in ("resume", "consult"):
+            if action in owner_actions:
+                actions.insert(0, action)
+        checkpoint_summary = next((
+            " ".join(checkpoint.working_summary.split())[:1_200]
+            for checkpoint in owner_checkpoints
+            if checkpoint.working_summary.strip()
+        ), "")
+        assessment_delta = (
+            assessment.attempts[-1].evidence_delta
+            if assessment is not None and assessment.attempts else 0
+        )
+        retained_evidence_count = max(
+            (
+                resources[owner.session_id].retained_evidence_count
+                for owner in owners if owner.session_id in resources
+            ),
+            default=0,
+        )
+        targets.append({
+            "handle": f"U{index}",
+            "risk_tier": item.risk_tier,
+            "subject": item.subject,
+            "summary": (
+                assessment.reason if assessment is not None and assessment.reason else
+                checkpoint_summary or
+                f"Investigate the {item.risk_tier}-risk obligation concerning {item.subject}."
+            ),
+            "allowed_actions": tuple(actions),
+            "last_conclusion": assessment.reason if assessment is not None else "",
+            "attempt_count": len(assessment.attempts) if assessment is not None else 0,
+            "evidence_delta": assessment_delta,
+            "retained_evidence_count": retained_evidence_count,
+            "next_actions": next_actions,
+        })
+    for index, lead in enumerate(_negotiable_leads(state), start=1):
+        allowed_actions = ["record_unknown"]
+        capable_sessions = _capable_lead_sessions(lead, state)
+        origin = lead.assigned_session_id or lead.origin_session_id
+        if origin in capable_sessions:
+            allowed_actions.insert(0, "resume")
+        if any(session_id != origin for session_id in capable_sessions):
+            allowed_actions.insert(0, "consult")
+        if (
+            capable_sessions
+            and state.current_session_count < state.max_sessions
+            and state.followup_sessions_started < state.max_followup_sessions
+            and state.new_session_turns_remaining > 0
+            and state.new_session_tool_call_cap > 0
+        ):
+            insert_at = max(0, len(allowed_actions) - 1)
+            allowed_actions.insert(insert_at, "new_session")
+        targets.append({
+            "handle": f"L{index}",
+            "risk_tier": "normal",
+            "subject": lead.affected_paths[0] if lead.affected_paths else "investigation lead",
+            "summary": lead.summary,
+            "allowed_actions": tuple(dict.fromkeys(allowed_actions)),
+            "last_conclusion": lead.resolution_reason,
+            "attempt_count": 0,
+            "evidence_delta": 0,
+            "retained_evidence_count": len(lead.evidence_ids),
+            "next_actions": (lead.next_action,),
+            "required_capability": lead.required_capability,
+        })
+    has_feasible_high_risk = any(
+        target["risk_tier"] in {"high", "critical"}
+        and any(
+            action != "record_unknown"
+            for action in target["allowed_actions"]
+        )
+        for target in targets
+    )
+    if has_feasible_high_risk:
+        admissible: list[dict[str, object]] = []
+        for target in targets:
+            if target["risk_tier"] not in {"high", "critical"}:
+                admissible.append(target)
+                continue
+            actions = tuple(
+                action for action in target["allowed_actions"]
+                if action != "record_unknown"
+            )
+            if actions:
+                admissible.append({**target, "allowed_actions": actions})
+        targets = admissible
+    return {
+        "protocol": "choose exactly one action for one target handle",
+        "targets": tuple(targets),
+    }
+
+
+def _assessment_by_obligation(
+    state: NegotiationState,
+) -> dict[str, ObligationAssessment]:
+    result: dict[str, ObligationAssessment] = {}
+    for checkpoint in state.checkpoints:
+        for item in checkpoint.obligation_assessments:
+            if isinstance(item, ObligationAssessment):
+                result[item.obligation_id] = item
+    return result
+
+
+def _negotiable_obligations(
+    state: NegotiationState,
+) -> tuple[CoverageObligation, ...]:
+    statuses = dict(state.coverage.obligation_statuses)
+    assessments = _assessment_by_obligation(state)
+    excluded = frozenset(state.excluded_obligation_ids)
+    terminal = {
+        ObligationDisposition.COVERED,
+        ObligationDisposition.NOT_APPLICABLE,
+        ObligationDisposition.EXHAUSTED,
+        ObligationDisposition.BLOCKED,
+    }
+    return tuple(sorted(
+        (
+            item for item in state.obligations
+            if item.id not in excluded
+            and item.mandatory
+            and item.required_evidence_categories
+            and statuses.get(item.id, ObligationStatus.PENDING) in {
+                ObligationStatus.PENDING, ObligationStatus.UNRESOLVED,
+            }
+            and (
+                item.id not in assessments
+                or assessments[item.id].disposition not in terminal
+            )
+        ),
+        key=lambda item: (_RISK_RANK.get(item.risk_tier, 2), item.id),
+    ))
+
+
+def _negotiable_leads(state: NegotiationState) -> tuple[InvestigationLead, ...]:
+    return tuple(sorted(
+        (
+            item for item in state.investigation_leads
+            if item.status in {
+                InvestigationLeadStatus.OPEN,
+                InvestigationLeadStatus.SCHEDULED,
+            }
+        ),
+        key=lambda item: item.lead_id,
+    ))
+
+
+def _required_tools(capability: str) -> frozenset[str]:
+    return {
+        "none": frozenset(),
+        "repository": frozenset({"read_file", "read_pr_diff", "git_grep"}),
+        "tests": frozenset({"read_test_results"}),
+        "web": frozenset({
+            "web_search", "web_fetch", "web_fetch_search_result",
+        }),
+    }.get(capability, frozenset({"__unsupported__"}))
+
+
+def _capable_lead_sessions(
+    lead: InvestigationLead, state: NegotiationState,
+) -> tuple[str, ...]:
+    required = _required_tools(lead.required_capability)
+    result = []
+    for resource in sorted(state.session_resources, key=lambda item: item.session_id):
+        if resource.remaining_model_turns <= _CHECKPOINT_TURN_RESERVE:
+            continue
+        if resource.remaining_tool_calls <= 0:
+            continue
+        if resource.lease_remaining_sec < state.seconds_per_turn:
+            continue
+        advertised = frozenset(resource.advertised_tools)
+        if required and not required.intersection(advertised):
+            continue
+        result.append(resource.session_id)
+    return tuple(result)
 
 
 def _string_list(value: Any, field: str, errors: list[str]) -> tuple[str, ...]:
@@ -216,6 +490,152 @@ def _string_list(value: Any, field: str, errors: list[str]) -> tuple[str, ...]:
     return tuple(sorted(set(result)))
 
 
+def _normalise_action_kind(value: Any, *, errors: list[str]) -> str | None:
+    if not isinstance(value, str):
+        return None
+    kind = value.strip()
+    normalised = _ACTION_ALIASES.get(kind, kind)
+    if normalised != kind:
+        errors.append(f"normalized action kind alias {kind!r} to {normalised!r}")
+    if normalised not in _ACTION_KINDS:
+        return None
+    return normalised
+
+
+def _compact_target_obligations(
+    state: NegotiationState,
+) -> dict[str, CoverageObligation]:
+    obligations = _negotiable_obligations(state)
+    return {f"U{index}": item for index, item in enumerate(obligations, start=1)}
+
+
+def _compact_target_leads(state: NegotiationState) -> dict[str, InvestigationLead]:
+    return {
+        f"L{index}": item
+        for index, item in enumerate(_negotiable_leads(state), start=1)
+    }
+
+
+def _compact_session_for(
+    kind: str,
+    obligation: CoverageObligation,
+    state: NegotiationState,
+) -> str | None:
+    owners = tuple(
+        owner for owner in state.session_ownership
+        if obligation.id in owner.obligation_ids
+    )
+    if kind == "resume":
+        owners = tuple(
+            owner for owner in owners
+            if obligation.id in owner.primary_obligation_ids
+        )
+    if not owners:
+        return None
+    resources = {item.session_id: item for item in state.session_resources}
+    # Prefer a feasible owner, then stable controller order.  Validation still
+    # rechecks ownership, budget and lease after this projection.
+    feasible = tuple(
+        owner for owner in sorted(owners, key=lambda item: item.session_id)
+        if (
+            resources.get(owner.session_id) is not None
+            and resources[owner.session_id].remaining_model_turns > _CHECKPOINT_TURN_RESERVE
+            and resources[owner.session_id].remaining_tool_calls > 0
+            and resources[owner.session_id].lease_remaining_sec >= state.seconds_per_turn
+        )
+    )
+    return (feasible or tuple(sorted(owners, key=lambda item: item.session_id)))[0].session_id
+
+
+def _compact_session_for_lead(
+    kind: str, lead: InvestigationLead, state: NegotiationState,
+) -> str | None:
+    capable = _capable_lead_sessions(lead, state)
+    origin = lead.assigned_session_id or lead.origin_session_id
+    if kind == "resume":
+        return origin if origin in capable else None
+    return next((item for item in capable if item != origin), None)
+
+
+def _compact_raw_to_legacy(
+    raw: Mapping[str, Any],
+    state: NegotiationState,
+) -> dict[str, Any]:
+    fields = set(raw)
+    unsupported = sorted(fields - {"kind", "target", "reason"})
+    if unsupported:
+        raise NegotiationError(
+            "compact proposal has unsupported fields: " + ", ".join(unsupported)
+        )
+    errors: list[str] = []
+    kind = _normalise_action_kind(raw.get("kind"), errors=[])
+    if kind is None:
+        errors.append(
+            "kind must be exactly resume, consult, new_session, or record_unknown"
+        )
+    target = raw.get("target")
+    if not isinstance(target, str) or not target.strip():
+        errors.append("target must be a non-empty controller target handle")
+        target = ""
+    else:
+        target = target.strip()
+    reason = raw.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        errors.append("reason must be a non-empty string")
+        reason = ""
+    else:
+        reason = " ".join(reason.split())
+    obligation = _compact_target_obligations(state).get(target)
+    lead = _compact_target_leads(state).get(target)
+    if obligation is None and lead is None:
+        errors.append(f"target {target!r} is not an unresolved controller target")
+    projected_target = next((
+        item for item in compact_negotiation_context(state)["targets"]
+        if item["handle"] == target
+    ), None)
+    if obligation is not None and projected_target is None:
+        errors.append(f"target {target!r} is not currently admissible")
+    if (
+        kind is not None
+        and projected_target is not None
+        and kind not in projected_target["allowed_actions"]
+    ):
+        errors.append(f"kind {kind!r} is not allowed for target {target!r}")
+    if errors:
+        # Alias diagnostics are useful in the event journal but are not errors.
+        diagnostics = tuple(
+            item for item in errors if item.startswith("normalized action kind alias")
+        )
+        fatal = tuple(item for item in errors if item not in diagnostics)
+        if fatal:
+            raise NegotiationError(fatal)
+    assert kind is not None
+    estimated_turns = 0 if kind == "record_unknown" else 1
+    action: dict[str, Any] = {
+        "kind": kind,
+        "obligation_ids": [obligation.id] if obligation is not None else [],
+        "lead_ids": [lead.lead_id] if lead is not None else [],
+        "expected_evidence": (
+            list(obligation.required_evidence_categories)
+            if obligation is not None else [lead.required_capability or "investigation"]
+        ),
+        "estimated_turns": estimated_turns,
+        "reason": reason,
+    }
+    if kind in {"resume", "consult"}:
+        session_id = (
+            _compact_session_for(kind, obligation, state)
+            if obligation is not None
+            else _compact_session_for_lead(kind, lead, state)
+        )
+        if session_id is None:
+            raise NegotiationError(
+                f"target {target!r} has no controller-owned session for {kind}"
+            )
+        action["session_id"] = session_id
+    return {"actions": [action]}
+
+
 def _parse_action(
     raw: Any,
     index: int,
@@ -228,14 +648,32 @@ def _parse_action(
     extra = sorted(set(raw) - _ACTION_FIELDS)
     if extra:
         errors.append(f"{label} has unsupported fields: {', '.join(extra)}")
-    kind = raw.get("kind")
-    if not isinstance(kind, str) or kind not in _ACTION_KINDS:
+    # Alias diagnostics are intentionally separate from fatal validation errors.
+    # The controller can journal the original value while legacy callers still
+    # receive the same validated action semantics.
+    kind = _normalise_action_kind(raw.get("kind"), errors=[])
+    if kind is None:
         errors.append(
             f"{label} kind must be exactly resume, consult, new_session, or record_unknown"
         )
         return None, errors
 
-    obligation_ids = _string_list(raw.get("obligation_ids"), f"{label} obligation_ids", errors)
+    raw_obligation_ids = raw.get("obligation_ids", [])
+    raw_lead_ids = raw.get("lead_ids", [])
+    if raw_obligation_ids:
+        obligation_ids = _string_list(
+            raw_obligation_ids, f"{label} obligation_ids", errors,
+        )
+    else:
+        obligation_ids = ()
+    if raw_lead_ids:
+        lead_ids = _string_list(raw_lead_ids, f"{label} lead_ids", errors)
+    else:
+        lead_ids = ()
+    if bool(obligation_ids) == bool(lead_ids):
+        errors.append(
+            f"{label} must target exactly one of obligation_ids or lead_ids"
+        )
     expected_evidence = _string_list(
         raw.get("expected_evidence"), f"{label} expected_evidence", errors
     )
@@ -257,6 +695,7 @@ def _parse_action(
         errors.append(f"{label} record_unknown must not consume model turns")
 
     obligation_by_id = {item.id: item for item in state.obligations}
+    lead_by_id = {item.lead_id: item for item in _negotiable_leads(state)}
     statuses = dict(state.coverage.obligation_statuses)
     unknown = sorted(set(obligation_ids) - set(obligation_by_id))
     if unknown:
@@ -273,6 +712,9 @@ def _parse_action(
     )
     if non_mandatory:
         errors.append(f"{label} targets non-mandatory obligations: {', '.join(non_mandatory)}")
+    unknown_leads = sorted(set(lead_ids) - set(lead_by_id))
+    if unknown_leads:
+        errors.append(f"{label} contains unknown investigation leads: {', '.join(unknown_leads)}")
 
     required_union: set[str] = set()
     no_gain: list[str] = []
@@ -284,6 +726,11 @@ def _parse_action(
         required_union.update(required)
         if not required.intersection(expected_evidence):
             no_gain.append(obligation_id)
+    if lead_ids:
+        required_union.update(
+            lead_by_id[lead_id].required_capability or "investigation"
+            for lead_id in lead_ids if lead_id in lead_by_id
+        )
     unsupported_evidence = sorted(set(expected_evidence) - required_union)
     if no_gain or unsupported_evidence:
         detail = ", ".join(sorted(no_gain))
@@ -312,7 +759,27 @@ def _parse_action(
     }
     if session_id is not None:
         owner = ownership_by_session.get(session_id)
-        if owner is None:
+        resource = next((
+            item for item in state.session_resources
+            if item.session_id == session_id
+        ), None)
+        if lead_ids:
+            lead = lead_by_id.get(lead_ids[0])
+            capable = (
+                lead is not None
+                and session_id in _capable_lead_sessions(lead, state)
+            )
+            origin = (
+                lead.assigned_session_id or lead.origin_session_id
+                if lead is not None else ""
+            )
+            if not capable:
+                errors.append(f"{label} session lacks the required lead capability")
+            elif kind == "resume" and session_id != origin:
+                errors.append(f"{label} resume session is not the lead origin")
+            elif kind == "consult" and session_id == origin:
+                errors.append(f"{label} consult must use a different capable session")
+        elif owner is None:
             errors.append(f"{label} session has no controller-owned assignment projection")
         elif kind == "resume" and not set(obligation_ids).issubset(owner.primary_obligation_ids):
             errors.append(f"{label} resume session is not the primary owner of all obligations")
@@ -333,7 +800,8 @@ def _parse_action(
         expected_evidence=expected_evidence,
         estimated_turns=estimated_turns,
         reason=reason,
-        expected_coverage_gain=len(obligation_ids),
+        expected_coverage_gain=len(obligation_ids) + len(lead_ids),
+        lead_ids=lead_ids,
         resolution_policies=policies,
     ), []
 
@@ -361,8 +829,20 @@ def _validate_feasibility(
         if resource is None:
             errors.append(f"session '{session_id}' has no remaining budget/lease projection")
             continue
+        usable_turns = max(
+            0, resource.remaining_model_turns - _CHECKPOINT_TURN_RESERVE,
+        )
         if turns > resource.remaining_model_turns:
-            errors.append(f"session '{session_id}' exceeds its remaining model-turn budget")
+            errors.append(
+                f"session '{session_id}' exceeds its remaining model-turn budget"
+            )
+        elif turns > usable_turns:
+            errors.append(
+                f"session '{session_id}' exceeds exploration turns available "
+                "after checkpoint reserve"
+            )
+        if resource.remaining_tool_calls == 0:
+            errors.append(f"session '{session_id}' has no remaining tool-call budget")
         if turns * state.seconds_per_turn > resource.lease_remaining_sec:
             errors.append(f"session '{session_id}' exceeds its remaining lease")
 
@@ -381,6 +861,8 @@ def _validate_feasibility(
         errors.append("new session exceeds its available lease")
     if any(item.estimated_turns > state.new_session_turn_cap for item in new_session_actions):
         errors.append("new session exceeds the controller-owned per-session turn cap")
+    if new_session_actions and state.new_session_tool_call_cap == 0:
+        errors.append("new session has no controller-owned tool-call budget")
     return errors
 
 
@@ -395,9 +877,10 @@ def _action_order(
         ),
         default=_RISK_RANK["normal"],
     )
+    targets = action.obligation_ids or action.lead_ids
     return (
         risk_rank,
-        action.obligation_ids,
+        targets,
         _ACTION_RANK[action.kind],
         action.session_id or "",
     )
@@ -409,6 +892,8 @@ def validate_negotiation(raw: Mapping[str, Any], state: NegotiationState) -> Neg
         raise TypeError("state must be a NegotiationState")
     if not isinstance(raw, Mapping):
         raise NegotiationError("proposal must be an object")
+    if "actions" not in raw and ({"kind", "target"} & set(raw)):
+        return validate_compact_negotiation(raw, state)
     extra = sorted(set(raw) - {"actions"})
     if extra:
         raise NegotiationError("proposal has unsupported fields: " + ", ".join(extra))
@@ -427,10 +912,11 @@ def validate_negotiation(raw: Mapping[str, Any], state: NegotiationState) -> Neg
     targeted: set[str] = set()
     targeted_sessions: set[str] = set()
     for action in actions:
-        duplicate = sorted(targeted.intersection(action.obligation_ids))
+        action_targets = (*action.obligation_ids, *action.lead_ids)
+        duplicate = sorted(targeted.intersection(action_targets))
         if duplicate:
-            errors.append("proposal repeats obligations across actions: " + ", ".join(duplicate))
-        targeted.update(action.obligation_ids)
+            errors.append("proposal repeats targets across actions: " + ", ".join(duplicate))
+        targeted.update(action_targets)
         if action.session_id is not None:
             if action.session_id in targeted_sessions:
                 errors.append(
@@ -447,57 +933,53 @@ def validate_negotiation(raw: Mapping[str, Any], state: NegotiationState) -> Neg
     )))
 
 
-def _fallback_raw(
-    kind: str,
-    obligation: CoverageObligation,
-    *,
-    session_id: str | None = None,
-) -> dict[str, Any]:
-    action: dict[str, Any] = {
-        "kind": kind,
-        "obligation_ids": [obligation.id],
-        "expected_evidence": list(obligation.required_evidence_categories),
-        "estimated_turns": 0 if kind == "record_unknown" else 1,
-        "reason": (
-            "Deterministic fallback selected the highest-risk uncovered obligation."
-            if kind != "record_unknown"
-            else "No feasible bounded investigation remains; apply the obligation's unresolved policy."
-        ),
-    }
-    if session_id is not None:
-        action["session_id"] = session_id
-    return {"actions": [action]}
+def validate_compact_negotiation(
+    raw: Mapping[str, Any], state: NegotiationState,
+) -> NegotiationProposal:
+    """Validate the one-action, handle-based negotiator response.
+
+    The compact response deliberately contains no controller-owned IDs, evidence
+    categories or budgets.  Those values are projected from ``state`` and then
+    passed through the same legacy validator, preserving all semantic checks.
+    """
+    if not isinstance(raw, Mapping):
+        raise NegotiationError("compact proposal must be an object")
+    if "actions" in raw:
+        actions = raw.get("actions")
+        if isinstance(actions, list) and len(actions) != 1:
+            raise NegotiationError("compact proposal must contain exactly one action")
+        raise NegotiationError(
+            "compact proposal must contain kind, target, and reason, not actions"
+        )
+    return validate_negotiation(_compact_raw_to_legacy(raw, state), state)
 
 
 def fallback_next_action(state: NegotiationState) -> NegotiationAction:
     """Choose one stable, narrow next action for the highest-risk uncovered work."""
-    statuses = dict(state.coverage.obligation_statuses)
-    uncovered = tuple(sorted(
-        (
-            item for item in state.obligations
-            if item.mandatory
-            and item.required_evidence_categories
-            and statuses.get(item.id, ObligationStatus.PENDING) is not ObligationStatus.COVERED
-        ),
-        key=lambda item: (_RISK_RANK.get(item.risk_tier, 2), item.id),
-    ))
-    if not uncovered:
+    targets = compact_negotiation_context(state)["targets"]
+    if not targets:
         raise NegotiationError("no uncovered mandatory obligations remain")
-    obligation = uncovered[0]
-
-    primary_owners = sorted(
-        item.session_id for item in state.session_ownership
-        if obligation.id in item.primary_obligation_ids
+    for target in targets:
+        for kind in ("resume", "consult", "new_session"):
+            if kind not in target["allowed_actions"]:
+                continue
+            return validate_compact_negotiation({
+                "kind": kind,
+                "target": target["handle"],
+                "reason": (
+                    "Deterministic fallback selected the highest-risk feasible "
+                    "bounded investigation."
+                ),
+            }, state).actions[0]
+    target = next(
+        item for item in targets
+        if "record_unknown" in item["allowed_actions"]
     )
-    for session_id in primary_owners:
-        try:
-            return validate_negotiation(
-                _fallback_raw("resume", obligation, session_id=session_id), state
-            ).actions[0]
-        except NegotiationError:
-            continue
-
-    try:
-        return validate_negotiation(_fallback_raw("new_session", obligation), state).actions[0]
-    except NegotiationError:
-        return validate_negotiation(_fallback_raw("record_unknown", obligation), state).actions[0]
+    return validate_compact_negotiation({
+        "kind": "record_unknown",
+        "target": target["handle"],
+        "reason": (
+            "No feasible bounded investigation remains; apply the obligation's "
+            "unresolved policy."
+        ),
+    }, state).actions[0]

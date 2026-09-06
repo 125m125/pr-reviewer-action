@@ -220,6 +220,28 @@ platform_compare() {
   fi
 }
 
+# ── Same-head CI artifacts ──────────────────────────────────────────────
+
+platform_actions_artifacts_for_head() {
+  # $1=repo $2=immutable head sha -> one bounded JSON array
+  if _platform_is_forgejo; then
+    _forgejo_unimplemented "actions-artifacts-for-head"
+  else
+    gh api "repos/$1/actions/artifacts?per_page=100" \
+      | jq --arg head "$2" \
+        '[.artifacts[] | select(.expired != true and .workflow_run.head_sha == $head)]'
+  fi
+}
+
+platform_artifact_download() {
+  # $1=repo $2=artifact id $3=destination zip
+  if _platform_is_forgejo; then
+    _forgejo_unimplemented "artifact-download"
+  else
+    gh api "repos/$1/actions/artifacts/$2/zip" > "$3"
+  fi
+}
+
 # ── Sticky comment + reviews (publish surface) ─────────────────────────
 
 platform_comment_sticky() {

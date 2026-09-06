@@ -267,7 +267,7 @@ def test_textual_intent_gets_one_native_repair_and_executes_only_native_call():
         if m.get("role") == "user"
     ]
     assert any("returned no native tool_calls" in text for text in repair_users)
-    assert any("planning turns remain" in text for text in repair_users)
+    assert all("planning turns remain" not in text for text in repair_users)
 
 
 def test_successful_native_repair_resets_consecutive_budget_for_later_textual_intent():
@@ -373,11 +373,52 @@ def test_qwen_reasoning_fallback_is_preserved_in_next_request():
         conv, post, execute, api_format="openai", model="m", budgets=LoopBudgets()
     )
     prior = next(m for m in payloads[1]["messages"] if m.get("tool_calls"))
-    assert prior["content"] == "I found a cancellation race; inspect the test."
+    assert prior["content"] == "\n\n"
+    assert prior["reasoning_content"] == (
+        "I found a cancellation race; inspect the test."
+    )
     assert outcome.text_sources[0] == "reasoning_fallback"
 
 
-def test_budget_notes_are_correct_and_do_not_accumulate():
+def test_tool_turn_preserves_reasoning_separately_when_content_is_also_present():
+    conv = fresh_conversation()
+    payloads = []
+    responses = [
+        {
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "I will inspect the effect test.",
+                    "reasoning_content": "The changed cleanup path may race.",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"src/effect.spec.ts"}',
+                        },
+                    }],
+                },
+            }]
+        },
+        openai_text_response("done"),
+    ]
+
+    def post(payload):
+        payloads.append(payload)
+        return responses.pop(0)
+
+    execute, _ = recording_execute()
+    drive_tool_loop(
+        conv, post, execute, api_format="openai", model="m", budgets=LoopBudgets()
+    )
+
+    prior = next(message for message in payloads[1]["messages"] if message.get("tool_calls"))
+    assert prior["reasoning_content"] == "The changed cleanup path may race."
+    assert prior["content"] == "I will inspect the effect test."
+
+
+def test_budget_notes_are_not_sent_to_the_model():
     conv = fresh_conversation()
     payloads = []
     responses = [
@@ -394,13 +435,11 @@ def test_budget_notes_are_correct_and_do_not_accumulate():
         conv, post, execute, api_format="openai", model="m",
         budgets=LoopBudgets(max_tool_calls=3, max_rounds=4),
     )
-    notes0 = [m for m in payloads[0]["messages"] if "Exploration budget" in str(m.get("content"))]
-    notes1 = [m for m in payloads[1]["messages"] if "Exploration budget" in str(m.get("content"))]
-    assert len(notes0) == len(notes1) == 1
-    assert "3 tool calls and 4 planning turns" in notes0[0]["content"]
-    # The preceding response was tool-only progress, so it consumed a tool
-    # call but not a planning turn.
-    assert "2 tool calls and 4 planning turns" in notes1[0]["content"]
+    assert all(
+        "Exploration budget" not in str(message.get("content"))
+        for payload in payloads
+        for message in payload["messages"]
+    )
 
 
 def test_length_without_usable_answer_is_not_model_done():

@@ -52,11 +52,15 @@ from pr_reviewer.tool_executors import (  # noqa: E402
     mask_and_truncate,
     normalize_host,
     read_file,
+    read_remote_file,
     run_command,
     web_fetch,
     web_search,
 )
-from pr_reviewer.specialist_runtime.web_evidence import SourcePolicy  # noqa: E402
+from pr_reviewer.specialist_runtime.web_evidence import (  # noqa: E402
+    SearchResultRegistry,
+    SourcePolicy,
+)
 from pr_reviewer.specialist_runtime.policy import load_review_policy  # noqa: E402
 
 
@@ -367,8 +371,11 @@ def normalize_tool_request(raw_req):
     if not isinstance(args, dict):
         args = {}
     # Promote known top-level params when "args" wasn't nested.
-    for key in ("path", "endpoint", "url", "pattern", "command", "query"):
-        if key not in args and isinstance(raw_req.get(key), str):
+    for key in (
+        "path", "endpoint", "url", "pattern", "command", "query", "result_id",
+        "repository", "ref", "offset", "limit", "include_line_numbers",
+    ):
+        if key not in args and key in raw_req:
             args[key] = raw_req[key]
     # gh_api accepts "path" as an alias for "endpoint".
     if tool_name == "gh_api" and "endpoint" not in args and isinstance(args.get("path"), str):
@@ -569,11 +576,17 @@ def run_native_loop(
     # Discovery is useful only when both the operator fixed an endpoint and
     # current source rules give it approved URLs to return.
     search_url = os.getenv("SEARCH_URL", "").strip()
+    allow_private_search_url = (
+        os.getenv("ALLOW_PRIVATE_SEARCH_URL", "false").strip().lower() == "true"
+    )
     max_search_results = env_int_bounded("TOOL_MAX_SEARCH_RESULTS", 5, 1, 15)
     source_policy = load_current_source_policy(
         workspace_root, os.getenv("SPECIALIST_CONFIG_FILE", "").strip()
     )
-    tool_schemas = web_tool_schemas(search_url, source_policy)
+    search_result_registry = SearchResultRegistry()
+    tool_schemas = web_tool_schemas(
+        search_url, source_policy, allow_private_search_url,
+    )
 
     # Read-only MCP tools (#245), allowlisted via TOOL_MCP_SERVERS. Fork-gating
     # happens upstream in run_review.sh (the env is blanked on fork PRs unless
@@ -678,8 +691,8 @@ def run_native_loop(
         f"{', '.join(sorted(allowed_gh_api_repos)) if allowed_gh_api_repos else '(none)'}\n"
         f"Current-policy sources for web_fetch: "
         f"{', '.join(rule.host for rule in source_policy.rules) if source_policy.rules else '(none)'}\n"
-        + ("web_search is available for discovery only; web_fetch an approved "
-           "result before relying on it as evidence.\n"
+        + ("web_search is available for discovery only; fetch an approved "
+           "result with its advertised fetch method before relying on it as evidence.\n"
            if search_url and source_policy.has_approved_sources else "")
         + "\nGather the evidence needed to review this PR corpus:\n\n"
     )
@@ -794,6 +807,8 @@ def run_native_loop(
             search_url,
             max_search_results,
             source_policy=source_policy,
+            allow_private_search_url=allow_private_search_url,
+            search_result_registry=search_result_registry,
         )
 
     # Result summarization between rounds (#197 §2): when the conversation

@@ -63,6 +63,7 @@ class NoteAnchor:
     path: str
     line: int | None = None
     side: str | None = None
+    start_line: int | None = None
 
 
 @dataclass(frozen=True)
@@ -101,7 +102,13 @@ class PublisherApprovalPolicy:
 
 
 class ReviewPublishClient(Protocol):
-    def update_sticky(self, repo: str, pr_number: int, body: str) -> Mapping[str, Any]: ...
+    def update_sticky(
+        self,
+        repo: str,
+        pr_number: int,
+        body: str,
+        known_comment_id: int | None = None,
+    ) -> Mapping[str, Any]: ...
     def query_pr_identity(self, repo: str, pr_number: int) -> Mapping[str, Any]: ...
     def query_managed_state(self, repo: str, pr_number: int) -> Mapping[str, Any]: ...
     def reply_thread(self, comment_id: object, body: str) -> Mapping[str, Any]: ...
@@ -267,6 +274,9 @@ def choose_note_anchor(
     snapshot was supplied.
     """
 
+    # Future: carry LEFT-side coordinates through findings and publishing so a
+    # deletion-only defect can be attached to the removed line instead of the file.
+
     path = _safe_repo_path(getattr(note, "file", None))
     if not path:
         return None
@@ -282,7 +292,19 @@ def choose_note_anchor(
         and line > 0
         and line in added_lines.get(path, set())
     ):
-        return NoteAnchor("LINE", path, line, "RIGHT")
+        commentable_lines = diff_positions(diff_text).get(path, {})
+        start_line = getattr(note, "start_line", None)
+        if not (
+            isinstance(start_line, int)
+            and not isinstance(start_line, bool)
+            and 0 < start_line < line
+            and all(
+                candidate in commentable_lines
+                for candidate in range(start_line, line + 1)
+            )
+        ):
+            start_line = None
+        return NoteAnchor("LINE", path, line, "RIGHT", start_line)
     return NoteAnchor("FILE", path)
 
 
@@ -356,6 +378,7 @@ def _note_reply_digest(note: NormalizedReviewNote) -> str:
                 "path": note.anchor.path,
                 "line": note.anchor.line,
                 "side": note.anchor.side,
+                "start_line": note.anchor.start_line,
             }
             if note.anchor is not None
             else None
@@ -425,6 +448,11 @@ def build_review_thread_variables(
     }
     if note.anchor.subject_type == "LINE":
         variables.update({"line": note.anchor.line, "side": "RIGHT"})
+        if note.anchor.start_line is not None:
+            variables.update({
+                "startLine": note.anchor.start_line,
+                "startSide": "RIGHT",
+            })
     elif note.anchor.subject_type != "FILE":
         raise ValueError("unsupported review-note anchor")
     return variables
@@ -579,7 +607,10 @@ def _valid_submitted_review(
         _valid_review_result(value)
         and value.get("state") == expected_state
         and isinstance(value.get("body"), str)
-        and value["body"].startswith(marker + "\n")
+        and (
+            value["body"] == marker
+            or value["body"].startswith(marker + "\n")
+        )
     )
 
 
@@ -610,10 +641,12 @@ def _native_event(
 ) -> tuple[str, str]:
     if not isinstance(policy_result, RuntimeVerdictPolicyResult):
         raise TypeError("policy_result must be a RuntimeVerdictPolicyResult")
+    if policy_result.verdict == "notice":
+        return "COMMENT", "coverage incomplete; non-verdict specialist review"
     if policy_result.verdict == "request_changes":
         return "REQUEST_CHANGES", "policy requested changes"
     if policy_result.verdict != "approve":
-        raise ValueError("policy verdict must be approve or request_changes")
+        raise ValueError("policy verdict must be approve, request_changes, or notice")
     if not approval.allow_approve:
         return "REQUEST_CHANGES", "native approval disabled"
     if approval.effective_scope == "incremental" and not approval.baseline_clean:
@@ -693,6 +726,9 @@ def _publication_id(
             "coverage_warning": handoff.coverage_warning,
             "access_request_count": handoff.access_request_count,
             "access_request_url": handoff.access_request_url,
+            "what_changed": list(handoff.what_changed),
+            "ai_reviewed": list(handoff.ai_reviewed),
+            "human_focus": list(handoff.human_focus),
         },
     }
     encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -830,8 +866,10 @@ class GitHubReviewPublisher:
             raise ValueError("unsupported publish mode")
         if not isinstance(policy_result, RuntimeVerdictPolicyResult):
             raise TypeError("policy_result must be a RuntimeVerdictPolicyResult")
-        if policy_result.verdict not in {"approve", "request_changes"}:
-            raise ValueError("policy verdict must be approve or request_changes")
+        if policy_result.verdict not in {"approve", "request_changes", "notice"}:
+            raise ValueError(
+                "policy verdict must be approve, request_changes, or notice"
+            )
         if not isinstance(approval_policy, PublisherApprovalPolicy):
             raise TypeError("approval_policy must be a PublisherApprovalPolicy")
         if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
@@ -1701,6 +1739,7 @@ class GitHubReviewPublisher:
                 repo,
                 pr_number,
                 _handoff_body(handoff, artifact_links, completed_review["url"]),
+                sticky["id"],
             )
             if _valid_comment_result(refreshed):
                 state["sticky"] = dict(refreshed)
@@ -1895,8 +1934,13 @@ class GitHubReviewPublisher:
                 self.client.submit_review,
                 review_id,
                 event,
-                review_marker + "\n"
-                "Automated specialist review notes. Detailed findings are in managed threads.",
+                review_marker
+                + (
+                    "\nAutomated specialist review notes. "
+                    "Detailed findings are in managed threads."
+                    if new_thread_notes
+                    else ""
+                ),
             )
             if submitted is not None and not _valid_submitted_review(
                 submitted, review_marker, expected_review_state
@@ -1958,6 +2002,7 @@ class GitHubReviewPublisher:
                     repo,
                     pr_number,
                     _handoff_body(handoff, artifact_links, review_url),
+                    sticky["id"],
                 )
                 if _valid_comment_result(refreshed):
                     state["sticky"] = dict(refreshed)
@@ -2043,8 +2088,8 @@ mutation CreatePendingReview($pullRequestId: ID!, $commitOID: GitObjectID!, $bod
 """.strip()
 
 _ADD_THREAD_MUTATION = """
-mutation AddManagedReviewThread($pullRequestReviewId: ID!, $body: String!, $subjectType: PullRequestReviewThreadSubjectType!, $path: String!, $line: Int, $side: DiffSide) {
-  addPullRequestReviewThread(input: {pullRequestReviewId: $pullRequestReviewId, body: $body, subjectType: $subjectType, path: $path, line: $line, side: $side}) {
+mutation AddManagedReviewThread($pullRequestReviewId: ID!, $body: String!, $subjectType: PullRequestReviewThreadSubjectType!, $path: String!, $line: Int, $side: DiffSide, $startLine: Int, $startSide: DiffSide) {
+  addPullRequestReviewThread(input: {pullRequestReviewId: $pullRequestReviewId, body: $body, subjectType: $subjectType, path: $path, line: $line, side: $side, startLine: $startLine, startSide: $startSide}) {
     thread { id comments(first: 1) { nodes { databaseId url } } }
   }
 }
@@ -2064,6 +2109,14 @@ mutation ResolveManagedThread($threadId: ID!) {
 }
 """.strip()
 
+_SPECIALIST_HANDOFF_MARKER = "<!-- ai-pr-review-specialist-handoff -->"
+_TRUSTED_WORKFLOW_COMMENT_AUTHORS = frozenset({
+    # REST represents the workflow actor with the ``[bot]`` suffix while
+    # GraphQL exposes the same actor as ``github-actions``.
+    "github-actions",
+    "github-actions[bot]",
+})
+
 
 class GhReviewClient:
     """Production GitHub client using argv lists and 0600 input files.
@@ -2076,6 +2129,7 @@ class GhReviewClient:
         self.action_root = Path(action_root).resolve()
         self.timeout = max(1, min(int(timeout), 300))
         self._repo_context: tuple[str, int] | None = None
+        self._trusted_sticky_comment_ids: dict[tuple[str, int], set[int]] = {}
 
     def _input_call(self, args: list[str], payload: Mapping[str, Any]) -> dict[str, Any]:
         fd, path = tempfile.mkstemp(prefix="ai-pr-review-publish-", suffix=".json")
@@ -2161,29 +2215,86 @@ class GhReviewClient:
                 return tuple(files)
         raise RuntimeError("changed-files pagination incomplete: page limit exceeded")
 
-    def update_sticky(self, repo: str, pr_number: int, body: str) -> Mapping[str, Any]:
+    def update_sticky(
+        self,
+        repo: str,
+        pr_number: int,
+        body: str,
+        known_comment_id: int | None = None,
+    ) -> Mapping[str, Any]:
         self._split_repo(repo)
-        existing = self.find_specialist_handoff(repo, pr_number)
-        if existing is None:
+        sticky_key = (repo, pr_number)
+        duplicates: tuple[Mapping[str, Any], ...] = ()
+        if known_comment_id is None:
+            managed = self._trusted_specialist_handoffs(repo, pr_number)
+            existing = max(managed, key=lambda item: item["id"]) if managed else None
+            comment_id = existing["id"] if existing is not None else None
+            if comment_id is not None:
+                self._trusted_sticky_comment_ids.setdefault(sticky_key, set()).add(comment_id)
+                duplicates = tuple(sorted(
+                    (
+                        item for item in managed
+                        if item["id"] != comment_id
+                    ),
+                    key=lambda item: item["id"],
+                ))
+        else:
+            if (
+                not isinstance(known_comment_id, int)
+                or isinstance(known_comment_id, bool)
+                or known_comment_id <= 0
+            ):
+                raise ValueError("known sticky comment id must be a positive integer")
+            if known_comment_id not in self._trusted_sticky_comment_ids.get(
+                sticky_key, set()
+            ):
+                raise ValueError(
+                    "known sticky comment id is not trusted for this pull request"
+                )
+            comment_id = known_comment_id
+        if comment_id is None:
             endpoint = f"repos/{repo}/issues/{pr_number}/comments"
             method = "POST"
         else:
-            endpoint = f"repos/{repo}/issues/comments/{existing['id']}"
+            endpoint = f"repos/{repo}/issues/comments/{comment_id}"
             method = "PATCH"
         try:
-            return self._api_write(endpoint, method, {"body": body})
+            result = self._api_write(endpoint, method, {"body": body})
+            if method == "POST":
+                self._trusted_sticky_comment_ids.setdefault(sticky_key, set()).add(result["id"])
         except Exception:
             reconciled = self.find_specialist_handoff(
                 repo, pr_number, expected_body=body
             )
             if reconciled is not None:
-                return reconciled
-            raise
+                self._trusted_sticky_comment_ids.setdefault(sticky_key, set()).add(
+                    reconciled["id"]
+                )
+                result = reconciled
+            else:
+                raise
+        cleanup_errors = []
+        for duplicate in duplicates:
+            try:
+                self._api_write(
+                    f"repos/{repo}/issues/comments/{duplicate['id']}",
+                    "DELETE",
+                    {},
+                )
+            except Exception:
+                cleanup_errors.append(
+                    f"duplicate sticky cleanup failed for comment {duplicate['id']}"
+                )
+        if cleanup_errors:
+            return {**result, "cleanup_errors": tuple(cleanup_errors[:10])}
+        return result
 
     def _api_write(
         self, endpoint: str, method: str, payload: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         result = self._input_call(["api", endpoint, "--method", method], payload)
+        if method == "DELETE":
+            return {"deleted": True}
         comment_id = result.get("id")
         url = result.get("html_url")
         if not isinstance(comment_id, int) or isinstance(comment_id, bool) or comment_id <= 0:
@@ -2195,20 +2306,40 @@ class GhReviewClient:
     def find_specialist_handoff(
         self, repo: str, pr_number: int, expected_body: str | None = None
     ) -> Mapping[str, Any] | None:
+        matches = self._trusted_specialist_handoffs(
+            repo, pr_number, expected_body=expected_body,
+        )
+        return max(matches, key=lambda item: item["id"]) if matches else None
+
+    def _trusted_specialist_handoffs(
+        self, repo: str, pr_number: int, expected_body: str | None = None
+    ) -> tuple[Mapping[str, Any], ...]:
         matches = []
         for node, viewer_login in self._owned_issue_comment_nodes(repo, pr_number):
             body = node.get("body")
+            author = node.get("author")
+            author_login = (
+                author.get("login") if isinstance(author, Mapping) else None
+            )
+            trusted_author = (
+                (
+                    node.get("viewerDidAuthor") is True
+                    and author_login == viewer_login
+                )
+                or author_login in _TRUSTED_WORKFLOW_COMMENT_AUTHORS
+            )
             if (
                 isinstance(body, str)
-                and body.startswith("<!-- ai-pr-review-specialist-handoff -->")
+                and (
+                    body == _SPECIALIST_HANDOFF_MARKER
+                    or body.startswith(_SPECIALIST_HANDOFF_MARKER + "\n")
+                )
                 and (expected_body is None or body == expected_body)
-                and node.get("viewerDidAuthor") is True
-                and isinstance(node.get("author"), Mapping)
-                and node["author"].get("login") == viewer_login
+                and trusted_author
             ):
                 comment = self._validated_issue_comment(node, label="sticky comment")
                 matches.append(comment)
-        return max(matches, key=lambda item: item["id"]) if matches else None
+        return tuple(matches)
 
     @staticmethod
     def _validated_issue_comment(
@@ -2234,8 +2365,15 @@ class GhReviewClient:
         pr = repository.get("pullRequest") if isinstance(repository, Mapping) else None
         viewer_login = viewer.get("login") if isinstance(viewer, Mapping) else None
         pull_request_id = pr.get("id") if isinstance(pr, Mapping) else None
+        repository_full_name = (
+            repository.get("nameWithOwner")
+            if isinstance(repository, Mapping)
+            else None
+        )
         if not isinstance(viewer_login, str) or not viewer_login:
             raise RuntimeError("sticky viewer identity is missing")
+        if repository_full_name != repo:
+            raise RuntimeError("sticky repository identity is invalid")
         if not isinstance(pull_request_id, str) or not pull_request_id:
             raise RuntimeError("sticky pull request id is missing")
         nodes = self._paged_nodes(

@@ -38,6 +38,7 @@ on:
     types: [opened, reopened, synchronize, ready_for_review]
 
 permissions:
+  actions: read
   contents: read
   pull-requests: write
 
@@ -90,6 +91,71 @@ flowchart LR
     E --> F[Validate & enforce<br/>required checks · findings · carry-forward]
     F --> G[Publish<br/>comment / native review]
 ```
+
+### Specialist review pipeline
+
+The specialist strategy expands the model step into bounded sessions. The
+negotiator is the continuation selector: it runs between the initial and
+follow-up waves and may schedule one bounded action at a time.
+
+```mermaid
+flowchart TD
+    P[Precheck and immutable PR snapshot] --> S[Collect context and deterministic obligations]
+    S --> SUM[Change summarizer<br/><small>LLM, bounded structured role</small>]
+    SUM --> PLAN[Planner<br/><small>LLM optional; deterministic plan is fallback</small>]
+    PLAN --> W1
+
+    subgraph W1[Initial specialist wave]
+        direction TB
+        SP1[Specialist session]
+        SP2[Specialist session]
+        SPN[Specialist session …]
+        SP1 --> PF1[report_candidate preflight]
+        SP2 --> PF2[report_candidate preflight]
+        SPN --> PFN[report_candidate preflight]
+        PF1 -->|accepted| EV1[Evidence and candidate state]
+        PF2 -->|accepted| EV2[Evidence and candidate state]
+        PFN -->|accepted| EVN[Evidence and candidate state]
+        PF1 -->|rejected with repair hints| SP1
+        PF2 -->|rejected with repair hints| SP2
+        PFN -->|rejected with repair hints| SPN
+        SP1 -. context pressure / completion .-> CP[Checkpoint and bounded repair]
+        SP2 -. context pressure / completion .-> CP
+        SPN -. context pressure / completion .-> CP
+        CP -->|compact-resume when progress exists| SP1
+    end
+
+    W1 --> N[Negotiator / continuation selector<br/><small>LLM proposal + deterministic validation</small>]
+    N -->|resume or consult existing session| W2[Follow-up wave]
+    N -->|start bounded new session| W2
+    N -->|record unknown / no feasible action| F[Finalization]
+    W2 --> N
+
+    F --> FIN[Final specialist checkpoints/finalization]
+    FIN --> CR[Critic<br/><small>LLM: keep, reject, merge, verify</small>]
+    CR --> ADJ[Deterministic adjudicator<br/><small>evidence, consequence, severity, location</small>]
+    ADJ --> REM[Remediator<br/><small>LLM: exact suggestion, guidance, or skip</small>]
+    REM --> HAND[Handoff summarizer<br/><small>LLM presentation role</small>]
+    HAND --> PUB[Publish notes and human handoff]
+```
+
+Candidate preflight rejects only the candidate, not the specialist session. The
+model receives the exact failed checks as a tool result and can collect better
+evidence immediately. If a candidate change is rejected while producing a
+checkpoint, checkpoint repair may correct that candidate or leave it as a
+bounded next action. A compact-resume checkpoint continues the same session
+only when it demonstrates meaningful progress; reworded informal TODOs do not
+count as progress. No-progress checkpoints pause instead of restarting exploration.
+Before a stopped session reaches the negotiator (or finalization), one bounded,
+tools-disabled pass can record still-pending obligation dispositions without
+regenerating the checkpoint. Accepted updates survive rejected siblings; missing
+or rejected updates stay pending, with per-target diagnostics in the artifact.
+This pass uses the existing lifetime budget and does not run at ordinary
+context-pressure compactions. The negotiator can later decide whether that session deserves a
+bounded follow-up. The critic does not schedule sessions.
+The remediator runs only for accepted findings, without tools, and cannot alter
+the finding or verdict. Invalid, skipped, or failed remediation is omitted while
+the original finding remains publishable.
 
 What it supports:
 
@@ -220,14 +286,17 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_max_sessions` | Maximum initial specialist sessions | No | `8` |
 | `specialist_max_followup_sessions` | Maximum bounded follow-up specialist sessions | No | `2` |
 | `specialist_max_model_turns_per_session` | Lifetime model-turn limit for one logical specialist session | No | `64` |
-| `specialist_max_tool_calls_per_session` | Lifetime read-only tool-call limit for one logical specialist session | No | `20` |
+| `specialist_max_tool_calls_per_session` | Lifetime read-only tool-call limit for one logical specialist session | No | `128` |
+| `specialist_max_total_model_turns` | Global model-turn lease shared by all specialist sessions in one review | No | `320` |
+| `specialist_max_total_tool_calls` | Global read-only tool-call lease shared by all specialist sessions in one review | No | `640` |
+| `specialist_remediator_max_evidence_chars` | Maximum cited-evidence characters supplied to each accepted-finding remediation request | No | `32000` |
 | `specialist_max_recoveries_per_session` | Lifetime reconstruction limit for one logical specialist session | No | `1` |
 | `specialist_config_file` | Deprecated one-release alias for a version-1 policy; migrate to `review_policy_file` | No | `.github/ai-review-specialists.json` |
 | `specialist_planner_max_tool_calls` | Deprecated no-op; the planner role does not expose tools. Use `specialist_max_tool_calls_per_session` | No | `2` |
 | `specialist_planner_max_tokens` | Completion-token ceiling for the bounded planning scout | No | `2048` |
 | `specialist_max_initial_passes` | Deprecated one-release alias for `specialist_max_sessions` | No | `6` |
 | `specialist_max_followup_passes` | Deprecated one-release alias for `specialist_max_followup_sessions` | No | `2` |
-| `specialist_max_tool_calls_per_pass` | Deprecated one-release alias for `specialist_max_tool_calls_per_session` | No | `20` |
+| `specialist_max_tool_calls_per_pass` | Deprecated one-release alias for `specialist_max_tool_calls_per_session` | No | `128` |
 | `specialist_tool_mode` | `native_loop` uses durable read-only specialist sessions; `packet` is deprecated | No | `native_loop` |
 | `specialist_planner_model` | Planning/scout model; empty inherits `ai_model` | No | `""` |
 | `specialist_model` | Specialist model; empty inherits `ai_model` | No | `""` |
@@ -236,9 +305,12 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_pass_timeout_sec` | Per-model-request timeout for specialist strategies | No | `600` |
 | `specialist_max_tokens` | Completion-token ceiling for specialist, critic, and aggregator turns | No | `4096` |
 | `specialist_recovery_max_tokens` | Completion-token ceiling for the first reconstructed specialist turn after bounded recovery | No | `2048` |
+| `specialist_delegated_summary_max_tokens` | Optional completion-token ceiling for `delegate_tool_summary`; empty derives twice `specialist_max_tokens`, with half reserved for its one repair | No | `""` |
+| `specialist_delegated_summary_max_source_bytes` | Optional source-byte ceiling for `delegate_tool_summary`; empty derives a context-safe limit after prompt, output, repair, and safety reserves | No | `""` |
 | `specialist_max_conversation_tokens` | Approximate transcript ceiling for one specialist conversation; independent of `model_context_tokens` | No | `96000` |
 | `specialist_temperature` | Sampling temperature for streamed specialist exploration turns; keep `0.0` for deterministic behavior or experiment with a modest value | No | `0.0` |
 | `specialist_stream_watchdog` | Interrupt streamed specialist output after repeated paragraphs/blocks and recover once from compact evidence | No | `true` |
+| `specialist_structured_chat_template_kwargs` | Optional JSON `chat_template_kwargs` added only to no-tool specialist structured turns; leave empty unless the provider supports it | No | `""` |
 | `specialist_max_truncation_continuations` | Deprecated no-op; durable sessions checkpoint instead of issuing truncation-continuation turns | No | `2` |
 | `specialist_planner_max_context_bytes` | Diff/context bytes supplied to the planner before tool exploration | No | `60000` |
 | `specialist_packet_max_bytes` | Deprecated no-op; durable sessions do not build packet-mode specialist inputs | No | `90000` |
@@ -269,6 +341,38 @@ ceilings. The job summary reports assignment coverage, model requests, runtime,
 and budget accounting. `specialists_evaluate` writes
 `specialist-review-artifact.json` and exposes its path as `specialist_artifact`,
 but the publish step is unconditionally skipped.
+
+When ordinary specialist evidence tools are available, sessions also expose
+`delegate_tool_summary` for a focused side question about a large web page,
+remote file, or other reference source. It is not a replacement for direct
+changed-code investigation or exact finding locations. The selected tool runs
+under its existing guards, the bounded original remains authoritative evidence,
+and only a compact summary, controller-extracted excerpts selected by numbered
+source ranges, uncertainties, truncation status, and the original evidence ID
+enter the specialist conversation. Invalid structured output receives one
+focused tools-disabled repair.
+
+The helper receives its returned-result byte budget separately from its larger
+reasoning/output-token allowance. Oversized optional excerpts may be omitted
+with an explicit `omitted_excerpt_count`, preserving the complete answer and
+original source reference. Invalid excerpts or an oversized required answer
+still require repair; range and size diagnostics are reported together where
+detectable. Specialist evidence snapshots preserve the configured source cap.
+
+The specialist job summary (`specialist-review-summary.md`) includes provider-reported
+cache and performance statistics, grouped by exploration, delegated summaries,
+the first exploration request after delegation, checkpoints (including repairs),
+and the first exploration request after a checkpoint with tools re-enabled.
+It shows cached/prompt tokens, cache-hit percentage and measurement coverage,
+prefill tokens/time/speed, generation speed, and speculative draft acceptance
+when available. Rates use summed tokens and time; missing measurements remain
+unavailable rather than counting as cache misses. These statistics cover the final
+provider response of each completed logical specialist request, not retry costs
+or separate controller-role calls. Per-request measurements and categories are
+retained under `budgets.request_attempts` in `specialist-review-artifact.json`.
+Low cache reuse after a transition helps identify expensive reprocessing but
+does not establish whether cache eviction, prompt/template changes, or another
+server behavior caused it. No llama-specific request options are required.
 
 `review_policy_file` is a current-branch version-2 policy. The older
 `specialist_config_file` remains a one-release version-1 migration input, but
@@ -364,6 +468,7 @@ for the complete schema, source-rule boundaries, and conversion checklist.
 |-------|-------------|----------|---------|
 | `context_limit_mode` | Context budget mode: `normal` (140k/70k/220k), `low` (80k/40k/120k), `minimal` (40k/20k/60k) | No | `normal` |
 | `model_context_tokens` | The model's real context window in tokens (e.g. `8192`, `32768`). When set, corpus/diff/file byte budgets are derived from it (reserving `ai_max_tokens` for output) instead of `context_limit_mode`. Recommended for local models. Empty uses `context_limit_mode` | No | `""` |
+| `review_diff_priority_file` | Optional current-branch JSON file that orders and quotas changed diff sections for large PRs | No | `.github/ai-review-diff-priorities.json` |
 | `enrichment_budget_sec` | Maximum seconds to spend on enrichment (linked source fetching, release metadata, ghcr.io lookups). Exceeding the budget stops further enrichment. | No | `60` |
 | `image_digest_budget_sec` | Maximum seconds to spend on image digest provenance lookups (registry tokens, manifests, revision compares). 0 disables the budget. | No | `60` |
 | `allowed_source_hosts` | Comma-separated allowlist for linked URL fetching | No | `github.com,api.github.com,gitlab.com,registry.terraform.io,artifacthub.io` |
@@ -376,6 +481,7 @@ for the complete schema, source-rule boundaries, and conversion checklist.
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `evidence_providers_file` | Optional JSON file in the reviewed repo defining evidence provider commands | No | `""` |
+| `specialist_test_results_file` | Optional repository-local normalized test manifest. When empty on GitHub, bounded same-head artifacts named like JUnit/test-results are discovered and normalized automatically. | No | `""` |
 | `evidence_provider_timeout_sec` | Default timeout in seconds for each evidence provider command | No | `30` |
 | `evidence_provider_max_output_bytes` | Max stdout or stderr bytes captured per provider command | No | `20000` |
 | `evidence_provider_parallelism` | Max evidence provider commands run concurrently (set `1` to force serial execution) | No | `4` |
@@ -404,9 +510,10 @@ for the complete schema, source-rule boundaries, and conversion checklist.
 | `tool_planning_max_context_bytes` | Maximum corpus bytes passed to planning | No | `50000` |
 | `tool_planning_max_tokens` | Maximum completion tokens for tool harness planning call | No | `400` |
 | `tool_max_response_bytes` | Maximum bytes captured from each tool response | No | `12000` |
-| `tool_allowed_gh_api_repos` | Comma-separated owner/repo allowlist for `gh_api`; use `*` to allow any repo endpoint still permitted by the tool path allowlist (empty = current repo only) | No | `""` |
+| `tool_allowed_gh_api_repos` | Comma-separated owner/repo allowlist for `gh_api` metadata and `read_remote_file` text reads. `read_remote_file` requires an explicitly named other repository plus an immutable commit SHA; it rejects both the repository under review and the `*` wildcard. `*` broadens metadata-only `gh_api` access while retaining endpoint guards (empty = current-repo `gh_api` metadata only) | No | `""` |
 | `tool_request_timeout_sec` | Timeout in seconds for each tool execution request | No | `20` |
 | `search_url` | Search-engine endpoint (e.g. a SearXNG `/search` URL) that enables the read-only `web_search` tool in the native tool loop. When set, the model can search for a page and then `web_fetch` the best result; empty leaves `web_search` un-advertised. The model supplies only the query — the host is fixed by this setting. Subject to the same fork gating as the rest of the tool harness | No | `""` |
+| `allow_private_search_url` | Explicitly allow the configured `search_url` to use private HTTP(S) endpoints and non-standard ports; intended for trusted self-hosted runners and still subject to fork gating | No | `false` |
 | `tool_max_search_results` | Maximum results returned per `web_search` call | No | `5` |
 | `tool_failure_enforcement` | Force `request_changes` when tool harness planning fails | No | `false` |
 | `tool_min_successful_requests` | Minimum successful tool requests required when `tool_failure_enforcement=true` | No | `0` |
@@ -661,6 +768,9 @@ Before synthesis and verdict, older tool results are compacted while recent evid
 
 - `gh_api` with a repo-local path like `repos/owner/repo/pulls/123/files`
 - `read_file` for files inside the checked-out repository
+- `read_remote_file` for UTF-8 text in an explicitly allowlisted *other*
+  repository at an immutable commit SHA; generic `gh_api` does not return file
+  contents or Git blobs
 - `web_fetch` for allowlisted hosts from `allowed_source_hosts`
 - `git_grep` for local repository content search
 - `run_command` for a fixed catalog of named read-only commands
@@ -1095,6 +1205,19 @@ on_model_failure: notice   # visible explanation instead of a long red check
 - By default, the action computes a stable patch fingerprint with `git patch-id --stable` and skips the LLM call when that fingerprint matches the most recent managed review comment. This avoids token spend on rebases and other history-only changes.
 - `publish_review_comment` uses `gh pr comment --edit-last --create-if-none`, so the comment is managed by the token identity used in the workflow.
 - `context_limit_mode` reduces the amount of PR data sent to the LLM. Use `minimal` for models with very small context windows. This skips nothing but truncates more aggressively.
+- Large diffs are rendered through `review_diff_priority_file` when present. The file contains `rules` with `glob` (or `globs`), `priority`, optional `category`, and optional `max_bytes`; lower priorities are selected first. The built-in ordering favors orientation/docs, contracts, configuration, build manifests, schemas, tests, and normal source; lockfiles are deliberately a late tier because they are usually noisy. Rules only reorder or quota paths already present in the authoritative PR diff and cannot grant additional repository or web access. Omitted sections are listed in the changed-file index and marked in the diff.
+
+Example `.github/ai-review-diff-priorities.json`:
+
+```json
+{
+  "rules": [
+    {"glob": "docs/**/*.md", "priority": 5, "max_bytes": 40000},
+    {"glob": "src/**/*.py", "priority": 15},
+    {"glob": "**/*_generated.*", "priority": 90, "max_bytes": 8000}
+  ]
+}
+```
 - `evidence_providers_file` accepts JSON only. It can be either an object with `providers: []` or a top-level provider array.
 - Provider `command` accepts either a shell string (executed via `bash -lc`) or an argument array (invoked directly). **Argv arrays are strongly recommended** to avoid shell injection risks. Each provider can override `timeout_sec` and `max_output_bytes`.
 - Provider output is appended to the review corpus under an `Evidence Providers` section.
@@ -1102,7 +1225,7 @@ on_model_failure: notice   # visible explanation instead of a long red check
 - Tool harness output is appended to the review corpus under `Tool Harness Findings`.
 - Tool harness planning treats corpus content as untrusted data and uses strict tool/path/host allowlists with output redaction. The `run_command` tool does not execute arbitrary shell text; it accepts only named read-only command definitions (`git_status_short`, `git_diff_stat`, `git_diff_name_only`) and runs them argv-only without `bash -lc`.
 - Evidence providers and tool harness are both disabled by default on cross-repository PRs (`*_enable_for_forks=false`).
-- `gh_api` defaults to current-repo scope only. Use `tool_allowed_gh_api_repos` to allow specific upstream repos, or `*` to allow any repository while keeping the path denylist and endpoint allowlist active.
+- `gh_api` defaults to current-repo metadata only. Use `tool_allowed_gh_api_repos` to allow specific upstream repositories. A specifically named entry also enables `read_remote_file`, which decodes only UTF-8 text at an immutable commit and refuses the repository under review. Generic `gh_api` rejects file-content and Git-blob endpoints. `*` broadens metadata access only and never grants remote source-text access.
 - For local models, reduce `tool_planning_max_context_bytes` and `tool_planning_max_tokens`, and increase `tool_planning_timeout_sec` as needed.
 - Set `tool_failure_enforcement=true` to fail closed when tool harness planning fails or when every tool request fails.
 - Use `tool_min_successful_requests` (for example `1`) to enforce a minimum successful tool-evidence threshold when the planner attempted tool requests.

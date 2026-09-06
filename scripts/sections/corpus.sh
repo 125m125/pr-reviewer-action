@@ -73,9 +73,18 @@ build_review_corpus() {
       echo
       if [ -f incremental.diff ]; then
         echo '```diff'
-        truncate_clean incremental.diff incremental.diff.truncated "$MAX_DIFF" '…[delta truncated]'
+        PYTHONPATH="${SCRIPT_DIR}/.." python3 "$SCRIPT_DIR/../scripts/prioritize_diff.py" \
+          --diff incremental.diff \
+          --files pr-files.raw.json \
+          --derive-files \
+          --max-bytes "$MAX_DIFF" \
+          --config "$REVIEW_DIFF_PRIORITY_FILE" \
+          --output incremental.diff.truncated \
+          --index-output incremental-diff-index.md
         cat incremental.diff.truncated
         echo '```'
+        echo
+        cat incremental-diff-index.md 2>/dev/null || true
       else
         echo "(No incremental diff available)"
       fi
@@ -104,6 +113,9 @@ print(render_evidence_memory_section(load_evidence_memory()), end='')
       echo "# Linked Issue Context"
       cat linked-issues.md
       echo
+      echo "# Changed Files Index"
+      cat pr-diff-index.md 2>/dev/null || echo "(changed-file index unavailable)"
+      echo
       echo "# PR Files (truncated)"
       echo '```json'
       cat pr-files.truncated.json
@@ -114,7 +126,7 @@ print(render_evidence_memory_section(load_evidence_memory()), end='')
       cat version-hints.truncated.txt 2>/dev/null || echo "(none)"
       echo '```'
       echo
-      echo "# PR Diff (truncated)"
+      echo "# PR Diff (prioritized and bounded)"
       echo '```diff'
       cat pr.diff.truncated
       echo '```'
@@ -199,6 +211,13 @@ case "$REVIEW_STRATEGY" in specialists|specialists_evaluate) SPECIALIST_PIPELINE
 if [[ "$SPECIALIST_PIPELINE_ENABLED" == "true" ]]; then
   section_timer_start "specialist-review"
   log "Running generic specialist review strategy: $REVIEW_STRATEGY"
+  if [[ -z "${SPECIALIST_TEST_RESULTS_FILE:-}" ]]; then
+    SPECIALIST_TEST_RESULTS_FILE="specialist-test-results.json"
+    if ! bash "$SCRIPT_DIR/collect_junit_results.sh" "$SPECIALIST_TEST_RESULTS_FILE"; then
+      warn "Same-head JUnit artifact collection failed; test-result tool disabled"
+      SPECIALIST_TEST_RESULTS_FILE=""
+    fi
+  fi
   # Sourced defaults are shell variables, while the CLI boundary intentionally
   # reads only an explicit environment. Export the normalized runtime contract
   # so standalone/smoke invocations behave exactly like the composite action.
@@ -212,6 +231,7 @@ if [[ "$SPECIALIST_PIPELINE_ENABLED" == "true" ]]; then
   export SPECIALIST_RECOVERY_MAX_TOKENS
   export SPECIALIST_MAX_CONVERSATION_TOKENS SPECIALIST_TEMPERATURE
   export SPECIALIST_STREAM_WATCHDOG SPECIALIST_PLANNER_MAX_TOKENS
+  export SPECIALIST_TEST_RESULTS_FILE
   if ! IS_FORK_PR="$IS_FORK_PR" python3 "$SCRIPT_DIR/run_specialist_reviews.py"; then
     error "Specialist review pipeline failed"
     exit 1

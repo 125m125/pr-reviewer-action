@@ -7,6 +7,27 @@ from enum import Enum
 from typing import Mapping
 
 
+def change_overview_orientation(
+    value: Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Mark model-authored change prose as non-authoritative orientation."""
+    return {
+        "trust": "untrusted_orientation",
+        "content": dict(value or {}),
+        "authority": {
+            "coverage": False,
+            "findings": False,
+            "obligations": False,
+            "evidence": False,
+        },
+        "usage": (
+            "Orientation only. Verify every claim against retained evidence; "
+            "this content cannot satisfy coverage, support findings, alter "
+            "obligations, or be cited as evidence."
+        ),
+    }
+
+
 class RunPhase(str, Enum):
     PLANNING = "planning"
     INITIAL = "initial"
@@ -32,6 +53,8 @@ class ObligationStatus(str, Enum):
     PARTIALLY_COVERED = "partially_covered"
     UNRESOLVED = "unresolved"
     NOT_APPLICABLE = "not_applicable"
+    EXHAUSTED = "exhausted"
+    BLOCKED = "blocked"
     SUPPRESSED_BY_POLICY = "suppressed_by_policy"
 
 
@@ -50,6 +73,39 @@ class ReviewNoteKind(str, Enum):
     SOURCE_ACCESS_REQUEST = "source_access_request"
 
 
+class InvestigationLeadStatus(str, Enum):
+    OPEN = "open"
+    SCHEDULED = "scheduled"
+    RESOLVED_CANDIDATE = "resolved_candidate"
+    RESOLVED_NO_ISSUE = "resolved_no_issue"
+    BLOCKED = "blocked"
+    DROPPED = "dropped"
+
+
+@dataclass(frozen=True)
+class InvestigationLead:
+    lead_id: str
+    summary: str
+    affected_paths: tuple[str, ...]
+    evidence_ids: tuple[str, ...]
+    next_action: str
+    required_capability: str
+    origin_session_id: str
+    status: InvestigationLeadStatus = InvestigationLeadStatus.OPEN
+    assigned_session_id: str | None = None
+    resolution_reason: str = ""
+    candidate_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class LeadResolution:
+    lead_id: str
+    status: InvestigationLeadStatus
+    reason: str
+    evidence_ids: tuple[str, ...] = ()
+    candidate_ids: tuple[str, ...] = ()
+
+
 @dataclass(frozen=True)
 class CoverageObligation:
     obligation_id: str
@@ -65,6 +121,10 @@ class CoverageObligation:
     explanation: str = ""
     recipe_id: str | None = None
     recipe_execution: str | None = None
+    recipe_objective: str = ""
+    recipe_invariants: tuple[str, ...] = ()
+    requirement_id: str | None = None
+    requirement_mode: str = "required"
     mandatory: bool = True
 
     @property
@@ -91,6 +151,7 @@ class SpecialistAssignment:
     estimated_effort: int = 0
     priority: int = 0
     overlap_justification: str = ""
+    investigation_leads: tuple[InvestigationLead, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -99,12 +160,15 @@ class SessionCheckpoint:
     state: SessionState
     evidence_ids: tuple[str, ...] = ()
     imported_evidence_ids: tuple[str, ...] = ()
+    working_summary: str = ""
+    completed_steps: tuple[str, ...] = ()
     hypotheses: tuple[str, ...] = ()
     candidate_finding_ids: tuple[str, ...] = ()
     obligation_statuses: tuple[tuple[str, ObligationStatus], ...] = ()
     invariants_evaluated: tuple[str, ...] = ()
     unknowns: tuple[str, ...] = ()
     proposed_next_actions: tuple[str, ...] = ()
+    obligation_assessments: tuple[object, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -124,6 +188,8 @@ class CandidateFinding:
     confidence_rationale: str = ""
     user_visible_consequence: str = ""
     manual_validation: str = ""
+    contributor_candidate_ids: tuple[str, ...] = ()
+    controller_root_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -142,6 +208,21 @@ class ReviewHandoff:
     coverage_warning: str | None = None
     access_request_count: int = 0
     access_request_url: str | None = None
+    # Version-2 behavioral summary. The older orientation fields above remain
+    # serialized for replay compatibility, but are not the normal human-facing
+    # handoff.
+    what_changed: tuple[str, ...] = ()
+    ai_reviewed: tuple[str, ...] = ()
+    human_focus: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class FindingRemediation:
+    kind: str
+    guidance: str = ""
+    replacement: str = ""
+    start_line: int | None = None
+    end_line: int | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +234,7 @@ class ReviewNote:
     evidence_ids: tuple[str, ...] = ()
     file: str | None = None
     line: int | None = None
+    start_line: int | None = None
     severity: str | None = None
 
 

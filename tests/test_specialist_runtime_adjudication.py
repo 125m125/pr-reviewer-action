@@ -2,20 +2,26 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from pr_reviewer.specialist_runtime.adjudication import (
     AdjudicatedReview,
+    CandidateDisposition,
     ReviewHandoffContext,
     ReviewOrientationTopic,
     adjudicate_candidates,
     apply_runtime_verdict_policy,
     build_review_handoff,
     build_review_notes,
+    consolidate_candidates,
+    project_review_handoff,
 )
 from pr_reviewer.specialist_runtime.evidence import EvidenceStore
 from pr_reviewer.specialist_runtime.types import (
     CandidateFinding,
     CoverageObligation,
     ReviewNoteKind,
+    FindingRemediation,
 )
 
 
@@ -52,7 +58,7 @@ def _candidate(
     candidate_id: str = "candidate-1",
     *,
     claim: str = "A retry can duplicate the write",
-    location: str = "./src\\store.py:41",
+    location: str = "src/store.py:41",
     category: str = "database",
     evidence_ids: tuple[str, ...] = (),
     contradicting_ids: tuple[str, ...] = (),
@@ -61,7 +67,14 @@ def _candidate(
     causal_chain: str = "The retry repeats a write after an ambiguous response.",
     consequence: str = "A user action can be persisted twice.",
     manual_validation: str = "Force an ambiguous retry and verify exactly one write is persisted.",
+    confidence_rationale: str | None = None,
 ) -> CandidateFinding:
+    rationale = confidence_rationale or (
+        "consequence_support:reachable_input_path; "
+        f"evidence_ids={','.join(evidence_ids)}; "
+        "input=ambiguous response; condition=retry repeats a write; "
+        "outcome=A user action can be persisted twice"
+    )
     return CandidateFinding(
         candidate_id=candidate_id,
         root_cause_fingerprint="model-controlled-value",
@@ -75,6 +88,7 @@ def _candidate(
         related_obligation_ids=obligation_ids,
         collector_session_id="session-1",
         model_identity="specialist-model",
+        confidence_rationale=rationale,
         user_visible_consequence=consequence,
         manual_validation=manual_validation,
     )
@@ -108,6 +122,394 @@ def _adjudicate(
     )
 
 
+@pytest.mark.parametrize(
+    ("path", "anchor_field", "anchor", "category", "first_claim", "second_claim"),
+    (
+        (
+            "scripts/sections/config.sh",
+            "symbols",
+            "validate_budget",
+            "budget-validation",
+            "validate_budget accepts an output budget larger than the model window",
+            "The validate_budget guard does not cap output tokens to the context window",
+        ),
+        (
+            ".github/workflows/ai-pr-review.yaml",
+            "workflow_keys",
+            "pull_request_target",
+            "workflow-trigger",
+            "pull_request_target runs the reviewer with target-repository privileges",
+            "The pull_request_target trigger exposes the privileged review path",
+        ),
+        (
+            "pr_reviewer/specialist_runtime/adjudication.py",
+            "symbols",
+            "_consequence_support_reason",
+            "rationale-format",
+            "_consequence_support_reason rejects a valid confidence_rationale layout",
+            "A supported confidence_rationale is misparsed by _consequence_support_reason",
+        ),
+        (
+            "pr_reviewer/specialist_runtime/adjudication.py",
+            "symbols",
+            "_exact_changed_location",
+            "location-normalization",
+            "_exact_changed_location rejects normalized changed paths",
+            "Changed-path normalization is lost at _exact_changed_location",
+        ),
+    ),
+)
+def test_controller_root_identity_consolidates_production_shaped_specialist_clusters(
+    path,
+    anchor_field,
+    anchor,
+    category,
+    first_claim,
+    second_claim,
+):
+    candidates = (
+        _candidate(
+            "specialist-a",
+            claim=first_claim,
+            location=f"{path}:41",
+            category=category,
+            evidence_ids=("evidence:a",),
+            causal_chain=f"{anchor} applies the changed contract incorrectly.",
+        ),
+        _candidate(
+            "specialist-b",
+            claim=second_claim,
+            location=path,
+            category=category,
+            evidence_ids=("evidence:b",),
+            causal_chain=f"The changed {anchor} contract takes the same faulty branch.",
+        ),
+    )
+
+    result = consolidate_candidates(
+        candidates,
+        changed_files=(path,),
+        change_facts={path: {anchor_field: (anchor,)}},
+        obligations=_obligations(),
+        valid_evidence_ids=("evidence:a", "evidence:b"),
+    )
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0].contributor_candidate_ids == (
+        "specialist-a",
+        "specialist-b",
+    )
+    assert result.dispositions == (
+        CandidateDisposition(
+            candidate_id="specialist-b",
+            action="merge",
+            reason="controller-root-identity",
+            target_id="specialist-a",
+        ),
+    )
+
+
+def test_controller_root_merge_retains_precise_location_valid_evidence_obligations_and_severity():
+    implementation = _obligation("obligation-implementation")
+    contract = _obligation("obligation-contract")
+    first = _candidate(
+        "budget-a",
+        claim="validate_budget permits an oversized output allowance",
+        location="src/store.py:41",
+        category="budget-validation",
+        evidence_ids=("evidence:a", "missing:evidence"),
+        obligation_ids=(implementation.id,),
+        severity="minor",
+        causal_chain="validate_budget compares the wrong remaining-token value.",
+    )
+    second = _candidate(
+        "budget-b",
+        claim="The output-token guard can exceed the remaining model context",
+        location="src/store.py",
+        category="budget-validation",
+        evidence_ids=("evidence:b",),
+        contradicting_ids=("evidence:contradiction", "missing:contradiction"),
+        obligation_ids=(contract.id,),
+        severity="major",
+        causal_chain="The changed validate_budget contract uses the same incorrect comparison.",
+    )
+
+    result = consolidate_candidates(
+        (second, first),
+        changed_files=CHANGED_FILES,
+        change_facts={"src/store.py": {"symbols": ("validate_budget",)}},
+        obligations=_obligations(implementation, contract),
+        valid_evidence_ids=(
+            "evidence:a",
+            "evidence:b",
+            "evidence:contradiction",
+        ),
+    )
+
+    assert len(result.candidates) == 1
+    merged = result.candidates[0]
+    assert merged.candidate_id == "budget-a"
+    assert merged.affected_location == "src/store.py:41"
+    assert merged.supporting_evidence_ids == ("evidence:a", "evidence:b")
+    assert merged.contradicting_evidence_ids == ("evidence:contradiction",)
+    assert merged.related_obligation_ids == (
+        "obligation-contract",
+        "obligation-implementation",
+    )
+    assert merged.severity == "major"
+    assert merged.root_cause_fingerprint.startswith("root:")
+
+
+def test_controller_root_merge_prefers_evidence_backed_changed_line():
+    store, evidence_id = _store()
+    diff = store.add_tool_result(
+        session_id="session-1",
+        tool="read_pr_diff",
+        arguments={"path": "src/store.py"},
+        result={
+            "status": "ok",
+            "content": (
+                "diff --git a/src/store.py b/src/store.py\n"
+                "--- a/src/store.py\n+++ b/src/store.py\n"
+                "@@ -40,3 +40,3 @@\n context\n"
+                "+return validate_budget(remaining)\n"
+                " context\n"
+            ),
+        },
+        category="implementation",
+        source="src/store.py",
+    )
+    wrong = _candidate(
+        "budget-a",
+        claim="validate_budget permits an oversized output allowance",
+        location="src/store.py:42",
+        category="budget-validation",
+        evidence_ids=(evidence_id, diff.id),
+        causal_chain="validate_budget compares the wrong remaining-token value.",
+    )
+    correct = _candidate(
+        "budget-b",
+        claim="The validate_budget output guard can exceed remaining context",
+        location="src/store.py:41",
+        category="budget-validation",
+        evidence_ids=(evidence_id, diff.id),
+        causal_chain="The changed validate_budget contract uses the wrong comparison.",
+    )
+
+    result = consolidate_candidates(
+        (wrong, correct),
+        changed_files=CHANGED_FILES,
+        change_facts={"src/store.py": {"symbols": ("validate_budget",)}},
+        obligations=_obligations(),
+        evidence=store,
+    )
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0].affected_location == "src/store.py:41"
+
+
+def test_controller_line_confirmation_reads_wrapped_executor_patch():
+    store, evidence_id = _store()
+    diff = store.add_tool_result(
+        session_id="session-1",
+        tool="read_pr_diff",
+        arguments={"path": "src/store.py"},
+        result={
+            "status": "ok",
+            "result": {
+                "path": "src/store.py",
+                "patch": (
+                    "diff --git a/src/store.py b/src/store.py\n"
+                    "--- a/src/store.py\n+++ b/src/store.py\n"
+                    "@@ -40 +40 @@\n-old\n+new\n"
+                ),
+                "range": None,
+            },
+        },
+        category="implementation",
+        source="src/store.py",
+    )
+    candidate = _candidate(
+        "wrapped-diff", location="src/store.py:40",
+        evidence_ids=(evidence_id, diff.id),
+    )
+
+    result = consolidate_candidates(
+        (candidate,), changed_files=CHANGED_FILES,
+        change_facts={}, obligations=_obligations(), evidence=store,
+    )
+
+    assert result.candidates[0].affected_location == "src/store.py:40"
+
+
+def test_unparseable_diff_does_not_disprove_submitted_line():
+    store, evidence_id = _store()
+    diff = store.add_tool_result(
+        session_id="session-1", tool="read_pr_diff",
+        arguments={"path": "src/store.py"},
+        result={"status": "ok", "content": "diff unavailable"},
+        category="implementation", source="src/store.py",
+    )
+    candidate = _candidate(
+        "unparseable-diff", location="src/store.py:41",
+        evidence_ids=(evidence_id, diff.id),
+    )
+
+    result = consolidate_candidates(
+        (candidate,), changed_files=CHANGED_FILES,
+        change_facts={}, obligations=_obligations(), evidence=store,
+    )
+
+    assert result.candidates[0].affected_location == "src/store.py:41"
+
+
+def test_unsupported_duplicate_cannot_supply_a_more_precise_location():
+    store, evidence_id = _store()
+    supported = _candidate(
+        "supported",
+        claim="validate_budget permits an oversized output allowance",
+        location="src/store.py",
+        category="budget-validation",
+        evidence_ids=(evidence_id,),
+        causal_chain="validate_budget compares the wrong remaining-token value.",
+    )
+    unsupported = _candidate(
+        "unsupported",
+        claim="The validate_budget output guard can overrun remaining context",
+        location="src/store.py:1",
+        category="budget-validation",
+        evidence_ids=("missing:evidence",),
+        causal_chain="The changed validate_budget contract uses the same comparison.",
+    )
+
+    result = consolidate_candidates(
+        (unsupported, supported),
+        changed_files=CHANGED_FILES,
+        change_facts={"src/store.py": {"symbols": ("validate_budget",)}},
+        obligations=_obligations(),
+        evidence=store,
+    )
+
+    assert result.candidates[0].affected_location == "src/store.py"
+
+
+def test_obligation_irrelevant_evidence_cannot_promote_merged_severity():
+    store = EvidenceStore()
+    supporting = store.add_tool_result(
+        session_id="session-1",
+        tool="read_file",
+        arguments={"path": "src/store.py"},
+        result={"status": "ok", "content": "validate_budget()"},
+        category="implementation",
+    )
+    unrelated = store.add_tool_result(
+        session_id="session-2",
+        tool="read_file",
+        arguments={"path": "README.md"},
+        result={"status": "ok", "content": "budget documentation"},
+        category="documentation",
+    )
+    supported = _candidate(
+        "supported",
+        claim="validate_budget permits an oversized output allowance",
+        category="budget-validation",
+        evidence_ids=(supporting.id,),
+        severity="minor",
+        causal_chain="validate_budget compares the wrong remaining-token value.",
+    )
+    unsupported_blocker = _candidate(
+        "unsupported-blocker",
+        claim="The validate_budget output guard can overrun remaining context",
+        category="budget-validation",
+        evidence_ids=(unrelated.id,),
+        severity="blocker",
+        causal_chain="The changed validate_budget contract uses the same comparison.",
+    )
+
+    result = consolidate_candidates(
+        (unsupported_blocker, supported),
+        changed_files=CHANGED_FILES,
+        change_facts={"src/store.py": {"symbols": ("validate_budget",)}},
+        obligations=_obligations(),
+        evidence=store,
+    )
+
+    assert result.candidates[0].severity == "minor"
+
+
+def test_shared_valid_evidence_cannot_launder_location_or_severity():
+    store, evidence_id = _store()
+    first = _candidate(
+        "candidate-a",
+        claim="validate_budget permits an oversized output allowance",
+        location="src/store.py:41",
+        category="budget-validation",
+        evidence_ids=(evidence_id,),
+        severity="minor",
+        causal_chain="validate_budget compares the wrong remaining-token value.",
+    )
+    hostile_duplicate = _candidate(
+        "candidate-b",
+        claim="The validate_budget output guard causes total service failure",
+        location="src/store.py:1",
+        category="budget-validation",
+        evidence_ids=(evidence_id,),
+        severity="blocker",
+        causal_chain="The changed validate_budget contract uses the same comparison.",
+    )
+
+    result = consolidate_candidates(
+        (first, hostile_duplicate),
+        changed_files=CHANGED_FILES,
+        change_facts={"src/store.py": {"symbols": ("validate_budget",)}},
+        obligations=_obligations(),
+        evidence=store,
+    )
+
+    assert result.candidates[0].affected_location == "src/store.py"
+    assert result.candidates[0].severity == "minor"
+
+
+def test_unique_unrelated_evidence_cannot_unlock_shared_support_donation():
+    store, shared_id = _store()
+    unrelated = store.add_tool_result(
+        session_id="session-2",
+        tool="read_file",
+        arguments={"path": "README.md"},
+        result={"status": "ok", "content": "budget documentation"},
+        category="documentation",
+    )
+    first = _candidate(
+        "candidate-a",
+        claim="validate_budget permits an oversized output allowance",
+        location="src/store.py:41",
+        category="budget-validation",
+        evidence_ids=(shared_id,),
+        severity="minor",
+        causal_chain="validate_budget compares the wrong remaining-token value.",
+    )
+    hostile_duplicate = _candidate(
+        "candidate-b",
+        claim="The validate_budget output guard causes total service failure",
+        location="src/store.py:1",
+        category="budget-validation",
+        evidence_ids=(shared_id, unrelated.id),
+        severity="blocker",
+        causal_chain="The changed validate_budget contract uses the same comparison.",
+    )
+
+    result = consolidate_candidates(
+        (first, hostile_duplicate),
+        changed_files=CHANGED_FILES,
+        change_facts={"src/store.py": {"symbols": ("validate_budget",)}},
+        obligations=_obligations(),
+        evidence=store,
+    )
+
+    assert result.candidates[0].affected_location == "src/store.py"
+    assert result.candidates[0].severity == "minor"
+
+
 def test_critic_cannot_publish_candidate_without_retained_evidence():
     candidate = _candidate(evidence_ids=("MISSING",))
 
@@ -115,6 +517,40 @@ def test_critic_cannot_publish_candidate_without_retained_evidence():
 
     assert review.accepted == ()
     assert review.verification_requests[0].reason == "missing-retained-evidence"
+
+
+def test_authorized_merge_source_is_kept_when_target_is_not_authoritative():
+    store, evidence_id = _store()
+    target = _candidate(
+        "candidate-target",
+        evidence_ids=(evidence_id, "MISSING"),
+    )
+    source = _candidate("candidate-source", evidence_ids=(evidence_id,))
+
+    review = _adjudicate(
+        (target, source),
+        {"actions": [
+            {"candidate_id": target.candidate_id, "action": "keep"},
+            {
+                "candidate_id": source.candidate_id,
+                "action": "merge",
+                "target_id": target.candidate_id,
+            },
+        ]},
+        store,
+    )
+
+    assert [item.candidate_id for item in review.accepted] == [source.candidate_id]
+    assert [item.candidate.candidate_id for item in review.verification_requests] == [
+        target.candidate_id,
+    ]
+    source_disposition = next(
+        item for item in review.dispositions
+        if item.candidate_id == source.candidate_id
+    )
+    assert source_disposition.action == "keep"
+    assert source_disposition.reason == "invalid-merge-target-kept"
+    assert source_disposition.target_id == target.candidate_id
 
 
 def test_fingerprint_normalizes_file_category_claim_and_ignores_line():
@@ -137,6 +573,31 @@ def test_fingerprint_normalizes_file_category_claim_and_ignores_line():
     assert second_review.accepted[0].line == 99
 
 
+def test_non_exact_candidate_location_stays_general_without_inferred_anchor():
+    store, evidence_id = _store()
+    candidate = _candidate(
+        evidence_ids=(evidence_id,),
+        location="./src\\store.py:41",
+    )
+
+    review = _adjudicate(
+        (candidate,), {candidate.candidate_id: "keep"}, store,
+    )
+    notes = build_review_notes(
+        review,
+        store,
+        "review_comment",
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert review.accepted == ()
+    assert len(notes) == 1
+    assert notes[0].kind is ReviewNoteKind.VERIFICATION_REQUEST
+    assert notes[0].file is None
+    assert notes[0].line is None
+
+
 def test_critic_action_vocabulary_is_closed():
     store, evidence_id = _store()
     candidate = _candidate(evidence_ids=(evidence_id,))
@@ -147,6 +608,120 @@ def test_critic_action_vocabulary_is_closed():
 
     assert review.accepted == ()
     assert review.rejected[0].reason == "invalid-critic-action"
+
+
+def test_critic_cannot_request_verification_that_github_review_lines_may_be_zero_based():
+    candidate = _candidate(
+        claim=(
+            "The `_exact_changed_location` function rejects line 0. If a system "
+            "uses zero-based locations, this will be treated as invalid."
+        ),
+        causal_chain=(
+            "The concern assumes GitHub review comments may accept zero-based "
+            "diff locations."
+        ),
+        consequence="A valid GitHub inline review comment could be discarded.",
+        manual_validation="Check whether the GitHub review API accepts line 0.",
+    )
+
+    review = _adjudicate(
+        (candidate,),
+        {candidate.candidate_id: "request_verification"},
+        EvidenceStore(),
+    )
+
+    assert review.verification_requests == ()
+    assert review.rejected[0].reason == "deterministic-platform-contradiction"
+
+
+def test_authorization_failure_cannot_publish_zero_based_github_line_hypothesis():
+    candidate = _candidate(
+        claim="GitHub review comment lines might be zero-based",
+        location="src/store.py:0",
+        causal_chain="GitHub may accept line 0 for a review comment location.",
+        consequence="A valid inline review comment could be discarded.",
+        manual_validation="Check whether the GitHub review API accepts line 0.",
+    )
+
+    review = _adjudicate(
+        (candidate,),
+        {candidate.candidate_id: "keep"},
+        EvidenceStore(),
+    )
+
+    assert review.verification_requests == ()
+    assert review.rejected[0].reason == "deterministic-platform-contradiction"
+
+
+def test_raw_candidate_verification_cannot_publish_zero_based_github_line_hypothesis():
+    candidate = _candidate(
+        claim="GitHub review comment lines might be zero-based",
+        location="src/store.py:0",
+        causal_chain="GitHub may accept line 0 for a review comment location.",
+        manual_validation="Check whether the GitHub review API accepts line 0.",
+    )
+    review = AdjudicatedReview(verification_requests=(candidate,))
+
+    notes = build_review_notes(
+        review,
+        EvidenceStore(),
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert notes == ()
+
+
+def test_defensive_revalidation_cannot_publish_zero_based_github_line_hypothesis():
+    store, evidence_id = _store()
+    candidate = _candidate(
+        claim="GitHub review comment lines might be zero-based",
+        causal_chain="GitHub may accept line 0 for a review comment location.",
+        evidence_ids=(evidence_id,),
+        confidence_rationale=(
+            "consequence_support:reachable_input_path; "
+            f"evidence_ids={evidence_id}; input=line 0; "
+            "condition=GitHub may accept line 0; "
+            "outcome=A user action can be persisted twice"
+        ),
+        manual_validation="Check whether the GitHub review API accepts line 0.",
+    )
+    accepted = _adjudicate(
+        (candidate,),
+        {candidate.candidate_id: "keep"},
+        store,
+    ).accepted[0]
+    review = AdjudicatedReview(accepted=(replace(accepted, line=0),))
+
+    notes = build_review_notes(
+        review,
+        store,
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert notes == ()
+
+
+def test_critic_preserves_genuine_github_diff_side_location_ambiguity():
+    candidate = _candidate(
+        claim="The requested line exists on both sides of the GitHub diff",
+        causal_chain=(
+            "The candidate names a changed line but retained evidence does not identify "
+            "whether the old or new side is intended."
+        ),
+        consequence="The review comment could attach to the wrong side of the diff.",
+        manual_validation="Inspect the patch and select LEFT or RIGHT for the location.",
+    )
+
+    review = _adjudicate(
+        (candidate,),
+        {candidate.candidate_id: "request_verification"},
+        EvidenceStore(),
+    )
+
+    assert review.rejected == ()
+    assert review.verification_requests[0].reason == "critic-requested-verification"
 
 
 def test_high_risk_unresolved_controller_obligation_blocks_by_policy():
@@ -167,7 +742,7 @@ def test_high_risk_unresolved_controller_obligation_blocks_by_policy():
         changed_files=CHANGED_FILES,
     )
 
-    assert result.verdict == "request_changes"
+    assert result.verdict == "notice"
     assert result.source == "incomplete-high-risk-coverage"
     assert result.blocking_obligation_ids == (obligation.id,)
 
@@ -231,6 +806,52 @@ def test_merge_preserves_retained_provenance_contradictions_and_highest_severity
     assert finding.contributor_candidate_ids == ("candidate-a", "candidate-b")
 
 
+def test_merge_prefers_evidence_backed_changed_line_over_representative_line():
+    store, first_evidence_id = _store()
+    diff = store.add_tool_result(
+        session_id="session-1",
+        tool="read_pr_diff",
+        arguments={"path": "src/store.py"},
+        result={
+            "status": "ok",
+            "content": (
+                "diff --git a/src/store.py b/src/store.py\n"
+                "--- a/src/store.py\n+++ b/src/store.py\n"
+                "@@ -40,3 +40,3 @@\n context\n"
+                "+return persist_once(record)\n"
+                " context\n"
+            ),
+        },
+        category="implementation",
+        source="src/store.py",
+    )
+    wrong_target = _candidate(
+        "candidate-a", location="src/store.py:42",
+        evidence_ids=(first_evidence_id, diff.id),
+    )
+    correct_source = _candidate(
+        "candidate-b", location="src/store.py:41",
+        evidence_ids=(first_evidence_id, diff.id),
+    )
+
+    review = _adjudicate(
+        (wrong_target, correct_source),
+        (
+            {"candidate_id": wrong_target.candidate_id, "action": "keep"},
+            {
+                "candidate_id": correct_source.candidate_id,
+                "action": "merge",
+                "target_id": wrong_target.candidate_id,
+            },
+        ),
+        store,
+    )
+
+    assert len(review.accepted) == 1
+    assert review.accepted[0].candidate_id == wrong_target.candidate_id
+    assert review.accepted[0].line == 41
+
+
 def test_merge_cannot_launder_missing_evidence():
     store, evidence_id = _store()
     target = _candidate("candidate-a", evidence_ids=(evidence_id,))
@@ -288,6 +909,117 @@ def test_handoff_is_sparse_and_uses_only_genuine_structured_theme():
     assert "Source access requests" not in handoff.markdown
 
 
+def test_handoff_renders_concise_behavioral_sections_without_component_inventory():
+    handoff = build_review_handoff(
+        ReviewHandoffContext(
+            what_changed=(
+                "`src/store.py` changes database persistence behavior.",
+                "`src/store.py` changes database persistence behavior.",
+            ),
+            ai_reviewed=(
+                "Reviewed database persistence behavior in `src/store.py`.",
+            ),
+            component_ids=("store",),
+            review_emphasis_topics=(
+                ReviewOrientationTopic.DATABASE,
+                ReviewOrientationTopic.FAILURE_RECOVERY,
+                ReviewOrientationTopic.CROSS_COMPONENT_CONTRACTS,
+                ReviewOrientationTopic.SECURITY,
+            ),
+        ),
+        review=AdjudicatedReview(),
+        evidence=EvidenceStore(),
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert "### What changed" in handoff.markdown
+    assert "### What the AI reviewed" in handoff.markdown
+    assert "### Human focus" in handoff.markdown
+    assert handoff.what_changed == (
+        "`src/store.py` changes database persistence behavior.",
+    )
+    assert handoff.ai_reviewed == (
+        "Reviewed database persistence behavior in `src/store.py`.",
+    )
+    assert len(handoff.human_focus) == 3
+    assert "Component: store" not in handoff.markdown
+    assert "### Change map" not in handoff.markdown
+    assert "### AI focus and coverage" not in handoff.markdown
+
+
+def test_handoff_drops_behavioral_summaries_without_an_authorized_changed_path():
+    handoff = build_review_handoff(
+        ReviewHandoffContext(
+            what_changed=(
+                "`src/store.py` changes database persistence behavior.",
+                "`src/invented.py` changes authorization behavior.",
+                "A path-free behavioral claim.",
+            ),
+            ai_reviewed=(
+                "Reviewed retry behavior using evidence:evidence-forged.",
+                "Reviewed persistence behavior in `src/store.py`.",
+            ),
+        ),
+        review=AdjudicatedReview(),
+        evidence=EvidenceStore(),
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert handoff.what_changed == (
+        "`src/store.py` changes database persistence behavior.",
+    )
+    assert handoff.ai_reviewed == (
+        "Reviewed persistence behavior in `src/store.py`.",
+    )
+    assert "invented.py" not in handoff.markdown
+    assert "path-free" not in handoff.markdown
+    assert "evidence-forged" not in handoff.markdown
+
+
+def test_handoff_caps_behavioral_summary_count_and_length():
+    changed_files = tuple(f"src/module-{index}.py" for index in range(7))
+    summaries = (
+        "`src/module-0.py` " + ("x" * 145),
+    ) + tuple(
+        f"`{path}` changes runtime implementation behavior."
+        for path in changed_files
+    )
+    handoff = build_review_handoff(
+        ReviewHandoffContext(what_changed=summaries),
+        review=AdjudicatedReview(),
+        evidence=EvidenceStore(),
+        obligations=_obligations(),
+        changed_files=changed_files,
+    )
+
+    assert len(handoff.what_changed) == 5
+    assert all(len(item) <= 160 for item in handoff.what_changed)
+
+
+def test_handoff_keeps_a_validated_overview_when_it_exceeds_detail_summary_limit():
+    overview = (
+        "This change updates orchestration, model transport, specialist runtime, "
+        "publishing, and regression tests; it changes session budgets, reasoning "
+        "continuity, candidate retention, and sticky handoff reconciliation. "
+        "The bounded summary deliberately carries the cross-component behavioral "
+        "themes needed by a human reviewer without copying individual findings."
+    )
+    handoff = build_review_handoff(
+        ReviewHandoffContext(
+            what_changed=(overview,),
+            what_changed_is_validated_overview=True,
+        ),
+        review=AdjudicatedReview(),
+        evidence=EvidenceStore(),
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert handoff.what_changed == (overview,)
+
+
 def test_handoff_compactly_names_distinct_degraded_stages_without_details():
     handoff = build_review_handoff(
         ReviewHandoffContext(
@@ -314,6 +1046,25 @@ def test_handoff_compactly_names_distinct_degraded_stages_without_details():
     assert "private-session-id" not in handoff.markdown
     assert "private-hook-id" not in handoff.markdown
     assert "exception" not in handoff.markdown.lower()
+
+
+def test_handoff_prepared_note_status_omits_severity_without_a_material_finding():
+    handoff = build_review_handoff(
+        ReviewHandoffContext(
+            unresolved_thread_count=2,
+            highest_thread_severity=None,
+        ),
+        review=AdjudicatedReview(),
+        evidence=EvidenceStore(),
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert handoff.thread_status == "2 detail review notes prepared for publication."
+    assert "**Prepared detail notes:**" in handoff.markdown
+    assert "highest proposed finding severity" not in handoff.markdown
+    assert "unresolved" not in handoff.markdown.casefold()
+    assert "thread status" not in handoff.markdown.casefold()
 
 
 def test_disparate_or_generic_findings_do_not_get_artificial_theme():
@@ -355,10 +1106,95 @@ def test_review_comment_builds_typed_detailed_finding_note():
     assert note.related_obligation_ids == ("obligation-1",)
     assert note.file == "src/store.py"
     assert note.line == 41
-    assert "Supporting evidence provenance" in note.markdown
+    assert "Evidence checked" in note.markdown
+    assert "evidence:" not in note.markdown
+    assert "content hash" not in note.markdown
     assert "Suggested validation" in note.markdown
     assert "A user action can be persisted twice" in note.markdown
     assert "Force an ambiguous retry" in note.markdown
+
+
+def test_finding_note_groups_machine_citations_into_human_evidence_summary():
+    store, implementation_id = _store()
+    diff = store.add_tool_result(
+        session_id="session-1", tool="read_pr_diff",
+        arguments={"path": "src/store.py"},
+        result={"status": "ok", "content": "- old\n+ new"},
+        category="implementation", source="src/store.py",
+    )
+    test_code = store.add_tool_result(
+        session_id="session-1", tool="read_file",
+        arguments={"path": "tests/test_store.py"},
+        result={"status": "ok", "content": "assert exactly_one_write"},
+        category="tests", source="tests/test_store.py",
+    )
+    test_result = store.add_tool_result(
+        session_id="session-1", tool="ci_test_results",
+        arguments={"name_contains": "exactly_one_write"},
+        result={"status": "ok", "content": "failed: expected one write"},
+        category="test-result", source="retained-tool-result",
+    )
+    candidate = _candidate(evidence_ids=(
+        implementation_id, diff.id, test_code.id, test_result.id,
+    ))
+    review = _adjudicate((candidate,), {candidate.candidate_id: "keep"}, store)
+
+    note = build_review_notes(
+        review, store, "review_comment",
+        obligations=_obligations(), changed_files=CHANGED_FILES,
+    )[0]
+
+    assert "**Evidence checked:**" in note.markdown
+    assert (
+        "- Changed implementation and PR diff: <code>src/store.py</code>"
+        in note.markdown
+    )
+    assert "- Related test code: <code>tests/test_store.py</code>" in note.markdown
+    assert "- CI test result retained." in note.markdown
+    assert implementation_id not in note.markdown
+    assert diff.id not in note.markdown
+    assert "content hash" not in note.markdown
+
+
+def test_finding_note_renders_validated_exact_remediation_as_suggestion():
+    store, evidence_id = _store()
+    candidate = _candidate(evidence_ids=(evidence_id,))
+    review = _adjudicate((candidate,), {candidate.candidate_id: "keep"}, store)
+    finding = review.accepted[0]
+
+    note = build_review_notes(
+        review, store, "review_comment",
+        obligations=_obligations(), changed_files=CHANGED_FILES,
+        remediations={finding.root_cause_fingerprint: FindingRemediation(
+            kind="exact",
+            replacement="return persist_once(record)",
+            start_line=41,
+            end_line=41,
+        )},
+    )[0]
+
+    assert "**Suggested change:**" in note.markdown
+    assert "```suggestion\nreturn persist_once(record)\n```" in note.markdown
+    assert note.start_line == 41
+
+
+def test_finding_note_renders_guidance_without_machine_diagnostics():
+    store, evidence_id = _store()
+    candidate = _candidate(evidence_ids=(evidence_id,))
+    review = _adjudicate((candidate,), {candidate.candidate_id: "keep"}, store)
+    finding = review.accepted[0]
+
+    note = build_review_notes(
+        review, store, "review_comment",
+        obligations=_obligations(), changed_files=CHANGED_FILES,
+        remediations={finding.root_cause_fingerprint: FindingRemediation(
+            kind="guidance",
+            guidance="Preserve the idempotency key across the retry boundary.",
+        )},
+    )[0]
+
+    assert "**Suggested approach:**" in note.markdown
+    assert "Preserve the idempotency key" in note.markdown
 
 
 def test_missing_structured_consequence_or_validation_downgrades_to_verification():
@@ -374,6 +1210,21 @@ def test_missing_structured_consequence_or_validation_downgrades_to_verification
     assert review.accepted == ()
     assert tuple(item.reason for item in review.verification_requests) == (
         "missing-required-finding-detail", "missing-required-finding-detail",
+    )
+
+
+def test_candidate_evidence_need_not_match_obligation_coverage_category():
+    store, evidence_id = _store()
+    obligation = _obligation(category="tests")
+    candidate = _candidate(evidence_ids=(evidence_id,))
+
+    review = _adjudicate(
+        (candidate,), {candidate.candidate_id: "keep"}, store,
+        obligations=_obligations(obligation),
+    )
+
+    assert tuple(item.candidate_id for item in review.accepted) == (
+        candidate.candidate_id,
     )
 
 
@@ -421,6 +1272,51 @@ def test_unanchored_keep_becomes_typed_verification_request_note():
     assert "Why human input is needed" in notes[0].markdown
 
 
+def test_exact_changed_file_without_line_stays_file_anchored():
+    store, evidence_id = _store()
+    candidate = _candidate(
+        evidence_ids=(evidence_id,),
+        location="src/store.py",
+    )
+    review = _adjudicate(
+        (candidate,), {candidate.candidate_id: "keep"}, store,
+    )
+
+    notes = build_review_notes(
+        review,
+        store,
+        "review_comment",
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert len(review.accepted) == 1
+    assert len(notes) == 1
+    assert notes[0].kind is ReviewNoteKind.FINDING
+    assert notes[0].file == "src/store.py"
+    assert notes[0].line is None
+
+
+@pytest.mark.parametrize("location", ("src/store.py:41-45", "src/store.py:save"))
+def test_changed_location_ranges_and_symbols_keep_file_anchor(location):
+    store, evidence_id = _store()
+    candidate = _candidate(evidence_ids=(evidence_id,), location=location)
+    review = _adjudicate((candidate,), {candidate.candidate_id: "keep"}, store)
+
+    notes = build_review_notes(
+        review,
+        store,
+        "review_comment",
+        obligations=_obligations(),
+        changed_files=CHANGED_FILES,
+    )
+
+    assert len(notes) == 1
+    assert notes[0].kind is ReviewNoteKind.FINDING
+    assert notes[0].file == "src/store.py"
+    assert notes[0].line is None
+
+
 def test_runtime_supported_severity_policy_and_approval_gate():
     store, evidence_id = _store()
     candidate = _candidate(evidence_ids=(evidence_id,), severity="major")
@@ -458,7 +1354,23 @@ def test_runtime_supported_severity_policy_and_approval_gate():
     assert default_result.verdict == "request_changes"
     assert default_result.source == "supported-findings"
     assert configured_result.verdict == "approve"
+    assert disabled_result.verdict == "notice"
     assert disabled_result.source == "approval-disabled"
+
+
+def test_clean_approval_disabled_handoff_is_not_a_negative_recommendation():
+    handoff = project_review_handoff(
+        ReviewHandoffContext(
+            recommendation="no_blocking_findings", status="complete",
+            ai_reviewed=("The AI examined runtime behavior in `src/worker.py`.",),
+            context_paths=("src/worker.py",),
+        ),
+        finding_categories=(), forbidden_detail_roots=(), obligations={},
+        changed_files=("src/worker.py",),
+    )
+
+    assert handoff.recommendation == "No blocking findings identified"
+    assert "Request changes" not in handoff.markdown
 
 
 def test_set_inputs_are_canonicalized_for_deterministic_output():

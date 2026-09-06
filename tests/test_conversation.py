@@ -13,6 +13,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 from pr_reviewer.conversation import (  # noqa: E402
     APPROX_BYTES_PER_TOKEN,
     TOOL_SCHEMAS,
+    WEB_FETCH_SEARCH_RESULT_SCHEMA,
     WEB_SEARCH_SCHEMA,
     Conversation,
     normalize_assistant_tool_calls_openai,
@@ -31,6 +32,7 @@ class TestToolSchemas:
         assert _tool_names() == {
             "gh_api",
             "read_file",
+            "read_remote_file",
             "web_fetch",
             "git_grep",
             "git_log",
@@ -61,6 +63,22 @@ class TestToolSchemas:
         assert "compare" in desc["gh_api"]
         assert "gh_api" in desc["web_fetch"]
         assert "/api/v1" in desc["web_fetch"]
+
+    def test_external_access_tools_accept_optional_bounded_purpose(self):
+        schemas = {
+            item["name"]: item
+            for item in (
+                *TOOL_SCHEMAS, WEB_SEARCH_SCHEMA, WEB_FETCH_SEARCH_RESULT_SCHEMA,
+            )
+        }
+
+        for name in (
+            "gh_api", "web_fetch", "web_search", "web_fetch_search_result",
+        ):
+            purpose = schemas[name]["parameters"]["properties"]["purpose"]
+            assert purpose["type"] == "string"
+            assert purpose["maxLength"] == 300
+            assert "purpose" not in schemas[name]["parameters"]["required"]
 
 
 class TestWebSearchGating:
@@ -185,6 +203,56 @@ def test_old_assistant_text_compaction_preserves_recent_analysis():
     assert texts[3].startswith("new-b:") and len(texts[3]) > 100
 
 
+def test_openai_replays_reasoning_content_and_tool_calls_in_one_assistant_turn():
+    conv = Conversation(system="s")
+    conv.add_user("review")
+    conv.add_assistant_reasoning("private chain")
+    conv.add_assistant_text("visible progress")
+    conv.add_assistant_tool_calls([{
+        "id": "call-1",
+        "name": "read_file",
+        "arguments": '{"path":"src/app.py"}',
+    }])
+
+    payload = conv.to_request_payload("openai", "m", max_tokens=64)
+
+    assert payload["messages"][2] == {
+        "role": "assistant",
+        "reasoning_content": "private chain",
+        "content": "visible progress",
+        "tool_calls": [{
+            "id": "call-1",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": '{"path":"src/app.py"}',
+            },
+        }],
+    }
+
+
+def test_old_assistant_reasoning_is_bounded_without_mutating_visible_content():
+    conv = Conversation(system="s")
+    conv.add_assistant_reasoning("old:" + "x" * 2000)
+    conv.add_assistant_text("visible")
+    conv.add_assistant_reasoning("new:" + "y" * 2000)
+
+    assert conv.truncate_oldest_assistant_reasoning(100, keep_newest=1) == 1
+
+    reasoning = [
+        event["content"]
+        for event in conv.events
+        if event["kind"] == "assistant_reasoning"
+    ]
+    assert len(reasoning[0].encode()) <= 100
+    assert reasoning[1].startswith("new:") and len(reasoning[1]) > 100
+    assert [
+        event["content"]
+        for event in conv.events
+        if event["kind"] == "assistant_text"
+    ] == ["visible"]
+
+
 def test_anthropic_ephemeral_note_merges_into_existing_user_turn():
     conv = Conversation(system="s")
     conv.add_user("review")
@@ -215,6 +283,242 @@ def test_completed_history_collapse_keeps_recent_pairs_and_open_call_contract():
     notes = [e for e in conv.events if e.get("compaction_note")]
     assert len(notes) == 1
     assert "read_file" in notes[0]["content"]
+
+
+def test_completed_history_collapse_does_not_graft_old_reasoning_onto_new_turn():
+    conv = Conversation(system="s")
+    conv.add_user("review")
+    conv.add_assistant_reasoning("old private reasoning")
+    conv.add_assistant_tool_calls([{
+        "id": "old-call",
+        "name": "read_file",
+        "arguments": '{"path":"old.py"}',
+    }])
+    conv.add_tool_result("old-call", {"content": "old evidence"})
+    conv.add_assistant_text("new visible analysis")
+    conv.add_assistant_tool_calls([{
+        "id": "new-call",
+        "name": "read_file",
+        "arguments": '{"path":"new.py"}',
+    }])
+    conv.add_tool_result("new-call", {"content": "new evidence"})
+
+    conv.collapse_oldest_completed_history(1200, keep_newest_results=1)
+    payload = conv.to_request_payload("openai", "m", max_tokens=64)
+
+    retained = next(
+        message
+        for message in payload["messages"]
+        if message.get("tool_calls")
+    )
+    assert "reasoning_content" not in retained
+    assert retained["content"] == "new visible analysis"
+    assert retained["tool_calls"][0]["id"] == "new-call"
+
+
+def test_completed_history_collapse_removes_all_fields_from_old_adjacent_turn():
+    conv = Conversation(system="s")
+    conv.add_user("review")
+    conv.add_assistant_turn(
+        reasoning="old private reasoning",
+        content="old visible analysis",
+    )
+    conv.add_assistant_turn(content="new visible analysis")
+
+    conv.collapse_oldest_completed_history(1200, keep_newest_results=1)
+    payload = conv.to_request_payload("openai", "m", max_tokens=64)
+
+    assistant_messages = [
+        message
+        for message in payload["messages"]
+        if message.get("role") == "assistant"
+    ]
+    assert assistant_messages == [{
+        "role": "assistant",
+        "content": "new visible analysis",
+    }]
+    assert not any(
+        event["kind"] in {"assistant_reasoning", "assistant_text"}
+        and event.get("content") in {
+            "old private reasoning",
+            "old visible analysis",
+        }
+        for event in conv.events
+    )
+
+
+def test_compact_tool_epoch_preserves_calls_and_replaces_only_old_results():
+    conv = Conversation(system="system")
+    conv.add_user("assignment")
+    conv.events.append({"kind": "assistant_text", "content": ""})
+    replacements = {}
+    original_calls = []
+    original_results = {}
+    for index in range(4):
+        call = {
+            "id": f"call-{index}",
+            "name": "read_file",
+            "arguments": json.dumps({"path": f"src/{index}.py"}),
+        }
+        result = json.dumps({
+            "evidence_id": f"evidence:{index}",
+            "status": "ok",
+            "content": f"complete-result-{index}",
+        }, sort_keys=True)
+        conv.add_assistant_turn(
+            reasoning=f"private-reasoning-{index}",
+            content="" if index == 0 else f"visible-{index}",
+            calls=[call],
+        )
+        conv.add_tool_result(call["id"], result)
+        original_calls.append(call)
+        original_results[call["id"]] = result
+        replacements[call["id"]] = {
+            "status": "compacted",
+            "evidence_id": f"evidence:{index}",
+            "source_path": f"src/{index}.py",
+            "original_bytes": 8192 + index,
+        }
+
+    boundary = len(conv.events)
+    later = [
+        {"kind": "user", "content": "checkpoint request"},
+        {"kind": "assistant_text", "content": "checkpoint response"},
+        {"kind": "assistant_turn_boundary"},
+    ]
+    conv.events.extend(later)
+
+    stats = conv.compact_tool_epoch(
+        boundary, replacements, keep_newest_results=2,
+    )
+
+    assert stats.removed_reasoning == 4
+    assert stats.replaced_results == 2
+    assert stats.retained_full_results == 2
+    assert stats.removed_empty_assistant_text == 1
+    assert not any(
+        event["kind"] == "assistant_reasoning"
+        for event in conv.events[:boundary]
+    )
+    assert [
+        call
+        for event in conv.events
+        if event["kind"] == "assistant_tool_calls"
+        for call in event["calls"]
+    ] == original_calls
+
+    results = {
+        event["call_id"]: event["content"]
+        for event in conv.events
+        if event["kind"] == "tool_result"
+    }
+    assert results["call-0"] == (
+        '{"evidence_id":"evidence:0","original_bytes":8192,'
+        '"source_path":"src/0.py","status":"compacted"}'
+    )
+    assert results["call-1"] == (
+        '{"evidence_id":"evidence:1","original_bytes":8193,'
+        '"source_path":"src/1.py","status":"compacted"}'
+    )
+    assert results["call-2"] == original_results["call-2"]
+    assert results["call-3"] == original_results["call-3"]
+    assert conv.events[-len(later):] == later
+
+
+def test_compact_tool_epoch_renders_no_orphan_openai_calls_or_results():
+    conv = Conversation(system="system")
+    conv.add_assistant_turn(
+        reasoning="old reasoning",
+        calls=[{
+            "id": "call-old",
+            "name": "git_grep",
+            "arguments": '{"pattern":"needle"}',
+        }],
+    )
+    conv.add_tool_result("call-old", "old full result")
+    conv.add_assistant_turn(
+        calls=[{
+            "id": "call-new",
+            "name": "read_file",
+            "arguments": '{"path":"new.py"}',
+        }],
+    )
+    conv.add_tool_result("call-new", "new full result")
+
+    conv.compact_tool_epoch(
+        len(conv.events),
+        {
+            "call-old": {
+                "status": "compacted",
+                "evidence_id": "evidence:old",
+                "source_path": "src/old.py",
+                "original_bytes": 4096,
+            },
+        },
+        keep_newest_results=1,
+    )
+
+    payload = conv.to_request_payload("openai", "model", max_tokens=64)
+    calls = [
+        call["id"]
+        for message in payload["messages"]
+        for call in message.get("tool_calls", [])
+    ]
+    results = [
+        message["tool_call_id"]
+        for message in payload["messages"]
+        if message["role"] == "tool"
+    ]
+    assert calls == ["call-old", "call-new"]
+    assert results == ["call-old", "call-new"]
+    assert conv.open_tool_call_ids() == set()
+
+
+def test_compact_tool_epoch_retains_newest_parallel_call_exchanges_atomically():
+    conv = Conversation(system="system")
+    replacements = {}
+    original_results = {}
+    for turn in range(3):
+        calls = [
+            {
+                "id": f"turn-{turn}-call-{call}",
+                "name": "read_file",
+                "arguments": json.dumps({"path": f"{turn}-{call}.py"}),
+            }
+            for call in range(2)
+        ]
+        conv.add_assistant_turn(
+            reasoning=f"reasoning-{turn}",
+            calls=calls,
+        )
+        for call in calls:
+            body = f"full-result-{call['id']}"
+            conv.add_tool_result(call["id"], body)
+            original_results[call["id"]] = body
+            replacements[call["id"]] = {
+                "status": "compacted",
+                "evidence_id": f"evidence:{call['id']}",
+                "source_path": f"src/{call['id']}.py",
+                "original_bytes": len(body),
+            }
+
+    stats = conv.compact_tool_epoch(
+        len(conv.events), replacements, keep_newest_results=2,
+    )
+
+    results = {
+        event["call_id"]: event["content"]
+        for event in conv.events
+        if event["kind"] == "tool_result"
+    }
+    assert stats.replaced_results == 2
+    assert stats.retained_full_results == 4
+    assert results["turn-0-call-0"] != original_results["turn-0-call-0"]
+    assert results["turn-0-call-1"] != original_results["turn-0-call-1"]
+    for turn in (1, 2):
+        for call in range(2):
+            call_id = f"turn-{turn}-call-{call}"
+            assert results[call_id] == original_results[call_id]
 
 
 class TestAnthropicCachePrefix:
@@ -628,6 +932,28 @@ class TestOpenAIPayload:
         assert "UNTRUSTED DATA" in content
         assert "IGNORE PRIOR INSTRUCTIONS" in content
         assert content.rstrip().endswith("</untrusted_tool_result>")
+
+    def test_truncated_tool_result_keeps_authoritative_evidence_metadata(self):
+        c = Conversation()
+        c.add_assistant_tool_calls(
+            [{"id": "a", "name": "read_pr_diff", "arguments": '{"path":"large.py"}'}]
+        )
+        c.add_tool_result(
+            "a",
+            {
+                "evidence_id": "evidence:0123456789abcdef",
+                "status": "ok",
+                "eligible_targets": ["OB-1"],
+                "content": "x" * 20_000,
+            },
+            max_bytes=256,
+        )
+
+        payload = c.to_request_payload("openai", "gpt-4o")
+        content = next(m for m in payload["messages"] if m["role"] == "tool")["content"]
+        assert 'evidence_id="evidence:0123456789abcdef"' in content
+        assert 'eligible_targets="OB-1"' in content
+        assert 'truncated="true"' in content
 
     def test_fence_cannot_be_escaped_by_delimiter_in_content(self):
         """Untrusted content carrying the closing tag must not break the fence."""

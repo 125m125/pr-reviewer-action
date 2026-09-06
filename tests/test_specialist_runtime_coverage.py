@@ -47,6 +47,25 @@ def test_coverage_obligation_exposes_legacy_friendly_evidence_aliases():
     assert obligation.mandatory is True
 
 
+def test_changed_components_without_configured_relationship_create_no_interaction():
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger, derive_obligations
+    from pr_reviewer.specialist_runtime.policy import ReviewPolicy
+
+    obligations = derive_obligations({
+        "changed_files": ["api/main.py", "worker/main.py"],
+        "components": [
+            {"id": "api", "changed_files": ["api/main.py"]},
+            {"id": "worker", "changed_files": ["worker/main.py"]},
+        ],
+        "relationships": [],
+    }, {}, ReviewPolicy.minimal())
+
+    assert not any(
+        item.subject == "api-to-worker" and "interaction" in item.required_evidence
+        for item in obligations
+    )
+
+
 def test_matching_recipe_becomes_named_mandatory_obligations():
     from pr_reviewer.specialist_runtime.coverage import derive_obligations
     from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy
@@ -63,13 +82,98 @@ def test_matching_recipe_becomes_named_mandatory_obligations():
     }
 
     obligations = derive_obligations(topology, {}, policy)
-    recipe_items = [item for item in obligations if item.recipe_id == "delivery"]
+    recipe_items = [
+        item for item in obligations
+        if item.recipe_id == "delivery" and item.required_evidence_categories
+    ]
 
     assert {item.required_evidence for item in recipe_items} == {
         ("producer",), ("consumer",), ("tests",)
     }
     assert all(item.mandatory for item in recipe_items)
     assert [item.id for item in recipe_items] == sorted(item.id for item in recipe_items)
+
+
+def test_forced_recipe_activates_only_matching_evidence_requirements():
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger, derive_obligations
+    from pr_reviewer.specialist_runtime.policy import (
+        EvidenceRequirementPolicy, RecipePolicy, ReviewPolicy,
+    )
+
+    policy = ReviewPolicy(
+        recipes=(RecipePolicy(
+            id="delivery", title="Delivery", objective="Trace runtime delivery",
+            evidence_requirements=(
+                EvidenceRequirementPolicy(
+                    id="workflow", category="workflow or deployment",
+                    when={"paths_any": (".github/workflows/**",)},
+                ),
+                EvidenceRequirementPolicy(
+                    id="manifest", category="build manifest",
+                    when={"paths_any": ("pom.xml", "**/pom.xml")},
+                ),
+            ),
+        ),),
+        coverage_rules=({
+            "id": "delivery-risk", "paths_any": (".github/workflows/**",),
+            "required_recipe_ids": ("delivery",), "risk_tier": "high",
+            "unresolved_policy": "block_when_unresolved",
+        },),
+    )
+    topology = {
+        "changed_files": [".github/workflows/review.yml"],
+        "file_roles": ["configuration"], "components": [],
+    }
+
+    obligations = derive_obligations(topology, {}, policy)
+    recipe_items = [
+        item for item in obligations
+        if item.recipe_id == "delivery" and item.required_evidence_categories
+    ]
+
+    assert [item.requirement_id for item in recipe_items] == ["workflow"]
+    assert recipe_items[0].risk_tier == "high"
+    assert recipe_items[0].unresolved_policy == "block_when_unresolved"
+    accounting = next(
+        item for item in obligations
+        if item.requirement_id == "manifest" and not item.required_evidence_categories
+    )
+    ledger = CoverageLedger(obligations)
+    assert accounting.mandatory is False
+    assert ledger.obligation_statuses()[accounting.id] is ObligationStatus.NOT_APPLICABLE
+
+
+def test_optional_and_one_of_requirements_have_bounded_mandatory_shape():
+    from pr_reviewer.specialist_runtime.coverage import CoverageLedger, derive_obligations
+    from pr_reviewer.specialist_runtime.policy import (
+        EvidenceRequirementPolicy, RecipePolicy, ReviewPolicy,
+    )
+
+    policy = ReviewPolicy.minimal(recipes=(RecipePolicy(
+        id="delivery", title="Delivery", objective="Trace",
+        match={"file_roles_any": ("configuration",)},
+        evidence_requirements=(
+            EvidenceRequirementPolicy("optional-doc", "documentation", {}, mode="optional"),
+            EvidenceRequirementPolicy("artifact", "generated output", {}, mode="one_of:proof"),
+            EvidenceRequirementPolicy("test", "behavioral test", {}, mode="one_of:proof"),
+        ),
+    ),))
+
+    obligations = derive_obligations({
+        "changed_files": ["config.yml"], "file_roles": ["configuration"],
+        "components": [],
+    }, {}, policy)
+    recipe_items = [item for item in obligations if item.recipe_id == "delivery"]
+
+    optional = next(item for item in recipe_items if item.requirement_id == "optional-doc")
+    group = next(item for item in recipe_items if item.requirement_id == "one_of:proof")
+    assert optional.mandatory is False
+    assert group.mandatory is True
+    assert group.required_evidence == ("behavioral test", "generated output")
+
+    ledger = CoverageLedger(obligations)
+    ledger.attach_evidence(group.id, "E-proof")
+    assert ledger.recipe_statuses()["delivery"] == "covered"
 
 
 def test_recipe_is_partial_until_every_obligation_has_evidence():
@@ -138,6 +242,42 @@ def test_topology_rules_include_artifacts_risks_and_component_interactions():
     assert any(item.origin == "risk-rule" and item.subject == "auth_changes" for item in obligations)
 
 
+def test_static_one_sided_relationship_does_not_create_interaction_coverage():
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.policy import ReviewPolicy
+
+    obligations = derive_obligations({
+        "changed_files": [".github/workflows/ai-review.yml"],
+        "file_roles": ["deployment", "implementation"],
+        "components": [{
+            "id": "deployment",
+            "changed_files": [".github/workflows/ai-review.yml"],
+        }],
+        "relationships": [{
+            "source": "deployment", "target": "database",
+            "active": False, "activation_reason": "orientation-only",
+        }],
+    }, {}, ReviewPolicy.minimal())
+
+    assert not any(
+        item.required_evidence == ("interaction",) for item in obligations
+    )
+
+
+def test_unrelated_repository_test_sample_does_not_create_test_coverage():
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.policy import ReviewPolicy
+
+    obligations = derive_obligations({
+        "changed_files": ["src/payment.py"],
+        "file_roles": ["implementation"],
+        "available_role_paths": {},
+        "role_availability": {"test": {"count": 500}},
+    }, {}, ReviewPolicy.minimal())
+
+    assert not any(item.required_evidence == ("tests",) for item in obligations)
+
+
 def test_recipe_accounting_preserves_suppressed_and_not_applicable_statuses():
     from pr_reviewer.specialist_runtime.coverage import CoverageLedger, derive_obligations
     from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy
@@ -170,6 +310,26 @@ def test_stable_ids_do_not_merge_distinct_subjects_with_the_same_slug():
     implementation_ids = [item.id for item in obligations if item.required_evidence == ("implementation",)]
     assert len(implementation_ids) == 2
     assert len(set(implementation_ids)) == 2
+
+
+def test_non_production_files_do_not_gain_generic_implementation_obligations():
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.policy import ReviewPolicy
+
+    paths = (
+        "tests/test_worker.py", "generated/client.py", "migrations/001_seed.py",
+        "deploy/render.py", "fixtures/sample.py",
+    )
+    obligations = derive_obligations(
+        {"changed_files": list(paths), "file_roles": ["implementation", "test"]},
+        {}, ReviewPolicy.minimal(),
+    )
+    implementation_scopes = {
+        item.scope[0] for item in obligations
+        if item.required_evidence == ("implementation",) and len(item.scope) == 1
+    }
+
+    assert implementation_scopes.isdisjoint(paths)
 
 
 def test_independent_recipe_requires_independent_verification():
@@ -208,6 +368,35 @@ def test_matching_recipe_obligation_retains_execution_policy(execution):
 
     recipe_obligation = next(item for item in obligations if item.recipe_id == "delivery")
     assert recipe_obligation.recipe_execution == execution
+
+
+def test_matching_recipe_obligation_carries_objective_and_invariants():
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy
+
+    policy = ReviewPolicy.minimal(recipes=(RecipePolicy(
+        id="delivery", title="Delivery",
+        objective="Trace delivery through acknowledgement and retry.",
+        invariants=(
+            "Failed work must not be acknowledged as successful.",
+            "Duplicate delivery must not duplicate persistent effects.",
+        ),
+        match={"file_roles_any": ("implementation",)},
+        expected_evidence=("consumer",),
+    ),))
+
+    obligations = derive_obligations(
+        {"changed_files": ["src/main.py"], "file_roles": ["implementation"]}, {}, policy
+    )
+
+    recipe_obligation = next(item for item in obligations if item.recipe_id == "delivery")
+    assert recipe_obligation.recipe_objective == (
+        "Trace delivery through acknowledgement and retry."
+    )
+    assert recipe_obligation.recipe_invariants == (
+        "Failed work must not be acknowledged as successful.",
+        "Duplicate delivery must not duplicate persistent effects.",
+    )
 
 
 def test_recipe_lifecycle_statuses_survive_tuple_materialization():
@@ -330,7 +519,7 @@ def test_documented_v2_rule_forces_recipe_and_blocks_unresolved_high_risk(tmp_pa
         policy=policy.verdict_policy,
     )
 
-    assert result.verdict == "request_changes"
+    assert result.verdict == "notice"
     assert result.source == "incomplete-high-risk-coverage"
     assert set(result.blocking_obligation_ids) == {
         item.id for item in recipe_obligations
