@@ -2090,6 +2090,48 @@ def _controller(tmp_path, **overrides):
     return ReviewController(**values)
 
 
+def test_controller_local_store_preserves_large_delegated_reference(tmp_path):
+    source = "reference text\n" * 5000 + "END_OF_REFERENCE"
+    received = []
+
+    class Gateway:
+        def complete(self, request):
+            received.append(request.conversation._render_openai_messages())
+            return ModelTurnResult(
+                response={}, tool_calls=(), text=json.dumps({
+                    "summary": "The reference is complete.", "relevant_excerpts": [],
+                    "uncertainties": [], "source_truncated": False,
+                }), text_source="content", finish_reason="stop", usage={}, request_diagnostics={},
+            )
+
+    def factory(assignment, lease, snapshot, evidence_store, coverage, obligations, expected_session_id):
+        session = SpecialistSession(
+            session_id=expected_session_id, assignment=assignment,
+            conversation=Conversation(system="Review", tool_schemas=[{
+                "name": "read_file", "parameters": {"type": "object"},
+            }]), gateway=Gateway(),
+            execute_tool=lambda name, args, **kwargs: {
+                "tool": name, "status": "ok", "result": {"content": source},
+            }, evidence_store=evidence_store, coverage=coverage,
+            budget=BudgetLedger(BudgetLimits(model_turns=10, tool_calls=10, recoveries=1)),
+            lease=lease, request_timeout_sec=10, max_tokens=1024,
+            max_context_tokens=75000, clock=lambda: 0.0,
+        )
+        payload, record, _ = session._execute_delegated_summary(
+            {"tool_name": "read_file", "arguments": {"path": "src/worker.py"},
+             "target": "reference", "question": "What does the reference establish?"},
+            timeout=10, requested_obligation_ids=(), requested_targets=(),
+        )
+        assert record.content == source
+        assert not payload["source_truncated"]
+        return _SuccessfulSession(assignment, evidence_store, obligations, expected_session_id)
+
+    result = _controller(tmp_path, session_factory=factory,
+                         evidence_store_factory=lambda: EvidenceStore(max_content_bytes=300_000)).run(_inputs(tmp_path))
+    assert received, result.artifact["degradation"]
+    assert "END_OF_REFERENCE" in json.dumps(received)
+
+
 def test_negotiator_stops_cleanly_when_no_model_turn_fits_deadline(tmp_path):
     called = False
 
@@ -5084,11 +5126,12 @@ def test_phase_cutoff_freezes_in_flight_request_once_before_late_completion(tmp_
         )
         frozen_artifact = json.dumps(result.artifact, sort_keys=True)
 
-        assert len(attempts) == 2
+        assert len(attempts) == 3
         assert attempts[0]["status"] == "timed_out_at_phase_cutoff"
         assert attempts[0]["in_flight"] is True
         assert attempts[1]["status"] == "completed"
         assert attempts[1]["purpose"] == "checkpoint"
+        assert attempts[2]["purpose"] == "stop-obligation-dispositions"
         assert tuple(event["kind"] for event in request_events) == (
             "specialist_request_started",
             "specialist_request_timed_out_at_phase_cutoff",
@@ -5108,7 +5151,7 @@ def test_phase_cutoff_freezes_in_flight_request_once_before_late_completion(tmp_
         for event in (request_events[1], gateway_events[-1]):
             assert event["payload"]["actual_prompt_tokens"] == 0
             assert event["payload"]["actual_completion_tokens"] == 0
-        assert result.artifact["budgets"]["totals"]["model_turns"] == 2
+        assert result.artifact["budgets"]["totals"]["model_turns"] == 3
         assert result.artifact["budgets"]["totals"]["specialist_model_cutoff"] == 1
         assert any(
             event["kind"] == "session_in_flight"
@@ -5209,8 +5252,9 @@ def test_exhausted_schema_repair_cannot_inflate_artifact_model_turns(tmp_path):
     session_budgets = result.artifact["budgets"]["sessions"]
     attempts = result.artifact["budgets"]["request_attempts"]
 
-    assert len(gateway.requests) == 1, result.artifact["degradation"]
-    assert len(attempts) == 1
+    assert len(gateway.requests) == 2, result.artifact["degradation"]
+    assert len(attempts) == 2
+    assert attempts[1]["purpose"] == "stop-obligation-dispositions"
     assert attempts[0]["cached_prompt_tokens"] == 2
     assert attempts[0]["measured_prompt_tokens"] == 3
     assert attempts[0]["prefill_tokens"] == 1
@@ -5249,12 +5293,12 @@ def test_exhausted_schema_repair_cannot_inflate_artifact_model_turns(tmp_path):
             value is None or isinstance(value, (bool, int, float, str))
             for value in event["payload"].values()
         )
-    assert max(item["model_turns"] for item in session_budgets.values()) == 1
+    assert max(item["model_turns"] for item in session_budgets.values()) == 2
     assert all(
         item["model_turns"] <= inputs.config.session_limits.model_turns
         for item in session_budgets.values()
     )
-    assert result.artifact["budgets"]["totals"]["model_turns"] == 1
+    assert result.artifact["budgets"]["totals"]["model_turns"] == 2
     assert result.artifact["budgets"]["totals"]["model_turns"] <= (
         len(session_budgets) * inputs.config.session_limits.model_turns
     )
@@ -5293,7 +5337,7 @@ def test_finalization_does_not_process_model_candidate_references(
                     "proposed_next_actions": [],
                 })
             else:
-                raise AssertionError("deterministic finalization must not call the model")
+                text = json.dumps({"obligation_updates": [], "candidate_finding_ids": ["unknown"]})
             return ModelTurnResult(
                 response={}, tool_calls=(), text=text, text_source="content",
                 finish_reason="stop",
@@ -5338,7 +5382,7 @@ def test_finalization_does_not_process_model_candidate_references(
 
     result = _controller(tmp_path, session_factory=factory).run(inputs)
 
-    assert len(gateway.requests) == 2
+    assert len(gateway.requests) == 3
     assert result.artifact["sessions"][0]["degraded"] is False
     assert any(
         event["kind"] == "specialist_finalized"

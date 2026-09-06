@@ -345,6 +345,7 @@ class EvidenceSnapshot:
     records: tuple[EvidenceRecord, ...]
     collections: tuple[EvidenceCollection, ...] = ()
     associations: tuple[EvidenceAssociation, ...] = ()
+    max_content_bytes: int = 64 * 1024
 
     @property
     def evidence_ids(self) -> tuple[str, ...]:
@@ -401,12 +402,14 @@ class EvidenceStore:
         cls,
         snapshot: EvidenceSnapshot,
         *,
-        max_content_bytes: int = 64 * 1024,
+        max_content_bytes: int | None = None,
     ) -> "EvidenceStore":
         """Create an isolated mutable store seeded from one immutable snapshot."""
         if not isinstance(snapshot, EvidenceSnapshot):
             raise TypeError("snapshot must be an EvidenceSnapshot")
-        store = cls(max_content_bytes=max_content_bytes)
+        store = cls(max_content_bytes=(
+            snapshot.max_content_bytes if max_content_bytes is None else max_content_bytes
+        ))
         for record in snapshot.records:
             if record.id in store._records:
                 raise ValueError(f"duplicate evidence id in snapshot: {record.id}")
@@ -788,4 +791,5 @@ class EvidenceStore:
                 self._associations[key]
                 for key in sorted(self._associations)
             ),
+            max_content_bytes=self._max_content_bytes,
         )

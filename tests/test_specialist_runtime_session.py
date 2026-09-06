@@ -503,11 +503,92 @@ def test_reworded_checkpoint_does_not_count_as_semantic_progress():
     second = replace(
         first, working_summary="Delivery behavior was checked in detail.",
         completed_steps=("Inspected a.py",),
+        proposed_next_actions=("Read the downstream consumer next",),
     )
 
     assert session._checkpoint_progress_fingerprint(first) == (
         session._checkpoint_progress_fingerprint(second)
     )
+
+
+def test_stop_disposition_pass_keeps_checkpoint_and_accepts_valid_siblings():
+    gateway = ScriptedGateway([invalid_response(json.dumps({
+        "obligation_updates": [
+            {"target": "O1", "disposition": "blocked", "reason": "Source unavailable",
+             "evidence_ids": [], "next_actions": []},
+            {"target": "O2", "disposition": "covered", "reason": "Looks fine",
+             "evidence_ids": [], "next_actions": []},
+        ],
+    }))])
+    session = make_session(gateway)
+    checkpoint = session._checkpoint_from_text(json.dumps({
+        "unresolved": ["O1", "O2"], "obligation_updates": [],
+        "working_summary": "Checked the changed behavior.",
+        "completed_steps": ["Read the changed implementation"],
+        "proposed_next_actions": ["Check the missing source"],
+    }))
+    assert checkpoint is not None
+    session.latest_checkpoint = session._last_valid_checkpoint = checkpoint
+
+    session.settle_for_scheduling()
+    # A scheduler retry that cannot start exploration must not buy another
+    # accounting attempt during finalization.
+    lease = session.lease
+    session.lease = SessionLease(RunPhase.FOLLOWUP, deadline_at=0.0)
+    with pytest.raises(TimeoutError):
+        session.explore()
+    session.lease = lease
+    session._settle_pending_obligations("completion")
+
+    assert len(gateway.requests) == 1
+    assert gateway.requests[0].tools_enabled is False
+    assert session.obligation_assessments.assessment("O1").disposition.value == "blocked"
+    assert session.obligation_assessments.assessment("O2").disposition.value == "pending"
+    assert session.latest_checkpoint.working_summary == checkpoint.working_summary
+    assert session.latest_checkpoint.completed_steps == checkpoint.completed_steps
+    assert session.latest_checkpoint.evidence_ids == checkpoint.evidence_ids
+    assert session.latest_checkpoint.candidate_finding_ids == checkpoint.candidate_finding_ids
+    diagnostic = session._disposition_pass_diagnostics[-1]
+    assert diagnostic["results"][0]["accepted"] is True
+    assert "evidence" in diagnostic["results"][1]["reason"]
+    assert gateway.requests[0].response_schema["required"] == ["obligation_updates"]
+
+
+def test_invalid_stop_disposition_response_preserves_checkpoint():
+    gateway = ScriptedGateway([invalid_response("<tool_call>")])
+    session = make_session(gateway)
+    checkpoint = replace(session.latest_checkpoint, working_summary="Retain this memory")
+    session.latest_checkpoint = session._last_valid_checkpoint = checkpoint
+
+    session._settle_pending_obligations("completion")
+
+    assert session.latest_checkpoint is checkpoint
+    assert all(item.disposition.value == "pending"
+               for item in session.obligation_assessments.assessments())
+    assert session._disposition_pass_diagnostics[-1]["status"] == "invalid"
+
+
+def test_stop_disposition_pass_preserves_retained_candidates_and_evidence():
+    session, gateway = _session_with_retained_candidate([
+        invalid_response(json.dumps({"obligation_updates": [
+            {"target": "O2", "disposition": "blocked", "reason": "Test source unavailable",
+             "evidence_ids": [], "next_actions": []},
+        ]})),
+    ])
+    previous = session.latest_checkpoint
+    candidates = session.candidate_findings
+    session.latest_checkpoint = replace(previous, unknowns=(*previous.unknowns, "retained-warning"))
+
+    result = session.settle_for_scheduling()
+    session.finalize()
+
+    assert len(gateway.requests) == 3
+    assert result.checkpoint.candidate_finding_ids == previous.candidate_finding_ids
+    assert result.checkpoint.evidence_ids == previous.evidence_ids
+    assert session.candidate_findings == candidates
+    assert "retained-warning" in result.checkpoint.unknowns
+    assert result.checkpoint.working_summary == previous.working_summary
+    assert session.obligation_assessments.assessment("O2").disposition.value == "blocked"
 
 
 def test_compaction_without_valid_checkpoint_keeps_assistant_analysis():
@@ -873,6 +954,62 @@ def test_delegated_summary_rejects_recursive_or_state_changing_inner_tools():
     visible = json.loads(session.conversation.events[-1]["content"])
     assert "read-only evidence tool" in visible["error"]
     assert session.budget.snapshot().tool_calls == 0
+
+
+@pytest.mark.parametrize("invalid_first", (False, True))
+def test_delegated_summary_preserves_answer_when_optional_quotes_overflow(invalid_first):
+    source = "header\n" + "é" * 1500 + "\ntail"
+    responses = [delegated_summary_response()]
+    if invalid_first:
+        responses.insert(0, delegated_summary_response(start_line=999, end_line=999))
+    gateway = ScriptedGateway(responses)
+    session = make_session(
+        gateway, max_tokens=1024, max_tool_result_bytes=1000,
+        tool_schemas=[{"name": "read_file", "parameters": {"type": "object"}}],
+        execute_tool=lambda name, args, **kwargs: {
+            "tool": name, "status": "ok", "result": {"content": source},
+        },
+    )
+    payload, record, _ = session._execute_delegated_summary(
+        {"tool_name": "read_file", "arguments": {"path": "a.py"},
+         "target": "feature", "question": "Is it enabled?"},
+        timeout=10, requested_obligation_ids=(), requested_targets=(),
+    )
+    assert payload["status"] == "ok"
+    assert payload["summary"] == "The feature is enabled."
+    assert payload["relevant_excerpts"] == []
+    assert payload["omitted_excerpt_count"] == 1
+    assert payload["source_evidence_id"] == record.id
+    assert record.content == source
+    assert len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) <= 1000
+    assert len(gateway.requests) == (2 if invalid_first else 1)
+
+
+def test_delegated_summary_repairs_range_and_required_body_size_together():
+    gateway = ScriptedGateway([
+        delegated_summary_response(start_line=360, end_line=400, summary="é" * 1200),
+        delegated_summary_response(start_line=1, end_line=1),
+    ])
+    session = make_session(
+        gateway, max_tokens=1024, max_tool_result_bytes=1000,
+        tool_schemas=[{"name": "read_file", "parameters": {"type": "object"}}],
+        execute_tool=lambda name, args, **kwargs: {
+            "tool": name, "status": "ok", "result": {"content": "x\n" * 400},
+        },
+    )
+    payload, _, _ = session._execute_delegated_summary(
+        {"tool_name": "read_file", "arguments": {"path": "a.py"},
+         "target": "feature", "question": "Is it enabled?"},
+        timeout=10, requested_obligation_ids=(), requested_targets=(),
+    )
+    assert payload["status"] == "ok"
+    initial = json.loads(json.loads(gateway.requests[0].messages)[0]["content"])
+    assert initial["result_budget_bytes"] == 1000
+    repair = json.loads(gateway.requests[1].messages)[-1]["content"]
+    assert "360-400 contains 41" in repair
+    assert "1000 bytes" in repair
+    assert "exceeds" in repair
+    assert "reduce by at least" in repair
 
 
 def test_specialist_protocol_requires_falsifying_changed_behavior_first():
@@ -2593,7 +2730,7 @@ def test_emergency_checkpoint_guard_is_session_lifetime():
 def test_session_result_reports_each_actual_request_transition_once():
     gateway = ScriptedGateway([
         checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
-        final_response(),
+        invalid_response('{"obligation_updates":[]}'),
     ])
     session = make_session(gateway)
 
@@ -2605,13 +2742,13 @@ def test_session_result_reports_each_actual_request_transition_once():
         "started", "completed",
     )
     assert tuple(item.status for item in final.request_events) == (
-        "started", "completed",
+        "started", "completed", "started", "completed",
     )
     assert repeated.request_events == final.request_events
     request_pairs = {}
     for event in final.request_events:
         request_pairs.setdefault(event.request_id, []).append(event.status)
-    assert tuple(request_pairs.values()) == (["started", "completed"],)
+    assert tuple(request_pairs.values()) == (["started", "completed"],) * 2
 
 
 def test_exploration_budget_is_enforced_without_wire_budget_notes():
@@ -2634,6 +2771,7 @@ def test_invalid_exploration_stop_forces_checkpoint_before_later_finalization():
         invalid_response("plain-text conclusion"),
         invalid_response("I still need to inspect the external contract."),
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
+        invalid_response('{"obligation_updates":[]}'),
     ])
     session = make_session(gateway)
 
@@ -2642,7 +2780,7 @@ def test_invalid_exploration_stop_forces_checkpoint_before_later_finalization():
 
     assert checkpoint.state.value == "checkpoint"
     assert final.state.value == "complete"
-    assert [request.tools_enabled for request in gateway.requests] == [True, True, False]
+    assert [request.tools_enabled for request in gateway.requests] == [True, True, False, False]
     assert gateway.requests[1].messages_contain(
         "Call the next required tool now, or return a checkpoint"
     )
@@ -2671,7 +2809,10 @@ def test_length_cutoff_gets_one_tools_enabled_continuation_before_checkpoint():
 
 def test_finalization_closes_from_valid_checkpoint_without_model_call():
     gateway = ScriptedGateway([
-        checkpoint_response(inspected=[], unresolved=["OB-code"]),
+        checkpoint_response(inspected=[], unresolved=[], obligation_updates=[
+            {"target": target, "disposition": "blocked", "reason": "Source unavailable",
+             "evidence_ids": [], "next_actions": []} for target in ("O1", "O2")
+        ]),
     ])
     session = make_session(gateway)
 
@@ -2686,6 +2827,7 @@ def test_finalization_closes_from_valid_checkpoint_without_model_call():
 def test_finalization_recovers_checkpoint_after_interrupted_exploration():
     gateway = ScriptedGateway([
         checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        invalid_response('{"obligation_updates":[]}'),
     ])
     session = make_session(gateway)
     session.mark_exploration_interrupted()
@@ -2694,7 +2836,7 @@ def test_finalization_recovers_checkpoint_after_interrupted_exploration():
 
     assert result.state is SessionState.COMPLETE
     assert result.report["source"] == "checkpoint-finalization"
-    assert len(gateway.requests) == 1
+    assert len(gateway.requests) == 2
     assert gateway.requests[0].tools_enabled is False
     assert gateway.requests[0].messages_contain("interrupted-exploration")
 
@@ -3469,7 +3611,7 @@ def test_textual_tool_markup_gets_repaired_before_checkpointing():
     )
 
 
-def test_repeated_textual_tool_markup_checkpoints_with_compact_resume():
+def test_repeated_textual_tool_markup_checkpoints_and_pauses():
     malformed = ModelTurnResult(
         response={}, tool_calls=(),
         text="[tool]<parameter=path>a.py</parameter>[/tool]",
@@ -3494,11 +3636,10 @@ def test_repeated_textual_tool_markup_checkpoints_with_compact_resume():
         "Checkpoint reason: malformed-textual-tool-call."
     )
     assert gateway.requests[2].messages_contain(
-        "Immediate compaction after validation: yes."
+        "Immediate compaction after validation: no."
     )
-    assert gateway.requests[2].messages_contain(
-        "After validation, resume the specialist session."
-    )
+    assert gateway.requests[3].tools_enabled is False
+    assert gateway.requests[3].messages_contain("Exploration is stopping, not restarting")
 
 
 def test_checkpoint_register_uses_exact_candidate_ids_without_unmapped_aliases():
@@ -5738,7 +5879,7 @@ def test_no_progress_guard_requests_checkpoint_instead_of_final_report():
         repeated,
         repeated,
         checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
-        checkpoint_response(inspected=["a.py"], unresolved=[]),
+        invalid_response('{"obligation_updates":[]}'),
     ])
     session = make_session(gateway, tool_calls=4, model_turns=8)
 
@@ -5750,11 +5891,13 @@ def test_no_progress_guard_requests_checkpoint_instead_of_final_report():
     assert gateway.requests[3].tools_enabled is False
     assert "not a final report" in gateway.requests[3].messages.lower()
     assert gateway.requests[3].messages_contain(
-        "Immediate compaction after validation: yes."
+        "Immediate compaction after validation: no."
     )
-    assert gateway.requests[3].messages_contain(
-        "After validation, resume the specialist session."
-    )
+    assert len(gateway.requests) == 5
+    assert gateway.requests[4].tools_enabled is False
+    assert gateway.requests[4].messages_contain("Exploration is stopping, not restarting")
+    session.finalize()
+    assert len(gateway.requests) == 5
 
 
 def test_no_progress_guard_projects_checkpoint_when_no_model_turn_remains():
@@ -6041,10 +6184,10 @@ def test_session_consumes_task_three_assignment_contract():
     assert "correctness" in gateway.requests[0].messages
 
 
-def test_finalization_uses_checkpoint_state_and_ignores_extra_provider_responses():
+def test_finalization_preserves_checkpoint_when_disposition_response_invalid():
     gateway = ScriptedGateway([
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
-        invalid_response("this must never be requested"),
+        invalid_response("invalid accounting"),
     ])
     session = make_session(gateway)
     session.explore()
@@ -6054,7 +6197,8 @@ def test_finalization_uses_checkpoint_state_and_ignores_extra_provider_responses
     assert result.degraded is False
     assert result.report["source"] == "checkpoint-finalization"
     assert result.report["unknowns"] == ["OB-code", "OB-tests"]
-    assert len(gateway.requests) == 1
+    assert len(gateway.requests) == 2
+    assert result.report["obligation_disposition_passes"][0]["status"] == "invalid"
 
 
 def _session_with_retained_candidate(final_responses):

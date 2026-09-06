@@ -169,6 +169,18 @@ def test_wave_snapshot_does_not_change_when_store_grows():
     assert snapshot.get_by_path("b.py") == ()
 
 
+def test_snapshot_preserves_content_ceiling_and_allows_explicit_override():
+    snapshot = EvidenceStore(max_content_bytes=100).snapshot()
+    for override, expected_prefix in ((None, 100), (40, 40)):
+        store = EvidenceStore.from_snapshot(snapshot, max_content_bytes=override)
+        record = store.add_tool_result(
+            session_id="S1", tool="read_file", arguments={"path": "a.py"},
+            result={"status": "ok", "result": {"content": "x" * 200}},
+        )
+        assert record.truncated
+        assert record.content == "x" * expected_prefix + "\n[truncated]"
+
+
 def test_snapshot_remains_immutable_when_later_session_imports_existing_evidence():
     store = EvidenceStore()
     first = store.add_tool_result(

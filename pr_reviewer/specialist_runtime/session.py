@@ -105,7 +105,12 @@ _DELEGATED_SUMMARY_SYSTEM = (
     "these labels. Long paragraphs may occupy one source line. Use source_metadata "
     "to distinguish a requested file slice from source or prompt truncation; missing "
     "range metadata does not establish whole-file completeness. State material "
-    "limits in uncertainties."
+    "limits in uncertainties. The complete returned result, including extracted quote "
+    "text and controller metadata, must fit result_budget_bytes (UTF-8 bytes, not tokens). "
+    "This is much smaller than your reasoning/output-token allowance. Leave room for "
+    "metadata and quotes, keep relevance explanations short, and omit optional quotes "
+    "when the precise answer already suffices. Answer only the requested question; "
+    "do not add unrelated declarations or repeat the answer in excerpt explanations."
 )
 
 _CONSEQUENCE_SUPPORT_SCHEMA: dict[str, Any] = {
@@ -1365,6 +1370,8 @@ class SpecialistSession:
         self._compacted_evidence_reads = 0
         self._compacted_evidence_generation = 0
         self._last_compact_progress_fingerprint = ""
+        self._disposition_pass_attempted = False
+        self._disposition_pass_diagnostics: list[dict[str, object]] = []
         self._last_checkpoint_should_resume = True
         self._last_checkpoint_dropped_keys: tuple[str, ...] = ()
         self._last_checkpoint_validation_error = ""
@@ -2178,10 +2185,17 @@ class SpecialistSession:
             output_tokens=completion_tokens,
         )
         self._recovery_turn_pending = False
+        if tools_enabled:
+            self._disposition_pass_attempted = False
         return result
 
     def _checkpoint_and_resume(self, reason: str) -> SessionResult:
         """Compact at a validated boundary and keep the same specialist active."""
+        if reason in {"no-progress-guard", "malformed-textual-tool-call"}:
+            result = self.request_checkpoint(reason, disposition=CheckpointDisposition.PAUSE)
+            if not result.degraded:
+                self._settle_pending_obligations(reason)
+            return self._snapshot(degraded=result.degraded)
         result = self.request_checkpoint(
             reason, disposition=CheckpointDisposition.COMPACT_RESUME,
         )
@@ -3032,9 +3046,8 @@ class SpecialistSession:
         )
         return available_tokens * 4
 
-    @staticmethod
     def _delegated_summary_conversation(
-        *, target: str, question: str, source_evidence_id: str, source: str,
+        self, *, target: str, question: str, source_evidence_id: str, source: str,
         source_metadata: Mapping[str, object] | None = None,
     ) -> Conversation:
         conversation = Conversation(system=_DELEGATED_SUMMARY_SYSTEM)
@@ -3042,6 +3055,7 @@ class SpecialistSession:
             "target": target,
             "question": question,
             "source_evidence_id": source_evidence_id,
+            "result_budget_bytes": self.max_tool_result_bytes,
             "source_metadata": {
                 **(source_metadata or {}),
                 "supplied_lines": len(source.splitlines()),
@@ -3081,13 +3095,15 @@ class SpecialistSession:
             return None, "relevant_excerpts must contain at most eight objects"
         source_lines = source.splitlines(keepends=True)
         clean_excerpts: list[dict[str, str]] = []
+        excerpt_errors: list[str] = []
         for item in excerpts:
             if not isinstance(item, Mapping) or set(item) != {
                 "start_line", "end_line", "relevance",
             }:
-                return None, (
+                excerpt_errors.append(
                     "each excerpt must contain start_line, end_line, and relevance"
                 )
+                continue
             start_line = item.get("start_line")
             end_line = item.get("end_line")
             relevance = item.get("relevance")
@@ -3096,19 +3112,22 @@ class SpecialistSession:
                 or not isinstance(end_line, int) or isinstance(end_line, bool)
                 or not isinstance(relevance, str)
             ):
-                return None, "excerpt ranges must be integers and relevance a string"
+                excerpt_errors.append("excerpt ranges must be integers and relevance a string")
+                continue
             if not (1 <= start_line <= end_line <= len(source_lines)):
-                return None, (
+                excerpt_errors.append(
                     f"Excerpt range {start_line}-{end_line} is outside the supplied "
                     f"L-number range 1-{len(source_lines)}. Select only supplied lines."
                 )
+                continue
             if end_line - start_line >= 40:
-                return None, (
+                excerpt_errors.append(
                     f"Excerpt range {start_line}-{end_line} contains "
                     f"{end_line - start_line + 1} lines inclusive; maximum 40. "
                     "Select a smaller relevant range with end_line <= start_line + 39; "
                     "put extracted names or facts in summary instead of quoting the whole source."
                 )
+                continue
             excerpt = "".join(source_lines[start_line - 1:end_line])
             if excerpt.endswith("\r\n"):
                 excerpt = excerpt[:-2]
@@ -3123,6 +3142,8 @@ class SpecialistSession:
                 ),
                 "relevance": relevance,
             })
+        if excerpt_errors:
+            return None, " ".join(excerpt_errors)
         return {
             "summary": summary.strip(),
             "relevant_excerpts": clean_excerpts,
@@ -3227,6 +3248,44 @@ class SpecialistSession:
                 "coverage_effect": "derived_summary; cite source_evidence_id",
             }
 
+        def payload_bytes(value: Mapping[str, object]) -> int:
+            return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+        def prepare_result(text: str) -> tuple[dict[str, object] | None, str]:
+            parsed, validation_error = self._validated_delegated_summary(text, source)
+            errors = [validation_error] if validation_error else []
+            # Even an invalid excerpt must not hide an oversized required answer
+            # until after the sole repair. Measure the quote-free envelope too.
+            raw = parsed if parsed is not None else _json_object(text)
+            if isinstance(raw, Mapping):
+                minimum = visible_payload({**raw, "relevant_excerpts": []})
+                size = payload_bytes(minimum)
+                if size > self.max_tool_result_bytes:
+                    errors.append(
+                        f"Required result without optional excerpts is {size} UTF-8 bytes "
+                        f"and exceeds {self.max_tool_result_bytes} bytes; reduce by at least "
+                        f"{size - self.max_tool_result_bytes} bytes, leaving room for metadata."
+                    )
+            if errors or parsed is None:
+                return None, " ".join(errors)
+            payload = visible_payload(parsed)
+            excerpts = payload["relevant_excerpts"]
+            omitted = 0
+            while payload_bytes(payload) > self.max_tool_result_bytes and excerpts:
+                # These are already validated quotes. Preserve the answer and
+                # source identity; omit the largest optional quote first.
+                excerpts.pop(max(range(len(excerpts)), key=lambda i: payload_bytes(excerpts[i])))
+                omitted += 1
+                payload["omitted_excerpt_count"] = omitted
+            size = payload_bytes(payload)
+            if size > self.max_tool_result_bytes:
+                return None, (
+                    f"Result including omission metadata is {size} UTF-8 bytes and exceeds "
+                    f"{self.max_tool_result_bytes} bytes; reduce by at least "
+                    f"{size - self.max_tool_result_bytes} bytes."
+                )
+            return payload, ""
+
         repair_tokens = max(1, self.delegated_summary_max_tokens // 2)
         while source:
             estimate = self._estimate_admission(
@@ -3262,33 +3321,20 @@ class SpecialistSession:
             )
         except (BudgetExhausted, TimeoutError) as exc:
             return {"error": f"delegated summary unavailable: {exc}"}, record, collection
-        parsed, error = self._validated_delegated_summary(turn.content, source)
-        visible_too_large = bool(
-            parsed is not None
-            and len(json.dumps(
-                visible_payload(parsed), ensure_ascii=False,
-            ).encode("utf-8"))
-            > self.max_tool_result_bytes
-        )
+        payload, error = prepare_result(turn.content)
         if (
-            parsed is None or turn.tool_calls
+            payload is None or turn.tool_calls
             or turn.finish_reason.casefold() in {"length", "max_tokens"}
-            or visible_too_large
         ):
             conversation.add_assistant_turn(
                 content=turn.content,
             )
             conversation.add_user(
                 "Repair only the previous delegated summary. Tools are disabled. "
-                + (
-                    error
-                    or (
-                        "The visible result exceeded the normal tool-result limit."
-                        if visible_too_large
-                        else "The response was incomplete or used tools."
-                    )
-                )
-                + " Return one shorter JSON object matching the schema; select "
+                + (error or "The response was incomplete or used tools.")
+                + f" The full returned result must fit {self.max_tool_result_bytes} UTF-8 bytes "
+                "including extracted quotes and metadata. Omit optional excerpts if needed. "
+                "Return one shorter JSON object matching the schema; select "
                 "excerpt ranges only from the supplied L-numbered source."
             )
             try:
@@ -3300,22 +3346,13 @@ class SpecialistSession:
                 )
             except (BudgetExhausted, TimeoutError) as exc:
                 return {"error": f"delegated summary repair unavailable: {exc}"}, record, collection
-            parsed, error = self._validated_delegated_summary(repair.content, source)
+            payload, error = prepare_result(repair.content)
             if repair.tool_calls or repair.finish_reason.casefold() in {"length", "max_tokens"}:
-                parsed = None
+                payload = None
                 error = "repair was incomplete or used tools"
-            elif (
-                parsed is not None
-                and len(json.dumps(
-                    visible_payload(parsed), ensure_ascii=False,
-                ).encode("utf-8"))
-                > self.max_tool_result_bytes
-            ):
-                parsed = None
-                error = "repair exceeded the normal tool-result limit"
-        if parsed is None:
+        if payload is None:
             return {"error": "delegated summary invalid: " + error}, record, collection
-        return visible_payload(parsed), record, collection
+        return payload, record, collection
 
     def _execute_calls(self, calls: tuple[dict[str, Any], ...]) -> bool:
         progressed = False
@@ -4396,7 +4433,6 @@ class SpecialistSession:
                 str(item) for item in self.obligation_assessments.assessments()
             ],
             "evidence_ids": sorted(checkpoint.evidence_ids),
-            "next_actions": sorted(checkpoint.proposed_next_actions),
         }
         return hashlib.sha256(json.dumps(
             payload, sort_keys=True, separators=(",", ":"), default=str,
@@ -6518,6 +6554,117 @@ class SpecialistSession:
         self.state = SessionState.EXPLORING
         return self._snapshot()
 
+    def settle_for_scheduling(self) -> SessionResult:
+        """Complete bounded accounting after exploration yields to the controller."""
+        if not self._checkpoint_recovery_required:
+            self._settle_pending_obligations("exploration-stopped")
+        return self._snapshot(degraded=self._checkpoint_state_degraded)
+
+    def _settle_pending_obligations(self, reason: str) -> None:
+        """One bounded accounting turn per exploration period, never more research."""
+        pending = [item.target for item in self.obligation_assessments.assessments()
+                   if item.disposition.value == "pending"]
+        if (self._disposition_pass_attempted or not pending
+                or self._last_valid_checkpoint is None):
+            return
+        self._disposition_pass_attempted = True
+        targets = pending[:40]
+        item_schema = json.loads(json.dumps(
+            _CHECKPOINT_SCHEMA["properties"]["obligation_updates"]["items"],
+        ))
+        item_schema["properties"]["target"]["enum"] = targets
+        schema = {
+            "type": "object", "additionalProperties": False,
+            "required": ["obligation_updates"],
+            "properties": {"obligation_updates": {
+                "type": "array", "maxItems": len(targets), "items": item_schema,
+            }},
+        }
+        diagnostic: dict[str, object] = {
+            "reason": reason, "status": "started", "targets": targets, "results": [],
+        }
+        self._disposition_pass_diagnostics.append(diagnostic)
+        if self._finalization_diagnostics:
+            self._finalization_diagnostics[-1].setdefault(
+                "obligation_disposition_passes", [],
+            ).append(diagnostic)
+        self.conversation.add_user(
+            "Exploration is stopping, not restarting. The checkpoint and candidates "
+            "are already retained. Tools are disabled. Give one concise disposition "
+            "for each target below using only the evidence already collected. "
+            "Return only obligation_updates matching the schema; do not regenerate "
+            "memory or candidates. Listing a target in checkpoint unresolved did not "
+            "record a disposition. Covered requires eligible retained evidence; "
+            "not_applicable requires evidence of irrelevance to this change. Use "
+            "blocked for an unavailable prerequisite, exhausted when bounded investigation "
+            "cannot resolve it, or unresolved with a concrete, new next action when "
+            "more investigation would help. Never claim coverage just to finish. "
+            "Missing or rejected updates remain pending.\n"
+            + json.dumps({"pending_obligations": [
+                self.obligation_assessments.explain(target) for target in targets
+            ], "response_schema": schema}, sort_keys=True)
+        )
+        try:
+            turn = self._request(
+                tools_enabled=False, schema=schema,
+                purpose="stop-obligation-dispositions",
+                max_output_tokens=min(self.checkpoint_max_tokens, 4_096),
+                allow_compaction=False, allow_gateway_fallbacks=False,
+            )
+        except Exception as exc:
+            diagnostic.update(status="unavailable", error=format_callback_error(exc, limit=300))
+            self.conversation.add_user(
+                "Obligation disposition pass unavailable; previous state retained: "
+                + json.dumps(diagnostic, sort_keys=True)
+            )
+            return
+        self.conversation.add_assistant_turn(reasoning=turn.reasoning, content=turn.content, calls=())
+        raw = None if turn.tool_calls else _json_object(turn.content)
+        diagnostic["finish_reason"] = turn.finish_reason
+        if not isinstance(raw, Mapping) or not isinstance(raw.get("obligation_updates"), list):
+            diagnostic.update(status="invalid", error="Expected obligation_updates array with tools disabled")
+        else:
+            results: list[dict[str, object]] = []
+            seen: set[str] = set()
+            for update in raw["obligation_updates"][:40]:
+                target = (self.obligation_assessments.canonical_target(update.get("target"))
+                          if isinstance(update, Mapping) else None)
+                if target not in targets or target in seen:
+                    results.append({"target": target, "accepted": False,
+                                    "reason": "Unknown, duplicate, or unrequested target"})
+                    continue
+                seen.add(target)
+                # Reuse checkpoint admission one item at a time: a malformed sibling
+                # cannot discard accepted dispositions or overwrite durable memory.
+                previous = self.latest_checkpoint
+                checkpoint = self._checkpoint_from_text(json.dumps({
+                    "unresolved": [], "obligation_updates": [update],
+                }), require_complete_pending=False, allowed_obligation_targets=set(targets))
+                accepted = checkpoint is not None and not self._last_checkpoint_rejections
+                error = " | ".join(item.reason for item in self._last_checkpoint_rejections)
+                results.append({"target": target, "accepted": accepted,
+                                "reason": "accepted" if accepted else (
+                                    error or self._last_checkpoint_validation_error or "Invalid update")})
+                if accepted:
+                    self.latest_checkpoint = replace(
+                        previous,
+                        obligation_assessments=self.obligation_assessments.assessments(),
+                        obligation_statuses=checkpoint.obligation_statuses,
+                        unknowns=tuple(dict.fromkeys((
+                            *self._derive_current_gaps(),
+                            *(item for item in previous.unknowns
+                              if item not in self._assigned_obligation_ids()),
+                        ))),
+                    )
+                    self._last_valid_checkpoint = self.latest_checkpoint
+            results.extend({"target": target, "accepted": False, "reason": "No update returned"}
+                           for target in pending if target not in seen)
+            diagnostic.update(status="completed", results=results)
+        self.conversation.add_user(
+            "Obligation disposition receipt (authoritative; no further repair requested): "
+            + json.dumps(diagnostic, sort_keys=True)
+        )
+
     def finalize(self) -> SessionResult:
         """Close the session from its latest authoritative checkpoint."""
         if self._final_result is not None:
@@ -6536,6 +6683,7 @@ class SpecialistSession:
                 disposition=CheckpointDisposition.PAUSE,
             )
         self.state = SessionState.FINALIZING
+        self._settle_pending_obligations("completion")
         self._synthesize_defect_leads()
         retention_unknown = _CANDIDATE_RETENTION_UNKNOWN in self.latest_checkpoint.unknowns
         report = self._checkpoint_finalization_report()
@@ -6573,6 +6721,7 @@ class SpecialistSession:
             "source": "checkpoint-finalization",
             "defect_leads": [dict(item) for item in self._defect_leads],
             "defect_synthesis": dict(self._defect_synthesis_diagnostic),
+            "obligation_disposition_passes": list(self._disposition_pass_diagnostics),
         }
 
     def _checkpoint_fallback_report(self) -> dict[str, Any]:

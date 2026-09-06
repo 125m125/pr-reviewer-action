@@ -1877,6 +1877,12 @@ class _IsolatedSessionHandle:
             self._validate_result(result)
             if result.state.value == "exploring":
                 raise RuntimeError("specialist returned while still exploring")
+            # Settle pending accounting before the negotiator sees the stopped
+            # session, not only at finalization when scheduling is already over.
+            settle = getattr(self.session, "settle_for_scheduling", None)
+            if callable(settle) and not result.degraded:
+                result = settle()
+                self._validate_result(result)
             self._validate_owned_outputs(result)
             self.latest_result = result
             return result

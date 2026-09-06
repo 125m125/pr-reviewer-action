@@ -144,8 +144,14 @@ model receives the exact failed checks as a tool result and can collect better
 evidence immediately. If a candidate change is rejected while producing a
 checkpoint, checkpoint repair may correct that candidate or leave it as a
 bounded next action. A compact-resume checkpoint continues the same session
-only when it demonstrates meaningful progress; repeated no-progress checkpoints
-remain paused. The negotiator can later decide whether that session deserves a
+only when it demonstrates meaningful progress; reworded informal TODOs do not
+count as progress. No-progress checkpoints pause instead of restarting exploration.
+Before a stopped session reaches the negotiator (or finalization), one bounded,
+tools-disabled pass can record still-pending obligation dispositions without
+regenerating the checkpoint. Accepted updates survive rejected siblings; missing
+or rejected updates stay pending, with per-target diagnostics in the artifact.
+This pass uses the existing lifetime budget and does not run at ordinary
+context-pressure compactions. The negotiator can later decide whether that session deserves a
 bounded follow-up. The critic does not schedule sessions.
 The remediator runs only for accepted findings, without tools, and cannot alter
 the finding or verdict. Invalid, skipped, or failed remediation is omitted while
@@ -345,6 +351,13 @@ and only a compact summary, controller-extracted excerpts selected by numbered
 source ranges, uncertainties, truncation status, and the original evidence ID
 enter the specialist conversation. Invalid structured output receives one
 focused tools-disabled repair.
+
+The helper receives its returned-result byte budget separately from its larger
+reasoning/output-token allowance. Oversized optional excerpts may be omitted
+with an explicit `omitted_excerpt_count`, preserving the complete answer and
+original source reference. Invalid excerpts or an oversized required answer
+still require repair; range and size diagnostics are reported together where
+detectable. Specialist evidence snapshots preserve the configured source cap.
 
 The specialist job summary (`specialist-review-summary.md`) includes provider-reported
 cache and performance statistics, grouped by exploration, delegated summaries,
