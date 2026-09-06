@@ -81,7 +81,7 @@ jobs:
       - name: Review pull request
         # Fork of pr-reviewer-action v2.0.0 with generic, model-planned specialist
         # reviews and LM Studio reasoning-channel compatibility; pinned for safety.
-        uses: 125m125/pr-reviewer-action@e7c464c92418f83eaa972c1a1e559266b262a1a2 # Fix delegated evidence store initialization
+        uses: 125m125/pr-reviewer-action@c6766550980bda28857561e02873245eface1865 # Fix documentation URL screening
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
