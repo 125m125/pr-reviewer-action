@@ -674,7 +674,12 @@ def _looks_high_entropy(token: str) -> bool:
     return len(token) >= 32 and len(set(token)) >= 12 and _entropy(token) >= 3.5
 
 
-_WORD_LIKE_PATH_SEGMENT_RE = re.compile(r"[A-Za-z]{1,20}(?:[-_.][A-Za-z]{1,20})*")
+# Short numeric components cover dates and versions without exempting arbitrary
+# mixed-alphanumeric tokens or long hashes embedded in documentation paths.
+_WORD_LIKE_PATH_SEGMENT_RE = re.compile(
+    r"(?:[A-Za-z]{1,20}[0-9]{0,4}|[0-9]{1,4})"
+    r"(?:[-_.](?:[A-Za-z]{1,20}[0-9]{0,4}|[0-9]{1,4}))*"
+)
 
 
 def _looks_high_entropy_url_token(token: str) -> bool:

@@ -295,6 +295,31 @@ def test_foreign_web_sources_report_allowlist_denial_before_entropy(url):
     assert decision.reason == "source is not allowlisted by current policy"
 
 
+@pytest.mark.parametrize("slug", [
+    "2023-12-14-github-actions-artifacts-v4-is-now-generally-available",
+    "github-actions-artifacts-v4.1-release-notes-and-permission-details",
+])
+def test_dated_versioned_access_request_preserves_url_without_granting_access(slug):
+    url = "https://github.blog/changelog/" + slug
+    discovery = discover("artifacts", FakeSearchProvider([
+        SearchCandidate("Announcement", url, "Official announcement"),
+    ]), source_policy())
+    assert not discovery.approved
+    request = source_access_request(discovery.unapproved[0], "O1", "verify permissions")
+    assert request.candidate_url == url
+    assert source_policy(SourceRule(host="github.blog")).classify(url).approved
+
+
+@pytest.mark.parametrize("token", [
+    "ea165f8d65b6e75b540449e92b4886f43607fa02",
+    "aB9cD8eF7gH6iJ5kL4mN3oP2qR1sT0uV",
+])
+def test_access_request_still_redacts_opaque_tokens_in_documentation_paths(token):
+    url = "https://github.blog/changelog/release-" + token
+    request = source_access_request(SearchCandidate(None, url, None), "O1", "verify")
+    assert request.candidate_url == "https://github.blog/[REDACTED]"
+
+
 def test_query_payload_does_not_receive_documentation_slug_exemption():
     decision = source_policy().classify(
         "https://docs.example.com/api?value=" + "abcdefghijklmnopqrstuvwxyz" * 2

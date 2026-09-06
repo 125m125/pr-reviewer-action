@@ -2000,6 +2000,14 @@ def test_checkpoint_diagnostic_projection_allowlists_bounded_lifecycle_fields(tm
         "rejected_correction_changes": (
             "C3:affected_consumer.consumer_evidence_id",
         ),
+        "obligation_disposition_passes": [{
+            "reason": "exploration-stopped", "status": "completed",
+            "targets": ["O1"], "results": [{
+                "target": "O1", "accepted": False,
+                "reason": "covered requires retained evidence token=super-secret-value",
+                "raw_response": "private model text",
+            }], "prompt": "private prompt",
+        }],
         "prompt": "secret prompt",
         "raw_response": "secret response",
         "evidence_body": "secret evidence",
@@ -2032,6 +2040,11 @@ def test_checkpoint_diagnostic_projection_allowlists_bounded_lifecycle_fields(tm
     )
 
     assert projected == event_projection
+    assert projected["obligation_disposition_passes"][0]["results"] == ({
+        "target": "O1", "accepted": False,
+        "reason": "covered requires retained evidence [REDACTED]",
+    },)
+    assert "private" not in json.dumps(projected)
     assert projected["reason"] == "context-pressure"
     assert projected["disposition"] == "compact_resume"
     assert projected["provider_calibrated_input_tokens"] == 12_500
@@ -3771,6 +3784,35 @@ def test_finalizer_failure_builds_useful_sparse_handoff_from_controller_state(tm
         item["component"] == "handoff_summarizer"
         for item in result.artifact["degradation"]
     )
+
+
+def test_handoff_receives_unresolved_assessment_reason_without_private_todos():
+    from types import SimpleNamespace
+    from pr_reviewer.specialist_runtime.obligation_assessment import (
+        ObligationAssessment, ObligationDisposition,
+    )
+
+    obligation = CoverageObligation(
+        obligation_id="O-risk", origin="recipe", subject="external-contracts",
+        required_evidence_categories=("implementation",), scope=("a.py",),
+    )
+    checkpoint = SimpleNamespace(obligation_assessments=(ObligationAssessment(
+        target="O1", obligation_id="O-risk", disposition=ObligationDisposition.EXHAUSTED,
+        reason="Could not establish which credential the upload client uses token=super-secret-value",
+        next_actions=("private TODO that must not become a human instruction",),
+    ),))
+    state = SimpleNamespace(
+        coverage=CoverageLedger((obligation,)), obligations=(obligation,),
+        quarantined_session_ids=set(),
+        assignments={"A1": SimpleNamespace(obligation_ids=("O-risk",))},
+        session_results={("A1", "S1"): SimpleNamespace(checkpoint=checkpoint)},
+    )
+    summaries = ReviewController._specialist_checkpoint_summaries(state)
+    assert summaries[0]["unresolved_assessments"] == ({
+        "subject": "external-contracts", "disposition": "exhausted",
+        "reason": "Could not establish which credential the upload client uses [REDACTED]",
+    },)
+    assert "private TODO" not in json.dumps(summaries)
 
 
 def test_finalizer_can_only_select_controller_backed_behavioral_summaries(tmp_path):

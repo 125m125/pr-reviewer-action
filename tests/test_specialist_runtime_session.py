@@ -839,6 +839,7 @@ def test_delegated_summary_retains_raw_source_but_returns_only_focused_result(so
     assert prompt["source_metadata"]["range"] == source_range
     assert prompt["source_metadata"]["source_truncated"] == source_range["truncated"]
     assert prompt["source_metadata"]["prompt_truncated"] == (source_limit is not None)
+    assert visible["source_metadata"] == prompt["source_metadata"]
     assert visible["summary"] == "The feature is enabled."
     assert visible["relevant_excerpts"][0]["text"] == "feature=true"
     assert visible["relevant_excerpts"][0]["locator"] == "line 2"

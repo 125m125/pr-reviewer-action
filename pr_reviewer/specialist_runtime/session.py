@@ -105,7 +105,12 @@ _DELEGATED_SUMMARY_SYSTEM = (
     "these labels. Long paragraphs may occupy one source line. Use source_metadata "
     "to distinguish a requested file slice from source or prompt truncation; missing "
     "range metadata does not establish whole-file completeness. State material "
-    "limits in uncertainties. The complete returned result, including extracted quote "
+    "limits in uncertainties. Controller source_metadata is authoritative about truncation: "
+    "do not describe content as cut off merely because the requested information is absent. "
+    "A page can be fully fetched yet not answer the question. Verify the question's premise "
+    "rather than inventing a missing section, endpoint, or requirement. Report 'not stated "
+    "in this source' when appropriate; this does not prove the claim true or false. "
+    "The complete returned result, including extracted quote "
     "text and controller metadata, must fit result_budget_bytes (UTF-8 bytes, not tokens). "
     "This is much smaller than your reasoning/output-token allowance. Leave room for "
     "metadata and quotes, keep relevance explanations short, and omit optional quotes "
@@ -3244,6 +3249,9 @@ class SpecialistSession:
                 "status": "ok", "evidence_id": record.id,
                 "source_evidence_id": record.id, **value,
                 "source_truncated": bool(record.truncated or prompt_truncated),
+                "source_metadata": {
+                    **source_metadata, "supplied_lines": len(source.splitlines()),
+                },
                 "eligible_targets": list(requested_targets),
                 "coverage_effect": "derived_summary; cite source_evidence_id",
             }

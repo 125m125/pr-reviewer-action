@@ -2097,6 +2097,23 @@ def _checkpoint_diagnostic_projection(value: object) -> dict[str, object]:
             for member in item[:16]
             if isinstance(member, (bool, int, float, str, Enum))
         )
+    passes = value.get("obligation_disposition_passes")
+    if isinstance(passes, (list, tuple)):
+        projected["obligation_disposition_passes"] = tuple({
+            **{key: _mask_runtime_text(str(item[key]))[:300]
+               for key in ("reason", "status", "error", "finish_reason")
+               if isinstance(item.get(key), str)},
+            "targets": tuple(_mask_runtime_text(target)[:32]
+                             for target in item.get("targets", ())[:40]
+                             if isinstance(target, str))
+                       if isinstance(item.get("targets"), (list, tuple)) else (),
+            "results": tuple({
+                "target": _mask_runtime_text(str(result.get("target") or ""))[:32],
+                "accepted": result.get("accepted") is True,
+                "reason": _mask_runtime_text(str(result.get("reason") or ""))[:600],
+            } for result in item.get("results", ())[:40] if isinstance(result, Mapping))
+                       if isinstance(item.get("results"), (list, tuple)) else (),
+        } for item in passes[:8] if isinstance(item, Mapping))
     return projected
 
 
@@ -4210,6 +4227,19 @@ class ReviewController:
                 ),
                 "covered_subjects": covered_subjects,
                 "unresolved_subjects": unresolved_subjects,
+                "unresolved_assessments": tuple({
+                    "subject": mask_runtime_text(
+                        obligation_map[item.obligation_id].subject, limit=240,
+                    ),
+                    "disposition": str(getattr(item.disposition, "value", item.disposition)),
+                    "reason": mask_runtime_text(item.reason, limit=600),
+                } for item in getattr(checkpoint, "obligation_assessments", ())
+                  if item.obligation_id in assigned_ids
+                  and item.obligation_id in obligation_map
+                  and statuses.get(item.obligation_id) not in {
+                      ObligationStatus.COVERED, ObligationStatus.NOT_APPLICABLE,
+                  }
+                  and item.reason)[:5],
                 "unknowns": strings(getattr(checkpoint, "unknowns", ())),
             })
         return tuple(projected)
