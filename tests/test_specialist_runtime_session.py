@@ -554,6 +554,33 @@ def test_truncated_proof_is_identified_instead_of_generic_authorization_failure(
     assert any(record.id in hint and "complete bounded excerpt" in hint for hint in feedback["repair_hints"])
 
 
+def test_search_proof_rejection_tells_specialist_to_fetch_source():
+    session = make_session(ScriptedGateway([]))
+    records = [session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool=tool, arguments={"path": "a.py"},
+        result={"status": "ok", "content": "implementation"}, source="a.py",
+    ) for tool in ("read_file", "web_search")]
+    draft = {
+        "claim": "Changed branch returns the wrong state.", "affected_location": "a.py:4",
+        "causal_chain": "Changed state reaches the invalid branch.", "severity": "major",
+        "supporting_evidence_ids": [r.id for r in records], "related_targets": ["O1"],
+        "consequence_support": reachable_consequence_support(),
+        "user_visible_consequence": "Operation returns the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    }
+    feedback, accepted = session._admit_candidate(draft)
+    assert not accepted
+    assert "fetch" in " ".join(feedback["repair_hints"])
+    checkpoint_draft = {**draft, "candidate_id": "draft-1", "related_obligation_ids": ["O1"]}
+    checkpoint_draft.pop("related_targets")
+    candidate, reason = session._candidate_from_checkpoint(
+        checkpoint_draft,
+        retained={r.id: r for r in records}, assigned={"OB-code", "OB-tests"},
+    )
+    assert candidate is None
+    assert "discovery-only-evidence" in reason
+
+
 def test_reworded_checkpoint_does_not_count_as_semantic_progress():
     session = make_session(ScriptedGateway([]))
     first = SessionCheckpoint(

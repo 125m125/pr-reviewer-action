@@ -1098,6 +1098,13 @@ def _authorize(
         return None, "missing-related-obligation"
     if any(obligation_id not in obligations for obligation_id in candidate.related_obligation_ids):
         return None, "unknown-related-obligation"
+    # Search snippets locate sources; allowlisting does not turn them into proof.
+    if any(
+        records[item].tool == "web_search"
+        for item in (*candidate.supporting_evidence_ids, *candidate.contradicting_evidence_ids)
+        if item in records
+    ):
+        return None, "discovery-only-evidence"
     supporting_records = [records.get(item) for item in candidate.supporting_evidence_ids]
     if not supporting_records or any(record is None for record in supporting_records):
         return None, "missing-retained-evidence"

@@ -28,6 +28,28 @@ from pr_reviewer.specialist_runtime.types import (
 CHANGED_FILES = ("src/store.py",)
 
 
+@pytest.mark.parametrize("contradiction", [False, True])
+def test_search_discovery_cannot_support_finding_even_when_critic_keeps_it(contradiction):
+    store, source_id = _store()
+    search = store.add_tool_result(
+        session_id="session-1", tool="web_search", arguments={"query": "artifact permissions"},
+        result={"status": "ok", "content": {
+            "kind": "search_discovery", "evidentiary": False,
+            "approved": [{"url": "https://docs.github.com/en/rest/orgs/artifact-metadata",
+                          "snippet": "Artifact metadata repository permissions (write)"}],
+        }},
+    )
+    candidate = _candidate(
+        evidence_ids=(source_id,) if contradiction else (source_id, search.id),
+        contradicting_ids=(search.id,) if contradiction else (),
+    )
+    result = _adjudicate((candidate,), {"actions": [
+        {"candidate_id": candidate.candidate_id, "action": "keep"},
+    ]}, store)
+    assert not result.accepted
+    assert result.dispositions[0].reason == "discovery-only-evidence"
+
+
 def _obligation(
     obligation_id: str = "obligation-1",
     *,

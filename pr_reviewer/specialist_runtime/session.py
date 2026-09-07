@@ -5313,6 +5313,14 @@ class SpecialistSession:
             ]
         if text == "candidate has no retained supporting evidence":
             return ["cite an evidence ID returned by a permitted read-only tool"]
+        if text == "discovery-only-evidence":
+            return [
+                "web_search results are discovery only, even when allowlisted; fetch the actual "
+                "source with web_fetch or web_fetch_search_result and cite its retained evidence ID "
+                "instead of the search result in supporting or contradicting evidence",
+                "verify that the fetched source establishes the claimed external contract; "
+                "do not merely remove the search citation while keeping its unsupported premise",
+            ]
         if text == "candidate must be an object":
             return ["submit one JSON object with the advertised candidate fields, not text or an array"]
         if text == "candidate has no related obligation targets":
