@@ -4216,6 +4216,9 @@ class ReviewController:
             )
             projected.append({
                 "assignment_id": mask_runtime_text(assignment_id, limit=160),
+                "candidate_admission_statistics": dict(
+                    getattr(result, "candidate_admission_statistics", None) or {}
+                ),
                 "objective": mask_runtime_text(
                     getattr(assignment, "objective", ""), limit=300,
                 ),
@@ -4955,6 +4958,10 @@ class ReviewController:
                         self._specialist_checkpoint_summaries(state)
                     ),
                     "successful_review_facts": {
+                        "coverage_semantics": "Covered subjects identify inspected scope, not proof that "
+                            "behavior is correct. Rejected candidate attempts are not verified defects or "
+                            "verified safety. Describe these areas as examined, not confirmed correct, unless "
+                            "a specific retained result establishes that conclusion.",
                         "covered_subjects": tuple(
                             obligation.subject
                             for obligation in state.obligations
@@ -5220,6 +5227,9 @@ class ReviewController:
                 "state": result.state.value if result else "failed_or_not_started",
                 "checkpoint": _checkpoint_projection(result.checkpoint) if result else None,
                 "budget": _budget_projection(result.budget) if result else _budget_projection(BudgetUsage()),
+                "candidate_admission_statistics": dict(
+                    getattr(result, "candidate_admission_statistics", None) or {}
+                ),
                 "degraded": bool(result.degraded) if result else True,
                 "finalization_diagnostics": (
                     _checkpoint_diagnostics_projection(getattr(
@@ -5311,6 +5321,11 @@ class ReviewController:
                 _json_value(item) for item in state.review.dispositions
             ] + list(state.collision_dispositions),
             "candidate_statistics": {
+                **{key: sum(
+                    (getattr(result, "candidate_admission_statistics", None) or {}).get(key, 0)
+                    for result in unique_sessions.values()
+                ) for key in ("proposal_attempts", "admission_rejected_attempts", "admission_passed_attempts")},
+                "admitted": len(state.candidates),
                 "submitted": len(state.candidates),
                 "critic_decisions": len(state.critic_actions),
                 "critic_actions": dict(sorted(Counter(

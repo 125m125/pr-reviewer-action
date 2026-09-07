@@ -208,8 +208,12 @@ _ROLE_SYSTEM = {
         "Do not turn checkpoint hypotheses or unknowns into change claims. Orient a human reviewer around "
         "behavior and review scope; do not list files, findings, severities, exact defect "
         "claims, lists of unknowns or verification requests, verdicts, approvals, or merge safety. "
-        "This is a presentation step, not code review. Tools are unavailable and the "
-        "supplied facts are final; do not inspect or request files. Use only the supplied "
+        "This is a presentation step, not code review. Tools are unavailable. "
+        "Covered subjects describe inspected scope, not verified correctness. Candidate rejection "
+        "does not prove the opposite claim. Use 'examined' or 'reviewed' for scope; use 'confirmed' "
+        "only for a specific conclusion backed by retained evidence, not merely a covered status "
+        "or a specialist's assertion in working_summary. "
+        "Supplied facts are final; do not inspect or request files. Use only the supplied "
         "change_overview, specialist_checkpoint_summaries, successful_review_facts, "
         "and prepared_notes. Do not add reference arrays or path inventories; "
         "the controller owns provenance. Do not claim complete coverage. The controller reuses the separately "
@@ -2347,8 +2351,10 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
         f"- Detail review notes: {detail_note_count}",
         f"- Publishing ready: `{str(result.publishing_ready).lower()}`",
         f"- Assignment plan: `{plan_source}` (repaired: `{planner_repaired}`)",
-        "- Candidates: submitted "
-        + str(candidate_stats.get("submitted", 0))
+        "- Candidate proposal attempts (including corrections): "
+        + str(candidate_stats.get("proposal_attempts", 0))
+        + "; admission-rejected attempts " + str(candidate_stats.get("admission_rejected_attempts", 0))
+        + "; admitted candidates " + str(candidate_stats.get("admitted", candidate_stats.get("submitted", 0)))
         + "; critic decisions " + str(candidate_stats.get("critic_decisions", 0))
         + critic_action_text
         + "; accepted " + str(candidate_stats.get("accepted", 0))

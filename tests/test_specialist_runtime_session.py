@@ -493,6 +493,67 @@ def test_candidate_rejection_identifies_acceptable_evidence_and_failed_predicate
     assert any(record.id in hint and "a.py" in hint for hint in payload["repair_hints"])
 
 
+@pytest.mark.parametrize("proof,expected", [
+    ({"kind": "violated_invariant", "obligation_target": "O1", "contract": "permissions must suffice", "violation": "wrong result"}, "exact selector"),
+    ({"kind": "violated_invariant", "obligation_target": "O1", "contract": "predicate_index:99", "violation": "wrong result"}, "available for O1"),
+    ({"kind": "violated_invariant", "obligation_target": "O99", "contract": "subject", "violation": "wrong result"}, "related assigned"),
+    ({"kind": "failing_behavioral_test", "test": "test_state", "observed": "failed"}, "CI execution record"),
+    ({"kind": "affected_consumer", "producer_evidence_id": "bad", "consumer_evidence_id": "bad"}, "exact supporting_evidence_id"),
+    ({"kind": "contradicting_evidence", "conflict": "opposite results"}, "contradicts"),
+    ({"kind": "reachable_input_path", "input": "unrelated request", "condition": "timeout expires", "outcome": "network unavailable"}, "shared terms"),
+    ({"kind": "invented"}, "use one of"),
+])
+def test_proof_rejections_explain_actual_repair_in_tool_and_checkpoint_paths(proof, expected):
+    session = make_session(ScriptedGateway([]))
+    records = [session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file", arguments={"path": path},
+        result={"status": "ok", "content": "implementation"}, category="implementation", source=path,
+    ) for path in ("a.py", "tests/test_a.py")]
+    draft = {
+        "claim": "Changed branch returns the wrong state.", "affected_location": "a.py:4",
+        "causal_chain": "Changed state reaches the invalid branch.", "severity": "major",
+        "supporting_evidence_ids": [records[0].id], "contradicting_evidence_ids": [records[1].id],
+        "related_targets": ["O1"], "consequence_support": proof,
+        "user_visible_consequence": "Operation returns the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    }
+    feedback, accepted = session._admit_candidate(draft)
+    assert not accepted
+    assert expected in " ".join(feedback["repair_hints"])
+    checkpoint_draft = {**draft, "candidate_id": "draft-1", "related_obligation_ids": ["O1"]}
+    checkpoint_draft.pop("related_targets")
+    candidate, reason = session._candidate_from_checkpoint(
+        checkpoint_draft, retained={r.id: r for r in records}, assigned={"OB-code", "OB-tests"},
+    )
+    assert candidate is None
+    assert expected in reason
+    assert session._snapshot().candidate_admission_statistics == {
+        "proposal_attempts": 2, "admission_rejected_attempts": 2, "admission_passed_attempts": 0,
+    }
+
+
+def test_truncated_proof_is_identified_instead_of_generic_authorization_failure():
+    session = make_session(ScriptedGateway([]))
+    session.evidence_store = EvidenceStore(max_content_bytes=100)
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "content": "implementation " * 1000},
+        category="implementation", source="a.py",
+    )
+    assert record.truncated
+    feedback, accepted = session._admit_candidate({
+        "claim": "Changed branch returns the wrong state.", "affected_location": "a.py:4",
+        "causal_chain": "Changed state reaches the invalid branch.", "severity": "major",
+        "supporting_evidence_ids": [record.id], "related_targets": ["O1"],
+        "consequence_support": reachable_consequence_support(),
+        "user_visible_consequence": "Operation returns the wrong state.",
+        "manual_validation": "Run the state transition test.",
+    })
+    assert not accepted
+    assert feedback["failed_check"] == "consequence_support.evidence_completeness"
+    assert any(record.id in hint and "complete bounded excerpt" in hint for hint in feedback["repair_hints"])
+
+
 def test_reworded_checkpoint_does_not_count_as_semantic_progress():
     session = make_session(ScriptedGateway([]))
     first = SessionCheckpoint(

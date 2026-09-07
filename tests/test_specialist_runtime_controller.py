@@ -2103,6 +2103,31 @@ def _controller(tmp_path, **overrides):
     return ReviewController(**values)
 
 
+def test_candidate_attempt_counts_reach_artifact_and_handoff_without_becoming_findings(tmp_path):
+    counts = {"proposal_attempts": 3, "admission_rejected_attempts": 2, "admission_passed_attempts": 1}
+    def factory(assignment, lease, snapshot, evidence_store, coverage, obligations, expected_session_id):
+        session = _factory(assignment, lease, snapshot, evidence_store, coverage, obligations, expected_session_id)
+        explore, finalize = session.explore, session.finalize
+        session.explore = lambda: replace(explore(), candidate_admission_statistics=counts)
+        session.finalize = lambda: replace(finalize(), candidate_admission_statistics=counts)
+        return session
+    seen = []
+    def finalizer(request):
+        seen.append(request.context)
+        assert "not proof" in request.context["successful_review_facts"]["coverage_semantics"]
+        assert all(item["candidate_admission_statistics"] == counts
+                   for item in request.context["specialist_checkpoint_summaries"])
+        return {"ai_reviewed_summary": "Examined delivery behavior.", "human_focus": ""}
+    result = _controller(tmp_path, session_factory=factory, finalizer=finalizer).run(_inputs(tmp_path))
+    assert seen
+    n = len(result.artifact["sessions"])
+    assert n > 0
+    for key, value in counts.items():
+        assert result.artifact["candidate_statistics"][key] == value * n
+    assert result.artifact["candidate_statistics"]["admitted"] < 3 * n
+    assert "proposal_attempts" not in result.handoff.markdown
+
+
 def test_controller_local_store_preserves_large_delegated_reference(tmp_path):
     source = "reference text\n" * 5000 + "END_OF_REFERENCE"
     received = []

@@ -144,7 +144,10 @@ _CONSEQUENCE_SUPPORT_SCHEMA: dict[str, Any] = {
         "test": {"type": "string"},
         "observed": {"type": "string"},
         "obligation_target": {"type": "string"},
-        "contract": {"type": "string"},
+        "contract": {
+            "type": "string",
+            "description": "For violated_invariant: exact selector subject or predicate_index:N (zero-based) from the assigned obligation, not prose. Explain the contradiction in violation. A general invariant does not prove an external API requirement; retain evidence for that premise.",
+        },
         "violation": {"type": "string"},
         "producer_evidence_id": {"type": "string"},
         "consumer_evidence_id": {"type": "string"},
@@ -1217,6 +1220,7 @@ class SessionResult:
     investigation_lead_resolutions: tuple[LeadResolution, ...] = ()
     advertised_tools: tuple[str, ...] = ()
     tool_activity: tuple[Mapping[str, object], ...] = ()
+    candidate_admission_statistics: Mapping[str, int] | None = None
 
 
 class SpecialistSession:
@@ -1339,6 +1343,10 @@ class SpecialistSession:
         # update is accounted for even though only active findings are exposed
         # through ``candidate_findings`` and checkpoints.
         self._candidate_statuses: dict[str, str] = {}
+        self._candidate_admission_statistics = {
+            "proposal_attempts": 0, "admission_rejected_attempts": 0,
+            "admission_passed_attempts": 0,
+        }
         self._rejected_candidate_ids: set[str] = set()
         self._candidate_targets: dict[str, str] = {}
         self._announced_candidate_targets: set[str] = set()
@@ -3048,7 +3056,7 @@ class SpecialistSession:
         hints = self._candidate_repair_hints(reason)
         if acceptable_evidence:
             hints.append(
-                "acceptable retained evidence: " + ", ".join(
+                "available retained evidence (availability alone does not prove the consequence): " + ", ".join(
                     f"{item['evidence_id']} ({item['source_path']})"
                     for item in acceptable_evidence
                 )
@@ -4973,7 +4981,7 @@ class SpecialistSession:
         if kind not in set(_CONSEQUENCE_SUPPORT_SCHEMA["properties"]["kind"]["enum"]):
             return None, self._proof_rejection(
                 "consequence_support.kind",
-                "use one advertised consequence_support kind",
+                "use one of: " + ", ".join(_CONSEQUENCE_SUPPORT_SCHEMA["properties"]["kind"]["enum"]),
             )
 
         def detail(name: str) -> str:
@@ -5013,9 +5021,25 @@ class SpecialistSession:
                     f"{kind}.obligation_target",
                     "use a related assigned obligation target",
                 )
+            obligation = next(item for item in self.coverage.obligations() if item.id == obligation_id)
+            selectors = {"subject": obligation.subject, **{
+                f"predicate_index:{index}": predicate
+                for index, predicate in enumerate(obligation.satisfaction_predicates)
+            }}
+            contract = detail("contract").casefold()
+            if contract == "subject:":
+                contract = "subject"
+            if contract not in selectors:
+                return None, self._proof_rejection(
+                    "violated_invariant.contract",
+                    "contract must be an exact selector, not prose; available for "
+                    + target + ": " + json.dumps(selectors, ensure_ascii=False),
+                    "put the explanation in violation; a general invariant does not establish "
+                    "a specific external requirement—cite evidence for that premise or omit the candidate",
+                )
             fields.extend((
                 ("obligation_id", obligation_id),
-                ("contract", detail("contract")),
+                ("contract", contract),
                 ("violation", detail("violation")),
             ))
         elif kind == "affected_consumer":
@@ -5071,6 +5095,23 @@ class SpecialistSession:
         ), ""
 
     def _candidate_from_checkpoint(
+        self,
+        value: object,
+        *,
+        retained: Mapping[str, EvidenceRecord],
+        assigned: set[str],
+    ) -> tuple[CandidateFinding | None, str]:
+        # Counts are attempts, not unique issues: corrections can resubmit a draft.
+        candidate, reason = self._validate_candidate_from_checkpoint(
+            value, retained=retained, assigned=assigned,
+        )
+        self._candidate_admission_statistics["proposal_attempts"] += 1
+        self._candidate_admission_statistics[
+            "admission_rejected_attempts" if candidate is None else "admission_passed_attempts"
+        ] += 1
+        return candidate, reason
+
+    def _validate_candidate_from_checkpoint(
         self,
         value: object,
         *,
@@ -5213,14 +5254,36 @@ class SpecialistSession:
         )
         if authorization_reason:
             kind = str(value.get("consequence_support", {}).get("kind") or "proof")
-            hint = (
-                "use concrete input and condition terms also present in causal_chain, "
-                "and outcome terms also present in user_visible_consequence"
-                if kind == "reachable_input_path"
-                else "repair the structured proof using the listed retained evidence"
-            )
+            if authorization_reason != "consequence-not-supported":
+                return None, self._format_candidate_rejection(
+                    authorization_reason, self._candidate_repair_hints(authorization_reason),
+                )
+            incomplete = [item for item in (*supporting, *contradicting)
+                          if retained[item].truncated or not retained[item].content.strip()]
+            if incomplete:
+                return None, self._proof_rejection(
+                    "consequence_support.evidence_completeness",
+                    "replace empty or truncated proof evidence with a complete bounded excerpt: "
+                    + ", ".join(incomplete),
+                )
+            hints_by_kind = {
+                "reachable_input_path": "cite retained evidence from affected_location's changed file; "
+                    "connect input and condition to causal_chain and outcome to user_visible_consequence "
+                    "using concrete shared terms (exact sentences are not required)",
+                "failing_behavioral_test": "cite an actual retained test execution result "
+                    "(test-result category or test runner tool), not test source or a proposed test; "
+                    "name the test and its observed failure",
+                "violated_invariant": "use a related assigned obligation and its exact contract selector "
+                    "(subject or predicate_index:N), describe violation, and cite retained support; "
+                    "an invariant alone does not prove an external API premise",
+                "affected_consumer": "producer_evidence_id and consumer_evidence_id must both be "
+                    "supporting retained records with source paths; describe the actual consumer consequence",
+                "contradicting_evidence": "the retained records must have a controller-recorded contradicts "
+                    "link between supporting and contradicting evidence; merely listing two IDs is insufficient; "
+                    "use a different supported proof kind if no such link exists",
+            }
             return None, self._proof_rejection(
-                f"{kind}.authorization", hint,
+                f"{kind}.authorization", hints_by_kind[kind],
             )
         return candidate, ""
 
@@ -5250,9 +5313,13 @@ class SpecialistSession:
             ]
         if text == "candidate has no retained supporting evidence":
             return ["cite an evidence ID returned by a permitted read-only tool"]
+        if text == "candidate must be an object":
+            return ["submit one JSON object with the advertised candidate fields, not text or an array"]
+        if text == "candidate has no related obligation targets":
+            return ["include at least one assigned O# target in related_targets (related_obligation_ids in checkpoints)"]
         if text.startswith("candidate references unavailable"):
             return ["use exact evidence IDs returned by the tools"]
-        if text.startswith("unknown related obligation target:"):
+        if text.startswith(("unknown related obligation target:", "unknown obligation target:")):
             return ["use an exact assigned obligation target from the assignment"]
         if text.startswith("unsupported candidate fields:"):
             fields = text.split(":", 1)[1].strip()
@@ -6198,6 +6265,7 @@ class SpecialistSession:
                 if str(item.get("name") or "").strip()
             })),
             tool_activity=self._tool_activity_snapshot(),
+            candidate_admission_statistics=dict(self._candidate_admission_statistics),
         )
 
     def _tool_activity_snapshot(self) -> tuple[Mapping[str, object], ...]:

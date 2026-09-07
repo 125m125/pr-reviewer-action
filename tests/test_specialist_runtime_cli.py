@@ -790,7 +790,7 @@ def test_cli_writes_structured_handoff_notes_artifact_and_compatibility_output(
     assert "\\!\\[image\\]\\(https://evil\\.example/x\\)" in summary
     assert "negotiator\\[details\\]\\(https://evil\\.example\\)" in summary
     assert "fallback after &lt;timeout&gt;" in summary
-    assert "Candidates: submitted 0" in summary
+    assert "Candidate proposal attempts (including corrections): 0; admission-rejected attempts 0; admitted candidates 0" in summary
     assert "CI test evidence: unavailable" in summary
     assert "## AI specialist tools" in summary
     assert "| web\\_search | 2 | 3 | 1 | 1 | 1 | 0 | 1 |" in summary
