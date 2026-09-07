@@ -2270,11 +2270,11 @@ def test_provider_prompt_usage_calibrates_next_same_mode_admission():
         tools_enabled=False, max_tokens=2_048,
     )
 
-    assert estimate.source == "provider-calibrated"
-    assert estimate.input_tokens >= 12_000
+    assert estimate.source == "provider-usage-delta"
+    assert 8_000 <= estimate.input_tokens < 12_000
     assert session._admission_calibration["structured"].last_completion_tokens == 80
     terminal = attempts.close_since(0)[-1]
-    assert terminal.admission_source == "provider-calibrated"
+    assert terminal.admission_source == "provider-usage-delta"
     assert terminal.actual_prompt_tokens == 8_000
     assert terminal.actual_completion_tokens == 80
 
@@ -2358,9 +2358,41 @@ def test_provider_calibration_carries_from_structured_to_tools_mode():
         tools_enabled=True, max_tokens=2_048,
     )
 
-    assert structured.source == "provider-calibrated"
-    assert tools.source == "provider-calibrated"
+    assert structured.source == "provider-usage-delta"
+    assert tools.source == "provider-usage-delta"
     assert tools.input_tokens >= 12_000
+
+
+def test_usage_anchor_estimates_only_new_content_and_ignores_helper_usage():
+    class SizedGateway(EstimatingGateway):
+        def rendered_request_bytes(self, request):
+            return 20_000 + len(json.dumps(request.conversation.events).encode("utf-8"))
+
+    gateway = SizedGateway([
+        tool_call_response("read_file", {"path": "a.py"}),
+        checkpoint_response(inspected=[], unresolved=[]),
+    ], rendered_bytes=0, usages=(
+        {"prompt_tokens": 10_000, "completion_tokens": 100},
+        {"prompt_tokens": 60_000, "completion_tokens": 4_000},
+    ))
+    session = make_session(gateway, max_context_tokens=100_000)
+    turn = session._request(tools_enabled=True, schema=None, purpose="exploration")
+    session.conversation.add_assistant_turn(reasoning=turn.reasoning, content=turn.content,
+                                          calls=turn.tool_calls)
+    baseline = session._estimate_admission(tools_enabled=True, max_tokens=2_048)
+    assert baseline.input_tokens == 10_116
+    session.conversation.add_tool_result(turn.tool_calls[0]["id"], {"content": "x" * 3_000})
+    before_helper = session._estimate_admission(tools_enabled=False, max_tokens=2_048)
+    assert 10_116 < before_helper.input_tokens < 13_000
+    helper = Conversation(system="Isolated source summary")
+    helper.add_user("Large unrelated source")
+    session._request(tools_enabled=False, schema=None, purpose="delegated-tool-summary",
+                     conversation=helper)
+    after_helper = session._estimate_admission(tools_enabled=False, max_tokens=2_048)
+    assert after_helper.input_tokens == before_helper.input_tokens
+    # Compaction changes old content; its old actual-token anchor is no longer valid.
+    session.conversation.events[0] = {"kind": "user", "content": "compacted"}
+    assert session._estimate_admission(tools_enabled=False, max_tokens=2_048).source != "provider-usage-delta"
 
 
 def test_actual_tool_prompt_usage_replaces_full_history_byte_fallback_for_checkpoint():
@@ -2379,7 +2411,7 @@ def test_actual_tool_prompt_usage_replaces_full_history_byte_fallback_for_checkp
         tools_enabled=False, max_tokens=8_192,
     )
 
-    assert estimate.source == "provider-calibrated"
+    assert estimate.source == "provider-usage-delta"
     assert estimate.input_tokens < 52_000
     assert estimate.input_tokens < 64_721
 
@@ -4391,7 +4423,7 @@ def test_checkpoint_diagnostic_projects_admission_and_regular_compaction_counts(
     assert diagnostic["provider_calibrated_input_tokens"] >= 9_000
     assert diagnostic["response_reserve_tokens"] == session.checkpoint_max_tokens
     assert diagnostic["repair_response_reserve_tokens"] == session.checkpoint_max_tokens
-    assert diagnostic["admission_source"] == "provider-calibrated"
+    assert diagnostic["admission_source"] == "provider-usage-delta"
     assert diagnostic["compaction_level"] == "regular"
     assert diagnostic["compaction_input_tokens_before"] > 0
     assert diagnostic["compaction_input_tokens_after"] > 0
@@ -5054,6 +5086,44 @@ def test_checkpoint_context_admission_failure_records_actionable_diagnostics():
     assert diagnostic["context_tokens_before"] >= diagnostic["context_tokens_after"]
     assert diagnostic["max_context_tokens"] == 300
     assert diagnostic["requested_output_tokens"] == 256
+
+
+def test_locally_rejected_checkpoint_uses_smaller_response_without_losing_history():
+    gateway = EstimatingGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ], rendered_bytes=21_000)
+    session = make_session(gateway, max_context_tokens=9_000, max_tokens=4_096)
+    session.conversation.add_user("Important investigation already performed")
+    result = session.request_checkpoint("context-pressure")
+    assert not result.degraded
+    assert len(gateway.requests) == 1
+    assert 512 <= gateway.requests[0].max_tokens < 2_048
+    assert "Important investigation already performed" in gateway.requests[0].messages
+    assert result.finalization_diagnostics[-1]["emergency_outcome"] == "smaller_checkpoint_succeeded"
+
+
+@pytest.mark.parametrize("padding", ["", "x" * 30_000])
+def test_actual_result_growth_is_deferred_and_replayed_without_execution_or_budget_charge(padding):
+    gateway = EstimatingGateway([], rendered_bytes=3_000)
+    session = make_session(gateway, max_context_tokens=20_000, max_tokens=2_048)
+    executed = []
+    def execute(name, arguments, **kwargs):
+        executed.append(name)
+        # Simulate a helper updating estimates during execution.
+        gateway.rendered_bytes = 57_000
+        return {"tool": name, "status": "ok", "result": {"content": "important result" + padding}}
+    session.execute_tool = execute
+    call = {"id": "first", "name": "read_file", "arguments": '{"path":"a.py"}'}
+    session._execute_calls((call,))
+    assert json.loads(session.conversation.events[-1]["content"])["status"] == "deferred"
+    tools_spent = session.budget.snapshot().tool_calls
+    gateway.rendered_bytes = 3_000
+    session._tool_calls_deferred_for_checkpoint = False
+    session._execute_calls(({**call, "id": "retry"},))
+    assert "important result" in session.conversation.events[-1]["content"]
+    assert executed == ["read_file"]
+    assert session.budget.snapshot().tool_calls == tools_spent
+    assert session.budget.snapshot().tool_rejections == 0
 
 
 def test_unrecoverable_candidate_text_is_reported_as_retention_unknown():

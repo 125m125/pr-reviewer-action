@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import hashlib
 import inspect
 import math
@@ -1366,6 +1367,8 @@ class SpecialistSession:
         self._successful_requests: dict[str, EvidenceRecord] = {}
         self._successful_collections: dict[str, str] = {}
         self._delegated_summary_cache: dict[str, dict[str, object]] = {}
+        self._deferred_tool_results: dict[str, tuple[dict[str, Any], str]] = {}
+        self._tool_call_keys: dict[str, str] = {}
         self._tool_call_evidence_ids: dict[str, str] = {}
         self._tool_activity_call_names: dict[str, str] = {}
         self._tool_activity_outcomes: dict[str, str] = {}
@@ -1402,7 +1405,9 @@ class SpecialistSession:
             "tools": _AdmissionCalibration(),
             "structured": _AdmissionCalibration(),
             "global": _AdmissionCalibration(),
+            "helper": _AdmissionCalibration(),
         }
+        self._usage_anchors: list[tuple[Conversation, int, int]] = []
         self._request_attempt_journal: RequestAttemptJournal | None = None
         self._request_assignment_id = str(getattr(
             assignment, "assignment_id", getattr(assignment, "id", ""),
@@ -1885,7 +1890,10 @@ class SpecialistSession:
         schema: dict[str, Any] | None = None,
         conversation: Conversation | None = None,
     ) -> _AdmissionEstimate:
-        mode = self._request_mode(tools_enabled)
+        mode = (
+            "helper" if conversation is not None and conversation.system != self.conversation.system
+            else self._request_mode(tools_enabled)
+        )
         rendered_conversation = (
             self.conversation if conversation is None else conversation
         )
@@ -1908,7 +1916,9 @@ class SpecialistSession:
                 rendered_bytes = 0
 
         calibration = self._admission_calibration[mode]
-        global_calibration = self._admission_calibration["global"]
+        global_calibration = self._admission_calibration[
+            "helper" if mode == "helper" else "global"
+        ]
         candidates = [(coarse_tokens, "coarse-conversation", 0)]
         calibrated_candidates: list[int] = []
         if rendered_bytes > 0:
@@ -1937,6 +1947,28 @@ class SpecialistSession:
         input_tokens, source, _priority = max(
             candidates, key=lambda item: (item[0], item[2]),
         )
+        if rendered_bytes > 0 and mode != "helper":
+            for baseline, actual_tokens, baseline_bytes in reversed(self._usage_anchors):
+                if (
+                    baseline.system != rendered_conversation.system
+                    or baseline.tool_schemas != rendered_conversation.tool_schemas
+                    or rendered_conversation.events[:len(baseline.events)] != baseline.events
+                ):
+                    continue
+                # Render the unchanged prefix in the new request format as well:
+                # removing tools must not hide the size of newly added messages.
+                prefix_bytes = int(renderer(self._renderable_request(
+                    tools_enabled=tools_enabled, schema=schema, max_tokens=max_tokens,
+                    conversation=baseline,
+                )))
+                added_bytes = max(0, rendered_bytes - prefix_bytes)
+                format_growth = max(0, prefix_bytes - baseline_bytes)
+                rate = max(1 / 3, calibration.max_tokens_per_rendered_byte,
+                           global_calibration.max_tokens_per_rendered_byte)
+                input_tokens = actual_tokens + math.ceil((added_bytes + format_growth) * rate * 1.05)
+                source = "provider-usage-delta"
+                provider_calibrated_input_tokens = input_tokens
+                break
         response_tokens = max(0, int(max_tokens))
         admission_tokens = (
             input_tokens + response_tokens + self.wire_safety_tokens
@@ -1959,7 +1991,9 @@ class SpecialistSession:
         usage: Mapping[str, Any],
     ) -> tuple[int, int]:
         calibration = self._admission_calibration[estimate.mode]
-        global_calibration = self._admission_calibration["global"]
+        global_calibration = self._admission_calibration[
+            "helper" if estimate.mode == "helper" else "global"
+        ]
         prompt_tokens = self._usage_tokens(usage, "prompt_tokens")
         completion_tokens = self._usage_tokens(usage, "completion_tokens")
         for item in (calibration, global_calibration):
@@ -2185,6 +2219,20 @@ class SpecialistSession:
         prompt_tokens, completion_tokens = self._record_admission_calibration(
             admission, result.usage,
         )
+        if admission.mode != "helper" and prompt_tokens > 0 and admission.rendered_bytes > 0:
+            baseline = copy.deepcopy(request.conversation)
+            self._usage_anchors = [(baseline, prompt_tokens, admission.rendered_bytes)]
+            if completion_tokens > 0:
+                completed = copy.deepcopy(baseline)
+                completed.add_assistant_turn(
+                    reasoning=result.reasoning, content=result.content, calls=result.tool_calls,
+                )
+                completed_bytes = int(self.gateway.rendered_request_bytes(replace(
+                    request, conversation=completed,
+                )))
+                self._usage_anchors.append((
+                    completed, prompt_tokens + completion_tokens + 16, completed_bytes,
+                ))
         self.budget.record_model_usage(
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,
@@ -3369,10 +3417,16 @@ class SpecialistSession:
             name = str(call.get("name") or "")
             if call_id and name:
                 self._tool_activity_call_names[call_id] = name
+                try:
+                    self._tool_call_keys[call_id] = native_tool_request_key(
+                        name, decode_native_tool_arguments(call.get("arguments")),
+                    )
+                except (ValueError, TypeError):
+                    pass
         for index, call in enumerate(calls):
             call_id = str(call.get("id") or "")
             name = str(call.get("name") or "")
-            if self._checkpoint_pressure_due(reserve_tool_result=True):
+            if self._tool_calls_deferred_for_checkpoint or self._checkpoint_pressure_due(reserve_tool_result=True):
                 for deferred in calls[index:]:
                     self._add_tool_result(
                         str(deferred.get("id") or ""),
@@ -3384,6 +3438,23 @@ class SpecialistSession:
                     )
                 self._tool_calls_deferred_for_checkpoint = True
                 break
+            key = self._tool_call_keys.get(call_id, "")
+            cached_result = self._deferred_tool_results.pop(key, None)
+            if cached_result is not None:
+                event, evidence_id = cached_result
+                if evidence_id:
+                    self._tool_call_evidence_ids[call_id] = evidence_id
+                try:
+                    payload = json.loads(event["content"])
+                except ValueError:
+                    # A bounded tool result may intentionally end mid-JSON.
+                    payload = event["content"]
+                self._add_tool_result(call_id, payload, is_error=event["is_error"],
+                                      max_bytes=self.max_tool_result_bytes)
+                if key not in self._deferred_tool_results:
+                    self.conversation.events[-1]["metadata"] = event["metadata"]
+                progressed = True
+                continue
             try:
                 arguments = decode_native_tool_arguments(call.get("arguments"))
             except (json.JSONDecodeError, ValueError, TypeError) as exc:
@@ -3986,6 +4057,25 @@ class SpecialistSession:
             )
         except (BudgetExhausted, TimeoutError) as exc:
             checkpoint_context_admission = dict(self._last_context_admission)
+            available = self.max_context_tokens - int(
+                checkpoint_context_admission.get("estimated_input_tokens", self.max_context_tokens)
+            ) - self.wire_safety_tokens
+            if (
+                isinstance(exc, BudgetExhausted)
+                and str(exc) == "model context limit cannot admit input and requested output"
+                and 512 <= available < checkpoint_output_tokens
+            ):
+                # No provider call was made. Keep investigation history intact;
+                # replace only the unsent checkpoint instruction and shrink output.
+                del self.conversation.events[checkpoint_request_start:]
+                result = self.request_checkpoint(
+                    reason, disposition=disposition, allow_repair=False,
+                    max_output_tokens=available, allow_gateway_fallbacks=False,
+                )
+                self._finalization_diagnostics[-1]["emergency_outcome"] = (
+                    "smaller_checkpoint_failed" if result.degraded else "smaller_checkpoint_succeeded"
+                )
+                return self._snapshot(degraded=result.degraded)
             if (
                 len(self._request_events) > request_event_count
                 and self._request_events[-1].status == "completed"
@@ -6131,6 +6221,26 @@ class SpecialistSession:
         max_bytes: int = TOOL_RESULT_MAX_BYTES,
     ) -> None:
         """Persist privacy-safe tool outcome counters across transcript compaction."""
+        event_count = len(self.conversation.events)
+        self.conversation.add_tool_result(
+            call_id, result, is_error=is_error, max_bytes=max_bytes,
+        )
+        key = self._tool_call_keys.get(call_id, "")
+        if (
+            len(self.conversation.events) > event_count
+            and key and not (isinstance(result, Mapping) and result.get("status") == "deferred")
+            and self._checkpoint_pressure_due()
+        ):
+            self._deferred_tool_results[key] = (
+                self.conversation.events[-1],
+                self._tool_call_evidence_ids.get(call_id, ""),
+            )
+            del self.conversation.events[event_count:]
+            result = {"status": "deferred", "reason": "checkpoint_required",
+                      "retry_after_compaction": True, "result_retained": True}
+            is_error = False
+            self.conversation.add_tool_result(call_id, result, max_bytes=max_bytes)
+            self._tool_calls_deferred_for_checkpoint = True
         name = self._tool_activity_call_names.get(call_id, "")
         if name:
             if is_error:
@@ -6153,9 +6263,6 @@ class SpecialistSession:
                     self._tool_activity_evidence.setdefault(name, set()).add(
                         evidence_id
                     )
-        self.conversation.add_tool_result(
-            call_id, result, is_error=is_error, max_bytes=max_bytes,
-        )
 
     def _record_checkpoint_diagnostic(
         self,
