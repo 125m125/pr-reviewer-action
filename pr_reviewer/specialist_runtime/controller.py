@@ -3898,7 +3898,25 @@ class ReviewController:
                     if record.is_usable_for_coverage
                 }
                 candidate_evidence = {}
+                candidate_assessments = {}
+                delegated_excerpts = [
+                    item for (_, session_id), result in state.session_results.items()
+                    if session_id not in state.quarantined_session_ids
+                    for item in getattr(result, "delegated_excerpts", ())
+                ]
                 for candidate in candidates:
+                    contributor_ids = set(candidate.contributor_candidate_ids) | {candidate.candidate_id}
+                    candidate_assessments[candidate.candidate_id] = tuple({
+                        "session_id": session_id,
+                        "authority": "collector context, not proof or an implicit withdrawal",
+                        "working_summary": mask_runtime_text(checkpoint.working_summary, limit=2400),
+                        "unknowns": tuple(mask_runtime_text(item, limit=600) for item in checkpoint.unknowns[:8]),
+                        "completed_steps": tuple(mask_runtime_text(item, limit=300) for item in checkpoint.completed_steps[:5]),
+                    } for (_, session_id), result in state.session_results.items()
+                        if session_id not in state.quarantined_session_ids
+                        and (checkpoint := getattr(result, "checkpoint", None)) is not None
+                        and (session_id == candidate.collector_session_id
+                             or contributor_ids.intersection(checkpoint.candidate_finding_ids)))
                     excerpts = []
                     for evidence_id in (
                         *candidate.supporting_evidence_ids,
@@ -3907,9 +3925,12 @@ class ReviewController:
                         record = retained.get(evidence_id)
                         if record is None:
                             continue
-                        excerpt = record.content.encode("utf-8")[:1200].decode(
-                            "utf-8", errors="replace",
-                        )
+                        selected = next((item for item in delegated_excerpts
+                            if item.get("source_evidence_id") == evidence_id
+                            and isinstance(item.get("text"), str) and item["text"].strip()
+                            and item["text"] in record.content), None)
+                        excerpt = (selected["text"] if selected else record.content).encode("utf-8")[:1200].decode(
+                            "utf-8", errors="ignore")
                         excerpts.append({
                             "evidence_id": record.id,
                             "path": record.source_path,
@@ -3919,6 +3940,10 @@ class ReviewController:
                             "content_hash": record.content_hash,
                             "content_excerpt": excerpt,
                             "truncated": record.truncated,
+                            "excerpt_truncated": len(excerpt.encode("utf-8")) < len(record.content.encode("utf-8")),
+                            "retained_bytes": len(record.content.encode("utf-8")),
+                            "excerpt_selection": "validated delegated excerpt" if selected else "source prefix",
+                            "excerpt_locator": selected.get("locator") if selected else None,
                             "redacted": record.redacted,
                             "contradicts": record.contradicts,
                         })
@@ -3926,6 +3951,7 @@ class ReviewController:
                 critic_context = {
                     "candidates": candidates,
                     "candidate_evidence": candidate_evidence,
+                    "candidate_assessments": candidate_assessments,
                     "obligations": obligation_map,
                     "changed_files": state.inputs.changed_files,
                     "pr_metadata": state.inputs.pr_metadata,
@@ -4068,6 +4094,10 @@ class ReviewController:
                                     "candidate_evidence"
                                 ][candidate_id]
                                 for candidate_id in invalid_merge_ids
+                            },
+                            "candidate_assessments": {
+                                item: critic_context["candidate_assessments"][item]
+                                for item in invalid_merge_ids
                             },
                             "eligible_merge_targets": tuple(
                                 item for item in candidates

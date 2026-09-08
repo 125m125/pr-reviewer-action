@@ -1150,6 +1150,46 @@ def test_critic_receives_bounded_retained_evidence_excerpt_and_metadata(tmp_path
     assert item["tool"] == "read_file"
     assert item["content_excerpt"] == "def process(): pass"
     assert len(item["content_excerpt"].encode("utf-8")) <= 1200
+    assert item["excerpt_truncated"] is False
+    assert item["retained_bytes"] == len(b"def process(): pass")
+    assert "candidate_assessments" in observed
+
+
+def test_critic_receives_latest_collector_doubts_not_private_todos(tmp_path):
+    observed = {}
+
+    class DoubtfulSession(_SuccessfulSession):
+        def explore(self):
+            result = super().explore()
+            return replace(result, checkpoint=replace(
+                result.checkpoint, working_summary="The credential premise is not established.",
+                unknowns=("The SDK may use a different credential.",),
+                proposed_next_actions=("PRIVATE TODO",),
+            ), delegated_excerpts=({
+                "source_evidence_id": result.checkpoint.evidence_ids[0],
+                "text": "process()", "locator": "line 1",
+            },))
+
+        def finalize(self):
+            return replace(self.explore(), state=SessionState.COMPLETE)
+
+    def factory(assignment, lease, snapshot, evidence_store, coverage, obligations, expected_session_id):
+        return DoubtfulSession(assignment, evidence_store, obligations, expected_session_id)
+
+    def critic(request):
+        observed.update(request.context)
+        return _critic_role(request)
+
+    _controller(tmp_path, critic=critic, session_factory=factory).run(_inputs(tmp_path))
+    assessment = observed["candidate_assessments"]["candidate-delivery"][0]
+    assert assessment["working_summary"] == "The credential premise is not established."
+    assert assessment["unknowns"] == ("The SDK may use a different credential.",)
+    assert "PRIVATE TODO" not in str(observed["candidate_assessments"])
+    excerpt = observed["candidate_evidence"]["candidate-delivery"][0]
+    assert excerpt["content_excerpt"] == "process()"
+    assert excerpt["excerpt_truncated"] is True
+    assert excerpt["excerpt_selection"] == "validated delegated excerpt"
+    assert excerpt["truncated"] is False
 
 
 def _policy() -> ReviewPolicy:

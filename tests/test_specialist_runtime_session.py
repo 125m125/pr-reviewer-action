@@ -861,6 +861,82 @@ def delegated_summary_response(
     )
 
 
+def test_delegated_comparison_combines_retained_evidence_and_multiple_reads():
+    gateway = ScriptedGateway([invalid_response(json.dumps({
+        "summary": "Inputs agree.", "relevant_excerpts": [],
+        "uncertainties": [], "source_truncated": False,
+    }))])
+    calls = []
+    def execute(name, arguments, **kwargs):
+        calls.append(arguments["path"])
+        return {"status": "ok", "content": arguments["path"] + "\n" + "x" * 2000}
+    session = make_session(gateway, execute_tool=execute,
+        delegated_summary_max_source_bytes=1200,
+        tool_schemas=[{"name": "read_file", "parameters": {"type": "object"}}])
+    existing = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file", arguments={"path": "workflow.yml"},
+        result={"status": "ok", "content": "with: input_a"},
+    )
+    session._execute_calls(({"id": "compare", "name": DELEGATE_TOOL_SUMMARY_NAME,
+        "arguments": json.dumps({"target": "inputs", "question": "Compare declarations",
+            "evidence_ids": [existing.id], "tool_requests": [
+                {"tool_name": "read_file", "arguments": {"path": "first.yml"}},
+                {"tool_name": "read_file", "arguments": {"path": "second.yml"}},
+            ]})},))
+    assert calls == ["first.yml", "second.yml"]
+    assert session.budget.snapshot().tool_calls == 2
+    payload = json.loads(session.conversation.events[-1]["content"])
+    assert payload["status"] == "ok"
+    assert len(payload["sources"]) == 3
+    assert payload["source_truncated"] is True
+    assert all(item["supplied_bytes"] > 0 for item in payload["sources"])
+    assert sum(item["supplied_bytes"] for item in payload["sources"]) <= 1200
+    assert "with: input_a" in gateway.requests[0].messages
+    assert "first.yml" in gateway.requests[0].messages
+    assert "second.yml" in gateway.requests[0].messages
+
+
+def test_evidence_only_delegation_preserves_quote_source_and_costs_no_tool_calls():
+    gateway = ScriptedGateway([delegated_summary_response(start_line=3, end_line=3)])
+    session = make_session(gateway, tool_schemas=[{"name": "read_file", "parameters": {"type": "object"}}])
+    records = [session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file", arguments={"path": name},
+        result={"status": "ok", "content": text},
+    ) for name, text in [("a.py", "preamble\nfeature=true\n"), ("b.py", "consumer\n")]]
+    assert session._execute_calls(({
+        "id": "summary", "name": DELEGATE_TOOL_SUMMARY_NAME,
+        "arguments": json.dumps({"target": "feature", "question": "Compare feature use",
+                                 "evidence_ids": [r.id for r in records]}),
+    },))
+    payload = json.loads(session.conversation.events[-1]["content"])
+    quote = payload["relevant_excerpts"][0]
+    assert quote["text"] == "feature=true"
+    assert quote["source_evidence_id"] == records[0].id
+    assert quote["locator"] == "lines 2-2"
+    assert session.budget.snapshot().tool_calls == 0
+    assert session._snapshot().delegated_excerpts[0]["text"] == "feature=true"
+
+
+@pytest.mark.parametrize("extra", [
+    {"evidence_ids": ["evidence:not-retained"]},
+    {"tool_requests": [{"tool_name": "not-advertised", "arguments": {}}]},
+    {"tool_requests": [{"tool_name": "read_file", "arguments": {"targets": ["O1"]}}]},
+    {"tool_requests": [{"tool_name": "read_file", "arguments": {}}] * 5},
+])
+def test_delegated_sources_are_validated_before_fetch_or_model_call(extra):
+    gateway = ScriptedGateway([])
+    def execute(*args, **kwargs):
+        pytest.fail("invalid source request must not execute")
+    session = make_session(gateway, execute_tool=execute,
+        tool_schemas=[{"name": "read_file", "parameters": {"type": "object"}}])
+    payload, _, _ = session._execute_delegated_summary(
+        {"target": "contract", "question": "Compare", **extra}, timeout=1,
+        requested_obligation_ids=(), requested_targets=(),
+    )
+    assert payload.get("error")
+    assert not gateway.requests
+
+
 @pytest.mark.parametrize("source_range", (
     {"offset": 1, "lines": 3, "total_lines": 3, "has_more": False, "truncated": False},
     {"offset": 800, "lines": 3, "total_lines": 1440, "has_more": True, "truncated": True},

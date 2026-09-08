@@ -117,6 +117,11 @@ _DELEGATED_SUMMARY_SYSTEM = (
     "metadata and quotes, keep relevance explanations short, and omit optional quotes "
     "when the precise answer already suffices. Answer only the requested question; "
     "do not add unrelated declarations or repeat the answer in excerpt explanations."
+    " Use the minimum sources needed for one focused extraction, summary, or comparison. "
+    "Summarize routine matches; quote only potential defects, contradictions, important "
+    "constraints, or uncertainty needing the specialist's inspection, not every match. "
+    "For multiple sources, each labelled section is independent: never select a quote "
+    "across source boundaries. Qualify comparisons when any relevant source is incomplete."
 )
 
 _CONSEQUENCE_SUPPORT_SCHEMA: dict[str, Any] = {
@@ -318,7 +323,12 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
         "name": "withdraw_candidate",
         "description": (
             "Withdraw one candidate reported by this session after later "
-            "evidence disproves it. Silence never withdraws a candidate."
+            "evidence disproves it or a necessary premise remains unsupported; proving the "
+            "opposite is not required. Silence never withdraws a candidate. Only if a "
+            "concrete unanswered question warrants separate investigation outside this "
+            "assignment, optionally use report_investigation_lead separately. Do not "
+            "create leads for disproven claims, duplicates, or merely to preserve a "
+            "withdrawn candidate. Leads grant no additional time or access."
         ),
         "parameters": {"type": "object", "properties": {
             "target": {
@@ -703,6 +713,9 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
     "Empty candidate_updates and new_candidates arrays are valid and mean no "
     "candidate state changed. Existing candidates remain active unless explicitly "
     "updated with status withdrawn or superseded; omission never withdraws one. "
+    "Withdraw candidates whose necessary premise remains unsupported, not only claims "
+    "proven false; describe the reason explicitly instead of leaving a contradictory "
+    "qualification solely in working_summary. "
     "Use compact candidate_updates entries such as "
     "{\"candidate_id\":\"C1\",\"status\":\"withdrawn\",\"reason\":\"...\"}. "
     "Use the controller C# handles from the latest authoritative receipt for "
@@ -1221,6 +1234,7 @@ class SessionResult:
     advertised_tools: tuple[str, ...] = ()
     tool_activity: tuple[Mapping[str, object], ...] = ()
     candidate_admission_statistics: Mapping[str, int] | None = None
+    delegated_excerpts: tuple[Mapping[str, object], ...] = ()
 
 
 class SpecialistSession:
@@ -1487,11 +1501,27 @@ class SpecialistSession:
                         "not to outsource the main changed-code investigation, infer "
                         "exact changed-line locations, or replace direct evidence for a "
                         "finding. The original result is retained as authoritative "
-                        "evidence; quoted excerpts are checked against it."
+                        "evidence; quoted excerpts are checked against it. "
+                        "Use one source for a lookup; supply multiple tool_requests or retained "
+                        "evidence_ids only for a focused comparison/cross-reference (paginated "
+                        "evidence may be combined). All sources share one input budget. "
+                        "Request quotes of potential defects, contradictions, constraints or "
+                        "important uncertainties, not every routine match."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
+                            "evidence_ids": {
+                                "type": "array", "maxItems": 8,
+                                "items": {"type": "string"},
+                            },
+                            "tool_requests": {
+                                "type": "array", "maxItems": 4,
+                                "items": {"type": "object", "properties": {
+                                    "tool_name": {"type": "string", "enum": sorted(self._delegatable_tool_names)},
+                                    "arguments": {"type": "object", "additionalProperties": True},
+                                }, "required": ["tool_name", "arguments"], "additionalProperties": False},
+                            },
                             "tool_name": {
                                 "type": "string",
                                 "enum": sorted(self._delegatable_tool_names),
@@ -1519,7 +1549,7 @@ class SpecialistSession:
                                 ),
                             },
                         },
-                        "required": ["tool_name", "arguments", "target", "question"],
+                        "required": ["target", "question"],
                         "additionalProperties": False,
                     },
                 })
@@ -3212,7 +3242,7 @@ class SpecialistSession:
             "source_truncated": value["source_truncated"],
         }, ""
 
-    def _execute_delegated_summary(
+    def _fetch_delegated_source(
         self,
         arguments: Mapping[str, Any],
         *,
@@ -3280,7 +3310,87 @@ class SpecialistSession:
                 "source_evidence_id": record.id,
             }, record, collection
 
-        source, prompt_truncated = self._clip_delegated_source(record.content, source_limit)
+        return result, record, collection
+
+    def _execute_delegated_summary(
+        self, arguments: Mapping[str, Any], *, timeout: float,
+        requested_obligation_ids: tuple[str, ...], requested_targets: tuple[str, ...],
+    ) -> tuple[dict[str, object], EvidenceRecord | None, EvidenceCollection | None]:
+        target = str(arguments.get("target") or "").strip()
+        question = str(arguments.get("question") or "").strip()
+        requests = arguments.get("tool_requests", [])
+        ids = arguments.get("evidence_ids", [])
+        if (not isinstance(requests, list) or len(requests) > 4
+            or not isinstance(ids, list) or len(ids) > 8
+            or any(not isinstance(item, str) for item in ids)):
+            return {"error": "supply at most four tool_requests and eight evidence_ids"}, None, None
+        if arguments.get("tool_name"):
+            if requests:
+                return {"error": "use tool_requests or tool_name/arguments, not both"}, None, None
+            requests = [{"tool_name": arguments["tool_name"], "arguments": arguments.get("arguments")}]
+        if not target or not question or not (requests or ids):
+            return {"error": "target, question, and at least one source are required"}, None, None
+        for request in requests:
+            if (not isinstance(request, Mapping)
+                or request.get("tool_name") not in self._delegatable_tool_names
+                or not isinstance(request.get("arguments"), Mapping)
+                or set(request["arguments"]).intersection({"targets", "obligation_ids", "evidence_category", "obligation_id"})):
+                return {"error": "each source must be an advertised read-only tool without evidence authority"}, None, None
+        retained = {item.id: item for item in self.evidence_store.snapshot().records}
+        sources = []
+        for evidence_id in dict.fromkeys(ids):
+            record = retained.get(evidence_id)
+            if record is None or not record.is_usable_for_coverage or record.tool == "web_search":
+                return {"error": "evidence_ids must reference usable retained primary sources"}, None, None
+            sources.append((record, None, {}))
+        for request in requests:
+            result, record, collection = self._fetch_delegated_source(
+                {**request, "target": target, "question": question}, timeout=timeout,
+                requested_obligation_ids=requested_obligation_ids, requested_targets=requested_targets,
+            )
+            if record is None or not record.is_usable_for_coverage:
+                return result, record, collection
+            sources.append((record, collection, result))
+        source_limit = self._delegated_source_byte_limit(target, question)
+        record, collection, result = sources[0]
+        if len(sources) > 1 and source_limit <= len(sources) * 180:
+            return {"error": "combined source budget is too small; use fewer sources or a larger limit"}, record, collection
+        source_spans: list[dict[str, object]] = []
+        def pack_sources(limit):
+            # Small sources take only their actual space; the rest share what remains.
+            sizes = [len(item[0].content.encode("utf-8")) for item in sources]
+            quotas = [0] * len(sources)
+            remaining = max(0, limit - (len(sources) * 180 if len(sources) > 1 else 0))
+            for position, index in enumerate(sorted(range(len(sources)), key=lambda i: sizes[i])):
+                share = remaining // (len(sources) - position)
+                quotas[index] = min(sizes[index], max(1, share))
+                remaining = max(0, remaining - quotas[index])
+            pieces = []
+            source_spans.clear()
+            next_line = 1
+            for (item, _, raw), quota in zip(sources, quotas):
+                content, clipped = self._clip_delegated_source(item.content, quota)
+                if len(sources) > 1:
+                    pieces.append(f"SOURCE {item.id}\n")
+                    next_line += 1
+                payload = raw.get("result", {})
+                raw_range = payload.get("range", {}) if isinstance(payload, Mapping) else {}
+                span = {
+                    "source_evidence_id": item.id, "source_path": item.source_path,
+                    "start_line": next_line, "end_line": next_line + len(content.splitlines()) - 1,
+                    "source_truncated": item.truncated, "prompt_truncated": clipped,
+                    "supplied_bytes": len(content.encode("utf-8")),
+                    "range": {key: value for key, value in raw_range.items()
+                              if key in {"offset", "lines", "total_lines", "has_more", "truncated"}
+                              and isinstance(value, (int, bool))} if isinstance(raw_range, Mapping) else {},
+                }
+                source_spans.append(span)
+                pieces.append(content + ("\n" if not content.endswith("\n") else ""))
+                next_line = span["end_line"] + 1
+            return "".join(pieces) if len(sources) > 1 else self._clip_delegated_source(record.content, quotas[0])[0]
+
+        source = pack_sources(source_limit)
+        prompt_truncated = any(item["prompt_truncated"] for item in source_spans)
         result_payload = result.get("result", {})
         source_range = (
             result_payload.get("range", {}) if isinstance(result_payload, Mapping) else {}
@@ -3291,8 +3401,9 @@ class SpecialistSession:
                 if key in {"offset", "lines", "total_lines", "has_more", "truncated"}
                 and isinstance(value, (int, bool))
             } if isinstance(source_range, Mapping) else {},
-            "source_truncated": record.truncated,
+            "source_truncated": any(item[0].truncated for item in sources),
             "prompt_truncated": prompt_truncated,
+            **({"sources": source_spans} if len(sources) > 1 else {}),
         }
         conversation = self._delegated_summary_conversation(
             target=target, question=question,
@@ -3304,10 +3415,11 @@ class SpecialistSession:
             return {
                 "status": "ok", "evidence_id": record.id,
                 "source_evidence_id": record.id, **value,
-                "source_truncated": bool(record.truncated or prompt_truncated),
+                "source_truncated": bool(any(item[0].truncated for item in sources) or prompt_truncated),
                 "source_metadata": {
                     **source_metadata, "supplied_lines": len(source.splitlines()),
                 },
+                **({"sources": source_spans, "source_evidence_ids": [item[0].id for item in sources]} if len(sources) > 1 else {}),
                 "eligible_targets": list(requested_targets),
                 "coverage_effect": "derived_summary; cite source_evidence_id",
             }
@@ -3317,6 +3429,19 @@ class SpecialistSession:
 
         def prepare_result(text: str) -> tuple[dict[str, object] | None, str]:
             parsed, validation_error = self._validated_delegated_summary(text, source)
+            if parsed is not None and len(sources) > 1:
+                raw_excerpts = _json_object(text)["relevant_excerpts"]
+                for excerpt, selected in zip(parsed["relevant_excerpts"], raw_excerpts):
+                    span = next((item for item in source_spans if item["start_line"] <= selected["start_line"] <= selected["end_line"] <= item["end_line"]), None)
+                    if span is None:
+                        validation_error = "excerpt must stay inside one labelled source, excluding headers"
+                        break
+                    excerpt["source_evidence_id"] = span["source_evidence_id"]
+                    excerpt["locator"] = f"lines {selected['start_line'] - span['start_line'] + 1}-{selected['end_line'] - span['start_line'] + 1}"
+                    original = next(item[0] for item in sources if item[0].id == span["source_evidence_id"])
+                    if excerpt["text"] not in original.content:
+                        validation_error = "quote original source text, not a truncation marker"
+                        break
             errors = [validation_error] if validation_error else []
             # Even an invalid excerpt must not hide an oversized required answer
             # until after the sole repair. Measure the quote-free envelope too.
@@ -3361,14 +3486,13 @@ class SpecialistSession:
             if estimate.admission_tokens + repair_tokens + 2_000 <= self.max_context_tokens:
                 break
             current_size = len(source.encode("utf-8"))
-            if current_size <= 1:
+            if current_size <= (len(sources) * 180 if len(sources) > 1 else 1):
                 return {
                     "error": "delegated source cannot fit the model context",
                     "source_evidence_id": record.id,
                 }, record, collection
-            source, clipped = self._clip_delegated_source(
-                source, max(1, current_size * 3 // 4),
-            )
+            source = pack_sources(max(1, current_size * 3 // 4))
+            clipped = any(item["prompt_truncated"] for item in source_spans)
             prompt_truncated = prompt_truncated or clipped
             source_metadata["prompt_truncated"] = prompt_truncated
             conversation = self._delegated_summary_conversation(
@@ -3416,7 +3540,7 @@ class SpecialistSession:
                 error = "repair was incomplete or used tools"
         if payload is None:
             return {"error": "delegated summary invalid: " + error}, record, collection
-        return payload, record, collection
+        return payload, record, collection or next((item[1] for item in sources if item[1] is not None), None)
 
     def _execute_calls(self, calls: tuple[dict[str, Any], ...]) -> bool:
         progressed = False
@@ -3596,7 +3720,7 @@ class SpecialistSession:
                     in requested_obligation_ids
                 )
             if name == DELEGATE_TOOL_SUMMARY_NAME:
-                if str(arguments.get("tool_name") or "").strip() not in self._delegatable_tool_names:
+                if arguments.get("tool_name") and str(arguments["tool_name"]).strip() not in self._delegatable_tool_names:
                     self.budget.record_tool_rejection(
                         "invalid delegated source tool"
                     )
@@ -3616,7 +3740,14 @@ class SpecialistSession:
                     )
                     continue
                 try:
-                    self.budget.reserve_tool_calls(1)
+                    source_calls = (len(arguments["tool_requests"])
+                                    if isinstance(arguments.get("tool_requests"), list)
+                                    else (1 if arguments.get("tool_name") else 0))
+                    if source_calls > 4:
+                        self._add_tool_result(call_id, {"error": "at most four source tool requests are allowed"}, is_error=True)
+                        continue
+                    if source_calls:
+                        self.budget.reserve_tool_calls(source_calls)
                     timeout = self.lease.request_timeout(
                         self.request_timeout_sec, now=self.clock(),
                     )
@@ -3639,10 +3770,11 @@ class SpecialistSession:
                     call_id, payload, is_error=is_error,
                     max_bytes=self.max_tool_result_bytes,
                 )
-                if not is_error and record is not None and collection is not None:
+                if not is_error and record is not None:
                     self._delegated_summary_cache[key] = dict(payload)
                     self._successful_requests[key] = record
-                    self._successful_collections[key] = collection.id
+                    if collection is not None:
+                        self._successful_collections[key] = collection.id
                     progressed = True
                 continue
             key = native_tool_request_key(name, arguments)
@@ -6274,6 +6406,11 @@ class SpecialistSession:
             })),
             tool_activity=self._tool_activity_snapshot(),
             candidate_admission_statistics=dict(self._candidate_admission_statistics),
+            delegated_excerpts=tuple({
+                **excerpt,
+                "source_evidence_id": excerpt.get("source_evidence_id", payload["source_evidence_id"]),
+            } for payload in self._delegated_summary_cache.values()
+                for excerpt in payload.get("relevant_excerpts", ())),
         )
 
     def _tool_activity_snapshot(self) -> tuple[Mapping[str, object], ...]:
