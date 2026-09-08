@@ -581,6 +581,16 @@ def test_search_proof_rejection_tells_specialist_to_fetch_source():
     assert "discovery-only-evidence" in reason
 
 
+def test_delegation_rejects_old_single_source_format():
+    session = make_session(ScriptedGateway([]))
+    result, _, _ = session._execute_delegated_summary(
+        {"tool_name": "read_file", "arguments": {"path": "a.py"},
+         "target": "inputs", "question": "Which inputs exist?"},
+        timeout=10, requested_obligation_ids=(), requested_targets=(),
+    )
+    assert "tool_requests" in result["error"]
+
+
 def test_reworded_checkpoint_does_not_count_as_semantic_progress():
     session = make_session(ScriptedGateway([]))
     first = SessionCheckpoint(
@@ -980,8 +990,7 @@ def test_delegated_summary_retains_raw_source_but_returns_only_focused_result(so
     progressed = session._execute_calls(({
         "id": "delegate-1", "name": DELEGATE_TOOL_SUMMARY_NAME,
         "arguments": json.dumps({
-            "tool_name": "read_file",
-            "arguments": {"path": "a.py"},
+            "tool_requests": [{"tool_name": "read_file", "arguments": {"path": "a.py"}}],
             "target": "feature toggle",
             "question": "Is the feature enabled?",
         }),
@@ -1036,7 +1045,7 @@ def test_delegated_summary_repairs_an_invalid_source_range_once():
     session._execute_calls(({
         "id": "delegate-1", "name": DELEGATE_TOOL_SUMMARY_NAME,
         "arguments": json.dumps({
-            "tool_name": "read_file", "arguments": {"path": "a.py"},
+            "tool_requests": [{"tool_name": "read_file", "arguments": {"path": "a.py"}}],
             "target": "feature toggle", "question": "Is it enabled?",
         }),
     },))
@@ -1085,7 +1094,7 @@ def test_delegated_summary_extracts_multiline_text_with_source_line_endings():
     session._execute_calls(({
         "id": "delegate-1", "name": DELEGATE_TOOL_SUMMARY_NAME,
         "arguments": json.dumps({
-            "tool_name": "read_file", "arguments": {"path": "a.py"},
+            "tool_requests": [{"tool_name": "read_file", "arguments": {"path": "a.py"}}],
             "target": "escaped value", "question": "What is configured?",
         }),
     },))
@@ -1111,8 +1120,8 @@ def test_delegated_summary_rejects_recursive_or_state_changing_inner_tools():
     session._execute_calls(({
         "id": "delegate-1", "name": DELEGATE_TOOL_SUMMARY_NAME,
         "arguments": json.dumps({
-            "tool_name": DELEGATE_TOOL_SUMMARY_NAME,
-            "arguments": {}, "target": "state", "question": "Summarize it",
+            "tool_requests": [{"tool_name": DELEGATE_TOOL_SUMMARY_NAME, "arguments": {}}],
+            "target": "state", "question": "Summarize it",
         }),
     },))
 
@@ -1136,7 +1145,7 @@ def test_delegated_summary_preserves_answer_when_optional_quotes_overflow(invali
         },
     )
     payload, record, _ = session._execute_delegated_summary(
-        {"tool_name": "read_file", "arguments": {"path": "a.py"},
+        {"tool_requests": [{"tool_name": "read_file", "arguments": {"path": "a.py"}}],
          "target": "feature", "question": "Is it enabled?"},
         timeout=10, requested_obligation_ids=(), requested_targets=(),
     )
@@ -1163,7 +1172,7 @@ def test_delegated_summary_repairs_range_and_required_body_size_together():
         },
     )
     payload, _, _ = session._execute_delegated_summary(
-        {"tool_name": "read_file", "arguments": {"path": "a.py"},
+        {"tool_requests": [{"tool_name": "read_file", "arguments": {"path": "a.py"}}],
          "target": "feature", "question": "Is it enabled?"},
         timeout=10, requested_obligation_ids=(), requested_targets=(),
     )

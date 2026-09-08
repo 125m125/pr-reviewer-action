@@ -1485,10 +1485,11 @@ class SpecialistSession:
                 schemas.append({
                     "name": DELEGATE_TOOL_SUMMARY_NAME,
                     "description": (
-                        "Fetch a large reference source and summarize or extract precise "
+                        "Prefer delegation for narrow questions about large reference files: "
+                        "summarize or extract precise "
                         "information with exact relevant source excerpts, without putting "
                         "the full result into your conversation. "
-                        "You can request exact input names, defaults, permission "
+                        "For example, check input compatibility, exact input names, defaults, permission "
                         "requirements, or declarations; this is not limited to prose summaries. "
                         "Specify the read-only tool and arguments needed to retrieve it; "
                         "no prior fetch is required. The controller retrieves and retains "
@@ -1502,7 +1503,7 @@ class SpecialistSession:
                         "exact changed-line locations, or replace direct evidence for a "
                         "finding. The original result is retained as authoritative "
                         "evidence; quoted excerpts are checked against it. "
-                        "Use one source for a lookup; supply multiple tool_requests or retained "
+                        "Use a one-element tool_requests array for an ordinary lookup; supply multiple tool_requests or retained "
                         "evidence_ids only for a focused comparison/cross-reference (paginated "
                         "evidence may be combined). All sources share one input budget. "
                         "Request quotes of potential defects, contradictions, constraints or "
@@ -1521,14 +1522,6 @@ class SpecialistSession:
                                     "tool_name": {"type": "string", "enum": sorted(self._delegatable_tool_names)},
                                     "arguments": {"type": "object", "additionalProperties": True},
                                 }, "required": ["tool_name", "arguments"], "additionalProperties": False},
-                            },
-                            "tool_name": {
-                                "type": "string",
-                                "enum": sorted(self._delegatable_tool_names),
-                            },
-                            "arguments": {
-                                "type": "object",
-                                "additionalProperties": True,
                             },
                             "target": {
                                 "type": "string", "minLength": 1,
@@ -3324,10 +3317,8 @@ class SpecialistSession:
             or not isinstance(ids, list) or len(ids) > 8
             or any(not isinstance(item, str) for item in ids)):
             return {"error": "supply at most four tool_requests and eight evidence_ids"}, None, None
-        if arguments.get("tool_name"):
-            if requests:
-                return {"error": "use tool_requests or tool_name/arguments, not both"}, None, None
-            requests = [{"tool_name": arguments["tool_name"], "arguments": arguments.get("arguments")}]
+        if "tool_name" in arguments or "arguments" in arguments:
+            return {"error": "use tool_requests: [{tool_name, arguments}]; top-level tool_name/arguments are not supported"}, None, None
         if not target or not question or not (requests or ids):
             return {"error": "target, question, and at least one source are required"}, None, None
         for request in requests:
@@ -3720,7 +3711,14 @@ class SpecialistSession:
                     in requested_obligation_ids
                 )
             if name == DELEGATE_TOOL_SUMMARY_NAME:
-                if arguments.get("tool_name") and str(arguments["tool_name"]).strip() not in self._delegatable_tool_names:
+                requests = arguments.get("tool_requests", [])
+                if ("tool_name" in arguments or "arguments" in arguments):
+                    self._add_tool_result(call_id, {"error": "use tool_requests: [{tool_name, arguments}]; top-level tool_name/arguments are not supported"}, is_error=True)
+                    continue
+                if (not isinstance(requests, list) or any(
+                    not isinstance(item, Mapping) or item.get("tool_name") not in self._delegatable_tool_names
+                    for item in requests
+                )):
                     self.budget.record_tool_rejection(
                         "invalid delegated source tool"
                     )
@@ -3740,9 +3738,7 @@ class SpecialistSession:
                     )
                     continue
                 try:
-                    source_calls = (len(arguments["tool_requests"])
-                                    if isinstance(arguments.get("tool_requests"), list)
-                                    else (1 if arguments.get("tool_name") else 0))
+                    source_calls = len(requests)
                     if source_calls > 4:
                         self._add_tool_result(call_id, {"error": "at most four source tool requests are allowed"}, is_error=True)
                         continue

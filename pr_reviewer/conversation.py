@@ -131,7 +131,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "repository at an immutable commit SHA. This tool is only for "
             "repositories other than the one under review; it rejects the "
             "current repository, branches/tags, binary files, and unallowlisted "
-            "repositories. Use offset/limit for a bounded line window and "
+            "repositories. Files over 8 MiB are rejected before content download; "
+            "offset/limit cannot bypass this transfer cap. Use offset/limit for a bounded line window and "
             "include_line_numbers when exact remote line references matter. "
             "Do not use gh_api to read repository contents."
         ),

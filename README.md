@@ -352,6 +352,19 @@ source ranges, uncertainties, truncation status, and the original evidence ID
 enter the specialist conversation. Invalid structured output receives one
 focused tools-disabled repair.
 
+Use `tool_requests: [{"tool_name": "read_remote_file", "arguments": {...}}]`
+for an ordinary lookup. Focused comparisons may supply up to four tool requests
+and up to eight retained `evidence_ids`; evidence-only summaries are also supported.
+All inputs share one source budget. Top-level `tool_name`/`arguments` are no
+longer accepted. Prefer delegation over manual pagination for narrow reference
+questions, such as input compatibility; keep the main investigation direct.
+
+Remote text reads check GitHub file metadata before raw retrieval and reject
+files over 8 MiB without downloading their contents. The transfer also enforces
+that ceiling, independently of returned excerpts and delegated context budgets.
+Binary data and redirects are rejected; smaller line windows do not bypass the
+download limit. Large-file remote search is future work.
+
 The helper receives its returned-result byte budget separately from its larger
 reasoning/output-token allowance. Oversized optional excerpts may be omitted
 with an explicit `omitted_excerpt_count`, preserving the complete answer and

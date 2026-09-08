@@ -554,6 +554,10 @@ the wildcard never grants source-text access. The latter requires an exact
 immutable commit SHA, rejects the repository currently under review, and rejects
 binary content. Generic `gh_api` rejects repository-content and Git-blob
 endpoints so base64 payloads never enter the model as accidental source text.
+Remote text retrieval uses raw GitHub content after checking metadata size;
+files over 8 MiB are rejected before content download, with a transfer cap as
+a second guard. This limit is separate from model-context/excerpt limits and
+cannot be bypassed with pagination. There is no base64 fallback.
 Use `read_file` or `read_pr_diff` for the current repository. Response byte caps,
 deadlines, and session tool-call budgets remain enforced. Granting an entry does
 not preload that repository, its history, or its full diff into model context.

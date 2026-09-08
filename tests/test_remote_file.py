@@ -1,6 +1,6 @@
 """Tests for the allowlisted remote text-file tool."""
 
-import base64
+import io
 import sys
 from pathlib import Path
 
@@ -28,10 +28,29 @@ def _call(**kwargs):
     return read_remote_file(**defaults)
 
 
+def test_raw_remote_file_with_empty_metadata_content(monkeypatch):
+    monkeypatch.setattr("pr_reviewer.platform.gh_api", lambda *a: {
+        "data": {"type": "file", "encoding": "none", "content": "", "size": 1200000},
+    })
+    monkeypatch.setattr("pr_reviewer.platform.gh_raw_file", lambda *a: {
+        "content": b"first\nsecond\n",
+    }, raising=False)
+    assert _call()["content"] == "first\nsecond\n"
+
+
+def test_oversized_remote_file_rejected_before_content_download(monkeypatch):
+    monkeypatch.setattr("pr_reviewer.platform.gh_api", lambda *a: {
+        "data": {"type": "file", "encoding": "none", "size": 100000000},
+    })
+    def fail(*args):
+        raise AssertionError("must not download oversized content")
+    monkeypatch.setattr("pr_reviewer.platform.gh_raw_file", fail, raising=False)
+    assert "download limit" in _call()["error"]
+
+
 def test_reads_allowlisted_remote_text_file_with_a_bounded_line_window(monkeypatch):
     seen = {}
     content = "first\nsecond\nthird\n"
-    encoded = base64.b64encode(content.encode()).decode()
     def fetch(endpoint, allowed_repos, current_repo, timeout):
         seen.update({
             "endpoint": endpoint,
@@ -40,12 +59,13 @@ def test_reads_allowlisted_remote_text_file_with_a_bounded_line_window(monkeypat
             "timeout": timeout,
         })
         return {"data": {
-            "type": "file", "encoding": "base64", "content": encoded,
+            "type": "file", "size": len(content.encode()),
         }}
     monkeypatch.setattr(
         "pr_reviewer.platform.gh_api",
         fetch,
     )
+    monkeypatch.setattr("pr_reviewer.platform.gh_raw_file", lambda *a: {"content": content.encode()})
 
     result = _call(offset=2, limit=2, include_line_numbers=True)
 
@@ -86,33 +106,62 @@ def test_rejects_unsafe_remote_file_requests_before_network(monkeypatch, kwargs,
 
 
 def test_rejects_binary_remote_content(monkeypatch):
-    encoded = base64.b64encode(b"text\x00not-text").decode()
     monkeypatch.setattr(
         "pr_reviewer.platform.gh_api",
         lambda *_args, **_kwargs: {"data": {
-            "type": "file", "encoding": "base64", "content": encoded,
+            "type": "file", "size": 13,
         }},
     )
 
+    monkeypatch.setattr("pr_reviewer.platform.gh_raw_file", lambda *a: {"content": b"text\x00not-text"})
     result = _call()
 
     assert "binary" in result["error"].lower()
 
 
 def test_remote_text_reports_byte_truncation(monkeypatch):
-    encoded = base64.b64encode(("line\n" * 100).encode()).decode()
     monkeypatch.setattr(
         "pr_reviewer.platform.gh_api",
         lambda *_args, **_kwargs: {"data": {
-            "type": "file", "encoding": "base64", "content": encoded,
+            "type": "file", "size": 500,
         }},
     )
 
+    monkeypatch.setattr("pr_reviewer.platform.gh_raw_file", lambda *a: {"content": b"line\n" * 100})
     result = _call(max_response_bytes=80)
 
     assert result["range"]["truncated"] is True
     assert result["range"]["has_more"] is True
     assert result["content"].endswith("[truncated]")
+
+
+@pytest.mark.parametrize("length,body", ((None, b"x" * 100), ("999", b"x" * 100), ("5", b"hello")))
+def test_raw_transfer_enforces_limit_even_with_missing_length(monkeypatch, length, body):
+    from pr_reviewer.platform import gh_raw_file
+    response = io.BytesIO(body)
+    response.headers = {} if length is None else {"Content-Length": length}
+    reads = []
+    original_read = response.read
+    def read(size):
+        reads.append(size)
+        return original_read(size)
+    response.read = read
+    class Opener:
+        def open(self, request, timeout):
+            assert request.get_header("Accept") == "application/vnd.github.raw+json"
+            assert "ref=" + "a" * 40 in request.full_url
+            return response
+    monkeypatch.setenv("GH_TOKEN", "test-token")
+    monkeypatch.setenv("PLATFORM", "github")
+    monkeypatch.setattr("urllib.request.build_opener", lambda *a: Opener())
+    result = gh_raw_file("repos/other/project/contents/a.js?ref=" + "a" * 40,
+                         {"other/project"}, 25, 10)
+    if len(body) > 10:
+        assert "download limit" in result["error"]
+    else:
+        assert result == {"content": b"hello"}
+    assert reads == ([] if length == "999" else [11])
+    assert response.closed
 
 
 def test_gh_api_does_not_read_contents_files(monkeypatch, tmp_path):

@@ -2196,7 +2196,7 @@ def test_controller_local_store_preserves_large_delegated_reference(tmp_path):
             max_context_tokens=75000, clock=lambda: 0.0,
         )
         payload, record, _ = session._execute_delegated_summary(
-            {"tool_name": "read_file", "arguments": {"path": "src/worker.py"},
+            {"tool_requests": [{"tool_name": "read_file", "arguments": {"path": "src/worker.py"}}],
              "target": "reference", "question": "What does the reference establish?"},
             timeout=10, requested_obligation_ids=(), requested_targets=(),
         )

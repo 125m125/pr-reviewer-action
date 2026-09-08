@@ -7,8 +7,6 @@ result-shaping helpers they need.
 Split out of scripts/run_tool_harness.py with no behaviour change.
 """
 
-import base64
-import binascii
 import json
 import re
 import subprocess
@@ -452,6 +450,9 @@ def read_remote_file(
     not expose GitHub's base64 ``contents`` representation, and this helper
     must never be usable for the repository currently under review.
     """
+    # Future: bounded remote-file grep for large text bundles, returning matching
+    # lines and context under the same repository/SHA guards. Keep a separate
+    # download-size ceiling; a small search result must not allow unlimited fetching.
     allowed, err = _remote_repo_allowed(repository, allowed_repos, current_repo)
     if not allowed:
         return {"error": err}
@@ -482,12 +483,20 @@ def read_remote_file(
     payload = response.get("data")
     if not isinstance(payload, dict) or payload.get("type") != "file":
         return {"error": "Remote path is not a single file"}
-    if payload.get("encoding") != "base64" or not isinstance(payload.get("content"), str):
-        return {"error": "Remote file is not available as base64 text content"}
+    download_limit = 8 * 1024 * 1024
+    size = payload.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        return {"error": "Remote file metadata lacks a valid byte size"}
+    if size > download_limit:
+        return {"error": f"Remote file exceeds download limit ({size}>{download_limit} bytes); use smaller source files instead"}
+    from pr_reviewer.platform import gh_raw_file
+    response = gh_raw_file(endpoint, {repository}, request_timeout, download_limit)
+    if response.get("error"):
+        return {"error": str(response["error"])}
+    raw = response["content"]
     try:
-        raw = base64.b64decode("".join(payload["content"].split()), validate=True)
         content = raw.decode("utf-8")
-    except (ValueError, UnicodeDecodeError, binascii.Error):
+    except UnicodeDecodeError:
         return {"error": "Remote file is binary or not valid UTF-8 text"}
     if any(byte < 32 and byte not in (9, 10, 12, 13) for byte in raw):
         return {"error": "Remote file is binary or contains unsupported control bytes"}
