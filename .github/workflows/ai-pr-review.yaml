@@ -85,19 +85,19 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
-          ai_base_url: ${{ vars.LM_STUDIO_BASE_URL }}
-          # Intermediate calls preserve LM Studio reasoning_content when normal
-          # content is blank. Public review text is rendered only from validated
-          # candidates; raw reasoning is never published.
+          ai_base_url: ${{ vars.LITELLM_BASE_URL }}
+          # LiteLLM exposes the model through the OpenAI-compatible
+          # /v1/chat/completions endpoint. Public review text is rendered only
+          # from validated candidates; raw reasoning is never published.
           ai_api_format: openai
-          ai_api_key: ${{ secrets.LM_STUDIO_API_KEY }}
-          ai_model: qwen/qwen3.6-35b-a3b
+          ai_api_key: ${{ secrets.LITELLM_API_KEY }}
+          ai_model: code
           ai_response_format: json_schema
           ai_reasoning_effort: ""
           ai_verdict_reasoning_effort: none
           ai_stream: "true"
           ai_max_tokens: "8192"
-          model_context_tokens: "75000"
+          model_context_tokens: "224000"
           ai_request_timeout_sec: "1200"
           standards_file: .github/ai-review-rules.md
           system_prompt_file: .github/ai-review-prompt.md
@@ -125,7 +125,7 @@ jobs:
           specialist_max_recoveries_per_session: "1"
 
           specialist_planner_max_tokens: "8192"
-          specialist_planner_max_context_bytes: "180000"
+          specialist_planner_max_context_bytes: "540000"
 
           specialist_pass_timeout_sec: "1200"
           specialist_max_tokens: "8192"
