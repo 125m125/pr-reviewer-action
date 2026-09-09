@@ -9,7 +9,7 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from redact import mask_secrets, mask_and_truncate  # noqa: E402
+from redact import mask_and_truncate, mask_secrets, mask_source_secrets  # noqa: E402
 
 import pytest
 
@@ -107,6 +107,36 @@ class TestMaskSecrets:
         text = "client-key-data: LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQ=="
         result = mask_secrets(text)
         assert "LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQ" not in result
+
+
+class TestMaskSourceSecrets:
+    @pytest.mark.parametrize("reference", (
+        "{api_token}", "$TOKEN", "${TOKEN}", "%TOKEN%", "api_token",
+        "settings.auth.api_token",
+    ))
+    def test_dynamic_secret_references_preserve_source_semantics(self, reference):
+        source = f'return f"delivery failed; api_token={reference}"'
+
+        result, redaction_count = mask_source_secrets(source)
+
+        assert result == source
+        assert redaction_count == 0
+
+    def test_literal_secret_keeps_key_and_operator_visible(self):
+        source = 'api_token="super_secret_literal_value_12345"'
+
+        result, redaction_count = mask_source_secrets(source)
+
+        assert result == 'api_token="[REDACTED_VALUE]"'
+        assert redaction_count == 1
+
+    def test_dotted_literal_credential_is_not_treated_as_a_reference(self):
+        source = "token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.signature"
+
+        result, redaction_count = mask_source_secrets(source)
+
+        assert result == "token=[REDACTED_VALUE]"
+        assert redaction_count == 1
 
 
 # ---------------------------------------------------------------------------

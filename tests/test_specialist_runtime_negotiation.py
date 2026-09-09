@@ -1,0 +1,1343 @@
+from __future__ import annotations
+
+from dataclasses import FrozenInstanceError, replace
+
+import pytest
+
+from pr_reviewer.specialist_runtime.assignments import Assignment, validate_assignment_plan
+from pr_reviewer.specialist_runtime.coverage import (
+    CoverageLedger,
+    SessionOwnership,
+    evidence_satisfies_obligation,
+    reconcile_wave,
+)
+from pr_reviewer.specialist_runtime.evidence import EvidenceStore
+from pr_reviewer.specialist_runtime.obligation_assessment import (
+    ObligationAssessment,
+    ObligationDisposition,
+)
+from pr_reviewer.specialist_runtime.negotiation import (
+    NegotiationError,
+    NegotiationState,
+    SessionResources,
+    compact_negotiation_context,
+    fallback_next_action,
+    validate_compact_negotiation,
+    validate_negotiation,
+)
+from pr_reviewer.specialist_runtime.policy import RuntimeConfig
+from pr_reviewer.specialist_runtime.types import (
+    CoverageObligation,
+    InvestigationLead,
+    ObligationStatus,
+    SessionCheckpoint,
+    SessionState,
+    SpecialistAssignment,
+)
+
+
+def obligation(
+    obligation_id: str,
+    *,
+    risk: str = "normal",
+    category: str = "tests",
+    path: str = "tests/test_a.py",
+    unresolved_policy: str = "record_unknown",
+) -> CoverageObligation:
+    return CoverageObligation(
+        obligation_id=obligation_id,
+        origin="test",
+        subject=path,
+        required_evidence_categories=(category,),
+        satisfaction_predicates=("recorded_evidence",),
+        risk_tier=risk,
+        unresolved_policy=unresolved_policy,
+        scope=(path,),
+    )
+
+
+def assignment(
+    session_id: str,
+    obligation_ids: tuple[str, ...],
+    *,
+    primary: tuple[str, ...] | None = None,
+) -> Assignment:
+    return Assignment(
+        id=session_id,
+        title=session_id,
+        objective=f"Review {', '.join(obligation_ids)}",
+        obligation_ids=obligation_ids,
+        recipe_ids=(),
+        lenses=("correctness",),
+        seed_paths=(),
+        boundary_paths=(),
+        expected_evidence=("tests", "implementation"),
+        estimated_turns=2,
+        priority="high",
+        primary_obligation_ids=obligation_ids if primary is None else primary,
+    )
+
+
+def state_for(
+    *,
+    covered: tuple[str, ...] = (),
+    resources: tuple[SessionResources, ...] | None = None,
+    current_session_count: int = 2,
+    max_sessions: int = 3,
+    followup_sessions_started: int = 0,
+    max_followup_sessions: int = 1,
+    new_session_turns_remaining: int = 4,
+    new_session_turn_cap: int = 2,
+    new_session_tool_call_cap: int = 3,
+    new_session_lease_remaining_sec: float = 100.0,
+    remaining_deadline_sec: float = 100.0,
+    assignments: tuple[Assignment | SpecialistAssignment, ...] | None = None,
+    session_ownership: tuple[SessionOwnership, ...] | None = None,
+    checkpoints: tuple[SessionCheckpoint, ...] = (),
+    investigation_leads: tuple[InvestigationLead, ...] = (),
+) -> NegotiationState:
+    obligations = (
+        obligation("OB1", risk="high"),
+        obligation("OB2", risk="critical", category="implementation", path="src/a.py"),
+    )
+    ledger = CoverageLedger(obligations)
+    for obligation_id in covered:
+        ledger.attach_evidence(obligation_id, f"E-{obligation_id}")
+    return NegotiationState(
+        obligations=obligations,
+        coverage=ledger.snapshot(),
+        assignments=assignments or (
+            assignment("A1", ("OB1",)), assignment("A2", ("OB2",)),
+        ),
+        checkpoints=checkpoints,
+        session_ownership=session_ownership or (
+            SessionOwnership("S1", "A1", primary_obligation_ids=("OB1",)),
+            SessionOwnership("S2", "A2", primary_obligation_ids=("OB2",)),
+        ),
+        session_resources=resources or (
+            SessionResources(
+                "S1", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0,
+            ),
+        ),
+        remaining_deadline_sec=remaining_deadline_sec,
+        seconds_per_turn=10.0,
+        current_session_count=current_session_count,
+        max_sessions=max_sessions,
+        followup_sessions_started=followup_sessions_started,
+        max_followup_sessions=max_followup_sessions,
+        new_session_turns_remaining=new_session_turns_remaining,
+        new_session_turn_cap=new_session_turn_cap,
+        new_session_tool_call_cap=new_session_tool_call_cap,
+        new_session_lease_remaining_sec=new_session_lease_remaining_sec,
+        investigation_leads=investigation_leads,
+    )
+
+
+def test_compact_negotiation_routes_open_lead_to_capable_existing_session():
+    lead = InvestigationLead(
+        lead_id="lead:web", summary="The external contract may have changed.",
+        affected_paths=("src/a.py",), evidence_ids=("evidence:1",),
+        next_action="Check the official contract documentation.",
+        required_capability="web", origin_session_id="S1",
+    )
+    resources = (
+        SessionResources(
+            "S1", remaining_model_turns=4, remaining_tool_calls=3,
+            lease_remaining_sec=100.0, advertised_tools=("read_file",),
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=4, remaining_tool_calls=3,
+            lease_remaining_sec=100.0,
+            advertised_tools=("read_file", "web_search", "web_fetch"),
+        ),
+    )
+    state = state_for(
+        covered=("OB1", "OB2"), resources=resources,
+        investigation_leads=(lead,),
+    )
+
+    context = compact_negotiation_context(state)
+    assert context["targets"] == ({
+        "handle": "L1",
+        "risk_tier": "normal",
+        "subject": "src/a.py",
+        "summary": "The external contract may have changed.",
+        "allowed_actions": ("consult", "new_session", "record_unknown"),
+        "last_conclusion": "",
+        "attempt_count": 0,
+        "evidence_delta": 0,
+        "retained_evidence_count": 1,
+        "next_actions": ("Check the official contract documentation.",),
+        "required_capability": "web",
+    },)
+    action = validate_compact_negotiation({
+        "kind": "consult", "target": "L1",
+        "reason": "Use the existing web-capable specialist.",
+    }, state).actions[0]
+    assert action.lead_ids == ("lead:web",)
+    assert action.obligation_ids == ()
+    assert action.session_id == "S2"
+
+
+def test_fallback_records_blocked_lead_when_no_capable_investigation_is_feasible():
+    lead = InvestigationLead(
+        lead_id="lead:web", summary="The external contract may have changed.",
+        affected_paths=("src/a.py",), evidence_ids=("evidence:1",),
+        next_action="Check the official contract documentation.",
+        required_capability="web", origin_session_id="S1",
+    )
+    state = state_for(
+        covered=("OB1", "OB2"), max_sessions=2,
+        max_followup_sessions=0, new_session_turns_remaining=0,
+        investigation_leads=(lead,),
+        resources=(
+            SessionResources(
+                "S1", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0, advertised_tools=("read_file",),
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0, advertised_tools=("read_file",),
+            ),
+        ),
+    )
+
+    action = fallback_next_action(state)
+    assert action.kind == "record_unknown"
+    assert action.lead_ids == ("lead:web",)
+
+
+def resume_raw(**updates):
+    raw = {
+        "kind": "resume",
+        "session_id": "S1",
+        "obligation_ids": ["OB1"],
+        "expected_evidence": ["tests"],
+        "estimated_turns": 2,
+        "reason": "The owner inspected implementation but not tests.",
+    }
+    raw.update(updates)
+    return {"actions": [raw]}
+
+
+def test_compact_negotiation_uses_controller_target_handle_and_derives_authority():
+    state = state_for()
+    context = compact_negotiation_context(state)
+
+    assert context["targets"]
+    target = next(item for item in context["targets"] if item["risk_tier"] == "critical")
+    assert target["handle"] == "U1"
+    assert "obligation_id" not in target
+    proposal = validate_compact_negotiation({
+        "kind": "resume",
+        "target": target["handle"],
+        "reason": "The durable owner needs one bounded implementation check.",
+    }, state)
+
+    assert proposal.actions[0].obligation_ids == ("OB2",)
+    assert proposal.actions[0].session_id == "S2"
+    assert proposal.actions[0].expected_evidence == ("implementation",)
+    assert proposal.actions[0].estimated_turns == 1
+
+
+def test_compact_negotiation_offers_resume_only_for_novel_checkpoint_action():
+    assessment = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.UNRESOLVED,
+        reason="The downstream consumer remains unchecked.",
+        next_actions=("read src/consumer.py diff",),
+    )
+    state = state_for(checkpoints=(SessionCheckpoint(
+        session_id="S2", state=SessionState.CHECKPOINT,
+        obligation_assessments=(assessment,),
+    ),))
+
+    target = compact_negotiation_context(state)["targets"][0]
+
+    assert target["last_conclusion"] == "The downstream consumer remains unchecked."
+    assert target["next_actions"] == ("read src/consumer.py diff",)
+    assert target["attempt_count"] == 0
+    assert "resume" in target["allowed_actions"]
+
+
+def test_compact_negotiation_does_not_promote_checkpoint_todos_to_scheduler_actions():
+    checkpoint = SessionCheckpoint(
+        session_id="S2",
+        state=SessionState.CHECKPOINT,
+        working_summary=(
+            "The changed redactor no longer masks literal passwords; the "
+            "consumer path still needs one bounded trace."
+        ),
+        unknowns=("OB2",),
+        proposed_next_actions=(
+            "Trace mask_source_secrets through the retained consumer call sites.",
+        ),
+        obligation_assessments=(ObligationAssessment(
+            target="O1",
+            obligation_id="OB2",
+            disposition=ObligationDisposition.PENDING,
+        ),),
+    )
+
+    state = state_for(
+        checkpoints=(checkpoint,),
+        resources=(
+            SessionResources(
+                "S1", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=4, remaining_tool_calls=3,
+                lease_remaining_sec=100.0, retained_evidence_count=17,
+            ),
+        ),
+    )
+    context = compact_negotiation_context(state)
+
+    assert all(item["subject"] != "src/a.py" for item in context["targets"])
+    assert checkpoint.proposed_next_actions[0] not in str(context)
+
+
+def test_compact_negotiation_only_advertises_globally_admissible_high_risk_actions():
+    blocked = ObligationAssessment(
+        target="O1", obligation_id="OB1",
+        disposition=ObligationDisposition.PENDING,
+    )
+    actionable = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.UNRESOLVED,
+        reason="Inspect the remaining consumer.",
+        next_actions=("read src/consumer.py diff",),
+    )
+    state = state_for(checkpoints=(
+        SessionCheckpoint(
+            session_id="S1", state=SessionState.CHECKPOINT,
+            obligation_assessments=(blocked,),
+        ),
+        SessionCheckpoint(
+            session_id="S2", state=SessionState.CHECKPOINT,
+            obligation_assessments=(actionable,),
+        ),
+    ))
+
+    targets = compact_negotiation_context(state)["targets"]
+
+    assert len(targets) == 1
+    target = targets[0]
+    assert target["subject"] == "src/a.py"
+    assert "resume" in target["allowed_actions"]
+    assert "record_unknown" not in target["allowed_actions"]
+
+
+def test_fallback_skips_infeasible_critical_target_for_actionable_high_target():
+    critical_blocked = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.PENDING,
+    )
+    high_actionable = ObligationAssessment(
+        target="O1", obligation_id="OB1",
+        disposition=ObligationDisposition.UNRESOLVED,
+        reason="Inspect the remaining workflow test.",
+        next_actions=("read tests/test_a.py diff",),
+    )
+    state = state_for(checkpoints=(
+        SessionCheckpoint(
+            session_id="S2", state=SessionState.CHECKPOINT,
+            obligation_assessments=(critical_blocked,),
+        ),
+        SessionCheckpoint(
+            session_id="S1", state=SessionState.CHECKPOINT,
+            obligation_assessments=(high_actionable,),
+        ),
+    ))
+
+    action = fallback_next_action(state)
+
+    assert action.kind == "resume"
+    assert action.obligation_ids == ("OB1",)
+    assert action.session_id == "S1"
+
+
+def test_compact_negotiation_omits_closed_assessment():
+    assessment = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.EXHAUSTED,
+        reason="All bounded sources were inspected.",
+    )
+    state = state_for(checkpoints=(SessionCheckpoint(
+        session_id="S2", state=SessionState.CHECKPOINT,
+        obligation_assessments=(assessment,),
+    ),))
+
+    targets = compact_negotiation_context(state)["targets"]
+
+    assert all(item["subject"] != "src/a.py" for item in targets)
+
+
+def test_compact_negotiation_rejects_resume_without_novel_action():
+    assessment = ObligationAssessment(
+        target="O1", obligation_id="OB2",
+        disposition=ObligationDisposition.PENDING,
+    )
+    state = state_for(checkpoints=(SessionCheckpoint(
+        session_id="S2", state=SessionState.CHECKPOINT,
+        obligation_assessments=(assessment,),
+    ),))
+
+    with pytest.raises(NegotiationError, match="not currently admissible"):
+        validate_compact_negotiation({
+            "kind": "resume", "target": "U1", "reason": "Keep reading.",
+        }, state)
+
+
+def test_compact_negotiation_does_not_advertise_new_session_at_hard_capacity():
+    context = compact_negotiation_context(
+        state_for(current_session_count=3, max_sessions=3),
+    )
+
+    assert context["targets"]
+    assert all("new_session" not in item["allowed_actions"] for item in context["targets"])
+
+
+def test_compact_negotiation_rejects_multi_action_payloads():
+    state = state_for()
+    with pytest.raises(NegotiationError, match="exactly one action"):
+        validate_compact_negotiation({
+            "actions": [
+                {"kind": "resume", "target": "U1", "reason": "first"},
+                {"kind": "record_unknown", "target": "U2", "reason": "second"},
+            ],
+        }, state)
+
+
+def test_compact_negotiation_normalizes_unambiguous_kind_alias():
+    state = state_for(
+        resources=(
+            SessionResources(
+                "S1", remaining_model_turns=3, remaining_tool_calls=0,
+                lease_remaining_sec=100.0,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=3, remaining_tool_calls=0,
+                lease_remaining_sec=100.0,
+            ),
+        ),
+        current_session_count=2,
+        max_sessions=2,
+        max_followup_sessions=0,
+        new_session_turns_remaining=0,
+    )
+    proposal = validate_compact_negotiation({
+        "kind": "record-unknown",
+        "target": "U1",
+        "reason": "No bounded evidence remains.",
+    }, state)
+
+    assert proposal.actions[0].kind == "record_unknown"
+
+
+def test_legacy_negotiation_normalizes_unambiguous_kind_alias():
+    proposal = validate_negotiation({
+        "actions": [{
+            "kind": "record-unknown",
+            "obligation_ids": ["OB1"],
+            "expected_evidence": ["tests"],
+            "estimated_turns": 0,
+            "reason": "No bounded evidence remains.",
+        }],
+    }, state_for())
+
+    assert proposal.actions[0].kind == "record_unknown"
+
+
+def test_tool_exhausted_durable_session_cannot_resume_but_new_session_can():
+    state = state_for(resources=(
+        SessionResources(
+            "S1", remaining_model_turns=3, remaining_tool_calls=0,
+            lease_remaining_sec=100.0,
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=3, remaining_tool_calls=3,
+            lease_remaining_sec=100.0,
+        ),
+    ))
+
+    with pytest.raises(
+        NegotiationError, match="session 'S1' has no remaining tool-call budget",
+    ):
+        validate_negotiation(resume_raw(), state)
+
+    proposal = validate_negotiation({
+        "actions": [{
+            "kind": "new_session",
+            "obligation_ids": ["OB1"],
+            "expected_evidence": ["tests"],
+            "estimated_turns": 2,
+            "reason": "The durable owner exhausted its evidence tools.",
+        }],
+    }, state)
+
+    assert proposal.actions[0].kind == "new_session"
+
+
+def test_tool_exhausted_session_can_record_unknown_when_no_new_session_is_available():
+    state = state_for(
+        resources=(
+            SessionResources(
+                "S1", remaining_model_turns=3, remaining_tool_calls=0,
+                lease_remaining_sec=100.0,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=3, remaining_tool_calls=0,
+                lease_remaining_sec=100.0,
+            ),
+        ),
+        current_session_count=2,
+        max_sessions=2,
+        max_followup_sessions=0,
+        new_session_turns_remaining=0,
+    )
+
+    action = fallback_next_action(state)
+
+    assert action.kind == "record_unknown"
+
+
+def test_reconcile_wave_requires_accepted_semantic_assessment_for_coverage():
+    obligations = (
+        obligation("OB1"),
+        obligation("OB2", category="implementation", path="src/a.py"),
+    )
+    ledger = CoverageLedger(obligations)
+    store = EvidenceStore()
+    evidence = store.add_tool_result(
+        session_id="S1",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "assert behavior"},
+        category="tests",
+    )
+    checkpoint = SessionCheckpoint(
+        session_id="S1",
+        state=SessionState.CHECKPOINT,
+        evidence_ids=(evidence.id,),
+        obligation_statuses=(("OB2", ObligationStatus.COVERED),),
+        obligation_assessments=(
+            ObligationAssessment("O1", "OB1"),
+            ObligationAssessment("O2", "OB2"),
+        ),
+    )
+
+    result = reconcile_wave(
+        ledger,
+        wave_start_coverage=ledger.snapshot(),
+        checkpoints=(checkpoint,),
+        evidence=store.snapshot(),
+        assignments=(assignment("S1", ("OB1", "OB2")),),
+        session_ownership=(SessionOwnership(
+            session_id="S1",
+            assignment_id="S1",
+            primary_obligation_ids=("OB1", "OB2"),
+        ),),
+    )
+
+    assert result.snapshot.obligation_statuses == (
+        ("OB1", ObligationStatus.PENDING),
+        ("OB2", ObligationStatus.PENDING),
+    )
+    assert result.newly_covered_obligation_ids == ()
+    assert result.uncovered_obligation_ids == ("OB1", "OB2")
+
+
+def test_reconcile_wave_accepts_covered_assessment_with_eligible_evidence():
+    required = obligation("OB1")
+    ledger = CoverageLedger((required,))
+    store = EvidenceStore()
+    evidence = store.add_tool_result(
+        session_id="S1", tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "assert behavior"},
+        category="tests",
+    )
+    checkpoint = SessionCheckpoint(
+        session_id="S1", state=SessionState.CHECKPOINT,
+        evidence_ids=(evidence.id,),
+        obligation_assessments=(ObligationAssessment(
+            target="O1", obligation_id="OB1",
+            disposition=ObligationDisposition.COVERED,
+            reason="The changed behavior is exercised by the retained test.",
+            evidence_ids=(evidence.id,),
+        ),),
+    )
+
+    result = reconcile_wave(
+        ledger, wave_start_coverage=ledger.snapshot(),
+        checkpoints=(checkpoint,), evidence=store.snapshot(),
+        assignments=(assignment("S1", ("OB1",)),),
+        session_ownership=(SessionOwnership(
+            session_id="S1", assignment_id="S1",
+            primary_obligation_ids=("OB1",),
+        ),),
+    )
+
+    assert result.snapshot.obligation_statuses == (
+        ("OB1", ObligationStatus.COVERED),
+    )
+
+
+@pytest.mark.parametrize("disposition, expected", [
+    (ObligationDisposition.NOT_APPLICABLE, ObligationStatus.NOT_APPLICABLE),
+    (ObligationDisposition.EXHAUSTED, ObligationStatus.EXHAUSTED),
+    (ObligationDisposition.BLOCKED, ObligationStatus.BLOCKED),
+])
+def test_reconcile_wave_preserves_non_negotiable_closure_status(
+    disposition, expected,
+):
+    required = obligation("OB1", risk="high")
+    ledger = CoverageLedger((required,))
+    checkpoint = SessionCheckpoint(
+        session_id="S1", state=SessionState.CHECKPOINT,
+        obligation_assessments=(ObligationAssessment(
+            target="O1", obligation_id="OB1", disposition=disposition,
+            reason="Bounded review reached a terminal coverage conclusion.",
+        ),),
+    )
+
+    result = reconcile_wave(
+        ledger, wave_start_coverage=ledger.snapshot(),
+        checkpoints=(checkpoint,), evidence=EvidenceStore().snapshot(),
+        assignments=(assignment("S1", ("OB1",)),),
+        session_ownership=(SessionOwnership(
+            session_id="S1", assignment_id="S1",
+            primary_obligation_ids=("OB1",),
+        ),),
+    )
+
+    assert result.snapshot.obligation_statuses == (("OB1", expected),)
+    assert result.uncovered_obligation_ids == ()
+
+
+def test_shared_path_with_wrong_evidence_category_does_not_satisfy_obligation():
+    required = obligation("OB1", category="tests", path="shared.py")
+    store = EvidenceStore()
+    implementation = store.add_tool_result(
+        session_id="session-1",
+        tool="read_file",
+        arguments={"path": "shared.py"},
+        result={"status": "ok", "content": "implementation"},
+        category="implementation",
+    )
+
+    assert evidence_satisfies_obligation(implementation, required) is False
+
+
+def test_reconciliation_maps_durable_session_to_specialist_assignment_ownership():
+    required = obligation("OB1")
+    ledger = CoverageLedger((required,))
+    specialist_assignment = SpecialistAssignment(
+        assignment_id="assignment-A",
+        objective="Inspect tests",
+        primary_obligation_ids=("OB1",),
+    )
+    ownership = SessionOwnership(
+        session_id="durable-session-9",
+        assignment_id=specialist_assignment.assignment_id,
+        primary_obligation_ids=specialist_assignment.primary_obligation_ids,
+        independent_obligation_ids=specialist_assignment.independent_obligation_ids,
+    )
+    store = EvidenceStore()
+    evidence = store.add_tool_result(
+        session_id="durable-session-9",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "assert behavior"},
+        category="tests",
+    )
+
+    result = reconcile_wave(
+        ledger,
+        wave_start_coverage=ledger.snapshot(),
+        checkpoints=(SessionCheckpoint(
+            session_id="durable-session-9",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(evidence.id,),
+        ),),
+        evidence=store.snapshot(),
+        assignments=(specialist_assignment,),
+        session_ownership=(ownership,),
+    )
+
+    assert result.snapshot.obligation_statuses == (("OB1", ObligationStatus.COVERED),)
+
+
+def test_independent_owner_cannot_satisfy_obligation_with_imported_evidence():
+    required = replace(obligation("OB1"), requires_independent_verification=True)
+    ledger = CoverageLedger((required,))
+    specialist_assignment = SpecialistAssignment(
+        assignment_id="independent-assignment",
+        objective="Independently inspect tests",
+        independent_obligation_ids=("OB1",),
+    )
+    ownership = SessionOwnership(
+        session_id="independent-session",
+        assignment_id=specialist_assignment.assignment_id,
+        independent_obligation_ids=("OB1",),
+    )
+    store = EvidenceStore()
+    imported = store.add_tool_result(
+        session_id="primary-session",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "primary collection"},
+        category="tests",
+    )
+    store.import_into_session("independent-session", imported.id)
+    wave_start_coverage = ledger.snapshot()
+    # SpecialistSession may optimistically attach checkpoint evidence before the
+    # controller's post-wave reconciliation. The controller must remove it.
+    ledger.attach_evidence("OB1", imported.id)
+
+    result = reconcile_wave(
+        ledger,
+        wave_start_coverage=wave_start_coverage,
+        checkpoints=(SessionCheckpoint(
+            session_id="independent-session",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(imported.id,),
+            imported_evidence_ids=(imported.id,),
+        ),),
+        evidence=store.snapshot(),
+        assignments=(specialist_assignment,),
+        session_ownership=(ownership,),
+    )
+
+    assert result.snapshot.obligation_statuses == (("OB1", ObligationStatus.PENDING),)
+
+
+def test_independent_owner_fresh_collection_satisfies_independent_obligation():
+    required = replace(obligation("OB1"), requires_independent_verification=True)
+    ledger = CoverageLedger((required,))
+    specialist_assignment = SpecialistAssignment(
+        assignment_id="independent-assignment",
+        objective="Independently inspect tests",
+        independent_obligation_ids=("OB1",),
+    )
+    ownership = SessionOwnership(
+        session_id="independent-session",
+        assignment_id=specialist_assignment.assignment_id,
+        independent_obligation_ids=("OB1",),
+    )
+    store = EvidenceStore()
+    fresh = store.add_tool_result(
+        session_id="independent-session",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "independent collection"},
+        category="tests",
+    )
+
+    result = reconcile_wave(
+        ledger,
+        wave_start_coverage=ledger.snapshot(),
+        checkpoints=(SessionCheckpoint(
+            session_id="independent-session",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(fresh.id,),
+        ),),
+        evidence=store.snapshot(),
+        assignments=(specialist_assignment,),
+        session_ownership=(ownership,),
+    )
+
+    assert result.snapshot.obligation_statuses == (("OB1", ObligationStatus.COVERED),)
+
+
+def test_independent_owner_identical_fresh_read_is_not_collapsed_to_import():
+    required = replace(obligation("OB1"), requires_independent_verification=True)
+    ledger = CoverageLedger((required,))
+    assignment_value = SpecialistAssignment(
+        assignment_id="independent-assignment",
+        objective="Independently inspect tests",
+        independent_obligation_ids=("OB1",),
+    )
+    ownership = SessionOwnership(
+        session_id="independent-session",
+        assignment_id=assignment_value.assignment_id,
+        independent_obligation_ids=("OB1",),
+    )
+    store = EvidenceStore()
+    store.add_tool_result(
+        session_id="primary-session", tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "identical"}, category="tests",
+    )
+    record, collection = store.add_tool_result_with_collection(
+        session_id="independent-session", tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "identical"}, category="tests",
+    )
+    store.associate_collection(
+        collection.id, obligation_id="OB1", categories=("tests",),
+    )
+
+    result = reconcile_wave(
+        ledger,
+        wave_start_coverage=ledger.snapshot(),
+        checkpoints=(SessionCheckpoint(
+            session_id="independent-session",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(record.id,),
+        ),),
+        evidence=store.snapshot(),
+        assignments=(assignment_value,),
+        session_ownership=(ownership,),
+    )
+
+    assert result.snapshot.obligation_statuses == (
+        ("OB1", ObligationStatus.COVERED),
+    )
+
+
+def test_wave_start_baseline_retains_prior_coverage_and_counts_current_gain():
+    obligations = (
+        obligation("OB1"),
+        obligation("OB2", category="implementation", path="src/a.py"),
+    )
+    store = EvidenceStore()
+    prior = store.add_tool_result(
+        session_id="prior-session",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "prior test evidence"},
+        category="tests",
+    )
+    current = store.add_tool_result(
+        session_id="current-session",
+        tool="read_file",
+        arguments={"path": "src/a.py"},
+        result={"status": "ok", "content": "current implementation evidence"},
+        category="implementation",
+    )
+    baseline_ledger = CoverageLedger(obligations)
+    baseline_ledger.attach_evidence("OB1", prior.id)
+    live_ledger = CoverageLedger(obligations)
+    live_ledger.attach_evidence("OB1", prior.id)
+    live_ledger.attach_evidence("OB2", current.id)  # optimistic current-wave attachment
+    assignments = (
+        SpecialistAssignment(
+            assignment_id="prior-assignment", objective="Prior tests",
+            primary_obligation_ids=("OB1",),
+        ),
+        SpecialistAssignment(
+            assignment_id="current-assignment", objective="Current implementation",
+            primary_obligation_ids=("OB2",),
+        ),
+    )
+    ownership = (
+        SessionOwnership(
+            "prior-session", "prior-assignment", primary_obligation_ids=("OB1",),
+        ),
+        SessionOwnership(
+            "current-session", "current-assignment", primary_obligation_ids=("OB2",),
+        ),
+    )
+
+    result = reconcile_wave(
+        live_ledger,
+        wave_start_coverage=baseline_ledger.snapshot(),
+        checkpoints=(SessionCheckpoint(
+            session_id="current-session",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(current.id,),
+        ),),
+        evidence=store.snapshot(),
+        assignments=assignments,
+        session_ownership=ownership,
+    )
+
+    assert result.snapshot.obligation_statuses == (
+        ("OB1", ObligationStatus.COVERED),
+        ("OB2", ObligationStatus.COVERED),
+    )
+    assert result.newly_covered_obligation_ids == ("OB2",)
+
+
+def test_unknown_checkpoint_session_fails_closed():
+    required = obligation("OB1")
+    ledger = CoverageLedger((required,))
+    specialist_assignment = SpecialistAssignment(
+        assignment_id="A1", objective="Tests", primary_obligation_ids=("OB1",),
+    )
+
+    with pytest.raises(ValueError, match="unknown durable session"):
+        reconcile_wave(
+            ledger,
+            wave_start_coverage=ledger.snapshot(),
+            checkpoints=(SessionCheckpoint(
+                session_id="rogue-session", state=SessionState.CHECKPOINT,
+            ),),
+            evidence=EvidenceStore().snapshot(),
+            assignments=(specialist_assignment,),
+            session_ownership=(SessionOwnership(
+                "known-session", "A1", primary_obligation_ids=("OB1",),
+            ),),
+        )
+
+
+def test_planner_secondary_owner_can_be_selected_for_consultation():
+    assignments = (
+        assignment("A1", ("OB1",), primary=("OB1",)),
+        assignment("A2", ("OB1",), primary=()),
+    )
+    ownership = (
+        SessionOwnership("S1", "A1", primary_obligation_ids=("OB1",)),
+        SessionOwnership("S2", "A2", secondary_obligation_ids=("OB1",)),
+    )
+    state = state_for(
+        assignments=assignments,
+        session_ownership=ownership,
+        resources=(
+            SessionResources(
+                "S1", remaining_model_turns=3, lease_remaining_sec=100.0,
+                remaining_tool_calls=3,
+            ),
+            SessionResources(
+                "S2", remaining_model_turns=3, lease_remaining_sec=100.0,
+                remaining_tool_calls=3,
+            ),
+        ),
+    )
+    raw = resume_raw(kind="consult", session_id="S2", estimated_turns=1)
+
+    proposal = validate_negotiation(raw, state)
+
+    assert proposal.actions[0].session_id == "S2"
+
+
+def test_planner_independent_owner_fresh_evidence_satisfies_obligation():
+    required = replace(obligation("OB1"), requires_independent_verification=True)
+    ledger = CoverageLedger((required,))
+    planner_assignment = assignment("A-independent", ("OB1",), primary=())
+    ownership = SessionOwnership(
+        "independent-session", "A-independent",
+        secondary_obligation_ids=("OB1",),
+        independent_obligation_ids=("OB1",),
+    )
+    store = EvidenceStore()
+    fresh = store.add_tool_result(
+        session_id="independent-session",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "fresh independent evidence"},
+        category="tests",
+    )
+
+    result = reconcile_wave(
+        ledger,
+        wave_start_coverage=ledger.snapshot(),
+        checkpoints=(SessionCheckpoint(
+            session_id="independent-session",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(fresh.id,),
+        ),),
+        evidence=store.snapshot(),
+        assignments=(planner_assignment,),
+        session_ownership=(ownership,),
+    )
+
+    assert result.snapshot.obligation_statuses == (("OB1", ObligationStatus.COVERED),)
+
+
+def test_validated_sole_independent_owner_is_primary_and_independent_collector():
+    required = replace(
+        obligation("OB1"),
+        requires_independent_verification=True,
+        recipe_id="independent-check",
+        recipe_execution="independent",
+    )
+    plan = validate_assignment_plan({"assignments": [{
+        "id": "A-independent",
+        "title": "Independent verification",
+        "objective": "Independently verify the relevant test behavior.",
+        "obligation_ids": ["OB1"],
+        "lenses": ["independent-verification"],
+        "seed_paths": ["tests/test_a.py"],
+        "boundary_paths": [],
+        "expected_evidence": ["tests"],
+        "estimated_turns": 1,
+        "priority": "normal",
+        "overlap_justification": "",
+    }]}, (required,), {}, RuntimeConfig())
+    planner_assignment = plan.assignments[0]
+    assert planner_assignment.primary_obligation_ids == ("OB1",)
+    ownership = SessionOwnership(
+        "independent-session",
+        planner_assignment.id,
+        primary_obligation_ids=("OB1",),
+        independent_obligation_ids=("OB1",),
+    )
+    assert ownership.obligation_ids == ("OB1",)
+
+    fresh_store = EvidenceStore()
+    fresh = fresh_store.add_tool_result(
+        session_id="independent-session",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "fresh independent collection"},
+        category="tests",
+    )
+    fresh_ledger = CoverageLedger((required,))
+    fresh_result = reconcile_wave(
+        fresh_ledger,
+        wave_start_coverage=fresh_ledger.snapshot(),
+        checkpoints=(SessionCheckpoint(
+            session_id="independent-session",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(fresh.id,),
+        ),),
+        evidence=fresh_store.snapshot(),
+        assignments=plan.assignments,
+        session_ownership=(ownership,),
+    )
+
+    imported_store = EvidenceStore()
+    imported = imported_store.add_tool_result(
+        session_id="other-collector",
+        tool="read_file",
+        arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "other collector evidence"},
+        category="tests",
+    )
+    imported_store.import_into_session("independent-session", imported.id)
+    imported_ledger = CoverageLedger((required,))
+    imported_result = reconcile_wave(
+        imported_ledger,
+        wave_start_coverage=imported_ledger.snapshot(),
+        checkpoints=(SessionCheckpoint(
+            session_id="independent-session",
+            state=SessionState.CHECKPOINT,
+            evidence_ids=(imported.id,),
+            imported_evidence_ids=(imported.id,),
+        ),),
+        evidence=imported_store.snapshot(),
+        assignments=plan.assignments,
+        session_ownership=(ownership,),
+    )
+
+    assert fresh_result.snapshot.obligation_statuses == (
+        ("OB1", ObligationStatus.COVERED),
+    )
+    assert imported_result.snapshot.obligation_statuses == (
+        ("OB1", ObligationStatus.PENDING),
+    )
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["delete_obligation", "mark_covered", "grant_budget", "reset_budget", "extend_deadline"],
+)
+def test_negotiator_cannot_change_controller_authority(action):
+    raw = {"actions": [{"kind": action, "obligation_ids": ["OB1"]}]}
+
+    with pytest.raises(NegotiationError):
+        validate_negotiation(raw, state_for())
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["delete_obligation", "mark_covered", "grant_budget", "reset_budget", "deadline_sec"],
+)
+def test_negotiator_cannot_smuggle_controller_mutations_into_valid_action(field):
+    with pytest.raises(NegotiationError, match="unsupported fields"):
+        validate_negotiation(resume_raw(**{field: 99}), state_for())
+
+
+def test_valid_resume_preserves_owner_and_returns_immutable_typed_proposal():
+    proposal = validate_negotiation(resume_raw(), state_for())
+
+    assert proposal.actions[0].kind == "resume"
+    assert proposal.actions[0].session_id == "S1"
+    assert proposal.actions[0].obligation_ids == ("OB1",)
+    assert proposal.actions[0].expected_coverage_gain == 1
+    with pytest.raises(FrozenInstanceError):
+        proposal.actions[0].reason = "mutated"
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        (resume_raw(obligation_ids=["OB2"]), "primary owner"),
+        (resume_raw(expected_evidence=["implementation"]), "expected new evidence"),
+        (resume_raw(estimated_turns=4), "checkpoint reserve"),
+    ],
+)
+def test_resume_requires_ownership_evidence_gain_and_budget(raw, message):
+    with pytest.raises(NegotiationError, match=message):
+        validate_negotiation(raw, state_for())
+
+
+def test_proposals_cannot_repeat_covered_work_or_exceed_lease_or_deadline():
+    with pytest.raises(NegotiationError, match="already covered"):
+        validate_negotiation(resume_raw(), state_for(covered=("OB1",)))
+
+    resources = (
+        SessionResources(
+            "S1", remaining_model_turns=3, lease_remaining_sec=15.0,
+            remaining_tool_calls=3,
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=3, lease_remaining_sec=100.0,
+            remaining_tool_calls=3,
+        ),
+    )
+    with pytest.raises(NegotiationError, match="lease"):
+        validate_negotiation(resume_raw(), state_for(resources=resources))
+
+    with pytest.raises(NegotiationError, match="deadline"):
+        validate_negotiation(resume_raw(), state_for(remaining_deadline_sec=15.0))
+
+
+def test_new_session_requires_hard_and_followup_capacity():
+    raw = {"actions": [{
+        "kind": "new_session",
+        "obligation_ids": ["OB1"],
+        "expected_evidence": ["tests"],
+        "estimated_turns": 1,
+        "reason": "Existing owners have no useful budget.",
+    }]}
+
+    proposal = validate_negotiation(raw, state_for())
+    assert proposal.actions[0].session_id is None
+
+    with pytest.raises(NegotiationError, match="session capacity"):
+        validate_negotiation(raw, state_for(current_session_count=3))
+    with pytest.raises(NegotiationError, match="follow-up session capacity"):
+        validate_negotiation(raw, state_for(followup_sessions_started=1))
+
+
+def test_consult_and_policy_governed_unknown_are_the_other_exact_actions():
+    consultation = validate_negotiation({"actions": [{
+        "kind": "consult",
+        "session_id": "S1",
+        "obligation_ids": ["OB1"],
+        "expected_evidence": ["tests"],
+        "estimated_turns": 1,
+        "reason": "Ask the assigned specialist for one bounded verification.",
+    }]}, state_for()).actions[0]
+    unknown = validate_negotiation({"actions": [{
+        "kind": "record_unknown",
+        "obligation_ids": ["OB1"],
+        "expected_evidence": ["tests"],
+        "estimated_turns": 0,
+        "reason": "The required source is externally unavailable.",
+    }]}, state_for()).actions[0]
+
+    assert consultation.kind == "consult"
+    assert unknown.kind == "record_unknown"
+    assert unknown.expected_coverage_gain == 1
+    assert unknown.resolution_policy == "record_unknown"
+
+
+def test_negotiation_uses_explicit_session_to_specialist_assignment_ownership():
+    specialist_assignment = SpecialistAssignment(
+        assignment_id="assignment-A",
+        objective="Inspect tests",
+        primary_obligation_ids=("OB1",),
+    )
+    state = state_for(
+        current_session_count=1,
+        assignments=(specialist_assignment,),
+        session_ownership=(SessionOwnership(
+            session_id="durable-session-9",
+            assignment_id="assignment-A",
+            primary_obligation_ids=("OB1",),
+        ),),
+        resources=(SessionResources(
+            "durable-session-9", remaining_model_turns=4, lease_remaining_sec=100.0,
+            remaining_tool_calls=3,
+        ),),
+    )
+
+    proposal = validate_negotiation(resume_raw(session_id="durable-session-9"), state)
+
+    assert proposal.actions[0].session_id == "durable-session-9"
+
+
+def test_multiple_actions_cannot_target_same_durable_session_even_when_disjoint():
+    shared_assignment = assignment("A1", ("OB1", "OB2"))
+    state = state_for(
+        current_session_count=1,
+        assignments=(shared_assignment,),
+        session_ownership=(SessionOwnership(
+            session_id="S1",
+            assignment_id="A1",
+            primary_obligation_ids=("OB1", "OB2"),
+        ),),
+        resources=(SessionResources(
+            "S1", remaining_model_turns=4, lease_remaining_sec=100.0,
+            remaining_tool_calls=3,
+        ),),
+    )
+    raw = {"actions": [
+        resume_raw()["actions"][0],
+        resume_raw(
+            obligation_ids=["OB2"], expected_evidence=["implementation"], estimated_turns=1,
+        )["actions"][0],
+    ]}
+
+    with pytest.raises(NegotiationError, match="same durable session"):
+        validate_negotiation(raw, state)
+
+
+def test_new_session_is_bounded_by_controller_owned_per_session_turn_cap():
+    raw = {"actions": [{
+        "kind": "new_session",
+        "obligation_ids": ["OB1"],
+        "expected_evidence": ["tests"],
+        "estimated_turns": 3,
+        "reason": "Collect missing tests evidence.",
+    }]}
+
+    with pytest.raises(NegotiationError, match="per-session turn cap"):
+        validate_negotiation(raw, state_for(new_session_turn_cap=2))
+    raw["actions"][0]["new_session_turn_cap"] = 99
+    with pytest.raises(NegotiationError, match="unsupported fields"):
+        validate_negotiation(raw, state_for(new_session_turn_cap=2))
+
+
+def test_controller_sorting_makes_equivalent_action_orders_identical():
+    resume = resume_raw()["actions"][0]
+    unknown = {
+        "kind": "record_unknown",
+        "obligation_ids": ["OB2"],
+        "expected_evidence": ["implementation"],
+        "estimated_turns": 0,
+        "reason": "The external source is unavailable.",
+    }
+
+    forward = validate_negotiation({"actions": [resume, unknown]}, state_for())
+    reverse = validate_negotiation({"actions": [unknown, resume]}, state_for())
+
+    assert forward == reverse
+    assert tuple(item.obligation_ids for item in forward.actions) == (("OB2",), ("OB1",))
+
+
+@pytest.mark.parametrize("kind", ["new_session", "record_unknown"])
+def test_non_session_actions_reject_session_id_even_when_null(kind):
+    raw = {
+        "kind": kind,
+        "session_id": None,
+        "obligation_ids": ["OB1"],
+        "expected_evidence": ["tests"],
+        "estimated_turns": 0 if kind == "record_unknown" else 1,
+        "reason": "Bounded action.",
+    }
+
+    with pytest.raises(NegotiationError, match="must omit session_id"):
+        validate_negotiation({"actions": [raw]}, state_for())
+
+
+@pytest.mark.parametrize("kind", ["resume", "consult"])
+def test_session_actions_require_session_id_field(kind):
+    raw = {
+        "kind": kind,
+        "obligation_ids": ["OB1"],
+        "expected_evidence": ["tests"],
+        "estimated_turns": 1,
+        "reason": "Bounded action.",
+    }
+
+    with pytest.raises(NegotiationError, match="requires session_id field"):
+        validate_negotiation({"actions": [raw]}, state_for())
+
+
+def test_fallback_resumes_useful_primary_owner_for_highest_risk_gap():
+    action = fallback_next_action(state_for())
+
+    assert action.kind == "resume"
+    assert action.session_id == "S2"
+    assert action.obligation_ids == ("OB2",)
+    assert action.expected_evidence == ("implementation",)
+
+
+def test_fallback_creates_one_narrow_session_when_primary_owner_is_infeasible():
+    resources = (
+        SessionResources(
+            "S1", remaining_model_turns=3, lease_remaining_sec=100.0,
+            remaining_tool_calls=3,
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=0, lease_remaining_sec=100.0,
+            remaining_tool_calls=0,
+        ),
+    )
+
+    action = fallback_next_action(state_for(resources=resources))
+
+    assert action.kind == "new_session"
+    assert action.session_id is None
+    assert action.obligation_ids == ("OB2",)
+
+
+def test_fallback_does_not_resume_owner_with_only_checkpoint_reserve():
+    resources = (
+        SessionResources("S1", remaining_model_turns=3,
+                         remaining_tool_calls=3, lease_remaining_sec=100.0),
+        SessionResources("S2", remaining_model_turns=2,
+                         remaining_tool_calls=3, lease_remaining_sec=100.0),
+    )
+
+    action = fallback_next_action(state_for(resources=resources))
+
+    assert action.kind == "new_session"
+    assert action.obligation_ids == ("OB2",)
+
+
+def test_trusted_resume_cannot_spend_checkpoint_reserve_turns():
+    resources = (
+        SessionResources("S1", remaining_model_turns=2,
+                         remaining_tool_calls=3, lease_remaining_sec=100.0),
+        SessionResources("S2", remaining_model_turns=3,
+                         remaining_tool_calls=3, lease_remaining_sec=100.0),
+    )
+
+    with pytest.raises(NegotiationError, match="checkpoint reserve"):
+        validate_negotiation(
+            resume_raw(estimated_turns=1),
+            state_for(resources=resources),
+        )
+
+
+def test_fallback_records_policy_governed_unknown_when_no_work_is_feasible():
+    resources = (
+        SessionResources(
+            "S1", remaining_model_turns=0, lease_remaining_sec=0.0,
+            remaining_tool_calls=0,
+        ),
+        SessionResources(
+            "S2", remaining_model_turns=0, lease_remaining_sec=0.0,
+            remaining_tool_calls=0,
+        ),
+    )
+
+    action = fallback_next_action(
+        state_for(resources=resources, current_session_count=3, max_sessions=3)
+    )
+
+    assert action.kind == "record_unknown"
+    assert action.obligation_ids == ("OB2",)
+    assert action.resolution_policy == "record_unknown"
+    assert action.estimated_turns == 0
+
+
+def test_fallback_order_is_stable_for_equal_risk_obligations():
+    original = state_for()
+    equal_risk = tuple(replace(item, risk_tier="high") for item in reversed(original.obligations))
+    state = replace(original, obligations=equal_risk)
+
+    assert fallback_next_action(state).obligation_ids == ("OB1",)

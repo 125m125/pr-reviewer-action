@@ -438,18 +438,15 @@ def test_gh_api_uses_custom_timeout():
 
 
 def test_web_fetch_uses_custom_timeout():
-    """web_fetch passes the timeout value to urllib.request.urlopen."""
+    """web_fetch passes the timeout value to the secure fetch boundary."""
     web_fetch = _import_tool("web_fetch")
 
-    fake_response = mock.Mock()
-    fake_response.read.return_value = b"content"
-    with mock.patch("urllib.request.urlopen", return_value=fake_response) as mock_urlopen:
+    with mock.patch("pr_reviewer.tool_executors.SecureFetcher") as fetcher_type:
+        fetcher_type.return_value.fetch.return_value.as_dict.return_value = {
+            "content": "content"
+        }
         web_fetch("https://github.com/test", ["github.com"], request_timeout=42)
-    mock_urlopen.assert_called_once()
-    args, kwargs = mock_urlopen.call_args
-    assert kwargs.get("timeout") == 42, (
-        f"Expected timeout=42, got {kwargs}"
-    )
+    assert fetcher_type.call_args.kwargs["timeout"] == 42
 
 
 def test_fetch_url_uses_custom_timeout():

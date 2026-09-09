@@ -32,6 +32,7 @@ SYSTEM_PROMPT_MODE="${SYSTEM_PROMPT_MODE:-replace}"
 # A supplied prompt held for append mode, composed onto the default after
 # fragment assembly (see apply_system_prompt_fragments).
 SYSTEM_PROMPT_ADDENDUM=""
+SYSTEM_PROMPT_IS_DEFAULT=0
 STANDARDS_FILE="${STANDARDS_FILE:-}"
 STANDARDS_FILE_CANDIDATES="${STANDARDS_FILE_CANDIDATES:-AGENTS.md,agents.md,CLAUDE.md,claude.md,.github/ai-review-rules.md,.github/ai-review-rules.txt}"
 CONTEXT_LIMIT_MODE="${CONTEXT_LIMIT_MODE:-normal}"
@@ -88,12 +89,30 @@ REVIEW_SCOPE="${REVIEW_SCOPE:-auto}"
 EFFECTIVE_SCOPE="${EFFECTIVE_SCOPE:-full}"
 PREVIOUS_HEAD_SHA="${PREVIOUS_HEAD_SHA:-}"
 REVIEW_STRATEGY="${REVIEW_STRATEGY:-single}"
+REVIEW_POLICY_FILE="${REVIEW_POLICY_FILE:-.github/ai-review-policy.json}"
+REVIEW_DIFF_PRIORITY_FILE="${REVIEW_DIFF_PRIORITY_FILE:-.github/ai-review-diff-priorities.json}"
+SPECIALIST_REVIEW_DEADLINE_SEC="${SPECIALIST_REVIEW_DEADLINE_SEC:-7200}"
+SPECIALIST_PHASE_SHARES="${SPECIALIST_PHASE_SHARES:-}"
+if [[ -z "$SPECIALIST_PHASE_SHARES" ]]; then
+  SPECIALIST_PHASE_SHARES='{"planning":10,"initial":60,"followup":20,"finalization":10}'
+fi
+SPECIALIST_CONCURRENCY="${SPECIALIST_CONCURRENCY:-1}"
+SPECIALIST_MAX_SESSIONS="${SPECIALIST_MAX_SESSIONS:-8}"
+SPECIALIST_MAX_FOLLOWUP_SESSIONS="${SPECIALIST_MAX_FOLLOWUP_SESSIONS:-2}"
+SPECIALIST_MAX_MODEL_TURNS_PER_SESSION="${SPECIALIST_MAX_MODEL_TURNS_PER_SESSION:-64}"
+SPECIALIST_MAX_TOOL_CALLS_PER_SESSION="${SPECIALIST_MAX_TOOL_CALLS_PER_SESSION:-128}"
+SPECIALIST_MAX_TOTAL_MODEL_TURNS="${SPECIALIST_MAX_TOTAL_MODEL_TURNS:-320}"
+SPECIALIST_MAX_TOTAL_TOOL_CALLS="${SPECIALIST_MAX_TOTAL_TOOL_CALLS:-640}"
+SPECIALIST_REMEDIATOR_MAX_EVIDENCE_CHARS="${SPECIALIST_REMEDIATOR_MAX_EVIDENCE_CHARS:-32000}"
+SPECIALIST_MAX_RECOVERIES_PER_SESSION="${SPECIALIST_MAX_RECOVERIES_PER_SESSION:-1}"
+# One-release aliases retained for migration diagnostics. The Python adapter
+# resolves an explicitly changed alias when its replacement is still default.
 SPECIALIST_CONFIG_FILE="${SPECIALIST_CONFIG_FILE:-.github/ai-review-specialists.json}"
 SPECIALIST_PLANNER_MAX_TOOL_CALLS="${SPECIALIST_PLANNER_MAX_TOOL_CALLS:-2}"
 SPECIALIST_PLANNER_MAX_TOKENS="${SPECIALIST_PLANNER_MAX_TOKENS:-2048}"
 SPECIALIST_MAX_INITIAL_PASSES="${SPECIALIST_MAX_INITIAL_PASSES:-6}"
 SPECIALIST_MAX_FOLLOWUP_PASSES="${SPECIALIST_MAX_FOLLOWUP_PASSES:-2}"
-SPECIALIST_MAX_TOOL_CALLS_PER_PASS="${SPECIALIST_MAX_TOOL_CALLS_PER_PASS:-20}"
+SPECIALIST_MAX_TOOL_CALLS_PER_PASS="${SPECIALIST_MAX_TOOL_CALLS_PER_PASS:-128}"
 SPECIALIST_TOOL_MODE="${SPECIALIST_TOOL_MODE:-native_loop}"
 SPECIALIST_PLANNER_MODEL="${SPECIALIST_PLANNER_MODEL:-}"
 SPECIALIST_MODEL="${SPECIALIST_MODEL:-}"
@@ -102,6 +121,8 @@ SPECIALIST_AGGREGATOR_MODEL="${SPECIALIST_AGGREGATOR_MODEL:-}"
 SPECIALIST_PASS_TIMEOUT_SEC="${SPECIALIST_PASS_TIMEOUT_SEC:-600}"
 SPECIALIST_MAX_TOKENS="${SPECIALIST_MAX_TOKENS:-4096}"
 SPECIALIST_RECOVERY_MAX_TOKENS="${SPECIALIST_RECOVERY_MAX_TOKENS:-2048}"
+SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS="${SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS-}"
+SPECIALIST_DELEGATED_SUMMARY_MAX_SOURCE_BYTES="${SPECIALIST_DELEGATED_SUMMARY_MAX_SOURCE_BYTES-}"
 SPECIALIST_MAX_CONVERSATION_TOKENS="${SPECIALIST_MAX_CONVERSATION_TOKENS:-96000}"
 SPECIALIST_TEMPERATURE="${SPECIALIST_TEMPERATURE:-0.0}"
 SPECIALIST_STREAM_WATCHDOG="${SPECIALIST_STREAM_WATCHDOG:-true}"
@@ -281,6 +302,8 @@ case "$(printf '%s' "$REVIEW_STRATEGY" | tr '[:upper:]' '[:lower:]')" in
     exit 1 ;;
 esac
 
+# ``packet`` is accepted only so the Python CLI can emit its one-release
+# migration warning. No runtime branch consumes it.
 case "$(printf '%s' "$SPECIALIST_TOOL_MODE" | tr '[:upper:]' '[:lower:]')" in
   native_loop|packet)
     SPECIALIST_TOOL_MODE="$(printf '%s' "$SPECIALIST_TOOL_MODE" | tr '[:upper:]' '[:lower:]')" ;;
@@ -290,6 +313,11 @@ case "$(printf '%s' "$SPECIALIST_TOOL_MODE" | tr '[:upper:]' '[:lower:]')" in
 esac
 
 for _specialist_budget_name in \
+  SPECIALIST_REVIEW_DEADLINE_SEC SPECIALIST_CONCURRENCY SPECIALIST_MAX_SESSIONS \
+  SPECIALIST_MAX_FOLLOWUP_SESSIONS SPECIALIST_MAX_MODEL_TURNS_PER_SESSION \
+  SPECIALIST_MAX_TOOL_CALLS_PER_SESSION SPECIALIST_MAX_TOTAL_MODEL_TURNS \
+  SPECIALIST_MAX_TOTAL_TOOL_CALLS SPECIALIST_REMEDIATOR_MAX_EVIDENCE_CHARS \
+  SPECIALIST_MAX_RECOVERIES_PER_SESSION \
   SPECIALIST_PLANNER_MAX_TOOL_CALLS SPECIALIST_PLANNER_MAX_TOKENS \
   SPECIALIST_MAX_INITIAL_PASSES \
   SPECIALIST_MAX_FOLLOWUP_PASSES SPECIALIST_MAX_TOOL_CALLS_PER_PASS \
@@ -303,6 +331,35 @@ for _specialist_budget_name in \
   fi
 done
 unset _specialist_budget_name _specialist_budget_value
+
+for _specialist_optional_budget_name in \
+  SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS \
+  SPECIALIST_DELEGATED_SUMMARY_MAX_SOURCE_BYTES; do
+  _specialist_optional_budget_value="${!_specialist_optional_budget_name}"
+  if [[ -n "$_specialist_optional_budget_value" \
+        && ! "$_specialist_optional_budget_value" =~ ^[1-9][0-9]*$ ]]; then
+    error "Invalid ${_specialist_optional_budget_name} '${_specialist_optional_budget_value}'; expected empty or a positive integer"
+    exit 1
+  fi
+done
+unset _specialist_optional_budget_name _specialist_optional_budget_value
+
+if [[ "$REVIEW_STRATEGY" != "single" ]]; then
+  if ! SPECIALIST_PHASE_SHARES="$SPECIALIST_PHASE_SHARES" python3 - <<'PY'
+import json, os
+value = json.loads(os.environ["SPECIALIST_PHASE_SHARES"])
+if set(value) != {"planning", "initial", "followup", "finalization"}:
+    raise SystemExit(1)
+if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in value.values()):
+    raise SystemExit(1)
+if sum(value.values()) != 100 or value["finalization"] <= 0:
+    raise SystemExit(1)
+PY
+  then
+    error "Invalid SPECIALIST_PHASE_SHARES; expected JSON percentages totaling 100 with a finalization reserve"
+    exit 1
+  fi
+fi
 
 if [[ ! "$SPECIALIST_TEMPERATURE" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]]; then
   error "Invalid SPECIALIST_TEMPERATURE '$SPECIALIST_TEMPERATURE'; expected a non-negative number"
@@ -465,7 +522,10 @@ apply_system_prompt_fragments() {
   if [[ -n "${SYSTEM_PROMPT_ADDENDUM:-}" ]]; then
     SYSTEM_PROMPT="${SYSTEM_PROMPT}"$'\n\n'"${SYSTEM_PROMPT_ADDENDUM}"
   fi
-  export SYSTEM_PROMPT
+  # The specialist CLI must distinguish this rendered whole-PR default from a
+  # user replacement. Append mode also needs the original addendum so it can
+  # combine it with specialist-neutral guidance instead of this verdict prompt.
+  export SYSTEM_PROMPT SYSTEM_PROMPT_IS_DEFAULT SYSTEM_PROMPT_ADDENDUM
 }
 
 resolve_standards_file

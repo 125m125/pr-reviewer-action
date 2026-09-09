@@ -52,10 +52,30 @@ from pr_reviewer.tool_executors import (  # noqa: E402
     mask_and_truncate,
     normalize_host,
     read_file,
+    read_remote_file,
     run_command,
     web_fetch,
     web_search,
 )
+from pr_reviewer.specialist_runtime.web_evidence import (  # noqa: E402
+    SearchResultRegistry,
+    SourcePolicy,
+)
+from pr_reviewer.specialist_runtime.policy import load_review_policy  # noqa: E402
+
+
+def load_current_source_policy(workspace_root, config_file):
+    """Load only validated current-worktree source rules; fail closed."""
+    if not str(config_file or "").strip():
+        return SourcePolicy(())
+    root = Path(workspace_root).resolve()
+    try:
+        candidate = (root / str(config_file)).resolve()
+        candidate.relative_to(root)
+        policy = load_review_policy(candidate)
+    except (OSError, ValueError):
+        return SourcePolicy(())
+    return SourcePolicy.from_review_policy(policy)
 
 
 def normalize_repo_name(value):
@@ -351,8 +371,11 @@ def normalize_tool_request(raw_req):
     if not isinstance(args, dict):
         args = {}
     # Promote known top-level params when "args" wasn't nested.
-    for key in ("path", "endpoint", "url", "pattern", "command", "query"):
-        if key not in args and isinstance(raw_req.get(key), str):
+    for key in (
+        "path", "endpoint", "url", "pattern", "command", "query", "result_id",
+        "repository", "ref", "offset", "limit", "include_line_numbers",
+    ):
+        if key not in args and key in raw_req:
             args[key] = raw_req[key]
     # gh_api accepts "path" as an alias for "endpoint".
     if tool_name == "gh_api" and "endpoint" not in args and isinstance(args.get("path"), str):
@@ -534,11 +557,11 @@ def run_native_loop(
         sys.path.insert(0, repo_root)
     from pr_reviewer.conversation import (  # noqa: PLC0415
         TOOL_SCHEMAS,
-        WEB_SEARCH_SCHEMA,
         Conversation,
+        web_tool_schemas,
     )
     from pr_reviewer.tool_loop import (  # noqa: PLC0415
-        adaptive_loop_budgets,
+        LoopBudgets,
         drive_tool_loop,
         extract_intermediate_turn,
         extract_tool_calls,
@@ -550,12 +573,20 @@ def run_native_loop(
     )
     from pr_reviewer.evidence_memory import build_evidence_digest  # noqa: PLC0415
 
-    # web_search is advertised only when a search endpoint is configured.
+    # Discovery is useful only when both the operator fixed an endpoint and
+    # current source rules give it approved URLs to return.
     search_url = os.getenv("SEARCH_URL", "").strip()
+    allow_private_search_url = (
+        os.getenv("ALLOW_PRIVATE_SEARCH_URL", "false").strip().lower() == "true"
+    )
     max_search_results = env_int_bounded("TOOL_MAX_SEARCH_RESULTS", 5, 1, 15)
-    tool_schemas = list(TOOL_SCHEMAS)
-    if search_url:
-        tool_schemas.append(WEB_SEARCH_SCHEMA)
+    source_policy = load_current_source_policy(
+        workspace_root, os.getenv("SPECIALIST_CONFIG_FILE", "").strip()
+    )
+    search_result_registry = SearchResultRegistry()
+    tool_schemas = web_tool_schemas(
+        search_url, source_policy, allow_private_search_url,
+    )
 
     # Read-only MCP tools (#245), allowlisted via TOOL_MCP_SERVERS. Fork-gating
     # happens upstream in run_review.sh (the env is blanked on fork PRs unless
@@ -593,16 +624,10 @@ def run_native_loop(
     synthesis_timeout = env_positive_int("TOOL_SYNTHESIS_TIMEOUT_SEC", 60)
     synthesis_max_tokens = env_positive_int("TOOL_SYNTHESIS_MAX_TOKENS", 2048)
     synthesis_reserve = min(synthesis_timeout, max(1, wall_clock // 2))
-    # Right-size the loop to PR risk (#197 §2): the fast route only fires on
-    # low-risk PRs, so they get a shallow loop; risk-flagged / smart-routed PRs
-    # get full depth. REVIEW_ROUTE is exported by run_review.sh; standalone runs
-    # default to legacy (full depth).
-    budgets = adaptive_loop_budgets(
-        max_rounds,
-        max_requests,
-        max(0.001, wall_clock - synthesis_reserve),
-        review_route=os.getenv("REVIEW_ROUTE", "legacy"),
-        risk_flag_count=_classification_risk_flag_count(),
+    budgets = LoopBudgets(
+        max_tool_calls=max_requests,
+        max_rounds=max_rounds,
+        wall_clock_sec=max(0.001, wall_clock - synthesis_reserve),
     )
     verdict_max_tokens = env_positive_int("AI_MAX_TOKENS", 8192)
     model_context_tokens = env_positive_int(
@@ -652,7 +677,7 @@ def run_native_loop(
     print(
         "Native-loop budget:\n"
         f"  tool calls: configured={max_requests}, effective={budgets.max_tool_calls}\n"
-        f"  planning turns: configured={max_rounds} rounds, effective={budgets.max_rounds} turns\n"
+        f"  planning turns: configured={max_rounds}, effective={budgets.max_rounds}\n"
         f"  total wall clock: configured={wall_clock}s, effective={wall_clock}s "
         f"(synthesis timeout configured={synthesis_timeout}s, "
         f"effective reserve={synthesis_reserve}s)",
@@ -664,10 +689,11 @@ def run_native_loop(
         f"Review scope: {os.getenv('EFFECTIVE_SCOPE', 'full')}\n"
         f"Allowed repos for gh_api: "
         f"{', '.join(sorted(allowed_gh_api_repos)) if allowed_gh_api_repos else '(none)'}\n"
-        f"Allowed hosts for web_fetch: "
-        f"{', '.join(allowed_hosts) if allowed_hosts else '(none)'}\n"
-        + ("web_search is available — use it to find a page's URL when you don't "
-           "know it, then web_fetch the best result.\n" if search_url else "")
+        f"Current-policy sources for web_fetch: "
+        f"{', '.join(rule.host for rule in source_policy.rules) if source_policy.rules else '(none)'}\n"
+        + ("web_search is available for discovery only; fetch an approved "
+           "result with its advertised fetch method before relying on it as evidence.\n"
+           if search_url and source_policy.has_approved_sources else "")
         + "\nGather the evidence needed to review this PR corpus:\n\n"
     )
     planning_input_allowance = (
@@ -780,6 +806,9 @@ def run_native_loop(
             request_timeout,
             search_url,
             max_search_results,
+            source_policy=source_policy,
+            allow_private_search_url=allow_private_search_url,
+            search_result_registry=search_result_registry,
         )
 
     # Result summarization between rounds (#197 §2): when the conversation
@@ -1200,8 +1229,9 @@ def main():
     max_requests = env_positive_int("TOOL_MAX_REQUESTS", 4)
     request_timeout = env_positive_int("TOOL_REQUEST_TIMEOUT_SEC", 20)
 
-    allowed_hosts_raw = os.getenv("ALLOWED_SOURCE_HOSTS", "github.com,api.github.com")
-    allowed_hosts = [h.strip() for h in allowed_hosts_raw.split(",") if h.strip()]
+    # Legacy positional executor argument only. Current-head ReviewPolicy.sources
+    # is the sole web authorization authority inside run_native_loop.
+    allowed_hosts = []
 
     workspace_root = os.getcwd()
 

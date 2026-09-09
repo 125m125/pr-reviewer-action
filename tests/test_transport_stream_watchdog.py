@@ -3,8 +3,20 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import pytest
 
 from pr_reviewer import transport
+
+
+@pytest.mark.parametrize("code,is_timeout", [(28, True), (7, False)])
+def test_curl_timeout_is_distinguished_from_endpoint_failure(monkeypatch, code, is_timeout):
+    monkeypatch.setattr(transport, "safe_run", lambda *a, **kw:
+                        subprocess.CompletedProcess([], code, "", "transport failed"))
+    with pytest.raises(transport.ModelRequestError) as raised:
+        transport.run_chat_request("http://localhost/v1", "openai", {}, "", 1)
+    assert raised.value.timeout is is_timeout
+    assert transport.is_model_endpoint_unavailable(raised.value) is (not is_timeout)
 
 
 def _sse(data: dict) -> str:

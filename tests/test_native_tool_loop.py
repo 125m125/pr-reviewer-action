@@ -16,7 +16,6 @@ from pr_reviewer.tool_loop import (
     STOP_STREAM_WATCHDOG,
     STOP_WALL_CLOCK,
     LoopBudgets,
-    adaptive_loop_budgets,
     detect_textual_tool_intent,
     drive_tool_loop,
     effective_intermediate_text,
@@ -33,33 +32,6 @@ src/parent.ts
 </parameter>
 </function>
 </tool_call>"""
-
-
-class TestAdaptiveLoopBudgets:
-    """Loop depth is route-independent: exactly 2× configured rounds
-    plus the configured tool-call budget, on every route. The route selects the
-    MODEL, never the tool budget — the primary model is fully capable and is no
-    longer shallow-capped (the loop self-limits when the model stops calling
-    tools)."""
-
-    def test_headroom_doubles_rounds_without_hidden_cap(self):
-        b = adaptive_loop_budgets(3, 4, 120.0)
-        assert b.max_rounds == 6  # 3 * 2
-        assert b.max_tool_calls == 4
-        assert adaptive_loop_budgets(6, 4, 120.0).max_rounds == 12
-
-    def test_primary_route_is_not_shallowed(self):
-        # Was capped to 2 rounds / 3 calls; now gets the full configured budget.
-        b = adaptive_loop_budgets(3, 8, 120.0, review_route="primary", risk_flag_count=0)
-        assert b.max_rounds == 6
-        assert b.max_tool_calls == 8
-
-    def test_every_route_gets_the_same_budget(self):
-        # incl. the deprecated "fast" value and risk_flag_count (now ignored).
-        for route in ("primary", "smart", "legacy", "fast", "", None):
-            b = adaptive_loop_budgets(3, 8, 120.0, review_route=route, risk_flag_count=0)
-            assert b.max_rounds == 6, route
-            assert b.max_tool_calls == 8, route
 
 
 def openai_tool_call_response(calls, content=None):
@@ -159,6 +131,71 @@ def test_extract_anthropic_tool_use_blocks():
     assert text == "I will read the file. "
 
 
+def test_extract_openai_rejects_blank_and_duplicate_normalized_call_ids():
+    response = openai_tool_call_response([
+        ("  ", "read_file", '{}'),
+        (" dup ", " read_file ", '{"path":"a.py"}'),
+        ("dup", "git_grep", '{"pattern":"x"}'),
+        ("named", "   ", '{}'),
+    ])
+
+    calls, _ = extract_tool_calls(response, "openai")
+
+    assert calls == [{
+        "id": "dup", "name": "read_file", "arguments": '{"path":"a.py"}',
+    }]
+
+
+def test_extract_anthropic_rejects_blank_and_duplicate_normalized_call_ids():
+    response = {
+        "stop_reason": "tool_use",
+        "content": [
+            {"type": "tool_use", "id": "  ", "name": "read_file", "input": {}},
+            {"type": "tool_use", "id": " dup ", "name": " read_file ",
+             "input": {"path": "a.py"}},
+            {"type": "tool_use", "id": "dup", "name": "git_grep",
+             "input": {"pattern": "x"}},
+            {"type": "tool_use", "id": "named", "name": "   ", "input": {}},
+        ],
+    }
+
+    calls, _ = extract_tool_calls(response, "anthropic")
+
+    assert len(calls) == 1
+    assert calls[0]["id"] == "dup"
+    assert calls[0]["name"] == "read_file"
+    assert json.loads(calls[0]["arguments"]) == {"path": "a.py"}
+
+
+def test_malformed_provider_calls_keep_assistant_and_tool_results_paired():
+    conversation = fresh_conversation()
+    response = openai_tool_call_response([
+        (" dup ", " read_file ", '{"path":"a.py"}'),
+        ("dup", "git_grep", '{"pattern":"x"}'),
+        (" ", "read_file", '{"path":"orphan.py"}'),
+    ])
+    execute, log = recording_execute()
+
+    drive_tool_loop(
+        conversation,
+        scripted_post([response, openai_text_response("done")]),
+        execute,
+        api_format="openai",
+        model="m",
+    )
+
+    assistant_ids = [
+        call["id"]
+        for event in conversation.events if event["kind"] == "assistant_tool_calls"
+        for call in event["calls"]
+    ]
+    result_ids = [
+        event["call_id"] for event in conversation.events if event["kind"] == "tool_result"
+    ]
+    assert assistant_ids == result_ids == ["dup"]
+    assert log == [("read_file", {"path": "a.py"})]
+
+
 def test_extract_malformed_response_is_empty():
     calls, text = extract_tool_calls({"unexpected": True}, "openai")
     assert calls == []
@@ -230,7 +267,7 @@ def test_textual_intent_gets_one_native_repair_and_executes_only_native_call():
         if m.get("role") == "user"
     ]
     assert any("returned no native tool_calls" in text for text in repair_users)
-    assert any("planning turns remain" in text for text in repair_users)
+    assert all("planning turns remain" not in text for text in repair_users)
 
 
 def test_successful_native_repair_resets_consecutive_budget_for_later_textual_intent():
@@ -336,11 +373,52 @@ def test_qwen_reasoning_fallback_is_preserved_in_next_request():
         conv, post, execute, api_format="openai", model="m", budgets=LoopBudgets()
     )
     prior = next(m for m in payloads[1]["messages"] if m.get("tool_calls"))
-    assert prior["content"] == "I found a cancellation race; inspect the test."
+    assert prior["content"] == "\n\n"
+    assert prior["reasoning_content"] == (
+        "I found a cancellation race; inspect the test."
+    )
     assert outcome.text_sources[0] == "reasoning_fallback"
 
 
-def test_budget_notes_are_correct_and_do_not_accumulate():
+def test_tool_turn_preserves_reasoning_separately_when_content_is_also_present():
+    conv = fresh_conversation()
+    payloads = []
+    responses = [
+        {
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "I will inspect the effect test.",
+                    "reasoning_content": "The changed cleanup path may race.",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"path":"src/effect.spec.ts"}',
+                        },
+                    }],
+                },
+            }]
+        },
+        openai_text_response("done"),
+    ]
+
+    def post(payload):
+        payloads.append(payload)
+        return responses.pop(0)
+
+    execute, _ = recording_execute()
+    drive_tool_loop(
+        conv, post, execute, api_format="openai", model="m", budgets=LoopBudgets()
+    )
+
+    prior = next(message for message in payloads[1]["messages"] if message.get("tool_calls"))
+    assert prior["reasoning_content"] == "The changed cleanup path may race."
+    assert prior["content"] == "I will inspect the effect test."
+
+
+def test_budget_notes_are_not_sent_to_the_model():
     conv = fresh_conversation()
     payloads = []
     responses = [
@@ -357,13 +435,11 @@ def test_budget_notes_are_correct_and_do_not_accumulate():
         conv, post, execute, api_format="openai", model="m",
         budgets=LoopBudgets(max_tool_calls=3, max_rounds=4),
     )
-    notes0 = [m for m in payloads[0]["messages"] if "Exploration budget" in str(m.get("content"))]
-    notes1 = [m for m in payloads[1]["messages"] if "Exploration budget" in str(m.get("content"))]
-    assert len(notes0) == len(notes1) == 1
-    assert "3 tool calls and 4 planning turns" in notes0[0]["content"]
-    # The preceding response was tool-only progress, so it consumed a tool
-    # call but not a planning turn.
-    assert "2 tool calls and 4 planning turns" in notes1[0]["content"]
+    assert all(
+        "Exploration budget" not in str(message.get("content"))
+        for payload in payloads
+        for message in payload["messages"]
+    )
 
 
 def test_length_without_usable_answer_is_not_model_done():

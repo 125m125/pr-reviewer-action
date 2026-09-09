@@ -292,7 +292,7 @@ class TestMainCli:
 
 
 class TestActionWiring:
-    ACTION = (_REPO_ROOT / "action.yml").read_text()
+    ACTION = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
 
     def test_inline_findings_input_declared(self):
         assert "inline_findings:" in self.ACTION

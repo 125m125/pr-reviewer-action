@@ -273,6 +273,8 @@ def _reassemble_openai(
     model: str | None = None
     usage_prompt_tokens = 0
     usage_completion_tokens = 0
+    usage_details: dict[str, Any] = {}
+    timings: dict[str, Any] = {}
     id_val = ""
     error_payload = None
 
@@ -368,8 +370,13 @@ def _reassemble_openai(
                 finish_reason = fr
         usage = chunk.get("usage")
         if isinstance(usage, dict):
-            usage_prompt_tokens += usage.get("prompt_tokens", 0)
-            usage_completion_tokens += usage.get("completion_tokens", 0)
+            # OpenAI usage chunks are cumulative snapshots, not token deltas.
+            # Keep provider extensions (notably prompt_tokens_details) too.
+            usage_details.update(usage)
+            usage_prompt_tokens = usage.get("prompt_tokens", usage_prompt_tokens)
+            usage_completion_tokens = usage.get("completion_tokens", usage_completion_tokens)
+        if isinstance(chunk.get("timings"), dict):
+            timings.update(chunk["timings"])
 
     # End of stream: flush any tool calls that never received a
     # finish_reason (truncated streams). Sorted so parallel calls come out in
@@ -390,11 +397,14 @@ def _reassemble_openai(
             }
         ],
         "usage": {
+            **usage_details,
             "prompt_tokens": usage_prompt_tokens,
             "completion_tokens": usage_completion_tokens,
             "total_tokens": usage_prompt_tokens + usage_completion_tokens,
         },
     }
+    if timings:
+        result["timings"] = timings
     if error_payload is not None:
         result["error"] = error_payload
     return result

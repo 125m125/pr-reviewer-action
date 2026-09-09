@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Read-only tool executors for the tool harness (#304 split).
 
-The model-plannable tools (read_file, git_*, gh_api, web_fetch, web_search,
-run_command) plus the path/host guards and result-shaping helpers they need.
+The model-plannable tools (read_file, read_remote_file, git_*, gh_api, web_fetch, web_search,
+web_fetch_search_result, run_command) plus the path/host guards and
+result-shaping helpers they need.
 Split out of scripts/run_tool_harness.py with no behaviour change.
 """
 
@@ -13,7 +14,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 
 # mask_secrets lives in scripts/redact.py; ensure scripts/ is importable.
@@ -21,12 +22,21 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from redact import mask_and_truncate, mask_secrets  # noqa: E402
+from redact import mask_and_truncate, mask_secrets, mask_source_secrets  # noqa: E402
 
 # The gh_api allowlist + denied path segments live on the platform seam (single
 # source of truth); _resolve_workspace_path reuses GH_DENY_SUBSTRINGS to block
 # the same sensitive segments in filesystem paths.
 from pr_reviewer.platform import GH_DENY_SUBSTRINGS  # noqa: E402
+from pr_reviewer.specialist_runtime.web_evidence import (  # noqa: E402
+    SearchProvider,
+    SearchResultRegistry,
+    SecureFetcher,
+    SearxngSearchProvider,
+    SourcePolicy,
+    discover,
+    opaque_reference_url,
+)
 
 
 SENSITIVE_PATH_RE = re.compile(
@@ -42,6 +52,49 @@ ALLOWED_COMMANDS = {
     "git_diff_stat": ["git", "diff", "--stat", "HEAD"],
     "git_diff_name_only": ["git", "diff", "--name-only", "HEAD"],
 }
+_GIT_OBJECT_ID_RE = re.compile(r"^[0-9a-fA-F]{40,64}$")
+_REMOTE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
+def _truncate_utf8(text, max_bytes, marker="\n[truncated]"):
+    raw = str(text or "").encode("utf-8", errors="replace")
+    if len(raw) <= max_bytes:
+        return raw.decode("utf-8", errors="replace"), False
+    marker_bytes = marker.encode("utf-8")
+    if max_bytes <= len(marker_bytes):
+        return marker_bytes[:max_bytes].decode("utf-8", errors="ignore"), True
+    clipped = raw[:max_bytes - len(marker_bytes)].decode("utf-8", errors="ignore")
+    return clipped + marker, True
+
+
+def _source_text(text, max_bytes):
+    masked, _count = mask_source_secrets(text)
+    return _truncate_utf8(masked, max_bytes)[0]
+
+
+def _bound_batched_diff_result(patches, max_bytes):
+    compact = [{
+        "path": item["path"],
+        "status": item["status"],
+        "patch": item.get("patch", ""),
+        "truncated": bool((item.get("range") or {}).get("truncated")),
+    } for item in patches]
+    result = {"patches": compact, "shared_max_bytes": max_bytes}
+    encode = lambda: json.dumps(result, separators=(",", ":")).encode("utf-8")
+    while len(encode()) > max_bytes:
+        candidates = [item for item in compact if item["patch"]]
+        if not candidates:
+            break
+        largest = max(candidates, key=lambda item: len(item["patch"].encode("utf-8")))
+        excess = len(encode()) - max_bytes
+        current = len(largest["patch"].encode("utf-8"))
+        largest["patch"], _ = _truncate_utf8(
+            largest["patch"], max(0, current - max(excess, 1)), "",
+        )
+        largest["truncated"] = True
+    if len(encode()) > max_bytes:
+        return {"truncated": True}
+    return result
 
 def command_catalog_markdown():
     return ", ".join(sorted(ALLOWED_COMMANDS))
@@ -123,7 +176,7 @@ def _resolve_workspace_path(path, workspace_root):
 
     return resolved, None
 
-def read_file(path, workspace_root, offset=None, limit=None):
+def read_file(path, workspace_root, offset=None, limit=None, include_line_numbers=False):
     """Read a file, optionally a 1-based line window, with path protection.
 
     ``offset``/``limit`` let the model read a slice of a large file without
@@ -139,17 +192,101 @@ def read_file(path, workspace_root, offset=None, limit=None):
     except Exception as exc:
         return {"error": str(exc)}
 
-    if offset is None and limit is None:
+    if offset is None and limit is None and not include_line_numbers:
         return {"content": content[:12000]}
 
     lines = content.splitlines(keepends=True)
     start = max((offset or 1) - 1, 0)
     end = start + limit if limit is not None else len(lines)
-    window = "".join(lines[start:end])
+    selected = lines[start:end]
+    window = (
+        "".join(
+            f"RIGHT {line_number} | {line}"
+            for line_number, line in enumerate(selected, start=start + 1)
+        )
+        if include_line_numbers else "".join(selected)
+    )
     return {
         "content": window[:12000],
-        "range": {"offset": start + 1, "lines": len(lines[start:end]), "total_lines": len(lines)},
+        "range": {"offset": start + 1, "lines": len(selected), "total_lines": len(lines)},
     }
+
+
+_DIFF_HUNK_COORDINATES_RE = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@"
+)
+
+
+def _number_diff_lines(patch):
+    """Label unified-diff rows with explicit GitHub LEFT/RIGHT coordinates."""
+    old_line = new_line = None
+    rendered = []
+    for raw in patch.splitlines(keepends=True):
+        match = _DIFF_HUNK_COORDINATES_RE.match(raw)
+        if match:
+            old_line, new_line = int(match.group(1)), int(match.group(3))
+            rendered.append(raw)
+        elif old_line is None or new_line is None or raw.startswith("\\"):
+            rendered.append(raw)
+        elif raw.startswith("-") and not raw.startswith("---"):
+            rendered.append(f"- [LEFT {old_line} | RIGHT -] {raw[1:]}")
+            old_line += 1
+        elif raw.startswith("+") and not raw.startswith("+++"):
+            rendered.append(f"+ [LEFT - | RIGHT {new_line}] {raw[1:]}")
+            new_line += 1
+        else:
+            content = raw[1:] if raw.startswith(" ") else raw
+            rendered.append(f"  [LEFT {old_line} | RIGHT {new_line}] {content}")
+            old_line += 1
+            new_line += 1
+    return "".join(rendered)
+
+def _read_bounded_line_window(stream, offset, limit, max_bytes):
+    """Stream a line window without retaining the skipped patch prefix."""
+    collected = bytearray()
+    current_line = 1
+    returned_lines = 0
+    at_line_start = True
+    include_current_line = False
+
+    while True:
+        chunk = stream.readline(max_bytes + 1)
+        if not chunk:
+            return bytes(collected), returned_lines, False
+
+        if at_line_start:
+            if current_line < offset:
+                include_current_line = False
+            elif returned_lines >= limit:
+                return bytes(collected), returned_lines, True
+            else:
+                include_current_line = True
+                returned_lines += 1
+
+        if include_current_line:
+            remaining = max_bytes - len(collected)
+            if len(chunk) > remaining:
+                collected.extend(chunk[:remaining])
+                return bytes(collected), returned_lines, True
+            collected.extend(chunk)
+
+        if chunk.endswith(b"\n"):
+            current_line += 1
+            at_line_start = True
+        else:
+            at_line_start = False
+
+def _kill_and_reap(process, request_timeout):
+    """Best-effort bounded child cleanup without replacing the primary error."""
+    cleanup_timeout = max(0.001, min(float(request_timeout), 1.0))
+    try:
+        process.kill()
+    except Exception:
+        pass
+    try:
+        process.wait(timeout=cleanup_timeout)
+    except Exception:
+        pass
 
 def git_grep(pattern, workspace_root, request_timeout=15):
     """Run git grep and return matched lines."""
@@ -233,68 +370,243 @@ def gh_api(endpoint, allowed_repos, current_repo, request_timeout=25):
     transport; this shim exists only for backward compatibility with
     call sites that import the function from this module.
     """
+    # Preserve the existing repository authorization result before applying
+    # the narrower file-content rule. This keeps denied-repository requests
+    # observable as typed access requests instead of disguising them as a
+    # generic endpoint rejection.
+    from pr_reviewer.platform import _validate_endpoint
+    validated = _validate_endpoint(endpoint, allowed_repos, current_repo)
+    if "error" in validated:
+        return validated
+    normalized_endpoint = str(validated["full_path"]).lower()
+    if (
+        re.search(r"/(?:contents)(?:/|$)", normalized_endpoint)
+        or "/git/blobs/" in normalized_endpoint
+    ):
+        return {
+            "error": (
+                "gh_api does not read repository files; use read_remote_file "
+                "with an allowlisted repository and immutable ref"
+            )
+        }
     # Imported lazily so this module can still be loaded when the
     # platform seam is unavailable (e.g. in a script-only test that
     # doesn't add the package to sys.path).
     from pr_reviewer.platform import gh_api as _platform_gh_api
     return _platform_gh_api(endpoint, allowed_repos, current_repo, request_timeout)
 
-def web_fetch(url, allowed_hosts, request_timeout=25):
-    """Fetch a URL using the same host-allowlist logic."""
-    parsed = urllib.parse.urlparse(url)
-    host = parsed.hostname or ""
 
-    if not allowlisted_host(host, allowed_hosts):
-        return {"error": f"Host not allowlisted: {host}"}
+def _remote_repo_allowed(repository, allowed_repos, current_repo):
+    """Validate a remote repository without treating the reviewed repo as remote."""
+    candidate = str(repository or "").strip().strip("/")
+    if not _REMOTE_REPO_RE.fullmatch(candidate):
+        return False, "Remote repository must be an owner/repository name"
+    current = str(current_repo or "").strip().strip("/")
+    if not _REMOTE_REPO_RE.fullmatch(current):
+        return False, "Current repository identity is required for remote access"
+    if candidate.casefold() == current.casefold():
+        return False, "read_remote_file cannot read the current repository"
+    allowed = {
+        str(item or "").strip().strip("/").casefold()
+        for item in (allowed_repos or set())
+    }
+    # Source text is more sensitive than metadata. Unlike generic gh_api,
+    # require an explicitly named repository and never honor its wildcard.
+    if candidate.casefold() not in allowed:
+        return False, f"Repo not allowed: {candidate}"
+    return True, None
 
+
+def _remote_path(path):
+    """Return a safe repository-relative path, or an error string."""
+    value = str(path or "").strip()
+    if not value or "\x00" in value or "\\" in value:
+        return None, "Remote file path must be a non-empty slash-separated path"
+    if value.startswith("/"):
+        return None, "Remote file path must be repository-relative"
+    parts = value.split("/")
+    if any(not part or part in {".", ".."} for part in parts):
+        return None, "Remote file path contains an invalid path segment"
+    if any(char in value for char in "?#"):
+        return None, "Remote file path contains URL query or fragment characters"
+    return value, None
+
+
+def read_remote_file(
+    repository,
+    path,
+    ref,
+    allowed_repos,
+    current_repo,
+    offset=None,
+    limit=None,
+    include_line_numbers=False,
+    request_timeout=25,
+    max_response_bytes=12000,
+):
+    """Read a UTF-8 text file from an explicitly allowlisted remote SHA.
+
+    This is deliberately separate from ``gh_api``: the generic API tool must
+    not expose GitHub's base64 ``contents`` representation, and this helper
+    must never be usable for the repository currently under review.
+    """
+    # Future: bounded remote-file grep for large text bundles, returning matching
+    # lines and context under the same repository/SHA guards. Keep a separate
+    # download-size ceiling; a small search result must not allow unlimited fetching.
+    allowed, err = _remote_repo_allowed(repository, allowed_repos, current_repo)
+    if not allowed:
+        return {"error": err}
+    repository = str(repository or "").strip().strip("/")
+    normalized_path, err = _remote_path(path)
+    if err:
+        return {"error": err}
+    revision = str(ref or "").strip()
+    if not _GIT_OBJECT_ID_RE.fullmatch(revision):
+        return {"error": "Remote file ref must be an immutable commit object ID"}
+    start = _opt_int(offset)
+    count = _opt_int(limit)
+    if start is not None and start < 1:
+        return {"error": "Remote file offset must be at least 1"}
+    if count is not None and not 1 <= count <= 400:
+        return {"error": "Remote file limit must be between 1 and 400 lines"}
+
+    quoted_path = urllib.parse.quote(normalized_path, safe="/:@!$&'()*+,;=-._~")
+    endpoint = f"repos/{repository}/contents/{quoted_path}?ref={revision}"
+    # Route through the shared platform seam after the stricter remote-only
+    # validation above. Generic gh_api deliberately blocks this endpoint.
+    from pr_reviewer.platform import gh_api as _platform_gh_api
+    response = _platform_gh_api(
+        endpoint, {str(repository).strip().strip("/")}, "", request_timeout,
+    )
+    if response.get("error"):
+        return {"error": str(response["error"])}
+    payload = response.get("data")
+    if not isinstance(payload, dict) or payload.get("type") != "file":
+        return {"error": "Remote path is not a single file"}
+    download_limit = 8 * 1024 * 1024
+    size = payload.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        return {"error": "Remote file metadata lacks a valid byte size"}
+    if size > download_limit:
+        return {"error": f"Remote file exceeds download limit ({size}>{download_limit} bytes); use smaller source files instead"}
+    from pr_reviewer.platform import gh_raw_file
+    response = gh_raw_file(endpoint, {repository}, request_timeout, download_limit)
+    if response.get("error"):
+        return {"error": str(response["error"])}
+    raw = response["content"]
     try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "ai-pr-reviewer/1.0"},
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return {"error": "Remote file is binary or not valid UTF-8 text"}
+    if any(byte < 32 and byte not in (9, 10, 12, 13) for byte in raw):
+        return {"error": "Remote file is binary or contains unsupported control bytes"}
+
+    lines = content.splitlines(keepends=True)
+    line_start = max((start or 1) - 1, 0)
+    line_end = line_start + count if count is not None else len(lines)
+    selected = lines[line_start:line_end]
+    if include_line_numbers:
+        selected_text = "".join(
+            f"LINE {line_number} | {line}"
+            for line_number, line in enumerate(selected, start=line_start + 1)
         )
-        with urllib.request.urlopen(req, timeout=request_timeout) as resp:
-            raw = resp.read()
-            text = raw.decode("utf-8", errors="replace")
-            return {"content": text[:10000]}
+    else:
+        selected_text = "".join(selected)
+    masked_text, _redaction_count = mask_source_secrets(selected_text)
+    selected_text, byte_truncated = _truncate_utf8(
+        masked_text, max_response_bytes,
+    )
+    has_more = line_end < len(lines) or byte_truncated
+    return {
+        "content": selected_text,
+        "range": {
+            "offset": line_start + 1,
+            "lines": len(selected),
+            "total_lines": len(lines),
+            "truncated": has_more,
+            "has_more": has_more,
+        },
+        "repository": str(repository).strip().strip("/"),
+        "path": normalized_path,
+        "ref": revision,
+    }
+
+def web_fetch(
+    url,
+    allowed_hosts,
+    request_timeout=25,
+    *,
+    source_policy=None,
+    secure_fetcher=None,
+    evidence_store=None,
+    session_id="tool-harness",
+    model_identity="",
+    deadline_at=None,
+    allow_opaque_url=False,
+    public_reference=None,
+    evidence_tool="web_fetch",
+    evidence_arguments=None,
+):
+    """Retrieve typed evidence through the redirect- and DNS-safe boundary."""
+    try:
+        policy = source_policy or SourcePolicy(())
+        fetcher = secure_fetcher or SecureFetcher(
+            policy, timeout=request_timeout, evidence_store=evidence_store,
+        )
+        return fetcher.fetch(
+            url,
+            session_id=session_id,
+            model_identity=model_identity,
+            deadline_at=deadline_at,
+            allow_opaque_url=allow_opaque_url,
+            public_reference=public_reference,
+            evidence_tool=evidence_tool,
+            evidence_arguments=evidence_arguments,
+        ).as_dict()
     except Exception as exc:
         return {"error": str(exc)}
 
-def web_search(query, search_url, request_timeout=20, max_results=5):
-    """Query a configured search engine (SearXNG JSON API) for a free-text query.
-
-    ``search_url`` is the engine's search endpoint (e.g.
-    ``https://search.example.com/search``); the query and ``format=json`` are
-    appended. Returns ``{"results": [{title, url, snippet}], ...}`` capped at
-    ``max_results``, or ``{"error": ...}``. The endpoint is a single trusted,
-    operator-configured URL — unlike web_fetch it is not host-allowlisted,
-    because the model supplies only the query string, never the host.
-    """
+def web_search(
+    query,
+    search_url,
+    request_timeout=20,
+    max_results=5,
+    *,
+    source_policy=None,
+    provider: SearchProvider | None = None,
+    search_scan_limit=25,
+    allow_private_search_url=False,
+    search_result_registry: SearchResultRegistry | None = None,
+):
+    """Return policy-filtered discovery metadata, never raw search output."""
     if not search_url:
         return {"error": "Search is not configured (no search_url)."}
-    sep = "&" if urllib.parse.urlparse(search_url).query else "?"
-    full = f"{search_url}{sep}" + urllib.parse.urlencode({"q": query, "format": "json"})
     try:
-        req = urllib.request.Request(
-            full,
-            headers={"User-Agent": "ai-pr-reviewer/1.0", "Accept": "application/json"},
+        policy = source_policy or SourcePolicy(())
+        search_provider = provider or SearxngSearchProvider(
+            search_url,
+            request_timeout=request_timeout,
+            allow_private_search_url=allow_private_search_url,
         )
-        with urllib.request.urlopen(req, timeout=request_timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        return discover(
+            query,
+            search_provider,
+            policy,
+            search_scan_limit=search_scan_limit,
+            tool_max_search_results=max_results,
+            result_registry=search_result_registry,
+        ).as_dict()
     except Exception as exc:
         return {"error": str(exc)}
 
-    results = []
-    for item in (data.get("results") or [])[:max_results]:
-        if not isinstance(item, dict):
-            continue
-        results.append({
-            "title": str(item.get("title", ""))[:300],
-            "url": str(item.get("url", "")),
-            "snippet": str(item.get("content", ""))[:500],
-        })
-    return {"results": results}
-
-def run_command(command, workspace_root, request_timeout=30):
+def run_command(
+    command,
+    workspace_root,
+    request_timeout=30,
+    *,
+    base_sha=None,
+    head_sha=None,
+):
     """Execute a named read-only command definition.
 
     The planner may choose only command names from ALLOWED_COMMANDS. Raw shell
@@ -310,6 +622,22 @@ def run_command(command, workspace_root, request_timeout=30):
                 + command_catalog_markdown()
             )
         }
+    args = list(args)
+    if command_name in {"git_diff_stat", "git_diff_name_only"} and (
+        base_sha is not None or head_sha is not None
+    ):
+        if (
+            not isinstance(base_sha, str)
+            or not isinstance(head_sha, str)
+            or not _GIT_OBJECT_ID_RE.fullmatch(base_sha)
+            or not _GIT_OBJECT_ID_RE.fullmatch(head_sha)
+        ):
+            return {"error": "Immutable diff range requires valid base and head object IDs"}
+        option = "--stat" if command_name == "git_diff_stat" else "--name-only"
+        args = [
+            "git", "diff", option, "--find-renames",
+            f"{base_sha}...{head_sha}", "--",
+        ]
 
     try:
         result = subprocess.run(
@@ -350,6 +678,20 @@ def execute_tool_request(
     request_timeout,
     search_url="",
     max_search_results=5,
+    *,
+    source_policy=None,
+    search_provider=None,
+    secure_fetcher=None,
+    evidence_store=None,
+    session_id="tool-harness",
+    model_identity="",
+    search_scan_limit=25,
+    deadline_at=None,
+    base_sha=None,
+    head_sha=None,
+    allowed_diff_paths=(),
+    allow_private_search_url=False,
+    search_result_registry=None,
 ):
     """Execute a single tool request and return the result dict.
 
@@ -364,16 +706,175 @@ def execute_tool_request(
             if not path:
                 raise ValueError("Missing 'path' argument")
             res = read_file(
-                path, workspace_root, _opt_int(args.get("offset")), _opt_int(args.get("limit"))
+                path, workspace_root, _opt_int(args.get("offset")), _opt_int(args.get("limit")),
+                args.get("include_line_numbers") is True,
             )
             if res.get("error"):
                 raise ValueError(res["error"])
-            text = mask_secrets(res.get("content", ""))
-            text, _ = mask_and_truncate(text, max_response_bytes)
+            text = _source_text(res.get("content", ""), max_response_bytes)
             result_payload = {"content": text}
             if res.get("range"):
                 result_payload["range"] = res["range"]
             tool_result["result"] = result_payload
+
+        elif tool_name == "read_pr_diff":
+            raw_paths = args.get("paths")
+            if raw_paths is not None:
+                if args.get("path"):
+                    raise ValueError("Use either 'path' or 'paths', not both")
+                if (
+                    not isinstance(raw_paths, list)
+                    or not raw_paths
+                    or any(not isinstance(item, str) or not item.strip() for item in raw_paths)
+                ):
+                    raise ValueError("'paths' must be a non-empty array of paths")
+                if len(raw_paths) > 8:
+                    raise ValueError("'paths' may contain at most 8 paths")
+                allowed = {
+                    candidate.replace("\\", "/").strip("/")
+                    for candidate in allowed_diff_paths
+                    if isinstance(candidate, str) and candidate
+                }
+                normalized = [item.replace("\\", "/").strip("/") for item in raw_paths]
+                if len(set(normalized)) != len(normalized):
+                    raise ValueError("'paths' must not contain duplicates")
+                if any(item not in allowed for item in normalized):
+                    raise ValueError("Path is outside this specialist assignment")
+                per_path_bytes = max(1, max_response_bytes // len(normalized))
+                patches = []
+                for item in normalized:
+                    nested = execute_tool_request(
+                        "read_pr_diff",
+                        {
+                            key: value for key, value in args.items()
+                            if key not in {"paths", "path"}
+                        } | {"path": item},
+                        workspace_root, allowed_gh_repos, current_repo, allowed_hosts,
+                        per_path_bytes, request_timeout, search_url, max_search_results,
+                        source_policy=source_policy, search_provider=search_provider,
+                        secure_fetcher=secure_fetcher, evidence_store=evidence_store,
+                        session_id=session_id, model_identity=model_identity,
+                        search_scan_limit=search_scan_limit, deadline_at=deadline_at,
+                        base_sha=base_sha, head_sha=head_sha,
+                        allowed_diff_paths=allowed_diff_paths,
+                        allow_private_search_url=allow_private_search_url,
+                    )
+                    nested_result = nested.get("result", {})
+                    patches.append({
+                        "path": item,
+                        "status": nested.get("status", "error"),
+                        "patch": nested_result.get("patch", ""),
+                        "range": nested_result.get("range"),
+                        "error": nested_result.get("error"),
+                    })
+                tool_result["result"] = _bound_batched_diff_result(
+                    patches, max_response_bytes,
+                )
+                tool_result["status"] = (
+                    "ok" if all(item["status"] == "ok" for item in patches) else "error"
+                )
+                return tool_result
+            path = args.get("path", "")
+            if not path:
+                raise ValueError("Missing 'path' argument")
+            if (
+                not isinstance(base_sha, str)
+                or not isinstance(head_sha, str)
+                or not _GIT_OBJECT_ID_RE.fullmatch(base_sha)
+                or not _GIT_OBJECT_ID_RE.fullmatch(head_sha)
+            ):
+                raise ValueError(
+                    "Immutable PR patch requires valid controller base and head object IDs"
+                )
+            resolved, err = _resolve_workspace_path(path, workspace_root)
+            if err:
+                raise ValueError(err)
+            root = Path(workspace_root).resolve()
+            normalized_path = resolved.relative_to(root).as_posix()
+            allowed = {
+                candidate.replace("\\", "/").strip("/")
+                for candidate in allowed_diff_paths
+                if isinstance(candidate, str) and candidate
+            }
+            if normalized_path not in allowed:
+                raise ValueError("Path is outside this specialist assignment")
+            requested_context = _opt_int(args.get("context_lines"))
+            context_lines = max(
+                0, min(3 if requested_context is None else requested_context, 20)
+            )
+            offset = max(_opt_int(args.get("offset")) or 1, 1)
+            limit = max(1, min(_opt_int(args.get("limit")) or 400, 400))
+            diff_args = [
+                "git", "--literal-pathspecs", "diff", "--no-ext-diff", "--no-color",
+                "--find-renames", f"--unified={context_lines}",
+                f"{base_sha}...{head_sha}", "--", normalized_path,
+            ]
+            process = subprocess.Popen(
+                diff_args,
+                cwd=workspace_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            if process.stdout is None:
+                process.kill()
+                raise ValueError("git diff did not provide a readable output stream")
+            with ThreadPoolExecutor(max_workers=1) as reader:
+                future = reader.submit(
+                    _read_bounded_line_window,
+                    process.stdout,
+                    offset,
+                    limit,
+                    max_response_bytes,
+                )
+                try:
+                    raw_output, returned_lines, has_more = future.result(
+                        timeout=request_timeout
+                    )
+                except FutureTimeoutError:
+                    _kill_and_reap(process, request_timeout)
+                    raise ValueError(
+                        f"git diff timed out after {request_timeout}s"
+                    )
+            if has_more:
+                process.kill()
+            try:
+                return_code = process.wait(timeout=request_timeout)
+            except subprocess.TimeoutExpired:
+                _kill_and_reap(process, request_timeout)
+                raise ValueError(
+                    f"git diff timed out after {request_timeout}s"
+                )
+            output = raw_output.decode("utf-8", errors="replace")
+            if return_code != 0 and not has_more:
+                raise ValueError(
+                    f"git diff failed: {mask_secrets(output.strip())}"
+                )
+            masked_patch, _redaction_count = mask_source_secrets(output)
+            if args.get("include_line_numbers") is True:
+                masked_patch = _number_diff_lines(masked_patch)
+            encoded_patch = masked_patch.encode("utf-8", errors="replace")
+            if len(encoded_patch) > max_response_bytes:
+                marker = b"\n[truncated]"
+                if max_response_bytes <= len(marker):
+                    encoded_patch = marker[:max_response_bytes]
+                else:
+                    encoded_patch = (
+                        encoded_patch[:max_response_bytes - len(marker)].decode(
+                            "utf-8", errors="ignore"
+                        ).encode("utf-8")
+                        + marker
+                    )
+            patch = encoded_patch.decode("utf-8", errors="replace")
+            tool_result["result"] = {
+                "path": normalized_path,
+                "patch": patch,
+                "range": {
+                    "offset": offset,
+                    "returned_lines": returned_lines,
+                    "has_more": has_more,
+                    "truncated": has_more,
+                },
+            }
 
         elif tool_name == "git_log":
             max_count = max(1, min(_opt_int(args.get("max_count")) or 20, 100))
@@ -395,7 +896,7 @@ def execute_tool_request(
             )
             if res.get("error"):
                 raise ValueError(res["error"])
-            text, _ = mask_and_truncate(res.get("blame", ""), max_response_bytes)
+            text = _source_text(res.get("blame", ""), max_response_bytes)
             tool_result["result"] = {"blame": text}
 
         elif tool_name == "git_grep":
@@ -406,9 +907,21 @@ def execute_tool_request(
             if res.get("error"):
                 raise ValueError(res["error"])
             matches = res.get("matches", [])
-            text = "\n".join(matches)
-            text, _ = mask_and_truncate(text, max_response_bytes)
-            tool_result["result"] = {"matches": matches[:60]}
+            text, _redaction_count = mask_source_secrets("\n".join(matches))
+            encoded = text.encode("utf-8", errors="replace")
+            if len(encoded) > max_response_bytes:
+                marker = b"\n[truncated]"
+                if max_response_bytes <= len(marker):
+                    encoded = marker[:max_response_bytes]
+                else:
+                    encoded = (
+                        encoded[:max_response_bytes - len(marker)].decode(
+                            "utf-8", errors="ignore"
+                        ).encode("utf-8")
+                        + marker
+                    )
+                text = encoded.decode("utf-8", errors="replace")
+            tool_result["result"] = {"matches": text.splitlines()}
 
         elif tool_name == "gh_api":
             endpoint = args.get("endpoint", "")
@@ -426,33 +939,128 @@ def execute_tool_request(
                 text = json.dumps(data, separators=(",", ":"))[:max_response_bytes]
             tool_result["result"] = {"response": text}
 
+        elif tool_name == "read_remote_file":
+            repository = args.get("repository", "")
+            path = args.get("path", "")
+            ref = args.get("ref", "")
+            if not repository or not path or not ref:
+                raise ValueError("read_remote_file requires repository, path, and immutable ref")
+            res = read_remote_file(
+                repository,
+                path,
+                ref,
+                allowed_gh_repos,
+                current_repo,
+                _opt_int(args.get("offset")),
+                _opt_int(args.get("limit")),
+                args.get("include_line_numbers") is True,
+                request_timeout,
+                max_response_bytes,
+            )
+            if res.get("error"):
+                raise ValueError(res["error"])
+            content = _source_text(res.get("content", ""), max_response_bytes)
+            tool_result["result"] = {
+                "content": content,
+                "repository": res["repository"],
+                "path": res["path"],
+                "ref": res["ref"],
+                "range": res["range"],
+            }
+
         elif tool_name == "web_fetch":
             url = args.get("url", "")
             if not url:
                 raise ValueError("Missing 'url' argument")
-            res = web_fetch(url, allowed_hosts, request_timeout)
+            res = web_fetch(
+                url,
+                allowed_hosts,
+                request_timeout,
+                source_policy=source_policy,
+                secure_fetcher=secure_fetcher,
+                evidence_store=evidence_store,
+                session_id=session_id,
+                model_identity=model_identity,
+                deadline_at=deadline_at,
+            )
             if res.get("error"):
                 raise ValueError(res["error"])
-            content_text = res.get("content", "")
-            text, _ = mask_and_truncate(content_text, max_response_bytes)
-            tool_result["result"] = {"content": text}
+            content_text, truncated = mask_and_truncate(
+                res.get("content", ""), max_response_bytes
+            )
+            tool_result["result"] = {
+                **res,
+                "content": content_text,
+                "truncated": bool(res.get("truncated")) or truncated,
+            }
 
         elif tool_name == "web_search":
             query = args.get("query", "")
             if not query:
                 raise ValueError("Missing 'query' argument")
-            res = web_search(query, search_url, request_timeout, max_search_results)
+            policy = source_policy or SourcePolicy(())
+            res = web_search(
+                query,
+                search_url,
+                request_timeout,
+                max_search_results,
+                source_policy=policy,
+                provider=search_provider,
+                search_scan_limit=search_scan_limit,
+                allow_private_search_url=allow_private_search_url,
+                search_result_registry=search_result_registry,
+            )
             if res.get("error"):
                 raise ValueError(res["error"])
-            text = json.dumps(res.get("results", []), separators=(",", ":"))
-            text, _ = mask_and_truncate(text, max_response_bytes)
-            tool_result["result"] = {"results": text}
+            encoded = json.dumps(res, ensure_ascii=False, separators=(",", ":"))
+            if len(encoded.encode("utf-8")) > max_response_bytes:
+                raise ValueError("Filtered search discovery exceeds tool response limit")
+            tool_result["result"] = res
+
+        elif tool_name == "web_fetch_search_result":
+            result_id = args.get("result_id", "")
+            if not result_id:
+                raise ValueError("Missing 'result_id' argument")
+            if search_result_registry is None:
+                raise ValueError("search result registry is unavailable")
+            url = search_result_registry.resolve(result_id)
+            res = web_fetch(
+                url,
+                allowed_hosts,
+                request_timeout,
+                source_policy=source_policy,
+                secure_fetcher=secure_fetcher,
+                evidence_store=evidence_store,
+                session_id=session_id,
+                model_identity=model_identity,
+                deadline_at=deadline_at,
+                allow_opaque_url=True,
+                public_reference=opaque_reference_url(url),
+                evidence_tool="web_fetch_search_result",
+                evidence_arguments={"result_id": result_id},
+            )
+            if res.get("error"):
+                raise ValueError(res["error"])
+            content_text, truncated = mask_and_truncate(
+                res.get("content", ""), max_response_bytes
+            )
+            tool_result["result"] = {
+                **res,
+                "content": content_text,
+                "truncated": bool(res.get("truncated")) or truncated,
+            }
 
         elif tool_name == "run_command":
             command = args.get("command", "")
             if not command:
                 raise ValueError("Missing 'command' argument")
-            res = run_command(command, workspace_root, request_timeout)
+            res = run_command(
+                command,
+                workspace_root,
+                request_timeout,
+                base_sha=base_sha,
+                head_sha=head_sha,
+            )
             if res.get("error"):
                 raise ValueError(res["error"])
             stdout_text = res.get("stdout", "")

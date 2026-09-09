@@ -49,6 +49,7 @@ for _p in (str(_SCRIPTS_DIR), str(_ACTION_ROOT)):
 
 from build_review_comments import FINDING_MARKER_PREFIX, finding_fingerprint  # noqa: E402
 from pr_reviewer.carry_forward import load_carried_findings  # noqa: E402
+from pr_reviewer.github_review_notes import extract_managed_fingerprint  # noqa: E402
 from pr_reviewer.platform import PlatformUnsupported, gh_argv, resolve_platform  # noqa: E402
 
 
@@ -146,21 +147,6 @@ def resolved_fingerprints(carried: list, findings) -> set:
     }
 
 
-def extract_marker_fingerprint(body):
-    """Pull the finding fingerprint out of a comment body, if present."""
-    if not isinstance(body, str):
-        return None
-    start = body.find(FINDING_MARKER_PREFIX)
-    if start == -1:
-        return None
-    rest = body[start + len(FINDING_MARKER_PREFIX):]
-    end = rest.find("-->")
-    if end == -1:
-        return None
-    fingerprint = rest[:end].strip()
-    return fingerprint or None
-
-
 def match_threads(thread_nodes) -> dict:
     """Map fingerprint -> thread info for unresolved marker-bearing threads.
 
@@ -177,7 +163,9 @@ def match_threads(thread_nodes) -> dict:
             continue
         first_nodes = (node.get("first") or {}).get("nodes") or []
         first = first_nodes[0] if first_nodes and isinstance(first_nodes[0], dict) else {}
-        fingerprint = extract_marker_fingerprint(first.get("body"))
+        fingerprint = extract_managed_fingerprint(
+            first.get("body"), FINDING_MARKER_PREFIX
+        )
         if not fingerprint or fingerprint in matched:
             continue
         last_nodes = (node.get("last") or {}).get("nodes") or []

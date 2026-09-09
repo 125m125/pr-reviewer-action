@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "id": "web-source-policy",
+  "approved_source": {
+    "url": "https://docs.example.org/reference/runtime",
+    "title": "Official runtime reference",
+    "snippet": "Approved discovery hint.",
+    "body": "Official runtime compatibility is version 42."
+  },
+  "unapproved_source": {
+    "url": "https://evil.example.net/leaked",
+    "title": "Unapproved result",
+    "snippet": "UNAPPROVED-SNIPPET-MUST-STAY-HIDDEN"
+  },
+  "redirect_escape": {
+    "url": "https://docs.example.org/reference/redirect",
+    "location": "https://evil.example.net/escape",
+    "body": "REDIRECT-ESCAPE-BODY-MUST-STAY-HIDDEN"
+  },
+  "source_rule": {
+    "host": "docs.example.org",
+    "path_prefix": "/reference"
+  },
+  "source_access": {
+    "obligation_id": "obligation:web-reference",
+    "purpose": "Confirm the vendor behavior not available from an approved source.",
+    "authority_reason": "Repository policy must be expanded by a maintainer."
+  },
+  "expected": {
+    "approved_fetches": ["https://docs.example.org/reference/runtime"],
+    "source_denials": 2,
+    "source_access_requests": 1,
+    "unsafe_fetch_attempts": 0,
+    "forbidden_public_text": [
+      "UNAPPROVED-SNIPPET-MUST-STAY-HIDDEN",
+      "REDIRECT-ESCAPE-BODY-MUST-STAY-HIDDEN"
+    ]
+  }
+}

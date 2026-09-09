@@ -11,6 +11,11 @@ set -euo pipefail
 # established first because every module relies on them.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}/..${PYTHONPATH:+:${PYTHONPATH}}"
+# The specialist CLI and controller accept artifacts only in this concrete,
+# controller-owned review workspace. Resolve it once before any sourced section
+# can change directory or derive output paths.
+SPECIALIST_ARTIFACT_ROOT="$(pwd -P)"
+export SPECIALIST_ARTIFACT_ROOT
 
 # Leaf helpers (log/error/sedi/section timers) first: config and every section
 # below call them at source time.

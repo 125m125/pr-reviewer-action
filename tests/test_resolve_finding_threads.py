@@ -19,9 +19,9 @@ for _p in (str(_SCRIPTS_DIR), str(_REPO_ROOT)):
 import pytest
 
 from build_review_comments import finding_fingerprint, finding_marker
+from pr_reviewer.github_review_notes import extract_managed_fingerprint
 from resolve_finding_threads import (
     FOLLOWUP_MARKER_PREFIX,
-    extract_marker_fingerprint,
     followup_body,
     main,
     match_threads,
@@ -59,20 +59,32 @@ class TestExtractMarkerFingerprint:
     def test_extracts_from_comment_body(self):
         finding = _finding()
         body = f"**Blocker:** bad\n\n{finding_marker(finding)}"
-        assert extract_marker_fingerprint(body) == finding_fingerprint(finding)
+        assert extract_managed_fingerprint(
+            body, "<!-- ai-pr-review-finding:"
+        ) == finding_fingerprint(finding)
 
     def test_no_marker(self):
-        assert extract_marker_fingerprint("a plain comment") is None
+        assert extract_managed_fingerprint(
+            "a plain comment", "<!-- ai-pr-review-finding:"
+        ) is None
 
     def test_unterminated_marker(self):
-        assert extract_marker_fingerprint("<!-- ai-pr-review-finding:abc123") is None
+        assert extract_managed_fingerprint(
+            "<!-- ai-pr-review-finding:abc123", "<!-- ai-pr-review-finding:"
+        ) is None
 
     def test_empty_fingerprint(self):
-        assert extract_marker_fingerprint("<!-- ai-pr-review-finding: -->") is None
+        assert extract_managed_fingerprint(
+            "<!-- ai-pr-review-finding: -->", "<!-- ai-pr-review-finding:"
+        ) is None
 
     def test_non_string(self):
-        assert extract_marker_fingerprint(None) is None
-        assert extract_marker_fingerprint(42) is None
+        assert extract_managed_fingerprint(
+            None, "<!-- ai-pr-review-finding:"
+        ) is None
+        assert extract_managed_fingerprint(
+            42, "<!-- ai-pr-review-finding:"
+        ) is None
 
 
 class TestResolvedFingerprints:
@@ -407,8 +419,10 @@ class TestMainEndToEnd:
 
 
 class TestActionWiring:
-    ACTION = (_REPO_ROOT / "action.yml").read_text()
-    HELPERS = (_REPO_ROOT / "scripts" / "publish_helpers.sh").read_text()
+    ACTION = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
+    HELPERS = (
+        _REPO_ROOT / "scripts" / "publish_helpers.sh"
+    ).read_text(encoding="utf-8")
 
     def test_both_publish_steps_resolve_threads(self):
         assert self.ACTION.count("resolve_finding_threads") == 2

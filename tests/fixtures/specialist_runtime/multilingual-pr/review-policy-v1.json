@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "components": [
+    {
+      "id": "order-contract",
+      "paths": ["contracts/**"],
+      "responsibilities": ["Own the order event schema."],
+      "related_components": ["java-api", "typescript-consumer", "python-messaging"],
+      "contracts": ["order-event"],
+      "invariants": ["Every consumer handles every published status."]
+    }
+  ],
+  "recipes": [
+    {
+      "id": "cross-language-contract",
+      "title": "Cross-language contract",
+      "objective": "Trace order event compatibility across producers and consumers.",
+      "match": {"paths_any": ["contracts/**"]},
+      "lenses": ["contract"],
+      "seed_paths": ["contracts/order-event.schema.json"],
+      "related_paths": [
+        "src/main/java/example/api/OrderController.java",
+        "web/src/order-client.ts",
+        "workers/messaging/order_worker.py"
+      ],
+      "invariants": ["Every consumer handles every published status."],
+      "expected_evidence": ["interaction"],
+      "priority": "high"
+    },
+    {
+      "id": "deployment-rollout",
+      "title": "Deployment rollout",
+      "objective": "Verify deployment artifacts consume the changed worker contract.",
+      "match": {"paths_any": ["deploy/**"]},
+      "lenses": ["deployment"],
+      "seed_paths": ["deploy/k8s/order-worker.yaml"],
+      "related_paths": ["workers/messaging/order_worker.py"],
+      "invariants": ["The deployed revision understands the changed contract."],
+      "expected_evidence": ["deployment-artifact"],
+      "priority": "normal"
+    }
+  ],
+  "generated_artifacts": [
+    {
+      "id": "order-worker-deployment",
+      "source_of_truth": ["deploy/k8s/order-worker.yaml"],
+      "generator_config": [],
+      "output_paths": ["deploy/k8s/order-worker.yaml"]
+    }
+  ],
+  "exclude": {
+    "paths": [],
+    "components": [],
+    "lenses": [],
+    "recipes": []
+  }
+}

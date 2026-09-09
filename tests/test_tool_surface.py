@@ -69,6 +69,27 @@ def test_read_file_offset_string_coerced(tmp_path):
     assert res["result"]["content"] == "y\n"
 
 
+def test_read_file_can_render_head_line_numbers(tmp_path):
+    (tmp_path / "f.txt").write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+    res = _exec(
+        "read_file",
+        {"path": "f.txt", "offset": 2, "limit": 2, "include_line_numbers": True},
+        tmp_path,
+    )
+
+    assert res["status"] == "ok"
+    assert res["result"]["content"] == "RIGHT 2 | beta\nRIGHT 3 | gamma\n"
+
+
+def test_read_file_can_number_a_whole_bounded_file(tmp_path):
+    (tmp_path / "f.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+
+    res = _exec("read_file", {"path": "f.txt", "include_line_numbers": True}, tmp_path)
+
+    assert res["result"]["content"] == "RIGHT 1 | alpha\nRIGHT 2 | beta\n"
+
+
 def test_read_file_range_still_blocks_sensitive(tmp_path):
     (tmp_path / ".env").write_text("SECRET=1\n", encoding="utf-8")
     res = _exec("read_file", {"path": ".env", "offset": 1, "limit": 1}, tmp_path)
@@ -120,3 +141,30 @@ def test_git_blame_blocks_sensitive_file(git_repo):
 def test_git_blame_escape_blocked(git_repo):
     res = _exec("git_blame", {"path": "../../etc/hosts"}, git_repo)
     assert res["status"] == "error"
+
+
+def test_git_grep_returns_only_redacted_bounded_matches(git_repo):
+    secret = "supersecretvalue-that-must-not-escape"
+    (git_repo / "config.txt").write_text(
+        "".join(f"token={secret}\n" for _ in range(20)),
+        encoding="utf-8",
+    )
+    _git(["add", "config.txt"], git_repo)
+    _git(["commit", "-q", "-m", "add config"], git_repo)
+
+    result = rth.execute_tool_request(
+        "git_grep",
+        {"pattern": "token"},
+        str(git_repo),
+        {_REPO},
+        _REPO,
+        ["github.com"],
+        96,
+        15,
+    )
+
+    retained = "\n".join(result["result"]["matches"])
+    assert result["status"] == "ok"
+    assert secret not in retained
+    assert "[REDACTED_VALUE]" in retained
+    assert len(retained.encode("utf-8")) <= 96

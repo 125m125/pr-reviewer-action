@@ -553,7 +553,15 @@ if ! platform_pr_get "$REPO" "$PR_NUMBER" > pr-object.json 2>/dev/null; then
 fi
 CURRENT_HEAD_SHA="$(jq -r '.head.sha // ""' pr-object.json 2>/dev/null || echo "")"
 CURRENT_BASE_SHA="$(jq -r '.base.sha // ""' pr-object.json 2>/dev/null || echo "")"
-IS_FORK_PR="$(jq -r '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' pr-object.json 2>/dev/null || echo "")"
+HEAD_REPO_FULL_NAME="$(jq -r '.head.repo.full_name // ""' pr-object.json 2>/dev/null || echo "")"
+BASE_REPO_FULL_NAME="$(jq -r '.base.repo.full_name // ""' pr-object.json 2>/dev/null || echo "")"
+if [[ -z "$HEAD_REPO_FULL_NAME" || -z "$BASE_REPO_FULL_NAME" ]]; then
+  IS_FORK_PR="unknown"
+elif [[ "$HEAD_REPO_FULL_NAME" == "$BASE_REPO_FULL_NAME" ]]; then
+  IS_FORK_PR="false"
+else
+  IS_FORK_PR="true"
+fi
 
 # Resolve effective review scope
 resolve_review_scope "$REVIEW_SCOPE" "$LAST_HEAD_SHA" "$LAST_BASE_SHA" \

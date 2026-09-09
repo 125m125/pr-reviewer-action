@@ -87,8 +87,9 @@ check_exists "action.yml has allow_approve input" \
 check_exists "action.yml has approve_forks input" \
   "$(grep -c 'approve_forks:' "$ACTION_YML" 2>/dev/null || echo 0)"
 
-check_contains "publish_mode default is comment" \
-  "$(cat "$ACTION_YML")" "default: \"comment\""
+PUBLISH_MODE_INPUT="$(sed -n '/^  publish_mode:/,/^  allow_approve:/p' "$ACTION_YML")"
+check_contains "publish_mode default is the strategy-aware omission sentinel" \
+  "$PUBLISH_MODE_INPUT" "default: \"\""
 
 check_contains "allow_approve default is false" \
   "$(cat "$ACTION_YML")" "default: \"false\""

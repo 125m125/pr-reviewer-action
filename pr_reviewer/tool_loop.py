@@ -99,40 +99,6 @@ class LoopBudgets:
     max_truncation_continuations: int = 1
 
 
-def adaptive_loop_budgets(
-    max_rounds: int,
-    max_tool_calls: int,
-    wall_clock_sec: float,
-    *,
-    review_route: str = "primary",
-    risk_flag_count: int = 0,
-) -> "LoopBudgets":
-    """Apply the documented legacy mapping of two planning turns per round.
-
-    Positive configured call and time limits are used exactly, with no hidden
-    cap or route-dependent reduction.
-
-    The budget is the SAME on every route — the route selects the MODEL, never
-    the tool budget. An earlier version shallow-capped the primary route (then
-    misnamed "fast") on low-risk PRs to "save budget on a trivial diff", but the
-    loop already self-limits (it stops as soon as the model stops calling
-    tools), so the cap never saved cost on trivial PRs — it only starved the
-    PRs that genuinely need a multi-hop chain (e.g. reading a deployed version,
-    then verifying it against a host platform's compatibility matrix). The
-    primary model is fully capable; don't ration its evidence-gathering.
-    ``review_route``/``risk_flag_count`` are retained for signature stability
-    and possible future heuristics.
-    """
-    if max_rounds <= 0 or max_tool_calls <= 0 or wall_clock_sec <= 0:
-        raise ValueError("native-loop budgets must be positive")
-    rounds = max_rounds * 2
-    return LoopBudgets(
-        max_tool_calls=max_tool_calls,
-        max_rounds=rounds,
-        wall_clock_sec=float(wall_clock_sec),
-    )
-
-
 @dataclass
 class ExecutedCall:
     tool: str
@@ -225,20 +191,35 @@ def extract_intermediate_turn(
     response: dict[str, Any], api_format: str
 ) -> tuple[list[dict[str, Any]], str, str, str]:
     """Return calls, effective text, text source, and provider finish reason."""
-    calls, text = extract_tool_calls(response, api_format)
-    finish_reason = ""
-    source = "content" if text.strip() else "none"
+    calls, content, reasoning, finish_reason = extract_intermediate_turn_parts(
+        response, api_format
+    )
+    text, source = effective_intermediate_text(
+        {"content": content, "reasoning_content": reasoning},
+        api_format,
+    )
+    return calls, text, source, finish_reason
+
+
+def extract_intermediate_turn_parts(
+    response: dict[str, Any], api_format: str
+) -> tuple[list[dict[str, Any]], str, str, str]:
+    """Return calls, ordinary content, private reasoning, and finish reason."""
+    calls, content = extract_tool_calls(response, api_format)
+    reasoning = ""
     if api_format == "openai":
         choices = response.get("choices")
         choice = choices[0] if isinstance(choices, list) and choices else {}
         message = choice.get("message") if isinstance(choice, dict) else {}
         if not isinstance(message, dict):
             message = {}
-        text, source = effective_intermediate_text(message, api_format)
+        raw_reasoning = message.get("reasoning_content")
+        if isinstance(raw_reasoning, str):
+            reasoning = raw_reasoning
         finish_reason = str(choice.get("finish_reason") or "")
     else:
         finish_reason = str(response.get("stop_reason") or "")
-    return calls, text, source, finish_reason
+    return calls, content, reasoning, finish_reason
 
 
 def extract_tool_calls(
@@ -253,6 +234,21 @@ def extract_tool_calls(
     """
     calls: list[dict[str, Any]] = []
     text_parts: list[str] = []
+    seen_call_ids: set[str] = set()
+
+    def append_call(call_id: object, name: object, arguments: str) -> None:
+        if not isinstance(call_id, str) or not isinstance(name, str):
+            return
+        normalized_id = call_id.strip()
+        normalized_name = name.strip()
+        if not normalized_id or not normalized_name or normalized_id in seen_call_ids:
+            return
+        seen_call_ids.add(normalized_id)
+        calls.append({
+            "id": normalized_id,
+            "name": normalized_name,
+            "arguments": arguments,
+        })
 
     if api_format == "anthropic":
         content = response.get("content")
@@ -265,8 +261,6 @@ def extract_tool_calls(
                 elif block.get("type") == "tool_use":
                     call_id = block.get("id")
                     name = block.get("name")
-                    if not isinstance(call_id, str) or not isinstance(name, str):
-                        continue
                     raw_input = block.get("input")
                     try:
                         arguments = json.dumps(
@@ -276,7 +270,7 @@ def extract_tool_calls(
                         )
                     except (TypeError, ValueError):
                         arguments = str(raw_input)
-                    calls.append({"id": call_id, "name": name, "arguments": arguments})
+                    append_call(call_id, name, arguments)
         return calls, "".join(text_parts)
 
     # OpenAI format
@@ -296,8 +290,6 @@ def extract_tool_calls(
             fn = raw.get("function") if isinstance(raw.get("function"), dict) else {}
             call_id = raw.get("id")
             name = fn.get("name") or raw.get("name")
-            if not isinstance(call_id, str) or not isinstance(name, str):
-                continue
             args = fn.get("arguments")
             if args is None:
                 args = raw.get("arguments")
@@ -310,14 +302,26 @@ def extract_tool_calls(
                     )
                 except (TypeError, ValueError):
                     args = str(args)
-            calls.append({"id": call_id, "name": name, "arguments": args})
+            append_call(call_id, name, args)
     return calls, "".join(text_parts)
 
 
-def _request_key(name: str, args: dict[str, Any]) -> str:
+def native_tool_request_key(name: str, args: dict[str, Any]) -> str:
+    """Return the stable native-tool identity shared by continuous sessions."""
     # Mirrors scripts/run_tool_harness.py request_key so dedup behaves the
     # same in both harness modes.
     return f"{name}:{json.dumps(args, sort_keys=True, separators=(',', ':'))}"
+
+
+def decode_native_tool_arguments(arguments: Any) -> dict[str, Any]:
+    """Decode one native call's opaque arguments into an object."""
+    if arguments is None or arguments == "":
+        value = {}
+    else:
+        value = json.loads(arguments) if isinstance(arguments, str) else arguments
+    if not isinstance(value, dict):
+        raise ValueError("arguments must be a JSON object")
+    return value
 
 
 def _normalise_assistant_text(text: str) -> str:
@@ -343,6 +347,21 @@ def repetitive_assistant_text(text: str, previous: str = "") -> bool:
         counts[item] = counts.get(item, 0) + 1
     repeated = max((len(item) * count for item, count in counts.items() if count >= 3), default=0)
     return repeated >= int(len(current) * 0.6)
+
+
+def _append_intermediate_assistant(
+    conversation: Conversation,
+    *,
+    reasoning: str,
+    content: str,
+    calls: list[dict[str, Any]] | None = None,
+) -> None:
+    """Retain one provider turn without conflating private and visible text."""
+    conversation.add_assistant_turn(
+        reasoning=reasoning,
+        content=content,
+        calls=calls or (),
+    )
 
 
 def drive_tool_loop(
@@ -416,6 +435,10 @@ def drive_tool_loop(
                     budgets.truncated_result_bytes
                 )
             if conversation.approx_tokens() > budgets.max_conversation_tokens:
+                conversation.truncate_oldest_assistant_reasoning(
+                    1000, keep_newest=budgets.summarize_keep_newest
+                )
+            if conversation.approx_tokens() > budgets.max_conversation_tokens:
                 conversation.truncate_oldest_assistant_text(
                     1000, keep_newest=budgets.summarize_keep_newest
                 )
@@ -441,26 +464,17 @@ def drive_tool_loop(
                 outcome.compaction_runs += 1
                 outcome.compaction_tokens_removed += removed
 
-        remaining_calls = max(0, budgets.max_tool_calls - calls_executed)
-        remaining_turns = max(0, budgets.max_rounds - outcome.planning_rounds)
-        budget_note = (
-            f"Exploration budget before this turn: {remaining_calls} tool calls "
-            f"and {remaining_turns} planning turns remain. Prioritize unresolved "
-            "correctness risks. Do not repeat completed checks. Stop requesting "
-            "tools when the evidence is sufficient so you can synthesize it."
-        )
-        if consecutive_no_progress:
-            allowance = max(0, budgets.max_consecutive_no_progress_rounds - consecutive_no_progress)
-            budget_note += (
-                f" No-progress allowance remaining: {allowance} round(s); another "
-                "duplicate cycle may end exploration."
-            )
+        # Budget values remain controller-owned state and are enforced below;
+        # do not inject them as an unsolicited user turn.  Some chat templates
+        # use the latest user turn to reconstruct reasoning state, so a
+        # transient status note can discard or distort prior reasoning.
+        repair_note = None
         if (
             textual_repair_pending
             and consecutive_textual_tool_repairs < budgets.max_textual_tool_repairs
             and outcome.textual_tool_repair_attempts < budgets.max_total_textual_tool_repairs
         ):
-            budget_note = _TEXTUAL_TOOL_REPAIR_NOTE + "\n\n" + budget_note
+            repair_note = _TEXTUAL_TOOL_REPAIR_NOTE
             outcome.textual_tool_repair_attempts += 1
             consecutive_textual_tool_repairs += 1
             outcome.consecutive_textual_tool_repair_attempts = consecutive_textual_tool_repairs
@@ -474,7 +488,7 @@ def drive_tool_loop(
             reasoning_effort=reasoning_effort,
             tokens_param=tokens_param,
             cache_prefix=cache_prefix,
-            ephemeral_user_note=budget_note,
+            ephemeral_user_note=repair_note,
         )
         try:
             response = post_fn(payload)
@@ -484,8 +498,12 @@ def drive_tool_loop(
             break
 
         outcome.rounds += 1
-        calls, text, text_source, finish_reason = extract_intermediate_turn(
+        calls, content, reasoning, finish_reason = extract_intermediate_turn_parts(
             response, api_format
+        )
+        text, text_source = effective_intermediate_text(
+            {"content": content, "reasoning_content": reasoning},
+            api_format,
         )
         if calls:
             outcome.tool_only_rounds += 1
@@ -519,8 +537,11 @@ def drive_tool_loop(
             if markers:
                 outcome.textual_tool_intent_detected = True
                 outcome.textual_tool_intent_markers.extend(markers)
-                if text:
-                    conversation.add_assistant_text(text)
+                _append_intermediate_assistant(
+                    conversation,
+                    reasoning=reasoning,
+                    content=content,
+                )
                 if (
                     not textual_repair_pending
                     and consecutive_textual_tool_repairs < budgets.max_textual_tool_repairs
@@ -538,8 +559,11 @@ def drive_tool_loop(
                 )
                 break
             if repetitive:
-                if text:
-                    conversation.add_assistant_text(text)
+                _append_intermediate_assistant(
+                    conversation,
+                    reasoning=reasoning,
+                    content=content,
+                )
                 conversation.add_system_note(_STAGNATION_NOTE)
                 outcome.final_text = text
                 outcome.final_text_source = text_source
@@ -548,7 +572,11 @@ def drive_tool_loop(
                 break
             if finish_reason == "length":
                 if text:
-                    conversation.add_assistant_text(text)
+                    _append_intermediate_assistant(
+                        conversation,
+                        reasoning=reasoning,
+                        content=content,
+                    )
                     outcome.final_text = text
                     outcome.final_text_source = text_source
                     outcome.preserved_truncated_bytes = len(text.encode("utf-8"))
@@ -577,12 +605,12 @@ def drive_tool_loop(
             )
             break
 
-        if text:
-            # Interleaved reasoning text rides along inside the same
-            # assistant turn on the wire; Conversation stores it as a
-            # separate event, which both renderers merge correctly.
-            conversation.add_assistant_text(text)
-        conversation.add_assistant_tool_calls(calls)
+        _append_intermediate_assistant(
+            conversation,
+            reasoning=reasoning,
+            content=content,
+            calls=calls,
+        )
         outcome.tool_calls_issued += len(calls)
 
         # Decide each call's disposition SEQUENTIALLY — dedup (seen_keys) and
@@ -600,9 +628,7 @@ def drive_tool_loop(
             # here, and on failure answer with a repairable error instead of
             # crashing the loop — weak models misquote JSON.
             try:
-                args = json.loads(call["arguments"]) if call["arguments"] else {}
-                if not isinstance(args, dict):
-                    raise ValueError("arguments must be a JSON object")
+                args = decode_native_tool_arguments(call["arguments"])
             except (json.JSONDecodeError, ValueError) as exc:
                 outcome.calls_malformed += 1
                 outcome.calls_rejected += 1
@@ -612,7 +638,7 @@ def drive_tool_loop(
                 )
                 continue
 
-            key = _request_key(call["name"], args)
+            key = native_tool_request_key(call["name"], args)
             round_keys.append(key)
             if key in seen_keys:
                 outcome.calls_duplicated += 1
@@ -672,7 +698,7 @@ def drive_tool_loop(
                 is_error=result.get("status") != "ok",
             )
             if result.get("status") == "ok":
-                key = _request_key(name, args)
+                key = native_tool_request_key(name, args)
                 successful_results[key] = {
                     "tool": result.get("tool", name),
                     "status": "ok",

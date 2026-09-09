@@ -380,6 +380,13 @@ DIFF_FETCHES="$(grep -c '^pr diff' /tmp/testfp_gh_calls.log || true)"
 check "diff fetched exactly once" "$DIFF_FETCHES" "1"
 
 echo ""
+echo "=== Test 15: missing PR identity fails closed as unknown fork state ==="
+mv /tmp/testfp_pr_object.json /tmp/testfp_pr_object.saved.json
+RESULT="$(FORCE_REVIEW=true run_precheck)"
+check "missing PR identity is unknown" "$(echo "$RESULT" | grep '^is_fork_pr=' | head -1 | cut -d= -f2)" "unknown"
+mv /tmp/testfp_pr_object.saved.json /tmp/testfp_pr_object.json
+
+echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 
 if [[ "$FAIL" -gt 0 ]]; then

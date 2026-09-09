@@ -168,7 +168,7 @@ fi
 
 resolve_review_route
 # Exported for the native-loop harness; the loop budget is the same on every
-# route (the route selects the model, not the tool budget — see adaptive_loop_budgets).
+# route; routing selects the model and leaves the configured tool budgets unchanged.
 export REVIEW_ROUTE
 if [[ "$REVIEW_ROUTE" == "primary" ]]; then
   AI_BASE_URL="$PRIMARY_BASE_URL"

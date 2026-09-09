@@ -38,6 +38,22 @@ class ModelRequestError(RuntimeError):
         return self.status is not None and 400 <= self.status < 500
 
 
+def is_model_endpoint_unavailable(exc):
+    """Return true only for transport failures that never reached a provider."""
+    current = exc
+    seen = set()
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        if (
+            isinstance(current, ModelRequestError)
+            and current.status is None
+            and not current.timeout
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 @dataclass
 class StreamingResult:
     """Captured result from a line-oriented curl streaming request."""
@@ -221,7 +237,8 @@ def run_chat_request(
             stderr = stderr[:500] + "...[truncated]"
         raise ModelRequestError(
             f"model request failed with exit code {completed.returncode}"
-            + (f": {stderr}" if stderr else "")
+            + (f": {stderr}" if stderr else ""),
+            timeout=completed.returncode == 28,
         )
 
     output = completed.stdout or ""

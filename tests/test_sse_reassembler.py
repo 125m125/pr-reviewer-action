@@ -21,6 +21,23 @@ def _make_sse_line(data: dict) -> str:
     return f"data: {json.dumps(data)}"
 
 
+def test_openai_preserves_final_cache_and_timing_snapshots_without_double_counting():
+    usage = {"prompt_tokens": 1000, "completion_tokens": 20,
+             "prompt_tokens_details": {"cached_tokens": 900}}
+    chunks = [
+        {"choices": [], "usage": usage, "timings": {"prompt_n": 100, "predicted_n": 10}},
+        {"choices": [], "usage": usage, "timings": {
+            "prompt_n": 100, "prompt_ms": 250, "predicted_n": 20,
+            "predicted_ms": 1000, "draft_n": 30, "draft_n_accepted": 15}},
+        {"choices": [], "usage": None},
+    ]
+    result = reassemble_sse("\n".join(map(_make_sse_line, chunks)), "openai")
+    assert result["usage"]["prompt_tokens"] == 1000
+    assert result["usage"]["prompt_tokens_details"]["cached_tokens"] == 900
+    assert result["timings"]["predicted_n"] == 20
+    assert result["timings"]["draft_n_accepted"] == 15
+
+
 class TestReassembleAnthropic:
     def test_message_start_only(self):
         lines = [
@@ -121,11 +138,11 @@ class TestReassembleOpenAI:
         assert result["usage"]["prompt_tokens"] == 5
         assert result["usage"]["completion_tokens"] == 2
 
-    def test_usage_accumulates_across_chunks(self):
+    def test_usage_uses_latest_cumulative_snapshot(self):
         lines = [
             _make_sse_line({"id": "c", "choices": [{"delta": {"content": "a"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}),
-            _make_sse_line({"id": "c", "choices": [{"delta": {"content": "b"}}], "usage": {"prompt_tokens": 0, "completion_tokens": 1}}),
-            _make_sse_line({"id": "c", "choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 0, "completion_tokens": 1}}),
+            _make_sse_line({"id": "c", "choices": [{"delta": {"content": "b"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 2}}),
+            _make_sse_line({"id": "c", "choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 3}}),
         ]
         result = reassemble_sse("\n".join(lines), "openai")
         assert result["usage"]["prompt_tokens"] == 1

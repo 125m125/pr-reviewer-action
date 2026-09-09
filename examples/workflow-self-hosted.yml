@@ -25,5 +25,14 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           ai_base_url: http://llama-server.internal:8080/v1
           ai_model: qwen3-32b
+          review_strategy: specialists
+          review_policy_file: .github/ai-review-policy.json
+          model_context_tokens: "262144"
+          specialist_review_deadline_sec: "7200"
+          # Raise only after provider capacity and deterministic replay are verified.
+          specialist_concurrency: "1"
+          system_prompt_file: .github/ai-review-prompt.md
+          system_prompt_mode: append
           standards_file: ""
           publish_review_comment: "true"
+          publish_mode: review_comment

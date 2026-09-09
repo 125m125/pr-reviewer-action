@@ -170,6 +170,43 @@ def _validate_endpoint(endpoint, allowed_repos, current_repo):
     return {"full_path": full_path, "repo_key": repo_key}
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def gh_raw_file(endpoint, allowed_repos, request_timeout, max_bytes):
+    """Read bounded raw bytes from the same authorized GitHub contents endpoint."""
+    validated = _validate_endpoint(endpoint, allowed_repos, "")
+    if validated.get("error"):
+        return validated
+    if resolve_platform() != "github":
+        return {"error": "Raw remote-file retrieval is only supported on GitHub"}
+    token = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN", "")
+    if not token:
+        return {"error": "Missing GH_TOKEN"}
+    request = urllib.request.Request(
+        "https://api.github.com" + validated["full_path"],
+        headers={"Authorization": f"Bearer {token}",
+                 "Accept": "application/vnd.github.raw+json",
+                 "User-Agent": "ai-pr-reviewer/1.0"},
+    )
+    try:
+        # Never forward credentials to a download URL or redirected host.
+        with urllib.request.build_opener(_NoRedirect()).open(request, timeout=request_timeout) as response:
+            length = response.headers.get("Content-Length")
+            if length is not None and int(length) > max_bytes:
+                return {"error": f"Remote file exceeds download limit ({max_bytes} bytes)"}
+            content = response.read(max_bytes + 1)
+            if len(content) > max_bytes:
+                return {"error": f"Remote file exceeds download limit ({max_bytes} bytes)"}
+            return {"content": content}
+    except urllib.error.HTTPError as exc:
+        return {"error": f"GitHub raw file error: {exc.code} {exc.reason}"}
+    except Exception:
+        return {"error": "GitHub raw file download failed or timed out"}
+
+
 def _gh_api_github(full_path, request_timeout):
     """Issue a read-only GitHub API request for an already-validated path."""
     token = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN", "")

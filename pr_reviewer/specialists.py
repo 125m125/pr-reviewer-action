@@ -1,32 +1,19 @@
-"""Generic topology and scheduling primitives for specialist PR reviews.
+"""Repository topology and file-role helpers for specialist reviews.
 
-This module deliberately contains no model or GitHub I/O.  It turns repository
-facts and strictly-structured planner/configuration data into a bounded review
-schedule, validates specialist reports, and prepares publishable candidates.
+Planning, scheduling, report validation, and publication belong to the
+specialist session runtime. This module retains only the deterministic
+repository-shape helpers consumed by that runtime.
 """
 
 from __future__ import annotations
 
 import fnmatch
-import json
 import re
 from collections import defaultdict
 from pathlib import Path, PurePosixPath
+import subprocess
 from typing import Any, Iterable
 
-
-BUILTIN_LENSES = {
-    "trust-boundary-security",
-    "state-lifecycle-concurrency",
-    "data-integrity-persistence",
-    "protocol-contract-compatibility",
-    "background-work-retry-idempotency",
-    "resource-boundary-numeric",
-    "generated-build-deployment",
-    "test-observability",
-    "interaction-data-flow",
-    "component-correctness",
-}
 
 MANIFEST_NAMES = {
     "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
@@ -49,10 +36,10 @@ LANGUAGES = {
     ".yaml": "yaml", ".yml": "yaml", ".json": "json", ".xml": "xml",
     ".sh": "shell", ".ps1": "powershell",
 }
+_MAX_CHANGE_FACT_PATHS = 500
+_MAX_LOCAL_PATCH_BYTES = 32_000
+_MAX_CHANGE_ITEMS = 5
 
-PRIORITY_SCORE = {"critical": 40, "high": 30, "normal": 20, "low": 10}
-SEVERITIES = {"blocker", "major", "minor", "info"}
-CATEGORIES = {"bug", "security", "performance", "style", "docs", "question", "other"}
 
 
 def _posix(value: Any) -> str:
@@ -84,6 +71,152 @@ def _slug(value: Any, fallback: str = "focus") -> str:
 def _match(path: str, patterns: Iterable[str]) -> bool:
     path = _posix(path)
     return any(fnmatch.fnmatchcase(path, _posix(pattern)) for pattern in patterns)
+
+
+def _configured_component_for(
+    path: str, configured: Iterable[dict[str, Any]],
+) -> dict[str, Any] | None:
+    return next(
+        (item for item in configured if _match(path, item.get("paths", []))),
+        None,
+    )
+
+
+_TEST_NAME_NOISE = {
+    "src", "source", "test", "tests", "testing", "spec", "specs",
+    "main", "index", "impl", "implementation",
+}
+
+
+def _name_tokens(path: str) -> set[str]:
+    stem = PurePosixPath(path).stem.lower()
+    return {
+        token for token in re.split(r"[^a-z0-9]+", stem)
+        if len(token) > 1 and token not in _TEST_NAME_NOISE
+    }
+
+
+def _relevant_test_paths(
+    changed: list[str],
+    tracked: list[str],
+    configured: list[dict[str, Any]],
+    roots: list[str],
+    recipe_patterns: Iterable[str] = (),
+    *,
+    limit: int = 25,
+) -> list[str]:
+    """Select stable test evidence related to the changed surface."""
+
+    changed_tests = [
+        path for path in changed if "test" in classify_file_roles(path)
+    ]
+    changed_sources = [path for path in changed if path not in changed_tests]
+
+    def component_id(path: str) -> str:
+        configured_component = _configured_component_for(path, configured)
+        if configured_component is not None:
+            return _slug(configured_component.get("id"), "repository")
+        return _slug(_component_for(path, roots) or "repository", "repository")
+
+    changed_components = {component_id(path) for path in changed_sources}
+    changed_tokens = set().union(*(_name_tokens(path) for path in changed_sources)) \
+        if changed_sources else set()
+    changed_first_segments = {
+        path.split("/", 1)[0] for path in changed_sources if "/" in path
+    }
+    ranked: list[tuple[int, str]] = []
+    for path in tracked:
+        if "test" not in classify_file_roles(path):
+            continue
+        if path in changed_tests:
+            rank = 0
+        elif component_id(path) in changed_components:
+            rank = 1
+        elif _match(path, recipe_patterns):
+            rank = 2
+        elif _name_tokens(path).intersection(changed_tokens):
+            rank = 3
+        elif (
+            "/" in path
+            and path.split("/", 1)[0] in changed_first_segments
+        ):
+            rank = 4
+        else:
+            continue
+        ranked.append((rank, path))
+    return [path for _rank, path in sorted(set(ranked))[:limit]]
+
+
+def _change_match(
+    match: object,
+    *,
+    changed: list[str],
+    component_ids: set[str],
+    roles: set[str],
+    risk_flags: set[str],
+) -> bool:
+    if not isinstance(match, dict):
+        return False
+    checks = {
+        "paths_any": lambda values: any(
+            _match(path, values) for path in changed
+        ),
+        "component_ids_any": lambda values: bool(
+            component_ids.intersection(_slug(item) for item in values)
+        ),
+        "file_roles_any": lambda values: bool(roles.intersection(values)),
+        "risk_flags_any": lambda values: bool(risk_flags.intersection(values)),
+    }
+    populated = False
+    for key, check in checks.items():
+        if key not in match:
+            continue
+        populated = True
+        values = match[key] if isinstance(match[key], list) else []
+        if not check(values):
+            return False
+    return populated
+
+
+def _active_recipe_patterns(
+    config: dict[str, Any],
+    *,
+    changed: list[str],
+    component_ids: set[str],
+    roles: set[str],
+    risk_flags: set[str],
+    fields: tuple[str, ...] = ("seed_paths", "related_paths"),
+) -> list[str]:
+    recipes = [
+        item for item in config.get("recipes", []) if isinstance(item, dict)
+    ]
+    active_ids = {
+        str(item.get("id") or "")
+        for item in recipes
+        if _change_match(
+            item.get("match"), changed=changed, component_ids=component_ids,
+            roles=roles, risk_flags=risk_flags,
+        )
+    }
+    for rule in config.get("coverage_rules", []):
+        if not isinstance(rule, dict) or not _change_match(
+            rule, changed=changed, component_ids=component_ids,
+            roles=roles, risk_flags=risk_flags,
+        ):
+            continue
+        active_ids.update(
+            str(item) for item in rule.get("required_recipe_ids", [])
+        )
+    patterns: list[str] = []
+    for recipe in recipes:
+        if str(recipe.get("id") or "") not in active_ids:
+            continue
+        for key in fields:
+            for pattern in recipe.get(key, []):
+                normalized = _posix(pattern)
+                if normalized and normalized not in patterns:
+                    patterns.append(normalized)
+    return patterns
 
 
 def classify_file_roles(path: str) -> list[str]:
@@ -143,15 +276,297 @@ def _component_for(path: str, roots: list[str]) -> str:
     return first
 
 
+def _change_type(status: object) -> str:
+    return {
+        "a": "adds",
+        "added": "adds",
+        "c": "adds",
+        "copied": "adds",
+        "d": "removes",
+        "removed": "removes",
+        "m": "modifies",
+        "modified": "modifies",
+        "r": "modifies",
+        "renamed": "modifies",
+        "t": "modifies",
+    }.get(str(status or "").strip().lower(), "modifies")
+
+
+def _clean_fact_text(value: object, *, limit: int = 160) -> str:
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    return " ".join(text.split())[:limit]
+
+
+def _facts_from_patch(
+    path: str,
+    status: object,
+    patch: object,
+    *,
+    include_intent: bool = False,
+) -> dict[str, object]:
+    symbols: list[str] = []
+    hunk_summaries: list[str] = []
+    action_inputs: list[str] = []
+    workflow_steps: list[str] = []
+    workflow_keys: list[str] = []
+    headings: list[str] = []
+    change_excerpts: list[str] = []
+    action_section = ""
+    lines = patch.splitlines() if isinstance(patch, str) else ()
+    for line in lines:
+        hunk_match = re.match(
+            r"^@@\s+-\d+(?:,\d+)?\s+\+(\d+)(?:,(\d+))?\s+@@\s*(.*)$",
+            line,
+        )
+        if hunk_match and len(hunk_summaries) < _MAX_CHANGE_ITEMS:
+            start = int(hunk_match.group(1))
+            count = int(hunk_match.group(2) or "1")
+            if count == 0:
+                line_label = (
+                    f"deletion-only hunk near new-file line {start} "
+                    "(no new lines)"
+                )
+            elif count == 1:
+                line_label = f"changed hunk at new-file line {start}"
+            else:
+                line_label = (
+                    f"changed hunk at new-file lines {start}-{start + count - 1}"
+                )
+            context = re.sub(
+                r"[^A-Za-z0-9 _().,:/+[\]-]+", " ",
+                hunk_match.group(3),
+            )
+            context = " ".join(context.split())[:120]
+            hunk_summaries.append(
+                f"{line_label}: {context}" if context else line_label
+            )
+            if path.endswith(".py"):
+                context_symbol = re.match(
+                    r"\s*(?:async\s+)?(?:def|class)\s+"
+                    r"([A-Za-z_][A-Za-z0-9_]*)",
+                    hunk_match.group(3),
+                )
+                if context_symbol and context_symbol.group(1) not in symbols:
+                    symbols.append(context_symbol.group(1))
+        yaml_line = line[1:] if line[:1] in {"+", "-", " "} else line
+        if path in {"action.yml", "action.yaml"}:
+            section_match = re.match(
+                r"^(inputs|outputs|runs|branding):\s*$", yaml_line,
+            )
+            if section_match:
+                action_section = section_match.group(1)
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        added = line[1:]
+        symbol_match = re.match(
+            r"\s*(?:async\s+)?(?:def|class|function)\s+"
+            r"([A-Za-z_][A-Za-z0-9_]*)",
+            added,
+        )
+        if symbol_match and symbol_match.group(1) not in symbols:
+            symbols.append(symbol_match.group(1))
+        if path in {"action.yml", "action.yaml"} and action_section == "inputs":
+            input_match = re.match(
+                r"\s{2}([A-Za-z_][A-Za-z0-9_-]*):\s*$", added,
+            )
+            if input_match and input_match.group(1) not in {
+                "name", "description", "inputs", "outputs", "runs", "branding",
+            } and input_match.group(1) not in action_inputs:
+                action_inputs.append(input_match.group(1))
+        if path.startswith(".github/workflows/"):
+            step_match = re.match(r"\s*-\s+name:\s*(.+?)\s*$", added)
+            if step_match:
+                step = re.sub(
+                    r"[^A-Za-z0-9 .:/+_-]+", " ",
+                    step_match.group(1).strip("'\""),
+                )
+                step = " ".join(step.split())[:120]
+                if step and step not in workflow_steps:
+                    workflow_steps.append(step)
+            key_match = re.match(
+                r"\s*(?:-\s+)?([A-Za-z_][A-Za-z0-9_-]*):(?:\s|$)",
+                added,
+            )
+            if (
+                key_match
+                and key_match.group(1) not in workflow_keys
+                and len(workflow_keys) < _MAX_CHANGE_ITEMS
+            ):
+                workflow_keys.append(key_match.group(1))
+        if include_intent and path.lower().endswith((".md", ".adoc", ".asciidoc")):
+            heading_match = (
+                re.match(r"\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", added)
+                if path.lower().endswith(".md")
+                else re.match(r"={1,6}\s+(.+?)\s*$", added)
+            )
+            if heading_match:
+                heading = _clean_fact_text(heading_match.group(1))
+                if heading and heading not in headings:
+                    headings.append(heading)
+            else:
+                excerpt = _clean_fact_text(added)
+                if excerpt and excerpt not in change_excerpts:
+                    change_excerpts.append(excerpt)
+    result: dict[str, object] = {
+        "symbols": symbols[:_MAX_CHANGE_ITEMS],
+        "hunk_summaries": hunk_summaries[:_MAX_CHANGE_ITEMS],
+        "action_inputs": action_inputs[:_MAX_CHANGE_ITEMS],
+        "workflow_steps": workflow_steps[:_MAX_CHANGE_ITEMS],
+        "change_type": _change_type(status),
+    }
+    if include_intent:
+        result.update({
+            "workflow_keys": workflow_keys[:_MAX_CHANGE_ITEMS],
+            "headings": headings[:_MAX_CHANGE_ITEMS],
+            "change_excerpts": change_excerpts[:_MAX_CHANGE_ITEMS],
+        })
+    return result
+
+
+def build_change_facts(
+    workspace: Path | str,
+    base_sha: str,
+    head_sha: str,
+    changed_paths: Iterable[str],
+) -> dict[str, object]:
+    """Build bounded semantic facts from the immutable local review range."""
+    if (
+        re.fullmatch(r"[0-9a-fA-F]{40,64}", str(base_sha or "")) is None
+        or re.fullmatch(r"[0-9a-fA-F]{40,64}", str(head_sha or "")) is None
+    ):
+        raise ValueError("change facts require full base and head object IDs")
+    root = Path(workspace)
+    all_paths = tuple(dict.fromkeys(
+        path for path in (_posix(item) for item in changed_paths) if path
+    ))
+    paths = all_paths[:_MAX_CHANGE_FACT_PATHS]
+    try:
+        status_result = subprocess.run(
+            [
+                "git", "diff", "--name-status", "--find-renames",
+                f"{base_sha}...{head_sha}", "--",
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return {
+            "facts": {},
+            "bounded": True,
+            "path_limit": _MAX_CHANGE_FACT_PATHS,
+            "included_path_count": 0,
+            "omitted_path_count": len(all_paths),
+            "failed_path_count": 0,
+            "status": "degraded",
+            "failures": [{
+                "scope": "range",
+                "reason": "immutable diff command unavailable",
+            }],
+        }
+    if status_result.returncode != 0:
+        return {
+            "facts": {},
+            "bounded": True,
+            "path_limit": _MAX_CHANGE_FACT_PATHS,
+            "included_path_count": 0,
+            "omitted_path_count": len(all_paths),
+            "failed_path_count": 0,
+            "status": "degraded",
+            "failures": [{
+                "scope": "range",
+                "reason": "immutable diff range unavailable",
+            }],
+        }
+    local_status: dict[str, str] = {}
+    for line in status_result.stdout.splitlines():
+        columns = line.split("\t")
+        if len(columns) < 2:
+            continue
+        status = columns[0][:1]
+        path = _posix(columns[-1])
+        if path:
+            local_status[path] = status
+    facts: dict[str, dict[str, object]] = {}
+    failures: list[dict[str, str]] = []
+    for path in paths:
+        if path not in local_status:
+            failures.append({
+                "scope": "path",
+                "path": path,
+                "reason": "immutable diff path unavailable",
+            })
+            continue
+        try:
+            result = subprocess.run(
+                [
+                    "git", "diff", "--no-ext-diff", "--no-color",
+                    "--find-renames", "--unified=3",
+                    f"{base_sha}...{head_sha}", "--", path,
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError:
+            failures.append({
+                "scope": "path",
+                "path": path,
+                "reason": "immutable diff command unavailable",
+            })
+            continue
+        if result.returncode != 0:
+            failures.append({
+                "scope": "path",
+                "path": path,
+                "reason": "immutable diff command failed",
+            })
+            continue
+        patch = result.stdout
+        if not patch.strip():
+            failures.append({
+                "scope": "path",
+                "path": path,
+                "reason": "immutable diff path unavailable",
+            })
+            continue
+        patch = patch.encode("utf-8")[:_MAX_LOCAL_PATCH_BYTES].decode(
+            "utf-8", errors="replace",
+        )
+        facts[path] = _facts_from_patch(
+            path,
+            local_status.get(path, "modified"),
+            patch,
+            include_intent=True,
+        )
+    return {
+        "facts": facts,
+        "bounded": True,
+        "path_limit": _MAX_CHANGE_FACT_PATHS,
+        "included_path_count": len(facts),
+        "omitted_path_count": len(all_paths) - len(facts),
+        "failed_path_count": len(failures),
+        "status": "degraded" if failures else "ok",
+        "failures": failures,
+    }
+
+
 def build_topology(
     pr_files: list[dict[str, Any]],
     classification: dict[str, Any] | None,
     tracked_paths: Iterable[str],
     config: dict[str, Any] | None = None,
     workspace_paths: Iterable[str] | None = None,
+    change_facts: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     classification = classification or {}
-    config = config or empty_config()
+    config = config or {}
     changed = [_posix(item.get("filename")) for item in pr_files if item.get("filename")]
     tracked = [_posix(path) for path in tracked_paths]
     present = set(tracked) | {_posix(path) for path in (workspace_paths or [])}
@@ -161,9 +576,7 @@ def build_topology(
     path_component: dict[str, str] = {}
 
     for path in changed:
-        configured_component = next(
-            (item for item in configured if _match(path, item.get("paths", []))), None
-        )
+        configured_component = _configured_component_for(path, configured)
         root = _component_for(path, roots)
         component_id = (
             configured_component["id"] if configured_component else _slug(root or "repository", "repository")
@@ -180,6 +593,11 @@ def build_topology(
             "contracts": [],
             "invariants": [],
             "configured": bool(configured_component),
+            "path_patterns": (
+                [_posix(item) for item in configured_component.get("paths", [])]
+                if configured_component
+                else ([f"{root}/**"] if root else ["**"])
+            ),
         })
         entry["changed_files"].append(path)
         suffix = PurePosixPath(path).suffix.lower()
@@ -193,13 +611,60 @@ def build_topology(
             for field in ("responsibilities", "related_components", "contracts", "invariants"):
                 entry[field] = _strings(configured_component.get(field))
 
+    changed_roles = {
+        role for component in components.values() for role in component["file_roles"]
+    }
+    active_recipe_patterns = _active_recipe_patterns(
+        config,
+        changed=changed,
+        component_ids=set(components),
+        roles=changed_roles,
+        risk_flags=set(_strings(classification.get("risk_flags"))),
+    )
+    active_recipe_related_patterns = _active_recipe_patterns(
+        config,
+        changed=changed,
+        component_ids=set(components),
+        roles=changed_roles,
+        risk_flags=set(_strings(classification.get("risk_flags"))),
+        fields=("related_paths",),
+    )
+    configured_by_id = {
+        str(item.get("id") or ""): item for item in configured
+    }
+
+    def recipe_activates_target(target: str) -> bool:
+        target_component = configured_by_id.get(target)
+        if target_component is None or not active_recipe_related_patterns:
+            return False
+        target_paths = target_component.get("paths", [])
+        return any(
+            _match(path, target_paths)
+            and _match(path, active_recipe_related_patterns)
+            for path in tracked
+        )
+
     relationships: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for component in components.values():
         for target in component["related_components"]:
             key = (component["id"], target, "configured")
             if key not in seen:
-                relationships.append({"source": key[0], "target": key[1], "reason": key[2]})
+                both_changed = target in components
+                recipe_active = recipe_activates_target(target)
+                active = both_changed or recipe_active
+                relationships.append({
+                    "source": key[0], "target": key[1], "reason": key[2],
+                    "active": active,
+                    "activation_reason": (
+                        "both-components-changed"
+                        if both_changed
+                        else (
+                            "active-recipe-path" if recipe_active
+                            else "orientation-only"
+                        )
+                    ),
+                })
                 seen.add(key)
 
     contract_components = [
@@ -219,16 +684,40 @@ def build_topology(
                 reason = "shared contract identity" if shared_identity else "changed contract consumer/producer"
                 key = (contract["id"], target_id, reason)
                 if key not in seen:
-                    relationships.append({"source": key[0], "target": key[1], "reason": key[2]})
+                    relationships.append({
+                        "source": key[0], "target": key[1], "reason": key[2],
+                        "active": True,
+                        "activation_reason": "both-components-changed",
+                    })
                     seen.add(key)
 
     all_roles = sorted({role for item in components.values() for role in item["file_roles"]})
     all_languages = sorted({lang for item in components.values() for lang in item["languages"]})
-    available_role_paths: dict[str, list[str]] = defaultdict(list)
+    role_counts: dict[str, int] = defaultdict(int)
+    role_components: dict[str, set[str]] = defaultdict(set)
     for path in tracked:
         for role in classify_file_roles(path):
-            if len(available_role_paths[role]) < 25:
-                available_role_paths[role].append(path)
+            role_counts[role] += 1
+            configured_component = _configured_component_for(path, configured)
+            component_id = _slug(
+                configured_component.get("id")
+                if configured_component is not None
+                else (_component_for(path, roots) or "repository"),
+                "repository",
+            )
+            role_components[role].add(component_id)
+    relevant_tests = _relevant_test_paths(
+        changed, tracked, configured, roots,
+        active_recipe_patterns,
+    )
+    available_role_paths = {"test": relevant_tests} if relevant_tests else {}
+    role_availability = {
+        role: {
+            "count": role_counts[role],
+            "component_ids": sorted(role_components[role]),
+        }
+        for role in sorted(role_counts)
+    }
     generated_artifacts = []
     configured_artifacts = config.get("generated_artifacts", [])
     if configured_artifacts:
@@ -253,7 +742,29 @@ def build_topology(
             "generator_config": [_posix(v) for v in artifact.get("generator_config", [])][:20],
             "output_paths": [_posix(v) for v in outputs][:20],
         })
-    return {
+    changed_contract_facts: dict[str, dict[str, object]] = {}
+    immutable_facts_value = (
+        change_facts.get("facts", {})
+        if isinstance(change_facts, dict)
+        else {}
+    )
+    immutable_facts = (
+        immutable_facts_value
+        if isinstance(immutable_facts_value, dict)
+        else {}
+    )
+    for item in pr_files:
+        path = _posix(item.get("filename"))
+        patch = item.get("patch")
+        if not path:
+            continue
+        local = immutable_facts.get(path)
+        changed_contract_facts[path] = (
+            dict(local)
+            if isinstance(local, dict)
+            else _facts_from_patch(path, item.get("status"), patch)
+        )
+    topology = {
         "changed_files": changed,
         "components": list(components.values()),
         "path_components": path_component,
@@ -261,609 +772,24 @@ def build_topology(
         "languages": all_languages,
         "relationships": relationships,
         "available_role_paths": dict(available_role_paths),
+        "role_availability": role_availability,
         "risk_flags": _strings(classification.get("risk_flags")),
         "pr_kind": str(classification.get("pr_kind") or "unknown"),
         "generated_artifacts": generated_artifacts,
+        "changed_contract_facts": changed_contract_facts,
     }
-
-
-def empty_config() -> dict[str, Any]:
-    return {"version": 1, "components": [], "recipes": [], "generated_artifacts": [], "exclude": {
-        "paths": [], "components": [], "lenses": [], "recipes": [],
-    }}
-
-
-def load_specialist_config(path: str | Path) -> dict[str, Any]:
-    candidate = Path(path)
-    if not candidate.is_file():
-        return empty_config()
-    data = json.loads(candidate.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or data.get("version") != 1:
-        raise ValueError("specialist config must be a JSON object with version 1")
-    result = empty_config()
-    for raw in data.get("components", []):
-        if not isinstance(raw, dict) or not raw.get("id"):
-            raise ValueError("every specialist component requires an id")
-        result["components"].append({
-            "id": _slug(raw["id"]),
-            "paths": [_posix(v) for v in _strings(raw.get("paths"), limit=100)],
-            "responsibilities": _strings(raw.get("responsibilities")),
-            "related_components": [_slug(v) for v in _strings(raw.get("related_components"))],
-            "contracts": _strings(raw.get("contracts")),
-            "invariants": _strings(raw.get("invariants")),
-        })
-    for raw in data.get("recipes", []):
-        if not isinstance(raw, dict) or not raw.get("id"):
-            raise ValueError("every specialist recipe requires an id")
-        match = raw.get("match") if isinstance(raw.get("match"), dict) else {}
-        result["recipes"].append({
-            "id": _slug(raw["id"]),
-            "match": {
-                key: _strings(match.get(key), limit=100)
-                for key in ("paths_any", "component_ids_any", "risk_flags_any", "file_roles_any")
-                if _strings(match.get(key), limit=100)
-            },
-            "title": str(raw.get("title") or raw["id"])[:160],
-            "objective": str(raw.get("objective") or "Review the matched change for correctness.")[:1000],
-            "lenses": [_slug(v) for v in _strings(raw.get("lenses"))],
-            "seed_paths": [_posix(v) for v in _strings(raw.get("seed_paths"), limit=100)],
-            "related_paths": [_posix(v) for v in _strings(raw.get("related_paths"), limit=100)],
-            "invariants": _strings(raw.get("invariants")),
-            "expected_evidence": _strings(raw.get("expected_evidence")),
-            "priority": _priority(raw.get("priority")),
-            "source": "recipe",
-        })
-    for raw in data.get("generated_artifacts", []):
-        if not isinstance(raw, dict) or not raw.get("id"):
-            raise ValueError("every generated artifact requires an id")
-        result["generated_artifacts"].append({
-            "id": _slug(raw["id"]),
-            "source_of_truth": [_posix(v) for v in _strings(raw.get("source_of_truth"), limit=50)],
-            "generator_config": [_posix(v) for v in _strings(raw.get("generator_config"), limit=50)],
-            "output_paths": [_posix(v) for v in _strings(raw.get("output_paths"), limit=50)],
-        })
-    exclude = data.get("exclude") if isinstance(data.get("exclude"), dict) else {}
-    result["exclude"] = {
-        "paths": [_posix(v) for v in _strings(exclude.get("paths"), limit=100)],
-        "components": [_slug(v) for v in _strings(exclude.get("components"), limit=100)],
-        "lenses": [_slug(v) for v in _strings(exclude.get("lenses"), limit=100)],
-        "recipes": [_slug(v) for v in _strings(exclude.get("recipes"), limit=100)],
-    }
-    return result
-
-
-def _priority(value: Any) -> str:
-    candidate = str(value or "normal").strip().lower()
-    return candidate if candidate in PRIORITY_SCORE else "normal"
-
-
-def normalize_focus(raw: Any, *, source: str = "planner", index: int = 0) -> dict[str, Any] | None:
-    if not isinstance(raw, dict):
-        return None
-    title = str(raw.get("title") or raw.get("id") or raw.get("name") or "").strip()[:160]
-    objective = str(raw.get("objective") or "").strip()[:1000]
-    if not title or not objective:
-        return None
-    focus_id = _slug(raw.get("id") or title, f"focus-{index + 1}")
-    lenses = raw.get("lenses")
-    if lenses is None and raw.get("lens") is not None:
-        lenses = [raw["lens"]]
-    return {
-        "id": focus_id,
-        "title": title,
-        "objective": objective,
-        "rationale": str(raw.get("rationale") or "")[:1000],
-        "lenses": [_slug(v) for v in _strings(lenses, limit=20)],
-        "seed_paths": [_posix(v) for v in _strings(raw.get("seed_paths"), limit=100)],
-        "related_paths": [_posix(v) for v in _strings(raw.get("related_paths"), limit=100)],
-        "related_symbols": _strings(raw.get("related_symbols"), limit=100, chars=200),
-        "invariants": _strings(raw.get("invariants"), limit=50),
-        "expected_evidence": _strings(raw.get("expected_evidence"), limit=50, chars=200),
-        "priority": _priority(raw.get("priority")),
-        "source": source,
-        "source_ids": _strings(raw.get("source_ids"), limit=20) or [focus_id],
-    }
-
-
-def validate_planner_plan(raw: Any) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise ValueError("planner output must be a JSON object")
-    focuses = []
-    for index, item in enumerate(raw.get("focuses", [])):
-        focus = normalize_focus(item, index=index)
-        if focus:
-            focuses.append(focus)
-    if not focuses:
-        raise ValueError("planner output did not contain a valid focus")
-    return {
-        "summary": str(raw.get("summary") or "")[:2000],
-        "focuses": focuses,
-        "coverage_notes": _strings(raw.get("coverage_notes"), limit=50),
-    }
-
-
-def _recipe_matches(recipe: dict[str, Any], topology: dict[str, Any]) -> bool:
-    match = recipe.get("match", {})
-    changed = topology.get("changed_files", [])
-    component_ids = {item["id"] for item in topology.get("components", [])}
-    values = {
-        "paths_any": lambda wanted: any(_match(path, wanted) for path in changed),
-        "component_ids_any": lambda wanted: bool(component_ids.intersection(map(_slug, wanted))),
-        "risk_flags_any": lambda wanted: bool(set(topology.get("risk_flags", [])).intersection(wanted)),
-        "file_roles_any": lambda wanted: bool(set(topology.get("file_roles", [])).intersection(wanted)),
-    }
-    return all(values[key](wanted) for key, wanted in match.items() if key in values)
-
-
-def recipe_focuses(config: dict[str, Any], topology: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        normalize_focus(item, source="recipe", index=index)
-        for index, item in enumerate(config.get("recipes", []))
-        if _recipe_matches(item, topology)
-    ]
-
-
-def deterministic_focuses(topology: dict[str, Any]) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    risk_flags = topology.get("risk_flags", [])
-    if risk_flags:
-        result.append(normalize_focus({
-            "id": "risk-boundaries",
-            "title": "Risk and trust-boundary verification",
-            "objective": "Trace the concrete behavior behind every deterministic risk flag and look for exploitable or destructive failure paths.",
-            "rationale": "Deterministic classification identified: " + ", ".join(risk_flags),
-            "lenses": ["trust-boundary-security", "resource-boundary-numeric"],
-            "seed_paths": topology.get("changed_files", []),
-            "invariants": ["risk checks are supported by concrete implementation evidence"],
-            "expected_evidence": ["changed implementation", "callers", "tests"],
-            "priority": "critical",
-        }, source="deterministic"))
-
-    for component in topology.get("components", []):
-        roles = set(component.get("file_roles", []))
-        lenses = ["component-correctness", "test-observability"]
-        invariants = list(component.get("invariants", []))
-        if "messaging" in roles:
-            lenses.append("background-work-retry-idempotency")
-            invariants.append("asynchronous work has correct acknowledgement, retry, and duplicate behavior")
-        if roles.intersection({"persistence", "migration"}):
-            lenses.append("data-integrity-persistence")
-            invariants.append("writes, reads, schema, and transaction boundaries remain consistent")
-        if "schema-contract" in roles:
-            lenses.append("protocol-contract-compatibility")
-            invariants.append("contract names, argument order, limits, and generated consumers agree")
-        if roles.intersection({"deployment", "build-manifest", "generated"}):
-            lenses.append("generated-build-deployment")
-        result.append(normalize_focus({
-            "id": f"component-{component['id']}",
-            "title": f"{component['id']} component correctness",
-            "objective": "Review the changed behavior in this component and trace material callers, dependencies, failure paths, and tests.",
-            "rationale": "Deterministic topology fallback for a changed component.",
-            "lenses": lenses,
-            "seed_paths": component.get("changed_files", []),
-            "related_symbols": component.get("responsibilities", []),
-            "invariants": invariants,
-            "expected_evidence": ["changed implementation", "material callers or dependencies", "relevant tests"],
-            "priority": "normal",
-        }, source="deterministic"))
-
-    if len(topology.get("components", [])) > 1 or topology.get("relationships"):
-        result.append(normalize_focus({
-            "id": "component-interactions",
-            "title": "Changed component interactions",
-            "objective": "Trace values, identity, units, ordering, lifecycle, and errors across the changed component boundaries.",
-            "rationale": "The topology contains multiple changed components or an explicit relationship.",
-            "lenses": ["interaction-data-flow", "protocol-contract-compatibility"],
-            "seed_paths": topology.get("changed_files", []),
-            "invariants": ["the same semantic value keeps its identity, order, unit, limit, and failure meaning across boundaries"],
-            "expected_evidence": ["at least two participating components or one component and its contract"],
-            "priority": "high",
-        }, source="deterministic"))
-    return [item for item in result if item]
-
-
-def apply_exclusions(
-    focuses: Iterable[dict[str, Any]], config: dict[str, Any], topology: dict[str, Any]
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    exclude = config.get("exclude", {})
-    paths = exclude.get("paths", [])
-    components = set(exclude.get("components", []))
-    lenses = set(exclude.get("lenses", []))
-    recipes = set(exclude.get("recipes", []))
-    path_components = topology.get("path_components", {})
-    kept: list[dict[str, Any]] = []
-    applied: list[dict[str, Any]] = []
-    for original in focuses:
-        focus = dict(original)
-        if focus.get("source") == "recipe" and focus.get("id") in recipes:
-            applied.append({"focus": focus["id"], "recipe": focus["id"], "dropped": True})
+    changed_line_counts: list[int] = []
+    for item in pr_files:
+        if not item.get("filename"):
             continue
-        removed_lenses = [lens for lens in focus.get("lenses", []) if lens in lenses]
-        focus["lenses"] = [lens for lens in focus.get("lenses", []) if lens not in lenses]
-        seed = []
-        removed_paths = []
-        for path in focus.get("seed_paths", []):
-            component = path_components.get(path)
-            if _match(path, paths) or component in components:
-                removed_paths.append(path)
-            else:
-                seed.append(path)
-        focus["seed_paths"] = seed
-        if removed_lenses or removed_paths:
-            applied.append({"focus": focus["id"], "lenses": removed_lenses, "paths": removed_paths})
-        if (original.get("seed_paths") and not seed) or (original.get("lenses") and not focus["lenses"]):
-            applied.append({"focus": focus["id"], "dropped": True})
-            continue
-        kept.append(focus)
-    return kept, applied
-
-
-def schedule_focuses(
-    planner: Iterable[dict[str, Any]],
-    recipes: Iterable[dict[str, Any]],
-    fallback: Iterable[dict[str, Any]],
-    config: dict[str, Any],
-    topology: dict[str, Any],
-    max_passes: int,
-) -> dict[str, Any]:
-    candidates = [item for item in [*planner, *recipes, *fallback] if item]
-    candidates, exclusions = apply_exclusions(candidates, config, topology)
-    merged: list[dict[str, Any]] = []
-    merge_decisions: list[dict[str, Any]] = []
-    for focus in candidates:
-        target = next((item for item in merged if _focuses_substantially_overlap(
-            item, focus, topology)), None)
-        if target is None:
-            merged.append(dict(focus))
-            continue
-        absorbed_id = focus["id"]
-        for field, limit in (("lenses", 20), ("seed_paths", 30), ("related_paths", 30),
-                             ("related_symbols", 40), ("invariants", 40),
-                             ("expected_evidence", 40), ("source_ids", 20)):
-            target[field] = list(dict.fromkeys(
-                [*target.get(field, []), *focus.get(field, [])]
-            ))[:limit]
-        if PRIORITY_SCORE[focus["priority"]] > PRIORITY_SCORE[target["priority"]]:
-            target["priority"] = focus["priority"]
-        target["sources"] = list(dict.fromkeys([
-            *target.get("sources", [target.get("source")]), focus.get("source")
-        ]))
-        merge_decisions.append({
-            "kept": target["id"], "merged": absorbed_id,
-            "source_ids": target["source_ids"],
-            "reason": "substantial shared component/path and investigation ownership",
-        })
-
-    selected: list[dict[str, Any]] = []
-    remaining = list(merged)
-    covered: set[str] = set()
-    selection_log: list[dict[str, Any]] = []
-    exhausted_marginal_coverage = False
-    while remaining and len(selected) < max_passes:
-        scored = [(_marginal_focus_score(item, topology, covered), item) for item in remaining]
-        score, chosen = max(scored, key=lambda pair: (pair[0],
-                                                       PRIORITY_SCORE[pair[1]["priority"]],
-                                                       pair[1]["source"] == "planner",
-                                                       pair[1]["id"]))
-        if score <= 0:
-            exhausted_marginal_coverage = True
+        additions = item.get("additions")
+        deletions = item.get("deletions")
+        if not all(isinstance(value, int) and value >= 0 for value in (additions, deletions)):
+            changed_line_counts = []
             break
-        features = _focus_features(chosen, topology)
-        chosen = dict(chosen)
-        chosen["marginal_coverage_score"] = score
-        chosen["coverage_features"] = sorted(features)
-        selected.append(chosen)
-        newly_covered = features - covered
-        covered.update(features)
-        remaining.remove(next(item for item in remaining if item["id"] == chosen["id"]))
-        selection_log.append({"focus": chosen["id"], "score": score,
-                              "new_features": sorted(newly_covered),
-                              "reason": "highest marginal uncovered coverage"})
-
-    omitted = []
-    for item in remaining:
-        candidate = dict(item)
-        candidate["marginal_coverage_score"] = _marginal_focus_score(item, topology, covered)
-        candidate["omission_reason"] = (
-            "no positive marginal coverage" if exhausted_marginal_coverage
-            else "pass limit reached after higher marginal coverage focuses"
-        )
-        omitted.append(candidate)
-    return {
-        "selected": selected,
-        "omitted": omitted,
-        "applied_exclusions": exclusions,
-        "merge_decisions": merge_decisions,
-        "selection_log": selection_log,
-    }
-
-
-_FOCUS_STOP = {"the", "and", "for", "from", "with", "into", "review", "trace",
-               "verify", "change", "changed", "behavior", "correctness", "component"}
-
-
-def _focus_terms(focus: dict[str, Any]) -> set[str]:
-    value = " ".join(str(focus.get(field) or "") for field in
-                     ("title", "objective", "rationale"))
-    return {word for word in re.findall(r"[a-z0-9]+", value.lower())
-            if len(word) >= 4 and word not in _FOCUS_STOP}
-
-
-def _focus_components(focus: dict[str, Any], topology: dict[str, Any]) -> set[str]:
-    result: set[str] = set()
-    for path in topology.get("changed_files", []):
-        if _match(path, [*focus.get("seed_paths", []), *focus.get("related_paths", [])]):
-            component = topology.get("path_components", {}).get(path)
-            if component:
-                result.add(component)
-    component_ids = {item.get("id") for item in topology.get("components", [])}
-    result.update(set(focus.get("related_symbols", [])).intersection(component_ids))
-    return result
-
-
-def _focuses_substantially_overlap(left: dict[str, Any], right: dict[str, Any],
-                                    topology: dict[str, Any]) -> bool:
-    lenses = set(left.get("lenses", [])) & set(right.get("lenses", []))
-    paths = set(left.get("seed_paths", [])) & set(right.get("seed_paths", []))
-    components = _focus_components(left, topology) & _focus_components(right, topology)
-    symbols = set(left.get("related_symbols", [])) & set(right.get("related_symbols", []))
-    terms_a, terms_b = _focus_terms(left), _focus_terms(right)
-    term_ratio = len(terms_a & terms_b) / max(1, min(len(terms_a), len(terms_b)))
-    invariants_a = {word for value in left.get("invariants", []) for word in re.findall(r"[a-z0-9]+", value.lower())}
-    invariants_b = {word for value in right.get("invariants", []) for word in re.findall(r"[a-z0-9]+", value.lower())}
-    invariant_overlap = len((invariants_a & invariants_b) - _FOCUS_STOP) >= 2
-    # A shared boundary is not enough: distinct persistence identity and
-    # protocol propagation ownership remain separate without lens/invariant similarity.
-    ownership_overlap = bool(lenses) or term_ratio >= 0.45 or invariant_overlap
-    scope_overlap = bool(paths or components or symbols)
-    return scope_overlap and ownership_overlap and sum((bool(lenses), bool(paths),
-                                                        bool(components), bool(symbols),
-                                                        term_ratio >= 0.45,
-                                                        invariant_overlap)) >= 3
-
-
-def _focus_features(focus: dict[str, Any], topology: dict[str, Any]) -> set[str]:
-    features = {f"component:{item}" for item in _focus_components(focus, topology)}
-    features.update(f"lens:{item}" for item in focus.get("lenses", []))
-    features.update(f"invariant:{item}" for item in _focus_terms({
-        "title": " ".join(focus.get("invariants", [])), "objective": "", "rationale": ""
-    }))
-    components = _focus_components(focus, topology)
-    for rel in topology.get("relationships", []):
-        if rel.get("source") in components or rel.get("target") in components:
-            features.add(f"relationship:{rel.get('source')}->{rel.get('target')}")
-    for flag in topology.get("risk_flags", []):
-        if "trust-boundary-security" in focus.get("lenses", []) or flag.lower() in " ".join(_focus_terms(focus)):
-            features.add(f"risk:{flag}")
-    if "component-correctness" in focus.get("lenses", []):
-        features.add("role:broad-scout")
-    if focus.get("source") == "recipe":
-        features.add(f"recipe:{focus['id']}")
-    return features
-
-
-def _marginal_focus_score(focus: dict[str, Any], topology: dict[str, Any],
-                          covered: set[str]) -> int:
-    features = _focus_features(focus, topology)
-    new = features - covered
-    weights = {"component": 16, "relationship": 15, "lens": 10, "risk": 14,
-               "invariant": 5, "recipe": 4, "role": 5}
-    score = PRIORITY_SCORE[focus["priority"]]
-    score += sum(weights.get(item.split(":", 1)[0], 2) for item in new)
-    score -= sum(4 for item in features & covered)
-    return score
-
-
-def normalize_specialist_report(raw: Any, focus: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise ValueError("specialist report must be a JSON object")
-    findings = []
-    for item in raw.get("findings", []):
-        if not isinstance(item, dict):
-            continue
-        claim = str(item.get("claim") or item.get("message") or "").strip()[:2000]
-        evidence = _strings(item.get("evidence"), limit=20, chars=2000)
-        causal = str(item.get("causal_chain") or "").strip()[:2000]
-        if not claim or not evidence or not causal:
-            continue
-        severity = str(item.get("severity") or "info").lower()
-        category = str(item.get("category") or "other").lower()
-        line = item.get("line")
-        findings.append({
-            "severity": severity if severity in SEVERITIES else "info",
-            "category": category if category in CATEGORIES else "other",
-            "file": _posix(item.get("file")) or None,
-            "line": line if isinstance(line, int) and line > 0 else None,
-            "claim": claim,
-            "evidence": evidence,
-            "causal_chain": causal,
-            "focus_id": focus["id"],
-        })
-    inspected = [_posix(v) for v in _strings(raw.get("inspected_files"), limit=200)]
-    return {
-        "domain": str(raw.get("domain") or focus["id"])[:160],
-        "completion_status": "complete" if raw.get("completion_status") == "complete" else "incomplete",
-        "inspected_files": inspected,
-        "unchecked_material_files": [_posix(v) for v in _strings(raw.get("unchecked_material_files"), limit=200)],
-        "invariants_checked": _strings(raw.get("invariants_checked"), limit=100),
-        "findings": findings,
-        "unknowns": _strings(raw.get("unknowns"), limit=100),
-    }
-
-
-def coverage_gaps(focus: dict[str, Any], report: dict[str, Any], topology: dict[str, Any]) -> list[str]:
-    gaps: list[str] = []
-    inspected = report.get("inspected_files", [])
-    for pattern in focus.get("seed_paths", []):
-        concrete = [path for path in topology.get("changed_files", []) if _match(path, [pattern])]
-        if concrete and not any(path in inspected for path in concrete):
-            gaps.append(f"inspect at least one seed file matching {pattern}")
-        elif not concrete and pattern in topology.get("changed_files", []) and pattern not in inspected:
-            gaps.append(f"inspect seed file {pattern}")
-    if "interaction-data-flow" in focus.get("lenses", []):
-        components = {
-            topology.get("path_components", {}).get(path)
-            for path in inspected
-            if topology.get("path_components", {}).get(path)
-        }
-        has_contract = any("schema-contract" in classify_file_roles(path) for path in inspected)
-        if len(components) < 2 and not (components and has_contract):
-            gaps.append("inspect at least two participating components, or a component and its contract")
-    if focus.get("invariants") and not report.get("invariants_checked"):
-        gaps.append("record which declared invariants were checked")
-    for category in focus.get("expected_evidence", []):
-        low = category.lower()
-        roles = {role for path in inspected for role in classify_file_roles(path)}
-        available = topology.get("available_role_paths", {})
-        satisfied = False
-        applicable = True
-        if "test" in low:
-            satisfied = "test" in roles
-            applicable = bool(available.get("test"))
-        elif "contract" in low or "schema" in low:
-            satisfied = "schema-contract" in roles
-            applicable = bool(available.get("schema-contract"))
-        elif "persist" in low or "repository" in low or "database" in low:
-            satisfied = "persistence" in roles or "migration" in roles
-            applicable = bool(available.get("persistence") or available.get("migration"))
-        elif "message" in low or "worker" in low or "queue" in low:
-            satisfied = "messaging" in roles
-            applicable = bool(available.get("messaging"))
-        elif "deploy" in low or "manifest" in low or "build" in low:
-            satisfied = bool(roles.intersection({"deployment", "build-manifest", "generated"}))
-            applicable = any(available.get(role) for role in ("deployment", "build-manifest", "generated"))
-        elif "caller" in low or "dependenc" in low:
-            satisfied = len(inspected) >= 2
-            applicable = len(available.get("implementation", [])) >= 2
-        elif "implementation" in low:
-            satisfied = "implementation" in roles
-            applicable = bool(available.get("implementation"))
-        else:
-            tokens = [token for token in re.findall(r"[a-z0-9]+", low) if len(token) >= 3]
-            satisfied = any(any(token in path.lower() for token in tokens) for path in inspected)
-            applicable = any(
-                any(token in path.lower() for token in tokens)
-                for paths in available.values() for path in paths
-            ) if tokens else False
-        if applicable and not satisfied:
-            gaps.append(f"inspect evidence category: {category}")
-    return gaps
-
-
-def parse_diff_changed_lines(diff_text: str) -> dict[str, set[int]]:
-    changed: dict[str, set[int]] = defaultdict(set)
-    current = ""
-    new_line = 0
-    for line in diff_text.splitlines():
-        header = re.match(r"^\+\+\+ b/(.*)$", line)
-        if header:
-            current = _posix(header.group(1))
-            continue
-        hunk = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
-        if hunk:
-            new_line = int(hunk.group(1))
-            continue
-        if not current or line.startswith("\\ No newline"):
-            continue
-        if line.startswith("+") and not line.startswith("+++"):
-            changed[current].add(new_line)
-            new_line += 1
-        elif line.startswith("-") and not line.startswith("---"):
-            continue
-        else:
-            new_line += 1
-    return changed
-
-
-def validate_candidates(
-    reports: Iterable[dict[str, Any]], changed_files: Iterable[str], diff_text: str,
-    rejected_keys: set[str] | None = None,
-) -> dict[str, Any]:
-    changed_set = {_posix(path) for path in changed_files}
-    changed_lines = parse_diff_changed_lines(diff_text)
-    rejected_keys = rejected_keys or set()
-    accepted: list[dict[str, Any]] = []
-    rejected: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for report in reports:
-        for item in report.get("findings", []):
-            key = candidate_key(item)
-            reason = ""
-            if key in rejected_keys:
-                reason = "critic-rejected"
-            elif item.get("file") not in changed_set:
-                reason = "outside-review-scope"
-            elif key in seen:
-                reason = "duplicate"
-            else:
-                root = next((existing for existing in accepted if _same_root_cause(existing, item)), None)
-                if root is not None:
-                    root["evidence"] = list(dict.fromkeys(root.get("evidence", []) + item.get("evidence", [])))
-                    reason = "duplicate-root-cause"
-            if reason:
-                rejected.append({**item, "validation_reason": reason})
-                continue
-            seen.add(key)
-            line = item.get("line")
-            inline = bool(line and line in changed_lines.get(item["file"], set()))
-            accepted.append({**item, "inline_eligible": inline})
-    return {"accepted": accepted, "rejected": rejected}
-
-
-def _same_root_cause(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    if _posix(left.get("file")) != _posix(right.get("file")):
-        return False
-    if left.get("line") and left.get("line") == right.get("line"):
-        return True
-    stop = {"the", "and", "that", "this", "with", "from", "when", "then", "into", "for", "not"}
-
-    def tokens(value: Any) -> set[str]:
-        result = set()
-        for token in re.findall(r"[a-z0-9]+", str(value or "").lower()):
-            if len(token) < 3 or token in stop:
-                continue
-            if token.startswith("cancel"):
-                token = "cancel"
-            result.add(token)
-        return result
-
-    for field, threshold in (("causal_chain", 0.65), ("claim", 0.7)):
-        a, b = tokens(left.get(field)), tokens(right.get(field))
-        if a and b and len(a & b) / len(a | b) >= threshold:
-            return True
-    return False
-
-
-def candidate_key(item: dict[str, Any]) -> str:
-    material = "|".join((
-        _posix(item.get("file")),
-        str(item.get("line") or ""),
-        re.sub(r"\s+", " ", str(item.get("claim") or item.get("message") or "").lower()).strip(),
-    ))
-    return material
-
-
-def findings_for_review(candidates: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{
-        "severity": item["severity"],
-        "category": item["category"],
-        "file": item.get("file"),
-        "line": item.get("line") if item.get("inline_eligible") else None,
-        "message": item["claim"],
-    } for item in candidates]
-
-
-def policy_notice(config_path: str, config_changed: bool, exclusions: list[dict[str, Any]]) -> str:
-    lines = []
-    if config_changed:
-        lines.append(f"The specialist policy `{config_path}` is changed by this PR and was used for this review.")
-    if exclusions:
-        focus_ids = sorted({item.get("focus", "unknown") for item in exclusions})
-        lines.append("Authoritative specialist exclusions were applied to: " + ", ".join(f"`{v}`" for v in focus_ids) + ".")
-    if not lines:
-        return ""
-    return "> **Specialist review policy notice:** " + " ".join(lines) + "\n\n"
-
-
-def dump_json(path: str | Path, value: Any) -> None:
-    Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        changed_line_counts.append(additions + deletions)
+    if len(changed_line_counts) == len(changed):
+        topology["changed_line_count"] = sum(changed_line_counts)
+    if change_facts is not None:
+        topology["change_facts"] = change_facts
+    return topology

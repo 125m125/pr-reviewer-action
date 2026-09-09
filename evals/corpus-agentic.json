@@ -93,6 +93,18 @@
       }
     }
   ],
+  "offline_specialist_replays": [
+    {
+      "id": "multilingual-specialist-runtime",
+      "kind": "runtime",
+      "fixture": "../tests/fixtures/specialist_runtime/multilingual-pr"
+    },
+    {
+      "id": "web-source-policy",
+      "kind": "web_policy",
+      "fixture": "../tests/fixtures/specialist_runtime/web-policy-pr"
+    }
+  ],
   "metadata": {
     "created_at": "2026-06-12T00:00:00Z",
     "updated_at": "2026-06-19T00:00:00Z",
