@@ -1802,6 +1802,7 @@ class _RunState:
     session_results: dict[tuple[str, str], object] = field(default_factory=dict)
     failed_session_budgets: dict[str, BudgetUsage] = field(default_factory=dict)
     quarantined_session_ids: set[str] = field(default_factory=set)
+    preserved_session_ids: set[str] = field(default_factory=set)
     admitted_specialist_request_events: set[tuple[str, str]] = field(default_factory=set)
     request_attempt_journal: RequestAttemptJournal | None = None
     request_attempts: dict[str, RequestAttempt] = field(default_factory=dict)
@@ -1842,6 +1843,8 @@ class _IsolatedSessionHandle:
     lease: SessionLease
     baseline_evidence_ids: frozenset[str] = frozenset()
     latest_result: object | None = None
+    accepted_work: tuple | None = None
+    accepted_work_error: str = ""
     exploration_done: Event = field(default_factory=Event, repr=False)
 
     @property
@@ -1898,6 +1901,17 @@ class _IsolatedSessionHandle:
         if callable(callback):
             callback()
 
+    def retain_accepted_work(self, archived: tuple) -> None:
+        """Replace the detached recovery boundary only after ownership checks."""
+        result, evidence, candidates, _requests = archived
+        try:
+            self._validate_result(result)
+            self._validate_owned_outputs(result, snapshot=evidence, candidates=candidates)
+        except (ValueError, TypeError) as exc:
+            self.accepted_work_error = _bounded_error(exc)
+            return
+        self.accepted_work = archived
+
     def apply_coverage_feedback(self, gaps: Iterable[str]) -> None:
         callback = getattr(self.session, "apply_coverage_feedback", None)
         if not callable(callback):
@@ -1934,8 +1948,8 @@ class _IsolatedSessionHandle:
         if checkpoint is None or checkpoint.session_id != self.session_id:
             raise ValueError("checkpoint identity differs from controller binding")
 
-    def _validate_owned_outputs(self, result: object) -> None:
-        retained = {record.id: record for record in self.evidence.snapshot().records}
+    def _validate_owned_outputs(self, result: object, *, snapshot=None, candidates=None) -> None:
+        retained = {record.id: record for record in (snapshot or self.evidence.snapshot()).records}
         for evidence_id in getattr(result.checkpoint, "evidence_ids", ()):
             if evidence_id not in retained:
                 raise ValueError("checkpoint references evidence outside its isolated store")
@@ -1945,9 +1959,11 @@ class _IsolatedSessionHandle:
                 and record.collector_session_id != self.session_id
             ):
                 raise ValueError("evidence collector identity differs from controller binding")
-        for candidate in self.candidate_findings:
+        for candidate in self.candidate_findings if candidates is None else candidates:
             if candidate.collector_session_id != self.session_id:
                 raise ValueError("candidate collector identity differs from controller binding")
+            if not set((*candidate.supporting_evidence_ids, *candidate.contradicting_evidence_ids)) <= retained.keys():
+                raise ValueError("candidate references evidence outside its isolated store")
 
 
 def _json_value(value: object) -> object:
@@ -2657,6 +2673,44 @@ class ReviewController:
         if isinstance(handle, _IsolatedSessionHandle):
             if state.assignment_sessions.get(handle.assignment.id) == session_id:
                 state.assignment_sessions.pop(handle.assignment.id, None)
+            archived = handle.accepted_work
+            if handle.accepted_work_error:
+                state.journal.emit("quarantined_work_rejected", {
+                    "session_id": session_id, "reason": handle.accepted_work_error,
+                })
+            if archived is not None:
+                result, evidence, candidates, requests = archived
+                try:
+                    handle._validate_result(result)
+                    handle._validate_owned_outputs(result, snapshot=evidence, candidates=candidates)
+                    state.evidence.merge_completed_snapshot(evidence)
+                except (ValueError, TypeError) as exc:
+                    state.journal.emit("quarantined_work_rejected", {
+                        "session_id": session_id, "reason": _bounded_error(exc),
+                    })
+                else:
+                    state.session_results[(handle.assignment.id, session_id)] = result
+                    state.ownership[session_id] = self._ownership(handle.assignment, session_id, state)
+                    self._admit_investigation_lead_state(state, result)
+                    state.source_requests.extend(requests)
+                    for key in tuple(state.candidate_occurrences):
+                        if key.startswith(f"preserved:{session_id}:") or key.startswith(f"session:{session_id}:"):
+                            del state.candidate_occurrences[key]
+                    for index, candidate in enumerate(candidates):
+                        state.candidate_occurrences[f"preserved:{session_id}:{index}"] = candidate
+                    state.preserved_session_ids.add(session_id)
+                    state.journal.emit("quarantined_work_preserved", {
+                        "session_id": session_id, "candidate_count": len(candidates),
+                        "evidence_count": len(evidence.records),
+                        "conversation_reusable": False,
+                    })
+            # Previously admitted controller results survive even if a later
+            # snapshot fails validation. Do not reuse the worker or its history.
+            if (handle.assignment.id, session_id) in state.session_results:
+                state.preserved_session_ids.add(session_id)
+                for key, candidate in tuple(state.candidate_occurrences.items()):
+                    if key.startswith(f"session:{session_id}:"):
+                        state.candidate_occurrences["preserved:" + key] = candidate
         state.journal.emit("session_quarantined", {
             "session_id": session_id,
             "reason": reason,
@@ -3117,6 +3171,9 @@ class ReviewController:
         )
         # Register immediately so a worker that is interrupted at the phase
         # cutoff still has a durable handle for finalization recovery.
+        from .session import SpecialistSession
+        if isinstance(session, SpecialistSession):
+            session._accepted_work_observer = handle.retain_accepted_work
         state.sessions[session_id] = handle
         state.assignment_sessions[assignment.id] = session_id
         return handle
@@ -3318,7 +3375,10 @@ class ReviewController:
         wave_snapshot: WaveSnapshot,
     ) -> CoverageReconciliation:
         assert state.coverage is not None
-        checkpoints = tuple(item.session_result.checkpoint for item in result.results)
+        checkpoints = tuple(item.session_result.checkpoint for item in result.results) + tuple(
+            res.checkpoint for (_, session_id), res in state.session_results.items()
+            if session_id in state.preserved_session_ids
+        )
         try:
             reconciled = reconcile_wave(
                 state.coverage,
@@ -3901,7 +3961,7 @@ class ReviewController:
                 candidate_assessments = {}
                 delegated_excerpts = [
                     item for (_, session_id), result in state.session_results.items()
-                    if session_id not in state.quarantined_session_ids
+                    if session_id not in state.quarantined_session_ids or session_id in state.preserved_session_ids
                     for item in getattr(result, "delegated_excerpts", ())
                 ]
                 for candidate in candidates:
@@ -3913,7 +3973,7 @@ class ReviewController:
                         "unknowns": tuple(mask_runtime_text(item, limit=600) for item in checkpoint.unknowns[:8]),
                         "completed_steps": tuple(mask_runtime_text(item, limit=300) for item in checkpoint.completed_steps[:5]),
                     } for (_, session_id), result in state.session_results.items()
-                        if session_id not in state.quarantined_session_ids
+                        if (session_id not in state.quarantined_session_ids or session_id in state.preserved_session_ids)
                         and (checkpoint := getattr(result, "checkpoint", None)) is not None
                         and (session_id == candidate.collector_session_id
                              or contributor_ids.intersection(checkpoint.candidate_finding_ids)))
@@ -4205,7 +4265,7 @@ class ReviewController:
         statuses = dict(state.coverage.snapshot().obligation_statuses)
         latest: dict[str, tuple[str, object]] = {}
         for (assignment_id, session_id), result in state.session_results.items():
-            if session_id not in state.quarantined_session_ids:
+            if session_id not in state.quarantined_session_ids or session_id in state.preserved_session_ids:
                 latest[session_id] = (assignment_id, result)
 
         def strings(

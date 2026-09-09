@@ -3030,6 +3030,38 @@ def test_finalization_closes_from_valid_checkpoint_without_model_call():
     assert len(gateway.requests) == 1
 
 
+@pytest.mark.parametrize("is_timeout", [True, False])
+def test_settled_transport_timeout_preserves_checkpoint_for_finalization(is_timeout):
+    class Gateway(ScriptedGateway):
+        fail = False
+
+        def complete(self, request):
+            if self.fail:
+                self.fail = False
+                raise ModelRequestError("transport failure", timeout=is_timeout)
+            return super().complete(request)
+
+    gateway = Gateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        invalid_response('{"obligation_updates":[]}'),
+    ])
+    session = make_session(gateway)
+    first = session.request_checkpoint("test-pause")
+    gateway.fail = True
+    if not is_timeout:
+        with pytest.raises(ModelRequestError):
+            session.explore()
+        return
+    stopped = session.explore()
+    assert stopped.checkpoint == first.checkpoint
+    assert stopped.state is SessionState.CHECKPOINT
+    result = session.finalize()
+    assert result.state is SessionState.COMPLETE
+    assert gateway.requests[1].tools_enabled is False
+    assert gateway.requests[1].messages_contain("interrupted-exploration")
+
+
 def test_finalization_recovers_checkpoint_after_interrupted_exploration():
     gateway = ScriptedGateway([
         checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),

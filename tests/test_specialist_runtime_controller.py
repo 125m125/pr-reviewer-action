@@ -1871,6 +1871,66 @@ def test_session_finalization_diagnostics_are_artifact_only(tmp_path):
     assert "candidate-forged" not in result.handoff.markdown
 
 
+@pytest.mark.parametrize("corrupt_owner", [False, True])
+def test_failed_session_preserves_detached_accepted_checkpoint(tmp_path, corrupt_owner):
+    created = []
+    class FailingSession(SpecialistSession):
+        def explore(self):
+            record = self.evidence_store.add_tool_result(
+                session_id=self.session_id, tool="read_file",
+                arguments={"path": "src/worker.py"},
+                result={"status": "ok", "content": "retained before failure"},
+                source="src/worker.py",
+            )
+            self.latest_checkpoint = SessionCheckpoint(
+                self.session_id, SessionState.CHECKPOINT,
+                evidence_ids=(record.id,), working_summary="Accepted investigation",
+            )
+            self.state = SessionState.CHECKPOINT
+            self._snapshot()
+            # Simulate a separately admitted tool candidate/lead after checkpoint.
+            self.candidate_findings = (CandidateFinding(
+                "retained-candidate", "root", "Potential repeated processing",
+                affected_location="src/worker.py:7", supporting_evidence_ids=(record.id,),
+                related_obligation_ids=tuple(self.assignment.obligation_ids),
+                collector_session_id="foreign" if corrupt_owner else self.session_id,
+            ),)
+            self._investigation_leads["retained-lead"] = InvestigationLead(
+                lead_id="retained-lead", summary="Check downstream processing",
+                affected_paths=("src/worker.py",), evidence_ids=(record.id,),
+                next_action="Inspect downstream caller", required_capability="repository",
+                origin_session_id=self.session_id,
+            )
+            self._snapshot()
+            self.latest_checkpoint = replace(self.latest_checkpoint, working_summary="unaccepted tail")
+            self.candidate_findings = ()
+            raise RuntimeError("broken after accepted checkpoint")
+
+    def factory(assignment, lease, snapshot, evidence_store, coverage, obligations, expected_session_id):
+        session = FailingSession(
+            session_id=expected_session_id, assignment=assignment,
+            conversation=Conversation(system="review"), gateway=None,
+            execute_tool=lambda *a, **kw: {}, evidence_store=evidence_store,
+            coverage=coverage, budget=BudgetLedger(BudgetLimits(model_turns=8, tool_calls=8, recoveries=1)),
+            lease=lease, request_timeout_sec=10, max_tokens=128,
+        )
+        created.append(session)
+        return session
+
+    result = _controller(tmp_path, session_factory=factory).run(_inputs(tmp_path))
+    if corrupt_owner:
+        assert any(e["kind"] == "quarantined_work_rejected" for e in result.artifact["events"])
+        assert not result.artifact["accepted_candidates"]
+        return
+    assert result.artifact["sessions"], result.artifact["degradation"]
+    assert any(e["kind"] == "quarantined_work_preserved" for e in result.artifact["events"])
+    assert created[0]._accepted_work[0].checkpoint.working_summary == "Accepted investigation"
+    assert "unaccepted tail" not in json.dumps(result.artifact)
+    assert any(e["kind"] == "quarantined_work_preserved" and e["payload"]["candidate_count"] == 1
+               for e in result.artifact["events"])
+    assert "retained-lead" in json.dumps(result.artifact["investigation_leads"])
+
+
 def test_controller_collects_candidate_added_during_session_finalization(tmp_path):
     class FinalizationCandidateSession(_SuccessfulSession):
         def explore(self):

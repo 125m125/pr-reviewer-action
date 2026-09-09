@@ -237,7 +237,8 @@ def run_chat_request(
             stderr = stderr[:500] + "...[truncated]"
         raise ModelRequestError(
             f"model request failed with exit code {completed.returncode}"
-            + (f": {stderr}" if stderr else "")
+            + (f": {stderr}" if stderr else ""),
+            timeout=completed.returncode == 28,
         )
 
     output = completed.stdout or ""

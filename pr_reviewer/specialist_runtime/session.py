@@ -2084,6 +2084,9 @@ class SpecialistSession:
         allow_gateway_fallbacks: bool = True,
         conversation: Conversation | None = None,
     ) -> ModelTurnResult:
+        # Freeze accepted ledgers before handing control to a fallible callback.
+        # This excludes conversation history and partially parsed responses.
+        self._snapshot()
         remaining_output_tokens = self.budget.remaining_output_tokens()
         if remaining_output_tokens is not None and remaining_output_tokens <= 0:
             raise BudgetExhausted("output token limit exhausted")
@@ -2204,7 +2207,8 @@ class SpecialistSession:
             )
         except BaseException as exc:
             terminal_status = (
-                "timed_out" if isinstance(exc, CallbackTimedOut) else "failed"
+                "timed_out" if isinstance(exc, CallbackTimedOut)
+                or (isinstance(exc, ModelRequestError) and exc.timeout) else "failed"
             )
             if self._request_attempt_journal is not None:
                 self._request_attempt_journal.finish(
@@ -2219,6 +2223,10 @@ class SpecialistSession:
                 schema_name,
                 format_callback_error(exc, limit=500),
             ))
+            if isinstance(exc, ModelRequestError) and exc.timeout:
+                # The transport has returned: no callback remains in flight.
+                # Checkpoint/repair callers already handle bounded TimeoutError.
+                raise TimeoutError(str(exc)) from exc
             raise
         actual_prompt_tokens = self._usage_tokens(
             result.usage, "prompt_tokens",
@@ -2359,6 +2367,12 @@ class SpecialistSession:
                     raise
                 return self._checkpoint_and_resume("context-pressure")
             except BaseException as exc:
+                if (isinstance(exc, TimeoutError)
+                    and isinstance(exc.__cause__, ModelRequestError)
+                    and exc.__cause__.timeout):
+                    self.mark_exploration_interrupted()
+                    self.state = SessionState.CHECKPOINT
+                    return self._snapshot()
                 if not _is_context_limit_error(exc):
                     raise
                 return self._recover_from_provider_context_limit(exc)
@@ -6383,7 +6397,7 @@ class SpecialistSession:
         report: Mapping[str, Any] | None = None,
         degraded: bool = False,
     ) -> SessionResult:
-        return SessionResult(
+        result = SessionResult(
             session_id=self.session_id, state=self.state,
             checkpoint=self.latest_checkpoint, budget=self.budget.snapshot(),
             report=dict(report) if report is not None else None, degraded=degraded,
@@ -6408,6 +6422,19 @@ class SpecialistSession:
             } for payload in self._delegated_summary_cache.values()
                 for excerpt in payload.get("relevant_excerpts", ())),
         )
+        evidence = self.evidence_store.snapshot()
+        if (result.checkpoint.working_summary or self.candidate_findings
+            or result.investigation_leads or any(
+                item.collector_session_id == self.session_id for item in evidence.records
+            )):
+            self._accepted_work = (
+                copy.deepcopy(result), evidence,
+                tuple(self.candidate_findings), tuple(self.source_access_requests),
+            )
+            observer = getattr(self, "_accepted_work_observer", None)
+            if observer is not None:
+                observer(self._accepted_work)
+        return result
 
     def _tool_activity_snapshot(self) -> tuple[Mapping[str, object], ...]:
         stats: dict[str, dict[str, object]] = {}
@@ -6472,6 +6499,7 @@ class SpecialistSession:
                     self._tool_activity_evidence.setdefault(name, set()).add(
                         evidence_id
                     )
+        self._snapshot()
 
     def _record_checkpoint_diagnostic(
         self,
