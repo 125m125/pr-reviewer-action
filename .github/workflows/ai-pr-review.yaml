@@ -86,6 +86,9 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
           ai_base_url: ${{ vars.LITELLM_BASE_URL }}
+          # The LiteLLM endpoint sits behind a self-signed cert the runner
+          # container's CA store doesn't trust, so skip TLS verification.
+          ai_allow_insecure_tls: "true"
           # LiteLLM exposes the model through the OpenAI-compatible
           # /v1/chat/completions endpoint. Public review text is rendered only
           # from validated candidates; raw reasoning is never published.

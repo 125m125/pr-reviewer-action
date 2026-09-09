@@ -38,6 +38,11 @@ class ModelRequestError(RuntimeError):
         return self.status is not None and 400 <= self.status < 500
 
 
+def _truthy_env(name):
+    """Return True when an env var is set to a truthy flag value."""
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def is_model_endpoint_unavailable(exc):
     """Return true only for transport failures that never reached a provider."""
     current = exc
@@ -178,6 +183,12 @@ def run_chat_request(
     ]
     if api_format == "anthropic":
         curl_args.extend(["-H", f"anthropic-version: {os.getenv('ANTHROPIC_VERSION', '2023-06-01')}"])
+
+    # The runner's container ships its own CA store that may not include a
+    # self-signed endpoint cert the host already trusts. Opt-in (not default)
+    # toggle to skip TLS verification for such local/self-signed endpoints.
+    if _truthy_env("PR_REVIEWER_ALLOW_INSECURE_TLS"):
+        curl_args.append("--insecure")
 
     # Streaming keeps bytes flowing so proxies with a short idle/read timeout
     # (Cloudflare's 100s edge timer etc.) don't 524 a long thinking-model turn.

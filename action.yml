@@ -27,6 +27,13 @@ inputs:
     description: Optional API key for the primary AI endpoint
     required: false
     default: ""
+  ai_allow_insecure_tls:
+    description: >-
+      Set to true to skip TLS certificate verification for the AI endpoint
+      (curl --insecure). Use only for local or self-signed endpoints whose cert
+      the runner container's CA store does not trust. Default false.
+    required: false
+    default: "false"
   ai_max_tokens:
     description: >-
       Maximum completion tokens for the primary and fallback final review calls.
@@ -837,6 +844,7 @@ runs:
         FORCE_REVIEW: ${{ inputs.force_review }}
         REREVIEW_LABEL: ${{ inputs.rereview_label }}
         ACTION_REF: ${{ github.action_ref }}
+        PR_REVIEWER_ALLOW_INSECURE_TLS: ${{ inputs.ai_allow_insecure_tls }}
         AI_MODEL: ${{ inputs.ai_model }}
         AI_API_FORMAT: ${{ inputs.ai_api_format }}
         AI_TEMPERATURE: ${{ inputs.ai_temperature }}
@@ -972,6 +980,7 @@ runs:
         AI_API_FORMAT: ${{ inputs.ai_api_format }}
         AI_MODEL: ${{ inputs.ai_model }}
         AI_API_KEY: ${{ inputs.ai_api_key }}
+        PR_REVIEWER_ALLOW_INSECURE_TLS: ${{ inputs.ai_allow_insecure_tls }}
         AI_MAX_TOKENS: ${{ inputs.ai_max_tokens }}
         AI_TEMPERATURE: ${{ inputs.ai_temperature }}
         AI_RESPONSE_FORMAT: ${{ inputs.ai_response_format }}
