@@ -349,6 +349,18 @@ def _facts_from_patch(
                 if context_symbol and context_symbol.group(1) not in symbols:
                     symbols.append(context_symbol.group(1))
         yaml_line = line[1:] if line[:1] in {"+", "-", " "} else line
+        # Retain actual edits, not the unchanged function label in a hunk header.
+        # The existing per-path item/text caps keep large patches bounded too.
+        if (
+            include_intent
+            and not path.lower().endswith((".md", ".adoc", ".asciidoc"))
+            and line[:1] in {"+", "-"}
+            and not line.startswith(("+++", "---"))
+            and len(change_excerpts) < _MAX_CHANGE_ITEMS
+        ):
+            excerpt = _clean_fact_text(line[1:], limit=158)
+            if excerpt:
+                change_excerpts.append(f"{line[0]} {excerpt}")
         if path in {"action.yml", "action.yaml"}:
             section_match = re.match(
                 r"^(inputs|outputs|runs|branding):\s*$", yaml_line,
