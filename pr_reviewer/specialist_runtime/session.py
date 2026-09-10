@@ -344,7 +344,9 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
         "description": (
             "Report a concrete, evidence-backed suspicion outside the current "
             "assignment that warrants separate investigation. If the defect is "
-            "already proven, use report_candidate instead."
+            "already proven, use report_candidate instead. Do not report completion "
+            "or 'no further work' as a lead. If finished, respond without tool calls; "
+            "the controller will request a checkpoint."
         ),
         "parameters": {"type": "object", "properties": {
             "summary": {"type": "string", "maxLength": 500},
@@ -388,11 +390,14 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "name_contains or name_regex; matching test cases include their "
             "status, failure details, source path/line when available, and "
             "the evidence ID to cite. This tool never executes tests or fetches "
-            "arbitrary artifacts."
+            "arbitrary artifacts. Optionally filter by exact report name; use offset "
+            "to page through matching cases."
         ),
         "parameters": {"type": "object", "properties": {
             "name_contains": {"type": "string", "maxLength": 300},
             "name_regex": {"type": "string", "maxLength": 300},
+            "report": {"type": "string", "maxLength": 1000},
+            "offset": {"type": "integer", "minimum": 0},
             "status": {"type": "string", "enum": [
                 "passed", "failed", "skipped", "errored", "xfailed", "unknown",
             ]},
@@ -2774,6 +2779,22 @@ class SpecialistSession:
                 "reason": "summary and next_action are required",
             }
             self._add_tool_result(call_id, payload)
+            return False
+        # Reject explicit no-work placeholders, not legitimate leads that need
+        # no additional capability. Reworded completion notices are not progress.
+        if re.match(
+            r"^(?:none|n/?a|not applicable|no (?:further )?(?:action|work|investigation)"
+            r"(?: (?:needed|required))?)(?:\s*[.!;]|\s*$)",
+            next_action.strip(), re.IGNORECASE,
+        ):
+            self._add_tool_result(call_id, {
+                "accepted": False,
+                "reason": (
+                    "A lead requires a concrete unanswered question and next action, "
+                    "not a completion message. If finished, respond without tool calls; "
+                    "the controller will request a checkpoint."
+                ),
+            })
             return False
         if capability not in {"none", "repository", "tests", "web"}:
             payload = {
@@ -6360,9 +6381,16 @@ class SpecialistSession:
             requested_limit = 20
         limit = max(1, min(50, requested_limit))
         requested_status = str(arguments.get("status") or "").casefold()
+        report = str(arguments.get("report") or "")
+        try:
+            offset = max(0, int(arguments.get("offset", 0)))
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "offset must be a nonnegative integer"}
         matches: list[dict[str, Any]] = []
         total = 0
         for index, test in enumerate(self.test_results, start=1):
+            if report and str(test.get("report") or "") != report:
+                continue
             name = str(test.get("name") or "")
             if not name or (contains and contains not in name.casefold()):
                 continue
@@ -6372,6 +6400,8 @@ class SpecialistSession:
             if requested_status and status != requested_status:
                 continue
             total += 1
+            if total <= offset:
+                continue
             if len(matches) < limit:
                 item = dict(test)
                 item["evidence_id"] = retain_test_result(
@@ -6387,7 +6417,8 @@ class SpecialistSession:
             "status": "ok",
             "count": len(matches),
             "total_matches": total,
-            "truncated": total > len(matches),
+            "truncated": total > offset + len(matches),
+            "next_offset": offset + len(matches) if total > offset + len(matches) else None,
             "tests": matches,
         }
 
