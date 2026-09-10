@@ -95,7 +95,12 @@ _ROLE_SYSTEM = {
         "state a consequence, defect, risk, verdict, finding, severity, approval or "
         "merge-safety judgment, verification result, test result, review result, or "
         "coverage claim. Describe only changed behavior and purpose from bounded "
-        "symbols, workflow keys/steps, and Markdown/AsciiDoc headings or excerpts; "
+        "actual changed-line excerpts (+ added, - removed), symbols, workflow "
+        "keys/steps, and Markdown/AsciiDoc headings or excerpts. Hunk summaries "
+        "are orientation only: their trailing function labels can be unchanged "
+        "surrounding code, not the code modified by the patch. Excerpts are bounded "
+        "samples, not a complete inventory; prefer them to hunk labels when "
+        "describing the edits. "
         "do not reproduce a full diff."
     ),
     "planner": (
@@ -130,7 +135,11 @@ _ROLE_SYSTEM = {
     "negotiator": (
         "Choose exactly one bounded action for one controller-provided target handle. "
         "Return only {\"kind\":string,\"target\":string,\"reason\":string}. "
-        "Allowed kinds are resume, consult, new_session, and record_unknown. Do not "
+        "The action vocabulary is resume, consult, new_session, and record_unknown. "
+        "Choose kind only from the selected target's allowed_actions; the overall "
+        "vocabulary does not make every action legal for every target. In particular, "
+        "do not choose record_unknown when it is absent from that target's "
+        "allowed_actions. Do not "
         "repeat obligation IDs, session IDs, evidence categories, turn counts, leases, "
         "budgets, or an actions array; the controller derives those values from the "
         "selected target. Use a hyphenated spelling only when unavoidable (for example "
@@ -964,6 +973,7 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
         },
         configuration_warnings=policy_warnings,
         adapter_configuration={
+            "review_policy_file": config.policy_path.relative_to(config.workspace).as_posix(),
             "endpoint": endpoint_identity,
             "role_models": dict(config.role_models),
             "response_format": config.response_format,

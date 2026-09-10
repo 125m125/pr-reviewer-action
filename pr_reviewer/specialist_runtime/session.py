@@ -344,7 +344,9 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
         "description": (
             "Report a concrete, evidence-backed suspicion outside the current "
             "assignment that warrants separate investigation. If the defect is "
-            "already proven, use report_candidate instead."
+            "already proven, use report_candidate instead. Do not report completion "
+            "or 'no further work' as a lead. If finished, respond without tool calls; "
+            "the controller will request a checkpoint."
         ),
         "parameters": {"type": "object", "properties": {
             "summary": {"type": "string", "maxLength": 500},
@@ -388,11 +390,14 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "name_contains or name_regex; matching test cases include their "
             "status, failure details, source path/line when available, and "
             "the evidence ID to cite. This tool never executes tests or fetches "
-            "arbitrary artifacts."
+            "arbitrary artifacts. Optionally filter by exact report name; use offset "
+            "to page through matching cases."
         ),
         "parameters": {"type": "object", "properties": {
             "name_contains": {"type": "string", "maxLength": 300},
             "name_regex": {"type": "string", "maxLength": 300},
+            "report": {"type": "string", "maxLength": 1000},
+            "offset": {"type": "integer", "minimum": 0},
             "status": {"type": "string", "enum": [
                 "passed", "failed", "skipped", "errored", "xfailed", "unknown",
             ]},
@@ -2043,6 +2048,26 @@ class SpecialistSession:
                 )
         return prompt_tokens, completion_tokens
 
+    def _checkpoint_output_allowances(self, schema: dict[str, Any]) -> tuple[int, int]:
+        admission = self._estimate_admission(
+            tools_enabled=False, max_tokens=self.max_tokens * 2, schema=schema,
+        )
+        # Include the repair instruction/contract before splitting free space.
+        repair_overhead = math.ceil(len((
+            _CHECKPOINT_REPAIR_INSTRUCTION + self._checkpoint_obligation_contract()
+        ).encode("utf-8")) / 3)
+        available = max(0, self.max_context_tokens - admission.input_tokens
+                        - self.wire_safety_tokens - repair_overhead)
+        remaining = self.budget.remaining_output_tokens()
+        if remaining is not None:
+            available = min(available, remaining)
+        if available < 768:
+            # Let existing emergency admission and lifetime-budget handling act;
+            # a one-token checkpoint would only waste a request.
+            return self.checkpoint_max_tokens, self.checkpoint_max_tokens
+        return (min(self.max_tokens * 2, max(1, available * 2 // 3)),
+                min(self.max_tokens, max(1, available // 3)))
+
     def _checkpoint_pressure_due(self, *, reserve_tool_result: bool = False) -> bool:
         projected = Conversation(
             system=self.conversation.system,
@@ -2402,6 +2427,20 @@ class SpecialistSession:
                             "malformed-textual-tool-call",
                         )
                     continue
+                if (
+                    not turn.content.strip()
+                    and turn.reasoning.strip()
+                    and str(turn.finish_reason).casefold()
+                    in {"length", "max_tokens", "max_output_tokens", "incomplete"}
+                    and not tool_less_continuation_used
+                    and self.budget.remaining_model_turns() > _CHECKPOINT_TURN_RESERVE
+                ):
+                    if self.budget.record_no_progress() < self.max_no_progress_streak:
+                        # Keep the assistant reasoning as the final message: a
+                        # new user instruction can reset reasoning in templates.
+                        # The next loop iteration still enforces context pressure.
+                        tool_less_continuation_used = True
+                        continue
                 checkpoint = self._checkpoint_from_text(turn.content)
                 checkpoint_change_rejected = bool(self._last_checkpoint_rejections)
                 if (
@@ -2774,6 +2813,22 @@ class SpecialistSession:
                 "reason": "summary and next_action are required",
             }
             self._add_tool_result(call_id, payload)
+            return False
+        # Reject explicit no-work placeholders, not legitimate leads that need
+        # no additional capability. Reworded completion notices are not progress.
+        if re.match(
+            r"^(?:none|n/?a|not applicable|no (?:further )?(?:action|work|investigation)"
+            r"(?: (?:needed|required))?)(?:\s*[.!;]|\s*$)",
+            next_action.strip(), re.IGNORECASE,
+        ):
+            self._add_tool_result(call_id, {
+                "accepted": False,
+                "reason": (
+                    "A lead requires a concrete unanswered question and next action, "
+                    "not a completion message. If finished, respond without tool calls; "
+                    "the controller will request a checkpoint."
+                ),
+            })
             return False
         if capability not in {"none", "repository", "tests", "web"}:
             payload = {
@@ -4190,10 +4245,9 @@ class SpecialistSession:
             if disposition is CheckpointDisposition.COMPACT_RESUME
             else _CHECKPOINT_SCHEMA
         )
-        checkpoint_output_tokens = min(
-            self.checkpoint_max_tokens,
-            max_output_tokens if max_output_tokens is not None else self.checkpoint_max_tokens,
-        )
+        checkpoint_output_tokens, checkpoint_repair_tokens = self._checkpoint_output_allowances(checkpoint_schema)
+        if max_output_tokens is not None:
+            checkpoint_output_tokens = min(checkpoint_output_tokens, max_output_tokens)
         request_event_count = len(self._request_events)
         checkpoint_context_admission: dict[str, object] = {}
         try:
@@ -4205,6 +4259,7 @@ class SpecialistSession:
                 allow_compaction=False,
                 allow_gateway_fallbacks=allow_gateway_fallbacks,
             )
+            self._last_context_admission["repair_response_reserve_tokens"] = checkpoint_repair_tokens
         except (BudgetExhausted, TimeoutError) as exc:
             checkpoint_context_admission = dict(self._last_context_admission)
             available = self.max_context_tokens - int(
@@ -4368,6 +4423,12 @@ class SpecialistSession:
                 self.conversation.add_user(repair_instruction)
             repair_event_count = len(self._request_events)
             try:
+                repair_admission = self._estimate_admission(
+                    tools_enabled=False, max_tokens=checkpoint_repair_tokens,
+                    schema=checkpoint_schema,
+                )
+                repair_tokens = min(checkpoint_repair_tokens, max(512,
+                    self.max_context_tokens - repair_admission.input_tokens - self.wire_safety_tokens))
                 repair = self._request(
                     tools_enabled=False,
                     schema=checkpoint_schema,
@@ -4375,7 +4436,7 @@ class SpecialistSession:
                         "checkpoint-clean-retry"
                         if reasoning_only_retry else "checkpoint-repair"
                     ),
-                    max_output_tokens=self.checkpoint_max_tokens,
+                    max_output_tokens=repair_tokens,
                     allow_compaction=False,
                     allow_gateway_fallbacks=allow_gateway_fallbacks,
                 )
@@ -6360,9 +6421,16 @@ class SpecialistSession:
             requested_limit = 20
         limit = max(1, min(50, requested_limit))
         requested_status = str(arguments.get("status") or "").casefold()
+        report = str(arguments.get("report") or "")
+        try:
+            offset = max(0, int(arguments.get("offset", 0)))
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "offset must be a nonnegative integer"}
         matches: list[dict[str, Any]] = []
         total = 0
         for index, test in enumerate(self.test_results, start=1):
+            if report and str(test.get("report") or "") != report:
+                continue
             name = str(test.get("name") or "")
             if not name or (contains and contains not in name.casefold()):
                 continue
@@ -6372,6 +6440,8 @@ class SpecialistSession:
             if requested_status and status != requested_status:
                 continue
             total += 1
+            if total <= offset:
+                continue
             if len(matches) < limit:
                 item = dict(test)
                 item["evidence_id"] = retain_test_result(
@@ -6387,7 +6457,8 @@ class SpecialistSession:
             "status": "ok",
             "count": len(matches),
             "total_matches": total,
-            "truncated": total > len(matches),
+            "truncated": total > offset + len(matches),
+            "next_offset": offset + len(matches) if total > offset + len(matches) else None,
             "tests": matches,
         }
 

@@ -30,6 +30,7 @@ from .web_evidence import (
     RepositoryAccessRequest,
     SourceAccessRequest,
     repository_access_request,
+    _safe_discovery_url,
 )
 
 
@@ -294,19 +295,23 @@ def _added_diff_lines_by_path(
 ) -> dict[str, frozenset[int]]:
     """Return controller-observed added RIGHT-side lines from retained diffs."""
     mutable: dict[str, set[int]] = {}
-    hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+    hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
     for record in records:
         path = str(record.source_path or "").replace("\\", "/").strip("/")
         if record.tool != "read_pr_diff" or record.truncated or not path:
             continue
         added: set[int] = set()
         saw_hunk = False
+        remaining = 0
+        incomplete_hunk = False
         current: int | None = None
         for raw in record.content.splitlines():
             match = hunk.match(raw)
             if match:
+                incomplete_hunk |= remaining > 0
                 saw_hunk = True
                 current = int(match.group(1))
+                remaining = int(match.group(2) or 1)
             elif current is None or raw.startswith(("diff --git ", "--- ", "+++ ")):
                 continue
             elif raw.startswith("-"):
@@ -317,7 +322,10 @@ def _added_diff_lines_by_path(
                 if raw.startswith("+"):
                     added.add(current)
                 current += 1
-        if saw_hunk:
+                remaining -= 1
+        # Paginated results can be untruncated pages of an incomplete hunk.
+        # Missing lines then mean unknown, not proof that a location is unchanged.
+        if saw_hunk and remaining <= 0 and not incomplete_hunk:
             mutable.setdefault(path, set()).update(added)
     return {path: frozenset(lines) for path, lines in mutable.items()}
 
@@ -2400,23 +2408,79 @@ def build_source_access_request_notes(
     values: Iterable[object],
     *,
     obligations: Mapping[str, CoverageObligation],
+    policy_file: str = ".github/ai-review-policy.json",
 ) -> tuple[ReviewNote, ...]:
     """Project valid source requests using the production authorization rules."""
     notes: dict[str, ReviewNote] = {}
-    repositories: dict[tuple[str, str, str], list[RepositoryAccessRequest]] = {}
+    sources: dict[tuple[str, str], list[SourceAccessRequest]] = {}
+    repositories: dict[str, list[RepositoryAccessRequest]] = {}
     for value in values:
         request = _source_request(value)
         if request is None or request.obligation_id not in obligations:
             continue
         if isinstance(request, RepositoryAccessRequest):
-            key = (request.repository, request.revision or "", request.endpoint)
-            repositories.setdefault(key, []).append(request)
+            repositories.setdefault(request.repository, []).append(request)
             continue
         note = _source_note(request, obligations=obligations)
         if note is not None:
-            notes[note.fingerprint] = note
+            canonical = _canonical_request_url(request.candidate_url)
+            host, url = canonical
+            segments = urlsplit(url).path.strip("/").split("/")
+            if host in {"github.com", "raw.githubusercontent.com", "api.github.com"}:
+                if host == "api.github.com":
+                    segments = segments[1:] if segments[0] == "repos" else []
+                if len(segments) >= 2:
+                    repo_request = repository_access_request(
+                        "repos/" + "/".join(segments[:2]), request.obligation_id,
+                        request.purpose, request.model_purpose, request.authority_reason,
+                    )
+                    if repo_request is not None:
+                        repositories.setdefault(repo_request.repository, []).append(repo_request)
+                        continue
+            # Query variants need the same path-scoped policy entry. Keep
+            # opaque/redacted URLs separate rather than widening their scope.
+            safe_url, _, safe_path = _safe_discovery_url(url)
+            key = (host, safe_url) if safe_url and "REDACTED" not in safe_path else canonical
+            sources.setdefault(key, []).append(request)
 
-    for (repository, revision, endpoint), requests in repositories.items():
+    for (host, url), requests in sources.items():
+        note = _source_note(requests[0], obligations=obligations)
+        obligation_ids = tuple(dict.fromkeys(r.obligation_id for r in requests))
+        extra_context = tuple(dict.fromkeys(
+            text for r in requests[1:] for text in (r.purpose, r.model_purpose)
+            if text and text not in (requests[0].purpose, requests[0].model_purpose)
+        ))[:8]
+        _safe_url, _safe_host, safe_path = _safe_discovery_url(url)
+        authorization = ""
+        if "REDACTED" not in safe_path and host not in {"github.com", "raw.githubusercontent.com", "api.github.com"}:
+            fragment = {
+                "host": host, "include_subdomains": False,
+                "path_prefixes": [safe_path], "classification": "human-approved-reference",
+                "max_age_hours": 720, "schemes": ["https"],
+            }
+            authorization = (
+                "\n\n**Optional authorization — human approval required:**\n\n"
+                "Append this entry to `sources` in " + _quoted(policy_file)
+                + " (the `review_policy_file` action input). Keep existing entries unchanged.\n\n```json\n"
+                + json.dumps(fragment, indent=2).replace("`", "\\u0060").replace("<", "\\u003c")
+                + "\n```\n\nThis grants HTTPS retrieval under this path prefix, not an exact-URL permission; "
+                "query variants are included and subdomains are excluded. Other network and secret guards "
+                "still apply. Verify the source and scope before editing; no access has been granted."
+            )
+        note = replace(note,
+            fingerprint=_request_fingerprint(
+                ReviewNoteKind.SOURCE_ACCESS_REQUEST, url, (), None, (host, url)),
+            related_obligation_ids=obligation_ids,
+            markdown=note.markdown + (
+                "\n\n**Additional purposes / context:**\n"
+                + "\n".join("- " + _quoted(text) for text in extra_context)
+                if extra_context else ""
+            ) + authorization,
+        )
+        notes[note.fingerprint] = note
+
+    for repository, requests in repositories.items():
+        revision, endpoint = requests[0].revision or "", requests[0].endpoint
         obligation_ids = tuple(dict.fromkeys(
             request.obligation_id for request in requests
         ))
@@ -2428,6 +2492,9 @@ def build_source_access_request_notes(
             request.authority_reason for request in requests
             if request.authority_reason
         ))
+        additional_endpoints = tuple(dict.fromkeys(
+            request.endpoint for request in requests if request.endpoint != endpoint
+        ))[:8]
         reason = reasons[0] if reasons else (
             "The repository is not in the current-branch GitHub API allowlist."
         )
@@ -2435,6 +2502,11 @@ def build_source_access_request_notes(
             "### Repository access request\n\n"
             "**Repository:** " + _quoted(repository, limit=200)
             + "\n\n**GitHub API endpoint:** " + _quoted(endpoint)
+            + (
+                "\n\n**Additional requested endpoints:**\n"
+                + "\n".join("- " + _quoted(item) for item in additional_endpoints)
+                if additional_endpoints else ""
+            )
             + (
                 "\n\n**Exact revision:** " + _quoted(revision, limit=80)
                 if revision else ""
@@ -2449,15 +2521,22 @@ def build_source_access_request_notes(
             + "\n\n**Why human input is needed:** " + _quoted(reason)
             + "\n\nNo repository content was retrieved; access remains pending "
             "current-branch human authorization."
+            + "\n\n**Optional authorization — human approval required:**\n\n"
+            "Append this repository to the comma-separated `tool_allowed_gh_api_repos` "
+            "input on the workflow step invoking the review action. Keep existing entries unchanged.\n\n"
+            "```text\n" + repository + "\n```\n\n"
+            "This permits the supported read-only repository tools; it is not limited to the "
+            "requested file, endpoint, or revision. It does not allow arbitrary GitHub web URLs "
+            "or grant credentials. Verify this broader scope before editing; no access has been granted."
         )
         note = ReviewNote(
             kind=ReviewNoteKind.SOURCE_ACCESS_REQUEST,
             fingerprint=_request_fingerprint(
                 ReviewNoteKind.SOURCE_ACCESS_REQUEST,
-                repository + ":" + endpoint,
-                obligation_ids,
+                repository,
+                (),
                 None,
-                (repository, revision, endpoint),
+                (repository,),
             ),
             markdown=markdown,
             related_obligation_ids=obligation_ids,
@@ -2599,6 +2678,7 @@ def build_review_notes(
     verification_requests: Iterable[object] = (),
     source_access_requests: Iterable[object] = (),
     remediations: Mapping[str, FindingRemediation] | None = None,
+    policy_file: str = ".github/ai-review-policy.json",
 ) -> tuple[ReviewNote, ...]:
     """Build typed notes only after defensive controller-state revalidation."""
     if publishing_mode == "comment":
@@ -2640,6 +2720,7 @@ def build_review_notes(
     notes.extend(build_source_access_request_notes(
         source_access_requests,
         obligations=obligation_map,
+        policy_file=policy_file,
     ))
     unique = {(note.kind.value, note.fingerprint): note for note in notes}
     return tuple(unique[key] for key in sorted(unique))
