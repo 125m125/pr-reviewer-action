@@ -174,8 +174,21 @@ either a top-level `tests` array or named `reports`:
 Have the validation workflow write this normalized file (or convert its JUnit
 output before the review job) and pass its repository-relative path as the
 input. A specialist can then call `read_test_results` with `name_contains` or
-`name_regex`, optionally filtering by status. Source inspection alone is never
+`name_regex`, optionally filtering by status and exact `report` name. Use `offset`
+and the returned `next_offset` to retrieve further matching cases. Source inspection alone is never
 treated as a test execution result.
+
+Failed and errored cases now receive explicit triage after initial planning.
+The controller groups them by configured component when a test-file path matches,
+otherwise by report, and selects one existing specialist using path/component
+overlap, test-review responsibility, then load and a stable ID tie-break. This
+does not add specialists or expand repository access boundaries. Scheduling is
+bounded to eight groups, with excess groups combined rather than discarded.
+Triage distinguishes PR-related failures from unrelated, environmental/flaky, or
+unexplained failures; a failed test alone is not a finding. Unresolved triage is
+recorded as unknown, not automatically made a blocking defect. No configuration
+migration is required; component paths improve ownership when report metadata
+includes reliable repository test-file paths.
 
 ## Version-1 to version-2 mapping
 

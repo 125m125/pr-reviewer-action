@@ -1484,6 +1484,25 @@ def test_investigation_lead_feedback_authorizes_targeted_tools_and_evidence_reco
     assert recovered["status"] == "ok"
 
 
+def test_test_result_report_filter_and_pagination_retain_distinct_evidence():
+    session = make_session([])
+    session.test_results = (
+        {"name": "other", "status": "failed", "report": "other.xml"},
+        {"name": "first", "status": "failed", "report": "suite.xml"},
+        {"name": "second", "status": "failed", "report": "suite.xml"},
+        {"name": "passed", "status": "passed", "report": "suite.xml"},
+    )
+    query = {"name_regex": ".*", "status": "failed", "report": "suite.xml", "max_results": 1}
+    first = session._read_test_results(query)
+    second = session._read_test_results({**query, "offset": first["next_offset"]})
+    assert first["total_matches"] == 2
+    assert [t["name"] for t in first["tests"]] == ["first"]
+    assert [t["name"] for t in second["tests"]] == ["second"]
+    assert first["tests"][0]["evidence_id"] != second["tests"][0]["evidence_id"]
+    assert second["next_offset"] is None
+    assert second["truncated"] is False
+
+
 def test_session_snapshot_projects_tool_activity_without_arguments():
     session = make_session(ScriptedGateway([]))
     calls = (
