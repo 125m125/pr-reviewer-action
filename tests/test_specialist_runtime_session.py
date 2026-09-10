@@ -1327,7 +1327,8 @@ def test_investigation_lead_tool_is_bounded_and_resolution_is_assignment_scoped(
     }]
 
 
-def test_report_investigation_lead_retains_evidence_and_deduplicates():
+@pytest.mark.parametrize("capability", ["repository", "none"])
+def test_report_investigation_lead_retains_evidence_and_deduplicates(capability):
     session = make_session(ScriptedGateway([]))
     session._execute_calls(({
         "id": "read-lead", "name": "read_file",
@@ -1339,7 +1340,7 @@ def test_report_investigation_lead_retains_evidence_and_deduplicates():
         "affected_paths": ["a.py"],
         "evidence_ids": [evidence_id],
         "next_action": "Trace consumers of the changed fallback.",
-        "required_capability": "repository",
+        "required_capability": capability,
     }
 
     first_progress = session._execute_calls(({
@@ -1360,6 +1361,27 @@ def test_report_investigation_lead_retains_evidence_and_deduplicates():
     result = session._snapshot()
     assert len(result.investigation_leads) == 1
     assert result.investigation_leads[0].evidence_ids == (evidence_id,)
+
+
+@pytest.mark.parametrize("next_action", ["None.", "None. Review is complete.", "N/A", "No further investigation required."])
+def test_completion_message_is_not_an_investigation_lead_or_progress(next_action):
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-lead", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    progressed = session._execute_calls(({
+        "id": "done-lead", "name": "report_investigation_lead",
+        "arguments": json.dumps({"summary": "Review complete, no further leads.",
+            "next_action": next_action, "required_capability": "none",
+            "evidence_ids": [evidence_id]}),
+    },))
+    assert progressed is False
+    response = json.loads(session.conversation.events[-1]["content"])
+    assert response["accepted"] is False
+    assert "without tool calls" in response["reason"]
+    assert session._snapshot().investigation_leads == ()
 
 
 def test_report_investigation_lead_rejects_unretained_evidence_and_unscoped_path():

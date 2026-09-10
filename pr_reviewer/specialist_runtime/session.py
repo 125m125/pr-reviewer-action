@@ -344,7 +344,9 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
         "description": (
             "Report a concrete, evidence-backed suspicion outside the current "
             "assignment that warrants separate investigation. If the defect is "
-            "already proven, use report_candidate instead."
+            "already proven, use report_candidate instead. Do not report completion "
+            "or 'no further work' as a lead. If finished, respond without tool calls; "
+            "the controller will request a checkpoint."
         ),
         "parameters": {"type": "object", "properties": {
             "summary": {"type": "string", "maxLength": 500},
@@ -2777,6 +2779,22 @@ class SpecialistSession:
                 "reason": "summary and next_action are required",
             }
             self._add_tool_result(call_id, payload)
+            return False
+        # Reject explicit no-work placeholders, not legitimate leads that need
+        # no additional capability. Reworded completion notices are not progress.
+        if re.match(
+            r"^(?:none|n/?a|not applicable|no (?:further )?(?:action|work|investigation)"
+            r"(?: (?:needed|required))?)(?:\s*[.!;]|\s*$)",
+            next_action.strip(), re.IGNORECASE,
+        ):
+            self._add_tool_result(call_id, {
+                "accepted": False,
+                "reason": (
+                    "A lead requires a concrete unanswered question and next action, "
+                    "not a completion message. If finished, respond without tool calls; "
+                    "the controller will request a checkpoint."
+                ),
+            })
             return False
         if capability not in {"none", "repository", "tests", "web"}:
             payload = {
