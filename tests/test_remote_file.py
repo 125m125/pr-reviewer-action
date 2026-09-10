@@ -202,6 +202,13 @@ def test_gh_api_file_endpoints_require_remote_file_tool(tmp_path, endpoint):
     assert "read_remote_file" in result["result"]["error"]
 
 
+@pytest.mark.parametrize("repo", ["other/readme", "contents/project"])
+def test_gh_api_does_not_treat_repository_names_as_file_endpoints(monkeypatch, repo):
+    from pr_reviewer.tool_executors import gh_api
+    monkeypatch.setattr("pr_reviewer.platform.gh_api", lambda *a, **kw: {"ok": True})
+    assert gh_api(f"repos/{repo}/issues/1", {repo}, "current/repository") == {"ok": True}
+
+
 def test_remote_file_evidence_cannot_look_like_a_current_repository_path():
     store = EvidenceStore()
     record, _collection = store.add_tool_result_with_collection(

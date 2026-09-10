@@ -2048,6 +2048,26 @@ class SpecialistSession:
                 )
         return prompt_tokens, completion_tokens
 
+    def _checkpoint_output_allowances(self, schema: dict[str, Any]) -> tuple[int, int]:
+        admission = self._estimate_admission(
+            tools_enabled=False, max_tokens=self.max_tokens * 2, schema=schema,
+        )
+        # Include the repair instruction/contract before splitting free space.
+        repair_overhead = math.ceil(len((
+            _CHECKPOINT_REPAIR_INSTRUCTION + self._checkpoint_obligation_contract()
+        ).encode("utf-8")) / 3)
+        available = max(0, self.max_context_tokens - admission.input_tokens
+                        - self.wire_safety_tokens - repair_overhead)
+        remaining = self.budget.remaining_output_tokens()
+        if remaining is not None:
+            available = min(available, remaining)
+        if available < 768:
+            # Let existing emergency admission and lifetime-budget handling act;
+            # a one-token checkpoint would only waste a request.
+            return self.checkpoint_max_tokens, self.checkpoint_max_tokens
+        return (min(self.max_tokens * 2, max(1, available * 2 // 3)),
+                min(self.max_tokens, max(1, available // 3)))
+
     def _checkpoint_pressure_due(self, *, reserve_tool_result: bool = False) -> bool:
         projected = Conversation(
             system=self.conversation.system,
@@ -2407,6 +2427,20 @@ class SpecialistSession:
                             "malformed-textual-tool-call",
                         )
                     continue
+                if (
+                    not turn.content.strip()
+                    and turn.reasoning.strip()
+                    and str(turn.finish_reason).casefold()
+                    in {"length", "max_tokens", "max_output_tokens", "incomplete"}
+                    and not tool_less_continuation_used
+                    and self.budget.remaining_model_turns() > _CHECKPOINT_TURN_RESERVE
+                ):
+                    if self.budget.record_no_progress() < self.max_no_progress_streak:
+                        # Keep the assistant reasoning as the final message: a
+                        # new user instruction can reset reasoning in templates.
+                        # The next loop iteration still enforces context pressure.
+                        tool_less_continuation_used = True
+                        continue
                 checkpoint = self._checkpoint_from_text(turn.content)
                 checkpoint_change_rejected = bool(self._last_checkpoint_rejections)
                 if (
@@ -4211,10 +4245,9 @@ class SpecialistSession:
             if disposition is CheckpointDisposition.COMPACT_RESUME
             else _CHECKPOINT_SCHEMA
         )
-        checkpoint_output_tokens = min(
-            self.checkpoint_max_tokens,
-            max_output_tokens if max_output_tokens is not None else self.checkpoint_max_tokens,
-        )
+        checkpoint_output_tokens, checkpoint_repair_tokens = self._checkpoint_output_allowances(checkpoint_schema)
+        if max_output_tokens is not None:
+            checkpoint_output_tokens = min(checkpoint_output_tokens, max_output_tokens)
         request_event_count = len(self._request_events)
         checkpoint_context_admission: dict[str, object] = {}
         try:
@@ -4226,6 +4259,7 @@ class SpecialistSession:
                 allow_compaction=False,
                 allow_gateway_fallbacks=allow_gateway_fallbacks,
             )
+            self._last_context_admission["repair_response_reserve_tokens"] = checkpoint_repair_tokens
         except (BudgetExhausted, TimeoutError) as exc:
             checkpoint_context_admission = dict(self._last_context_admission)
             available = self.max_context_tokens - int(
@@ -4389,6 +4423,12 @@ class SpecialistSession:
                 self.conversation.add_user(repair_instruction)
             repair_event_count = len(self._request_events)
             try:
+                repair_admission = self._estimate_admission(
+                    tools_enabled=False, max_tokens=checkpoint_repair_tokens,
+                    schema=checkpoint_schema,
+                )
+                repair_tokens = min(checkpoint_repair_tokens, max(512,
+                    self.max_context_tokens - repair_admission.input_tokens - self.wire_safety_tokens))
                 repair = self._request(
                     tools_enabled=False,
                     schema=checkpoint_schema,
@@ -4396,7 +4436,7 @@ class SpecialistSession:
                         "checkpoint-clean-retry"
                         if reasoning_only_retry else "checkpoint-repair"
                     ),
-                    max_output_tokens=self.checkpoint_max_tokens,
+                    max_output_tokens=repair_tokens,
                     allow_compaction=False,
                     allow_gateway_fallbacks=allow_gateway_fallbacks,
                 )

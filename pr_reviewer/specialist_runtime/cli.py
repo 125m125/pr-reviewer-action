@@ -973,6 +973,7 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
         },
         configuration_warnings=policy_warnings,
         adapter_configuration={
+            "review_policy_file": config.policy_path.relative_to(config.workspace).as_posix(),
             "endpoint": endpoint_identity,
             "role_models": dict(config.role_models),
             "response_format": config.response_format,

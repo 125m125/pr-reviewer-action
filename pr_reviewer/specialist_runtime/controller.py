@@ -5031,6 +5031,8 @@ class ReviewController:
                 ),
                 source_access_requests=state.source_requests,
                 remediations=state.remediations,
+                policy_file=str(state.inputs.adapter_configuration.get(
+                    "review_policy_file", ".github/ai-review-policy.json")),
             )
         except Exception as exc:
             self._degrade(state, "review_notes", _bounded_error(exc))
@@ -5273,6 +5275,8 @@ class ReviewController:
                     ),
                     source_access_requests=state.source_requests,
                     remediations=state.remediations,
+                    policy_file=str(state.inputs.adapter_configuration.get(
+                        "review_policy_file", ".github/ai-review-policy.json")),
                 )
             except Exception as exc:
                 state.journal.emit("remediation_note_render_failed", {

@@ -4628,6 +4628,18 @@ def test_later_controller_feedback_expires_checkpoint_todos():
     assert "Read an unrelated historical file." not in message
 
 
+def test_checkpoint_output_uses_spare_context_and_reserves_repair():
+    session = make_session(EstimatingGateway([], rendered_bytes=3000), max_context_tokens=75000)
+    session.max_tokens = 8192
+    first, repair = session._checkpoint_output_allowances({})
+    assert (first, repair) == (16384, 8192)
+    session.max_context_tokens = 10000
+    first, repair = session._checkpoint_output_allowances({})
+    assert 0 < repair <= 8192
+    assert first in (2 * repair, 2 * repair + 1)
+    assert first + repair < 9000
+
+
 def test_checkpoint_diagnostic_projects_admission_and_regular_compaction_counts():
     gateway = EstimatingGateway(
         [
@@ -4667,7 +4679,7 @@ def test_checkpoint_diagnostic_projects_admission_and_regular_compaction_counts(
     assert diagnostic["disposition"] == "compact_resume"
     assert diagnostic["estimated_input_tokens"] >= 9_000
     assert diagnostic["provider_calibrated_input_tokens"] >= 9_000
-    assert diagnostic["response_reserve_tokens"] == session.checkpoint_max_tokens
+    assert diagnostic["response_reserve_tokens"] == session.max_tokens * 2
     assert diagnostic["repair_response_reserve_tokens"] == session.checkpoint_max_tokens
     assert diagnostic["admission_source"] == "provider-usage-delta"
     assert diagnostic["compaction_level"] == "regular"
@@ -4755,8 +4767,37 @@ def test_checkpoint_diagnostic_admission_keeps_initial_and_repair_reserves():
     diagnostic = result.finalization_diagnostics[-1]
 
     assert diagnostic["repair_attempted"] is True
-    assert diagnostic["response_reserve_tokens"] == session.checkpoint_max_tokens
+    assert diagnostic["response_reserve_tokens"] == session.max_tokens * 2
     assert diagnostic["repair_response_reserve_tokens"] == session.checkpoint_max_tokens
+    assert [request.max_tokens for request in gateway.requests] == [2048, 1024]
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "max_tokens", "max_output_tokens", "incomplete"])
+def test_interrupted_reasoning_continues_without_new_user_instruction(finish_reason):
+    gateway = ScriptedGateway([
+        replace(reasoning_only_response("Still tracing the caller."), finish_reason=finish_reason),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway, model_turns=8)
+    session.explore()
+    first = json.loads(gateway.requests[0].messages)
+    second = json.loads(gateway.requests[1].messages)
+    assert [m for m in second if m["role"] == "user"] == [m for m in first if m["role"] == "user"]
+    assert "Still tracing the caller." in gateway.requests[1].messages
+    assert gateway.requests[1].tools_enabled
+
+
+def test_repeated_incomplete_reasoning_falls_back_to_checkpoint():
+    interrupted = replace(reasoning_only_response("Still investigating."), finish_reason="incomplete")
+    gateway = ScriptedGateway([
+        interrupted, interrupted,
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway, model_turns=8)
+    session.explore()
+    assert len(gateway.requests) == 3
+    assert [r.tools_enabled for r in gateway.requests] == [True, True, False]
+    assert "Checkpoint requested" in gateway.requests[2].messages
 
 
 def test_reasoning_only_checkpoint_retries_without_retaining_failed_response():
@@ -5136,7 +5177,7 @@ def test_pressure_requests_checkpoint_before_exploration():
     assert len(gateway.requests) == 2
     assert gateway.requests[0].tools_enabled is False
     assert gateway.requests[1].tools_enabled is True
-    assert gateway.requests[0].max_tokens == 2_048
+    assert 512 <= gateway.requests[0].max_tokens <= 2_048
     assert gateway.requests[0].reasoning_effort == "none"
     assert gateway.requests[0].messages_contain(
         "After validation, resume the specialist session."
@@ -5334,7 +5375,7 @@ def test_checkpoint_context_admission_failure_records_actionable_diagnostics():
     assert diagnostic["requested_output_tokens"] == 256
 
 
-def test_locally_rejected_checkpoint_uses_smaller_response_without_losing_history():
+def test_tight_checkpoint_uses_smaller_response_without_losing_history():
     gateway = EstimatingGateway([
         checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
     ], rendered_bytes=21_000)
@@ -5345,7 +5386,7 @@ def test_locally_rejected_checkpoint_uses_smaller_response_without_losing_histor
     assert len(gateway.requests) == 1
     assert 512 <= gateway.requests[0].max_tokens < 2_048
     assert "Important investigation already performed" in gateway.requests[0].messages
-    assert result.finalization_diagnostics[-1]["emergency_outcome"] == "smaller_checkpoint_succeeded"
+    assert result.finalization_diagnostics[-1]["emergency_outcome"] == "not_attempted"
 
 
 @pytest.mark.parametrize("padding", ["", "x" * 30_000])
