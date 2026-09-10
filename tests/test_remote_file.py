@@ -180,10 +180,16 @@ def test_gh_api_does_not_read_contents_files(monkeypatch, tmp_path):
     assert "read_remote_file" in result["result"]["error"]
 
 
-def test_gh_api_does_not_read_git_blobs(tmp_path):
+@pytest.mark.parametrize("endpoint", [
+    "repos/other/project/git/blobs/" + "a" * 40,
+    "repos/other/project/readme",
+    "repos/other/project/readme?ref=main",
+    "repos/other/project/readme/docs",
+])
+def test_gh_api_file_endpoints_require_remote_file_tool(tmp_path, endpoint):
     result = execute_tool_request(
         "gh_api",
-        {"endpoint": "repos/other/project/git/blobs/" + "a" * 40},
+        {"endpoint": endpoint},
         str(tmp_path),
         {"other/project"},
         "current/repository",

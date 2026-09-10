@@ -1344,6 +1344,17 @@ def _prose_path_references(
         reference = match.group(0).rstrip(".,;:!?)]}")
         if reference.lower().startswith("www."):
             continue
+        # An arbitrary dotted identifier (test.afterEach, policy.verdict) is
+        # not a file. Exact tracked names were handled above, including unusual
+        # extensions; infer untracked root files only for common file suffixes.
+        if not reference.startswith(".") and reference.rsplit(".", 1)[-1].lower() not in {
+            "py", "pyi", "js", "jsx", "ts", "tsx", "java", "kt", "go", "rs",
+            "c", "h", "cpp", "hpp", "cs", "rb", "php", "sh", "ps1", "bat",
+            "cmd", "md", "adoc", "asciidoc", "txt", "json", "yaml", "yml",
+            "toml", "xml", "ini", "conf", "properties", "sql", "html", "css",
+            "scss", "dart", "proto", "lock",
+        }:
+            continue
         if reference and reference not in references:
             references.append(reference)
     return tuple(references)
@@ -1635,7 +1646,7 @@ def _deterministic_change_overview(inputs: ReviewInputs) -> dict[str, object]:
             ("workflow_steps", "workflow steps"),
             ("workflow_keys", "workflow keys"),
             ("headings", "headings"),
-            ("change_excerpts", "documentation excerpts"),
+            ("change_excerpts", "changed-line excerpts"),
             ("hunk_summaries", "hunks"),
         ):
             values = fact.get(field_name, ())
@@ -6131,6 +6142,24 @@ class ReviewController:
             state.coverage = CoverageLedger(state.obligations)
             state.change_overview = self._summarize_changes(state)
             state.plan = self._plan(state)
+            from .test_triage import assign_test_failure_triage
+            state.plan, test_obligations = assign_test_failure_triage(
+                state.plan, inputs.test_results, inputs.policy.components,
+            )
+            if test_obligations:
+                state.obligations = (*state.obligations, *test_obligations)
+                state.coverage = CoverageLedger(state.obligations)
+                terminal_capture["obligations"] = tuple(
+                    (item.id, "unresolved" if item.mandatory else "not_applicable", item.mandatory)
+                    for item in state.obligations
+                )
+                journal.emit("test_failure_triage_assigned", {
+                    "groups": len(test_obligations),
+                    "failed_or_errored_cases": sum(
+                        row.get("status") in {"failed", "errored"} for row in inputs.test_results
+                    ),
+                    "unassigned_obligation_ids": state.plan.unassigned_obligation_ids,
+                })
             state.assignments = {
                 item.id: item for item in state.plan.assignments
             }
