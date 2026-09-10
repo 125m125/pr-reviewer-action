@@ -913,6 +913,15 @@ def test_change_overview_rejects_tracked_and_unknown_path_like_tokens(
         controller_module._validated_change_overview(proposal, inputs)
 
 
+def test_summary_path_detection_does_not_treat_method_names_as_files():
+    assert controller_module._prose_path_references(
+        "Updates test.setTimeout without changing test.afterEach; see UNKNOWN.txt."
+    ) == ("UNKNOWN.txt",)
+    assert controller_module._prose_path_references(
+        "Updates custom.settings.", ("custom.settings",),
+    ) == ("custom.settings",)
+
+
 def test_change_overview_accepts_controller_supplied_context_path_without_claiming_change(
     tmp_path,
 ):

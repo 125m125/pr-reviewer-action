@@ -104,6 +104,27 @@ def test_local_diff_facts_do_not_depend_on_github_patch_text(tmp_path):
     ]["change_excerpts"]
 
 
+def test_change_facts_include_signed_code_edits_not_hunk_context():
+    facts = specialists._facts_from_patch(
+        "tests/example.spec.ts", "modified",
+        "@@ -30,3 +30,3 @@ test.afterEach(async () => {\n"
+        " test('example', () => {\n"
+        "-  test.setTimeout(30_000);\n"
+        "+  test.setTimeout(60_000);\n",
+        include_intent=True,
+    )
+    assert facts["change_excerpts"] == [
+        "- test.setTimeout(30_000);", "+ test.setTimeout(60_000);",
+    ]
+    assert all("afterEach" not in text for text in facts["change_excerpts"])
+    large = specialists._facts_from_patch(
+        "large.ts", "modified", "\n".join("+" + "x" * 500 for _ in range(1000)),
+        include_intent=True,
+    )
+    assert len(large["change_excerpts"]) <= 5
+    assert all(len(text) <= 160 for text in large["change_excerpts"])
+
+
 def test_authoritative_change_facts_stay_capped_when_api_patches_are_missing(
     monkeypatch,
     tmp_path,
