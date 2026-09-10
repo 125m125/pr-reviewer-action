@@ -9,6 +9,22 @@ provider capacity are understood.
 
 ## What changes
 
+Checkpoint output uses available provider-context headroom: approximately two
+thirds for the initial checkpoint and one third reserved for a repair, after
+instruction and safety overhead. The caps are twice the configured specialist
+response-token limit initially and that limit for repair (for example, 16384
+and 8192 with an 8192 response limit). Repair admission is recalculated after
+the failed response; lifetime budgets and emergency admission still apply.
+This does not delay context-pressure checkpoints. Stream diagnostics now use
+`incomplete` when the provider stream has no finish reason; that is not proof
+of output-token exhaustion.
+During exploration, reasoning-only responses marked `length`, `max_tokens`,
+`max_output_tokens`, or `incomplete` can receive one continuation without a new
+user message. Retained reasoning stays in the assistant history. Context,
+no-progress, and lifetime limits still apply; repeated interruption falls back
+to checkpoint recovery. Partial content and tool calls retain their existing
+validation paths.
+
 - A specialist is now a continuous, bounded session. It retains only the
   review state needed across planning, investigation, bounded follow-up, and
   finalization instead of restarting an unrelated whole-PR review.
@@ -716,6 +732,16 @@ not need to be repeated in checkpoints.
 | `specialists_evaluate` | Writes the same artifacts but intentionally does not publish a review. |
 
 ## Troubleshooting
+
+Source-access notes include optional, copyable authorization additions for human
+review. Website requests suggest one narrowly scoped `sources` entry in the
+configured `review_policy_file`; repository requests suggest an addition to the
+workflow's `tool_allowed_gh_api_repos` input. Append rather than replace existing
+entries. Website permissions cover the stated path and descendants (including
+query variants), while repository permissions are not restricted to one file or
+revision. Requests needing the same authorization are consolidated. Sensitive
+or redacted URL paths do not receive a copyable website entry. These suggestions
+never grant access automatically and are kept out of the sticky handoff.
 
 | Symptom | Check | Resolution |
 |---|---|---|

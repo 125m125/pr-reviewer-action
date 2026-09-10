@@ -21,6 +21,13 @@ def _make_sse_line(data: dict) -> str:
     return f"data: {json.dumps(data)}"
 
 
+def test_truncated_openai_stream_does_not_invent_normal_stop():
+    result = reassemble_sse(_make_sse_line({
+        "choices": [{"delta": {"content": '{"unfinished":'}, "finish_reason": None}],
+    }), "openai")
+    assert result["choices"][0]["finish_reason"] == "incomplete"
+
+
 def test_openai_preserves_final_cache_and_timing_snapshots_without_double_counting():
     usage = {"prompt_tokens": 1000, "completion_tokens": 20,
              "prompt_tokens_details": {"cached_tokens": 900}}

@@ -244,7 +244,8 @@ def _reassemble_anthropic(
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": content_text},
-                "finish_reason": stop_reason or "stop",
+                # A missing terminal signal is not evidence of a normal stop.
+                "finish_reason": stop_reason or "incomplete",
             }
         ],
         "usage": {
@@ -393,7 +394,8 @@ def _reassemble_openai(
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": content_text},
-                "finish_reason": finish_reason or "stop",
+                # Preserve the distinction between truncation and provider stop.
+                "finish_reason": finish_reason or "incomplete",
             }
         ],
         "usage": {
