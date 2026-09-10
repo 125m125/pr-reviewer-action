@@ -105,6 +105,24 @@ def test_controller_public_api_is_importable():
     assert ReviewResult
 
 
+def test_ci_failures_are_assigned_after_planner_without_becoming_findings(tmp_path):
+    observed = []
+    def factory(assignment, *args):
+        observed.append(assignment)
+        return _factory(assignment, *args)
+    result = _controller(tmp_path, session_factory=factory).run(replace(
+        _inputs(tmp_path), test_results=({
+            "name": "test_delivery", "status": "failed", "report": "pytest.xml",
+        },),
+    ))
+    triage_ids = {key for key in result.artifact["coverage"] if key.startswith("obligation:ci-test-triage:")}
+    assert len(triage_ids) == 1
+    assert any(triage_ids.issubset(set(item.obligation_ids)) for item in observed)
+    assert any(e["kind"] == "test_failure_triage_assigned" for e in result.artifact["events"])
+    assert not any(e["kind"] == "session_quarantined" for e in result.artifact["events"])
+    assert not result.artifact["accepted_candidates"]
+
+
 def test_controller_admits_and_explicitly_resolves_session_investigation_lead(tmp_path):
     controller = _controller(tmp_path)
     state = _RunState(
