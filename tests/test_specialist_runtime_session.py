@@ -652,6 +652,53 @@ def test_stop_disposition_pass_keeps_checkpoint_and_accepts_valid_siblings():
     assert gateway.requests[0].response_schema["required"] == ["obligation_updates"]
 
 
+@pytest.mark.parametrize("operation", ["checkpoint", "accounting"])
+def test_unadmitted_structured_prompt_does_not_pollute_history(operation):
+    gateway = ScriptedGateway([])
+    session = make_session(gateway, max_context_tokens=100)
+    session._last_valid_checkpoint = session.latest_checkpoint
+    before = list(session.conversation.events)
+    if operation == "checkpoint":
+        session.request_checkpoint("interrupted-exploration")
+    else:
+        session._settle_pending_obligations("completion")
+    assert not gateway.requests
+    assert session.conversation.events == before
+
+
+def test_accounting_batches_large_scopes_without_repeating_path_catalogs():
+    obligations = tuple(CoverageObligation(
+        obligation_id=f"OB-{i}", origin="test", subject=f"behavior {i}",
+        scope=tuple(f"src/long/component/path/module{j}.py" for j in range(200)),
+        seed_hints=tuple(f"tests/module{j}.py" for j in range(200)),
+    ) for i in range(6))
+    assignment = SpecialistAssignment(
+        assignment_id="large", objective="Review behavior",
+        primary_obligation_ids=tuple(o.id for o in obligations),
+    )
+    def respond(targets):
+        return invalid_response(json.dumps({"obligation_updates": [
+            {"target": t, "disposition": "blocked", "reason": "Required source unavailable",
+             "evidence_ids": [], "next_actions": []} for t in targets
+        ]}))
+    gateway = ScriptedGateway([respond(["O1", "O2", "O3", "O4"]), respond(["O5", "O6"])])
+    session = make_session(gateway, obligations=obligations, assignment=assignment)
+    session._last_valid_checkpoint = session.latest_checkpoint
+    session._settle_pending_obligations("completion")
+    assert len(gateway.requests) == 2
+    assert all(a.disposition.value == "blocked" for a in session.obligation_assessments.assessments())
+
+
+def test_failed_checkpoint_defers_accounting_until_checkpoint_recovery():
+    gateway = ScriptedGateway([TimeoutError("phase cutoff")])
+    session = make_session(gateway)
+    session._last_valid_checkpoint = session.latest_checkpoint
+    session.request_checkpoint("context-pressure")
+    session.settle_for_scheduling()
+    assert len(gateway.requests) == 1
+    assert not session._disposition_pass_diagnostics
+
+
 def test_invalid_stop_disposition_response_preserves_checkpoint():
     gateway = ScriptedGateway([invalid_response("<tool_call>")])
     session = make_session(gateway)
@@ -5206,10 +5253,8 @@ def test_coarse_context_overflow_preserves_history_until_checkpoint_validates():
         event.get("compaction_note")
         for event in session.conversation.events
     )
-    checkpoint_prompt = session.conversation.events[-1]["content"]
-    assert "Checkpoint reason: context-pressure." in checkpoint_prompt
-    assert "Immediate compaction after validation: yes." in checkpoint_prompt
-    assert "After validation, resume the specialist session." in checkpoint_prompt
+    # An instruction rejected before dispatch must not pollute recovery history.
+    assert session.conversation.events[-1]["content"] == retained_content
 
 
 def test_checkpoint_request_includes_compact_schema_contract():

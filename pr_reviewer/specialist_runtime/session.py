@@ -4262,6 +4262,10 @@ class SpecialistSession:
             self._last_context_admission["repair_response_reserve_tokens"] = checkpoint_repair_tokens
         except (BudgetExhausted, TimeoutError) as exc:
             checkpoint_context_admission = dict(self._last_context_admission)
+            if isinstance(exc, BudgetExhausted):
+                # Admission failed before dispatch. Do not carry an unsent
+                # instruction into a later recovery request.
+                del self.conversation.events[checkpoint_request_start:]
             available = self.max_context_tokens - int(
                 checkpoint_context_admission.get("estimated_input_tokens", self.max_context_tokens)
             ) - self.wire_safety_tokens
@@ -6985,13 +6989,24 @@ class SpecialistSession:
 
     def _settle_pending_obligations(self, reason: str) -> None:
         """One bounded accounting turn per exploration period, never more research."""
+        if (self._finalization_diagnostics
+                and self._finalization_diagnostics[-1].get("initial_parse") == "unavailable"):
+            # Preserve room/time for checkpoint recovery, including the interval
+            # before the scheduler marks an interrupted exploration callback.
+            return
         pending = [item.target for item in self.obligation_assessments.assessments()
                    if item.disposition.value == "pending"]
         if (self._disposition_pass_attempted or not pending
                 or self._last_valid_checkpoint is None):
             return
         self._disposition_pass_attempted = True
-        targets = pending[:40]
+        for offset in range(0, min(len(pending), 40), 4):
+            self._settle_obligation_batch(reason, pending[offset:offset + 4])
+            if self._disposition_pass_diagnostics[-1]["status"] != "completed":
+                break
+
+    def _settle_obligation_batch(self, reason: str, targets: list[str]) -> None:
+        """Account for a small group without repeating exploration path catalogs."""
         item_schema = json.loads(json.dumps(
             _CHECKPOINT_SCHEMA["properties"]["obligation_updates"]["items"],
         ))
@@ -7011,6 +7026,7 @@ class SpecialistSession:
             self._finalization_diagnostics[-1].setdefault(
                 "obligation_disposition_passes", [],
             ).append(diagnostic)
+        request_start = len(self.conversation.events)
         self.conversation.add_user(
             "Exploration is stopping, not restarting. The checkpoint and candidates "
             "are already retained. Tools are disabled. Give one concise disposition "
@@ -7024,22 +7040,32 @@ class SpecialistSession:
             "more investigation would help. Never claim coverage just to finish. "
             "Missing or rejected updates remain pending.\n"
             + json.dumps({"pending_obligations": [
-                self.obligation_assessments.explain(target) for target in targets
+                {"subject": self.coverage.obligation(
+                    self.obligation_assessments.assessment(target).obligation_id,
+                 ).subject,
+                 **{key: value for key, value in self.obligation_assessments.explain(target).items()
+                    if key in {"target", "objective", "required_evidence", "disposition", "last_conclusion"}}}
+                for target in targets
             ], "response_schema": schema}, sort_keys=True)
         )
         try:
+            estimate = self._estimate_admission(
+                tools_enabled=False, schema=schema, max_tokens=512,
+            )
+            available = self.max_context_tokens - estimate.input_tokens - self.wire_safety_tokens
+            if available < 512:
+                raise BudgetExhausted("model context limit cannot admit input and requested output")
             turn = self._request(
                 tools_enabled=False, schema=schema,
                 purpose="stop-obligation-dispositions",
-                max_output_tokens=min(self.checkpoint_max_tokens, 4_096),
+                max_output_tokens=min(self.checkpoint_max_tokens, 4_096, available),
                 allow_compaction=False, allow_gateway_fallbacks=False,
             )
         except Exception as exc:
             diagnostic.update(status="unavailable", error=format_callback_error(exc, limit=300))
-            self.conversation.add_user(
-                "Obligation disposition pass unavailable; previous state retained: "
-                + json.dumps(diagnostic, sort_keys=True)
-            )
+            if isinstance(exc, BudgetExhausted):
+                del self.conversation.events[request_start:]
+            # Failure diagnostics belong in the artifact, not another prompt.
             return
         self.conversation.add_assistant_turn(reasoning=turn.reasoning, content=turn.content, calls=())
         raw = None if turn.tool_calls else _json_object(turn.content)
@@ -7081,7 +7107,7 @@ class SpecialistSession:
                     )
                     self._last_valid_checkpoint = self.latest_checkpoint
             results.extend({"target": target, "accepted": False, "reason": "No update returned"}
-                           for target in pending if target not in seen)
+                           for target in targets if target not in seen)
             diagnostic.update(status="completed", results=results)
         self.conversation.add_user(
             "Obligation disposition receipt (authoritative; no further repair requested): "

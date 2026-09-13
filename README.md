@@ -329,7 +329,9 @@ one compact recovery request instead of continuing the same transcript.
 
 Specialist mode derives a generic component topology and deterministic review
 obligations from manifests, paths, file roles, contracts, recipes, and risk
-flags. A bounded planner assigns those obligations to durable specialist
+flags. See the [file-role reference](docs/file-roles.md) for every supported
+`file_roles_any` value, its exact path-matching rules, and limitations.
+A bounded planner assigns those obligations to durable specialist
 sessions. Sessions gather read-only evidence, checkpoint their progress, and
 finish on the same logical conversation; the coverage ledger and scheduler
 decide whether a bounded follow-up is justified. Deterministic adjudication
@@ -387,11 +389,16 @@ Low cache reuse after a transition helps identify expensive reprocessing but
 does not establish whether cache eviction, prompt/template changes, or another
 server behavior caused it. No llama-specific request options are required.
 
+For new configurations, start with the permanent
+[policy-authoring guide](docs/review-policy-authoring.md): schema/defaults,
+matching rules, bounded recipes, access configuration, validation, and a
+copyable brief for configuration-generating agents.
+
 `review_policy_file` is a current-branch version-2 policy. The older
 `specialist_config_file` remains a one-release version-1 migration input, but
 version-2 recipes/policy control deterministic obligations and specialist
 selection. See the [migration handoff](docs/migrations/specialist-session-runtime.md)
-for the complete schema, source-rule boundaries, and conversion checklist.
+for the version-1 conversion checklist.
 
 </details>
 
