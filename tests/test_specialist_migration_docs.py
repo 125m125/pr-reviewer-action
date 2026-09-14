@@ -48,14 +48,14 @@ def parse_migration_input_table() -> dict[str, dict[str, str]]:
 
 
 def documented_v2_policy() -> dict[str, object]:
-    """Return the version-2 JSON fence from the executable migration guide."""
-    text = MIGRATION.read_text(encoding="utf-8")
+    """Return the version-2 JSON fence from the policy-authoring guide."""
+    text = (ROOT / "docs" / "review-policy-authoring.md").read_text(encoding="utf-8")
     match = re.search(
         r"## Complete version-2 policy example.*?```json\s*(\{.*?\})\s*```",
         text,
         flags=re.DOTALL,
     )
-    assert match, "the migration handoff must contain one version-2 policy JSON fence"
+    assert match, "the policy-authoring guide must contain one version-2 policy JSON fence"
     return json.loads(match.group(1))
 
 
