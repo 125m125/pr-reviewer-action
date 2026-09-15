@@ -311,6 +311,7 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_temperature` | Sampling temperature for streamed specialist exploration turns; keep `0.0` for deterministic behavior or experiment with a modest value | No | `0.0` |
 | `specialist_stream_watchdog` | Interrupt streamed specialist output after repeated paragraphs/blocks and recover once from compact evidence | No | `true` |
 | `specialist_structured_chat_template_kwargs` | Optional JSON `chat_template_kwargs` added only to no-tool specialist structured turns; leave empty unless the provider supports it | No | `""` |
+| `specialist_checkpoint_reasoning_budget_tokens` | Opt-in cache-preserving first checkpoint: retains tool schemas/thinking settings and sends nonstandard `thinking_budget_tokens`. Requires server enforcement; tested with ik_llama at `256`. Empty preserves strict checkpoints; `0` requests immediate end of thinking. Repairs remain strict and no checkpoint tool calls execute. | No | `""` |
 | `specialist_max_truncation_continuations` | Deprecated no-op; durable sessions checkpoint instead of issuing truncation-continuation turns | No | `2` |
 | `specialist_planner_max_context_bytes` | Diff/context bytes supplied to the planner before tool exploration | No | `60000` |
 | `specialist_packet_max_bytes` | Deprecated no-op; durable sessions do not build packet-mode specialist inputs | No | `90000` |

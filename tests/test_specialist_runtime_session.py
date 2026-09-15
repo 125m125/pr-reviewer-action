@@ -756,6 +756,7 @@ class RecordedRequest:
     ephemeral_user_note: str | None
     reasoning_effort: str | None
     response_schema: dict | None
+    thinking_budget_tokens: int | None = None
 
     def messages_contain(self, value):
         return value in self.messages
@@ -775,6 +776,7 @@ class ScriptedGateway:
             ephemeral_user_note=request.ephemeral_user_note,
             reasoning_effort=request.reasoning_effort,
             response_schema=request.response_schema,
+            thinking_budget_tokens=getattr(request, "thinking_budget_tokens", None),
         ))
         assert self.responses, "model called more times than scripted"
         response = self.responses.pop(0)
@@ -3215,7 +3217,8 @@ def test_checkpoint_repairs_candidate_missing_actionable_severity():
     assert "severity" in repair_prompts[-1]
 
 
-def test_checkpoint_carries_forward_candidates_when_update_arrays_are_empty():
+@pytest.mark.parametrize("thinking_budget", [None, 256])
+def test_checkpoint_carries_forward_candidates_when_update_arrays_are_empty(thinking_budget):
     """Unchanged candidates remain active without replaying their full objects."""
     initial = candidate_checkpoint_response(("candidate-code",))
     second = candidate_update_checkpoint_response(updates=(), new_candidates=())
@@ -3227,12 +3230,14 @@ def test_checkpoint_carries_forward_candidates_when_update_arrays_are_empty():
     session = make_session(gateway, model_turns=4)
 
     first = session.explore()
+    session.checkpoint_reasoning_budget_tokens = thinking_budget
     session.apply_coverage_feedback(["OB-tests"])
-    second_result = session.explore()
+    second_result = session.request_checkpoint("controller-request")
 
     assert first.checkpoint.candidate_finding_ids == ("candidate-code",)
     assert second_result.checkpoint.candidate_finding_ids == ("candidate-code",)
     assert second_result.degraded is False
+    assert gateway.requests[-1].thinking_budget_tokens == thinking_budget
 
 
 def test_checkpoint_retains_bounded_cumulative_working_state():
@@ -4832,6 +4837,76 @@ def test_interrupted_reasoning_continues_without_new_user_instruction(finish_rea
     assert [m for m in second if m["role"] == "user"] == [m for m in first if m["role"] == "user"]
     assert "Still tracing the caller." in gateway.requests[1].messages
     assert gateway.requests[1].tools_enabled
+
+
+@pytest.mark.parametrize("repeat_error", [False, True])
+def test_rejected_reasoning_prefill_gets_one_user_continuation(repeat_error):
+    error = ModelRequestError(
+        "provider rejected request", status=500,
+        body="Assistant response prefill is incompatible with enable_thinking.",
+    )
+    gateway = ScriptedGateway([
+        replace(reasoning_only_response("Still tracing the caller."), finish_reason="incomplete"),
+        error,
+        error if repeat_error else checkpoint_response(
+            inspected=[], unresolved=["OB-code", "OB-tests"],
+        ),
+    ])
+    session = make_session(gateway, model_turns=8)
+    if repeat_error:
+        with pytest.raises(ModelRequestError):
+            session.explore()
+    else:
+        session.explore()
+    assert len(gateway.requests) == 3
+    messages = json.loads(gateway.requests[2].messages)
+    assert messages[-1]["role"] == "user"
+    assert "tools remain enabled" in messages[-1]["content"]
+    assert "Still tracing the caller." in gateway.requests[2].messages
+    assert gateway.requests[2].tools_enabled
+    assert session.budget.remaining_model_turns() == 5
+
+
+@pytest.mark.parametrize("failure", ["invalid", "tools", "provider", "reasoning"])
+def test_budgeted_checkpoint_falls_back_without_executing_tools(failure):
+    failed = {
+        "invalid": invalid_response("not JSON"),
+        "tools": tool_call_response("read_file", {"path": "a.py"}),
+        "provider": ModelRequestError("unknown thinking_budget_tokens", status=400),
+        "reasoning": replace(reasoning_only_response("Still thinking"), finish_reason="length"),
+    }[failure]
+    gateway = ScriptedGateway([
+        failed, checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.checkpoint_reasoning_budget_tokens = 256
+    executed = []
+    session.execute_tool = lambda *args: executed.append(args)
+    result = session.request_checkpoint("controller-request")
+    assert not result.degraded
+    assert executed == []
+    assert [r.thinking_budget_tokens for r in gateway.requests] == [256, None]
+    assert all(not r.tools_enabled for r in gateway.requests)
+    assert all('"tool_calls"' not in r.messages for r in gateway.requests)
+
+
+@pytest.mark.parametrize("optimized_bytes,uses_budget", [(24_000, True), (300_000, False)])
+def test_budgeted_checkpoint_accounts_for_retained_tool_size(optimized_bytes, uses_budget):
+    class SizedGateway(ScriptedGateway):
+        def rendered_request_bytes(self, request):
+            return optimized_bytes if request.thinking_budget_tokens is not None else 12_000
+
+    gateway = SizedGateway([checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])])
+    session = make_session(gateway, max_tokens=8192, max_context_tokens=20_000)
+    session.checkpoint_reasoning_budget_tokens = 256
+    result = session.request_checkpoint("controller-request")
+    assert not result.degraded
+    assert (gateway.requests[0].thinking_budget_tokens is not None) == uses_budget
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["checkpoint_mode_reason"] == ("enabled" if uses_budget else "context-reserve")
+    if uses_budget:
+        assert gateway.requests[0].max_tokens < 8192
+        assert diagnostic["admission_tokens"] + diagnostic["repair_response_reserve_tokens"] <= 20_000
 
 
 def test_repeated_incomplete_reasoning_falls_back_to_checkpoint():

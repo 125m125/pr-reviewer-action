@@ -1,6 +1,26 @@
 import json
+from dataclasses import replace
 
 import pytest
+
+
+def test_budgeted_checkpoint_retains_wire_tools_without_enabling_execution():
+    value = Conversation(system="Review.")
+    value.add_user("Save checkpoint.")
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1", api_key="", default_model="review",
+        response_format="json_schema",
+        structured_chat_template_kwargs={"enable_thinking": False},
+    )
+    request = replace(turn_request(value, tools_enabled=False),
+                      thinking_budget_tokens=256)
+    payload = gateway.render_request(request)
+    assert not request.tools_enabled
+    assert payload["tools"]
+    assert payload["thinking_budget_tokens"] == 256
+    assert "chat_template_kwargs" not in payload
+    assert "response_format" not in payload
+    assert "reasoning_effort" not in payload
 
 from pr_reviewer.conversation import Conversation
 from pr_reviewer.specialist_runtime.model_gateway import (

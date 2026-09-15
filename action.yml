@@ -220,6 +220,15 @@ inputs:
       output budget on the required JSON instead of private reasoning.
     required: false
     default: ""
+  specialist_checkpoint_reasoning_budget_tokens:
+    description: >-
+      Optional nonnegative thinking_budget_tokens for the first specialist checkpoint
+      attempt. Retains tool schemas and exploration thinking settings for cache reuse,
+      but never executes checkpoint tool calls. Requires an endpoint that enforces
+      this nonstandard field (tested with ik_llama; recommended 256). Empty disables
+      the optimization. Repairs and tight-context requests use strict no-tool turns.
+    required: false
+    default: ""
   specialist_max_truncation_continuations:
     description: Deprecated no-op retained for one release; durable sessions checkpoint instead of issuing truncation-continuation turns.
     required: false
@@ -874,6 +883,7 @@ runs:
         SPECIALIST_TEMPERATURE: ${{ inputs.specialist_temperature }}
         SPECIALIST_STREAM_WATCHDOG: ${{ inputs.specialist_stream_watchdog }}
         SPECIALIST_STRUCTURED_CHAT_TEMPLATE_KWARGS: ${{ inputs.specialist_structured_chat_template_kwargs }}
+        SPECIALIST_CHECKPOINT_REASONING_BUDGET_TOKENS: ${{ inputs.specialist_checkpoint_reasoning_budget_tokens }}
         SPECIALIST_MAX_TRUNCATION_CONTINUATIONS: ${{ inputs.specialist_max_truncation_continuations }}
         SPECIALIST_PLANNER_MAX_CONTEXT_BYTES: ${{ inputs.specialist_planner_max_context_bytes }}
         SPECIALIST_PACKET_MAX_BYTES: ${{ inputs.specialist_packet_max_bytes }}
@@ -1015,6 +1025,7 @@ runs:
         SPECIALIST_TEMPERATURE: ${{ inputs.specialist_temperature }}
         SPECIALIST_STREAM_WATCHDOG: ${{ inputs.specialist_stream_watchdog }}
         SPECIALIST_STRUCTURED_CHAT_TEMPLATE_KWARGS: ${{ inputs.specialist_structured_chat_template_kwargs }}
+        SPECIALIST_CHECKPOINT_REASONING_BUDGET_TOKENS: ${{ inputs.specialist_checkpoint_reasoning_budget_tokens }}
         SPECIALIST_MAX_TRUNCATION_CONTINUATIONS: ${{ inputs.specialist_max_truncation_continuations }}
         SPECIALIST_PLANNER_MAX_CONTEXT_BYTES: ${{ inputs.specialist_planner_max_context_bytes }}
         SPECIALIST_PACKET_MAX_BYTES: ${{ inputs.specialist_packet_max_bytes }}

@@ -653,6 +653,23 @@ def write_review_workspace(root: Path) -> None:
     (root / "standards-context.md").write_text("# standards\n", encoding="utf-8")
 
 
+@pytest.mark.parametrize("raw,expected", [("", None), ("0", 0), ("256", 256)])
+def test_checkpoint_reasoning_budget_configuration(tmp_path, monkeypatch, raw, expected):
+    monkeypatch.setenv("AI_BASE_URL", "http://model/v1")
+    monkeypatch.setenv("AI_MODEL", "test")
+    monkeypatch.setenv("SPECIALIST_CHECKPOINT_REASONING_BUDGET_TOKENS", raw)
+    assert cli.CliConfig.from_env(workspace=tmp_path).checkpoint_reasoning_budget_tokens == expected
+
+
+@pytest.mark.parametrize("raw", ["-1", "abc", "2.5"])
+def test_invalid_checkpoint_reasoning_budget(tmp_path, monkeypatch, raw):
+    monkeypatch.setenv("AI_BASE_URL", "http://model/v1")
+    monkeypatch.setenv("AI_MODEL", "test")
+    monkeypatch.setenv("SPECIALIST_CHECKPOINT_REASONING_BUDGET_TOKENS", raw)
+    with pytest.raises(ValueError, match="checkpoint_reasoning_budget"):
+        cli.CliConfig.from_env(workspace=tmp_path)
+
+
 class ScriptedController:
     def __init__(self, root: Path, verdict: str = "request_changes"):
         self.root = root
@@ -1123,6 +1140,7 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
     monkeypatch.setenv("SPECIALIST_PASS_TIMEOUT_SEC", "41")
     monkeypatch.setenv("SPECIALIST_MAX_TOKENS", "1234")
     monkeypatch.setenv("SPECIALIST_RECOVERY_MAX_TOKENS", "456")
+    monkeypatch.setenv("SPECIALIST_CHECKPOINT_REASONING_BUDGET_TOKENS", "256")
     monkeypatch.setenv("SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS", "2468")
     monkeypatch.setenv("SPECIALIST_DELEGATED_SUMMARY_MAX_SOURCE_BYTES", "98765")
     monkeypatch.setenv("SPECIALIST_PLANNER_MAX_CONTEXT_BYTES", "6543")
@@ -1193,6 +1211,7 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
         "session:test:g0",
     )
     assert session.recovery_max_tokens == 456
+    assert session.checkpoint_reasoning_budget_tokens == 256
     assert session.delegated_summary_max_tokens == 2468
     assert session.delegated_summary_max_source_bytes == 98765
 

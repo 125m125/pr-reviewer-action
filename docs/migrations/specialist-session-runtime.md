@@ -147,6 +147,7 @@ replay and provider capacity have been demonstrated.
 | `specialist_temperature` | retained | `0.0` | `0.0` | Keeps exploration deterministic while replay behavior is established. |
 | `model_context_tokens` | retained |  | Set the provider's actual served window; use `75000` for the tested local Qwen configuration | Derives corpus/diff and admission budgets from the real context window. Never copy a model's advertised maximum when the server is configured lower. |
 | `specialist_structured_chat_template_kwargs` | added |  | `{"enable_thinking":false}` for llama.cpp-compatible Qwen servers; otherwise leave blank | Applies provider-specific chat-template options only to no-tool structured roles so exploration can retain reasoning while checkpoints spend their output on JSON. Providers that reject unknown request fields must leave it empty. |
+| `specialist_checkpoint_reasoning_budget_tokens` | added | blank (disabled) | `256` only for an endpoint verified to enforce `thinking_budget_tokens`, such as the tested ik_llama setup | First eligible checkpoint retains tool schemas and exploration thinking settings for cache reuse, but tool execution remains prohibited. Context admission includes retained schemas and repair reserves; tight-context/emergency requests and repairs use the existing strict no-tool, thinking-disabled settings. This does not cap exploration reasoning. Unknown fields may be silently ignored by other servers, so do not enable without checking enforcement. |
 | `system_prompt_file` | retained |  | `.github/ai-review-prompt.md` | Stores repository conventions alongside the code being reviewed. |
 | `system_prompt_mode` | changed | `replace` | `append` | Preserves the action-owned specialist protocol and appends repository conventions. |
 | `specialist_stream_watchdog` | retained | `true` | `true` | Stops repeated streamed blocks and permits one compact recovery. |
@@ -385,6 +386,8 @@ jobs:
           specialist_recovery_max_tokens: "4096"
           specialist_max_conversation_tokens: "60000"
           specialist_structured_chat_template_kwargs: '{"enable_thinking":false}'
+          # Optional, only after verifying this endpoint enforces the budget:
+          # specialist_checkpoint_reasoning_budget_tokens: "256"
           publish_review_comment: "false"
           publish_mode: review_comment
 ```

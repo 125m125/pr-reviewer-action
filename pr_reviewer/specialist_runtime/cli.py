@@ -319,6 +319,19 @@ def _optional_positive_int(env: Mapping[str, str], name: str) -> int | None:
     return _positive_int(env, name, 1)
 
 
+def _optional_nonnegative_int(env: Mapping[str, str], name: str) -> int | None:
+    raw = str(env.get(name, "")).strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+        if value >= 0:
+            return value
+    except ValueError:
+        pass
+    raise ValueError(f"{name.lower()} must be a nonnegative integer")
+
+
 def _nonnegative_float(env: Mapping[str, str], name: str, default: float) -> float:
     try:
         value = float(str(env.get(name, default)).strip())
@@ -399,6 +412,7 @@ class CliConfig:
     request_timeout_sec: int
     max_tokens: int
     recovery_max_tokens: int
+    checkpoint_reasoning_budget_tokens: int | None
     delegated_summary_max_tokens: int | None
     delegated_summary_max_source_bytes: int | None
     planner_max_tokens: int
@@ -532,6 +546,9 @@ class CliConfig:
             request_timeout_sec=request_timeout,
             max_tokens=_positive_int(source, "SPECIALIST_MAX_TOKENS", 4096),
             recovery_max_tokens=_positive_int(source, "SPECIALIST_RECOVERY_MAX_TOKENS", 2048),
+            checkpoint_reasoning_budget_tokens=_optional_nonnegative_int(
+                source, "SPECIALIST_CHECKPOINT_REASONING_BUDGET_TOKENS",
+            ),
             delegated_summary_max_tokens=_optional_positive_int(
                 source, "SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS",
             ),
@@ -984,6 +1001,7 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
             "planner_max_tokens": config.planner_max_tokens,
             "planner_max_context_bytes": config.planner_max_context_bytes,
             "recovery_max_tokens": config.recovery_max_tokens,
+            "checkpoint_reasoning_budget_tokens": config.checkpoint_reasoning_budget_tokens,
             "delegated_summary_max_tokens": (
                 config.delegated_summary_max_tokens or config.max_tokens * 2
             ),
@@ -1254,6 +1272,7 @@ def build_controller(
             stream=config.stream,
             max_context_tokens=config.model_context_tokens,
             recovery_max_tokens=config.recovery_max_tokens,
+            checkpoint_reasoning_budget_tokens=config.checkpoint_reasoning_budget_tokens,
             delegated_summary_max_tokens=config.delegated_summary_max_tokens,
             delegated_summary_max_source_bytes=(
                 config.delegated_summary_max_source_bytes
