@@ -81,7 +81,7 @@ jobs:
       - name: Review pull request
         # Fork of pr-reviewer-action v2.0.0 with generic, model-planned specialist
         # reviews and LM Studio reasoning-channel compatibility; pinned for safety.
-        uses: 125m125/pr-reviewer-action@1a52de1200ac8635df49fb4f7f4816be1ef46de3
+        uses: 125m125/pr-reviewer-action@291e4db8e873ff18dbd80d12782336ebf084e00f
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -136,6 +136,7 @@ jobs:
           specialist_temperature: "0.6"
           specialist_stream_watchdog: "true"
           specialist_structured_chat_template_kwargs: '{"enable_thinking":false}'
+          specialist_checkpoint_reasoning_budget_tokens: "256"
 
           # Specialist calls reuse the existing read-only executor restrictions.
           tool_max_response_bytes: "12000"
