@@ -1,0 +1,83 @@
+{
+  "policy": {
+    "version": 3,
+    "components": [
+      {
+        "id": "java-orders",
+        "paths": ["services/orders/**"],
+        "responsibilities": ["order lifecycle and event production"]
+      },
+      {
+        "id": "java-billing",
+        "paths": ["services/billing/**"],
+        "responsibilities": ["invoice and payment state"]
+      },
+      {
+        "id": "python-worker",
+        "paths": ["workers/fulfillment/**"],
+        "responsibilities": ["asynchronous fulfillment consumption"]
+      }
+    ],
+    "ownership_precedence": [],
+    "boundaries": [
+      {
+        "id": "order-events",
+        "contract_paths": ["contracts/events/**"],
+        "participants": ["java-orders", "python-worker"],
+        "contract_change_owner": "java-orders",
+        "endpoint_paths": {
+          "java-orders": ["services/orders/**/messaging/**"],
+          "python-worker": ["workers/fulfillment/**/messaging/**"]
+        },
+        "objective": "Compare event production and consumption, including identity and failure semantics."
+      },
+      {
+        "id": "fulfillment-deployment",
+        "contract_paths": ["deploy/fulfillment/**"],
+        "participants": ["python-worker"],
+        "contract_change_owner": "python-worker",
+        "endpoint_paths": {
+          "python-worker": ["workers/fulfillment/**"]
+        },
+        "objective": "Check that worker configuration, rollout, and runtime assumptions remain aligned."
+      }
+    ],
+    "recipes": [
+      {
+        "id": "event-contract-review",
+        "title": "Order event contract",
+        "objective": "Verify producer and consumer compatibility for changed order events.",
+        "execution": "integrated",
+        "match": {"paths_any": ["contracts/events/**", "services/orders/**/messaging/**", "workers/fulfillment/**/messaging/**"]},
+        "expected_evidence": ["producer", "consumer", "contract tests"]
+      },
+      {
+        "id": "deployment-rollout-review",
+        "title": "Fulfillment rollout",
+        "objective": "Verify deployment settings and rollback behavior for the worker.",
+        "execution": "independent",
+        "match": {"paths_any": ["deploy/fulfillment/**"]},
+        "expected_evidence": ["deployment manifest", "rollback test"]
+      }
+    ]
+  },
+  "changed_files": [
+    "services/orders/src/main/java/example/orders/OrderEvents.java",
+    "services/billing/src/main/java/example/billing/InvoiceService.java",
+    "workers/fulfillment/src/fulfillment/consumer.py",
+    "contracts/events/order-created.json",
+    "deploy/fulfillment/worker.yaml",
+    "docs/release-notes.md"
+  ],
+  "tracked_files": [
+    "services/orders/src/main/java/example/orders/OrderEvents.java",
+    "services/orders/src/test/java/example/orders/OrderEventsTest.java",
+    "services/billing/src/main/java/example/billing/InvoiceService.java",
+    "services/billing/src/test/java/example/billing/InvoiceServiceTest.java",
+    "workers/fulfillment/src/fulfillment/consumer.py",
+    "workers/fulfillment/tests/test_consumer.py",
+    "contracts/events/order-created.json",
+    "deploy/fulfillment/worker.yaml",
+    "docs/release-notes.md"
+  ]
+}
