@@ -554,6 +554,25 @@ def test_reconcile_wave_requires_accepted_semantic_assessment_for_coverage():
     assert result.uncovered_obligation_ids == ("OB1", "OB2")
 
 
+def test_partial_component_paths_remain_followup_targets():
+    state = state_for(checkpoints=(SessionCheckpoint(
+        "S1", SessionState.CHECKPOINT,
+        obligation_assessments=(ObligationAssessment(
+            "O1", "OB1", ObligationDisposition.PARTIALLY_COVERED,
+            "Validated the request entry point.", assessed_paths=("src/a.py",),
+            omitted_paths=("src/b.py",),
+        ),),
+    ),))
+    state = replace(state, coverage=replace(state.coverage, obligation_statuses=tuple(
+        (key, ObligationStatus.PARTIALLY_COVERED if key == "OB1" else value)
+        for key, value in state.coverage.obligation_statuses
+    )))
+    context = compact_negotiation_context(state)
+    target = next(item for item in context["targets"] if item["subject"] == "tests/test_a.py")
+    assert "resume" in target["allowed_actions"]
+    assert "src/b.py" in " ".join(target["next_actions"])
+
+
 def test_reconcile_wave_accepts_covered_assessment_with_eligible_evidence():
     required = obligation("OB1")
     ledger = CoverageLedger((required,))

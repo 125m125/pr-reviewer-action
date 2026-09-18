@@ -126,6 +126,12 @@ class CoverageObligation:
     requirement_id: str | None = None
     requirement_mode: str = "required"
     mandatory: bool = True
+    owner_component_id: str = ""
+    boundary_id: str = ""
+    participant_id: str = ""
+    evaluator_owned: bool = False
+    evidence_requirements: tuple[Mapping[str, object], ...] = ()
+    evidence_hints: tuple[str, ...] = ()
 
     @property
     def id(self) -> str:
@@ -152,6 +158,10 @@ class SpecialistAssignment:
     priority: int = 0
     overlap_justification: str = ""
     investigation_leads: tuple[InvestigationLead, ...] = ()
+    owner_component_id: str = ""
+    owned_changed_paths: tuple[str, ...] = ()
+    parent_assignment_id: str | None = None
+    delegation_depth: int = 0
 
 
 @dataclass(frozen=True)
