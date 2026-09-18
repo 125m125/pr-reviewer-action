@@ -652,6 +652,53 @@ def test_stop_disposition_pass_keeps_checkpoint_and_accepts_valid_siblings():
     assert gateway.requests[0].response_schema["required"] == ["obligation_updates"]
 
 
+@pytest.mark.parametrize("operation", ["checkpoint", "accounting"])
+def test_unadmitted_structured_prompt_does_not_pollute_history(operation):
+    gateway = ScriptedGateway([])
+    session = make_session(gateway, max_context_tokens=100)
+    session._last_valid_checkpoint = session.latest_checkpoint
+    before = list(session.conversation.events)
+    if operation == "checkpoint":
+        session.request_checkpoint("interrupted-exploration")
+    else:
+        session._settle_pending_obligations("completion")
+    assert not gateway.requests
+    assert session.conversation.events == before
+
+
+def test_accounting_batches_large_scopes_without_repeating_path_catalogs():
+    obligations = tuple(CoverageObligation(
+        obligation_id=f"OB-{i}", origin="test", subject=f"behavior {i}",
+        scope=tuple(f"src/long/component/path/module{j}.py" for j in range(200)),
+        seed_hints=tuple(f"tests/module{j}.py" for j in range(200)),
+    ) for i in range(6))
+    assignment = SpecialistAssignment(
+        assignment_id="large", objective="Review behavior",
+        primary_obligation_ids=tuple(o.id for o in obligations),
+    )
+    def respond(targets):
+        return invalid_response(json.dumps({"obligation_updates": [
+            {"target": t, "disposition": "blocked", "reason": "Required source unavailable",
+             "evidence_ids": [], "next_actions": []} for t in targets
+        ]}))
+    gateway = ScriptedGateway([respond(["O1", "O2", "O3", "O4"]), respond(["O5", "O6"])])
+    session = make_session(gateway, obligations=obligations, assignment=assignment)
+    session._last_valid_checkpoint = session.latest_checkpoint
+    session._settle_pending_obligations("completion")
+    assert len(gateway.requests) == 2
+    assert all(a.disposition.value == "blocked" for a in session.obligation_assessments.assessments())
+
+
+def test_failed_checkpoint_defers_accounting_until_checkpoint_recovery():
+    gateway = ScriptedGateway([TimeoutError("phase cutoff")])
+    session = make_session(gateway)
+    session._last_valid_checkpoint = session.latest_checkpoint
+    session.request_checkpoint("context-pressure")
+    session.settle_for_scheduling()
+    assert len(gateway.requests) == 1
+    assert not session._disposition_pass_diagnostics
+
+
 def test_invalid_stop_disposition_response_preserves_checkpoint():
     gateway = ScriptedGateway([invalid_response("<tool_call>")])
     session = make_session(gateway)
@@ -709,6 +756,7 @@ class RecordedRequest:
     ephemeral_user_note: str | None
     reasoning_effort: str | None
     response_schema: dict | None
+    thinking_budget_tokens: int | None = None
 
     def messages_contain(self, value):
         return value in self.messages
@@ -728,6 +776,7 @@ class ScriptedGateway:
             ephemeral_user_note=request.ephemeral_user_note,
             reasoning_effort=request.reasoning_effort,
             response_schema=request.response_schema,
+            thinking_budget_tokens=getattr(request, "thinking_budget_tokens", None),
         ))
         assert self.responses, "model called more times than scripted"
         response = self.responses.pop(0)
@@ -1327,7 +1376,8 @@ def test_investigation_lead_tool_is_bounded_and_resolution_is_assignment_scoped(
     }]
 
 
-def test_report_investigation_lead_retains_evidence_and_deduplicates():
+@pytest.mark.parametrize("capability", ["repository", "none"])
+def test_report_investigation_lead_retains_evidence_and_deduplicates(capability):
     session = make_session(ScriptedGateway([]))
     session._execute_calls(({
         "id": "read-lead", "name": "read_file",
@@ -1339,7 +1389,7 @@ def test_report_investigation_lead_retains_evidence_and_deduplicates():
         "affected_paths": ["a.py"],
         "evidence_ids": [evidence_id],
         "next_action": "Trace consumers of the changed fallback.",
-        "required_capability": "repository",
+        "required_capability": capability,
     }
 
     first_progress = session._execute_calls(({
@@ -1360,6 +1410,27 @@ def test_report_investigation_lead_retains_evidence_and_deduplicates():
     result = session._snapshot()
     assert len(result.investigation_leads) == 1
     assert result.investigation_leads[0].evidence_ids == (evidence_id,)
+
+
+@pytest.mark.parametrize("next_action", ["None.", "None. Review is complete.", "N/A", "No further investigation required."])
+def test_completion_message_is_not_an_investigation_lead_or_progress(next_action):
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-lead", "name": "read_file",
+        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+    },))
+    evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
+    progressed = session._execute_calls(({
+        "id": "done-lead", "name": "report_investigation_lead",
+        "arguments": json.dumps({"summary": "Review complete, no further leads.",
+            "next_action": next_action, "required_capability": "none",
+            "evidence_ids": [evidence_id]}),
+    },))
+    assert progressed is False
+    response = json.loads(session.conversation.events[-1]["content"])
+    assert response["accepted"] is False
+    assert "without tool calls" in response["reason"]
+    assert session._snapshot().investigation_leads == ()
 
 
 def test_report_investigation_lead_rejects_unretained_evidence_and_unscoped_path():
@@ -1482,6 +1553,25 @@ def test_investigation_lead_feedback_authorizes_targeted_tools_and_evidence_reco
         "purpose": "contradiction_check", "offset": 0, "limit": 100,
     })
     assert recovered["status"] == "ok"
+
+
+def test_test_result_report_filter_and_pagination_retain_distinct_evidence():
+    session = make_session([])
+    session.test_results = (
+        {"name": "other", "status": "failed", "report": "other.xml"},
+        {"name": "first", "status": "failed", "report": "suite.xml"},
+        {"name": "second", "status": "failed", "report": "suite.xml"},
+        {"name": "passed", "status": "passed", "report": "suite.xml"},
+    )
+    query = {"name_regex": ".*", "status": "failed", "report": "suite.xml", "max_results": 1}
+    first = session._read_test_results(query)
+    second = session._read_test_results({**query, "offset": first["next_offset"]})
+    assert first["total_matches"] == 2
+    assert [t["name"] for t in first["tests"]] == ["first"]
+    assert [t["name"] for t in second["tests"]] == ["second"]
+    assert first["tests"][0]["evidence_id"] != second["tests"][0]["evidence_id"]
+    assert second["next_offset"] is None
+    assert second["truncated"] is False
 
 
 def test_session_snapshot_projects_tool_activity_without_arguments():
@@ -3127,7 +3217,8 @@ def test_checkpoint_repairs_candidate_missing_actionable_severity():
     assert "severity" in repair_prompts[-1]
 
 
-def test_checkpoint_carries_forward_candidates_when_update_arrays_are_empty():
+@pytest.mark.parametrize("thinking_budget", [None, 256])
+def test_checkpoint_carries_forward_candidates_when_update_arrays_are_empty(thinking_budget):
     """Unchanged candidates remain active without replaying their full objects."""
     initial = candidate_checkpoint_response(("candidate-code",))
     second = candidate_update_checkpoint_response(updates=(), new_candidates=())
@@ -3139,12 +3230,14 @@ def test_checkpoint_carries_forward_candidates_when_update_arrays_are_empty():
     session = make_session(gateway, model_turns=4)
 
     first = session.explore()
+    session.checkpoint_reasoning_budget_tokens = thinking_budget
     session.apply_coverage_feedback(["OB-tests"])
-    second_result = session.explore()
+    second_result = session.request_checkpoint("controller-request")
 
     assert first.checkpoint.candidate_finding_ids == ("candidate-code",)
     assert second_result.checkpoint.candidate_finding_ids == ("candidate-code",)
     assert second_result.degraded is False
+    assert gateway.requests[-1].thinking_budget_tokens == thinking_budget
 
 
 def test_checkpoint_retains_bounded_cumulative_working_state():
@@ -4587,6 +4680,18 @@ def test_later_controller_feedback_expires_checkpoint_todos():
     assert "Read an unrelated historical file." not in message
 
 
+def test_checkpoint_output_uses_spare_context_and_reserves_repair():
+    session = make_session(EstimatingGateway([], rendered_bytes=3000), max_context_tokens=75000)
+    session.max_tokens = 8192
+    first, repair = session._checkpoint_output_allowances({})
+    assert (first, repair) == (16384, 8192)
+    session.max_context_tokens = 10000
+    first, repair = session._checkpoint_output_allowances({})
+    assert 0 < repair <= 8192
+    assert first in (2 * repair, 2 * repair + 1)
+    assert first + repair < 9000
+
+
 def test_checkpoint_diagnostic_projects_admission_and_regular_compaction_counts():
     gateway = EstimatingGateway(
         [
@@ -4626,7 +4731,7 @@ def test_checkpoint_diagnostic_projects_admission_and_regular_compaction_counts(
     assert diagnostic["disposition"] == "compact_resume"
     assert diagnostic["estimated_input_tokens"] >= 9_000
     assert diagnostic["provider_calibrated_input_tokens"] >= 9_000
-    assert diagnostic["response_reserve_tokens"] == session.checkpoint_max_tokens
+    assert diagnostic["response_reserve_tokens"] == session.max_tokens * 2
     assert diagnostic["repair_response_reserve_tokens"] == session.checkpoint_max_tokens
     assert diagnostic["admission_source"] == "provider-usage-delta"
     assert diagnostic["compaction_level"] == "regular"
@@ -4714,8 +4819,107 @@ def test_checkpoint_diagnostic_admission_keeps_initial_and_repair_reserves():
     diagnostic = result.finalization_diagnostics[-1]
 
     assert diagnostic["repair_attempted"] is True
-    assert diagnostic["response_reserve_tokens"] == session.checkpoint_max_tokens
+    assert diagnostic["response_reserve_tokens"] == session.max_tokens * 2
     assert diagnostic["repair_response_reserve_tokens"] == session.checkpoint_max_tokens
+    assert [request.max_tokens for request in gateway.requests] == [2048, 1024]
+
+
+@pytest.mark.parametrize("finish_reason", ["length", "max_tokens", "max_output_tokens", "incomplete"])
+def test_interrupted_reasoning_continues_without_new_user_instruction(finish_reason):
+    gateway = ScriptedGateway([
+        replace(reasoning_only_response("Still tracing the caller."), finish_reason=finish_reason),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway, model_turns=8)
+    session.explore()
+    first = json.loads(gateway.requests[0].messages)
+    second = json.loads(gateway.requests[1].messages)
+    assert [m for m in second if m["role"] == "user"] == [m for m in first if m["role"] == "user"]
+    assert "Still tracing the caller." in gateway.requests[1].messages
+    assert gateway.requests[1].tools_enabled
+
+
+@pytest.mark.parametrize("repeat_error", [False, True])
+def test_rejected_reasoning_prefill_gets_one_user_continuation(repeat_error):
+    error = ModelRequestError(
+        "provider rejected request", status=500,
+        body="Assistant response prefill is incompatible with enable_thinking.",
+    )
+    gateway = ScriptedGateway([
+        replace(reasoning_only_response("Still tracing the caller."), finish_reason="incomplete"),
+        error,
+        error if repeat_error else checkpoint_response(
+            inspected=[], unresolved=["OB-code", "OB-tests"],
+        ),
+    ])
+    session = make_session(gateway, model_turns=8)
+    if repeat_error:
+        with pytest.raises(ModelRequestError):
+            session.explore()
+    else:
+        session.explore()
+    assert len(gateway.requests) == 3
+    messages = json.loads(gateway.requests[2].messages)
+    assert messages[-1]["role"] == "user"
+    assert "tools remain enabled" in messages[-1]["content"]
+    assert "Still tracing the caller." in gateway.requests[2].messages
+    assert gateway.requests[2].tools_enabled
+    assert session.budget.remaining_model_turns() == 5
+
+
+@pytest.mark.parametrize("failure", ["invalid", "tools", "provider", "reasoning"])
+def test_budgeted_checkpoint_falls_back_without_executing_tools(failure):
+    failed = {
+        "invalid": invalid_response("not JSON"),
+        "tools": tool_call_response("read_file", {"path": "a.py"}),
+        "provider": ModelRequestError("unknown thinking_budget_tokens", status=400),
+        "reasoning": replace(reasoning_only_response("Still thinking"), finish_reason="length"),
+    }[failure]
+    gateway = ScriptedGateway([
+        failed, checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.checkpoint_reasoning_budget_tokens = 256
+    executed = []
+    session.execute_tool = lambda *args: executed.append(args)
+    result = session.request_checkpoint("controller-request")
+    assert not result.degraded
+    assert executed == []
+    assert [r.thinking_budget_tokens for r in gateway.requests] == [256, None]
+    assert all(not r.tools_enabled for r in gateway.requests)
+    assert all('"tool_calls"' not in r.messages for r in gateway.requests)
+
+
+@pytest.mark.parametrize("optimized_bytes,uses_budget", [(24_000, True), (300_000, False)])
+def test_budgeted_checkpoint_accounts_for_retained_tool_size(optimized_bytes, uses_budget):
+    class SizedGateway(ScriptedGateway):
+        def rendered_request_bytes(self, request):
+            return optimized_bytes if request.thinking_budget_tokens is not None else 12_000
+
+    gateway = SizedGateway([checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])])
+    session = make_session(gateway, max_tokens=8192, max_context_tokens=20_000)
+    session.checkpoint_reasoning_budget_tokens = 256
+    result = session.request_checkpoint("controller-request")
+    assert not result.degraded
+    assert (gateway.requests[0].thinking_budget_tokens is not None) == uses_budget
+    diagnostic = result.finalization_diagnostics[-1]
+    assert diagnostic["checkpoint_mode_reason"] == ("enabled" if uses_budget else "context-reserve")
+    if uses_budget:
+        assert gateway.requests[0].max_tokens < 8192
+        assert diagnostic["admission_tokens"] + diagnostic["repair_response_reserve_tokens"] <= 20_000
+
+
+def test_repeated_incomplete_reasoning_falls_back_to_checkpoint():
+    interrupted = replace(reasoning_only_response("Still investigating."), finish_reason="incomplete")
+    gateway = ScriptedGateway([
+        interrupted, interrupted,
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway, model_turns=8)
+    session.explore()
+    assert len(gateway.requests) == 3
+    assert [r.tools_enabled for r in gateway.requests] == [True, True, False]
+    assert "Checkpoint requested" in gateway.requests[2].messages
 
 
 def test_reasoning_only_checkpoint_retries_without_retaining_failed_response():
@@ -5095,7 +5299,7 @@ def test_pressure_requests_checkpoint_before_exploration():
     assert len(gateway.requests) == 2
     assert gateway.requests[0].tools_enabled is False
     assert gateway.requests[1].tools_enabled is True
-    assert gateway.requests[0].max_tokens == 2_048
+    assert 512 <= gateway.requests[0].max_tokens <= 2_048
     assert gateway.requests[0].reasoning_effort == "none"
     assert gateway.requests[0].messages_contain(
         "After validation, resume the specialist session."
@@ -5124,10 +5328,8 @@ def test_coarse_context_overflow_preserves_history_until_checkpoint_validates():
         event.get("compaction_note")
         for event in session.conversation.events
     )
-    checkpoint_prompt = session.conversation.events[-1]["content"]
-    assert "Checkpoint reason: context-pressure." in checkpoint_prompt
-    assert "Immediate compaction after validation: yes." in checkpoint_prompt
-    assert "After validation, resume the specialist session." in checkpoint_prompt
+    # An instruction rejected before dispatch must not pollute recovery history.
+    assert session.conversation.events[-1]["content"] == retained_content
 
 
 def test_checkpoint_request_includes_compact_schema_contract():
@@ -5293,7 +5495,7 @@ def test_checkpoint_context_admission_failure_records_actionable_diagnostics():
     assert diagnostic["requested_output_tokens"] == 256
 
 
-def test_locally_rejected_checkpoint_uses_smaller_response_without_losing_history():
+def test_tight_checkpoint_uses_smaller_response_without_losing_history():
     gateway = EstimatingGateway([
         checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
     ], rendered_bytes=21_000)
@@ -5304,7 +5506,7 @@ def test_locally_rejected_checkpoint_uses_smaller_response_without_losing_histor
     assert len(gateway.requests) == 1
     assert 512 <= gateway.requests[0].max_tokens < 2_048
     assert "Important investigation already performed" in gateway.requests[0].messages
-    assert result.finalization_diagnostics[-1]["emergency_outcome"] == "smaller_checkpoint_succeeded"
+    assert result.finalization_diagnostics[-1]["emergency_outcome"] == "not_attempted"
 
 
 @pytest.mark.parametrize("padding", ["", "x" * 30_000])

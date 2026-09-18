@@ -51,6 +51,8 @@ class ModelTurnRequest:
     response_format_override: str | None = None
     ephemeral_user_note: str | None = None
     allow_fallbacks: bool = True
+    # Retain exploration wire settings for a logically tools-disabled checkpoint.
+    thinking_budget_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -123,6 +125,10 @@ class OpenAIModelGateway:
         """Render the exact provider payload used for a model turn."""
         if request.max_tokens <= 0:
             raise ValueError("max_tokens must be positive")
+        cache_checkpoint = request.thinking_budget_tokens is not None
+        if cache_checkpoint and (request.tools_enabled or request.thinking_budget_tokens < 0):
+            raise ValueError("thinking budget requires a tools-disabled checkpoint and nonnegative budget")
+        strict = not request.tools_enabled and not cache_checkpoint
         response_format = (
             request.response_format_override
             if request.response_format_override is not None
@@ -136,9 +142,9 @@ class OpenAIModelGateway:
             stream=request.stream,
             max_tokens=request.max_tokens,
             temperature=request.temperature,
-            verdict_turn=not request.tools_enabled,
+            verdict_turn=strict,
             keep_full_history_on_verdict=request.keep_full_history_on_verdict,
-            response_format=response_format if not request.tools_enabled else None,
+            response_format=response_format if strict else None,
             response_schema=request.response_schema,
             response_schema_name=(request.response_schema_name or f"specialist_{request.role}"),
             reasoning_effort=request.reasoning_effort,
@@ -146,7 +152,9 @@ class OpenAIModelGateway:
             tokens_param=request.tokens_param,
             cache_prefix=request.cache_prefix,
         )
-        if not request.tools_enabled and self.structured_chat_template_kwargs:
+        if cache_checkpoint:
+            payload["thinking_budget_tokens"] = request.thinking_budget_tokens
+        if strict and self.structured_chat_template_kwargs:
             payload["chat_template_kwargs"] = dict(
                 self.structured_chat_template_kwargs
             )

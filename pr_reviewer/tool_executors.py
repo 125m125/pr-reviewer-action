@@ -380,8 +380,8 @@ def gh_api(endpoint, allowed_repos, current_repo, request_timeout=25):
         return validated
     normalized_endpoint = str(validated["full_path"]).lower()
     if (
-        re.search(r"/(?:contents)(?:/|$)", normalized_endpoint)
-        or "/git/blobs/" in normalized_endpoint
+        re.match(r"^/repos/[^/]+/[^/]+/(?:contents|readme)(?:/|\?|$)", normalized_endpoint)
+        or re.match(r"^/repos/[^/]+/[^/]+/git/blobs/", normalized_endpoint)
     ):
         return {
             "error": (

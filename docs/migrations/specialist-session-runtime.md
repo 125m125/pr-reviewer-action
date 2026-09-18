@@ -9,6 +9,22 @@ provider capacity are understood.
 
 ## What changes
 
+Checkpoint output uses available provider-context headroom: approximately two
+thirds for the initial checkpoint and one third reserved for a repair, after
+instruction and safety overhead. The caps are twice the configured specialist
+response-token limit initially and that limit for repair (for example, 16384
+and 8192 with an 8192 response limit). Repair admission is recalculated after
+the failed response; lifetime budgets and emergency admission still apply.
+This does not delay context-pressure checkpoints. Stream diagnostics now use
+`incomplete` when the provider stream has no finish reason; that is not proof
+of output-token exhaustion.
+During exploration, reasoning-only responses marked `length`, `max_tokens`,
+`max_output_tokens`, or `incomplete` can receive one continuation without a new
+user message. Retained reasoning stays in the assistant history. Context,
+no-progress, and lifetime limits still apply; repeated interruption falls back
+to checkpoint recovery. Partial content and tool calls retain their existing
+validation paths.
+
 - A specialist is now a continuous, bounded session. It retains only the
   review state needed across planning, investigation, bounded follow-up, and
   finalization instead of restarting an unrelated whole-PR review.
@@ -131,6 +147,7 @@ replay and provider capacity have been demonstrated.
 | `specialist_temperature` | retained | `0.0` | `0.0` | Keeps exploration deterministic while replay behavior is established. |
 | `model_context_tokens` | retained |  | Set the provider's actual served window; use `75000` for the tested local Qwen configuration | Derives corpus/diff and admission budgets from the real context window. Never copy a model's advertised maximum when the server is configured lower. |
 | `specialist_structured_chat_template_kwargs` | added |  | `{"enable_thinking":false}` for llama.cpp-compatible Qwen servers; otherwise leave blank | Applies provider-specific chat-template options only to no-tool structured roles so exploration can retain reasoning while checkpoints spend their output on JSON. Providers that reject unknown request fields must leave it empty. |
+| `specialist_checkpoint_reasoning_budget_tokens` | added | blank (disabled) | `256` only for an endpoint verified to enforce `thinking_budget_tokens`, such as the tested ik_llama setup | First eligible checkpoint retains tool schemas and exploration thinking settings for cache reuse, but tool execution remains prohibited. Context admission includes retained schemas and repair reserves; tight-context/emergency requests and repairs use the existing strict no-tool, thinking-disabled settings. This does not cap exploration reasoning. Unknown fields may be silently ignored by other servers, so do not enable without checking enforcement. |
 | `system_prompt_file` | retained |  | `.github/ai-review-prompt.md` | Stores repository conventions alongside the code being reviewed. |
 | `system_prompt_mode` | changed | `replace` | `append` | Preserves the action-owned specialist protocol and appends repository conventions. |
 | `specialist_stream_watchdog` | retained | `true` | `true` | Stops repeated streamed blocks and permits one compact recovery. |
@@ -174,8 +191,21 @@ either a top-level `tests` array or named `reports`:
 Have the validation workflow write this normalized file (or convert its JUnit
 output before the review job) and pass its repository-relative path as the
 input. A specialist can then call `read_test_results` with `name_contains` or
-`name_regex`, optionally filtering by status. Source inspection alone is never
+`name_regex`, optionally filtering by status and exact `report` name. Use `offset`
+and the returned `next_offset` to retrieve further matching cases. Source inspection alone is never
 treated as a test execution result.
+
+Failed and errored cases now receive explicit triage after initial planning.
+The controller groups them by configured component when a test-file path matches,
+otherwise by report, and selects one existing specialist using path/component
+overlap, test-review responsibility, then load and a stable ID tie-break. This
+does not add specialists or expand repository access boundaries. Scheduling is
+bounded to eight groups, with excess groups combined rather than discarded.
+Triage distinguishes PR-related failures from unrelated, environmental/flaky, or
+unexplained failures; a failed test alone is not a finding. Unresolved triage is
+recorded as unknown, not automatically made a blocking defect. No configuration
+migration is required; component paths improve ownership when report metadata
+includes reliable repository test-file paths.
 
 ## Version-1 to version-2 mapping
 
@@ -356,6 +386,8 @@ jobs:
           specialist_recovery_max_tokens: "4096"
           specialist_max_conversation_tokens: "60000"
           specialist_structured_chat_template_kwargs: '{"enable_thinking":false}'
+          # Optional, only after verifying this endpoint enforces the budget:
+          # specialist_checkpoint_reasoning_budget_tokens: "256"
           publish_review_comment: "false"
           publish_mode: review_comment
 ```
@@ -421,205 +453,13 @@ Do not copy `.github/ai-review-specialists.json` into a fresh version-2 project,
 do not broaden source hosts merely because search returned them, and do not
 replace the bundled specialist prompt with the repository addendum.
 
-## Complete version-2 policy example
+## Policy authoring and evidence requirements
 
-This JSON uses only fields accepted by the version-2 parser. Every populated
-recipe `match` group must match; values within a group are alternatives. The
-three recipes show the supported execution modes: `coverage`, `dedicated`, and
-`independent`.
-
-```json
-{
-  "version": 2,
-  "components": [
-    {
-      "id": "api",
-      "paths": ["services/api/**", "openapi/**"],
-      "responsibilities": ["HTTP API and schema"],
-      "related_components": ["worker"],
-      "contracts": ["OpenAPI request and response compatibility"],
-      "invariants": ["authenticated callers cannot cross tenant boundaries"]
-    },
-    {
-      "id": "worker",
-      "paths": ["services/worker/**"],
-      "responsibilities": ["asynchronous delivery"],
-      "related_components": ["api"],
-      "contracts": ["durable event payloads"],
-      "invariants": ["retries do not create duplicate effects"]
-    }
-  ],
-  "recipes": [
-    {
-      "id": "api-coverage",
-      "title": "API compatibility coverage",
-      "objective": "Trace schema, authorization, and consumer compatibility.",
-      "execution": "coverage",
-      "match": {"component_ids_any": ["api"]},
-      "lenses": ["authorization", "backward-compatibility"],
-      "seed_paths": ["services/api/**"],
-      "related_paths": ["openapi/**", "tests/api/**"],
-      "invariants": ["tenant boundary is preserved"],
-      "expected_evidence": ["changed endpoint and contract tests"],
-      "priority": "high"
-    },
-    {
-      "id": "generated-client",
-      "title": "Generated client integrity",
-      "objective": "Verify the generator inputs and committed generated output agree.",
-      "execution": "dedicated",
-      "match": {"paths_any": ["openapi/**", "clients/generated/**"]},
-      "lenses": ["generated-artifact"],
-      "seed_paths": ["openapi/openapi.yaml"],
-      "related_paths": ["clients/generated/**", "scripts/generate-client.sh"],
-      "invariants": ["generated client follows the OpenAPI source"],
-      "expected_evidence": ["source specification and generated diff"],
-      "priority": "normal"
-    },
-    {
-      "id": "worker-delivery",
-      "title": "Worker delivery independence",
-      "objective": "Independently examine retry and acknowledgement behavior.",
-      "execution": "independent",
-      "match": {"component_ids_any": ["worker"]},
-      "lenses": ["retry", "idempotency"],
-      "seed_paths": ["services/worker/**"],
-      "related_paths": ["tests/worker/**"],
-      "invariants": ["retries do not create duplicate effects"],
-      "expected_evidence": ["failure path and worker tests"],
-      "priority": "high"
-    }
-  ],
-  "coverage_rules": [
-    {"id": "auth-risk", "risk_flags_any": ["auth_changes"], "required_recipe_ids": ["api-coverage"]}
-  ],
-  "sources": [
-    {
-      "host": "platform.openai.com",
-      "include_subdomains": false,
-      "path_prefixes": ["/docs"],
-      "classification": "official-documentation",
-      "max_age_hours": 720,
-      "schemes": ["https"]
-    },
-    {
-      "host": "docs.python.org",
-      "include_subdomains": false,
-      "path_prefixes": ["/3"],
-      "classification": "official-documentation",
-      "schemes": ["https"]
-    }
-  ],
-  "generated_artifacts": [
-    {
-      "id": "openapi-client",
-      "source_of_truth": ["openapi/openapi.yaml"],
-      "generator_config": ["scripts/generate-client.sh"],
-      "output_paths": ["clients/generated/**"]
-    }
-  ],
-  "verdict_policy": {
-    "blocker_requires_request_changes": true,
-    "require_evidence_for_findings": true
-  },
-  "publishing": {
-    "allowed_modes": ["review_comment"],
-    "allow_approve": false
-  },
-  "exclude": {"paths": ["vendor/**"], "components": [], "lenses": [], "recipes": []}
-}
-```
-
-The official-documentation rules above are examples, not a broad web permit.
-Use concrete lowercase DNS hosts, HTTPS only, and narrow path prefixes. Keep
-policy changes in the PR diff so a reviewer can audit them before a manual
-re-review label is applied.
-
-### Authorize external GitHub repositories separately
-
-The review policy `sources` list controls ordinary HTTPS discovery and fetches;
-it does not authorize GitHub repository tools. `gh_api` defaults to metadata for
-the repository under review. If a changed workflow pins an action or other
-dependency from another repository, explicitly list only the reviewed remote
-repositories:
-
-```yaml
-tool_allowed_gh_api_repos: "125m125/pr-reviewer-action"
-```
-
-Do not use `*` unless unrestricted repository metadata access is an intentional
-trust decision. A specifically named repository entry permits safe read-only
-metadata through `gh_api` and UTF-8 source text through `read_remote_file`;
-the wildcard never grants source-text access. The latter requires an exact
-immutable commit SHA, rejects the repository currently under review, and rejects
-binary content. Generic `gh_api` rejects repository-content and Git-blob
-endpoints so base64 payloads never enter the model as accidental source text.
-Remote text retrieval uses raw GitHub content after checking metadata size;
-files over 8 MiB are rejected before content download, with a transfer cap as
-a second guard. This limit is separate from model-context/excerpt limits and
-cannot be bypassed with pagination. There is no base64 fallback.
-Use `read_file` or `read_pr_diff` for the current repository. Response byte caps,
-deadlines, and session tool-call budgets remain enforced. Granting an entry does
-not preload that repository, its history, or its full diff into model context.
-
-When a specialist requests a repository that is not listed, the runtime does not
-fetch it. Instead it records a typed repository-access request containing the
-repository, exact API endpoint and revision when available, related obligation,
-controller-derived purpose, optional bounded specialist context, and the denial
-reason. The sticky handoff shows only the number of open requests; the detailed
-request lives in the structured artifact and, for review publishing modes, a
-resolvable general note. A human can then review the repository/authors and add
-the narrow allowlist entry on the current branch before manually rerunning the
-review.
-
-## Make evidence requirements conditional
-
-`expected_evidence` remains supported, but every entry is unconditional once its
-recipe runs. Use it only when every matched change genuinely requires every
-listed category. For broad components or risk rules, prefer
-`evidence_requirements`:
-
-```json
-{
-  "id": "runtime-delivery",
-  "title": "Runtime delivery",
-  "objective": "Trace changed build and delivery behavior.",
-  "execution": "dedicated",
-  "match": {"component_ids_any": ["review-infrastructure"]},
-  "evidence_requirements": [
-    {
-      "id": "workflow",
-      "category": "workflow or deployment",
-      "when": {"paths_any": [".github/workflows/**", "ci/**"]},
-      "mode": "required"
-    },
-    {
-      "id": "build-manifest",
-      "category": "build manifest",
-      "when": {
-        "paths_any": [
-          "pom.xml", "**/pom.xml", "package.json", "**/package.json",
-          "build.gradle", "**/build.gradle", "build.gradle.kts",
-          "**/build.gradle.kts"
-        ]
-      },
-      "seed_paths": ["pom.xml", "**/pom.xml", "package.json", "**/package.json"],
-      "mode": "required"
-    },
-    {
-      "id": "artifact-proof",
-      "category": "generated output",
-      "when": {"file_roles_any": ["generated-artifact"]},
-      "mode": "optional"
-    }
-  ]
-}
-```
-
-Every populated `when` group must match; values within one group use `any`
-semantics. A coverage rule may force the recipe and raise its risk tier, but it
-does not bypass a requirement's `when`. Modes are `required`, `optional`, and
-`one_of:<group>`; one matching evidence category satisfies a `one_of` group.
+Use the permanent [policy-authoring guide](../review-policy-authoring.md) for
+the version-2 schema, complete example, external-repository authorization, and
+conditional evidence requirements. The [file-role reference](../file-roles.md)
+defines the built-in path heuristics. Keep migration-specific changes from this
+guide, but use those references when creating or maintaining repository policy.
 
 During exploration, specialists receive short handles such as `O1` rather than
 internal obligation hashes. The controller-local tools
@@ -703,6 +543,16 @@ not need to be repeated in checkpoints.
 | `specialists_evaluate` | Writes the same artifacts but intentionally does not publish a review. |
 
 ## Troubleshooting
+
+Source-access notes include optional, copyable authorization additions for human
+review. Website requests suggest one narrowly scoped `sources` entry in the
+configured `review_policy_file`; repository requests suggest an addition to the
+workflow's `tool_allowed_gh_api_repos` input. Append rather than replace existing
+entries. Website permissions cover the stated path and descendants (including
+query variants), while repository permissions are not restricted to one file or
+revision. Requests needing the same authorization are consolidated. Sensitive
+or redacted URL paths do not receive a copyable website entry. These suggestions
+never grant access automatically and are kept out of the sticky handoff.
 
 | Symptom | Check | Resolution |
 |---|---|---|

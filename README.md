@@ -153,6 +153,22 @@ or rejected updates stay pending, with per-target diagnostics in the artifact.
 This pass uses the existing lifetime budget and does not run at ordinary
 context-pressure compactions. The negotiator can later decide whether that session deserves a
 bounded follow-up. The critic does not schedule sessions.
+
+The critic receives only candidate-referenced obligation contracts, without the
+expanded repository scope/seed-path lists. Its requests and continuations are
+checked against `model_context_tokens`, including output and safety reserves.
+If evaluation is unavailable or the estimated request is too large, affected
+candidates remain unverified and notes explicitly identify critic unavailability;
+this is not an explicit model decision requesting verification.
+Large critic inputs are partitioned by serialized size (also reserving space for
+decision output), with each candidate's evidence and obligations kept together.
+Missing-decision repairs and failures are isolated to their batch. All batches
+share the existing finalization deadline; an individually oversized candidate
+falls back without blocking the others. After multiple batches, one compact
+deduplication pass can only merge already accepted findings under the existing
+merge checks. It cannot reject findings or promote unverified candidates. If
+even the compact cards exceed the budget, or deduplication fails, accepted
+findings are preserved and the skipped/failed deduplication is logged.
 The remediator runs only for accepted findings, without tools, and cannot alter
 the finding or verdict. Invalid, skipped, or failed remediation is omitted while
 the original finding remains publishable.
@@ -311,6 +327,7 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_temperature` | Sampling temperature for streamed specialist exploration turns; keep `0.0` for deterministic behavior or experiment with a modest value | No | `0.0` |
 | `specialist_stream_watchdog` | Interrupt streamed specialist output after repeated paragraphs/blocks and recover once from compact evidence | No | `true` |
 | `specialist_structured_chat_template_kwargs` | Optional JSON `chat_template_kwargs` added only to no-tool specialist structured turns; leave empty unless the provider supports it | No | `""` |
+| `specialist_checkpoint_reasoning_budget_tokens` | Opt-in cache-preserving first checkpoint: retains tool schemas/thinking settings and sends nonstandard `thinking_budget_tokens`. Requires server enforcement; tested with ik_llama at `256`. Empty preserves strict checkpoints; `0` requests immediate end of thinking. Repairs remain strict and no checkpoint tool calls execute. | No | `""` |
 | `specialist_max_truncation_continuations` | Deprecated no-op; durable sessions checkpoint instead of issuing truncation-continuation turns | No | `2` |
 | `specialist_planner_max_context_bytes` | Diff/context bytes supplied to the planner before tool exploration | No | `60000` |
 | `specialist_packet_max_bytes` | Deprecated no-op; durable sessions do not build packet-mode specialist inputs | No | `90000` |
@@ -329,7 +346,9 @@ one compact recovery request instead of continuing the same transcript.
 
 Specialist mode derives a generic component topology and deterministic review
 obligations from manifests, paths, file roles, contracts, recipes, and risk
-flags. A bounded planner assigns those obligations to durable specialist
+flags. See the [file-role reference](docs/file-roles.md) for every supported
+`file_roles_any` value, its exact path-matching rules, and limitations.
+A bounded planner assigns those obligations to durable specialist
 sessions. Sessions gather read-only evidence, checkpoint their progress, and
 finish on the same logical conversation; the coverage ledger and scheduler
 decide whether a bounded follow-up is justified. Deterministic adjudication
@@ -387,11 +406,16 @@ Low cache reuse after a transition helps identify expensive reprocessing but
 does not establish whether cache eviction, prompt/template changes, or another
 server behavior caused it. No llama-specific request options are required.
 
+For new configurations, start with the permanent
+[policy-authoring guide](docs/review-policy-authoring.md): schema/defaults,
+matching rules, bounded recipes, access configuration, validation, and a
+copyable brief for configuration-generating agents.
+
 `review_policy_file` is a current-branch version-2 policy. The older
 `specialist_config_file` remains a one-release version-1 migration input, but
 version-2 recipes/policy control deterministic obligations and specialist
 selection. See the [migration handoff](docs/migrations/specialist-session-runtime.md)
-for the complete schema, source-rule boundaries, and conversion checklist.
+for the version-1 conversion checklist.
 
 </details>
 

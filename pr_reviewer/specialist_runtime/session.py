@@ -344,7 +344,9 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
         "description": (
             "Report a concrete, evidence-backed suspicion outside the current "
             "assignment that warrants separate investigation. If the defect is "
-            "already proven, use report_candidate instead."
+            "already proven, use report_candidate instead. Do not report completion "
+            "or 'no further work' as a lead. If finished, respond without tool calls; "
+            "the controller will request a checkpoint."
         ),
         "parameters": {"type": "object", "properties": {
             "summary": {"type": "string", "maxLength": 500},
@@ -388,11 +390,14 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "name_contains or name_regex; matching test cases include their "
             "status, failure details, source path/line when available, and "
             "the evidence ID to cite. This tool never executes tests or fetches "
-            "arbitrary artifacts."
+            "arbitrary artifacts. Optionally filter by exact report name; use offset "
+            "to page through matching cases."
         ),
         "parameters": {"type": "object", "properties": {
             "name_contains": {"type": "string", "maxLength": 300},
             "name_regex": {"type": "string", "maxLength": 300},
+            "report": {"type": "string", "maxLength": 1000},
+            "offset": {"type": "integer", "minimum": 0},
             "status": {"type": "string", "enum": [
                 "passed", "failed", "skipped", "errored", "xfailed", "unknown",
             ]},
@@ -1260,6 +1265,7 @@ class SpecialistSession:
         max_no_progress_streak: int = 2,
         max_context_tokens: int = 24_000,
         recovery_max_tokens: int | None = None,
+        checkpoint_reasoning_budget_tokens: int | None = None,
         recovery_evidence_bytes: int = 8_000,
         clock: Callable[[], float] = time.monotonic,
         wire_safety_tokens: int = 256,
@@ -1295,6 +1301,9 @@ class SpecialistSession:
         self.lease = lease
         self.request_timeout_sec = float(request_timeout_sec)
         self.max_tokens = max_tokens
+        if checkpoint_reasoning_budget_tokens is not None and checkpoint_reasoning_budget_tokens < 0:
+            raise ValueError("checkpoint reasoning budget must be nonnegative")
+        self.checkpoint_reasoning_budget_tokens = checkpoint_reasoning_budget_tokens
         self.stream = stream
         self.max_no_progress_streak = max_no_progress_streak
         self.max_context_tokens = max_context_tokens
@@ -1898,6 +1907,7 @@ class SpecialistSession:
         max_tokens: int,
         conversation: Conversation | None = None,
         allow_fallbacks: bool = True,
+        thinking_budget_tokens: int | None = None,
     ) -> ModelTurnRequest:
         return ModelTurnRequest(
             role="specialist",
@@ -1909,8 +1919,9 @@ class SpecialistSession:
             deadline_at=self.lease.deadline_at,
             stream=self.stream,
             response_schema_name=self._request_schema_name(schema),
-            reasoning_effort="none" if not tools_enabled else None,
+            reasoning_effort="none" if not tools_enabled and thinking_budget_tokens is None else None,
             allow_fallbacks=allow_fallbacks,
+            thinking_budget_tokens=thinking_budget_tokens,
         )
 
     def _estimate_admission(
@@ -1920,6 +1931,7 @@ class SpecialistSession:
         max_tokens: int,
         schema: dict[str, Any] | None = None,
         conversation: Conversation | None = None,
+        thinking_budget_tokens: int | None = None,
     ) -> _AdmissionEstimate:
         mode = (
             "helper" if conversation is not None and conversation.system != self.conversation.system
@@ -1935,6 +1947,7 @@ class SpecialistSession:
             try:
                 value = renderer(self._renderable_request(
                     tools_enabled=tools_enabled,
+                    thinking_budget_tokens=thinking_budget_tokens,
                     schema=(schema if schema is not None else (
                         None if tools_enabled else _CHECKPOINT_SCHEMA
                     )),
@@ -1991,6 +2004,7 @@ class SpecialistSession:
                 prefix_bytes = int(renderer(self._renderable_request(
                     tools_enabled=tools_enabled, schema=schema, max_tokens=max_tokens,
                     conversation=baseline,
+                    thinking_budget_tokens=thinking_budget_tokens,
                 )))
                 added_bytes = max(0, rendered_bytes - prefix_bytes)
                 format_growth = max(0, prefix_bytes - baseline_bytes)
@@ -2043,6 +2057,29 @@ class SpecialistSession:
                 )
         return prompt_tokens, completion_tokens
 
+    def _checkpoint_output_allowances(
+        self, schema: dict[str, Any], *, thinking_budget_tokens: int | None = None,
+    ) -> tuple[int, int]:
+        admission = self._estimate_admission(
+            tools_enabled=False, max_tokens=self.max_tokens * 2, schema=schema,
+            thinking_budget_tokens=thinking_budget_tokens,
+        )
+        # Include the repair instruction/contract before splitting free space.
+        repair_overhead = math.ceil(len((
+            _CHECKPOINT_REPAIR_INSTRUCTION + self._checkpoint_obligation_contract()
+        ).encode("utf-8")) / 3)
+        available = max(0, self.max_context_tokens - admission.input_tokens
+                        - self.wire_safety_tokens - repair_overhead)
+        remaining = self.budget.remaining_output_tokens()
+        if remaining is not None:
+            available = min(available, remaining)
+        if available < 768:
+            # Let existing emergency admission and lifetime-budget handling act;
+            # a one-token checkpoint would only waste a request.
+            return self.checkpoint_max_tokens, self.checkpoint_max_tokens
+        return (min(self.max_tokens * 2, max(1, available * 2 // 3)),
+                min(self.max_tokens, max(1, available // 3)))
+
     def _checkpoint_pressure_due(self, *, reserve_tool_result: bool = False) -> bool:
         projected = Conversation(
             system=self.conversation.system,
@@ -2083,6 +2120,7 @@ class SpecialistSession:
         allow_compaction: bool = True,
         allow_gateway_fallbacks: bool = True,
         conversation: Conversation | None = None,
+        thinking_budget_tokens: int | None = None,
     ) -> ModelTurnResult:
         # Freeze accepted ledgers before handing control to a fallible callback.
         # This excludes conversation history and partially parsed responses.
@@ -2106,6 +2144,7 @@ class SpecialistSession:
         )
         admission = self._estimate_admission(
             tools_enabled=tools_enabled,
+            thinking_budget_tokens=thinking_budget_tokens,
             max_tokens=request_max_tokens,
             schema=schema,
             conversation=conversation,
@@ -2136,6 +2175,7 @@ class SpecialistSession:
             "admission_source": admission.source,
             "compacted_evidence_count": 0,
             "assistant_messages_compacted": 0,
+            "checkpoint_reasoning_budget_tokens": thinking_budget_tokens,
         }
         if admission.admission_tokens > self.max_context_tokens:
             if allow_compaction:
@@ -2144,6 +2184,7 @@ class SpecialistSession:
                 self._compact_conversation()
                 admission = self._estimate_admission(
                     tools_enabled=tools_enabled,
+                    thinking_budget_tokens=thinking_budget_tokens,
                     max_tokens=request_max_tokens,
                     schema=schema,
                 )
@@ -2194,6 +2235,7 @@ class SpecialistSession:
         try:
             request = self._renderable_request(
                 tools_enabled=tools_enabled,
+                thinking_budget_tokens=thinking_budget_tokens,
                 schema=schema,
                 max_tokens=request_max_tokens,
                 conversation=conversation,
@@ -2342,6 +2384,8 @@ class SpecialistSession:
                     return self._snapshot(degraded=True)
         self.state = SessionState.EXPLORING
         tool_less_continuation_used = False
+        prefill_fallback_used = False
+        request_purpose = "exploration"
         while True:
             if self.conversation.approx_tokens() > self.max_context_tokens:
                 return self._checkpoint_and_resume("context-pressure")
@@ -2360,13 +2404,33 @@ class SpecialistSession:
                 return self.request_checkpoint("checkpoint-retention-reserve")
             try:
                 turn = self._request(
-                    tools_enabled=True, schema=None, purpose="exploration",
+                    tools_enabled=True, schema=None, purpose=request_purpose,
                 )
             except BudgetExhausted as exc:
                 if "model context limit" not in str(exc):
                     raise
                 return self._checkpoint_and_resume("context-pressure")
             except BaseException as exc:
+                if (
+                    isinstance(exc, ModelRequestError)
+                    and "assistant response prefill is incompatible with enable_thinking"
+                    in f"{exc} {exc.body}".casefold()
+                    and tool_less_continuation_used
+                    and not prefill_fallback_used
+                    and [event["kind"] for event in self.conversation.events[-2:]]
+                    == ["assistant_reasoning", "assistant_turn_boundary"]
+                ):
+                    # Some thinking templates cannot continue an assistant prefill.
+                    # Keep the partial reasoning, but start a new assistant turn.
+                    # The loop still enforces the normal context/time/turn budget.
+                    prefill_fallback_used = True
+                    request_purpose = "exploration-prefill-fallback"
+                    self.conversation.add_user(
+                        "The server could not continue the interrupted assistant "
+                        "response as a prefill. Continue the investigation from "
+                        "the retained history; tools remain enabled."
+                    )
+                    continue
                 if (isinstance(exc, TimeoutError)
                     and isinstance(exc.__cause__, ModelRequestError)
                     and exc.__cause__.timeout):
@@ -2376,6 +2440,7 @@ class SpecialistSession:
                 if not _is_context_limit_error(exc):
                     raise
                 return self._recover_from_provider_context_limit(exc)
+            request_purpose = "exploration"
             self._candidate_retention_signal = (
                 self._candidate_retention_signal.merged(
                     _candidate_retention_signal(turn.content)
@@ -2402,6 +2467,20 @@ class SpecialistSession:
                             "malformed-textual-tool-call",
                         )
                     continue
+                if (
+                    not turn.content.strip()
+                    and turn.reasoning.strip()
+                    and str(turn.finish_reason).casefold()
+                    in {"length", "max_tokens", "max_output_tokens", "incomplete"}
+                    and not tool_less_continuation_used
+                    and self.budget.remaining_model_turns() > _CHECKPOINT_TURN_RESERVE
+                ):
+                    if self.budget.record_no_progress() < self.max_no_progress_streak:
+                        # Keep the assistant reasoning as the final message: a
+                        # new user instruction can reset reasoning in templates.
+                        # The next loop iteration still enforces context pressure.
+                        tool_less_continuation_used = True
+                        continue
                 checkpoint = self._checkpoint_from_text(turn.content)
                 checkpoint_change_rejected = bool(self._last_checkpoint_rejections)
                 if (
@@ -2774,6 +2853,22 @@ class SpecialistSession:
                 "reason": "summary and next_action are required",
             }
             self._add_tool_result(call_id, payload)
+            return False
+        # Reject explicit no-work placeholders, not legitimate leads that need
+        # no additional capability. Reworded completion notices are not progress.
+        if re.match(
+            r"^(?:none|n/?a|not applicable|no (?:further )?(?:action|work|investigation)"
+            r"(?: (?:needed|required))?)(?:\s*[.!;]|\s*$)",
+            next_action.strip(), re.IGNORECASE,
+        ):
+            self._add_tool_result(call_id, {
+                "accepted": False,
+                "reason": (
+                    "A lead requires a concrete unanswered question and next action, "
+                    "not a completion message. If finished, respond without tool calls; "
+                    "the controller will request a checkpoint."
+                ),
+            })
             return False
         if capability not in {"none", "repository", "tests", "web"}:
             payload = {
@@ -4190,23 +4285,78 @@ class SpecialistSession:
             if disposition is CheckpointDisposition.COMPACT_RESUME
             else _CHECKPOINT_SCHEMA
         )
-        checkpoint_output_tokens = min(
-            self.checkpoint_max_tokens,
-            max_output_tokens if max_output_tokens is not None else self.checkpoint_max_tokens,
-        )
+        checkpoint_output_tokens, checkpoint_repair_tokens = self._checkpoint_output_allowances(checkpoint_schema)
+        if max_output_tokens is not None:
+            checkpoint_output_tokens = min(checkpoint_output_tokens, max_output_tokens)
+        thinking_budget = None
+        mode_reason = "disabled"
+        if self.checkpoint_reasoning_budget_tokens is not None:
+            mode_reason = "strict-recovery-or-correction"
+            if allow_repair and max_output_tokens is None and not prior_change_rejections:
+                prompt = self.conversation.events[-1]["content"]
+                self.conversation.events[-1]["content"] += (
+                    "\n\nThis is a state-saving checkpoint, not further investigation. "
+                    "Use only retained information. Do not call tools, revisit "
+                    "conclusions, or perform new calculations. Keep any reasoning "
+                    "brief and emit the checkpoint JSON immediately. Record "
+                    "unresolved questions rather than trying to solve them now."
+                )
+                optimized_output, optimized_repair = self._checkpoint_output_allowances(
+                    checkpoint_schema,
+                    thinking_budget_tokens=self.checkpoint_reasoning_budget_tokens,
+                )
+                proposed_budget = min(self.checkpoint_reasoning_budget_tokens,
+                                      max(0, optimized_output - 512))
+                admission = self._estimate_admission(
+                    tools_enabled=False, schema=checkpoint_schema,
+                    max_tokens=optimized_output,
+                    thinking_budget_tokens=proposed_budget,
+                )
+                repair_overhead = math.ceil(len((
+                    _CHECKPOINT_REPAIR_INSTRUCTION + self._checkpoint_obligation_contract()
+                ).encode("utf-8")) / 3)
+                if (optimized_output >= 512 and optimized_repair >= 512
+                    and admission.admission_tokens + optimized_repair + repair_overhead <= self.max_context_tokens):
+                    thinking_budget = proposed_budget
+                    checkpoint_output_tokens, checkpoint_repair_tokens = optimized_output, optimized_repair
+                    mode_reason = "enabled"
+                else:
+                    self.conversation.events[-1]["content"] = prompt
+                    mode_reason = "context-reserve"
         request_event_count = len(self._request_events)
         checkpoint_context_admission: dict[str, object] = {}
+        provider_error = ""
         try:
-            turn = self._request(
-                tools_enabled=False,
-                schema=checkpoint_schema,
-                purpose="checkpoint",
-                max_output_tokens=checkpoint_output_tokens,
-                allow_compaction=False,
-                allow_gateway_fallbacks=allow_gateway_fallbacks,
-            )
+            try:
+                turn = self._request(
+                    tools_enabled=False,
+                    schema=checkpoint_schema,
+                    purpose=("checkpoint-cache-preserving" if thinking_budget is not None
+                             else f"checkpoint-strict-{mode_reason}" if mode_reason != "disabled"
+                             else "checkpoint"),
+                    max_output_tokens=checkpoint_output_tokens,
+                    allow_compaction=False,
+                    allow_gateway_fallbacks=allow_gateway_fallbacks and thinking_budget is None,
+                    thinking_budget_tokens=thinking_budget,
+                )
+            except ModelRequestError as exc:
+                if thinking_budget is None or exc.status is None:
+                    raise
+                # One rejected optimized attempt consumes its normal turn. Use
+                # the existing strict repair, not a new provider-retry loop.
+                provider_error = format_callback_error(exc, limit=500)
+                turn = ModelTurnResult(
+                    response={}, tool_calls=(), text="", text_source="content",
+                    finish_reason="provider_error", usage={}, request_diagnostics={},
+                )
+            self._last_context_admission["repair_response_reserve_tokens"] = checkpoint_repair_tokens
+            self._last_context_admission["checkpoint_mode_reason"] = mode_reason
         except (BudgetExhausted, TimeoutError) as exc:
             checkpoint_context_admission = dict(self._last_context_admission)
+            if isinstance(exc, BudgetExhausted):
+                # Admission failed before dispatch. Do not carry an unsent
+                # instruction into a later recovery request.
+                del self.conversation.events[checkpoint_request_start:]
             available = self.max_context_tokens - int(
                 checkpoint_context_admission.get("estimated_input_tokens", self.max_context_tokens)
             ) - self.wire_safety_tokens
@@ -4288,11 +4438,12 @@ class SpecialistSession:
         self.conversation.add_assistant_turn(
             reasoning=turn.reasoning,
             content=turn.content,
-            calls=turn.tool_calls,
+            # Never carry unexecuted checkpoint tool calls into repair history.
+            calls=(),
         )
         initial_error = (
             "tool calls returned while checkpoint tools were disabled"
-            if turn.tool_calls else ""
+            if turn.tool_calls else provider_error
         )
         checkpoint = None if turn.tool_calls else self._checkpoint_from_text(
             turn.content,
@@ -4350,6 +4501,8 @@ class SpecialistSession:
                     + "\n"
                     + self._checkpoint_obligation_contract()
                 )
+                if initial_error:
+                    repair_instruction += " Previous checkpoint failed: " + initial_error
                 if self._last_checkpoint_validation_error:
                     repair_instruction += " " + self._last_checkpoint_validation_error
                 candidate_rejections = tuple(
@@ -4368,6 +4521,12 @@ class SpecialistSession:
                 self.conversation.add_user(repair_instruction)
             repair_event_count = len(self._request_events)
             try:
+                repair_admission = self._estimate_admission(
+                    tools_enabled=False, max_tokens=checkpoint_repair_tokens,
+                    schema=checkpoint_schema,
+                )
+                repair_tokens = min(checkpoint_repair_tokens, max(512,
+                    self.max_context_tokens - repair_admission.input_tokens - self.wire_safety_tokens))
                 repair = self._request(
                     tools_enabled=False,
                     schema=checkpoint_schema,
@@ -4375,7 +4534,7 @@ class SpecialistSession:
                         "checkpoint-clean-retry"
                         if reasoning_only_retry else "checkpoint-repair"
                     ),
-                    max_output_tokens=self.checkpoint_max_tokens,
+                    max_output_tokens=repair_tokens,
                     allow_compaction=False,
                     allow_gateway_fallbacks=allow_gateway_fallbacks,
                 )
@@ -4396,7 +4555,7 @@ class SpecialistSession:
                 self.conversation.add_assistant_turn(
                     reasoning=repair.reasoning,
                     content=repair.content,
-                    calls=repair.tool_calls,
+                    calls=(),
                 )
                 if repair.tool_calls:
                     repair_error = (
@@ -6360,9 +6519,16 @@ class SpecialistSession:
             requested_limit = 20
         limit = max(1, min(50, requested_limit))
         requested_status = str(arguments.get("status") or "").casefold()
+        report = str(arguments.get("report") or "")
+        try:
+            offset = max(0, int(arguments.get("offset", 0)))
+        except (TypeError, ValueError):
+            return {"status": "error", "error": "offset must be a nonnegative integer"}
         matches: list[dict[str, Any]] = []
         total = 0
         for index, test in enumerate(self.test_results, start=1):
+            if report and str(test.get("report") or "") != report:
+                continue
             name = str(test.get("name") or "")
             if not name or (contains and contains not in name.casefold()):
                 continue
@@ -6372,6 +6538,8 @@ class SpecialistSession:
             if requested_status and status != requested_status:
                 continue
             total += 1
+            if total <= offset:
+                continue
             if len(matches) < limit:
                 item = dict(test)
                 item["evidence_id"] = retain_test_result(
@@ -6387,7 +6555,8 @@ class SpecialistSession:
             "status": "ok",
             "count": len(matches),
             "total_matches": total,
-            "truncated": total > len(matches),
+            "truncated": total > offset + len(matches),
+            "next_offset": offset + len(matches) if total > offset + len(matches) else None,
             "tests": matches,
         }
 
@@ -6914,13 +7083,24 @@ class SpecialistSession:
 
     def _settle_pending_obligations(self, reason: str) -> None:
         """One bounded accounting turn per exploration period, never more research."""
+        if (self._finalization_diagnostics
+                and self._finalization_diagnostics[-1].get("initial_parse") == "unavailable"):
+            # Preserve room/time for checkpoint recovery, including the interval
+            # before the scheduler marks an interrupted exploration callback.
+            return
         pending = [item.target for item in self.obligation_assessments.assessments()
                    if item.disposition.value == "pending"]
         if (self._disposition_pass_attempted or not pending
                 or self._last_valid_checkpoint is None):
             return
         self._disposition_pass_attempted = True
-        targets = pending[:40]
+        for offset in range(0, min(len(pending), 40), 4):
+            self._settle_obligation_batch(reason, pending[offset:offset + 4])
+            if self._disposition_pass_diagnostics[-1]["status"] != "completed":
+                break
+
+    def _settle_obligation_batch(self, reason: str, targets: list[str]) -> None:
+        """Account for a small group without repeating exploration path catalogs."""
         item_schema = json.loads(json.dumps(
             _CHECKPOINT_SCHEMA["properties"]["obligation_updates"]["items"],
         ))
@@ -6940,6 +7120,7 @@ class SpecialistSession:
             self._finalization_diagnostics[-1].setdefault(
                 "obligation_disposition_passes", [],
             ).append(diagnostic)
+        request_start = len(self.conversation.events)
         self.conversation.add_user(
             "Exploration is stopping, not restarting. The checkpoint and candidates "
             "are already retained. Tools are disabled. Give one concise disposition "
@@ -6953,22 +7134,32 @@ class SpecialistSession:
             "more investigation would help. Never claim coverage just to finish. "
             "Missing or rejected updates remain pending.\n"
             + json.dumps({"pending_obligations": [
-                self.obligation_assessments.explain(target) for target in targets
+                {"subject": self.coverage.obligation(
+                    self.obligation_assessments.assessment(target).obligation_id,
+                 ).subject,
+                 **{key: value for key, value in self.obligation_assessments.explain(target).items()
+                    if key in {"target", "objective", "required_evidence", "disposition", "last_conclusion"}}}
+                for target in targets
             ], "response_schema": schema}, sort_keys=True)
         )
         try:
+            estimate = self._estimate_admission(
+                tools_enabled=False, schema=schema, max_tokens=512,
+            )
+            available = self.max_context_tokens - estimate.input_tokens - self.wire_safety_tokens
+            if available < 512:
+                raise BudgetExhausted("model context limit cannot admit input and requested output")
             turn = self._request(
                 tools_enabled=False, schema=schema,
                 purpose="stop-obligation-dispositions",
-                max_output_tokens=min(self.checkpoint_max_tokens, 4_096),
+                max_output_tokens=min(self.checkpoint_max_tokens, 4_096, available),
                 allow_compaction=False, allow_gateway_fallbacks=False,
             )
         except Exception as exc:
             diagnostic.update(status="unavailable", error=format_callback_error(exc, limit=300))
-            self.conversation.add_user(
-                "Obligation disposition pass unavailable; previous state retained: "
-                + json.dumps(diagnostic, sort_keys=True)
-            )
+            if isinstance(exc, BudgetExhausted):
+                del self.conversation.events[request_start:]
+            # Failure diagnostics belong in the artifact, not another prompt.
             return
         self.conversation.add_assistant_turn(reasoning=turn.reasoning, content=turn.content, calls=())
         raw = None if turn.tool_calls else _json_object(turn.content)
@@ -7010,7 +7201,7 @@ class SpecialistSession:
                     )
                     self._last_valid_checkpoint = self.latest_checkpoint
             results.extend({"target": target, "accepted": False, "reason": "No update returned"}
-                           for target in pending if target not in seen)
+                           for target in targets if target not in seen)
             diagnostic.update(status="completed", results=results)
         self.conversation.add_user(
             "Obligation disposition receipt (authoritative; no further repair requested): "

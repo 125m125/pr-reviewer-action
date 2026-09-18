@@ -180,10 +180,16 @@ def test_gh_api_does_not_read_contents_files(monkeypatch, tmp_path):
     assert "read_remote_file" in result["result"]["error"]
 
 
-def test_gh_api_does_not_read_git_blobs(tmp_path):
+@pytest.mark.parametrize("endpoint", [
+    "repos/other/project/git/blobs/" + "a" * 40,
+    "repos/other/project/readme",
+    "repos/other/project/readme?ref=main",
+    "repos/other/project/readme/docs",
+])
+def test_gh_api_file_endpoints_require_remote_file_tool(tmp_path, endpoint):
     result = execute_tool_request(
         "gh_api",
-        {"endpoint": "repos/other/project/git/blobs/" + "a" * 40},
+        {"endpoint": endpoint},
         str(tmp_path),
         {"other/project"},
         "current/repository",
@@ -194,6 +200,13 @@ def test_gh_api_does_not_read_git_blobs(tmp_path):
 
     assert result["status"] == "error"
     assert "read_remote_file" in result["result"]["error"]
+
+
+@pytest.mark.parametrize("repo", ["other/readme", "contents/project"])
+def test_gh_api_does_not_treat_repository_names_as_file_endpoints(monkeypatch, repo):
+    from pr_reviewer.tool_executors import gh_api
+    monkeypatch.setattr("pr_reviewer.platform.gh_api", lambda *a, **kw: {"ok": True})
+    assert gh_api(f"repos/{repo}/issues/1", {repo}, "current/repository") == {"ok": True}
 
 
 def test_remote_file_evidence_cannot_look_like_a_current_repository_path():

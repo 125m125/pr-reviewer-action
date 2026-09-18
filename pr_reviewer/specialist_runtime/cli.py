@@ -95,7 +95,12 @@ _ROLE_SYSTEM = {
         "state a consequence, defect, risk, verdict, finding, severity, approval or "
         "merge-safety judgment, verification result, test result, review result, or "
         "coverage claim. Describe only changed behavior and purpose from bounded "
-        "symbols, workflow keys/steps, and Markdown/AsciiDoc headings or excerpts; "
+        "actual changed-line excerpts (+ added, - removed), symbols, workflow "
+        "keys/steps, and Markdown/AsciiDoc headings or excerpts. Hunk summaries "
+        "are orientation only: their trailing function labels can be unchanged "
+        "surrounding code, not the code modified by the patch. Excerpts are bounded "
+        "samples, not a complete inventory; prefer them to hunk labels when "
+        "describing the edits. "
         "do not reproduce a full diff."
     ),
     "planner": (
@@ -130,7 +135,11 @@ _ROLE_SYSTEM = {
     "negotiator": (
         "Choose exactly one bounded action for one controller-provided target handle. "
         "Return only {\"kind\":string,\"target\":string,\"reason\":string}. "
-        "Allowed kinds are resume, consult, new_session, and record_unknown. Do not "
+        "The action vocabulary is resume, consult, new_session, and record_unknown. "
+        "Choose kind only from the selected target's allowed_actions; the overall "
+        "vocabulary does not make every action legal for every target. In particular, "
+        "do not choose record_unknown when it is absent from that target's "
+        "allowed_actions. Do not "
         "repeat obligation IDs, session IDs, evidence categories, turn counts, leases, "
         "budgets, or an actions array; the controller derives those values from the "
         "selected target. Use a hyphenated spelling only when unavoidable (for example "
@@ -169,6 +178,10 @@ _ROLE_SYSTEM = {
         " If the controller supplies a critic repair request, return decisions only for "
         "the listed missing_candidate_ids; accepted decisions are already retained and "
         "must not be repeated."
+        " If critic_deduplication is supplied, override the ordinary decision contract: "
+        "all supplied findings are already accepted. Return only optional merge actions "
+        "for duplicate findings, or an empty actions array. Do not change substantive "
+        "decisions, reject findings, or request verification in this mode."
     ),
     "remediator": (
         "Suggest a bounded remediation only for the supplied already accepted finding. "
@@ -310,6 +323,19 @@ def _optional_positive_int(env: Mapping[str, str], name: str) -> int | None:
     return _positive_int(env, name, 1)
 
 
+def _optional_nonnegative_int(env: Mapping[str, str], name: str) -> int | None:
+    raw = str(env.get(name, "")).strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+        if value >= 0:
+            return value
+    except ValueError:
+        pass
+    raise ValueError(f"{name.lower()} must be a nonnegative integer")
+
+
 def _nonnegative_float(env: Mapping[str, str], name: str, default: float) -> float:
     try:
         value = float(str(env.get(name, default)).strip())
@@ -390,6 +416,7 @@ class CliConfig:
     request_timeout_sec: int
     max_tokens: int
     recovery_max_tokens: int
+    checkpoint_reasoning_budget_tokens: int | None
     delegated_summary_max_tokens: int | None
     delegated_summary_max_source_bytes: int | None
     planner_max_tokens: int
@@ -523,6 +550,9 @@ class CliConfig:
             request_timeout_sec=request_timeout,
             max_tokens=_positive_int(source, "SPECIALIST_MAX_TOKENS", 4096),
             recovery_max_tokens=_positive_int(source, "SPECIALIST_RECOVERY_MAX_TOKENS", 2048),
+            checkpoint_reasoning_budget_tokens=_optional_nonnegative_int(
+                source, "SPECIALIST_CHECKPOINT_REASONING_BUDGET_TOKENS",
+            ),
             delegated_summary_max_tokens=_optional_positive_int(
                 source, "SPECIALIST_DELEGATED_SUMMARY_MAX_TOKENS",
             ),
@@ -589,11 +619,13 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
         context_projector=None,
         runtime_logger=None,
         stream: bool = False,
+        max_context_tokens: int | None = None,
     ):
         super().__init__(
             gateway, system_prompt, response_format_override,
             attempt_logger=runtime_logger,
             stream=stream,
+            max_context_tokens=max_context_tokens,
         )
         self.max_tokens = max_tokens
         self.max_context_bytes = max_context_bytes
@@ -964,6 +996,7 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
         },
         configuration_warnings=policy_warnings,
         adapter_configuration={
+            "review_policy_file": config.policy_path.relative_to(config.workspace).as_posix(),
             "endpoint": endpoint_identity,
             "role_models": dict(config.role_models),
             "response_format": config.response_format,
@@ -974,6 +1007,7 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
             "planner_max_tokens": config.planner_max_tokens,
             "planner_max_context_bytes": config.planner_max_context_bytes,
             "recovery_max_tokens": config.recovery_max_tokens,
+            "checkpoint_reasoning_budget_tokens": config.checkpoint_reasoning_budget_tokens,
             "delegated_summary_max_tokens": (
                 config.delegated_summary_max_tokens or config.max_tokens * 2
             ),
@@ -1068,6 +1102,10 @@ def build_controller(
         gateway, _role_prompt(config.system_prompt, "critic"), config.max_tokens,
         role_response_format,
         runtime_logger=runtime_logger,
+        max_context_tokens=config.model_context_tokens,
+        # Leave room for a full first response plus its focused repair. The
+        # per-attempt rendered-token guard remains the final admission check.
+        max_context_bytes=max(1, (config.model_context_tokens - 2 * config.max_tokens - 2048) * 3 - 8192),
     )
     remediator = _BoundedRoleAdapter(
         gateway, _role_prompt(config.system_prompt, "remediator"),
@@ -1244,6 +1282,7 @@ def build_controller(
             stream=config.stream,
             max_context_tokens=config.model_context_tokens,
             recovery_max_tokens=config.recovery_max_tokens,
+            checkpoint_reasoning_budget_tokens=config.checkpoint_reasoning_budget_tokens,
             delegated_summary_max_tokens=config.delegated_summary_max_tokens,
             delegated_summary_max_source_bytes=(
                 config.delegated_summary_max_source_bytes
@@ -1898,6 +1937,18 @@ def _runtime_event_line(
     if kind == "negotiation_adjustment":
         action = _compact_text(payload.get("action"), 40)
         return f"negotiation adjusted kind={action}{(': ' + error) if error else ''}"
+    if kind == "critic_batch_started":
+        return (f"critic batch {payload.get('batch')}/{payload.get('batch_count')} "
+                f"candidates={len(payload.get('candidate_ids', ()))} "
+                f"context_bytes={payload.get('context_bytes')} limit={payload.get('limit_bytes')}")
+    if kind == "critic_batch_completed":
+        return (f"critic batch completed request={_compact_text(payload.get('request_id'), 100)} "
+                f"decisions={payload.get('decision_count')} "
+                f"fallback={len(payload.get('fallback_candidate_ids', ()))}")
+    if kind.startswith("critic_deduplication_"):
+        return (f"critic deduplication {kind.removeprefix('critic_deduplication_')} "
+                f"merged={payload.get('merged_count', 0)} retained={payload.get('retained_count', '?')}"
+                + (f": {error}" if error else ""))
     if kind in {"model_request_started", "model_request_completed", "model_request_failed", "model_request_timed_out"}:
         status = kind.removeprefix("model_request_")
         suffix = f": {error}" if error else ""

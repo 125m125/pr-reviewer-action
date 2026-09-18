@@ -1003,6 +1003,81 @@ def test_duplicate_consequence_or_validation_placeholder_downgrades_to_verificat
     )
 
 
+def test_source_access_same_url_merges_obligations_and_purposes():
+    store, _ = _store()
+    obligations = _controller_obligations(_obligation("one"), _obligation("two"))
+    keys = list(obligations)
+    first = SourceAccessRequest(host="docs.example.com",
+        candidate_url="https://docs.example.com/schema/v1", obligation_id=keys[0],
+        purpose="Check schema.", authority_reason="Not allowed.")
+    second = replace(first, purpose="Check consumer.", obligation_id=keys[-1])
+    notes = build_review_notes(AdjudicatedReview(), store, "review_comment",
+        obligations=obligations, changed_files=CHANGED_FILES,
+        source_access_requests=(first, second))
+    assert len(notes) == 1
+    assert "Check schema." in notes[0].markdown
+    assert "Check consumer." in notes[0].markdown
+    assert set(notes[0].related_obligation_ids) == {keys[0], keys[-1]}
+
+
+def test_source_authorization_fragment_uses_configured_file_and_narrow_scope():
+    request = SourceAccessRequest(host="docs.example.com",
+        candidate_url="https://docs.example.com/manual/page?section=one",
+        obligation_id="obligation-store", purpose="Verify contract.",
+        authority_reason="Not allowed.")
+    notes = build_source_access_request_notes([request], obligations=_controller_obligations(),
+        policy_file=".config/review.json")
+    import json
+    body = notes[0].markdown
+    fragment = json.loads(body.split("```json\n", 1)[1].split("\n```", 1)[0])
+    assert fragment["host"] == "docs.example.com"
+    assert fragment["path_prefixes"] == ["/manual/page"]
+    assert fragment["include_subdomains"] is False
+    assert ".config/review.json" in body
+    assert "Keep existing" in body
+    assert "query" in body
+
+
+def test_source_authorization_combines_query_variants():
+    requests = [SourceAccessRequest(
+        host="docs.example.com", candidate_url="https://docs.example.com/manual?section=" + section,
+        obligation_id="obligation-store", purpose="Verify " + section,
+        authority_reason="Not allowed.",
+    ) for section in ("one", "two")]
+    notes = build_source_access_request_notes(requests, obligations=_controller_obligations())
+    assert len(notes) == 1
+    assert "Verify one" in notes[0].markdown and "Verify two" in notes[0].markdown
+
+
+def test_raw_repository_request_suggests_repository_not_web_permission():
+    request = SourceAccessRequest(
+        host="raw.githubusercontent.com",
+        candidate_url="https://raw.githubusercontent.com/actions/upload-artifact/" + "a" * 40 + "/README.md",
+        obligation_id="obligation-store", purpose="Verify contract.", authority_reason="Not allowed.",
+    )
+    note, = build_source_access_request_notes([request], obligations=_controller_obligations())
+    assert "```text\nactions/upload-artifact\n```" in note.markdown
+    assert "```json" not in note.markdown
+
+
+def test_repository_authorization_combines_endpoints_into_one_addition():
+    requests = [repository_access_request(endpoint, "obligation-store", "Verify contract.", "Inspect source.", "Repo not allowed")
+        for endpoint in ["repos/owner/project", "repos/owner/project/commits/" + "a" * 40]]
+    notes = build_source_access_request_notes(requests, obligations=_controller_obligations())
+    assert len(notes) == 1
+    assert "tool_allowed_gh_api_repos" in notes[0].markdown
+    assert "```text\nowner/project\n```" in notes[0].markdown
+    assert "not limited" in notes[0].markdown
+
+
+def test_partial_diff_page_is_not_complete_negative_line_evidence():
+    from types import SimpleNamespace
+    from pr_reviewer.specialist_runtime.adjudication import _added_diff_lines_by_path
+    record = SimpleNamespace(source_path="a.py", tool="read_pr_diff", truncated=False,
+        content="@@ -0,0 +1,593 @@\n+first line\n+second line\n")
+    assert _added_diff_lines_by_path([record]) == {}
+
+
 def test_real_source_access_requests_include_context_and_distinguish_url():
     store, _ = _store()
     obligations = _controller_obligations()
