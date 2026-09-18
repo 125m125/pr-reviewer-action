@@ -128,6 +128,32 @@ def _store(*, status: str = "ok") -> tuple[EvidenceStore, str]:
     return store, record.id
 
 
+def test_cross_batch_dedup_can_only_merge_previously_accepted_findings():
+    from pr_reviewer.specialist_runtime.adjudication import merge_accepted_findings
+
+    store, evidence_id = _store()
+    candidates = (
+        _candidate("C1", evidence_ids=(evidence_id,), claim="A retry duplicates a write"),
+        _candidate("C2", evidence_ids=(evidence_id,), claim="An ambiguous response repeats persistence"),
+        _candidate("C3", evidence_ids=(evidence_id,), claim="An unsupported concern"),
+    )
+    before = _adjudicate(candidates, {"actions": [
+        {"candidate_id": "C1", "action": "keep"},
+        {"candidate_id": "C2", "action": "keep"},
+        {"candidate_id": "C3", "action": "request_verification"},
+    ]}, store)
+    assert len(before.accepted) == 2
+    after = merge_accepted_findings(before, {"actions": [
+        {"candidate_id": "C1", "action": "reject"},
+        {"candidate_id": "C3", "action": "merge", "target_id": "C1"},
+        {"candidate_id": "C2", "action": "merge", "target_id": "C1"},
+    ]}, store)
+    assert [item.candidate_id for item in after.accepted] == ["C1"]
+    assert set(after.accepted[0].contributor_candidate_ids) == {"C1", "C2"}
+    assert after.verification_requests == before.verification_requests
+    assert not after.rejected
+
+
 def _adjudicate(
     candidates: tuple[CandidateFinding, ...],
     decisions: object,

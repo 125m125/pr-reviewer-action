@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 from pr_reviewer.conversation import Conversation
 from pr_reviewer.specialists import classify_file_roles
 from .adjudication import (
+    merge_accepted_findings,
     AcceptedFinding,
     AdjudicatedReview,
     ReviewHandoffContext,
@@ -1042,6 +1043,7 @@ class GatewayRoleAdapter:
     response_format_override: str | None = None
     attempt_logger: Callable[[str], None] | None = None
     stream: bool = False
+    max_context_tokens: int | None = None
 
     def complete(self, request: RoleRequest) -> object:
         return self._complete_recoverable_structured_role(request)
@@ -1087,7 +1089,7 @@ class GatewayRoleAdapter:
                 )
             if before_attempt is not None:
                 before_attempt(attempt)
-            result = self.gateway.complete(ModelTurnRequest(
+            turn_request = ModelTurnRequest(
                 role=request.role,
                 conversation=conversation,
                 max_tokens=(
@@ -1114,7 +1116,26 @@ class GatewayRoleAdapter:
                         if finalization else None
                     )
                 ),
-            ))
+            )
+            if self.max_context_tokens is not None:
+                renderer = getattr(self.gateway, "rendered_request_bytes", None)
+                input_tokens = (
+                    (renderer(turn_request) + 2) // 3
+                    if callable(renderer) else conversation.approx_tokens()
+                )
+                admission = input_tokens + turn_request.max_tokens + 1024
+                if self.attempt_logger is not None:
+                    self.attempt_logger(
+                        f"role {request.role} context admission estimated_input={input_tokens} "
+                        f"response_reserve={turn_request.max_tokens} safety=1024 "
+                        f"total={admission} limit={self.max_context_tokens}"
+                    )
+                if admission > self.max_context_tokens:
+                    raise ValueError(
+                        f"{request.role} rendered context exceeds token limit "
+                        f"({admission}>{self.max_context_tokens}); request not sent"
+                    )
+            result = self.gateway.complete(turn_request)
             content = result.content
             if not content and result.text_source == "content":
                 # Compatibility for test/provider adapters built before
@@ -3951,6 +3972,176 @@ class ReviewController:
             })
         return {"decisions": decisions}
 
+    @staticmethod
+    def _critic_context_slice(context, candidates):
+        ids = {item.candidate_id for item in candidates}
+        obligation_ids = {oid for item in candidates for oid in item.related_obligation_ids}
+        return {
+            **context,
+            "candidates": tuple(candidates),
+            "candidate_evidence": {key: value for key, value in context["candidate_evidence"].items()
+                                   if key in ids},
+            "candidate_assessments": {key: value for key, value in context["candidate_assessments"].items()
+                                      if key in ids},
+            "obligations": {key: value for key, value in context["obligations"].items()
+                            if key in obligation_ids},
+        }
+
+    @staticmethod
+    def _critic_context_bytes(context) -> int:
+        return len(json.dumps(_json_value(context), ensure_ascii=False,
+                              separators=(",", ":")).encode("utf-8"))
+
+    def _critic_batch_result(self, state, context, request_id):
+        candidates = context["candidates"]
+        try:
+            result = self._model_request(
+                state, role="critic", request_id=request_id, phase=RunPhase.FINALIZATION,
+                component=self.critic, method="adjudicate", context=context,
+            )
+            diagnostics = _critic_response_diagnostics(result)
+            if diagnostics["ignored_fields"]:
+                state.journal.emit("critic_response_normalized", diagnostics)
+            try:
+                result = _validated_critic_result(result, candidates)
+                return tuple(result["actions"]), set()
+            except ValueError as exc:
+                if "omitted candidate decisions" not in str(exc):
+                    raise
+            partial_rows, missing_ids = _partial_critic_result(result, candidates)
+            missing_candidates = tuple(c for c in candidates if c.candidate_id in missing_ids)
+            state.journal.emit("critic_repair_requested", {
+                "request_id": request_id, "missing_candidate_ids": missing_ids,
+                "accepted_decision_count": len(partial_rows),
+            })
+            try:
+                repaired = self._model_request(
+                    state, role="critic",
+                    request_id="critic:repair" if request_id == "critic:1" else request_id + ":repair",
+                    phase=RunPhase.FINALIZATION, component=self.critic, method="adjudicate",
+                    context={**context, "critic_repair": {
+                        "missing_candidate_ids": missing_ids,
+                        "accepted_decisions": partial_rows,
+                        "instruction": "Return decisions only for missing candidate IDs; do not repeat accepted decisions.",
+                    }},
+                )
+                # Validate against the full batch so a missing decision can
+                # still merge into a candidate whose decision was retained.
+                repaired_rows, _ = _partial_critic_result(repaired, candidates)
+                repaired_rows = tuple(row for row in repaired_rows if row["candidate_id"] in missing_ids)
+                if {row["candidate_id"] for row in repaired_rows} != set(missing_ids):
+                    raise ValueError("critic repair omitted candidate decisions")
+                validated = _validated_critic_result({"actions": (*partial_rows, *repaired_rows)}, candidates)
+                state.journal.emit("critic_repair_completed", {
+                    "request_id": request_id, "repaired_candidate_ids": missing_ids,
+                })
+                return tuple(validated["actions"]), set()
+            except Exception as exc:
+                self._degrade(state, "critic", request_id + ": " + _bounded_error(exc))
+                fallback = self._conservative_critic(missing_candidates)
+                return (*partial_rows, *fallback["decisions"]), set(missing_ids)
+        except Exception as exc:
+            self._degrade(state, "critic", request_id + ": " + _bounded_error(exc))
+            return tuple(self._conservative_critic(candidates)["decisions"]), {c.candidate_id for c in candidates}
+
+    def _run_critic_batches(self, state, context):
+        limit = getattr(self.critic, "max_context_bytes", None) or 160_000
+        output_tokens = min(getattr(self.critic, "max_tokens", 4096),
+                            state.inputs.config.session_limits.output_tokens or 4096)
+
+        def fits(items):
+            # Budget decision output too: many tiny candidates can fit the
+            # input window while their ID/action rows exceed completion space.
+            decision_bytes = sum(len(c.candidate_id.encode("utf-8")) * 2 + 160 for c in items)
+            return (self._critic_context_bytes(self._critic_context_slice(context, items)) <= limit
+                    and decision_bytes <= max(1, output_tokens - 256) * 3)
+
+        batches, current = [], []
+        for candidate in context["candidates"]:
+            if current and not fits((*current, candidate)):
+                batches.append(tuple(current))
+                current = []
+            current.append(candidate)
+        if current:
+            batches.append(tuple(current))
+        rows, fallback_ids = [], set()
+        for index, candidates in enumerate(batches, 1):
+            batch_context = self._critic_context_slice(context, candidates)
+            request_id = "critic:1" if len(batches) == 1 else f"critic:batch:{index}"
+            state.journal.emit("critic_batch_started", {
+                "request_id": request_id, "batch": index, "batch_count": len(batches),
+                "candidate_ids": tuple(c.candidate_id for c in candidates),
+                "context_bytes": self._critic_context_bytes(batch_context), "limit_bytes": limit,
+            })
+            if fits(candidates):
+                batch_rows, failed = self._critic_batch_result(state, batch_context, request_id)
+            else:
+                self._degrade(state, "critic", f"{request_id}: single candidate exceeds critic batch budget; request not sent")
+                batch_rows = self._conservative_critic(candidates)["decisions"]
+                failed = {c.candidate_id for c in candidates}
+            rows.extend(batch_rows)
+            fallback_ids.update(failed)
+            state.journal.emit("critic_batch_completed", {
+                "request_id": request_id, "decision_count": len(batch_rows),
+                "fallback_candidate_ids": tuple(sorted(failed)),
+            })
+        return {"actions": rows}, fallback_ids, len(batches)
+
+    def _deduplicate_critic_batches(self, state):
+        if len(state.review.accepted) < 2:
+            return
+        context = {
+            "critic_deduplication": {
+                "instruction": (
+                    "These findings already passed substantive review and deterministic validation. "
+                    "Only identify duplicates with the same defect and consequence. Return "
+                    "{\"actions\":[{\"candidate_id\":\"source\",\"action\":\"merge\",\"target_id\":\"survivor\"}]}. "
+                    "Return an empty actions array if none are duplicates. Do not reject, downgrade, "
+                    "promote, rewrite, or re-evaluate findings. Omit unchanged findings. "
+                    "When uncertain, leave both findings unchanged."
+                ),
+            },
+            "candidates": tuple({
+                "candidate_id": item.candidate_id,
+                "claim": item.claim,
+                "affected_location": item.affected_location,
+                "causal_chain": item.causal_chain,
+                "user_visible_consequence": item.user_visible_consequence,
+            } for item in state.review.accepted),
+        }
+        size = self._critic_context_bytes(context)
+        limit = getattr(self.critic, "max_context_bytes", None) or 160_000
+        # ponytail: one compact dedup pass; leave duplicates rather than launch
+        # unbounded pairwise review when even the accepted-finding cards overflow.
+        if size > limit:
+            state.journal.emit("critic_deduplication_skipped", {
+                "reason": "compact finding cards exceed context budget",
+                "context_bytes": size, "limit_bytes": limit,
+            })
+            return
+        try:
+            result = self._model_request(
+                state, role="critic", request_id="critic:deduplicate",
+                phase=RunPhase.FINALIZATION, component=self.critic,
+                method="adjudicate", context=context,
+            )
+            if not isinstance(result, Mapping) or not isinstance(result.get("actions"), (list, tuple)):
+                raise ValueError("critic deduplication must return an actions array")
+            before = len(state.review.accepted)
+            state.review = merge_accepted_findings(state.review, result, state.evidence)
+            state.journal.emit("critic_deduplication_completed", {
+                "proposed_action_count": len(result["actions"]),
+                "merged_count": before - len(state.review.accepted),
+                "retained_count": len(state.review.accepted),
+            })
+            for disposition in state.review.dispositions:
+                if disposition.reason == "cross-batch-duplicate":
+                    state.critic_actions[disposition.candidate_id] = "merge"
+        except Exception as exc:
+            state.journal.emit("critic_deduplication_failed", {
+                "reason": _bounded_error(exc), "accepted_findings_preserved": True,
+            })
+
     def _adjudicate(self, state: _RunState, candidates: tuple[CandidateFinding, ...]) -> None:
         obligation_map = {item.id: item for item in state.obligations}
         if not candidates:
@@ -3958,9 +4149,12 @@ class ReviewController:
             return
         critic_result: object
         critic_context: dict[str, object] | None = None
+        fallback_candidate_ids: set[str] = set()
+        critic_batch_count = 0
         if self.critic is None:
             self._degrade(state, "critic", "deterministic conservative critic fallback")
             critic_result = self._conservative_critic(candidates)
+            fallback_candidate_ids.update(item.candidate_id for item in candidates)
         else:
             try:
                 retained = {
@@ -4023,7 +4217,15 @@ class ReviewController:
                     "candidates": candidates,
                     "candidate_evidence": candidate_evidence,
                     "candidate_assessments": candidate_assessments,
-                    "obligations": obligation_map,
+                    # The critic evaluates candidates, not repository coverage.
+                    # Expanded scope/seed paths describe exploration routing,
+                    # not the invariant or evidence contract being adjudicated.
+                    "obligations": {
+                        key: {field: value for field, value in _json_value(obligation).items()
+                              if field not in {"scope", "seed_hints"}}
+                        for key, obligation in obligation_map.items()
+                        if any(key in candidate.related_obligation_ids for candidate in candidates)
+                    },
                     "changed_files": state.inputs.changed_files,
                     "pr_metadata": state.inputs.pr_metadata,
                     "policy": state.inputs.policy,
@@ -4031,85 +4233,9 @@ class ReviewController:
                         state.change_overview,
                     ),
                 }
-                critic_result = self._model_request(
-                    state,
-                    role="critic",
-                    request_id="critic:1",
-                    phase=RunPhase.FINALIZATION,
-                    component=self.critic,
-                    method="adjudicate",
-                    context=critic_context,
+                critic_result, fallback_candidate_ids, critic_batch_count = self._run_critic_batches(
+                    state, critic_context,
                 )
-                diagnostics = _critic_response_diagnostics(critic_result)
-                if diagnostics["ignored_fields"]:
-                    state.journal.emit("critic_response_normalized", diagnostics)
-                try:
-                    critic_result = _validated_critic_result(
-                        critic_result, candidates,
-                    )
-                except ValueError as exc:
-                    if "omitted candidate decisions" not in str(exc):
-                        raise
-                    partial_rows, missing_ids = _partial_critic_result(
-                        critic_result, candidates,
-                    )
-                    if not missing_ids:
-                        raise
-                    missing_candidates = tuple(
-                        item for item in candidates
-                        if item.candidate_id in set(missing_ids)
-                    )
-                    state.journal.emit("critic_repair_requested", {
-                        "missing_candidate_ids": missing_ids,
-                        "accepted_decision_count": len(partial_rows),
-                    })
-                    try:
-                        repaired = self._model_request(
-                            state,
-                            role="critic",
-                            request_id="critic:repair",
-                            phase=RunPhase.FINALIZATION,
-                            component=self.critic,
-                            method="adjudicate",
-                            context={
-                                **critic_context,
-                                "critic_repair": {
-                                    "missing_candidate_ids": missing_ids,
-                                    "accepted_decisions": partial_rows,
-                                    "instruction": (
-                                        "Return decisions only for the missing candidate IDs; "
-                                        "do not repeat accepted decisions."
-                                    ),
-                                },
-                            },
-                        )
-                        repaired_rows, still_missing = _partial_critic_result(
-                            repaired, missing_candidates,
-                        )
-                        if still_missing:
-                            raise ValueError(
-                                "critic repair omitted candidate decisions"
-                            )
-                        critic_result = _validated_critic_result(
-                            {"actions": (*partial_rows, *repaired_rows)},
-                            candidates,
-                        )
-                        state.journal.emit("critic_repair_completed", {
-                            "repaired_candidate_ids": tuple(
-                                item["candidate_id"] for item in repaired_rows
-                            ),
-                        })
-                    except Exception as repair_exc:
-                        # Preserve valid initial decisions and apply the
-                        # evidence-gated fallback only to IDs still missing.
-                        self._degrade(state, "critic", _bounded_error(repair_exc))
-                        fallback = self._conservative_critic(missing_candidates)
-                        critic_result = {
-                            "actions": (
-                                *partial_rows,
-                                *fallback.get("decisions", ()),
-                            ),
-                        }
             except Exception as exc:
                 if not any(
                     str(item.get("component", "")) == "critic"
@@ -4117,6 +4243,7 @@ class ReviewController:
                 ):
                     self._degrade(state, "critic", _bounded_error(exc))
                 critic_result = self._conservative_critic(candidates)
+                fallback_candidate_ids.update(item.candidate_id for item in candidates)
         try:
             state.review = adjudicate_candidates(
                 candidates, critic_result, state.evidence,
@@ -4238,6 +4365,22 @@ class ReviewController:
         except Exception as exc:
             self._degrade(state, "adjudication", _bounded_error(exc))
             state.review = AdjudicatedReview()
+        if fallback_candidate_ids:
+            def fallback_reason(candidate_id: str, reason: str) -> str:
+                return ("critic-unavailable" if candidate_id in fallback_candidate_ids
+                        and reason == "critic-requested-verification" else reason)
+
+            state.review = replace(
+                state.review,
+                verification_requests=tuple(replace(
+                    item, reason=fallback_reason(item.candidate.candidate_id, item.reason),
+                ) for item in state.review.verification_requests),
+                dispositions=tuple(replace(
+                    item, reason=fallback_reason(item.candidate_id, item.reason),
+                ) for item in state.review.dispositions),
+            )
+        if critic_batch_count > 1:
+            self._deduplicate_critic_batches(state)
         for disposition in state.review.dispositions:
             state.journal.emit("candidate_disposition", _json_value(disposition))
     @staticmethod
