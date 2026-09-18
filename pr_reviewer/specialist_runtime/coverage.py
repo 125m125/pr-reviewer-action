@@ -14,7 +14,7 @@ from pr_reviewer.specialists import classify_file_roles
 
 from .assignments import Assignment
 from .evidence import EvidenceRecord, EvidenceSnapshot
-from .obligation_assessment import ObligationAssessment, ObligationDisposition
+from .obligation_assessment import ObligationAssessment, ObligationAssessmentLedger, ObligationDisposition
 from .policy import RecipePolicy, ReviewPolicy
 from .types import (
     CoverageObligation,
@@ -139,6 +139,7 @@ def evidence_satisfies_obligation(
             return False
         if not any(
             source_path == scope_path or source_path.startswith(scope_path + "/")
+            or fnmatch.fnmatchcase(source_path, scope_path)
             for raw_path in scoped_paths
             if (scope_path := _normalized_path(raw_path))
         ):
@@ -193,50 +194,6 @@ def _recipe_accounting_obligation(
     )
 
 
-def _add_obligation(
-    obligations: dict[str, CoverageObligation],
-    *,
-    origin: str,
-    subject: str,
-    evidence_category: str,
-    risk_tier: str = "normal",
-    recipe_id: str | None = None,
-    recipe_execution: str | None = None,
-    recipe_objective: str = "",
-    recipe_invariants: Iterable[str] = (),
-    requirement_id: str | None = None,
-    requirement_mode: str = "required",
-    requires_independent_verification: bool = False,
-    unresolved_policy: str = "record_unknown",
-    required_evidence_categories: tuple[str, ...] | None = None,
-    mandatory: bool = True,
-    scope: Iterable[str] = (),
-    seed_hints: Iterable[str] = (),
-    explanation: str,
-) -> None:
-    obligation_id = _obligation_id(origin, subject, evidence_category)
-    obligations.setdefault(obligation_id, CoverageObligation(
-        obligation_id=obligation_id,
-        origin=origin,
-        subject=subject,
-        required_evidence_categories=(
-            (evidence_category,) if required_evidence_categories is None else required_evidence_categories
-        ),
-        satisfaction_predicates=("recorded_evidence",),
-        risk_tier=risk_tier,
-        requires_independent_verification=requires_independent_verification,
-        unresolved_policy=unresolved_policy,
-        scope=tuple(scope),
-        seed_hints=tuple(seed_hints),
-        explanation=explanation,
-        recipe_id=recipe_id,
-        recipe_execution=recipe_execution,
-        recipe_objective=recipe_objective,
-        recipe_invariants=tuple(recipe_invariants),
-        requirement_id=requirement_id,
-        requirement_mode=requirement_mode,
-        mandatory=mandatory,
-    ))
 
 
 def _recipe_matches(recipe: RecipePolicy, topology: Mapping[str, Any], risk_flags: set[str]) -> bool:
@@ -297,302 +254,166 @@ def derive_obligations(
     classification: Mapping[str, Any] | None,
     policy: ReviewPolicy,
 ) -> tuple[CoverageObligation, ...]:
-    """Return deterministic mandatory obligations and recipe lifecycle decisions."""
-    classification = classification or {}
+    """Derive substantive owner questions; file inventories and topology are hints."""
     excluded_paths = tuple(policy.exclude.get("paths", ()))
-
-    def included(path: str) -> bool:
-        return not any(
-            fnmatch.fnmatchcase(path, pattern) for pattern in excluded_paths
-        )
-
-    changed_files = tuple(
-        path for path in _paths(topology.get("changed_files")) if included(path)
-    )
-    changed_roles = {
-        role for path in changed_files for role in classify_file_roles(path)
-    }
-    roles = set(_strings(topology.get("file_roles"))) | changed_roles
-    risk_flags = set(_strings(topology.get("risk_flags"))) | set(_strings(classification.get("risk_flags")))
-    excluded_components = {
-        _slug(item) for item in policy.exclude.get("components", ())
-    }
-    components = tuple(
-        sorted(
-            (
-                {
-                    **component,
-                    "changed_files": tuple(
-                        path for path in _paths(component.get("changed_files"))
-                        if included(path)
-                    ),
-                }
-                for component in topology.get("components", [])
-                if isinstance(component, Mapping)
-                and _slug(component.get("id")) not in excluded_components
-            ),
-            key=lambda component: _slug(component.get("id")),
-        )
-    )
-    effective_topology = {
-        **topology,
-        "changed_files": changed_files,
-        "components": components,
-        "file_roles": sorted(roles),
-    }
-    obligations: dict[str, CoverageObligation] = {}
-
-    for path in changed_files:
-        path_roles = set(classify_file_roles(path))
-        non_production_roles = {
-            "test", "documentation", "generated", "migration",
-            "build-manifest", "deployment",
-        }
-        fixture_path = re.search(r"(^|/)(fixtures?|testdata|samples?)(/|$)", path.lower())
-        if (
-            "implementation" in path_roles
-            and not path_roles.intersection(non_production_roles)
-            and not fixture_path
-        ):
-            _add_obligation(
-                obligations, origin="topology", subject=path, evidence_category="implementation",
-                scope=(path,), seed_hints=(path,),
-                explanation="Inspect the changed implementation behavior.",
-            )
-
-    available_tests = _paths((topology.get("available_role_paths") or {}).get("test"))
-    changed_tests = tuple(path for path in changed_files if "test" in classify_file_roles(path))
-    if available_tests or changed_tests:
-        _add_obligation(
-            obligations, origin="topology", subject="relevant-tests", evidence_category="tests",
-            scope=changed_files, seed_hints=changed_tests or available_tests,
-            explanation="Inspect relevant tests when they are available to the review.",
-        )
-
-    for path in changed_files:
-        path_roles = set(classify_file_roles(path))
-        if "schema-contract" in path_roles:
-            for category in ("producer", "consumer"):
-                _add_obligation(
-                    obligations, origin="topology", subject=path, evidence_category=category,
-                    scope=(path,), seed_hints=(path,),
-                    explanation="Trace the changed schema or contract through its producers and consumers.",
-                )
-
-    for component in components:
-        component_id = _slug(component.get("id"), "repository")
-        component_roles = set(_strings(component.get("file_roles")))
-        component_paths = _paths(component.get("changed_files"))
-        if "messaging" in component_roles or (not component_roles and "messaging" in roles):
-            for category in ("producer", "consumer", "delivery"):
-                _add_obligation(
-                    obligations, origin="topology", subject=component_id, evidence_category=category,
-                    scope=component_paths, seed_hints=component_paths,
-                    explanation="Verify message production, consumption, and delivery behavior.",
-                )
-        if component_roles.intersection({"persistence", "migration"}) or (
-            not component_roles and roles.intersection({"persistence", "migration"})
-        ):
-            for category in ("persistence", "migration"):
-                _add_obligation(
-                    obligations, origin="topology", subject=component_id, evidence_category=category,
-                    scope=component_paths, seed_hints=component_paths,
-                    explanation="Verify persistence and migration consistency for the changed component.",
-                )
-        if component_roles.intersection({"deployment", "build-manifest", "generated"}) or (
-            not component_roles and roles.intersection({"deployment", "build-manifest", "generated"})
-        ):
-            _add_obligation(
-                obligations, origin="topology", subject=component_id, evidence_category="deployment-artifact",
-                scope=component_paths, seed_hints=component_paths,
-                explanation="Confirm deployment or generated artifacts consume the changed revision.",
-            )
-
-    for artifact in topology.get("generated_artifacts", []):
-        if not isinstance(artifact, Mapping):
+    excluded_components = set(policy.exclude.get("components", ()))
+    changed = tuple(path for path in _paths(topology.get("changed_files")) if not any(
+        fnmatch.fnmatchcase(path, pattern) for pattern in excluded_paths
+    ))
+    component_by_id = {str(item["id"]): item for item in policy.components}
+    owner_paths: dict[str, tuple[str, ...]] = {}
+    for component in topology.get("components", ()):
+        owner = str(component["id"])
+        if owner in excluded_components:
             continue
-        source_paths = _paths(artifact.get("source_of_truth"))
-        if not set(source_paths).intersection(changed_files):
-            continue
-        artifact_id = _slug(artifact.get("id"), "generated-artifact")
-        _add_obligation(
-            obligations, origin="topology", subject=artifact_id, evidence_category="deployment-artifact",
-            scope=source_paths, seed_hints=_paths(artifact.get("output_paths")),
-            explanation="Confirm the changed source propagates to its generated deployment artifact.",
-        )
-
-    for flag in sorted(risk_flags):
-        _add_obligation(
-            obligations, origin="risk-rule", subject=flag, evidence_category="risk-assessment",
-            risk_tier="high" if flag.startswith("linked_priority") else "critical",
-            unresolved_policy="block_when_unresolved",
-            scope=changed_files, seed_hints=changed_files,
-            explanation=f"Verify the deterministic risk flag: {flag}.",
-        )
-
-    relationships = tuple(
-        relationship for relationship in topology.get("relationships", []) if isinstance(relationship, Mapping)
-    )
-    for relationship in sorted(relationships, key=lambda item: (_slug(item.get("source")), _slug(item.get("target")))):
-        source, target = _slug(relationship.get("source")), _slug(relationship.get("target"))
-        active = (
-            bool(relationship.get("active"))
-            if "active" in relationship
-            else source in {_slug(item.get("id")) for item in components}
-            and target in {_slug(item.get("id")) for item in components}
-        )
-        if source and target and active:
-            _add_obligation(
-                obligations, origin="topology", subject=f"{source}-to-{target}",
-                evidence_category="interaction", scope=changed_files,
-                explanation="Trace the changed interaction across component boundaries.",
-            )
-
-    recipe_states: dict[str, RecipeStatus] = {}
-    excluded_recipes = {
-        _slug(recipe_id) for recipe_id in policy.exclude.get("recipes", ())
+        paths = tuple(path for path in _paths(component.get("changed_files")) if path in changed)
+        if paths:
+            owner_paths[owner] = paths
+    # The topology is authoritative for ownership, but must never silently lose a path.
+    accounted = {path for paths in owner_paths.values() for path in paths}
+    excluded_owned = {
+        path for item in topology.get("components", ()) if item["id"] in excluded_components
+        for path in _paths(item.get("changed_files"))
     }
-    excluded_lenses = {
-        _slug(lens) for lens in policy.exclude.get("lenses", ())
-    }
-    forced_recipes: dict[str, tuple[str, str]] = {}
-    risk_rank = {"low": 0, "normal": 1, "high": 2, "critical": 3}
-    for rule in policy.coverage_rules:
-        if not _rule_matches(rule, effective_topology, risk_flags):
+    remainder = tuple(path for path in changed if path not in accounted | excluded_owned)
+    if remainder:
+        owner_paths["repository-remainder"] = tuple(sorted(set(
+            owner_paths.get("repository-remainder", ()) + remainder
+        )))
+    changed = tuple(path for path in changed if path not in excluded_owned)
+    risks = set(_strings(topology.get("risk_flags"))) | set(_strings((classification or {}).get("risk_flags")))
+    active_topology = {**topology, "changed_files": changed}
+    excluded_recipes = set(policy.exclude.get("recipes", ()))
+    excluded_lenses = set(policy.exclude.get("lenses", ()))
+    obligations: list[CoverageObligation] = []
+    active_recipes: list[tuple[RecipePolicy, str, str]] = []
+    rank = {"low": 0, "normal": 1, "high": 2, "critical": 3}
+    for recipe in policy.recipes:
+        if (recipe.id in excluded_recipes or excluded_lenses.intersection(recipe.lenses)
+                or set(recipe.match.get("component_ids_any", ())).intersection(excluded_components)):
+            obligations.append(_recipe_accounting_obligation(recipe.id, RecipeStatus.SUPPRESSED_BY_POLICY))
             continue
-        for recipe_id in rule.get("required_recipe_ids", ()):
-            current = forced_recipes.get(str(recipe_id))
-            candidate = (
-                str(rule.get("risk_tier", "high")),
-                str(rule.get("unresolved_policy", "block_when_unresolved")),
-            )
-            if current is None or risk_rank[candidate[0]] > risk_rank[current[0]]:
-                forced_recipes[str(recipe_id)] = candidate
-    for recipe in sorted(policy.recipes, key=lambda item: item.id):
-        if (
-            _slug(recipe.id) in excluded_recipes
-            or excluded_lenses.intersection(_slug(item) for item in recipe.lenses)
-            or set(recipe.match.get("component_ids_any", ())).intersection(
-                excluded_components
-            )
-        ):
-            recipe_states[recipe.id] = RecipeStatus.SUPPRESSED_BY_POLICY
+        rules = [rule for rule in policy.coverage_rules
+                 if recipe.id in rule.get("required_recipe_ids", ())
+                 and _rule_matches(rule, active_topology, risks)]
+        if not changed or (not rules and not _recipe_matches(recipe, active_topology, risks)):
+            obligations.append(_recipe_accounting_obligation(recipe.id, RecipeStatus.NOT_APPLICABLE))
             continue
-        if (
-            recipe.id not in forced_recipes
-            and not _recipe_matches(recipe, effective_topology, risk_flags)
-        ):
-            recipe_states[recipe.id] = RecipeStatus.NOT_APPLICABLE
-            continue
-        recipe_states[recipe.id] = RecipeStatus.ASSIGNED
-        forced = forced_recipes.get(recipe.id)
-        risk_tier = forced[0] if forced else recipe.priority
-        unresolved_policy = (
-            forced[1]
-            if forced
-            else (
-                "block_when_unresolved"
-                if recipe.priority in {"critical", "high"}
-                else "record_unknown"
-            )
+        risk = max((recipe.priority, *(str(rule.get("risk_tier", "high")) for rule in rules)), key=rank.__getitem__)
+        unresolved = ("block_when_unresolved" if risk in {"critical", "high"} or any(
+            rule.get("unresolved_policy") == "block_when_unresolved" for rule in rules
+        ) else "record_unknown")
+        active_recipes.append((recipe, risk, unresolved))
+
+    def requirements(recipes: Iterable[RecipePolicy], local: Mapping[str, Any]) -> tuple[Mapping[str, object], ...]:
+        return tuple(
+            {"id": f"{recipe.id}:{item.id}", "category": item.category,
+             "mode": f"one_of:{recipe.id}:{item.mode[7:]}" if item.mode.startswith("one_of:") else item.mode,
+             "seed_paths": item.seed_paths, "related_paths": item.related_paths}
+            for recipe in recipes for item in recipe.evidence_requirements
+            if not item.when or _rule_matches(item.when, local, risks)
         )
-        requirements = tuple(
-            item for item in recipe.evidence_requirements
-            if not item.when or _rule_matches(item.when, effective_topology, risk_flags)
+
+    for owner, paths in sorted(owner_paths.items()):
+        component = component_by_id.get(owner, {})
+        local = {**topology, "changed_files": paths, "components": [{"id": owner}],
+                 "file_roles": tuple({role for path in paths for role in classify_file_roles(path)})}
+        recipes = [(recipe, risk, unresolved) for recipe, risk, unresolved in active_recipes
+                   if recipe.execution == "integrated" and (
+                       _recipe_matches(recipe, local, risks) or any(
+                           recipe.id in rule.get("required_recipe_ids", ())
+                           and _rule_matches(rule, local, risks) for rule in policy.coverage_rules
+                       )
+                   )]
+        questions = tuple(recipe.objective for recipe, _, _ in recipes)
+        invariants = tuple(dict.fromkeys((
+            *component.get("invariants", ()),
+            *(invariant for recipe, _, _ in recipes for invariant in recipe.invariants),
+        )))
+        risk = max(("normal", *(risk for _, risk, _ in recipes)), key=rank.__getitem__)
+        obligations.append(CoverageObligation(
+            obligation_id=_obligation_id("component", owner, "changed-behavior"),
+            origin="component", subject=owner, owner_component_id=owner,
+            required_evidence_categories=("tool-result", "implementation", "tests", "test-result", "review"),
+            satisfaction_predicates=("recorded_evidence",), risk_tier=risk,
+            unresolved_policy="block_when_unresolved" if any(v == "block_when_unresolved" for _, _, v in recipes) else "record_unknown",
+            scope=paths,
+            seed_hints=tuple(dict.fromkeys((*paths, *(p for recipe, _, _ in recipes for p in (*recipe.seed_paths, *recipe.related_paths))))),
+            explanation=("Review changed behavior owned by " + owner
+                         + "; unassessed paths and unresolved behavior stay incomplete. "
+                         + " ".join(component.get("responsibilities", ()))),
+            recipe_objective=" ".join(questions),
+            recipe_invariants=invariants,
+            evidence_requirements=requirements((recipe for recipe, _, _ in recipes), local),
+            evidence_hints=tuple(dict.fromkeys(hint for recipe, _, _ in recipes for hint in recipe.expected_evidence)),
+        ))
+
+    for recipe, risk, unresolved in active_recipes:
+        if recipe.execution != "independent":
+            continue
+        paths = tuple(path for path in changed if (
+            not recipe.match.get("paths_any") or any(fnmatch.fnmatchcase(path, pattern) for pattern in recipe.match["paths_any"])
+        ) and (
+            not recipe.match.get("component_ids_any") or any(
+                path in owner_paths.get(owner, ()) for owner in recipe.match["component_ids_any"]
+            )
+        ))
+        obligations.append(CoverageObligation(
+            obligation_id=_obligation_id("recipe", recipe.id, "independent-review"),
+            origin="recipe", subject=recipe.id, recipe_id=recipe.id,
+            recipe_execution="independent", recipe_objective=recipe.objective,
+            recipe_invariants=recipe.invariants, requires_independent_verification=True,
+            required_evidence_categories=("tool-result", "implementation", "tests", "test-result", "review"),
+            satisfaction_predicates=("recorded_evidence",), risk_tier=risk,
+            unresolved_policy=unresolved, scope=paths,
+            seed_hints=tuple(dict.fromkeys((*paths, *recipe.seed_paths, *recipe.related_paths))),
+            explanation=recipe.objective,
+            evidence_requirements=requirements((recipe,), active_topology),
+            evidence_hints=recipe.expected_evidence,
+        ))
+
+    for boundary in policy.boundaries:
+        contract_changes = tuple(path for path in changed if any(
+            fnmatch.fnmatchcase(path, pattern) for pattern in boundary.contract_paths
+        ))
+        endpoint_changes = tuple(path for path in changed if any(
+            fnmatch.fnmatchcase(path, pattern)
+            for patterns in boundary.endpoint_paths.values() for pattern in patterns
+        ))
+        if not contract_changes and not endpoint_changes:
+            continue
+        affected_owners = [owner for owner in boundary.participants if owner in owner_paths]
+        fallback_owner = boundary.contract_change_owner if contract_changes else (
+            affected_owners[0] if affected_owners else boundary.contract_change_owner
         )
-        matched_requirement_ids = {item.id for item in requirements}
-        for requirement in recipe.evidence_requirements:
-            if requirement.id in matched_requirement_ids:
+        for participant in boundary.participants:
+            owner = participant if participant in owner_paths else fallback_owner
+            if owner in excluded_components:
                 continue
-            obligation_id = _obligation_id(
-                "requirement-accounting",
-                f"{recipe.id}:{requirement.id}",
-                "not-applicable",
-            )
-            obligations.setdefault(obligation_id, CoverageObligation(
-                obligation_id=obligation_id,
-                origin="requirement-accounting",
-                subject=f"{recipe.id}:{requirement.id}",
-                satisfaction_predicates=("requirement_status:not_applicable",),
-                risk_tier=risk_tier,
-                unresolved_policy=unresolved_policy,
-                explanation=(
-                    f"Repository recipe '{recipe.id}' requirement "
-                    f"'{requirement.id}' did not match the immutable change."
-                ),
-                recipe_id=recipe.id,
-                recipe_execution=recipe.execution,
-                requirement_id=requirement.id,
-                requirement_mode=requirement.mode,
-                mandatory=False,
+            local_paths = tuple(path for path in owner_paths.get(participant, ()) if path not in contract_changes)
+            obligations.append(CoverageObligation(
+                obligation_id=_obligation_id("boundary-participant", boundary.id, participant),
+                origin="boundary-participant", subject=f"{boundary.id}:{participant}",
+                owner_component_id=owner, boundary_id=boundary.id, participant_id=participant,
+                required_evidence_categories=("tool-result", "implementation", "review"),
+                satisfaction_predicates=("recorded_evidence",), scope=local_paths,
+                seed_hints=tuple(dict.fromkeys((
+                    *contract_changes, *boundary.contract_paths,
+                    *boundary.endpoint_paths.get(participant, ()),
+                    *component_by_id[participant].get("paths", ()),
+                ))),
+                explanation=f"Check {participant}'s side of {boundary.id}: {boundary.objective}",
+                recipe_objective=boundary.objective,
             ))
-        entries: list[tuple[str, tuple[str, ...], str, tuple[str, ...], bool]] = []
-        for category in recipe.expected_evidence:
-            entries.append((category, (category,), "required", (), True))
-        for requirement in requirements:
-            if requirement.mode.startswith("one_of:"):
-                continue
-            entries.append((
-                requirement.id,
-                (requirement.category,),
-                requirement.mode,
-                tuple(dict.fromkeys((*requirement.seed_paths, *requirement.related_paths))),
-                requirement.mode != "optional",
-            ))
-        groups = sorted({
-            item.mode for item in requirements if item.mode.startswith("one_of:")
-        })
-        for group in groups:
-            members = tuple(item for item in requirements if item.mode == group)
-            entries.append((
-                group,
-                tuple(sorted({item.category for item in members})),
-                group,
-                tuple(dict.fromkeys(
-                    path for item in members
-                    for path in (*item.seed_paths, *item.related_paths)
-                )),
-                True,
-            ))
-        if not recipe.expected_evidence and not recipe.evidence_requirements:
-            entries.append(("review", ("review",), "required", (), True))
-        for requirement_id, categories, mode, requirement_paths, mandatory in entries:
-            _add_obligation(
-                obligations, origin="recipe",
-                subject=(
-                    recipe.id if requirement_id in recipe.expected_evidence
-                    else f"{recipe.id}:{requirement_id}"
-                ),
-                evidence_category=categories[0],
-                required_evidence_categories=categories,
-                risk_tier=risk_tier, recipe_id=recipe.id,
-                recipe_execution=recipe.execution,
-                recipe_objective=recipe.objective,
-                recipe_invariants=recipe.invariants,
-                requirement_id=requirement_id,
-                requirement_mode=mode,
-                requires_independent_verification=recipe.execution == "independent",
-                unresolved_policy=unresolved_policy,
-                scope=changed_files,
-                seed_hints=(
-                    tuple(dict.fromkeys((*recipe.seed_paths, *requirement_paths)))
-                    or changed_files
-                ),
-                mandatory=mandatory,
-                explanation=(
-                    f"Repository recipe '{recipe.id}' requires "
-                    f"{' or '.join(categories)} evidence."
-                ),
-            )
-
-    for recipe_id, status in recipe_states.items():
-        if status not in {RecipeStatus.NOT_APPLICABLE, RecipeStatus.SUPPRESSED_BY_POLICY}:
-            continue
-        marker = _recipe_accounting_obligation(recipe_id, status)
-        obligations.setdefault(marker.obligation_id, marker)
-
-    return tuple(obligations[obligation_id] for obligation_id in sorted(obligations))
-
+        obligations.append(CoverageObligation(
+            obligation_id=_obligation_id("boundary", boundary.id, "compatibility"),
+            origin="boundary", subject=boundary.id, boundary_id=boundary.id,
+            evaluator_owned=True, required_evidence_categories=("implementation",),
+            satisfaction_predicates=("recorded_evidence",),
+            scope=tuple(dict.fromkeys((*contract_changes, *endpoint_changes))),
+            seed_hints=boundary.contract_paths, explanation=boundary.objective,
+        ))
+    return tuple(sorted(obligations, key=lambda item: item.id))
 
 class CoverageLedger:
     """Mutable evidence-to-obligation accounting with immutable obligations."""
@@ -625,6 +446,8 @@ class CoverageLedger:
         if not str(evidence_id).strip():
             raise ValueError("evidence_id must be non-empty")
         self._evidence[obligation_id].add(str(evidence_id))
+        if _group_scoped(self._obligations[obligation_id]):
+            return  # Evidence retention is not a substantive group assessment.
         self._unresolved.discard(obligation_id)
         self._closures.pop(obligation_id, None)
 
@@ -686,14 +509,19 @@ class CoverageLedger:
         self._evidence = reconciled
         self._unresolved = {
             obligation_id for obligation_id in unresolved_ids
-            if not reconciled[obligation_id]
+            if not reconciled[obligation_id] or _group_scoped(self._obligations[obligation_id])
         }
         self._closures = dict(closed_statuses or {})
 
     def obligation_statuses(self) -> dict[str, ObligationStatus]:
         statuses: dict[str, ObligationStatus] = {}
         for obligation_id in sorted(self._obligations):
-            if self._evidence[obligation_id]:
+            if _group_scoped(self._obligations[obligation_id]):
+                statuses[obligation_id] = self._closures.get(
+                    obligation_id,
+                    ObligationStatus.UNRESOLVED if obligation_id in self._unresolved else ObligationStatus.PENDING,
+                )
+            elif self._evidence[obligation_id]:
                 statuses[obligation_id] = ObligationStatus.COVERED
             elif obligation_id in self._closures:
                 statuses[obligation_id] = self._closures[obligation_id]
@@ -716,7 +544,7 @@ class CoverageLedger:
                 statuses[recipe_id] = RecipeStatus.COVERED
             elif all(value is ObligationStatus.NOT_APPLICABLE for value in values):
                 statuses[recipe_id] = RecipeStatus.NOT_APPLICABLE
-            elif any(value is ObligationStatus.COVERED for value in values):
+            elif any(value in {ObligationStatus.COVERED, ObligationStatus.PARTIALLY_COVERED} for value in values):
                 statuses[recipe_id] = RecipeStatus.PARTIALLY_COVERED
             elif any(value in {
                 ObligationStatus.UNRESOLVED,
@@ -738,6 +566,10 @@ class CoverageLedger:
                 for obligation_id in sorted(self._evidence)
             ),
         )
+
+
+def _group_scoped(obligation: CoverageObligation) -> bool:
+    return bool(obligation.owner_component_id or obligation.boundary_id or obligation.evaluator_owned)
 
 
 def _assignment_id(assignment: Assignment | SpecialistAssignment) -> str:
@@ -845,6 +677,7 @@ def _validated_wave_start(
     allowed_statuses = {
         ObligationStatus.PENDING,
         ObligationStatus.COVERED,
+        ObligationStatus.PARTIALLY_COVERED,
         ObligationStatus.UNRESOLVED,
         ObligationStatus.NOT_APPLICABLE,
         ObligationStatus.EXHAUSTED,
@@ -854,7 +687,10 @@ def _validated_wave_start(
         if status not in allowed_statuses:
             raise ValueError(f"unsupported wave-start status for '{obligation_id}'")
         has_evidence = bool(seeded_evidence[obligation_id])
-        if (status is ObligationStatus.COVERED) != has_evidence:
+        needs_evidence = status in {ObligationStatus.COVERED, ObligationStatus.PARTIALLY_COVERED}
+        if (needs_evidence and not has_evidence) or (
+            not _group_scoped(obligation_by_id[obligation_id]) and needs_evidence != has_evidence
+        ):
             raise ValueError(
                 f"wave-start status/evidence mismatch for obligation '{obligation_id}'"
             )
@@ -868,7 +704,9 @@ def _validated_wave_start(
             ObligationStatus.NOT_APPLICABLE,
             ObligationStatus.EXHAUSTED,
             ObligationStatus.BLOCKED,
+            ObligationStatus.PARTIALLY_COVERED,
         }
+        or (_group_scoped(obligation_by_id[obligation_id]) and status is ObligationStatus.COVERED)
     }
     return statuses, seeded_evidence, unresolved, closures
 
@@ -952,6 +790,7 @@ def reconcile_wave(
                     evidence_ids=legacy_ids,
                 )
                 for index, obligation_id in enumerate(owned_ids, start=1)
+                if not _group_scoped(obligation_by_id[obligation_id])
             )
         for assessment in assessments:
             obligation_id = assessment.obligation_id
@@ -959,6 +798,28 @@ def reconcile_wave(
                 raise ValueError(
                     "checkpoint assessment references an unowned obligation"
                 )
+            obligation = obligation_by_id[obligation_id]
+            if obligation.evaluator_owned:
+                continue
+            if _group_scoped(obligation):
+                # Reuse admission validation; persisted/model assessments are not authority.
+                validator = ObligationAssessmentLedger(
+                    session_id=checkpoint.session_id, obligations=(obligation,), obligation_ids=(obligation_id,),
+                )
+                proposal = validator.propose(
+                    target="O1", disposition=assessment.disposition.value,
+                    reason=assessment.reason, evidence_ids=assessment.evidence_ids,
+                    next_actions=assessment.next_actions, assessed_paths=assessment.assessed_paths,
+                    omitted_paths=assessment.omitted_paths, evidence=evidence,
+                    eligible=lambda record, item: bool(_associated_collections_satisfying(
+                        evidence, record, item, session_id=checkpoint.session_id,
+                    )) or evidence_satisfies_obligation(record, item),
+                )
+                if not proposal.accepted:
+                    continue
+                assessment = validator.assessment("O1")
+                reconciled_closures[obligation_id] = ObligationStatus(assessment.disposition.value)
+                reconciled_unresolved.discard(obligation_id)
             if assessment.disposition is ObligationDisposition.NOT_APPLICABLE:
                 reconciled_closures[obligation_id] = ObligationStatus.NOT_APPLICABLE
                 continue
@@ -971,7 +832,7 @@ def reconcile_wave(
             if assessment.disposition is ObligationDisposition.UNRESOLVED:
                 reconciled_unresolved.add(obligation_id)
                 continue
-            if assessment.disposition is not ObligationDisposition.COVERED:
+            if assessment.disposition not in {ObligationDisposition.COVERED, ObligationDisposition.PARTIALLY_COVERED}:
                 continue
             obligation = obligation_by_id[obligation_id]
             referenced_ids = assessment.evidence_ids
@@ -1035,11 +896,11 @@ def reconcile_wave(
     uncovered = tuple(sorted(
         obligation_id for obligation_id, status in after.items()
         if obligation_by_id[obligation_id].mandatory
-        and status in {ObligationStatus.PENDING, ObligationStatus.UNRESOLVED}
+        and status in {ObligationStatus.PENDING, ObligationStatus.UNRESOLVED, ObligationStatus.PARTIALLY_COVERED}
     ))
     attempted = tuple(sorted(
         obligation_id for obligation_id in uncovered
-        if after[obligation_id] is ObligationStatus.UNRESOLVED
+        if after[obligation_id] in {ObligationStatus.UNRESOLVED, ObligationStatus.PARTIALLY_COVERED}
     ))
     never_covered = tuple(sorted(set(uncovered) - set(attempted)))
     return CoverageReconciliation(

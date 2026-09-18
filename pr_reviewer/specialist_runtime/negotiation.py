@@ -264,12 +264,15 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             tuple(dict.fromkeys(assessment.next_actions))
             if assessment is not None else ()
         )
+        if assessment is not None and assessment.omitted_paths:
+            next_actions = (*next_actions, "Inspect unassessed changed paths: " + ", ".join(assessment.omitted_paths[:20]))
         has_novel_action = (
             assessment is None
             or (
                 assessment.disposition in {
                     ObligationDisposition.PENDING,
                     ObligationDisposition.UNRESOLVED,
+                    ObligationDisposition.PARTIALLY_COVERED,
                 }
                 and bool(next_actions)
             )
@@ -417,9 +420,10 @@ def _negotiable_obligations(
             item for item in state.obligations
             if item.id not in excluded
             and item.mandatory
+            and not item.evaluator_owned
             and item.required_evidence_categories
             and statuses.get(item.id, ObligationStatus.PENDING) in {
-                ObligationStatus.PENDING, ObligationStatus.UNRESOLVED,
+                ObligationStatus.PENDING, ObligationStatus.UNRESOLVED, ObligationStatus.PARTIALLY_COVERED,
             }
             and (
                 item.id not in assessments
