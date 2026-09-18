@@ -25,6 +25,24 @@ from pr_reviewer.specialist_runtime.types import (
 )
 
 
+def test_critic_batch_and_dedup_logs_report_sizes_and_outcomes():
+    from pr_reviewer.specialist_runtime.events import RunEvent
+    batch = cli._runtime_event_line(RunEvent(1, "critic_batch_started", {
+        "batch": 2, "batch_count": 3, "candidate_ids": ["C1", "C2"],
+        "context_bytes": 1234, "limit_bytes": 5678,
+    }))
+    assert "2/3" in batch and "candidates=2" in batch
+    assert "1234" in batch and "5678" in batch
+    completed = cli._runtime_event_line(RunEvent(2, "critic_batch_completed", {
+        "request_id": "critic:batch:2", "decision_count": 2, "fallback_candidate_ids": ["C1"],
+    }))
+    assert "critic:batch:2" in completed and "fallback=1" in completed
+    dedup = cli._runtime_event_line(RunEvent(3, "critic_deduplication_completed", {
+        "merged_count": 2, "retained_count": 3,
+    }))
+    assert "merged=2" in dedup and "retained=3" in dedup
+
+
 def test_planner_system_prompt_declares_controller_owned_fields_and_paths():
     prompt = cli._ROLE_SYSTEM["planner"]
 

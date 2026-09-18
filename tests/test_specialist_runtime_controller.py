@@ -3349,6 +3349,190 @@ def test_transient_initial_session_degradation_is_cleared_by_finalization(tmp_pa
     )
 
 
+def test_critic_receives_only_referenced_obligations_without_expanded_scopes(tmp_path):
+    seen = []
+
+    def critic(request):
+        seen.append(request.context)
+        return _critic_role(request)
+
+    result = _controller(tmp_path, critic=critic).run(_inputs(tmp_path))
+    assert seen
+    context = seen[0]
+    expected_ids = {oid for candidate in context["candidates"]
+                    for oid in candidate.related_obligation_ids}
+    assert set(context["obligations"]) == expected_ids
+    assert len(expected_ids) < len(result.artifact["coverage"])
+    for obligation in context["obligations"].values():
+        assert "scope" not in obligation
+        assert "seed_hints" not in obligation
+        assert "satisfaction_predicates" in obligation
+        assert "recipe_invariants" in obligation
+
+
+@pytest.mark.parametrize("bad_batch", [False, True])
+def test_critic_size_batches_keep_candidate_context_and_isolate_failures(tmp_path, bad_batch):
+    calls = []
+    candidates = tuple(CandidateFinding(
+        candidate_id=f"C{i}", root_cause_fingerprint=f"root{i}", claim="defect",
+        affected_location="src/worker.py:7", causal_chain="path", severity="major",
+        supporting_evidence_ids=(f"E{i}",), related_obligation_ids=(f"O{i}",),
+        user_visible_consequence="broken", manual_validation="check",
+    ) for i in range(3))
+    context = {
+        "candidates": candidates,
+        "candidate_evidence": {c.candidate_id: ({"text": "x" * 2000},) for c in candidates},
+        "candidate_assessments": {c.candidate_id: () for c in candidates},
+        "obligations": {f"O{i}": {"subject": f"subject{i}"} for i in range(3)},
+    }
+
+    def critic(request):
+        calls.append(request)
+        items = request.context["candidates"]
+        assert len(items) == 1
+        candidate = items[0]
+        assert set(request.context["candidate_evidence"]) == {candidate.candidate_id}
+        assert set(request.context["obligations"]) == set(candidate.related_obligation_ids)
+        if bad_batch and candidate.candidate_id == "C1":
+            raise RuntimeError("batch failed")
+        return {"actions": [{"candidate_id": candidate.candidate_id, "action": "keep"}]}
+
+    critic.max_context_bytes = 3500
+    state = _RunState(inputs=_inputs(tmp_path), journal=EventJournal(),
+                      deadline=RunDeadline(0.0, 90.0, PhaseShares()), evidence=EvidenceStore())
+    result, fallback_ids, batch_count = _controller(tmp_path, critic=critic)._run_critic_batches(state, context)
+    assert len(calls) == batch_count == 3
+    assert {item["candidate_id"] for item in result["actions"]} == {"C0", "C1", "C2"}
+    assert fallback_ids == ({"C1"} if bad_batch else set())
+    assert [item["action"] for item in result["actions"]] == [
+        "keep", "request_verification" if bad_batch else "keep", "keep",
+    ]
+
+
+def test_critic_oversized_single_candidate_does_not_block_other_batches(tmp_path):
+    candidates = tuple(CandidateFinding(candidate_id=f"C{i}", root_cause_fingerprint="r", claim="claim")
+                       for i in range(2))
+    seen = []
+    def critic(request):
+        seen.extend(c.candidate_id for c in request.context["candidates"])
+        return {"actions": [{"candidate_id": c.candidate_id, "action": "keep"}
+                            for c in request.context["candidates"]]}
+    critic.max_context_bytes = 2000
+    context = {"candidates": candidates, "candidate_evidence": {"C0": "x" * 10000, "C1": "small"},
+               "candidate_assessments": {}, "obligations": {}}
+    state = _RunState(inputs=_inputs(tmp_path), journal=EventJournal(),
+                      deadline=RunDeadline(0.0, 90.0, PhaseShares()), evidence=EvidenceStore())
+    result, fallback_ids, _count = _controller(tmp_path, critic=critic)._run_critic_batches(state, context)
+    assert seen == ["C1"]
+    assert fallback_ids == {"C0"}
+    assert result["actions"][-1]["action"] == "keep"
+
+
+@pytest.mark.parametrize("dedup_fails", [False, True])
+def test_batched_adjudication_runs_compact_dedup_without_reversing_decisions(tmp_path, dedup_fails):
+    store = EvidenceStore()
+    evidence = store.add_tool_result(session_id="S", tool="read_file", arguments={"path": "src/worker.py"},
+                                    result={"status": "ok", "content": "retry_write()\n" * 100})
+    obligation = CoverageObligation("O", "topology", "worker", scope=("src/worker.py",))
+    candidates = tuple(CandidateFinding(
+        candidate_id=f"C{i}", root_cause_fingerprint=f"root{i}",
+        claim=f"Failure case {i} duplicates a write", affected_location="src/worker.py:7",
+        causal_chain="The retry repeats a write after an ambiguous response.", severity="major",
+        supporting_evidence_ids=(evidence.id,), related_obligation_ids=("O",),
+        confidence_rationale=(f"consequence_support:reachable_input_path; evidence_ids={evidence.id}; "
+                              "input=ambiguous response; condition=retry repeats a write; "
+                              "outcome=A user action can be persisted twice"),
+        user_visible_consequence="A user action can be persisted twice.", manual_validation="Retry once.",
+    ) for i in range(3))
+    calls = []
+    def critic(request):
+        calls.append(request)
+        if "critic_deduplication" in request.context:
+            assert {c["candidate_id"] for c in request.context["candidates"]} == {"C0", "C1"}
+            assert "candidate_evidence" not in request.context
+            if dedup_fails:
+                raise RuntimeError("dedup unavailable")
+            return {"actions": [{"candidate_id": "C1", "action": "merge", "target_id": "C0"},
+                                {"candidate_id": "C0", "action": "reject"},
+                                {"candidate_id": "C2", "action": "keep"}]}
+        return {"actions": [{"candidate_id": c.candidate_id,
+                             "action": "request_verification" if c.candidate_id == "C2" else "keep"}
+                            for c in request.context["candidates"]]}
+    critic.max_context_bytes = 5500
+    state = _RunState(inputs=_inputs(tmp_path), journal=EventJournal(),
+                      deadline=RunDeadline(0.0, 90.0, PhaseShares()), evidence=store,
+                      obligations=(obligation,))
+    _controller(tmp_path, critic=critic)._adjudicate(state, candidates)
+    assert any("critic_deduplication" in call.context for call in calls)
+    assert len([call for call in calls if "critic_deduplication" not in call.context]) > 1
+    assert {c.candidate_id for c in state.review.accepted} == ({"C0", "C1"} if dedup_fails else {"C0"})
+    assert [r.candidate.candidate_id for r in state.review.verification_requests] == ["C2"]
+
+
+def test_critic_batch_repairs_missing_decisions_without_losing_merge_targets(tmp_path):
+    candidates = tuple(CandidateFinding(f"C{i}", "root", "claim") for i in range(2))
+    calls = []
+    def critic(request):
+        calls.append(request)
+        if "critic_repair" in request.context:
+            return {"actions": [{"candidate_id": "C1", "action": "merge", "target_id": "C0"}]}
+        return {"actions": [{"candidate_id": "C0", "action": "keep"}]}
+    state = _RunState(inputs=_inputs(tmp_path), journal=EventJournal(),
+                      deadline=RunDeadline(0.0, 90.0, PhaseShares()), evidence=EvidenceStore())
+    rows, fallback, _count = _controller(tmp_path, critic=critic)._run_critic_batches(state, {
+        "candidates": candidates, "candidate_evidence": {}, "candidate_assessments": {}, "obligations": {},
+    })
+    assert len(calls) == 2
+    assert not fallback
+    assert [r["action"] for r in rows["actions"]] == ["keep", "merge"]
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_critic_unavailable_is_not_presented_as_explicit_verification(tmp_path, fails):
+    def critic(request):
+        if fails:
+            raise RuntimeError("context too large")
+        return {"actions": [{"candidate_id": item.candidate_id,
+                             "action": "request_verification"}
+                            for item in request.context["candidates"]]}
+
+    result = _controller(tmp_path, critic=critic).run(_inputs(tmp_path))
+    reasons = {item["reason"] for item in result.artifact["candidate_dispositions"]
+               if item["action"] == "request_verification"}
+    assert reasons == {"critic-unavailable" if fails else "critic-requested-verification"}
+    if fails:
+        assert any("critic could not evaluate" in note.markdown for note in result.notes)
+
+
+@pytest.mark.parametrize("large_initial", [False, True])
+def test_critic_context_guard_checks_initial_and_continuation_payloads(large_initial):
+    from pr_reviewer.specialist_runtime.model_gateway import OpenAIModelGateway
+
+    sent = []
+
+    class Gateway(OpenAIModelGateway):
+        def complete(self, request):
+            sent.append(request)
+            return ModelTurnResult(
+                response={}, tool_calls=(), text="", text_source="reasoning",
+                finish_reason="length", usage={}, request_diagnostics={},
+                reasoning="analysis " * 2000,
+            )
+
+    adapter = GatewayRoleAdapter(
+        Gateway("http://unused", "", "test"), max_context_tokens=2000,
+    )
+    request = RoleRequest(
+        role="critic", request_id="critic:test", phase=RunPhase.FINALIZATION,
+        lease=controller_module.SessionLease(RunPhase.FINALIZATION, 10**20),
+        timeout_sec=30, max_tokens=512,
+        context={"candidates": "x" * (10000 if large_initial else 100)},
+    )
+    with pytest.raises(ValueError, match="critic.*context.*limit"):
+        adapter.complete(request)
+    assert len(sent) == (0 if large_initial else 1)
+
+
 def test_critic_failure_rejects_ambiguous_candidate(tmp_path):
     ambiguous = CandidateFinding(
         candidate_id="ambiguous",

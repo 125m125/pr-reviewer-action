@@ -178,6 +178,10 @@ _ROLE_SYSTEM = {
         " If the controller supplies a critic repair request, return decisions only for "
         "the listed missing_candidate_ids; accepted decisions are already retained and "
         "must not be repeated."
+        " If critic_deduplication is supplied, override the ordinary decision contract: "
+        "all supplied findings are already accepted. Return only optional merge actions "
+        "for duplicate findings, or an empty actions array. Do not change substantive "
+        "decisions, reject findings, or request verification in this mode."
     ),
     "remediator": (
         "Suggest a bounded remediation only for the supplied already accepted finding. "
@@ -615,11 +619,13 @@ class _BoundedRoleAdapter(GatewayRoleAdapter):
         context_projector=None,
         runtime_logger=None,
         stream: bool = False,
+        max_context_tokens: int | None = None,
     ):
         super().__init__(
             gateway, system_prompt, response_format_override,
             attempt_logger=runtime_logger,
             stream=stream,
+            max_context_tokens=max_context_tokens,
         )
         self.max_tokens = max_tokens
         self.max_context_bytes = max_context_bytes
@@ -1096,6 +1102,10 @@ def build_controller(
         gateway, _role_prompt(config.system_prompt, "critic"), config.max_tokens,
         role_response_format,
         runtime_logger=runtime_logger,
+        max_context_tokens=config.model_context_tokens,
+        # Leave room for a full first response plus its focused repair. The
+        # per-attempt rendered-token guard remains the final admission check.
+        max_context_bytes=max(1, (config.model_context_tokens - 2 * config.max_tokens - 2048) * 3 - 8192),
     )
     remediator = _BoundedRoleAdapter(
         gateway, _role_prompt(config.system_prompt, "remediator"),
@@ -1927,6 +1937,18 @@ def _runtime_event_line(
     if kind == "negotiation_adjustment":
         action = _compact_text(payload.get("action"), 40)
         return f"negotiation adjusted kind={action}{(': ' + error) if error else ''}"
+    if kind == "critic_batch_started":
+        return (f"critic batch {payload.get('batch')}/{payload.get('batch_count')} "
+                f"candidates={len(payload.get('candidate_ids', ()))} "
+                f"context_bytes={payload.get('context_bytes')} limit={payload.get('limit_bytes')}")
+    if kind == "critic_batch_completed":
+        return (f"critic batch completed request={_compact_text(payload.get('request_id'), 100)} "
+                f"decisions={payload.get('decision_count')} "
+                f"fallback={len(payload.get('fallback_candidate_ids', ()))}")
+    if kind.startswith("critic_deduplication_"):
+        return (f"critic deduplication {kind.removeprefix('critic_deduplication_')} "
+                f"merged={payload.get('merged_count', 0)} retained={payload.get('retained_count', '?')}"
+                + (f": {error}" if error else ""))
     if kind in {"model_request_started", "model_request_completed", "model_request_failed", "model_request_timed_out"}:
         status = kind.removeprefix("model_request_")
         suffix = f": {error}" if error else ""

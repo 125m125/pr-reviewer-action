@@ -1358,6 +1358,36 @@ def _merge_findings(
     )
 
 
+def merge_accepted_findings(
+    review: AdjudicatedReview,
+    proposals: object,
+    evidence: EvidenceStore | EvidenceSnapshot,
+) -> AdjudicatedReview:
+    """A dedup-only pass cannot reject, promote, or rewrite a finding."""
+    accepted = {item.candidate_id: item for item in review.accepted}
+    dispositions = {item.candidate_id: item for item in review.dispositions}
+    added_lines = _added_diff_lines_by_path(_snapshot(evidence).records)
+    for row in _decision_rows(proposals):
+        if row.get("action") != "merge":
+            continue
+        source_id, target_id = str(row.get("candidate_id", "")), str(row.get("target_id", ""))
+        source, target = accepted.get(source_id), accepted.get(target_id)
+        if source is None or target is None or source_id == target_id:
+            continue
+        if not _merge_compatible(_candidate_from_accepted(source), _candidate_from_accepted(target)):
+            continue
+        accepted[target_id] = _merge_findings((source, target), target_id, added_diff_lines=added_lines)
+        del accepted[source_id]
+        # Flatten existing merges if their representative is merged again.
+        for candidate_id, disposition in tuple(dispositions.items()):
+            if candidate_id == source_id or (disposition.action == "merge" and disposition.target_id == source_id):
+                dispositions[candidate_id] = CandidateDisposition(
+                    candidate_id, "merge", "cross-batch-duplicate", target_id,
+                )
+    return replace(review, accepted=tuple(accepted[key] for key in sorted(accepted)),
+                   dispositions=tuple(dispositions[key] for key in sorted(dispositions)))
+
+
 def adjudicate_candidates(
     candidates: Iterable[CandidateFinding],
     critic_result: object,
@@ -2141,7 +2171,11 @@ def _verification_note(
         "### Verification request\n\n"
         "**Question:** Verify whether this potential issue is present before treating it as a defect: "
         + _quoted(candidate.claim)
-        + "\n\n**Why human input is needed:** " + _quoted(request.reason)
+        + "\n\n**Why human input is needed:** " + _quoted(
+            "The critic could not evaluate this candidate. It remains unverified; "
+            "this is not an explicit critic decision about the reported issue."
+            if request.reason == "critic-unavailable" else request.reason
+        )
     )
     if evidence_ids:
         markdown += "\n\n**Retained evidence already checked:** " + ", ".join(

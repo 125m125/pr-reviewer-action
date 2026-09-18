@@ -153,6 +153,22 @@ or rejected updates stay pending, with per-target diagnostics in the artifact.
 This pass uses the existing lifetime budget and does not run at ordinary
 context-pressure compactions. The negotiator can later decide whether that session deserves a
 bounded follow-up. The critic does not schedule sessions.
+
+The critic receives only candidate-referenced obligation contracts, without the
+expanded repository scope/seed-path lists. Its requests and continuations are
+checked against `model_context_tokens`, including output and safety reserves.
+If evaluation is unavailable or the estimated request is too large, affected
+candidates remain unverified and notes explicitly identify critic unavailability;
+this is not an explicit model decision requesting verification.
+Large critic inputs are partitioned by serialized size (also reserving space for
+decision output), with each candidate's evidence and obligations kept together.
+Missing-decision repairs and failures are isolated to their batch. All batches
+share the existing finalization deadline; an individually oversized candidate
+falls back without blocking the others. After multiple batches, one compact
+deduplication pass can only merge already accepted findings under the existing
+merge checks. It cannot reject findings or promote unverified candidates. If
+even the compact cards exceed the budget, or deduplication fails, accepted
+findings are preserved and the skipped/failed deduplication is logged.
 The remediator runs only for accepted findings, without tools, and cannot alter
 the finding or verdict. Invalid, skipped, or failed remediation is omitted while
 the original finding remains publishable.
