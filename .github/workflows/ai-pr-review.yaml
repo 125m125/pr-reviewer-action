@@ -79,9 +79,9 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Review pull request
-        # Fork of pr-reviewer-action v2.0.0 with generic, model-planned specialist
-        # reviews and LM Studio reasoning-channel compatibility; pinned for safety.
-        uses: 125m125/pr-reviewer-action@291e4db8e873ff18dbd80d12782336ebf084e00f
+        # Component-owned specialist reviews with policy v3 and bounded
+        # cross-component evaluation; pin the clean implementation, not canaries.
+        uses: 125m125/pr-reviewer-action@ac25087b10416b83571cc0d1f15040c012814af4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -107,8 +107,8 @@ jobs:
           # only the latest delta.
           review_scope: full
 
-          # Let a bounded scout derive free-form focuses from the diff and the
-          # repository topology below, then run each specialist sequentially.
+          # Start from deterministic component ownership, then schedule bounded
+          # follow-ups/delegations. The local model runs specialists sequentially.
           review_strategy: specialists
           review_policy_file: .github/ai-review-policy.json
           specialist_tool_mode: native_loop
