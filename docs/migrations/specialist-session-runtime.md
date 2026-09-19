@@ -1,8 +1,10 @@
 # Migrate to the specialist session runtime
 
 This guide is a self-contained handoff for a repository moving from a single
-AI review (or the version-1 specialists file) to the version-2 specialist
-session runtime. It applies to OpenAI-compatible endpoints as well as hosted
+AI review or a version-1/2 policy to the version-3 component-owned specialist
+session runtime. Older policies require explicit migration; there is no legacy
+runtime fallback. A policy file is required. Start with the tested
+[one-owner quick start](../review-policy-authoring.md#quick-start-one-owner). It applies to OpenAI-compatible endpoints as well as hosted
 models. Start with `review_strategy: specialists_evaluate` to inspect the
 outputs without publishing; switch to `specialists` once the policy and
 provider capacity are understood.
@@ -64,17 +66,24 @@ validation paths.
   capability. The controller deduplicates and routes the resulting `L#` target;
   an assigned specialist must explicitly produce a candidate, resolve it as no
   issue, or mark it blocked.
-- Deterministic assignments are balanced across the configured session
-  capacity (targeting roughly six ordinary obligations per specialist when
-  capacity permits). Assignment orientation ranks directly scoped code and
-  seed paths ahead of broad documentation scopes; dedicated and independent
-  recipe assignments remain isolated.
-- The current-head version-2 policy derives deterministic coverage obligations.
-  Recipes record whether work is `coverage`, `dedicated`, or `independent`, so
-  the runtime can account for every selected and omitted obligation. Each
-  specialist's compact assignment brief includes the matched recipe objective
-  and invariants up front; the model does not need a tool call merely to learn
-  what the repository policy expects it to verify.
+- One deterministic assignment owns each affected component's changed behavior;
+  integrated recipes add objectives/invariants, and only explicit independent
+  reviews intentionally overlap. Related files and generic risks are hints, not
+  separate closure jobs. Unmatched files enter a visible repository remainder.
+- Group assessments name `assessed_paths` and remaining omissions or behavioral
+  gaps. Unread/unassessed scope stays incomplete and schedulable. Local boundary
+  checks can finish before the whole component; a fresh bounded evaluator compares
+  actual retained source excerpts from participants before supporting a combined
+  contract question. Failed comparison preserves local assessments and can create
+  targeted leads, never automatic findings.
+- Specialists may request one-level delegation of a concrete owned subset.
+  Accepted requests join the lead queue; the parent retains substantive work.
+  Queued or failed work remains incomplete, and children cannot delegate further.
+  Evidence, candidate validation, deadline, and lifetime budgets stay shared.
+- The initial planner model call is removed. The change summarizer and follow-up
+  negotiator remain. The existing `specialist_planner_model`,
+  `specialist_planner_max_tokens`, and `specialist_planner_max_context_bytes`
+  still configure the change summarizer, not assignment transformations.
 - Web access is controlled by the validated policy's `sources` rules. A changed
   policy or allowlist is not trusted until validation succeeds; an invalid
   policy produces a constrained/degraded result rather than broader access.
@@ -112,7 +121,7 @@ replay and provider capacity have been demonstrated.
 | Input | Lifecycle | Default | Large multilingual recommendation | Why |
 |---|---|---|---|---|
 | `review_strategy` | added | `single` | Begin with `specialists_evaluate`, then use `specialists` with `publish_review_comment: "true"` | Evaluate without publishing before enabling the handoff; the strategy alone never publishes. |
-| `review_policy_file` | added | `.github/ai-review-policy.json` | Keep the default and commit a version-2 policy | The validated current-head policy selects work and limits sources/publishing. |
+| `review_policy_file` | added | `.github/ai-review-policy.json` | Keep the default and commit a version-3 policy | The validated current-head policy selects work and limits sources/publishing. |
 | `review_diff_priority_file` | added | `.github/ai-review-diff-priorities.json` | Keep the default; add the file only when project-specific ordering or quotas improve large-diff orientation | Rules only reorder or quota paths already present in the immutable changed-file manifest. Missing or invalid files safely use built-in priorities. |
 | `specialist_test_results_file` | added |  | Usually leave empty. On GitHub, the action discovers bounded same-head artifacts whose names contain `junit` or `test-results`. Set an explicit normalized JSON path only for custom CI integration. | Makes actual test outcomes searchable when at least one JUnit case was parsed and provides admissible evidence for behavioral-test claims without allowing arbitrary test execution. |
 | `ai_max_tokens` | retained | `8192` | `8192` for the tested local Qwen baseline | Leaves enough room for reasoning-heavy structured roles and checkpoint repair. |
@@ -127,14 +136,14 @@ replay and provider capacity have been demonstrated.
 | `specialist_max_total_tool_calls` | added | `640` | `640` | Bounds total repository calls while preserving the recommended two-tool-calls-per-model-turn ratio. |
 | `specialist_remediator_max_evidence_chars` | added | `32000` | `32000` | Bounds cited evidence supplied to each accepted-finding remediation request; increase when remediation needs more source context, independently of the validation diff budget. |
 | `specialist_max_recoveries_per_session` | added | `1` | `1` | Allows one bounded reconstruction without endless retrying. |
-| `specialist_config_file` | deprecated | `.github/ai-review-specialists.json` | Retain only while translating version-1 recipes | One-release compatibility alias; `review_policy_file` is the version-2 authority. |
-| `specialist_max_initial_passes` | deprecated | `6` | Replace with `specialist_max_sessions: "8"` | Legacy alias, not the version-2 session limit. |
-| `specialist_max_followup_passes` | deprecated | `2` | Replace with `specialist_max_followup_sessions: "2"` | Legacy alias, not the version-2 follow-up limit. |
+| `specialist_config_file` | deprecated | `.github/ai-review-specialists.json` | Remove after explicit v3 migration | Not a runtime fallback; `review_policy_file` is required. |
+| `specialist_max_initial_passes` | deprecated | `6` | Replace with `specialist_max_sessions: "8"` | Legacy alias, not the current session limit. |
+| `specialist_max_followup_passes` | deprecated | `2` | Replace with `specialist_max_followup_sessions: "2"` | Legacy alias, not the current follow-up limit. |
 | `specialist_max_tool_calls_per_pass` | deprecated | `128` | Replace with `specialist_max_tool_calls_per_session: "128"` | Legacy alias; the new limit is lifetime-per-session. |
 | `specialist_tool_mode` | retained | `native_loop` | `native_loop` | Uses durable read-only specialist sessions; `packet` is deprecated. |
-| `specialist_planner_max_tool_calls` | deprecated | `2` | Remove it; use `specialist_max_tool_calls_per_session` for evidence gathering | The planner role does not expose tools, so this compatibility input is a no-op and warns when customized. |
+| `specialist_planner_max_tool_calls` | deprecated | `2` | Remove it; use `specialist_max_tool_calls_per_session` for evidence gathering | No initial assignment-planner call runs; this compatibility input is a no-op. |
 | `specialist_planner_max_tokens` | retained | `2048` | `8192` for reasoning-heavy local models | The smaller default is suitable for concise hosted models; Qwen may otherwise spend the response entirely on reasoning before emitting JSON. |
-| `specialist_planner_model` | retained |  | Leave blank to inherit `ai_model` initially | A separate planner model is an optional capacity/quality tuning point. |
+| `specialist_planner_model` | retained |  | Leave blank to inherit `ai_model` initially | Selects the change-summarizer model, not an assignment planner. |
 | `specialist_model` | retained |  | Leave blank to inherit `ai_model` initially | A separate worker model is optional after the baseline is stable. |
 | `specialist_critic_model` | retained |  | Leave blank to inherit `specialist_model`, then `ai_model` | Avoids introducing a second provider variable during migration. |
 | `specialist_aggregator_model` | retained |  | Leave blank to inherit `ai_model` | Candidate ranking is bounded; tune only from artifacts. |
@@ -147,12 +156,12 @@ replay and provider capacity have been demonstrated.
 | `specialist_temperature` | retained | `0.0` | `0.0` | Keeps exploration deterministic while replay behavior is established. |
 | `model_context_tokens` | retained |  | Set the provider's actual served window; use `75000` for the tested local Qwen configuration | Derives corpus/diff and admission budgets from the real context window. Never copy a model's advertised maximum when the server is configured lower. |
 | `specialist_structured_chat_template_kwargs` | added |  | `{"enable_thinking":false}` for llama.cpp-compatible Qwen servers; otherwise leave blank | Applies provider-specific chat-template options only to no-tool structured roles so exploration can retain reasoning while checkpoints spend their output on JSON. Providers that reject unknown request fields must leave it empty. |
-| `specialist_checkpoint_reasoning_budget_tokens` | added | blank (disabled) | `256` only for an endpoint verified to enforce `thinking_budget_tokens`, such as the tested ik_llama setup | First eligible checkpoint retains tool schemas and exploration thinking settings for cache reuse, but tool execution remains prohibited. Context admission includes retained schemas and repair reserves; tight-context/emergency requests and repairs use the existing strict no-tool, thinking-disabled settings. This does not cap exploration reasoning. Unknown fields may be silently ignored by other servers, so do not enable without checking enforcement. |
+| `specialist_checkpoint_reasoning_budget_tokens` | added |  | `256` only for an endpoint verified to enforce `thinking_budget_tokens`, such as the tested ik_llama setup | First eligible checkpoint retains tool schemas and exploration thinking settings for cache reuse, but tool execution remains prohibited. Context admission includes retained schemas and repair reserves; tight-context/emergency requests and repairs use the existing strict no-tool, thinking-disabled settings. This does not cap exploration reasoning. Unknown fields may be silently ignored by other servers, so do not enable without checking enforcement. |
 | `system_prompt_file` | retained |  | `.github/ai-review-prompt.md` | Stores repository conventions alongside the code being reviewed. |
 | `system_prompt_mode` | changed | `replace` | `append` | Preserves the action-owned specialist protocol and appends repository conventions. |
 | `specialist_stream_watchdog` | retained | `true` | `true` | Stops repeated streamed blocks and permits one compact recovery. |
 | `specialist_max_truncation_continuations` | deprecated | `2` | Remove it | Durable sessions do not issue truncation-continuation turns; they checkpoint and preserve bounded unknowns instead. |
-| `specialist_planner_max_context_bytes` | retained | `60000` | `60000` | Limits context given to the planning scout before tool exploration. |
+| `specialist_planner_max_context_bytes` | retained | `60000` | `60000` | Bounds the retained change-summarizer input. The assignment-planner call is removed. |
 | `specialist_packet_max_bytes` | deprecated | `90000` | Remove it | Packet mode has been removed; durable sessions ignore this compatibility input and warn when it is customized. |
 | `publish_review_comment` | retained | `false` | `"true"` when publishing | Enables managed publication for the selected publish mode. |
 | `publish_mode` | changed |  | `review_comment` | The empty default is an omission sentinel: `single` resolves to `comment`; specialist strategies resolve to `review_comment`. An explicit `comment` remains authoritative and stays a sticky comment. |
@@ -207,29 +216,41 @@ recorded as unknown, not automatically made a blocking defect. No configuration
 migration is required; component paths improve ownership when report metadata
 includes reliable repository test-file paths.
 
-## Version-1 to version-2 mapping
+## Version-1/2 to version-3 mapping
 
-Translate the existing `.github/ai-review-specialists.json` into
-`.github/ai-review-policy.json` rather than deleting it before the first v2
-evaluation. The v1 file remains a compatibility migration input, but the
-validated current-head v2 policy is authoritative for obligations, specialist
-selection, sources, and publishing.
+Migrate `.github/ai-review-specialists.json` or the existing policy into
+`.github/ai-review-policy.json` before starting the new runtime. Merely changing
+the version number is insufficient. Validate with the production parser and
+inspect representative ownership/activation cases without an LLM first.
+Recipe `execution` now distinguishes integrated guidance from independent verification.
 
-| Version-1 field | Version-2 field | Translation |
+| Old property or behavior | Replacement / recommendation | Why |
 |---|---|---|
-| `version: 1` | `version: 2` | Change the version and add v2-only sections as needed. |
-| `components` | `components` | Copy each component's `id`, `paths`, responsibilities, relationships, contracts, and invariants. IDs are normalized to slugs; paths must remain repository-relative. |
-| `recipes` | `recipes` | Copy recipe IDs, title, objective, `match`, lenses, paths, invariants, expected evidence, and priority. Add `execution`: use `coverage` for normal obligation coverage, `dedicated` for a focused separate examination, or `independent` for a separate corroborating examination. |
-| `match` | `match` | Preserve `paths_any`, `component_ids_any`, `risk_flags_any`, and `file_roles_any`. Every populated match group must match; values within a group use `any` semantics. Do not turn separate match groups into alternatives. |
-| `exclude` | `exclude` | Copy `paths`, `components`, `lenses`, and `recipes`. Exclusions remain authoritative for scheduling and are disclosed; they do not disable classifier, verdict, or publication guardrails. |
-| `generated_artifacts` | `generated_artifacts` | Copy each artifact's `id`, `source_of_truth`, `generator_config`, and `output_paths`. If an output is absent, review the source specification, generator config, handwritten consumers, and tests instead of assuming generated output is evidence. |
+| `version: 1` or `version: 2` | Set `version: 3` after the changes below. Missing and old policies fail before model calls. | No silent reinterpretation or legacy runtime. |
+| `components` | Keep IDs and responsibilities; make paths define actual review owners, not languages or every API schema. | One initial owner per changed component; same-language services remain distinct. |
+| Overlapping component paths | Prefer non-overlap; otherwise list all overlapping IDs in `ownership_precedence`, first wins. | Changed files must have one ordinary owner. |
+| Shared API/schema components | Declare `boundaries` with `contract_paths`, `participants`, `contract_change_owner`, `objective`, and optional `endpoint_paths`. Keep an actual database/migration owner where appropriate. | Contract-only work has an owner without speculative all-pairs investigations. |
+| `recipes` with `execution: coverage` or `dedicated` | Choose `execution: integrated` normally; use `independent` only for deliberate corroboration. | Focus comes from owner work and informed subset delegation, not one extra session per recipe. |
+| `expected_evidence` | Suggested evidence only. Move genuinely mandatory proof to conditional `evidence_requirements`. | Avoid one obligation per evidence category without weakening explicit requirements. |
+| `match` | Preserve filters carefully. Every populated match group must match; values within a group use `any` semantics. | No broadening from AND to OR; recipes and forcing rules must agree. |
+| `coverage_rules` | Retain narrow mandatory triggers and risk tiers. | Important questions stay mandatory, but within owner work. |
+| `exclude` | Keep deliberate path/component/lens/recipe exclusions. | Exclusions suppress review work, not security or publishing guards. |
+| `generated_artifacts` | Keep `source_of_truth`, `generator_config`, `output_paths`. | These describe available generation evidence, not mandatory absent outputs. |
+| Initial planner configuration | No assignment-planner call; planner model/token/context inputs still bound the change summarizer. Remove obsolete planner tool-call tuning. | No redundant planning LLM; no misleading claim that these shared inputs are all inert. |
+| Session/turn/tool/deadline configuration | Keep existing measured settings initially; evaluator and delegation use these limits too. | No new budget knobs or free child/evaluator allowance. |
+| `sources`, API repository allowlists, verdict and publishing policy | Preserve unchanged unless a separate access/publishing change is intended. | Ownership and hints never grant read or publication authority. |
 
-Then add the v2-only sections deliberately: `coverage_rules` for deterministic
-risk/obligation requirements, `sources` for narrow official-documentation
-allowlists, `verdict_policy` for verdict restrictions, and `publishing` for
-policy-level narrowing. Recipes are structured review data: they do not grant
-commands, arbitrary web hosts, custom models, custom budgets, or full prompt
-replacement.
+See the [complete examples and exact matcher semantics](../review-policy-authoring.md),
+including a parser-tested movieHRdb-style policy. For downstream agents, deliver
+the updated policy, any obsolete prompt instructions removed, validation results,
+and remaining unmapped paths. Do not edit credentials or widen source permissions
+as part of migration.
+
+When the policy migration itself is in the PR, an automatic run does not trust
+new current-branch ownership or source permissions. After inspecting the policy,
+use the maintainer-only `ai-review` label (or a manual workflow dispatch) to
+authorize a review with it. Until migration is merged, an older base policy may
+still produce an explicit migration warning; it must not silently grant access.
 
 ## Repository file checklist
 
@@ -244,12 +265,11 @@ Create or review these files in the consuming repository before enabling
    PR-write permission. Check out the PR head with `fetch-depth: 0`.
 2. `.github/ai-review-rules.md`: repository-visible standards and constraints.
    It is suitable for conventions, but does not grant web access or replace the
-   version-2 policy.
-3. `.github/ai-review-specialists.json`: migration-only compatibility input.
-   Preserve an existing version-1 file while translating components/recipes,
-   then remove it after version-2 output is established. Fresh version-2
-   adopters should not create this file.
-4. `.github/ai-review-policy.json`: the version-2 current-head policy. It owns
+   version-3 policy.
+3. `.github/ai-review-specialists.json`: obsolete; translate its components and
+   recipes into the required v3 policy, then remove this old file. It is not a
+   runtime fallback. Fresh version-3 adopters should not create this file.
+4. `.github/ai-review-policy.json`: the version-3 current-head policy. It owns
    component/recipe obligations, allowed documentation sources, generated
    artifacts, and any narrowing publishing/risk policy.
 5. `.github/ai-review-prompt.md`: concise repository addendum. Set
@@ -321,7 +341,7 @@ jobs:
           publish_mode: comment
 ```
 
-### After: tested local-Qwen version-2 baseline
+### After: local-Qwen workflow baseline
 
 ```yaml
 name: AI PR Review
@@ -449,14 +469,14 @@ Keep these values initially:
   `contents` permission, narrowly scoped `pull-requests: write`, and fork
   exclusion until the trust boundaries have been reviewed for that project.
 
-Do not copy `.github/ai-review-specialists.json` into a fresh version-2 project,
+Do not copy `.github/ai-review-specialists.json` into a fresh version-3 project,
 do not broaden source hosts merely because search returned them, and do not
 replace the bundled specialist prompt with the repository addendum.
 
 ## Policy authoring and evidence requirements
 
 Use the permanent [policy-authoring guide](../review-policy-authoring.md) for
-the version-2 schema, complete example, external-repository authorization, and
+the version-3 schema, complete example, external-repository authorization, and
 conditional evidence requirements. The [file-role reference](../file-roles.md)
 defines the built-in path heuristics. Keep migration-specific changes from this
 guide, but use those references when creating or maintaining repository policy.
@@ -558,8 +578,8 @@ never grant access automatically and are kept out of the sticky handoff.
 |---|---|---|
 | No specialist review is published | `review_strategy` and `publish_review_comment` | Use `specialists` and `publish_review_comment: "true"`; `specialists_evaluate` is intentionally non-publishing. |
 | A specialist review is a sticky comment | `publish_mode` | Omit it for specialist default `review_comment`, or set `review_comment` explicitly. `comment` is an intentional sticky override. |
-| Policy/source access is constrained or degraded | `specialist-review-artifact.json` policy/degradation fields | Validate `.github/ai-review-policy.json`; use only known version-2 keys, concrete lowercase HTTPS hosts, and repository-relative paths. |
-| Expected recipe did not run | artifact coverage/omitted obligations and recipe `match` | Check every populated match group and exclusions; add a `coverage`, `dedicated`, or `independent` recipe that matches the changed component/path. |
+| Policy/source access is constrained or degraded | `specialist-review-artifact.json` policy/degradation fields | Validate `.github/ai-review-policy.json`; use only known version-3 keys, concrete lowercase HTTPS hosts, and repository-relative paths. |
+| Expected recipe did not run | artifact coverage/omitted obligations and recipe `match` | Check every populated match group and exclusions; add an `integrated` or `independent` recipe that matches the changed component/path. |
 | Deadline is reached | artifact budget/event accounting | Keep concurrency at `1`, inspect expensive recipes/tool usage, then tune direct budgets or deadline from evidence. |
 | Provider overload or nondeterministic results | model logs and repeated artifacts | Keep `specialist_concurrency: "1"`; increase it only after capacity and deterministic replay are confirmed. |
 | Native review cannot publish | workflow permissions | Grant `pull-requests: write`; preserve `contents: read` and checkout the PR head. |

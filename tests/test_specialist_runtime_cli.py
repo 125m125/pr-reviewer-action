@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import os
 from pathlib import Path
 import re
@@ -298,11 +299,11 @@ def test_planner_projection_keeps_only_active_recipe_globs():
             "recipe_id": "delivery",
         }],
         "policy": {
-            "version": 2,
+            "version": 3,
             "recipes": [
                 {
                     "id": "delivery",
-                    "execution": "dedicated",
+                    "execution": "integrated",
                     "seed_paths": ["worker/**"],
                     "related_paths": ["contracts/**", "tests/**"],
                 },
@@ -316,51 +317,12 @@ def test_planner_projection_keeps_only_active_recipe_globs():
 
     assert projected["policy"]["recipes"] == [{
         "id": "delivery",
-        "execution": "dedicated",
+        "execution": "integrated",
         "seed_paths": ["worker/**"],
         "related_paths": ["contracts/**", "tests/**"],
     }]
 
 
-def test_planner_logs_bounded_projection_shape_counts(monkeypatch, tmp_path):
-    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
-    monkeypatch.setenv("AI_MODEL", "local-model")
-    lines = []
-    controller = cli.build_controller(
-        cli.CliConfig.from_env(workspace=tmp_path),
-        runtime_logger=lines.append,
-    )
-    controller.planner.gateway.transport = _successful_transport([])
-
-    controller.planner.complete(RoleRequest(
-        role="planner",
-        request_id="planner:shape-counts",
-        phase=RunPhase.PLANNING,
-        lease=SessionLease(RunPhase.PLANNING, 10**20),
-        timeout_sec=30,
-        max_tokens=512,
-        context={
-            "base_plan": {"assignments": [{"id": "assignment-1"}]},
-            "obligations": [{"obligation_id": "obligation-1"}],
-            "topology": {
-                "changed_files": ["src/changed.py"],
-                "available_role_paths": {"test": ["tests/test_changed.py"]},
-                "role_availability": {"test": {"count": 4}},
-                "relationships": [{
-                    "source": "app", "target": "contract", "active": True,
-                }],
-            },
-        },
-    ))
-
-    assert any(
-        "planner projection counts changed_paths=1 assignments=1 obligations=1 "
-        "active_relationships=1 capability_roles=1" in line
-        for line in lines
-    )
-    assert any(
-        "omitted_topology_fields=available_role_paths" in line for line in lines
-    )
 
 
 def test_runtime_event_line_suppresses_delayed_specialist_admission_duplicate():
@@ -669,6 +631,16 @@ def write_review_workspace(root: Path) -> None:
     )
     (root / "review-corpus.truncated.md").write_text("# corpus\n", encoding="utf-8")
     (root / "standards-context.md").write_text("# standards\n", encoding="utf-8")
+    policy = root / ".github" / "ai-review-policy.json"
+    policy.parent.mkdir(exist_ok=True)
+    policy.write_text(json.dumps({
+        "version": 3,
+        "components": [{
+            "id": "application",
+            "paths": ["src/**"],
+            "responsibilities": ["Own application behavior."],
+        }],
+    }), encoding="utf-8")
 
 
 @pytest.mark.parametrize("raw,expected", [("", None), ("0", 0), ("256", 256)])
@@ -1135,6 +1107,15 @@ def test_load_workspace_uses_immutable_local_diff_when_api_patches_are_absent(
         '{"pr_kind":"app_code","risk_flags":[]}',
         encoding="utf-8",
     )
+    policy = tmp_path / ".github" / "ai-review-policy.json"
+    policy.parent.mkdir()
+    policy.write_text(json.dumps({
+        "version": 3,
+        "components": [{
+            "id": "application", "paths": ["src/**"],
+            "responsibilities": ["Own application behavior."],
+        }],
+    }), encoding="utf-8")
     monkeypatch.setenv("REPO", "owner/repo")
 
     workspace = cli.load_workspace(cli.CliConfig.from_env(workspace=tmp_path))
@@ -1180,11 +1161,12 @@ def test_build_controller_uses_openai_gateway_role_models_and_bounded_session(mo
 
     controller = cli.build_controller(config)
 
-    gateway = controller.planner.gateway
+    gateway = controller.change_summarizer.gateway
     assert gateway.role_models == {
         "change_summarizer": "planner", "planner": "planner",
         "specialist": "worker", "negotiator": "critic",
-        "critic": "critic", "remediator": "critic", "finalizer": "finalizer",
+        "boundary_evaluator": "critic", "critic": "critic",
+        "remediator": "critic", "finalizer": "finalizer",
     }
     assert controller.change_summarizer.gateway is gateway
     assert controller.remediator.gateway is gateway
@@ -1412,7 +1394,7 @@ def test_git_changed_files_uses_merge_base_when_target_branch_advances(tmp_path)
     ) == ("feature.txt",)
 
 
-def test_planner_context_byte_limit_stops_oversized_request_before_transport(
+def test_change_summarizer_context_limit_stops_oversized_request_before_transport(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
@@ -1420,11 +1402,11 @@ def test_planner_context_byte_limit_stops_oversized_request_before_transport(
     monkeypatch.setenv("SPECIALIST_PLANNER_MAX_CONTEXT_BYTES", "64")
     controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
     captured = []
-    controller.planner.gateway.transport = _successful_transport(captured)
+    controller.change_summarizer.gateway.transport = _successful_transport(captured)
 
-    with pytest.raises(ValueError, match="planner context"):
-        controller.planner.complete(RoleRequest(
-            role="planner",
+    with pytest.raises(ValueError, match="change_summarizer context"):
+        controller.change_summarizer.complete(RoleRequest(
+            role="change_summarizer",
             request_id="planner:oversized",
             phase=RunPhase.PLANNING,
             lease=SessionLease(RunPhase.PLANNING, 10**20),
@@ -1436,105 +1418,8 @@ def test_planner_context_byte_limit_stops_oversized_request_before_transport(
     assert captured == []
 
 
-def test_planner_compacts_repeated_path_sets_before_context_preflight(
-    monkeypatch, tmp_path,
-):
-    changed_files = [
-        f"services/component-{index:03d}/src/implementation.py"
-        for index in range(108)
-    ]
-    obligations = [
-        {
-            "obligation_id": f"obligation:global:{index}",
-            "origin": "topology",
-            "subject": f"global-{index}",
-            "required_evidence_categories": ["implementation"],
-            "risk_tier": "high",
-            "scope": list(changed_files),
-            "seed_hints": list(changed_files),
-        }
-        for index in range(36)
-    ]
-    context = {
-        "obligations": obligations,
-        "topology": {
-            "changed_files": list(changed_files),
-            "components": [{
-                "id": "repository",
-                "changed_files": list(changed_files),
-            }],
-        },
-        "config": {"max_sessions": 8},
-        "policy": {"version": 2},
-        "pr_metadata": {"title": "Large cross-cutting change"},
-    }
-    raw_bytes = len(json.dumps(
-        context, sort_keys=True, separators=(",", ":"),
-    ).encode("utf-8"))
-    assert raw_bytes > 120_000
-
-    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
-    monkeypatch.setenv("AI_MODEL", "local-model")
-    monkeypatch.setenv("SPECIALIST_PLANNER_MAX_CONTEXT_BYTES", "120000")
-    controller = cli.build_controller(
-        cli.CliConfig.from_env(workspace=tmp_path),
-    )
-    captured = []
-    controller.planner.gateway.transport = _successful_transport(captured)
-
-    controller.planner.complete(RoleRequest(
-        role="planner",
-        request_id="planner:large-repeated-scopes",
-        phase=RunPhase.PLANNING,
-        lease=SessionLease(RunPhase.PLANNING, 10**20),
-        timeout_sec=30,
-        max_tokens=512,
-        context=context,
-    ))
-
-    assert captured
-    compact = json.loads(captured[0]["messages"][-1]["content"])
-    compact_bytes = len(json.dumps(
-        compact, sort_keys=True, separators=(",", ":"),
-    ).encode("utf-8"))
-    assert compact_bytes < 120_000
-    assert len(compact["path_sets"]) == 1
-    path_set_id, retained_paths = next(iter(compact["path_sets"].items()))
-    assert retained_paths == changed_files
-    for original, projected in zip(obligations, compact["obligations"]):
-        assert "scope" not in projected
-        assert "seed_hints" not in projected
-        assert projected["scope_ref"] == path_set_id
-        assert projected["seed_hints_ref"] == path_set_id
-        assert compact["path_sets"][projected["scope_ref"]] == original["scope"]
-        assert compact["path_sets"][projected["seed_hints_ref"]] == original["seed_hints"]
-    assert obligations[0]["scope"] == changed_files
-    assert obligations[0]["seed_hints"] == changed_files
 
 
-def test_planner_serializes_frozen_policy_context_without_mappingproxy_copy(
-    monkeypatch, tmp_path,
-):
-    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
-    monkeypatch.setenv("AI_MODEL", "local-model")
-    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
-    captured = []
-    controller.planner.gateway.transport = _successful_transport(captured)
-    frozen_context = freeze_callback_value({"policy": ReviewPolicy.minimal()})
-
-    controller.planner.complete(RoleRequest(
-        role="planner",
-        request_id="planner:frozen-policy",
-        phase=RunPhase.PLANNING,
-        lease=SessionLease(RunPhase.PLANNING, 10**20),
-        timeout_sec=30,
-        max_tokens=512,
-        context=frozen_context,
-    ))
-
-    assert captured
-    message = captured[0]["messages"][-1]["content"]
-    assert json.loads(message)["policy"]["version"] == 2
 
 
 def _role_request(role: str, phase: RunPhase) -> RoleRequest:
@@ -1563,7 +1448,7 @@ def _successful_transport(captured):
     return transport
 
 
-def test_planner_continues_truncated_reasoning_then_forces_json_response(
+def test_change_summarizer_continues_truncated_reasoning_then_forces_json_response(
     monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
@@ -1601,9 +1486,9 @@ def test_planner_continues_truncated_reasoning_then_forces_json_response(
         payloads.append(payload)
         return next(responses)
 
-    controller.planner.gateway.transport = transport
+    controller.change_summarizer.gateway.transport = transport
 
-    assert controller.planner.complete(_role_request("planner", RunPhase.PLANNING)) == {
+    assert controller.change_summarizer.complete(replace(_role_request("change_summarizer", RunPhase.PLANNING), max_attempts=3, max_tokens=8192)) == {
         "assignments": [],
     }
 
@@ -1972,17 +1857,17 @@ def test_structured_role_ignores_quoted_braces_and_rejects_container_objects(
         ) == {"real": 1}
 
 
-def test_planner_uses_its_configured_output_limit_over_session_limit(monkeypatch, tmp_path):
+def test_change_summarizer_respects_request_limit_within_configured_cap(monkeypatch, tmp_path):
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
     monkeypatch.setenv("AI_MODEL", "local-model")
     monkeypatch.setenv("SPECIALIST_MAX_TOKENS", "4096")
     monkeypatch.setenv("SPECIALIST_PLANNER_MAX_TOKENS", "8192")
     controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
     captured = []
-    controller.planner.gateway.transport = _successful_transport(captured)
+    controller.change_summarizer.gateway.transport = _successful_transport(captured)
 
-    controller.planner.complete(RoleRequest(
-        role="planner",
+    controller.change_summarizer.complete(RoleRequest(
+        role="change_summarizer",
         request_id="planner:session-limit",
         phase=RunPhase.PLANNING,
         lease=SessionLease(RunPhase.PLANNING, 10**20),
@@ -1991,10 +1876,10 @@ def test_planner_uses_its_configured_output_limit_over_session_limit(monkeypatch
         context={},
     ))
 
-    assert captured[0]["max_tokens"] == 8192
+    assert captured[0]["max_tokens"] == 4096
 
 
-def test_planner_rejects_repeated_textual_tools_without_retaining_them(
+def test_change_summarizer_rejects_repeated_textual_tools_without_retaining_them(
     monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
@@ -2030,21 +1915,21 @@ def test_planner_rejects_repeated_textual_tools_without_retaining_them(
         payloads.append(payload)
         return next(responses)
 
-    controller.planner.gateway.transport = transport
+    controller.change_summarizer.gateway.transport = transport
 
-    assert controller.planner.complete(
-        _role_request("planner", RunPhase.PLANNING)
+    assert controller.change_summarizer.complete(
+        _role_request("change_summarizer", RunPhase.PLANNING)
     ) == {"transformations": []}
     assert len(payloads) == 2
-    assert payloads[0]["stream"] is True
-    assert payloads[1]["max_tokens"] == 2048
+    assert payloads[0]["stream"] is False
+    assert payloads[1]["max_tokens"] == 512
     assert payloads[1]["reasoning_effort"] == "none"
     retry_history = json.dumps(payloads[1]["messages"])
     assert "<tool_call>" not in retry_history
     assert "Tools are unavailable" in retry_history
 
 
-def test_planner_rejects_repeated_reasoning_tools_without_retaining_them(
+def test_change_summarizer_rejects_repeated_reasoning_tools_without_retaining_them(
     monkeypatch, tmp_path,
 ):
     monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
@@ -2078,41 +1963,15 @@ def test_planner_rejects_repeated_reasoning_tools_without_retaining_them(
         payloads.append(payload)
         return next(responses)
 
-    controller.planner.gateway.transport = transport
+    controller.change_summarizer.gateway.transport = transport
 
-    assert controller.planner.complete(
-        _role_request("planner", RunPhase.PLANNING)
+    assert controller.change_summarizer.complete(
+        _role_request("change_summarizer", RunPhase.PLANNING)
     ) == {"transformations": []}
     retry_history = json.dumps(payloads[1]["messages"])
     assert "<tool_call>" not in retry_history
 
 
-def test_planner_projection_trims_to_configured_context_limit(monkeypatch, tmp_path):
-    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
-    monkeypatch.setenv("AI_MODEL", "local-model")
-    monkeypatch.setenv("SPECIALIST_PLANNER_MAX_CONTEXT_BYTES", "60000")
-    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
-    captured = []
-    controller.planner.gateway.transport = _successful_transport(captured)
-    obligations = [{
-        "obligation_id": f"obligation-{index}",
-        "subject": "x" * 400,
-        "explanation": "y" * 1200,
-        "scope": [f"src/file-{index}.py"],
-    } for index in range(200)]
-
-    controller.planner.complete(RoleRequest(
-        role="planner", request_id="planner:configured-limit",
-        phase=RunPhase.PLANNING,
-        lease=SessionLease(RunPhase.PLANNING, 10**20),
-        timeout_sec=30, max_tokens=512,
-        context={"base_plan": {"assignments": []}, "obligations": obligations},
-    ))
-
-    user_context = json.loads(captured[0]["messages"][1]["content"])
-    assert len(json.dumps(
-        user_context, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-    ).encode("utf-8")) <= 60000
 
 
 def test_default_lm_studio_requests_use_role_and_session_protocols_not_legacy_verdict_prompt(
@@ -2125,10 +1984,10 @@ def test_default_lm_studio_requests_use_role_and_session_protocols_not_legacy_ve
     config = cli.CliConfig.from_env(workspace=tmp_path)
     controller = cli.build_controller(config)
     captured = []
-    gateway = controller.planner.gateway
+    gateway = controller.change_summarizer.gateway
     gateway.transport = _successful_transport(captured)
 
-    controller.planner.complete(_role_request("planner", RunPhase.PLANNING))
+    controller.change_summarizer.complete(_role_request("change_summarizer", RunPhase.PLANNING))
 
     from pr_reviewer.specialist_runtime.assignments import Assignment
     from pr_reviewer.specialist_runtime.coverage import CoverageLedger
@@ -2159,7 +2018,7 @@ def test_default_lm_studio_requests_use_role_and_session_protocols_not_legacy_ve
     forbidden = "Return STRICT JSON with keys verdict and review_markdown"
     assert forbidden not in planner_system
     assert forbidden not in specialist_system
-    assert "optional bounded transformations" in planner_system
+    assert "changed behavior" in planner_system.lower()
     assert "checkpoint" in specialist_system
     assert "final" in specialist_system
     assert "response_format" not in planner_payload
@@ -2177,10 +2036,10 @@ def test_json_schema_mode_uses_json_object_for_each_controller_role(monkeypatch,
     monkeypatch.setenv("AI_RESPONSE_FORMAT", "json_schema")
     controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
     captured = []
-    controller.planner.gateway.transport = _successful_transport(captured)
+    controller.change_summarizer.gateway.transport = _successful_transport(captured)
 
     roles = (
-        ("planner", RunPhase.PLANNING, controller.planner),
+        ("change_summarizer", RunPhase.PLANNING, controller.change_summarizer),
         ("negotiator", RunPhase.FOLLOWUP, controller.negotiator),
         ("critic", RunPhase.FINALIZATION, controller.critic),
         ("finalizer", RunPhase.FINALIZATION, controller.finalizer),
@@ -2375,6 +2234,7 @@ def test_specialist_assignment_message_serializes_semantic_brief_and_context(
     payload = json.loads(content.split("\n", 1)[1])
 
     assert payload["obligation_briefs"] == [{
+        "evidence_hints": [],
         "obligation_id": "topology:worker:delivery",
         "subject": "worker delivery",
         "explanation": "Trace acknowledgement after persistence.",
@@ -2556,7 +2416,8 @@ def test_recovery_reuses_complete_semantic_assignment_prompt(
 
     recovered_assignment = session.conversation.events[0]["content"]
     payload = json.loads(recovered_assignment.split("\n", 1)[1])
-    assert recovered_assignment == initial_assignment
+    initial_payload = json.loads(initial_assignment.split("\n", 1)[1])
+    assert all(payload[key] == value for key, value in initial_payload.items())
     assert payload["obligation_briefs"][0]["obligation_id"] == obligation.id
     assert payload["changed_context"][0]["path"] == "worker/delivery.py"
     assert payload["changed_context_omitted_paths"] == 3
@@ -2671,20 +2532,17 @@ def test_cli_ignores_legacy_source_hosts_and_warns_for_aliases(monkeypatch, tmp_
     assert "ALLOWED_SOURCE_HOSTS" in warning
 
 
-def test_invalid_current_policy_is_an_authoritative_controller_degradation(monkeypatch, tmp_path):
+def test_invalid_current_policy_fails_before_any_review(monkeypatch, tmp_path):
     write_review_workspace(tmp_path)
     policy = tmp_path / ".github" / "ai-review-policy.json"
-    policy.parent.mkdir()
+    policy.parent.mkdir(exist_ok=True)
     policy.write_text('{"version":2,"sources":"not-an-array"}', encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("REPO", "owner/repo")
     monkeypatch.setattr(cli, "_git_changed_files", lambda *_: ("src/app.py",))
 
-    workspace = cli.load_workspace(cli.CliConfig.from_env())
-
-    assert workspace.policy_degraded is True
-    assert workspace.inputs.configuration_warnings
-    assert "locked minimal policy" in workspace.inputs.configuration_warnings[0]
+    with pytest.raises(ValueError, match="migrat"):
+        cli.load_workspace(cli.CliConfig.from_env())
 
 
 def test_automatic_policy_change_uses_base_head_non_widening_policy(
@@ -2692,15 +2550,15 @@ def test_automatic_policy_change_uses_base_head_non_widening_policy(
 ):
     write_review_workspace(tmp_path)
     policy = tmp_path / ".github" / "ai-review-policy.json"
-    policy.parent.mkdir()
+    policy.parent.mkdir(exist_ok=True)
     policy.write_text(json.dumps({
-        "version": 2,
+        "version": 3,
         "publishing": {
             "allowed_modes": ["review_verdict"], "allow_approve": True,
         },
     }), encoding="utf-8")
     base_policy = json.dumps({
-        "version": 2,
+        "version": 3,
         "publishing": {
             "allowed_modes": ["comment"], "allow_approve": False,
         },
@@ -2729,15 +2587,15 @@ def test_automatic_policy_change_uses_base_head_non_widening_policy(
 def test_manual_rereview_authorizes_validated_head_policy(monkeypatch, tmp_path):
     write_review_workspace(tmp_path)
     policy = tmp_path / ".github" / "ai-review-policy.json"
-    policy.parent.mkdir()
+    policy.parent.mkdir(exist_ok=True)
     policy.write_text(json.dumps({
-        "version": 2,
+        "version": 3,
         "publishing": {
             "allowed_modes": ["review_comment"], "allow_approve": False,
         },
     }), encoding="utf-8")
     base_policy = json.dumps({
-        "version": 2,
+        "version": 3,
         "publishing": {
             "allowed_modes": ["comment"], "allow_approve": False,
         },
@@ -2762,20 +2620,20 @@ def test_manual_rereview_authorizes_validated_head_policy(monkeypatch, tmp_path)
     assert workspace.inputs.pr_metadata["policy_authorization"]["authorized"] is True
 
 
-def test_deleting_v2_policy_cannot_switch_automatic_run_to_legacy_authority(
+def test_deleting_v3_policy_cannot_switch_automatic_run_to_legacy_authority(
     monkeypatch, tmp_path,
 ):
     write_review_workspace(tmp_path)
     legacy = tmp_path / ".github" / "ai-review-specialists.json"
-    legacy.parent.mkdir()
+    legacy.parent.mkdir(exist_ok=True)
     legacy.write_text(json.dumps({
         "version": 1,
         "recipes": [{
             "id": "legacy", "objective": "Legacy review",
         }],
     }), encoding="utf-8")
-    base_v2 = json.dumps({
-        "version": 2,
+    base_v3 = json.dumps({
+        "version": 3,
         "publishing": {
             "allowed_modes": ["comment"], "allow_approve": False,
         },
@@ -2790,7 +2648,7 @@ def test_deleting_v2_policy_cannot_switch_automatic_run_to_legacy_authority(
     def git_run(arguments, **_kwargs):
         revision_path = arguments[-1]
         if revision_path.endswith(".github/ai-review-policy.json"):
-            return Result(0, base_v2)
+            return Result(0, base_v3)
         if revision_path.endswith(".github/ai-review-specialists.json"):
             return Result(0, base_legacy)
         raise AssertionError(arguments)

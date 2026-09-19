@@ -262,8 +262,8 @@ def _completion_controller_run(
     order: Sequence[str],
 ) -> dict[str, Any]:
     assignment_aliases = {
-        "assignment-a": "fallback-combined-1",
-        "assignment-b": "fallback-combined-1-split-2",
+        "assignment-a": "component-a",
+        "assignment-b": "component-b",
     }
     authoritative_order = tuple(
         assignment_aliases.get(item, item) for item in order
@@ -338,28 +338,6 @@ def _completion_controller_run(
     topology = _controller_topology()
     with tempfile.TemporaryDirectory(prefix="completion-inversion-") as temp_dir:
         controller = ReviewController(
-            planner=lambda request: {
-                "transformations": [
-                    {
-                        "kind": "merge",
-                        "target_assignment_id": "fallback-combined-1",
-                        "source_assignment_ids": ["fallback-combined-2"],
-                    },
-                    {
-                        "kind": "split",
-                        "assignment_id": "fallback-combined-1",
-                        "obligation_groups": [
-                            [
-                                "obligation:topology:a-to-b:interaction:0a65f4aa488f",
-                                "obligation:topology:src-a-py:implementation:a24afd9558cf",
-                            ],
-                            [
-                                "obligation:topology:src-b-py:implementation:acdc539c18ab",
-                            ],
-                        ],
-                    },
-                ],
-            },
             session_factory=session_factory,
             artifact_output_root=Path(temp_dir),
         )

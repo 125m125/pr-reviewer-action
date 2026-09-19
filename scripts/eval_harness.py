@@ -738,7 +738,7 @@ _ADVERSARIAL_PREDICATES = {
     "reconstruction.recoveries": 1,
     "reconstruction.checkpoint_retained": True,
     "planner_repair.repair_requests": 0,
-    "planner_repair.source": "deterministic_base_transformed",
+    "planner_repair.source": "component_owned",
     "failed_critic.terminal": True,
     "failed_critic.fallback": "conservative",
     "deadline_cutoff.deadline_violation": False,

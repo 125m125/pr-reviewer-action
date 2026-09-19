@@ -260,7 +260,7 @@ def test_current_head_policy_wiring_is_empty_when_file_missing(tmp_path):
 def test_current_head_policy_wiring_preserves_path_restrictions(tmp_path):
     path = tmp_path / "policy.json"
     path.write_text(json.dumps({
-        "version": 2,
+        "version": 3,
         "sources": [{
             "host": "docs.example.com",
             "path_prefixes": ["/api"],
@@ -275,7 +275,7 @@ def test_current_head_policy_wiring_preserves_path_restrictions(tmp_path):
 
 
 def test_current_head_policy_wiring_fails_closed_when_invalid(tmp_path):
-    (tmp_path / "policy.json").write_text('{"version": 2, "sources": [{"host": "*"}]}')
+    (tmp_path / "policy.json").write_text('{"version": 3, "sources": [{"host": "*"}]}')
 
     policy = rth.load_current_source_policy(tmp_path, "policy.json")
 

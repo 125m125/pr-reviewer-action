@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "components": [
     {
       "id": "orchestration",
@@ -33,6 +33,7 @@
       "paths": [
         "pr_reviewer/specialist_runtime/**",
         "pr_reviewer/specialists.py",
+        "pr_reviewer/diff_prioritizer.py",
         "scripts/run_specialist_reviews.py"
       ],
       "responsibilities": [
@@ -45,7 +46,7 @@
         "verification-documentation"
       ],
       "contracts": [
-        "Version-2 policy selects bounded work without granting tools, hosts, models, or budgets",
+        "Version-3 policy assigns component-owned questions without granting tools, hosts, models, or budgets",
         "Artifacts account for selected, completed, omitted, degraded, and unresolved obligations"
       ],
       "invariants": [
@@ -65,7 +66,8 @@
         "pr_reviewer/stream_watchdog.py",
         "pr_reviewer/mcp_client.py",
         "scripts/model_call.sh",
-        "scripts/run_tool_harness.py"
+        "scripts/run_tool_harness.py",
+        "scripts/redact.py"
       ],
       "responsibilities": [
         "OpenAI-compatible and Anthropic-compatible requests, streaming, structured responses, and read-only evidence tools"
@@ -151,7 +153,7 @@
       "id": "action-interface-compatibility",
       "title": "Action interface and orchestration compatibility",
       "objective": "Trace changed inputs, defaults, environment propagation, strategy routing, timeouts, and failure states through action.yml and the shell orchestration.",
-      "execution": "coverage",
+      "execution": "integrated",
       "match": {
         "component_ids_any": [
           "orchestration"
@@ -187,7 +189,7 @@
       "id": "durable-session-safety",
       "title": "Durable specialist session safety",
       "objective": "Examine session continuity, policy authorization, coverage accounting, deadlines, lifetime budgets, recovery, and final adjudication as one state machine.",
-      "execution": "dedicated",
+      "execution": "integrated",
       "match": {
         "component_ids_any": [
           "specialist-runtime"
@@ -226,7 +228,7 @@
       "id": "model-api-compatibility",
       "title": "Model API and stream compatibility",
       "objective": "Trace request construction and response assembly for both supported provider formats, including native tools, structured verdict turns, streaming deltas, retries, and cancellation.",
-      "execution": "coverage",
+      "execution": "integrated",
       "match": {
         "component_ids_any": [
           "model-transport"
@@ -310,7 +312,7 @@
       "id": "publishing-hygiene",
       "title": "Publishing and human-handoff hygiene",
       "objective": "Verify verdict enforcement, managed review lifecycle, inline anchoring, sanitization, carry-forward behavior, and the separation between concise handoff and detailed notes.",
-      "execution": "dedicated",
+      "execution": "integrated",
       "match": {
         "component_ids_any": [
           "publishing"
@@ -349,7 +351,7 @@
       "id": "contract-verification",
       "title": "Tests and documentation contract verification",
       "objective": "Check that behavioral changes have focused regression coverage and that documented inputs, defaults, migration advice, and examples match executable behavior.",
-      "execution": "coverage",
+      "execution": "integrated",
       "match": {
         "component_ids_any": [
           "verification-documentation"
@@ -628,5 +630,46 @@
     "components": [],
     "lenses": [],
     "recipes": []
-  }
+  },
+  "ownership_precedence": [],
+  "boundaries": [
+    {
+      "id": "action-runtime-inputs",
+      "contract_paths": [
+        "action.yml"
+      ],
+      "participants": [
+        "orchestration",
+        "specialist-runtime"
+      ],
+      "contract_change_owner": "orchestration",
+      "endpoint_paths": {
+        "orchestration": [
+          "scripts/sections/config.sh"
+        ],
+        "specialist-runtime": [
+          "pr_reviewer/specialist_runtime/cli.py"
+        ]
+      },
+      "objective": "Compare changed action input defaults and environment values with runtime parsing and validation."
+    },
+    {
+      "id": "runtime-publication",
+      "contract_paths": [
+        "pr_reviewer/specialist_runtime/types.py"
+      ],
+      "participants": [
+        "specialist-runtime",
+        "publishing"
+      ],
+      "contract_change_owner": "specialist-runtime",
+      "endpoint_paths": {
+        "publishing": [
+          "scripts/publish_specialist_review.py",
+          "pr_reviewer/github_review_notes.py"
+        ]
+      },
+      "objective": "Compare retained review outcomes and note fields with their publication consumers, including incomplete states and finding locations."
+    }
+  ]
 }
