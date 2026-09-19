@@ -496,13 +496,14 @@ def replay_fixture(fixture_dir: Path | str) -> SpecialistReplayResult:
             request_timeout_sec=runtime.model_request_timeout_sec,
             max_tokens=1024,
             max_context_tokens=24_000,
+            repository_head_sha=str(fixture["head_sha"]),
             clock=clock,
         )
 
     with tempfile.TemporaryDirectory(prefix="specialist-replay-") as temp_dir:
         controller = ReviewController(
-            planner=role_adapter,
             session_factory=session_factory,
+            boundary_evaluator=role_adapter,
             critic=role_adapter,
             finalizer=role_adapter,
             clock=clock,

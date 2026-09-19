@@ -102,7 +102,7 @@ follow-up waves and may schedule one bounded action at a time.
 flowchart TD
     P[Precheck and immutable PR snapshot] --> S[Collect context and deterministic obligations]
     S --> SUM[Change summarizer<br/><small>LLM, bounded structured role</small>]
-    SUM --> PLAN[Planner<br/><small>LLM optional; deterministic plan is fallback</small>]
+    SUM --> PLAN[Component owners<br/><small>Deterministic assignments and explicit independent checks</small>]
     PLAN --> W1
 
     subgraph W1[Initial specialist wave]
@@ -125,9 +125,10 @@ flowchart TD
         CP -->|compact-resume when progress exists| SP1
     end
 
-    W1 --> N[Negotiator / continuation selector<br/><small>LLM proposal + deterministic validation</small>]
+    W1 --> B[Boundary evaluator<br/><small>LLM compares retained participant evidence when ready</small>]
+    B --> N[Negotiator / continuation selector<br/><small>LLM proposal + deterministic validation</small>]
     N -->|resume or consult existing session| W2[Follow-up wave]
-    N -->|start bounded new session| W2
+    N -->|schedule a gap, lead, or bounded delegation| W2
     N -->|record unknown / no feasible action| F[Finalization]
     W2 --> N
 
@@ -295,7 +296,7 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `review_strategy` | `single` preserves the existing path; `specialists_evaluate` runs without publishing; `specialists` enables publication only when `publish_review_comment` is also `true` | No | `single` |
-| `review_policy_file` | Current-branch version-2 specialist policy; source and publishing restrictions are authoritative | No | `.github/ai-review-policy.json` |
+| `review_policy_file` | Required current-branch version-3 owner/boundary policy; old policies require explicit migration | No | `.github/ai-review-policy.json` |
 | `specialist_review_deadline_sec` | Absolute specialist run deadline including finalization and artifact production | No | `7200` |
 | `specialist_phase_shares` | JSON percentage allocation for planning, initial, follow-up, and finalization; must total 100 | No | `{"planning":10,"initial":60,"followup":20,"finalization":10}` |
 | `specialist_concurrency` | Maximum concurrent specialist sessions | No | `1` |
@@ -307,14 +308,14 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_max_total_tool_calls` | Global read-only tool-call lease shared by all specialist sessions in one review | No | `640` |
 | `specialist_remediator_max_evidence_chars` | Maximum cited-evidence characters supplied to each accepted-finding remediation request | No | `32000` |
 | `specialist_max_recoveries_per_session` | Lifetime reconstruction limit for one logical specialist session | No | `1` |
-| `specialist_config_file` | Deprecated one-release alias for a version-1 policy; migrate to `review_policy_file` | No | `.github/ai-review-specialists.json` |
-| `specialist_planner_max_tool_calls` | Deprecated no-op; the planner role does not expose tools. Use `specialist_max_tool_calls_per_session` | No | `2` |
-| `specialist_planner_max_tokens` | Completion-token ceiling for the bounded planning scout | No | `2048` |
+| `specialist_config_file` | Obsolete legacy path; migrate explicitly to version-3 `review_policy_file` | No | `.github/ai-review-specialists.json` |
+| `specialist_planner_max_tool_calls` | Deprecated no-op; no initial assignment-planner call runs. Use `specialist_max_tool_calls_per_session` | No | `2` |
+| `specialist_planner_max_tokens` | Completion-token ceiling for the change summarizer; no initial assignment-planner call | No | `2048` |
 | `specialist_max_initial_passes` | Deprecated one-release alias for `specialist_max_sessions` | No | `6` |
 | `specialist_max_followup_passes` | Deprecated one-release alias for `specialist_max_followup_sessions` | No | `2` |
 | `specialist_max_tool_calls_per_pass` | Deprecated one-release alias for `specialist_max_tool_calls_per_session` | No | `128` |
 | `specialist_tool_mode` | `native_loop` uses durable read-only specialist sessions; `packet` is deprecated | No | `native_loop` |
-| `specialist_planner_model` | Planning/scout model; empty inherits `ai_model` | No | `""` |
+| `specialist_planner_model` | Change-summarizer model; empty inherits `ai_model`; no assignment-planner call | No | `""` |
 | `specialist_model` | Specialist model; empty inherits `ai_model` | No | `""` |
 | `specialist_critic_model` | Critic model; empty inherits `specialist_model`, then `ai_model` | No | `""` |
 | `specialist_aggregator_model` | Candidate-ranking model; empty inherits `ai_model` | No | `""` |
@@ -329,10 +330,10 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_structured_chat_template_kwargs` | Optional JSON `chat_template_kwargs` added only to no-tool specialist structured turns; leave empty unless the provider supports it | No | `""` |
 | `specialist_checkpoint_reasoning_budget_tokens` | Opt-in cache-preserving first checkpoint: retains tool schemas/thinking settings and sends nonstandard `thinking_budget_tokens`. Requires server enforcement; tested with ik_llama at `256`. Empty preserves strict checkpoints; `0` requests immediate end of thinking. Repairs remain strict and no checkpoint tool calls execute. | No | `""` |
 | `specialist_max_truncation_continuations` | Deprecated no-op; durable sessions checkpoint instead of issuing truncation-continuation turns | No | `2` |
-| `specialist_planner_max_context_bytes` | Diff/context bytes supplied to the planner before tool exploration | No | `60000` |
+| `specialist_planner_max_context_bytes` | Change-summarizer input byte cap; retained despite removal of the initial planner | No | `60000` |
 | `specialist_packet_max_bytes` | Deprecated no-op; durable sessions do not build packet-mode specialist inputs | No | `90000` |
 
-For an executable version-2 migration, policy example, workflow conversion,
+For an executable version-3 migration, policy example, workflow conversion,
 artifact expectations, and troubleshooting, see the
 [specialist session runtime migration handoff](docs/migrations/specialist-session-runtime.md).
 
@@ -344,14 +345,21 @@ conversation bounded. A practical baseline is `ai_stream: "true"`,
 repeated paragraphs or blocks, discards the polluted partial turn, and performs
 one compact recovery request instead of continuing the same transcript.
 
-Specialist mode derives a generic component topology and deterministic review
-obligations from manifests, paths, file roles, contracts, recipes, and risk
-flags. See the [file-role reference](docs/file-roles.md) for every supported
-`file_roles_any` value, its exact path-matching rules, and limitations.
-A bounded planner assigns those obligations to durable specialist
-sessions. Sessions gather read-only evidence, checkpoint their progress, and
-finish on the same logical conversation; the coverage ledger and scheduler
-decide whether a bounded follow-up is justified. Deterministic adjudication
+Specialist mode requires an explicit version-3 policy. Start with the
+[one-owner quick start](docs/review-policy-authoring.md#quick-start-one-owner),
+then add owner components and shared contract boundaries where useful.
+Deterministic assignments group changed behavior by owner rather than creating
+jobs for every file, inferred edge, or evidence category. Ordinary recipes use
+`integrated`; `independent` explicitly requests separate corroboration.
+See the [file-role reference](docs/file-roles.md) for supported matching heuristics.
+
+Group assessments retain assessed paths and unresolved gaps. Unmatched paths go
+to a visible remainder owner; capacity overflow is incomplete, never silently
+covered. Specialists can request bounded one-level subset delegation through
+the existing lead queue. The negotiator prioritizes gaps and continuations
+within shared budgets. For configured boundaries, a fresh tools-disabled
+evaluator compares actual retained participant evidence; local completion does
+not itself establish cross-component compatibility. Deterministic adjudication
 accepts only evidence-backed, in-scope notes, and the finalizer produces the
 sparse human handoff without reopening findings or starting gap conversations.
 
@@ -411,11 +419,11 @@ For new configurations, start with the permanent
 matching rules, bounded recipes, access configuration, validation, and a
 copyable brief for configuration-generating agents.
 
-`review_policy_file` is a current-branch version-2 policy. The older
-`specialist_config_file` remains a one-release version-1 migration input, but
-version-2 recipes/policy control deterministic obligations and specialist
-selection. See the [migration handoff](docs/migrations/specialist-session-runtime.md)
-for the version-1 conversion checklist.
+`review_policy_file` must contain version 3; missing files and version-1/2
+policies fail before model calls. The old `specialist_config_file` is not a
+runtime fallback. See the [migration handoff](docs/migrations/specialist-session-runtime.md)
+for property-by-property recommendations. Ownership does not widen tool, source,
+or publishing authority.
 
 </details>
 
