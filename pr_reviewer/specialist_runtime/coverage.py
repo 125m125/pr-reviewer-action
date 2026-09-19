@@ -13,6 +13,7 @@ from typing import Any
 from pr_reviewer.specialists import classify_file_roles
 
 from .assignments import Assignment
+from .boundary_evaluation import _source_diagnostic
 from .evidence import EvidenceRecord, EvidenceSnapshot
 from .obligation_assessment import ObligationAssessment, ObligationAssessmentLedger, ObligationDisposition
 from .policy import RecipePolicy, ReviewPolicy
@@ -139,7 +140,6 @@ def evidence_satisfies_obligation(
             return False
         if not any(
             source_path == scope_path or source_path.startswith(scope_path + "/")
-            or fnmatch.fnmatchcase(source_path, scope_path)
             for raw_path in scoped_paths
             if (scope_path := _normalized_path(raw_path))
         ):
@@ -150,6 +150,15 @@ def evidence_satisfies_obligation(
         for item in obligation.required_evidence_categories
         if item.strip()
     }
+
+
+def _assessment_evidence_satisfies(record: EvidenceRecord, obligation: CoverageObligation) -> bool:
+    """Owner hints guide inspection, but never widen candidate proof admission."""
+    if _group_scoped(obligation) and record.source_path and any(
+        fnmatch.fnmatchcase(record.source_path, pattern) for pattern in obligation.seed_hints
+    ):
+        obligation = replace(obligation, scope=(record.source_path,), seed_hints=())
+    return evidence_satisfies_obligation(record, obligation)
 
 
 def _associated_collections_satisfying(
@@ -166,7 +175,7 @@ def _associated_collections_satisfying(
         if session_id is not None and collection.session_id != session_id:
             continue
         if any(
-            evidence_satisfies_obligation(
+            _assessment_evidence_satisfies(
                 replace(record, category=category), obligation,
             )
             for category in association.categories
@@ -343,6 +352,7 @@ def derive_obligations(
                          + "; unassessed paths and unresolved behavior stay incomplete. "
                          + " ".join(component.get("responsibilities", ()))),
             recipe_objective=" ".join(questions),
+            integrated_recipe_ids=tuple(recipe.id for recipe, _, _ in recipes),
             recipe_invariants=invariants,
             evidence_requirements=requirements((recipe for recipe, _, _ in recipes), local),
             evidence_hints=tuple(dict.fromkeys(hint for recipe, _, _ in recipes for hint in recipe.expected_evidence)),
@@ -390,7 +400,12 @@ def derive_obligations(
             owner = participant if participant in owner_paths else fallback_owner
             if owner in excluded_components:
                 continue
-            local_paths = tuple(path for path in owner_paths.get(participant, ()) if path not in contract_changes)
+            local_paths = tuple(sorted(set(contract_changes).union(
+                path for path in changed if any(
+                    fnmatch.fnmatchcase(path, pattern)
+                    for pattern in boundary.endpoint_paths.get(participant, ())
+                )
+            )))
             obligations.append(CoverageObligation(
                 obligation_id=_obligation_id("boundary-participant", boundary.id, participant),
                 origin="boundary-participant", subject=f"{boundary.id}:{participant}",
@@ -437,8 +452,8 @@ class CoverageLedger:
             if obligation.origin == "requirement-accounting"
         }
         for obligation in self._obligations.values():
-            if obligation.recipe_id:
-                self._recipe_states.setdefault(obligation.recipe_id, RecipeStatus.ASSIGNED)
+            for recipe_id in (*obligation.integrated_recipe_ids, *((obligation.recipe_id,) if obligation.recipe_id else ())):
+                self._recipe_states.setdefault(recipe_id, RecipeStatus.ASSIGNED)
 
     def attach_evidence(self, obligation_id: str, evidence_id: str) -> None:
         if obligation_id not in self._obligations:
@@ -483,6 +498,16 @@ class CoverageLedger:
         if not self._evidence[obligation_id]:
             self._unresolved.discard(obligation_id)
             self._closures[obligation_id] = status
+
+    def record_boundary_result(self, obligation_id: str, evidence_ids: Iterable[str], *, supported: bool) -> None:
+        """Apply a controller-validated evaluator result, never a local declaration."""
+        if not self.obligation(obligation_id).evaluator_owned:
+            raise ValueError("boundary evaluation requires evaluator-owned work")
+        retained = set(evidence_ids)
+        if supported and (not retained or any(not item.strip() for item in retained)):
+            raise ValueError("supported boundary requires retained source evidence")
+        self._evidence[obligation_id] = retained if supported else set()
+        self._closures[obligation_id] = ObligationStatus.COVERED if supported else ObligationStatus.UNRESOLVED
 
     def replace_reconciled_state(
         self,
@@ -536,8 +561,9 @@ class CoverageLedger:
         obligation_statuses = self.obligation_statuses()
         recipe_obligations: dict[str, list[str]] = {}
         for obligation in self._obligations.values():
-            if obligation.recipe_id and obligation.mandatory:
-                recipe_obligations.setdefault(obligation.recipe_id, []).append(obligation.obligation_id)
+            if obligation.mandatory:
+                for recipe_id in (*obligation.integrated_recipe_ids, *((obligation.recipe_id,) if obligation.recipe_id else ())):
+                    recipe_obligations.setdefault(recipe_id, []).append(obligation.obligation_id)
         for recipe_id, obligation_ids in recipe_obligations.items():
             values = [obligation_statuses[obligation_id] for obligation_id in obligation_ids]
             if all(value is ObligationStatus.COVERED for value in values):
@@ -569,7 +595,7 @@ class CoverageLedger:
 
 
 def _group_scoped(obligation: CoverageObligation) -> bool:
-    return bool(obligation.owner_component_id or obligation.boundary_id or obligation.evaluator_owned)
+    return bool(obligation.owner_component_id or obligation.boundary_id or obligation.evaluator_owned or obligation.recipe_execution == "independent")
 
 
 def _assignment_id(assignment: Assignment | SpecialistAssignment) -> str:
@@ -662,11 +688,19 @@ def _validated_wave_start(
             record = records.get(evidence_id)
             if record is None:
                 raise ValueError(f"wave-start coverage references unknown evidence: {evidence_id}")
+            if obligation.evaluator_owned:
+                # The evaluator has already checked question/participants/head.
+                # Keep validating retained source integrity, not owner proof categories.
+                diagnostic = _source_diagnostic(record, None)
+                if diagnostic is not None:
+                    raise ValueError(f"wave-start boundary source is unusable: {diagnostic}")
+                retained.add(evidence_id)
+                continue
             if not (
                 _associated_collections_satisfying(
                     evidence, record, obligation,
                 )
-                or evidence_satisfies_obligation(record, obligation)
+                or _assessment_evidence_satisfies(record, obligation)
             ):
                 raise ValueError(
                     f"wave-start evidence does not satisfy obligation '{obligation_id}'"
@@ -720,7 +754,7 @@ def reconcile_wave(
     assignments: Iterable[Assignment | SpecialistAssignment],
     session_ownership: Iterable[SessionOwnership],
 ) -> CoverageReconciliation:
-    """Reconcile a wave without trusting specialist-declared coverage states."""
+    """Reconcile checkpoints in controller retention order, oldest to newest."""
     if not isinstance(ledger, CoverageLedger):
         raise TypeError("ledger must be a CoverageLedger")
     if not isinstance(evidence, EvidenceSnapshot):
@@ -744,6 +778,11 @@ def reconcile_wave(
         assignment_by_id[assignment_id] = assignment
 
     owned_by_session: dict[str, SessionOwnership] = {}
+    split_assignment_ids = {
+        parent for assignment in assignment_by_id.values()
+        if (parent := getattr(assignment, "parent_assignment_id", None))
+    }
+    split_assessments: dict[str, dict[tuple[str, ...], ObligationAssessment]] = {}
     for ownership in session_ownership:
         if ownership.session_id in owned_by_session:
             raise ValueError(f"duplicate durable session id: {ownership.session_id}")
@@ -767,7 +806,7 @@ def reconcile_wave(
             raise ValueError("session ownership contains unknown obligations: " + ", ".join(unknown_ids))
         owned_by_session[ownership.session_id] = ownership
 
-    for checkpoint in sorted(tuple(checkpoints), key=lambda item: item.session_id):
+    for checkpoint in checkpoints:
         ownership = owned_by_session.get(checkpoint.session_id)
         if ownership is None:
             raise ValueError(
@@ -802,22 +841,52 @@ def reconcile_wave(
             if obligation.evaluator_owned:
                 continue
             if _group_scoped(obligation):
+                assignment = assignment_by_id[ownership.assignment_id]
+                split_group = obligation.origin == "component" and (
+                    ownership.assignment_id in split_assignment_ids or getattr(assignment, "parent_assignment_id", None)
+                )
+                if split_group:
+                    owned_paths = set(getattr(assignment, "owned_changed_paths", ()))
+                    obligation = replace(obligation, scope=tuple(path for path in obligation.scope if path in owned_paths), evidence_requirements=())
+                    # Old checkpoints may still list transferred paths as omitted;
+                    # they may never claim those paths as assessed after transfer.
+                    assessment = replace(assessment, omitted_paths=tuple(path for path in assessment.omitted_paths if path in owned_paths))
                 # Reuse admission validation; persisted/model assessments are not authority.
                 validator = ObligationAssessmentLedger(
                     session_id=checkpoint.session_id, obligations=(obligation,), obligation_ids=(obligation_id,),
                 )
+                def eligible_group_record(record: EvidenceRecord, item: CoverageObligation) -> bool:
+                    associated = _associated_collections_satisfying(
+                        evidence, record, item, session_id=checkpoint.session_id,
+                    )
+                    if item.requires_independent_verification and not (
+                        obligation_id in ownership.independent_obligation_ids and (
+                            associated or (
+                                record.collector_session_id == checkpoint.session_id
+                                and checkpoint.session_id in record.imported_by
+                                and record.id not in checkpoint.imported_evidence_ids
+                            )
+                        )
+                    ):
+                        return False
+                    return bool(associated) or _assessment_evidence_satisfies(record, item)
+
                 proposal = validator.propose(
                     target="O1", disposition=assessment.disposition.value,
                     reason=assessment.reason, evidence_ids=assessment.evidence_ids,
                     next_actions=assessment.next_actions, assessed_paths=assessment.assessed_paths,
                     omitted_paths=assessment.omitted_paths, evidence=evidence,
-                    eligible=lambda record, item: bool(_associated_collections_satisfying(
-                        evidence, record, item, session_id=checkpoint.session_id,
-                    )) or evidence_satisfies_obligation(record, item),
+                    eligible=eligible_group_record,
                 )
                 if not proposal.accepted:
                     continue
                 assessment = validator.assessment("O1")
+                if split_group:
+                    # Reassessment replaces the old conclusion for this scope;
+                    # disjoint parent/child scopes still contribute separately.
+                    split_assessments.setdefault(obligation_id, {})[
+                        tuple(sorted(obligation.scope))
+                    ] = assessment
                 reconciled_closures[obligation_id] = ObligationStatus(assessment.disposition.value)
                 reconciled_unresolved.discard(obligation_id)
             if assessment.disposition is ObligationDisposition.NOT_APPLICABLE:
@@ -865,7 +934,7 @@ def reconcile_wave(
                     record is not None
                     and (
                         bool(associated)
-                        or evidence_satisfies_obligation(record, obligation)
+                        or _assessment_evidence_satisfies(record, obligation)
                     )
                     and (
                         not obligation.requires_independent_verification
@@ -883,6 +952,24 @@ def reconcile_wave(
         for obligation_id in sorted(declared_unresolved.intersection(owned_ids)):
             reconciled_unresolved.add(obligation_id)
 
+    for obligation_id, scoped_parts in split_assessments.items():
+        parts = tuple(scoped_parts.values())
+        obligation = obligation_by_id[obligation_id]
+        assessed = tuple(sorted({path for part in parts for path in part.assessed_paths}))
+        supported_parts = all(part.disposition is ObligationDisposition.COVERED for part in parts)
+        pending_actions = tuple(dict.fromkeys(action for part in parts for action in part.next_actions))
+        validator = ObligationAssessmentLedger(session_id="controller-group", obligations=(obligation,), obligation_ids=(obligation_id,))
+        proposal = validator.propose(
+            target="O1", disposition="covered" if supported_parts else "partially_covered",
+            reason="; ".join(part.reason for part in parts),
+            evidence_ids=tuple(dict.fromkeys(value for part in parts for value in part.evidence_ids)),
+            next_actions=() if supported_parts else pending_actions,
+            assessed_paths=assessed, omitted_paths=tuple(path for path in obligation.scope if path not in assessed),
+            evidence=evidence, eligible=_assessment_evidence_satisfies,
+        )
+        reconciled_closures[obligation_id] = (
+            ObligationStatus(proposal.disposition.value) if proposal.accepted and proposal.disposition else ObligationStatus.UNRESOLVED
+        )
     ledger.replace_reconciled_state(
         reconciled_evidence, reconciled_unresolved, reconciled_closures,
     )

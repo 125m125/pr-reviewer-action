@@ -166,3 +166,30 @@ def test_independent_component_recipe_does_not_claim_other_owner_files():
     _, obligations = _derive(fixture)
     independent = next(o for o in obligations if o.requires_independent_verification)
     assert independent.scope == ("services/billing/src/main/java/example/billing/InvoiceService.java",)
+
+
+def test_boundary_local_scope_excludes_unrelated_changed_owner_behavior():
+    fixture = load_component_fixture()
+    endpoint = "services/orders/src/main/java/messaging/OrderEvents.java"
+    unrelated = "services/orders/src/main/java/OrderSearch.java"
+    contract = "contracts/events/order-created.json"
+    fixture["changed_files"] = [endpoint, unrelated, contract]
+    _, obligations = _derive(fixture)
+    owner = next(o for o in obligations if o.origin == "component")
+    local = next(o for o in obligations if o.boundary_id == "order-events" and o.participant_id == "java-orders")
+    assert set(local.scope) == {endpoint, contract}
+    assert unrelated in owner.scope
+    assert "services/orders/**" in local.seed_hints
+
+
+def test_shared_boundary_references_do_not_duplicate_changed_path_ownership():
+    from pr_reviewer.specialist_runtime.assignments import component_assignment_plan
+    from pr_reviewer.specialist_runtime.policy import RuntimeConfig
+    topology, obligations = _derive()
+    plan = component_assignment_plan(obligations, topology, RuntimeConfig())
+    contract = "contracts/events/order-created.json"
+    ordinary = [assignment for assignment in plan.assignments if not assignment.overlap_justification]
+    assert [a.owner_component_id for a in ordinary if contract in a.owned_changed_paths] == ["java-orders"]
+    worker = next(a for a in ordinary if a.owner_component_id == "python-worker")
+    assert contract in worker.boundary_paths
+    assert contract in worker.seed_paths

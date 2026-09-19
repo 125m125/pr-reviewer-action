@@ -30,8 +30,13 @@ from .callbacks import (
     format_callback_error,
     mask_runtime_text,
 )
-from .coverage import CoverageLedger
-from .evidence import EvidenceCollection, EvidenceRecord, EvidenceStore
+from .coverage import CoverageLedger, _assessment_evidence_satisfies
+from .evidence import (
+    EvidenceCollection,
+    EvidenceProvenance,
+    EvidenceRecord,
+    EvidenceStore,
+)
 from .model_gateway import ModelGateway, ModelTurnRequest, ModelTurnResult
 from .obligation_assessment import ObligationAssessmentLedger
 from .request_attempts import RequestAttemptJournal
@@ -282,7 +287,8 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
     {
         "name": "propose_obligation_resolution",
         "description": (
-            "Propose covered, not_applicable, exhausted, blocked, or unresolved; "
+            "Propose covered, partially_covered, not_applicable, exhausted, "
+            "blocked, or unresolved; "
             "the controller validates it immediately. Also assess concrete "
             "defects while the obligation evidence is fresh; candidate drafts "
             "are admitted independently even if this resolution is rejected. "
@@ -296,15 +302,36 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
                 "description": "Short assigned handle from obligation_targets, such as O1.",
             },
             "disposition": {"type": "string", "enum": [
-                "covered", "not_applicable", "exhausted", "blocked", "unresolved",
+                "covered", "partially_covered", "not_applicable", "exhausted",
+                "blocked", "unresolved",
             ]},
-            "reason": {"type": "string"},
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Concise actual observed behavior and any remaining behavioral "
+                    "gap; do not use a generic completion claim."
+                ),
+            },
+            "assessed_paths": {
+                "type": "array", "items": {"type": "string"},
+                "description": (
+                    "Exact owned changed paths assessed together in this update; "
+                    "describe observed behavior in reason."
+                ),
+            },
+            "omitted_paths": {
+                "type": "array", "items": {"type": "string"},
+                "description": (
+                    "Exact owned paths explicitly withdrawn or left out of this update. "
+                    "The controller derives the full remaining scope."
+                ),
+            },
             "evidence_ids": {"type": "array", "items": {"type": "string"}},
             "next_actions": {"type": "array", "items": {"type": "string"}},
             "defect_assessment": _DEFECT_ASSESSMENT_SCHEMA,
         }, "required": [
             "target", "disposition", "reason", "evidence_ids", "next_actions",
-            "defect_assessment",
+            "assessed_paths", "omitted_paths", "defect_assessment",
         ], "additionalProperties": False},
     },
     {
@@ -405,9 +432,31 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
         }, "additionalProperties": False},
     },
 )
+_DELEGATION_TOOL_SCHEMA = {
+    "name": "request_delegation",
+    "description": (
+        "Propose a substantial, separable subset of your remaining owned review work. "
+        "Keep substantive work yourself; do not split tiny lookups or transfer all remaining work. "
+        "The controller validates and queues it alongside other leads; do not wait for a child "
+        "or assume queued work completed. Use report_investigation_lead for work outside your ownership."
+    ),
+    "parameters": {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "question": {"type": "string"}, "reason": {"type": "string"},
+            "changed_paths": {"type": "array", "items": {"type": "string"}},
+            "targets": {"type": "array", "items": {"type": "string"}},
+            "reference_paths": {"type": "array", "items": {"type": "string"}},
+            "evidence_ids": {"type": "array", "items": {"type": "string"}},
+            "observations": {"type": "array", "items": {"type": "string"}},
+            "expected_result": {"type": "string"},
+        },
+        "required": ["question", "reason"],
+    },
+}
 _OBLIGATION_LOCAL_TOOL_NAMES = frozenset(
     str(item["name"]) for item in _OBLIGATION_LOCAL_TOOL_SCHEMAS
-)
+) | {"request_delegation"}
 
 COMPACTED_EVIDENCE_TOOL_NAME = "read_compacted_evidence"
 TEST_RESULTS_TOOL_NAME = "read_test_results"
@@ -566,16 +615,28 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
                 "properties": {
                     "target": {"type": "string", "maxLength": 16},
                     "disposition": {"type": "string", "enum": [
-                        "covered", "not_applicable", "exhausted", "blocked", "unresolved",
+                        "covered", "partially_covered", "not_applicable",
+                        "exhausted", "blocked", "unresolved",
                     ]},
-                    "reason": {"type": "string", "maxLength": 600},
+                    "reason": {
+                        "type": "string", "maxLength": 600,
+                        "description": (
+                            "Concise actual observed behavior and any remaining "
+                            "behavioral gap."
+                        ),
+                    },
+                    "assessed_paths": {"type": "array", "maxItems": 40,
+                        "items": {"type": "string", "maxLength": 500}},
+                    "omitted_paths": {"type": "array", "maxItems": 40,
+                        "items": {"type": "string", "maxLength": 500}},
                     "evidence_ids": {"type": "array", "maxItems": 20,
                         "items": {"type": "string", "maxLength": 256}},
                     "next_actions": {"type": "array", "maxItems": 8,
                         "items": {"type": "string", "maxLength": 300}},
                 },
                 "required": [
-                    "target", "disposition", "reason", "evidence_ids", "next_actions",
+                    "target", "disposition", "reason", "assessed_paths",
+                    "omitted_paths", "evidence_ids", "next_actions",
                 ],
                 "additionalProperties": False,
             },
@@ -690,7 +751,9 @@ _OBLIGATION_PROTOCOL_INSTRUCTION = (
     "obligation tools; exact assigned obligation IDs are accepted only as a "
     "compatibility fallback. "
     "Use the obligation tools during exploration to record covered, "
-    "not_applicable, exhausted, blocked, or unresolved conclusions. "
+    "partially_covered, not_applicable, exhausted, blocked, or unresolved "
+    "group conclusions. Report exact assessed paths and explicit omissions; "
+    "do not create one disposition per file or repeat the full inventory. "
     "Whenever proposing a resolution, explicitly assess whether the evidence "
     "reveals concrete defects: submit up to three candidate drafts while the "
     "evidence is fresh, retain a specific needs_followup lead, or state that "
@@ -1063,6 +1126,7 @@ def specialist_assignment_prompt(
     assignment: object,
     *,
     change_overview: Mapping[str, object] | None = None,
+    obligations: tuple[CoverageObligation, ...] = (),
 ) -> str:
     """Serialize the immutable semantic assignment for initial and recovery turns."""
     lenses = getattr(assignment, "analytical_lens", "")
@@ -1072,6 +1136,35 @@ def specialist_assignment_prompt(
     all_ids = tuple(getattr(assignment, "obligation_ids", ()))
     independent = tuple(getattr(assignment, "independent_obligation_ids", ()))
     investigation_leads = tuple(getattr(assignment, "investigation_leads", ()))
+    component_obligations = tuple(
+        item for item in obligations
+        if item.owner_component_id
+        or item.boundary_id
+        or item.participant_id
+        or item.evaluator_owned
+    )
+    obligation_briefs = tuple(
+        value for item in getattr(assignment, "obligation_briefs", ())
+        if isinstance((value := _assignment_json_value(item)), Mapping)
+    )
+    if not obligation_briefs and component_obligations:
+        obligation_briefs = tuple({
+            "obligation_id": item.id,
+            "subject": item.subject,
+            "explanation": item.explanation,
+            "risk_tier": item.risk_tier,
+            "required_evidence": list(item.required_evidence_categories),
+            "satisfaction_predicates": list(item.satisfaction_predicates),
+            "scope": list(item.scope),
+            "recipe_objective": item.recipe_objective,
+            "recipe_invariants": list(item.recipe_invariants),
+            "evidence_hints": list(item.evidence_hints),
+        } for item in component_obligations)
+    boundary_hints = tuple(dict.fromkeys((*getattr(
+        assignment,
+        "permitted_boundaries",
+        getattr(assignment, "boundary_paths", ()),
+    ), *(path for item in component_obligations for path in item.seed_hints))))
     payload = {
         "assignment_id": getattr(
             assignment, "assignment_id", getattr(assignment, "id", ""),
@@ -1100,14 +1193,8 @@ def specialist_assignment_prompt(
         ],
         "analytical_lens": lenses,
         "seed_paths": list(getattr(assignment, "seed_paths", ())),
-        "permitted_boundaries": list(getattr(
-            assignment,
-            "permitted_boundaries",
-            getattr(assignment, "boundary_paths", ()),
-        )),
-        "obligation_briefs": _assignment_json_value(getattr(
-            assignment, "obligation_briefs", (),
-        )),
+        "permitted_boundaries": list(boundary_hints),
+        "obligation_briefs": list(obligation_briefs),
         "changed_context": _assignment_json_value(getattr(
             assignment, "changed_context", (),
         )),
@@ -1130,6 +1217,45 @@ def specialist_assignment_prompt(
             change_overview_orientation(change_overview),
         ),
     }
+    if (
+        getattr(assignment, "owner_component_id", "")
+        or getattr(assignment, "owned_changed_paths", ())
+        or component_obligations
+        or boundary_hints
+    ):
+        payload["group_context"] = {
+            "owner_component_id": str(getattr(
+                assignment, "owner_component_id", "",
+            ) or next((
+                item.owner_component_id
+                for item in component_obligations if item.owner_component_id
+            ), "")),
+            "objective": str(getattr(assignment, "objective", "")),
+            "recipe_objectives": list(dict.fromkeys(
+                str(item.get("recipe_objective") or "").strip()
+                for item in obligation_briefs
+                if str(item.get("recipe_objective") or "").strip()
+            )),
+            "invariants": list(dict.fromkeys(
+                str(value).strip()
+                for item in obligation_briefs
+                for value in item.get("recipe_invariants", ())
+                if str(value).strip()
+            )),
+            "owned_changed_paths": list(
+                getattr(assignment, "owned_changed_paths", ())
+                or tuple(dict.fromkeys(
+                    path for item in component_obligations for path in item.scope
+                ))
+            ),
+            "boundary_hints": list(boundary_hints),
+            "evidence_hints": list(dict.fromkeys(
+                str(value).strip()
+                for item in obligation_briefs
+                for value in item.get("evidence_hints", ())
+                if str(value).strip()
+            )),
+        }
     return "Immutable specialist assignment:\n" + json.dumps(
         payload, sort_keys=True,
     )
@@ -1149,27 +1275,8 @@ def _evidence_matches_obligation(
     record: EvidenceRecord,
     obligation: CoverageObligation,
 ) -> bool:
-    """Apply deterministic path/category authority to one evidence mapping."""
-    if not record.is_usable_for_coverage:
-        return False
-    scoped_paths = tuple(dict.fromkeys((*obligation.scope, *obligation.seed_hints)))
-    if scoped_paths:
-        source_path = _normalized_path(record.source_path or "")
-        if not source_path:
-            return False
-        if not any(
-            source_path == scope_path or source_path.startswith(scope_path + "/")
-            for raw_path in scoped_paths
-            if (scope_path := _normalized_path(raw_path))
-        ):
-            return False
-    category = record.category.strip().lower()
-    return bool(category) and category in {
-        item.strip().lower()
-        for item in obligation.required_evidence_categories
-        if item.strip()
-    }
-
+    """Assessment eligibility; candidate proof keeps its separate exact-path guard."""
+    return _assessment_evidence_satisfies(record, obligation)
 
 @dataclass(frozen=True)
 class SpecialistRequestEvent:
@@ -1277,6 +1384,7 @@ class SpecialistSession:
         test_results: tuple[Mapping[str, object], ...] = (),
         test_results_repository: str = "",
         test_results_head_sha: str = "",
+        repository_head_sha: str = "",
     ) -> None:
         if not session_id.strip():
             raise ValueError("session_id must not be empty")
@@ -1288,6 +1396,9 @@ class SpecialistSession:
             raise ValueError("request timeout and max tokens must be positive")
         self.session_id = session_id
         self.assignment = assignment
+        self._delegation_request_handler: Callable[[Mapping[str, object]], Mapping[str, object]] | None = None
+        self._global_budget_admission_handler: Callable[[str, int], None] | None = None
+        self._delegation_receipts: list[dict[str, object]] = []
         self.change_overview = json.loads(json.dumps(
             _assignment_json_value(change_overview or {}),
             sort_keys=True,
@@ -1342,6 +1453,7 @@ class SpecialistSession:
         self.test_results = test_results
         self.test_results_repository = str(test_results_repository).strip()
         self.test_results_head_sha = str(test_results_head_sha).strip()
+        self.repository_head_sha = str(repository_head_sha).strip()
         self.changed_files = tuple(dict.fromkeys(
             str(path).replace("\\", "/").strip("/")
             for path in (
@@ -1358,7 +1470,7 @@ class SpecialistSession:
         self._current_gaps = self._assigned_obligation_ids()
         self.obligation_assessments = ObligationAssessmentLedger(
             session_id=self.session_id,
-            obligations=self.coverage.obligations(),
+            obligations=self._session_obligations(),
             obligation_ids=self._current_gaps,
         )
         self.candidate_findings: tuple[CandidateFinding, ...] = ()
@@ -1564,10 +1676,117 @@ class SpecialistSession:
         self.conversation.tool_schemas = schemas
 
     def _assignment_prompt(self) -> str:
-        return specialist_assignment_prompt(
+        prompt = specialist_assignment_prompt(
             self.assignment,
             change_overview=self.change_overview,
+            obligations=self._session_obligations(),
         )
+        payload = json.loads(prompt.split("\n", 1)[1])
+        payload["obligation_targets"] = [
+            {"target": target, "obligation_id": self.obligation_assessments.obligation_id(target)}
+            for target in self.obligation_assessments.handles()
+        ]
+        payload["delegation_receipts"] = self._delegation_receipts
+        payload["ownership_instruction"] = (
+            "Only current owned_changed_paths and assigned targets are your responsibility. "
+            "Transferred work remains queued/incomplete until the controller reports otherwise. "
+            "Do not rewrite child findings or wait for child results; continue your own work."
+        )
+        # Assignment briefs were prepared before transfers; project scope from the live ledger.
+        scopes = {item.id: item.scope for item in self._session_obligations()}
+        for brief in payload.get("obligation_briefs", ()):
+            if brief.get("obligation_id") in scopes:
+                brief["scope"] = list(scopes[brief["obligation_id"]])
+        return "Immutable specialist assignment:\n" + json.dumps(payload, sort_keys=True)
+
+    def _session_obligations(self) -> tuple[CoverageObligation, ...]:
+        owned = set(getattr(self.assignment, "owned_changed_paths", ()))
+        component = str(getattr(self.assignment, "owner_component_id", ""))
+        result = []
+        for item in self.coverage.obligations():
+            if item.id not in self._assigned_obligation_ids():
+                continue
+            if item.origin == "component" and component:
+                scope = tuple(path for path in item.scope if path in owned)
+                item = replace(item, scope=scope, evidence_requirements=(
+                    item.evidence_requirements if scope == item.scope else ()
+                ))
+            result.append(item)
+        return tuple(result)
+
+    def bind_global_budget_admission_handler(self, handler: Callable[[str, int], None]) -> None:
+        self._global_budget_admission_handler = handler
+
+    def _reserve_model_turn(self) -> None:
+        if self.budget.remaining_model_turns() < 1:
+            raise BudgetExhausted("model turn limit exhausted")
+        if self._global_budget_admission_handler is not None:
+            self._global_budget_admission_handler("model_turn", 1)
+        self.budget.reserve_model_turn()
+
+    def _reserve_tool_calls(self, count: int) -> None:
+        if self.budget.remaining_tool_calls() < count:
+            raise BudgetExhausted("tool call limit exhausted")
+        if self._global_budget_admission_handler is not None:
+            self._global_budget_admission_handler("tool_calls", count)
+        self.budget.reserve_tool_calls(count)
+
+    def bind_delegation_request_handler(
+        self, handler: Callable[[Mapping[str, object]], Mapping[str, object]],
+    ) -> None:
+        self._delegation_request_handler = handler
+        eligible = (
+            bool(getattr(self.assignment, "owner_component_id", ""))
+            and not getattr(self.assignment, "parent_assignment_id", None)
+            and getattr(self.assignment, "delegation_depth", 0) == 0
+            and bool(self.conversation.tool_schemas)
+        )
+        if eligible and not any(item.get("name") == "request_delegation" for item in self.conversation.tool_schemas):
+            self.conversation.tool_schemas.append(copy.deepcopy(_DELEGATION_TOOL_SCHEMA))
+
+    def _execute_delegation_request(self, call_id: str, arguments: Mapping[str, Any]) -> bool:
+        eligible = (
+            self._delegation_request_handler is not None
+            and bool(getattr(self.assignment, "owner_component_id", ""))
+            and not getattr(self.assignment, "parent_assignment_id", None)
+            and getattr(self.assignment, "delegation_depth", 0) == 0
+        )
+        if not eligible:
+            self._add_tool_result(call_id, {"status": "rejected", "reason": "delegation is unavailable for this session"})
+            return False
+        request = dict(arguments)
+        if isinstance(request.get("targets"), list):
+            request["targets"] = [
+                self.obligation_assessments.obligation_id(target) or target
+                for target in request["targets"]
+            ]
+        receipt = dict(self._delegation_request_handler(request))
+        assignment = receipt.pop("parent_assignment", None)
+        if assignment is not None:
+            if getattr(assignment, "id", getattr(assignment, "assignment_id", "")) != getattr(self.assignment, "id", getattr(self.assignment, "assignment_id", "")):
+                raise ValueError("delegation receipt changed the parent assignment identity")
+            self.assignment = assignment
+            self.obligation_assessments.replace_owned_obligations(
+                self._session_obligations(), self._assigned_obligation_ids(),
+            )
+            self._current_gaps = tuple(
+                oid for oid in self._current_gaps if oid in self._assigned_obligation_ids()
+            )
+            previous = self.latest_checkpoint
+            self.latest_checkpoint = replace(previous,
+                obligation_assessments=self.obligation_assessments.assessments(),
+                obligation_statuses=tuple(
+                    pair for pair in previous.obligation_statuses
+                    if pair[0] in self._assigned_obligation_ids()
+                ),
+            )
+            if self._last_valid_checkpoint is previous:
+                self._last_valid_checkpoint = self.latest_checkpoint
+        receipt["owned_changed_paths"] = list(getattr(self.assignment, "owned_changed_paths", ()))
+        if receipt.get("status") == "queued":
+            self._delegation_receipts.append(receipt)
+        self._add_tool_result(call_id, receipt)
+        return receipt.get("status") == "queued"
 
     @property
     def request_events(self) -> tuple[SpecialistRequestEvent, ...]:
@@ -1586,6 +1805,20 @@ class SpecialistSession:
         all_ids = tuple(getattr(self.assignment, "obligation_ids", ()))
         independent = tuple(getattr(self.assignment, "independent_obligation_ids", ()))
         return tuple(dict.fromkeys((*primary, *all_ids, *independent)))
+
+    def _repository_source_provenance(
+        self, tool: str, arguments: Mapping[str, Any],
+    ) -> EvidenceProvenance | None:
+        if (
+            not self.repository_head_sha
+            or tool not in {"read_file", "read_pr_diff", "git_grep", "git_blame"}
+            or any(arguments.get(key) for key in ("repository", "repo", "ref", "revision"))
+        ):
+            return None
+        return EvidenceProvenance(
+            head_sha=self.repository_head_sha,
+            source_classification="repository-source",
+        )
 
     def _accounted_candidate_ids(self) -> tuple[str, ...]:
         return tuple(dict.fromkeys((
@@ -1610,14 +1843,31 @@ class SpecialistSession:
 
     def _checkpoint_obligation_contract(self) -> str:
         pending: list[dict[str, object]] = []
-        accepted: list[dict[str, str]] = []
+        partial: list[dict[str, object]] = []
+        accepted: list[dict[str, object]] = []
+        obligations = {item.id: item for item in self._session_obligations()}
         for assessment in self.obligation_assessments.assessments():
+            obligation = obligations[assessment.obligation_id]
             if assessment.disposition.value == "pending":
-                obligation = self.coverage.obligation(assessment.obligation_id)
                 pending.append({
                     "target": assessment.target,
                     "subject": obligation.subject,
+                    "objective": obligation.recipe_objective or obligation.explanation,
+                    "invariants": list(obligation.recipe_invariants),
                     "required_evidence": list(obligation.required_evidence_categories),
+                    "owned_changed_paths": list(obligation.scope),
+                    "boundary_hints": list(obligation.seed_hints),
+                })
+            elif assessment.disposition.value == "partially_covered":
+                partial.append({
+                    "target": assessment.target,
+                    "subject": obligation.subject,
+                    "objective": obligation.recipe_objective or obligation.explanation,
+                    "invariants": list(obligation.recipe_invariants),
+                    "assessed_paths": list(assessment.assessed_paths),
+                    "unassessed_paths": list(assessment.omitted_paths),
+                    "next_actions": list(assessment.next_actions),
+                    "assessment_version": assessment.assessment_version,
                 })
             else:
                 accepted.append({
@@ -1626,12 +1876,20 @@ class SpecialistSession:
                 })
         contract = "Checkpoint obligation contract: " + json.dumps({
             "pending_obligations": pending,
+            "partial_obligations": partial,
             "accepted_obligations": accepted,
         }, sort_keys=True)
-        if not pending:
+        if not pending and not partial:
             return contract + (
                 " No obligations are pending; return empty obligation_updates "
                 "and unresolved arrays."
+            )
+        if not pending:
+            return contract + (
+                " Accepted partial work remains schedulable. Do not repeat the full "
+                "path inventory or create one update per file. Emit an obligation update "
+                "only for new group-level assessment progress; otherwise list a partial "
+                "target in unresolved only when a concrete next action remains."
             )
         example_target = str(pending[0]["target"])
         return contract + (
@@ -1642,11 +1900,30 @@ class SpecialistSession:
                 "target": example_target,
                 "disposition": "not_applicable",
                 "reason": "...",
+                "assessed_paths": [],
+                "omitted_paths": [],
                 "evidence_ids": [],
                 "next_actions": [],
             }, separators=(",", ":"))
             + "."
         )
+
+    @staticmethod
+    def _assessment_state_payloads(values: tuple[object, ...]) -> list[dict[str, object]]:
+        return [
+            {
+                "target": assessment.target,
+                "obligation_id": assessment.obligation_id,
+                "disposition": assessment.disposition.value,
+                "reason": assessment.reason,
+                "evidence_ids": list(assessment.evidence_ids),
+                "next_actions": list(assessment.next_actions),
+                "assessed_paths": list(assessment.assessed_paths),
+                "omitted_paths": list(assessment.omitted_paths),
+                "assessment_version": assessment.assessment_version,
+            }
+            for assessment in values
+        ]
 
     def _checkpoint_correction_schema(
         self, rejections: tuple[_CheckpointChangeRejection, ...],
@@ -2212,7 +2489,7 @@ class SpecialistSession:
         timeout = self.lease.request_timeout(
             self.request_timeout_sec, now=self.clock(),
         )
-        self.budget.reserve_model_turn()
+        self._reserve_model_turn()
         self._request_turn += 1
         request_id = f"{self.session_id}:model:{self._request_turn}"
         schema_name = self._request_schema_name(schema)
@@ -2700,6 +2977,8 @@ class SpecialistSession:
             })
             return False
         self._obligation_local_tool_calls += 1
+        if name == "request_delegation":
+            return self._execute_delegation_request(call_id, arguments)
         if name in {"report_candidate", "withdraw_candidate"}:
             return self._execute_candidate_tool(call_id, name, arguments)
         if name in {"report_investigation_lead", "resolve_investigation_lead"}:
@@ -2716,6 +2995,9 @@ class SpecialistSession:
                     "last_conclusion": assessment.reason,
                     "evidence_ids": list(assessment.evidence_ids),
                     "next_actions": list(assessment.next_actions),
+                    "assessed_paths": list(assessment.assessed_paths),
+                    "omitted_paths": list(assessment.omitted_paths),
+                    "assessment_version": assessment.assessment_version,
                     "attempt_count": len(assessment.attempts),
                 }
                 accepted = True
@@ -2743,7 +3025,9 @@ class SpecialistSession:
                     return False
                 disposition = str(arguments.get("disposition") or "")
                 evidence_ids = _tool_string_list(arguments.get("evidence_ids"))
-                if disposition.strip().casefold() == "covered":
+                if disposition.strip().casefold() in {
+                    "covered", "partially_covered",
+                }:
                     self._associate_proposed_evidence(target, evidence_ids)
                 result = self.obligation_assessments.propose(
                     target=target,
@@ -2751,6 +3035,8 @@ class SpecialistSession:
                     reason=arguments.get("reason"),
                     evidence_ids=evidence_ids,
                     next_actions=_tool_string_list(arguments.get("next_actions")),
+                    assessed_paths=_tool_string_list(arguments.get("assessed_paths")),
+                    omitted_paths=_tool_string_list(arguments.get("omitted_paths")),
                     evidence=self.evidence_store.snapshot(),
                     eligible=self._record_matches_obligation,
                 )
@@ -2766,6 +3052,14 @@ class SpecialistSession:
                         result.ignored_supplemental_evidence_ids
                     ),
                 }
+                if self.obligation_assessments.canonical_target(result.target):
+                    current = self.obligation_assessments.assessment(result.target)
+                    payload.update({
+                        "assessed_paths": list(current.assessed_paths),
+                        "omitted_paths": list(current.omitted_paths),
+                        "assessment_version": current.assessment_version,
+                        "next_actions": list(current.next_actions),
+                    })
                 accepted = result.accepted
                 if accepted:
                     self._current_gaps = self._derive_current_gaps()
@@ -3404,6 +3698,9 @@ class SpecialistSession:
         record, collection = self.evidence_store.add_tool_result_with_collection(
             session_id=self.session_id, tool=tool_name,
             arguments=source_arguments, result=result,
+            provenance=self._repository_source_provenance(
+                tool_name, source_arguments,
+            ),
         )
         self._associate_collection(collection.id, record, requested_obligation_ids)
         if not record.is_usable_for_coverage:
@@ -3852,7 +4149,7 @@ class SpecialistSession:
                         self._add_tool_result(call_id, {"error": "at most four source tool requests are allowed"}, is_error=True)
                         continue
                     if source_calls:
-                        self.budget.reserve_tool_calls(source_calls)
+                        self._reserve_tool_calls(source_calls)
                     timeout = self.lease.request_timeout(
                         self.request_timeout_sec, now=self.clock(),
                     )
@@ -3910,7 +4207,7 @@ class SpecialistSession:
                 )
                 continue
             try:
-                self.budget.reserve_tool_calls(1)
+                self._reserve_tool_calls(1)
             except BudgetExhausted:
                 self.budget.record_tool_rejection("tool call budget exhausted")
                 self._add_tool_result(
@@ -3988,6 +4285,9 @@ class SpecialistSession:
                         self.evidence_store.add_tool_result_with_collection(
                             session_id=self.session_id, tool=name,
                             arguments=slice_arguments, result=slice_result,
+                            provenance=self._repository_source_provenance(
+                                name, slice_arguments,
+                            ),
                         )
                     )
                     self._associate_collection(
@@ -4025,6 +4325,7 @@ class SpecialistSession:
                 continue
             record, collection = self.evidence_store.add_tool_result_with_collection(
                 session_id=self.session_id, tool=name, arguments=arguments, result=result,
+                provenance=self._repository_source_provenance(name, arguments),
             )
             self._associate_collection(
                 collection.id, record, requested_obligation_ids,
@@ -4927,6 +5228,8 @@ class SpecialistSession:
             normalized_update.pop("conclusion", None)
             normalized_update.setdefault("evidence_ids", [])
             normalized_update.setdefault("next_actions", [])
+            normalized_update.setdefault("assessed_paths", [])
+            normalized_update.setdefault("omitted_paths", [])
             target_label = str(normalized_update.get("target") or "<missing>")
             canonical_target = self.obligation_assessments.canonical_target(
                 normalized_update.get("target"),
@@ -4952,30 +5255,6 @@ class SpecialistSession:
                 rejections.append(_CheckpointChangeRejection(
                     "obligation", canonical_target,
                     "target appears in both unresolved and obligation_updates",
-                    normalized_update,
-                ))
-                continue
-            if str(normalized_update.get("disposition") or "") not in {
-                "covered", "not_applicable", "exhausted", "blocked", "unresolved",
-            }:
-                rejections.append(_CheckpointChangeRejection(
-                    "obligation", canonical_target,
-                    "invalid or missing disposition", normalized_update,
-                ))
-                continue
-            if not str(normalized_update.get("reason") or "").strip():
-                rejections.append(_CheckpointChangeRejection(
-                    "obligation", canonical_target,
-                    "a concise reason is required", normalized_update,
-                ))
-                continue
-            disposition = str(normalized_update.get("disposition") or "")
-            if disposition in {"covered", "not_applicable"} and _strings(
-                normalized_update.get("next_actions")
-            ):
-                rejections.append(_CheckpointChangeRejection(
-                    "obligation", canonical_target,
-                    f"{disposition} cannot include next_actions",
                     normalized_update,
                 ))
                 continue
@@ -5180,7 +5459,9 @@ class SpecialistSession:
             self._rejected_candidate_ids.discard(candidate_id)
 
         for update, resolved_evidence_ids in prepared_obligation_updates:
-            if str(update.get("disposition") or "").strip().casefold() == "covered":
+            if str(update.get("disposition") or "").strip().casefold() in {
+                "covered", "partially_covered",
+            }:
                 self._associate_proposed_evidence(
                     str(update.get("target") or ""), resolved_evidence_ids,
                 )
@@ -5190,6 +5471,8 @@ class SpecialistSession:
                 reason=update.get("reason"),
                 evidence_ids=resolved_evidence_ids,
                 next_actions=_strings(update.get("next_actions")),
+                assessed_paths=_strings(update.get("assessed_paths")),
+                omitted_paths=_strings(update.get("omitted_paths")),
                 evidence=self.evidence_store.snapshot(),
                 eligible=self._record_matches_obligation,
             )
@@ -6209,6 +6492,8 @@ class SpecialistSession:
 
         continuation = {
             "cumulative_checkpoint": self._model_checkpoint_memory(),
+            "current_owned_changed_paths": list(getattr(self.assignment, "owned_changed_paths", ())),
+            "delegation_receipts": self._delegation_receipts,
             "compacted_evidence": self._compacted_evidence_catalogue(),
             "removal_summary": {
                 **asdict(stats),
@@ -6260,6 +6545,25 @@ class SpecialistSession:
             or not self.latest_checkpoint.completed_steps
         ):
             return False
+        if self.latest_checkpoint.obligation_assessments:
+            # Tool updates remain authoritative even when no newer checkpoint fit.
+            live = {
+                item.target: item for item in self.obligation_assessments.assessments()
+            }
+            self.obligation_assessments.restore(
+                tuple(
+                    live[item.target]
+                    if live[item.target].assessment_version >= item.assessment_version
+                    else item
+                    for item in self.latest_checkpoint.obligation_assessments
+                ),
+            )
+            self.latest_checkpoint = replace(
+                self.latest_checkpoint,
+                obligation_assessments=self.obligation_assessments.assessments(),
+            )
+            self._last_valid_checkpoint = self.latest_checkpoint
+            self._current_gaps = self._derive_current_gaps()
         previous = self.conversation
         rebuilt = Conversation(
             system=previous.system,
@@ -6755,6 +7059,9 @@ class SpecialistSession:
             "invariants_evaluated": list(checkpoint.invariants_evaluated),
             "unknowns": list(checkpoint.unknowns),
             "proposed_next_actions": list(checkpoint.proposed_next_actions),
+            "obligation_assessments": self._assessment_state_payloads(
+                checkpoint.obligation_assessments,
+            ),
         }
         evidence_metadata: list[dict[str, object]] = []
         for record in retained_evidence:
@@ -6804,6 +7111,9 @@ class SpecialistSession:
             "defect_leads": [dict(item) for item in self._defect_leads],
             "unknowns": list(checkpoint.unknowns),
             "proposed_next_actions": list(checkpoint.proposed_next_actions),
+            "obligation_assessments": self._assessment_state_payloads(
+                checkpoint.obligation_assessments,
+            ),
         }
 
     def conversation_contains_evidence_ids(self, evidence_ids: tuple[str, ...]) -> bool:

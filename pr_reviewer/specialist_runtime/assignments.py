@@ -1088,14 +1088,19 @@ def component_assignment_plan(
             title=f"Independent {owner} review" if independent else f"Review {owner} changed behavior",
             objective=" ".join(dict.fromkeys(item.explanation + " " + item.recipe_objective for item in items)),
             obligation_ids=tuple(item.id for item in items),
-            recipe_ids=tuple(sorted({item.recipe_id for item in items if item.recipe_id})),
+            recipe_ids=tuple(sorted({recipe_id for item in items for recipe_id in (
+                *item.integrated_recipe_ids, *((item.recipe_id,) if item.recipe_id else ()),
+            )})),
             lenses=("independent-verification",) if independent else ("component-owned-review",),
             seed_paths=seed_paths, boundary_paths=scope,
             expected_evidence=tuple(sorted({category for item in items for category in item.required_evidence_categories})),
             estimated_turns=len(items), priority=_priority(items),
             overlap_justification="Explicit policy independent verification" if independent else "",
             owner_component_id="" if independent else owner,
-            owned_changed_paths=tuple(path for path in scope if path in changed),
+            owned_changed_paths=tuple(sorted({
+                path for item in items if independent or item.origin == "component"
+                for path in item.scope if path in changed
+            })),
         )
         assignments.append(_with_semantic_brief(assignment, {item.id: item for item in items}, topology))
     unassigned = tuple(sorted(item.id for _, items in ordered[cap:] for item in items))

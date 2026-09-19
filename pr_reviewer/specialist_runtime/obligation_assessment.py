@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, Iterable, Mapping
 
@@ -132,6 +132,23 @@ def _missing_requirement_actions(
     return _actions(missing)
 
 
+def is_retained_empty_repository_search(record: EvidenceRecord) -> bool:
+    """A scoped not-affected observation, never affirmative coverage or defect proof."""
+    if (record.tool != "git_grep" or not record.is_usable_for_coverage
+            or record.truncated or not record.provenance.head_sha):
+        return False
+    try:
+        arguments = json.loads(record.arguments)
+        content = json.loads(record.content)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(arguments, Mapping) or not isinstance(arguments.get("pattern"), str) or not arguments["pattern"].strip():
+        return False
+    if isinstance(content, Mapping) and isinstance(content.get("result"), Mapping):
+        content = content["result"]
+    return isinstance(content, Mapping) and content.get("matches") == []
+
+
 class ObligationAssessmentLedger:
     """Validate model proposals while retaining controller authority."""
 
@@ -166,6 +183,7 @@ class ObligationAssessmentLedger:
             obligation_id: target
             for target, obligation_id in self._handle_to_id.items()
         }
+        self._all_id_to_handle = dict(self._id_to_handle)
         self._assessments = {
             target: ObligationAssessment(target, obligation_id)
             for target, obligation_id in self._handle_to_id.items()
@@ -173,6 +191,37 @@ class ObligationAssessmentLedger:
 
     def handles(self) -> tuple[str, ...]:
         return tuple(self._handle_to_id)
+
+    def replace_owned_obligations(
+        self, obligations: Iterable[CoverageObligation], obligation_ids: Iterable[str],
+    ) -> None:
+        """Apply controller ownership changes without recycling existing short handles."""
+        by_id = {item.id: item for item in obligations}
+        selected = tuple(dict.fromkeys(obligation_ids))
+        if set(selected) - set(by_id):
+            raise ValueError("updated ownership contains unknown obligations")
+        next_handle = max((int(target[1:]) for target in self._all_id_to_handle.values()), default=0) + 1
+        handles = {}
+        for oid in selected:
+            if oid not in self._all_id_to_handle:
+                self._all_id_to_handle[oid] = f"O{next_handle}"
+                next_handle += 1
+            handles[self._all_id_to_handle[oid]] = oid
+        assessments = {}
+        for target, oid in handles.items():
+            previous = self._assessments.get(target, ObligationAssessment(target, oid))
+            obligation = by_id[oid]
+            if obligation.origin == "component":
+                owned = set(obligation.scope)
+                previous = replace(previous,
+                    assessed_paths=tuple(path for path in previous.assessed_paths if path in owned),
+                    omitted_paths=tuple(path for path in previous.omitted_paths if path in owned),
+                )
+            assessments[target] = previous
+        self._obligations = {oid: by_id[oid] for oid in selected}
+        self._handle_to_id = handles
+        self._id_to_handle = {oid: target for target, oid in handles.items()}
+        self._assessments = assessments
 
     def obligation_id(self, target: str) -> str | None:
         canonical = self.canonical_target(target)
@@ -274,10 +323,12 @@ class ObligationAssessmentLedger:
             str(item).strip() for item in evidence_ids if str(item).strip()
         ))[:20]
         actions = _actions(next_actions)
+        submitted_actions = actions
         records = {record.id: record for record in evidence.records}
         obligation = self._obligations[assessment.obligation_id]
         component_scoped = bool(
             obligation.owner_component_id
+            or obligation.recipe_execution == "independent"
             or obligation.boundary_id
             or obligation.participant_id
             or obligation.evaluator_owned
@@ -331,7 +382,7 @@ class ObligationAssessmentLedger:
             )
         requirement_actions = (
             _missing_requirement_actions(evidence, eligible_ids, obligation)
-            if proposed is ObligationDisposition.COVERED else ()
+            if supported else ()
         )
         if requirement_actions:
             effective = ObligationDisposition.PARTIALLY_COVERED
@@ -375,9 +426,19 @@ class ObligationAssessmentLedger:
         elif supported and not eligible_ids:
             error = "supported work requires eligible retained evidence"
         elif (
+            proposed is ObligationDisposition.PARTIALLY_COVERED
+            and not resolved_omitted
+            and not submitted_actions
+        ):
+            error = (
+                "partially_covered with no omitted paths requires a concrete "
+                "next action"
+            )
+        elif (
             proposed is ObligationDisposition.NOT_APPLICABLE
             and obligation.boundary_id
             and not any(
+                is_retained_empty_repository_search(records[item]) or (
                 records[item].is_usable_for_coverage
                 and not records[item].truncated
                 and eligible(records[item], obligation)
@@ -387,6 +448,7 @@ class ObligationAssessmentLedger:
                         "search", "grep", "lookup", "inspect", "blame",
                     ))
                     or records[item].tool == "gh_api"
+                )
                 )
                 for item in retained_ids
             )

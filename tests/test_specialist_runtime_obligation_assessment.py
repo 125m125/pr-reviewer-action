@@ -601,3 +601,66 @@ def test_component_covered_downgrades_until_collective_evidence_requirements_are
     assert assessment.disposition.value == "covered"
     assert assessment.next_actions == ()
     assert assessment.assessment_version == 2
+
+
+def test_component_partial_retains_missing_collective_evidence_hints():
+    paths = ("backend/a.py", "backend/b.py")
+    ledger = _ledger(
+        scope=paths,
+        owner_component_id="backend",
+        evidence_requirements=({
+            "id": "tests", "category": "tests", "mode": "required",
+        },),
+    )
+    store, record = _store_with_path(paths[0])
+
+    result = ledger.propose(
+        target="O1", disposition="partially_covered",
+        reason="The first handler preserves the validated request identity.",
+        assessed_paths=(paths[0],), omitted_paths=(),
+        evidence_ids=(record.id,), next_actions=(), evidence=store.snapshot(),
+        eligible=lambda _record, _obligation: True,
+    )
+
+    assert result.accepted is True
+    assessment = ledger.assessment("O1")
+    assert assessment.omitted_paths == (paths[1],)
+    assert assessment.next_actions == (
+        "Collect evidence requirement 'tests' (tests).",
+    )
+
+
+def test_component_partial_with_no_omitted_paths_requires_explicit_next_action_and_preserves_state():
+    paths = ("backend/a.py", "backend/b.py")
+    ledger = _ledger(scope=paths, owner_component_id="backend")
+    store, record = _store_with_path(paths[0])
+    accepted = ledger.propose(
+        target="O1", disposition="partially_covered",
+        reason="The first handler preserves the validated request identity.",
+        assessed_paths=(paths[0],), omitted_paths=(),
+        evidence_ids=(record.id,), next_actions=("Inspect backend/b.py.",),
+        evidence=store.snapshot(), eligible=lambda _record, _obligation: True,
+    )
+    before = ledger.assessment("O1")
+
+    rejected = ledger.propose(
+        target="O1", disposition="partially_covered",
+        reason="Both handlers were inspected but a behavioral gap remains.",
+        assessed_paths=(paths[1],), omitted_paths=(),
+        evidence_ids=(record.id,), next_actions=(), evidence=store.snapshot(),
+        eligible=lambda _record, _obligation: True,
+    )
+
+    after = ledger.assessment("O1")
+    assert accepted.accepted is True
+    assert rejected.accepted is False
+    assert rejected.reason == (
+        "partially_covered with no omitted paths requires a concrete next action"
+    )
+    assert after.disposition == before.disposition
+    assert after.reason == before.reason
+    assert after.evidence_ids == before.evidence_ids
+    assert after.next_actions == before.next_actions
+    assert after.assessed_paths == before.assessed_paths
+    assert after.omitted_paths == before.omitted_paths
+    assert after.assessment_version == before.assessment_version

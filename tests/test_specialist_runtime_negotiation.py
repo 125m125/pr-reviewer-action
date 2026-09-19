@@ -1018,6 +1018,11 @@ def test_validated_sole_independent_owner_is_primary_and_independent_collector()
             session_id="independent-session",
             state=SessionState.CHECKPOINT,
             evidence_ids=(fresh.id,),
+            obligation_assessments=(ObligationAssessment(
+                "O1", "OB1", ObligationDisposition.COVERED,
+                "Independently checked the assigned test behavior.", (fresh.id,),
+                assessed_paths=("tests/test_a.py",),
+            ),),
         ),),
         evidence=fresh_store.snapshot(),
         assignments=plan.assignments,
@@ -1042,6 +1047,11 @@ def test_validated_sole_independent_owner_is_primary_and_independent_collector()
             state=SessionState.CHECKPOINT,
             evidence_ids=(imported.id,),
             imported_evidence_ids=(imported.id,),
+            obligation_assessments=(ObligationAssessment(
+                "O1", "OB1", ObligationDisposition.COVERED,
+                "Checked the assigned test behavior using imported evidence.", (imported.id,),
+                assessed_paths=("tests/test_a.py",),
+            ),),
         ),),
         evidence=imported_store.snapshot(),
         assignments=plan.assignments,

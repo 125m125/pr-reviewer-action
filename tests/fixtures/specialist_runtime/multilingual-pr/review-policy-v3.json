@@ -1,0 +1,124 @@
+{
+  "version": 3,
+  "components": [
+    {
+      "id": "java-api",
+      "paths": ["src/main/java/example/api/**", "tests/java/**"],
+      "responsibilities": ["Produce order events from the Java API."]
+    },
+    {
+      "id": "typescript-consumer",
+      "paths": ["web/**"],
+      "responsibilities": ["Consume and render order events in the web client."]
+    },
+    {
+      "id": "python-messaging",
+      "paths": ["workers/messaging/**", "tests/python/**"],
+      "responsibilities": ["Consume order events and persist worker outcomes."]
+    },
+    {
+      "id": "order-contract",
+      "paths": ["contracts/**"],
+      "responsibilities": ["Own the order event schema."]
+    },
+    {
+      "id": "order-store",
+      "paths": ["db/**"],
+      "responsibilities": ["Own persisted order status values and migration safety."]
+    },
+    {
+      "id": "order-deployment",
+      "paths": ["deploy/**"],
+      "responsibilities": ["Own worker deployment and rollout configuration."]
+    }
+  ],
+  "ownership_precedence": [],
+  "boundaries": [
+    {
+      "id": "order-event",
+      "contract_paths": ["contracts/**"],
+      "participants": [
+        "order-contract",
+        "java-api",
+        "typescript-consumer",
+        "python-messaging"
+      ],
+      "contract_change_owner": "order-contract",
+      "endpoint_paths": {
+        "order-contract": ["contracts/**"],
+        "java-api": ["src/main/java/example/api/**"],
+        "typescript-consumer": ["web/src/**"],
+        "python-messaging": ["workers/messaging/**"]
+      },
+      "objective": "Compare the changed event schema with every producer and consumer, including status and failure semantics."
+    },
+    {
+      "id": "order-storage",
+      "contract_paths": ["db/migrations/**"],
+      "participants": ["order-store", "python-messaging"],
+      "contract_change_owner": "order-store",
+      "endpoint_paths": {
+        "order-store": ["db/migrations/**"],
+        "python-messaging": ["workers/messaging/**"]
+      },
+      "objective": "Verify the worker and database agree on persisted order status values."
+    },
+    {
+      "id": "worker-deployment",
+      "contract_paths": ["deploy/k8s/**"],
+      "participants": ["order-deployment", "python-messaging"],
+      "contract_change_owner": "order-deployment",
+      "endpoint_paths": {
+        "order-deployment": ["deploy/k8s/**"],
+        "python-messaging": ["workers/messaging/**"]
+      },
+      "objective": "Verify deployment settings, worker behavior, and rollback assumptions remain aligned."
+    }
+  ],
+  "recipes": [
+    {
+      "id": "cross-language-contract",
+      "title": "Cross-language contract",
+      "objective": "Trace order event compatibility across producers and consumers.",
+      "execution": "integrated",
+      "match": {"paths_any": ["contracts/**", "src/main/java/example/api/**", "web/**", "workers/messaging/**"]},
+      "lenses": ["contract"],
+      "seed_paths": ["contracts/order-event.schema.json"],
+      "related_paths": [
+        "src/main/java/example/api/OrderController.java",
+        "web/src/order-client.ts",
+        "workers/messaging/order_worker.py"
+      ],
+      "invariants": ["Every consumer handles every published status."],
+      "expected_evidence": ["producer behavior", "consumer behavior", "contract tests"],
+      "priority": "high"
+    },
+    {
+      "id": "deployment-rollout",
+      "title": "Deployment rollout",
+      "objective": "Verify deployment artifacts consume the changed worker contract.",
+      "execution": "integrated",
+      "match": {"paths_any": ["deploy/**", "workers/messaging/**"]},
+      "lenses": ["deployment"],
+      "seed_paths": ["deploy/k8s/order-worker.yaml"],
+      "related_paths": ["workers/messaging/order_worker.py"],
+      "invariants": ["The deployed revision understands the changed contract."],
+      "expected_evidence": ["deployment manifest", "worker configuration"],
+      "priority": "normal"
+    }
+  ],
+  "generated_artifacts": [
+    {
+      "id": "order-worker-deployment",
+      "source_of_truth": ["deploy/k8s/order-worker.yaml"],
+      "generator_config": [],
+      "output_paths": ["deploy/k8s/order-worker.yaml"]
+    }
+  ],
+  "exclude": {
+    "paths": [],
+    "components": [],
+    "lenses": [],
+    "recipes": []
+  }
+}

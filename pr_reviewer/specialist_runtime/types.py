@@ -95,6 +95,11 @@ class InvestigationLead:
     assigned_session_id: str | None = None
     resolution_reason: str = ""
     candidate_ids: tuple[str, ...] = ()
+    kind: str = "investigation"
+    parent_assignment_id: str | None = None
+    child_assignment_id: str | None = None
+    delegated_paths: tuple[str, ...] = ()
+    delegated_obligation_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -132,6 +137,7 @@ class CoverageObligation:
     evaluator_owned: bool = False
     evidence_requirements: tuple[Mapping[str, object], ...] = ()
     evidence_hints: tuple[str, ...] = ()
+    integrated_recipe_ids: tuple[str, ...] = ()
 
     @property
     def id(self) -> str:
