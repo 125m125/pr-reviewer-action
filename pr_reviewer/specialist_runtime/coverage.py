@@ -410,6 +410,8 @@ def derive_obligations(
                 obligation_id=_obligation_id("boundary-participant", boundary.id, participant),
                 origin="boundary-participant", subject=f"{boundary.id}:{participant}",
                 owner_component_id=owner, boundary_id=boundary.id, participant_id=participant,
+                boundary_endpoint_paths=boundary.endpoint_paths.get(participant, ()),
+                boundary_contract_paths=boundary.contract_paths,
                 required_evidence_categories=("tool-result", "implementation", "review"),
                 satisfaction_predicates=("recorded_evidence",), scope=local_paths,
                 seed_hints=tuple(dict.fromkeys((

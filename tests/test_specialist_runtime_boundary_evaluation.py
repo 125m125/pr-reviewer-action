@@ -18,6 +18,155 @@ from pr_reviewer.specialist_runtime.policy import BoundaryPolicy
 HEAD_SHA = "a" * 40
 
 
+def _runtime_input_obligations():
+    from pathlib import Path
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.policy import load_review_policy
+
+    policy = load_review_policy(Path(__file__).parents[1] / ".github/ai-review-policy.json")
+    obligations = derive_obligations({
+        "changed_files": ["action.yml"],
+        "components": [{"id": "orchestration", "changed_files": ["action.yml"]}],
+    }, {}, policy)
+    return (
+        next(item for item in policy.boundaries if item.id == "action-runtime-inputs"),
+        tuple(item for item in obligations if item.boundary_id == "action-runtime-inputs" and not item.evaluator_owned),
+    )
+
+
+def test_boundary_accepts_unchanged_inspected_runtime_sources_without_changed_coverage():
+    from pr_reviewer.specialist_runtime.coverage import _assessment_evidence_satisfies
+    from pr_reviewer.specialist_runtime.obligation_assessment import ObligationAssessmentLedger
+
+    boundary, obligations = _runtime_input_obligations()
+    store = EvidenceStore()
+    contract = _record(store, path="action.yml", content="specialist_allow_approve: false")
+    config = _record(store, path="scripts/sections/config.sh", content="export SPECIALIST_ALLOW_APPROVE")
+    parser = _record(store, path="pr_reviewer/specialist_runtime/policy.py", content="_boolean(env, 'SPECIALIST_ALLOW_APPROVE', False)")
+    assessments = []
+    for obligation in obligations:
+        endpoint = parser if obligation.participant_id == "specialist-runtime" else config
+        ledger = ObligationAssessmentLedger(session_id="session-1", obligations=(obligation,), obligation_ids=(obligation.id,))
+        result = ledger.propose(
+            target="O1", disposition="covered", reason="Input default and runtime parser preserve the same boolean value.",
+            evidence_ids=(contract.id, endpoint.id), next_actions=(), evidence=store.snapshot(),
+            eligible=_assessment_evidence_satisfies,
+            assessed_paths=("action.yml", endpoint.source_path), omitted_paths=(),
+        )
+        assert result.accepted, result.reason
+        assert ledger.assessment("O1").assessed_paths == ("action.yml",)
+        assert endpoint.id in ledger.assessment("O1").evidence_ids
+        assessments.append(ledger.assessment("O1"))
+    context = build_boundary_context(boundary, assessments, store.snapshot(), max_bytes=30_000,
+        obligations={item.id: item.participant_id for item in obligations}, expected_head_sha=HEAD_SHA)
+    assert context["incomplete"] is False
+    assert context["participant_evidence_ids"]["specialist-runtime"] == [parser.id]
+
+
+@pytest.mark.parametrize("path,head_sha", [
+    ("action.yml", HEAD_SHA),
+    ("pr_reviewer/specialist_runtime/session.py", HEAD_SHA),
+    ("pr_reviewer/specialist_runtime/cli.py", None),
+])
+def test_boundary_covered_rejects_evidence_without_usable_participant_endpoint(path, head_sha):
+    from pr_reviewer.specialist_runtime.coverage import _assessment_evidence_satisfies
+    from pr_reviewer.specialist_runtime.obligation_assessment import ObligationAssessmentLedger
+
+    _boundary_policy, obligations = _runtime_input_obligations()
+    obligation = next(item for item in obligations if item.participant_id == "specialist-runtime")
+    store = EvidenceStore()
+    record = _record(store, path=path, content="input plumbing", head_sha=head_sha)
+    ledger = ObligationAssessmentLedger(session_id="session-1", obligations=(obligation,), obligation_ids=(obligation.id,))
+    result = ledger.propose(
+        target="O1", disposition="covered", reason="Runtime accepts the action input values.",
+        evidence_ids=(record.id,), next_actions=(), evidence=store.snapshot(), eligible=_assessment_evidence_satisfies,
+        assessed_paths=("action.yml",), omitted_paths=(),
+    )
+    assert not result.accepted
+    assert "participant source" in result.reason
+    assert "cli.py" in result.reason
+
+
+@pytest.mark.parametrize("assessed,omitted,cite_endpoint,accepted", [
+    (("pr_reviewer/specialist_runtime/policy.py",), (), True, True),
+    (("action.yml", "pr_reviewer/specialist_runtime/policy.py"), (), False, False),
+    (("action.yml", "unrelated.py"), (), True, False),
+    (("action.yml", "pr_reviewer/specialist_runtime/*.py"), (), True, False),
+    (("action.yml",), ("pr_reviewer/specialist_runtime/policy.py",), True, False),
+])
+def test_boundary_supporting_paths_require_exact_cited_sources_and_do_not_cover_changed_paths(
+    assessed, omitted, cite_endpoint, accepted,
+):
+    from pr_reviewer.specialist_runtime.coverage import _assessment_evidence_satisfies
+    from pr_reviewer.specialist_runtime.obligation_assessment import ObligationAssessmentLedger
+
+    _boundary_policy, obligations = _runtime_input_obligations()
+    obligation = next(item for item in obligations if item.participant_id == "specialist-runtime")
+    store = EvidenceStore()
+    contract = _record(store, path="action.yml", content="input default: false")
+    parser = _record(store, path="pr_reviewer/specialist_runtime/policy.py", content="boolean input parser")
+    ledger = ObligationAssessmentLedger(session_id="session-1", obligations=(obligation,), obligation_ids=(obligation.id,))
+    result = ledger.propose(
+        target="O1", disposition="covered", reason="Runtime parsing preserves the action input values.",
+        evidence_ids=(contract.id, parser.id) if cite_endpoint else (contract.id,),
+        next_actions=(), evidence=store.snapshot(), eligible=_assessment_evidence_satisfies,
+        assessed_paths=assessed, omitted_paths=omitted,
+    )
+    assert result.accepted is accepted
+    if accepted:
+        assert ledger.assessment("O1").disposition is ObligationDisposition.PARTIALLY_COVERED
+        assert ledger.assessment("O1").assessed_paths == ()
+        assert ledger.assessment("O1").omitted_paths == ("action.yml",)
+
+
+def test_boundary_admission_and_evaluator_accept_pathless_negative_search():
+    from pr_reviewer.specialist_runtime.coverage import _assessment_evidence_satisfies
+    from pr_reviewer.specialist_runtime.obligation_assessment import ObligationAssessmentLedger
+
+    boundary, obligations = _runtime_input_obligations()
+    obligation = next(item for item in obligations if item.participant_id == "specialist-runtime")
+    store = EvidenceStore()
+    lookup = store.add_tool_result(
+        session_id="session-1", tool="git_grep", arguments={"pattern": "REMOVED_INPUT"},
+        result={"status": "ok", "result": {"matches": []}},
+        provenance=EvidenceProvenance(head_sha=HEAD_SHA),
+    )
+    ledger = ObligationAssessmentLedger(session_id="session-1", obligations=(obligation,), obligation_ids=(obligation.id,))
+    result = ledger.propose(
+        target="O1", disposition="not_applicable", reason="No runtime usage of the removed input remains.",
+        evidence_ids=(lookup.id,), next_actions=(), evidence=store.snapshot(), eligible=_assessment_evidence_satisfies,
+    )
+    assert result.accepted, result.reason
+    context = build_boundary_context(boundary, ledger.assessments(), store.snapshot(), max_bytes=20_000,
+        obligations={obligation.id: obligation.participant_id}, expected_head_sha=HEAD_SHA)
+    assert context["participant_evidence_ids"]["specialist-runtime"] == [lookup.id]
+
+
+@pytest.mark.parametrize("assessed_paths", [
+    ("action.yml",),
+    ("action.yml", "pr_reviewer/specialist_runtime/cli.py"),
+])
+def test_boundary_admission_rejects_wrong_head_endpoint_and_supporting_paths(assessed_paths):
+    from pr_reviewer.specialist_runtime.coverage import _assessment_evidence_satisfies
+    from pr_reviewer.specialist_runtime.obligation_assessment import ObligationAssessmentLedger
+
+    _boundary_policy, obligations = _runtime_input_obligations()
+    obligation = next(item for item in obligations if item.participant_id == "specialist-runtime")
+    store = EvidenceStore()
+    source = _record(store, path="pr_reviewer/specialist_runtime/cli.py", content="input parser", head_sha="b" * 40)
+    ledger = ObligationAssessmentLedger(
+        session_id="session-1", obligations=(obligation,), obligation_ids=(obligation.id,),
+        expected_head_sha=HEAD_SHA,
+    )
+    result = ledger.propose(
+        target="O1", disposition="covered", reason="Runtime parsing matches the input default.",
+        evidence_ids=(source.id,), next_actions=(), evidence=store.snapshot(),
+        eligible=_assessment_evidence_satisfies, assessed_paths=assessed_paths,
+    )
+    assert not result.accepted
+    assert ledger.assessment("O1").disposition is ObligationDisposition.PENDING
+
+
 def _boundary():
     return BoundaryPolicy(
         id="backend-worker-messages",

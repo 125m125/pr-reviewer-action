@@ -138,6 +138,8 @@ class CoverageObligation:
     evidence_requirements: tuple[Mapping[str, object], ...] = ()
     evidence_hints: tuple[str, ...] = ()
     integrated_recipe_ids: tuple[str, ...] = ()
+    boundary_endpoint_paths: tuple[str, ...] = ()
+    boundary_contract_paths: tuple[str, ...] = ()
 
     @property
     def id(self) -> str:
