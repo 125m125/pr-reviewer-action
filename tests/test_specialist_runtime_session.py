@@ -3289,6 +3289,7 @@ def test_failed_emergency_checkpoint_reconstructs_previous_valid_checkpoint():
     assert diagnostic["emergency_outcome"] == "fallback_reconstructed"
     assert diagnostic["compaction_input_tokens_before"] > 0
     assert diagnostic["compaction_input_tokens_after"] > 0
+    assert not session.continuation_blocked
     assert session.finalize().degraded is False
 
 
@@ -5175,6 +5176,84 @@ def test_rejected_reasoning_prefill_gets_one_user_continuation(repeat_error):
     assert "Still tracing the caller." in gateway.requests[2].messages
     assert gateway.requests[2].tools_enabled
     assert session.budget.remaining_model_turns() == 5
+
+
+def test_prefill_rejection_handles_partial_text_and_remembers_provider_limit():
+    error = ModelRequestError(
+        "provider rejected request", status=500,
+        body="Assistant response prefill is incompatible with enable_thinking.",
+    )
+    gateway = ScriptedGateway([
+        error,
+        tool_call_response("read_file", {"path": "a.py"}),
+        replace(reasoning_only_response("Checking the test."), finish_reason="incomplete"),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway, model_turns=12)
+    session.conversation.add_assistant_turn(
+        reasoning="Still tracing the caller.", content="The caller", calls=(),
+    )
+    session.explore()
+    assert json.loads(gateway.requests[1].messages)[-1]["role"] == "user"
+    # Once unsupported, subsequent interrupted turns must not retry a prefill.
+    assert json.loads(gateway.requests[3].messages)[-1]["role"] == "user"
+    assert "Checking the test." in gateway.requests[3].messages
+
+
+def test_failed_compaction_does_not_repeat_checkpoint_on_resume():
+    gateway = ScriptedGateway([invalid_response("invalid")] * 6)
+    session = make_session(gateway, model_turns=12)
+    first = session.request_checkpoint("context-pressure", disposition="compact_resume")
+    assert first.degraded
+    calls = len(gateway.requests)
+    resumed = session.explore()
+    assert resumed.degraded
+    assert len(gateway.requests) == calls
+    assert session.continuation_blocked
+    gateway.responses[:] = [checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])]
+    recovered = session.request_checkpoint("recovery", disposition="compact_resume")
+    assert not recovered.degraded
+    assert not session.continuation_blocked
+    session.max_context_tokens = 100
+    assert session.explore().degraded
+    assert session.continuation_blocked
+
+
+def test_checkpoint_candidate_without_id_is_retained_and_compacted():
+    draft = json.loads(candidate_checkpoint_response(("draft",)).text)
+    del draft["new_candidates"][0]["candidate_id"]
+    gateway = ScriptedGateway([invalid_response(json.dumps(draft))])
+    session = make_session(gateway, model_turns=8)
+    session._execute_calls(({
+        "id": "read", "name": "read_file", "arguments": '{"path":"a.py"}',
+    },))
+    result = session.request_checkpoint("context-pressure", disposition="compact_resume")
+    assert not result.degraded
+    assert len(session.candidate_findings) == 1
+    assert len(gateway.requests) == 1
+    assert result.finalization_diagnostics[-1]["compaction_level"] == "regular"
+
+
+def test_rejected_idless_candidate_is_accounted_for_after_focused_repair():
+    repaired = json.loads(candidate_checkpoint_response(("N1",)).text)
+    draft = json.loads(json.dumps(repaired))
+    del draft["new_candidates"][0]["candidate_id"]
+    del draft["new_candidates"][0]["severity"]
+    gateway = ScriptedGateway([
+        invalid_response(json.dumps(draft)),
+        invalid_response(json.dumps({
+            "unresolved": [], "obligation_updates": [], "candidate_updates": [],
+            "new_candidates": repaired["new_candidates"],
+        })),
+    ])
+    session = make_session(gateway, model_turns=8)
+    session._execute_calls(({
+        "id": "read", "name": "read_file", "arguments": '{"path":"a.py"}',
+    },))
+    result = session.request_checkpoint("context-pressure", disposition="compact_resume")
+    assert not result.degraded
+    assert result.checkpoint.candidate_finding_ids == ("N1",)
+    assert len(gateway.requests) == 2
 
 
 @pytest.mark.parametrize("failure", ["invalid", "tools", "provider", "reasoning"])

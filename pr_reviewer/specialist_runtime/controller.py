@@ -3980,6 +3980,14 @@ class ReviewController:
             result = state.session_results.get((ownership.assignment_id, session_id))
             if session is None or result is None:
                 continue
+            if getattr(session.session, "continuation_blocked", False):
+                # Keep its checkpoint/evidence in negotiation, but do not offer
+                # a lease that can only repeat a failed compaction checkpoint.
+                state.journal.emit("session_continuation_blocked", {
+                    "session_id": session_id,
+                    "reason": "compaction checkpoint was not usable for continuation",
+                })
+                continue
             ledger = getattr(session, "budget", None)
             if isinstance(ledger, BudgetLedger):
                 remaining_turns = ledger.remaining_model_turns()

@@ -2679,7 +2679,10 @@ def test_unproductive_followup_retires_target_and_tries_a_different_one(tmp_path
     ] == list(range(1, request_count + 1))
 
 
-def test_record_unknown_status_change_does_not_trigger_another_negotiation_round(tmp_path):
+@pytest.mark.parametrize("continuation_blocked", [False, True])
+def test_record_unknown_status_change_does_not_trigger_another_negotiation_round(
+    tmp_path, continuation_blocked,
+):
     calls = []
 
     def factory(
@@ -2687,9 +2690,11 @@ def test_record_unknown_status_change_does_not_trigger_another_negotiation_round
         expected_session_id,
     ):
         del lease, snapshot, coverage
-        return _ResumeSession(
+        session = _ResumeSession(
             assignment, evidence_store, obligations, expected_session_id,
         )
+        session.continuation_blocked = continuation_blocked
+        return session
 
     def record_unknown(request):
         calls.append(request)
@@ -2717,6 +2722,10 @@ def test_record_unknown_status_change_does_not_trigger_another_negotiation_round
     ).run(_inputs(tmp_path))
 
     assert len(calls) == 1
+    if continuation_blocked:
+        state = calls[0].context["negotiation_state"]
+        assert state.session_resources == ()
+        assert state.checkpoints  # Retained work remains available.
     assert [event.payload["round"] for event in result.events if event.kind == "negotiation_round"] == [1]
 
 

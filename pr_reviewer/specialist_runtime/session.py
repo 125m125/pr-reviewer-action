@@ -587,7 +587,7 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
                     "manual_validation": {"type": "string", "maxLength": 300},
                 },
                 "required": [
-                    "candidate_id", "claim", "affected_location",
+                    "claim", "affected_location",
                     "causal_chain", "supporting_evidence_ids",
                     "related_obligation_ids", "consequence_support", "severity",
                     "user_visible_consequence",
@@ -789,8 +789,9 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
     "Use the controller C# handles from the latest authoritative receipt for "
     "existing candidates. A superseded update must include superseded_by with "
     "a different active C# handle. Put full candidate objects only in "
-    "new_candidates; their original candidate_id remains valid within the same "
-    "checkpoint until the controller assigns a handle. "
+    "new_candidates; candidate_id is optional for new candidates because the "
+    "controller assigns handles. A supplied original candidate_id remains valid "
+    "within the same checkpoint. "
     "Keep checkpoints compact: emit at most 8 new candidates, with one concise "
     "sentence per claim/causal_chain/consequence/manual_validation field; keep "
     "claim under 300 characters, causal_chain under 600 characters, and "
@@ -1001,6 +1002,15 @@ class _CandidateRetentionSignal:
         )
 
 
+def _candidate_retention_id(value: Mapping[str, Any]) -> str:
+    """Identify a draft even when the model leaves handle allocation to us."""
+    return str(value.get("candidate_id") or "").strip() or (
+        "draft:" + hashlib.sha256(json.dumps(
+            value, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+    )
+
+
 def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
     """Retain only bounded structured IDs/counts, never candidate prose."""
     raw = _json_object(text)
@@ -1044,7 +1054,7 @@ def _candidate_retention_signal(text: str) -> _CandidateRetentionSignal:
             omitted_candidate_ids = 1
         for value in raw_new_candidates[:_MAX_CHECKPOINT_CANDIDATE_IDS + 1]:
             if isinstance(value, Mapping):
-                candidate_id = str(value.get("candidate_id") or "").strip()
+                candidate_id = _candidate_retention_id(value)
                 if candidate_id:
                     candidate_ids.append(candidate_id)
                     if not str(value.get("claim") or "").strip():
@@ -1503,6 +1513,8 @@ class SpecialistSession:
             "attempted": False, "status": "not_needed",
         }
         self._candidate_retention_signal = _CandidateRetentionSignal()
+        self.continuation_blocked = False
+        self._prefill_unsupported = False
         self.latest_checkpoint = self._project_checkpoint(())
         self.source_access_requests: tuple[
             SourceAccessRequest | RepositoryAccessRequest, ...
@@ -2620,6 +2632,8 @@ class SpecialistSession:
         """Explore until the specialist emits or is forced to a checkpoint."""
         if self._final_result is not None:
             return self._final_result
+        if self.continuation_blocked:
+            return self._snapshot(degraded=True)
         self.lease.request_timeout(
             self.request_timeout_sec, now=self.clock(),
         )
@@ -2657,11 +2671,11 @@ class SpecialistSession:
                         or self._checkpoint_pressure_due()
                     )
                 if continuation_pressure:
+                    self.continuation_blocked = True
                     self.state = SessionState.CHECKPOINT
                     return self._snapshot(degraded=True)
         self.state = SessionState.EXPLORING
         tool_less_continuation_used = False
-        prefill_fallback_used = False
         request_purpose = "exploration"
         while True:
             if self.conversation.approx_tokens() > self.max_context_tokens:
@@ -2679,6 +2693,19 @@ class SpecialistSession:
                 return self._checkpoint_and_resume("context-pressure")
             if self.budget.remaining_model_turns() <= _CHECKPOINT_TURN_RESERVE:
                 return self.request_checkpoint("checkpoint-retention-reserve")
+            assistant_ended = bool(
+                len(self.conversation.events) >= 2
+                and self.conversation.events[-1]["kind"] == "assistant_turn_boundary"
+                and self.conversation.events[-2]["kind"]
+                in {"assistant_reasoning", "assistant_text"}
+            )
+            if self._prefill_unsupported and assistant_ended:
+                self.conversation.add_user(
+                    "The server cannot continue an assistant prefill. Continue "
+                    "the investigation from the retained history; tools remain enabled."
+                )
+                request_purpose = "exploration-prefill-fallback"
+                assistant_ended = False
             try:
                 turn = self._request(
                     tools_enabled=True, schema=None, purpose=request_purpose,
@@ -2692,21 +2719,13 @@ class SpecialistSession:
                     isinstance(exc, ModelRequestError)
                     and "assistant response prefill is incompatible with enable_thinking"
                     in f"{exc} {exc.body}".casefold()
-                    and tool_less_continuation_used
-                    and not prefill_fallback_used
-                    and [event["kind"] for event in self.conversation.events[-2:]]
-                    == ["assistant_reasoning", "assistant_turn_boundary"]
+                    and assistant_ended
+                    and not self._prefill_unsupported
                 ):
                     # Some thinking templates cannot continue an assistant prefill.
                     # Keep the partial reasoning, but start a new assistant turn.
                     # The loop still enforces the normal context/time/turn budget.
-                    prefill_fallback_used = True
-                    request_purpose = "exploration-prefill-fallback"
-                    self.conversation.add_user(
-                        "The server could not continue the interrupted assistant "
-                        "response as a prefill. Continue the investigation from "
-                        "the retained history; tools remain enabled."
-                    )
+                    self._prefill_unsupported = True
                     continue
                 if (isinstance(exc, TimeoutError)
                     and isinstance(exc.__cause__, ModelRequestError)
@@ -2914,6 +2933,10 @@ class SpecialistSession:
         if self._reconstruct_from_valid_checkpoint():
             after = self._estimate_admission(
                 tools_enabled=True, max_tokens=self.max_tokens,
+            )
+            self.continuation_blocked = (
+                after.admission_tokens > self.max_context_tokens
+                or self._checkpoint_pressure_due()
             )
             if diagnostic_recorded and self._finalization_diagnostics:
                 self._finalization_diagnostics[-1]["fallback_projection"] = False
@@ -4561,6 +4584,10 @@ class SpecialistSession:
     ) -> SessionResult:
         """Request a structured checkpoint; never force a final report."""
         disposition = CheckpointDisposition(disposition)
+        if disposition is CheckpointDisposition.COMPACT_RESUME:
+            # An explicit successful checkpoint can reopen continuation. Until
+            # then, even timeout/admission failures must not create a retry loop.
+            self.continuation_blocked = True
         prior_checkpoint = self._last_valid_checkpoint
         had_valid_checkpoint = prior_checkpoint is not None
         if candidate_signal is not None:
@@ -5056,6 +5083,8 @@ class SpecialistSession:
         elif retention_unknown:
             checkpoint = self._checkpoint_with_retention_unknown(checkpoint)
         self._checkpoint_state_degraded = fallback_projection or retention_unknown
+        if disposition is CheckpointDisposition.COMPACT_RESUME:
+            self.continuation_blocked = self._checkpoint_state_degraded
         # Keep one bounded diagnostic for every checkpoint request, including
         # successful first-pass checkpoints.  This makes the lifecycle log
         # distinguish “valid checkpoint accepted” from “repair/fallback”
@@ -5359,6 +5388,8 @@ class SpecialistSession:
                     diagnostic,
                 ))
                 self._rejected_candidate_ids.add(candidate_label)
+                if isinstance(value, Mapping):
+                    self._rejected_candidate_ids.add(_candidate_retention_id(value))
                 continue
             existing = candidates.get(candidate.candidate_id)
             if existing is not None and existing != candidate:
@@ -5714,7 +5745,7 @@ class SpecialistSession:
         unsupported = sorted(set(value) - allowed)
         if unsupported:
             return None, "unsupported candidate fields: " + ", ".join(unsupported)
-        candidate_id = str(value.get("candidate_id") or "").strip()
+        candidate_id = _candidate_retention_id(value)
         claim = str(value.get("claim") or "").strip()
         affected_location = str(value.get("affected_location") or "").strip()
         causal_chain = str(value.get("causal_chain") or "").strip()
