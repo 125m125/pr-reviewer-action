@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 from dataclasses import dataclass, replace
@@ -149,6 +150,41 @@ def is_retained_empty_repository_search(record: EvidenceRecord) -> bool:
     return isinstance(content, Mapping) and content.get("matches") == []
 
 
+def boundary_participant_source(
+    record: EvidenceRecord, endpoint_paths: tuple[str, ...],
+    contract_paths: tuple[str, ...], *, not_applicable: bool = False,
+) -> bool:
+    if not_applicable and is_retained_empty_repository_search(record):
+        return True
+    if not record.source_path:
+        return False
+    if endpoint_paths:
+        return any(fnmatch.fnmatchcase(record.source_path, pattern) for pattern in endpoint_paths)
+    return not any(fnmatch.fnmatchcase(record.source_path, pattern) for pattern in contract_paths)
+
+
+def boundary_source_diagnostic(
+    record: EvidenceRecord, expected_head_sha: str | None,
+) -> str | None:
+    if record.tool not in {"read_file", "read_pr_diff", "read_remote_file", "git_grep", "git_blame"} or (
+        not record.source_path and not is_retained_empty_repository_search(record)
+    ):
+        return "not retained repository source"
+    if not record.is_usable_for_coverage or not record.content:
+        return "unsuccessful or empty source read"
+    if record.truncated:
+        return "truncated source read"
+    actual_hash = hashlib.sha256(record.content.encode("utf-8")).hexdigest()
+    if actual_hash != record.content_hash:
+        return "content hash mismatch"
+    revision = record.provenance.head_sha
+    if not revision:
+        return "missing immutable head_sha provenance"
+    if expected_head_sha and revision != expected_head_sha:
+        return "head_sha provenance mismatch"
+    return None
+
+
 class ObligationAssessmentLedger:
     """Validate model proposals while retaining controller authority."""
 
@@ -158,6 +194,7 @@ class ObligationAssessmentLedger:
         session_id: str,
         obligations: Iterable[CoverageObligation],
         obligation_ids: Iterable[str],
+        expected_head_sha: str | None = None,
     ) -> None:
         if not str(session_id).strip():
             raise ValueError("session_id must be non-empty")
@@ -174,6 +211,7 @@ class ObligationAssessmentLedger:
                 explanation="Inspect the assigned obligation.",
             )
         self.session_id = str(session_id)
+        self.expected_head_sha = expected_head_sha
         self._obligations = {item: by_id[item] for item in owned}
         self._handle_to_id = {
             f"O{index}": obligation_id
@@ -339,6 +377,16 @@ class ObligationAssessmentLedger:
             marker in path for path in proposed_path_set for marker in "*?["
         )
         invalid_paths = proposed_path_set - set(owned_paths)
+        if obligation.boundary_id and not obligation.evaluator_owned:
+            # Unchanged sources support the boundary conclusion, not changed-file coverage.
+            supporting_paths = {
+                records[item].source_path for item in retained_ids if item in records
+                and eligible(records[item], obligation)
+                and boundary_source_diagnostic(records[item], self.expected_head_sha) is None
+            }
+            invalid_paths = (
+                set(proposed_assessed) - set(owned_paths) - supporting_paths
+            ) | (set(proposed_omitted) - set(owned_paths))
         overlap = set(proposed_assessed) & set(proposed_omitted)
         accumulated_paths = (
             set(assessment.assessed_paths) | set(proposed_assessed)
@@ -425,6 +473,25 @@ class ObligationAssessmentLedger:
             error = "supported work requires retained evidence"
         elif supported and not eligible_ids:
             error = "supported work requires eligible retained evidence"
+        elif (
+            obligation.boundary_id and obligation.participant_id
+            and effective in {ObligationDisposition.COVERED, ObligationDisposition.NOT_APPLICABLE}
+            and not any(
+                boundary_source_diagnostic(records[item], self.expected_head_sha) is None
+                and boundary_participant_source(
+                    records[item], obligation.boundary_endpoint_paths,
+                    obligation.boundary_contract_paths,
+                    not_applicable=effective is ObligationDisposition.NOT_APPLICABLE,
+                )
+                for item in eligible_ids
+            )
+        ):
+            error = (
+                "boundary closure requires usable retained participant source evidence; "
+                "inspect and cite " + (", ".join(obligation.boundary_endpoint_paths)
+                or "participant implementation outside the boundary contract")
+                + " with immutable current-head head_sha provenance"
+            )
         elif (
             proposed is ObligationDisposition.PARTIALLY_COVERED
             and not resolved_omitted

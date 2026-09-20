@@ -648,7 +648,8 @@
           "scripts/sections/config.sh"
         ],
         "specialist-runtime": [
-          "pr_reviewer/specialist_runtime/cli.py"
+          "pr_reviewer/specialist_runtime/cli.py",
+          "pr_reviewer/specialist_runtime/policy.py"
         ]
       },
       "objective": "Compare changed action input defaults and environment values with runtime parsing and validation."

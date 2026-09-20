@@ -1979,6 +1979,8 @@ class _IsolatedSessionHandle:
 
     def apply_investigation_lead_feedback(
         self, target: str, lead: InvestigationLead,
+        prior_work: Mapping[str, object] | None = None,
+        evidence: EvidenceSnapshot | None = None,
     ) -> None:
         callback = getattr(
             self.session, "apply_investigation_lead_feedback", None,
@@ -1987,7 +1989,15 @@ class _IsolatedSessionHandle:
             raise TypeError(
                 "resumed session must support apply_investigation_lead_feedback"
             )
-        callback(target, lead)
+        if evidence is not None:
+            self.evidence.merge_completed_snapshot(evidence)
+            for record in evidence.records:
+                self.evidence.import_into_session(self.session_id, record.id)
+            self.baseline_evidence_ids |= frozenset(evidence.evidence_ids)
+        if prior_work is None:
+            callback(target, lead)
+        else:
+            callback(target, lead, prior_work)
 
     def recover(self, reason: str) -> object:
         callback = getattr(self.session, "recover", None)
@@ -3437,6 +3447,16 @@ class ReviewController:
             session._accepted_work_observer = handle.retain_accepted_work
         state.sessions[session_id] = handle
         state.assignment_sessions[assignment.id] = session_id
+        if lease.phase is RunPhase.FOLLOWUP and callable(getattr(
+            session, "apply_investigation_lead_feedback", None,
+        )):
+            for index, lead in enumerate(assignment.investigation_leads, start=1):
+                if lead.kind == "delegation":
+                    continue
+                prior_work, sources = self._followup_prior_work(state, assignment, lead)
+                handle.apply_investigation_lead_feedback(
+                    f"L{index}", lead, prior_work, sources,
+                )
         budget_binder = getattr(
             session, "bind_global_budget_admission_handler", None,
         )
@@ -3797,6 +3817,7 @@ class ReviewController:
                     )
                 validator = ObligationAssessmentLedger(
                     session_id=session_id,
+                    expected_head_sha=state.inputs.head_sha,
                     obligations=(obligation,),
                     obligation_ids=(obligation.id,),
                 )
@@ -4212,6 +4233,105 @@ class ReviewController:
             self._degrade(state, "negotiator", _bounded_error(exc))
             return ()
 
+    def _followup_prior_work(
+        self, state: _RunState, assignment: Assignment, lead: InvestigationLead,
+    ) -> tuple[dict[str, object], EvidenceSnapshot]:
+        """Share bounded claims, never coverage authority or local candidate handles."""
+        paths = tuple(dict.fromkeys((
+            *assignment.seed_paths, *assignment.boundary_paths,
+            *assignment.owned_changed_paths, *lead.affected_paths,
+        )))
+
+        def relevant(path: str) -> bool:
+            return any(
+                fnmatch.fnmatchcase(path, pattern)
+                or path == pattern.rstrip("/")
+                or path.startswith(pattern.rstrip("/") + "/")
+                for pattern in paths
+            )
+
+        obligation_ids = set(assignment.obligation_ids)
+        obligation_ids.update(
+            item.id for item in state.obligations
+            if any(relevant(path) for path in item.scope)
+        )
+        evidence_ids = list(lead.evidence_ids[:12])
+        candidates = []
+        active_by_session = {
+            session_id: set(result.checkpoint.candidate_finding_ids)
+            for (_assignment_id, session_id), result in state.session_results.items()
+        }
+        for candidate in (*state.candidate_occurrences.values(), *state.inputs.candidate_findings):
+            if (
+                candidate.collector_session_id in active_by_session
+                and candidate.candidate_id not in active_by_session[candidate.collector_session_id]
+            ):
+                continue
+            if not (
+                candidate.candidate_id in lead.candidate_ids
+                or set(candidate.related_obligation_ids) & obligation_ids
+                or relevant(candidate.affected_location.split(":", 1)[0])
+            ):
+                continue
+            candidates.append({
+                "candidate_id": candidate.candidate_id[:160],
+                "claim": mask_runtime_text(candidate.claim, limit=600),
+                "causal_chain": mask_runtime_text(candidate.causal_chain, limit=600),
+                "affected_location": candidate.affected_location[:300],
+                "evidence_ids": list(dict.fromkeys((
+                    *candidate.supporting_evidence_ids,
+                    *candidate.contradicting_evidence_ids,
+                )))[:8],
+            })
+            evidence_ids.extend(candidates[-1]["evidence_ids"])
+            if len(candidates) == 6:
+                break
+        latest = {}
+        for _revision, _owner, assessment in self._accepted_checkpoint_assessments(state):
+            if assessment.obligation_id in obligation_ids:
+                latest[assessment.obligation_id] = assessment
+        assessments = []
+        for assessment in tuple(latest.values())[:8]:
+            assessments.append({
+                "obligation_id": assessment.obligation_id,
+                "disposition": assessment.disposition.value,
+                "reason": mask_runtime_text(assessment.reason, limit=600),
+                "evidence_ids": list(assessment.evidence_ids[:8]),
+                "next_actions": [mask_runtime_text(item, limit=300) for item in assessment.next_actions[:3]],
+            })
+            evidence_ids.extend(assessment.evidence_ids[:8])
+        sources = []
+        for evidence_id in dict.fromkeys(evidence_ids):
+            record = state.evidence.lookup_canonical(evidence_id)
+            if (
+                record is not None and record.source_path and relevant(record.source_path)
+                and record.provenance.head_sha == state.inputs.head_sha
+            ):
+                sources.append(record)
+            if len(sources) == 12:
+                break
+        retained_ids = {record.id for record in sources}
+        for item in (*candidates, *assessments):
+            item["evidence_ids"] = [value for value in item["evidence_ids"] if value in retained_ids]
+        evaluation = state.boundary_evaluations.get(lead.lead_id.removeprefix("boundary:"))
+        return {
+            "missing_question": mask_runtime_text(
+                getattr(evaluation, "missing_fact", "") or lead.next_action, limit=1000,
+            ),
+            "semantics": (
+                "Prior candidates and assessments are unverified claims, not facts or coverage proof. "
+                "You may contradict them. Answer only the missing question; do not restart the whole "
+                "investigation. Candidate IDs identify other sessions' work, not local withdrawal handles. "
+                "Use retained source evidence to verify claims and avoid restating an existing defect."
+            ),
+            "candidates": candidates,
+            "assessments": assessments,
+            "evidence": [{
+                "evidence_id": record.id, "source": record.source_path,
+                "excerpt": record.content[:600],
+            } for record in sources],
+        }, EvidenceSnapshot(tuple(sources))
+
     def _followup_assignments(
         self, state: _RunState, actions: Iterable[NegotiationAction],
     ) -> tuple[Assignment, ...]:
@@ -4275,10 +4395,13 @@ class ReviewController:
                     lead_id = action.lead_ids[0]
                     lead = state.investigation_leads.get(lead_id)
                     lead_target = self._investigation_lead_target(state, lead_id)
+                    prior_work, sources = self._followup_prior_work(
+                        state, assignment, lead,
+                    ) if lead is not None else (None, None)
                     succeeded, _ = self._session_hook(
                         state, action.session_id,
                         "apply_investigation_lead_feedback",
-                        RunPhase.FOLLOWUP, lead_target, lead,
+                        RunPhase.FOLLOWUP, lead_target, lead, prior_work, sources,
                     ) if lead is not None else (False, None)
                     if succeeded and lead is not None:
                         state.investigation_leads[lead_id] = replace(

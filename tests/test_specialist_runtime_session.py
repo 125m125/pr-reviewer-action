@@ -1582,6 +1582,34 @@ def test_investigation_lead_feedback_authorizes_targeted_tools_and_evidence_reco
     assert recovered["status"] == "ok"
 
 
+def test_followup_prior_work_exposes_only_selected_retained_evidence():
+    session = make_session(ScriptedGateway([]))
+    record = seed_successful_tool_exchange(
+        session, call_id="prior-read", path="a.py", content="retained implementation",
+    )
+    lead = InvestigationLead(
+        lead_id="lead:followup", summary="Check the remaining consumer.",
+        affected_paths=("a.py",), evidence_ids=(), next_action="Trace the consumer.",
+        required_capability="repository", origin_session_id="S0",
+    )
+    prior_work = {
+        "missing_question": "Does the consumer preserve the value?",
+        "evidence": [{"evidence_id": record.id, "excerpt": "retained"}],
+    }
+    session.apply_investigation_lead_feedback("L7", lead, prior_work)
+    feedback = session.conversation.events[-1]["content"]
+    assert "Does the consumer preserve the value?" in feedback
+    assert "not authoritative" in feedback
+    recovered = session._read_compacted_evidence({
+        "evidence_id": record.id, "target": "L7", "purpose": "contradiction_check",
+    })
+    assert recovered["content"] == "retained implementation"
+    assert session.session_id in session.evidence_store.lookup_canonical(record.id).imported_by
+    assert session._read_compacted_evidence({
+        "evidence_id": record.id, "target": "L7", "purpose": "contradiction_check",
+    })["replayed_compacted"] is True
+
+
 def test_test_result_report_filter_and_pagination_retain_distinct_evidence():
     session = make_session([])
     session.test_results = (
@@ -3865,6 +3893,7 @@ def test_checkpoint_partially_accepts_obligations_and_repairs_only_rejections():
         candidate_updates=[], new_candidates=[], unknowns=[],
         working_summary="The implementation and tests were inspected.",
         completed_steps=["Inspected both assigned paths."],
+        proposed_next_actions=[],
     )
     correction = ModelTurnResult(
         response={}, tool_calls=(), text=json.dumps({
@@ -3882,6 +3911,7 @@ def test_checkpoint_partially_accepts_obligations_and_repairs_only_rejections():
     result = session.request_checkpoint("controller-request")
 
     assert result.degraded is False
+    assert result.finalization_diagnostics[-1]["change_correction_parse"] == "valid"
     assert result.checkpoint.working_summary == "The implementation and tests were inspected."
     assessments = session.obligation_assessments.assessments()
     assert assessments[0].disposition.value == "pending"
@@ -3899,6 +3929,30 @@ def test_checkpoint_partially_accepts_obligations_and_repairs_only_rejections():
     assert "Correction result" in receipt
     assert "O1 remains unresolved" in receipt
     assert "O2" in receipt and "blocked" in receipt
+
+
+def test_focused_unresolved_correction_preserves_existing_coverage_and_scope():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read", "name": "read_file", "arguments": '{"path":"a.py"}',
+    },))
+    original = session._checkpoint_from_text(checkpoint_response(
+        inspected=["a.py"], unresolved=["O2"],
+    ).text)
+    assert original is not None
+    session.latest_checkpoint = replace(original, proposed_next_actions=())
+    before = session.coverage.snapshot()
+    correction = json.dumps({"unresolved": ["O1"], "obligation_updates": [],
+                             "candidate_updates": [], "new_candidates": []})
+    assert session._checkpoint_from_text(
+        correction, require_complete_pending=False, allowed_obligation_targets={"O2"},
+    ) is None
+    result = session._checkpoint_from_text(
+        correction, require_complete_pending=False, allowed_obligation_targets={"O1"},
+    )
+    assert result is not None
+    assert session.coverage.snapshot() == before
+    assert session._checkpoint_from_text(correction) is None
 
 
 def test_checkpoint_repairs_only_obligation_declared_updated_and_unresolved():
