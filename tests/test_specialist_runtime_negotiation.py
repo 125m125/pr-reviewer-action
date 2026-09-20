@@ -154,6 +154,7 @@ def test_compact_negotiation_routes_open_lead_to_capable_existing_session():
             "S2", remaining_model_turns=4, remaining_tool_calls=3,
             lease_remaining_sec=100.0,
             advertised_tools=("read_file", "web_search", "web_fetch"),
+            allowed_diff_paths=("src/a.py",),
         ),
     )
     state = state_for(
@@ -210,6 +211,78 @@ def test_fallback_records_blocked_lead_when_no_capable_investigation_is_feasible
     action = fallback_next_action(state)
     assert action.kind == "record_unknown"
     assert action.lead_ids == ("lead:web",)
+
+
+@pytest.mark.parametrize(
+    ("scoped_session", "capacity", "remaining_turns", "fresh_turns", "expected_kind", "expected_session"),
+    [(True, 3, 4, 4, "consult", "S2"), (False, 3, 4, 4, "new_session", None),
+     (False, 2, 4, 4, "record_unknown", None),
+     (True, 3, 0, 4, "new_session", None),
+     (False, 3, 4, 0, "record_unknown", None)],
+)
+def test_lead_followup_requires_immutable_session_scope(
+    scoped_session, capacity, remaining_turns, fresh_turns, expected_kind, expected_session,
+):
+    lead = InvestigationLead(
+        lead_id="boundary:action-runtime-inputs",
+        summary="Check action runtime input transport.",
+        affected_paths=("action.yml",), evidence_ids=(),
+        next_action="Inspect the changed action input wiring.",
+        required_capability="repository", origin_session_id="boundary-evaluator",
+    )
+    resources = tuple(SessionResources(
+        session_id, remaining_model_turns=remaining_turns, remaining_tool_calls=3,
+        lease_remaining_sec=100.0, advertised_tools=("read_pr_diff",),
+        allowed_diff_paths=paths,
+    ) for session_id, paths in (
+        ("S1", ("scripts/redact.py",)),
+        ("S2", ("action.yml",) if scoped_session else ("other.py",)),
+    ))
+    state = state_for(
+        covered=("OB1", "OB2"), resources=resources,
+        max_sessions=capacity, investigation_leads=(lead,),
+        new_session_turns_remaining=fresh_turns,
+    )
+
+    action = fallback_next_action(state)
+
+    assert (action.kind, action.session_id) == (expected_kind, expected_session)
+    with pytest.raises(NegotiationError, match="capability|scope"):
+        validate_negotiation({"actions": [{
+            "kind": "consult", "session_id": "S1", "obligation_ids": [],
+            "lead_ids": [lead.lead_id], "expected_evidence": ["repository"],
+            "estimated_turns": 1, "reason": "Attempt an out-of-scope reuse.",
+        }]}, state)
+
+
+@pytest.mark.parametrize("changed_files,expected_kind", [
+    (("src/a.py",), "resume"),
+    (("src/a.py", "src/caller.py"), "record_unknown"),
+    (None, "record_unknown"),
+])
+def test_lead_scope_distinguishes_unchanged_supporting_sources(changed_files, expected_kind):
+    lead = InvestigationLead(
+        lead_id="lead:caller", summary="Trace the caller contract.",
+        affected_paths=("src/a.py", "src/caller.py"), evidence_ids=("evidence:caller",),
+        next_action="Inspect the retained caller source.",
+        required_capability="repository", origin_session_id="S1",
+    )
+    state = state_for(
+        covered=("OB1", "OB2"), max_sessions=2,
+        resources=(SessionResources(
+            "S1", remaining_model_turns=4, remaining_tool_calls=3,
+            lease_remaining_sec=100.0, advertised_tools=("read_file", "read_pr_diff"),
+            allowed_diff_paths=("src/a.py",),
+        ),),
+        investigation_leads=(lead,),
+    )
+    state = replace(state, changed_files=changed_files)
+
+    action = fallback_next_action(state)
+
+    assert action.kind == expected_kind
+    if expected_kind == "resume":
+        assert action.session_id == "S1"
 
 
 def resume_raw(**updates):

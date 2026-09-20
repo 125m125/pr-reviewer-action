@@ -4,6 +4,54 @@ from dataclasses import replace
 import pytest
 
 
+def test_whole_run_measurements_include_role_calls_retries_and_failed_requests():
+    responses = iter((
+        {"error": "retry me", "usage": {"prompt_tokens": 10, "completion_tokens": 1}},
+        stop_response("{}"),
+        stop_response("{}"),
+    ))
+    gateway = OpenAIModelGateway(
+        base_url="http://model/v1", api_key="secret", default_model="model",
+        transport=lambda *_args, **_kwargs: next(responses),
+    )
+    gateway.complete(replace(turn_request(conversation(), tools_enabled=True), stream=True))
+    gateway.complete(replace(turn_request(conversation(), tools_enabled=False), role="critic"))
+    with pytest.raises(StopIteration):
+        gateway.complete(replace(turn_request(conversation(), tools_enabled=True), allow_fallbacks=False))
+    rows = gateway.performance_snapshot()
+    assert len(rows) == 4
+    assert [row["measured_prompt_tokens"] for row in rows] == [10, 3, 3, None]
+    assert [row["measured_completion_tokens"] for row in rows] == [1, 2, 2, None]
+    assert all(value is None or isinstance(value, (int, float)) for row in rows for value in row.values())
+    rows[0]["measured_prompt_tokens"] = 999
+    assert gateway.performance_snapshot()[0]["measured_prompt_tokens"] == 10
+
+
+def test_whole_run_snapshot_includes_inflight_requests_without_inventing_usage():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Event
+
+    entered, release = Barrier(3), Event()
+    def transport(*_args, **_kwargs):
+        entered.wait(timeout=5)
+        assert release.wait(timeout=5)
+        return stop_response("{}")
+
+    gateway = OpenAIModelGateway(base_url="http://model/v1", api_key="", default_model="model", transport=transport)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(gateway.complete, turn_request(conversation(), tools_enabled=True)) for _ in range(2)]
+        try:
+            entered.wait(timeout=5)
+            rows = gateway.performance_snapshot()
+            assert len(rows) == 2
+            assert all(row["measured_prompt_tokens"] is None for row in rows)
+        finally:
+            release.set()
+        for future in futures:
+            future.result(timeout=5)
+    assert sum(row["measured_prompt_tokens"] for row in gateway.performance_snapshot()) == 6
+
+
 def test_budgeted_checkpoint_retains_wire_tools_without_enabling_execution():
     value = Conversation(system="Review.")
     value.add_user("Save checkpoint.")

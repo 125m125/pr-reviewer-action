@@ -1324,6 +1324,7 @@ def build_controller(
             or config.model_context_tokens * 4,
         )),
         artifact_output_root=config.artifact_root,
+        performance_snapshot=gateway.performance_snapshot,
         event_sink=event_sink,
     )
     controller._cli_session_factory = session_factory  # type: ignore[attr-defined]
@@ -2477,6 +2478,10 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
     ]
     budgets = artifact.get("budgets", {})
     summary_lines.extend(_component_coverage_summary(artifact))
+    model_performance = artifact.get("model_performance", ())
+    summary_lines.extend(performance_summary([
+        item for item in model_performance if isinstance(item, Mapping)
+    ] if isinstance(model_performance, (list, tuple)) else [], all_model_requests=True))
     attempts = budgets.get("request_attempts", ()) if isinstance(budgets, Mapping) else ()
     summary_lines.extend(performance_summary([
         item for item in attempts if isinstance(item, Mapping)

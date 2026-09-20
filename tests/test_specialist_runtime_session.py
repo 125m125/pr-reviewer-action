@@ -2884,7 +2884,8 @@ def test_provider_performance_reaches_attempts_and_checkpoint_resume_report(stre
     assert rows[-1]["prefill_ms"] == 250
     report = "\n".join(performance_summary(rows))
     assert "Checkpoint resumes | 1 | 90.0% (1/1)" in report
-    assert "400.0 | 20.0 | 50.0%" in report
+    assert "400.0 (1/1) | 20.0 (1/1) | 50.0%" in report
+    assert rows[-1]["measured_completion_tokens"] == 20
 
 
 @pytest.mark.parametrize("usage", (
@@ -5232,6 +5233,41 @@ def test_checkpoint_candidate_without_id_is_retained_and_compacted():
     assert len(session.candidate_findings) == 1
     assert len(gateway.requests) == 1
     assert result.finalization_diagnostics[-1]["compaction_level"] == "regular"
+
+
+def test_idless_candidate_survives_whole_checkpoint_repair():
+    draft = json.loads(candidate_checkpoint_response(("draft",)).text)
+    del draft["new_candidates"][0]["candidate_id"]
+    del draft["new_candidates"][0]["severity"]
+    draft["obligation_updates"] = []
+    draft["unresolved"] = []
+    repaired = json.loads(candidate_checkpoint_response(("repaired",)).text)
+    del repaired["new_candidates"][0]["candidate_id"]
+    repaired["new_candidates"][0]["category"] = "correctness"
+    gateway = ScriptedGateway([
+        invalid_response(json.dumps(draft)), invalid_response(json.dumps(repaired)),
+    ])
+    session = make_session(gateway, model_turns=8)
+    session._execute_calls(({
+        "id": "read", "name": "read_file", "arguments": '{"path":"a.py"}',
+    },))
+    result = session.request_checkpoint("context-pressure", disposition="compact_resume")
+    assert not result.degraded
+    assert len(session.candidate_findings) == 1
+    assert len(gateway.requests) == 2
+
+
+@pytest.mark.parametrize("missing_field", ["working_summary", "unresolved"])
+def test_valid_candidate_retained_even_when_checkpoint_memory_is_invalid(missing_field):
+    draft = json.loads(candidate_checkpoint_response(("draft",)).text)
+    draft.pop(missing_field)
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read", "name": "read_file", "arguments": '{"path":"a.py"}',
+    },))
+    assert session._checkpoint_from_text(json.dumps(draft), require_working_memory=True) is None
+    assert [candidate.candidate_id for candidate in session.candidate_findings] == ["draft"]
+    assert not session.latest_checkpoint.candidate_finding_ids
 
 
 def test_rejected_idless_candidate_is_accounted_for_after_focused_repair():

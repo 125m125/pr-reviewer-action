@@ -11,6 +11,7 @@ import json
 import math
 import time
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any, Callable, Mapping, Protocol
 
 from pr_reviewer.conversation import Conversation
@@ -20,6 +21,7 @@ from pr_reviewer.tool_loop import (
     extract_intermediate_turn_parts,
 )
 from pr_reviewer.transport import is_model_endpoint_unavailable, run_chat_request
+from .performance import request_performance
 
 # ``transport`` adds scripts/ to sys.path before importing this module's
 # dependencies, so this is the same redaction implementation used by the
@@ -99,6 +101,8 @@ class OpenAIModelGateway:
     stream_watchdog: bool = True
     structured_chat_template_kwargs: Mapping[str, Any] = field(default_factory=dict)
     transport: Transport | None = None
+    _performance_rows: list[dict[str, int | float | None]] = field(default_factory=list, init=False, repr=False, compare=False)
+    _performance_lock: Any = field(default_factory=Lock, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
@@ -120,6 +124,11 @@ class OpenAIModelGateway:
     def model_for_role(self, role: str) -> str:
         """Return the configured override, otherwise the deterministic default."""
         return self.role_models.get(role, self.default_model)
+
+    def performance_snapshot(self) -> tuple[dict[str, int | float | None], ...]:
+        """Snapshot every physical request, including unmeasured/in-flight calls."""
+        with self._performance_lock:
+            return tuple(dict(row) for row in self._performance_rows)
 
     def render_request(self, request: ModelTurnRequest) -> dict[str, Any]:
         """Render the exact provider payload used for a model turn."""
@@ -253,9 +262,18 @@ class OpenAIModelGateway:
             kwargs: dict[str, Any] = {}
             if watchdog is not None and candidate.get("stream"):
                 kwargs["stream_watchdog"] = watchdog
-            return self.transport(
-                self.base_url, "openai", candidate, self.api_key, request_timeout(), **kwargs,
+            timeout = request_timeout()
+            measurement = request_performance({}, {})
+            with self._performance_lock:
+                self._performance_rows.append(measurement)
+            response = self.transport(
+                self.base_url, "openai", candidate, self.api_key, timeout, **kwargs,
             )
+            if isinstance(response, Mapping):
+                measured = request_performance(response.get("usage"), response.get("timings"))
+                with self._performance_lock:
+                    measurement.update(measured)
+            return response
 
         def unstructured_retry() -> dict[str, Any]:
             nonlocal structured_fallback

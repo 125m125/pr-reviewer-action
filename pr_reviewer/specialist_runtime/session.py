@@ -5175,6 +5175,75 @@ class SpecialistSession:
             payload, sort_keys=True, separators=(",", ":"), default=str,
         ).encode("utf-8")).hexdigest()
 
+    def _retain_checkpoint_candidates(
+        self, raw: Mapping[str, Any], retained: Mapping[str, EvidenceRecord],
+        assigned: set[str], *, account_rejections: bool,
+    ) -> tuple[_CheckpointChangeRejection, ...]:
+        # Candidate admission is independent of checkpoint memory/coverage validity.
+        rejections: list[_CheckpointChangeRejection] = []
+        candidates: dict[str, CandidateFinding] = {
+            item.candidate_id: item for item in self.candidate_findings
+        }
+        candidate_statuses = dict(self._candidate_statuses)
+        new_candidates = raw.get("new_candidates")
+        if isinstance(new_candidates, list):
+            candidate_payloads: list[object] = list(new_candidates)
+        elif new_candidates is not None:
+            return ()
+        else:
+            candidate_payloads = []
+        for index, value in enumerate(candidate_payloads, start=1):
+            candidate_label = (
+                str(value.get("candidate_id") or "").strip()
+                if isinstance(value, Mapping) else ""
+            ) or f"N{index}"
+            candidate, rejection_reason = self._candidate_from_checkpoint(
+                value,
+                retained=retained,
+                assigned=assigned,
+            )
+            if candidate is None:
+                if not account_rejections:
+                    # An incomplete envelope may contain unfinished drafts.
+                    # Salvage valid findings, but keep uncertain losses visible.
+                    continue
+                lead = ""
+                if isinstance(value, Mapping):
+                    lead = self._retain_rejected_candidate_lead(
+                        value, rejection_reason, retained,
+                    )
+                diagnostic = self._candidate_rejection_diagnostic(
+                    rejection_reason, retained=retained, lead=lead,
+                    candidate=value if isinstance(value, Mapping) else None,
+                )
+                rejections.append(_CheckpointChangeRejection(
+                    "candidate-new", candidate_label,
+                    rejection_reason,
+                    dict(value) if isinstance(value, Mapping) else {},
+                    diagnostic,
+                ))
+                self._rejected_candidate_ids.add(candidate_label)
+                if isinstance(value, Mapping):
+                    self._rejected_candidate_ids.add(_candidate_retention_id(value))
+                continue
+            existing = candidates.get(candidate.candidate_id)
+            if existing is not None and existing != candidate:
+                # A repeated ID must not silently rewrite the retained finding.
+                rejections.append(_CheckpointChangeRejection(
+                    "candidate-new", candidate.candidate_id,
+                    "candidate ID conflicts with an admitted candidate",
+                    dict(value),
+                ))
+                self._rejected_candidate_ids.add(candidate.candidate_id)
+                continue
+            candidates[candidate.candidate_id] = candidate
+            candidate_statuses[candidate.candidate_id] = "active"
+            self._rejected_candidate_ids.discard(candidate.candidate_id)
+
+        self.candidate_findings = tuple(candidates[key] for key in sorted(candidates))
+        self._candidate_statuses = candidate_statuses
+        return tuple(rejections)
+
     def _checkpoint_from_text(
         self,
         text: str,
@@ -5195,7 +5264,18 @@ class SpecialistSession:
             and isinstance(raw.get("checkpoint"), Mapping)
         ):
             raw = raw["checkpoint"]
-        if raw is None or not isinstance(raw.get("unresolved"), list):
+        if raw is None:
+            return None
+        retained = {record.id: record for record in self.evidence_store.snapshot().records}
+        assigned = set(self._assigned_obligation_ids())
+        has_envelope = isinstance(raw.get("unresolved"), list)
+        rejections.extend(self._retain_checkpoint_candidates(
+            raw, retained, assigned, account_rejections=has_envelope,
+        ))
+        self._last_checkpoint_rejections = tuple(rejections)
+        if not has_envelope:
+            return None
+        if raw.get("new_candidates") is not None and not isinstance(raw["new_candidates"], list):
             return None
         recognized_keys = set(_CHECKPOINT_SCHEMA["properties"])
         self._last_checkpoint_dropped_keys = tuple(sorted(set(raw) - recognized_keys))
@@ -5212,7 +5292,6 @@ class SpecialistSession:
         )
         if require_working_memory and not (working_summary and completed_steps):
             return None
-        retained = {record.id: record for record in self.evidence_store.snapshot().records}
         evidence_ids = list(dict.fromkeys(
             item for item in (
                 _resolve_retained_evidence_id(value, retained)
@@ -5292,7 +5371,6 @@ class SpecialistSession:
                 if (item := _resolve_retained_evidence_id(value, retained)) is not None
             )
             prepared_obligation_updates.append((normalized_update, resolved_evidence_ids))
-        assigned = set(self._assigned_obligation_ids())
         pending_targets = {
             item.target for item in self.obligation_assessments.assessments()
             if item.disposition.value == "pending"
@@ -5350,60 +5428,8 @@ class SpecialistSession:
             obligation_id = self.obligation_assessments.obligation_id(target)
             if obligation_id in assigned:
                 self.coverage.mark_unresolved(obligation_id)
-        candidates: dict[str, CandidateFinding] = {
-            item.candidate_id: item for item in self.candidate_findings
-        }
+        candidates = {item.candidate_id: item for item in self.candidate_findings}
         candidate_statuses = dict(self._candidate_statuses)
-        new_candidates = raw.get("new_candidates")
-        if isinstance(new_candidates, list):
-            candidate_payloads: list[object] = list(new_candidates)
-        elif new_candidates is not None:
-            return None
-        else:
-            candidate_payloads = []
-        for index, value in enumerate(candidate_payloads, start=1):
-            candidate_label = (
-                str(value.get("candidate_id") or "").strip()
-                if isinstance(value, Mapping) else ""
-            ) or f"N{index}"
-            candidate, rejection_reason = self._candidate_from_checkpoint(
-                value,
-                retained=retained,
-                assigned=assigned,
-            )
-            if candidate is None:
-                lead = ""
-                if isinstance(value, Mapping):
-                    lead = self._retain_rejected_candidate_lead(
-                        value, rejection_reason, retained,
-                    )
-                diagnostic = self._candidate_rejection_diagnostic(
-                    rejection_reason, retained=retained, lead=lead,
-                    candidate=value if isinstance(value, Mapping) else None,
-                )
-                rejections.append(_CheckpointChangeRejection(
-                    "candidate-new", candidate_label,
-                    rejection_reason,
-                    dict(value) if isinstance(value, Mapping) else {},
-                    diagnostic,
-                ))
-                self._rejected_candidate_ids.add(candidate_label)
-                if isinstance(value, Mapping):
-                    self._rejected_candidate_ids.add(_candidate_retention_id(value))
-                continue
-            existing = candidates.get(candidate.candidate_id)
-            if existing is not None and existing != candidate:
-                # A repeated ID must not silently rewrite the retained finding.
-                rejections.append(_CheckpointChangeRejection(
-                    "candidate-new", candidate.candidate_id,
-                    "candidate ID conflicts with an admitted candidate",
-                    dict(value),
-                ))
-                self._rejected_candidate_ids.add(candidate.candidate_id)
-                continue
-            candidates[candidate.candidate_id] = candidate
-            candidate_statuses[candidate.candidate_id] = "active"
-            self._rejected_candidate_ids.discard(candidate.candidate_id)
 
         updates = raw.get("candidate_updates", [])
         if updates is None:
