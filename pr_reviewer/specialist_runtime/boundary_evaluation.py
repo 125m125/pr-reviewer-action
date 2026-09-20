@@ -11,14 +11,12 @@ from typing import Iterable, Mapping
 from .evidence import EvidenceRecord, EvidenceSnapshot
 from .obligation_assessment import (
     ObligationAssessment, ObligationDisposition,
-    is_retained_empty_repository_search,
+    boundary_participant_source,
+    boundary_source_diagnostic as _source_diagnostic,
 )
 from .policy import BoundaryPolicy
 
 
-_SOURCE_TOOLS = frozenset({
-    "read_file", "read_pr_diff", "read_remote_file", "git_grep", "git_blame",
-})
 _COMPLETE_DISPOSITIONS = frozenset({
     ObligationDisposition.COVERED,
     ObligationDisposition.NOT_APPLICABLE,
@@ -36,14 +34,10 @@ def _participant_source(
     record: EvidenceRecord, participant: str,
     assessment: ObligationAssessment, boundary: BoundaryPolicy,
 ) -> bool:
-    if assessment.disposition is ObligationDisposition.NOT_APPLICABLE and is_retained_empty_repository_search(record):
-        return True
-    if not record.source_path:
-        return False
-    endpoints = boundary.endpoint_paths.get(participant)
-    if endpoints:
-        return any(fnmatch.fnmatchcase(record.source_path, pattern) for pattern in endpoints)
-    return not any(fnmatch.fnmatchcase(record.source_path, pattern) for pattern in boundary.contract_paths)
+    return boundary_participant_source(
+        record, boundary.endpoint_paths.get(participant, ()), boundary.contract_paths,
+        not_applicable=assessment.disposition is ObligationDisposition.NOT_APPLICABLE,
+    )
 
 
 @dataclass(frozen=True)
@@ -407,25 +401,3 @@ def _record_semantics(record: EvidenceRecord) -> dict[str, object]:
         "head_sha": record.provenance.head_sha,
         "contradicts": list(record.contradicts),
     }
-
-
-def _source_diagnostic(
-    record: EvidenceRecord, expected_head_sha: str | None,
-) -> str | None:
-    if record.tool not in _SOURCE_TOOLS or (
-        not record.source_path and not is_retained_empty_repository_search(record)
-    ):
-        return "not retained repository source"
-    if not record.is_usable_for_coverage or not record.content:
-        return "unsuccessful or empty source read"
-    if record.truncated:
-        return "truncated source read"
-    actual_hash = hashlib.sha256(record.content.encode("utf-8")).hexdigest()
-    if actual_hash != record.content_hash:
-        return "content hash mismatch"
-    revision = record.provenance.head_sha
-    if not revision:
-        return "missing immutable head_sha provenance"
-    if expected_head_sha and revision != expected_head_sha:
-        return "head_sha provenance mismatch"
-    return None

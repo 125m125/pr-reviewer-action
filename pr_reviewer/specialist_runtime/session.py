@@ -316,7 +316,9 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
                 "type": "array", "items": {"type": "string"},
                 "description": (
                     "Exact owned changed paths assessed together in this update; "
-                    "describe observed behavior in reason."
+                    "describe observed behavior in reason. Boundary assessments may also "
+                    "cite retained unchanged supporting paths; only owned changed paths "
+                    "count toward changed-path coverage."
                 ),
             },
             "omitted_paths": {
@@ -1480,6 +1482,7 @@ class SpecialistSession:
         self._current_gaps = self._assigned_obligation_ids()
         self.obligation_assessments = ObligationAssessmentLedger(
             session_id=self.session_id,
+            expected_head_sha=self.repository_head_sha or None,
             obligations=self._session_obligations(),
             obligation_ids=self._current_gaps,
         )
@@ -1989,7 +1992,10 @@ class SpecialistSession:
         lines.extend((
             "Return only corrections for these rejected changes. For each "
             "rejected obligation, revise its obligation_updates entry or list "
-            "its target in unresolved. A rejected new candidate may be revised "
+            "its target in unresolved. Listing a target in unresolved leaves "
+            "its current assessment unchanged; this partial correction does "
+            "not require a new working summary or proposed_next_actions. "
+            "A rejected new candidate may be revised "
             "in new_candidates or omitted; omission leaves it inactive. A "
             "rejected candidate update may be revised in candidate_updates or "
             "omitted; omission preserves the current candidate state.",
@@ -5312,6 +5318,14 @@ class SpecialistSession:
             target for value in unresolved
             if (target := self.obligation_assessments.canonical_target(value))
         }
+        if allowed_obligation_targets is not None and any(
+            self.obligation_assessments.canonical_target(value)
+            not in allowed_obligation_targets for value in unresolved
+        ):
+            self._last_checkpoint_validation_error = (
+                "unresolved correction targets must belong to the rejected change set"
+            )
+            return None
         obligation_updates = raw.get("obligation_updates", [])
         if not isinstance(obligation_updates, list):
             return None
@@ -5417,14 +5431,16 @@ class SpecialistSession:
             if action.strip().casefold() not in unresolved_action_labels
             and len(action.split()) >= 2
         )
-        if unresolved_targets and not concrete_next_actions:
+        if allowed_obligation_targets is None and unresolved_targets and not concrete_next_actions:
             self._last_checkpoint_validation_error = (
                 "Unresolved obligations require at least one concrete "
                 "proposed_next_actions entry describing the next repository "
                 "or evidence check; obligation IDs alone are not actions."
             )
             return None
-        for target in unresolved_targets:
+        # In a focused correction, unresolved declines the proposed update;
+        # it must not downgrade an existing accepted assessment or coverage.
+        for target in unresolved_targets if allowed_obligation_targets is None else ():
             obligation_id = self.obligation_assessments.obligation_id(target)
             if obligation_id in assigned:
                 self.coverage.mark_unresolved(obligation_id)
@@ -6244,6 +6260,7 @@ class SpecialistSession:
 
     def apply_investigation_lead_feedback(
         self, target: str, lead: InvestigationLead,
+        prior_work: Mapping[str, Any] | None = None,
     ) -> None:
         """Attach one controller-selected lead to this durable session."""
         if self._final_result is not None:
@@ -6254,6 +6271,15 @@ class SpecialistSession:
         self._investigation_leads[lead.lead_id] = lead
         self._investigation_lead_targets[normalized_target] = lead.lead_id
         self._assigned_investigation_lead_ids.add(lead.lead_id)
+        if prior_work:
+            for item in prior_work.get("evidence", ()):
+                evidence_id = str(item.get("evidence_id") or "")
+                record = self.evidence_store.lookup_canonical(evidence_id)
+                if record is not None:
+                    # Full prior-source content is omitted from this bounded handoff.
+                    self._compacted_evidence[record.id] = (
+                        self.evidence_store.import_into_session(self.session_id, record.id)
+                    )
         if not any(
             item.get("name") == "resolve_investigation_lead"
             for item in self.conversation.tool_schemas
@@ -6277,7 +6303,15 @@ class SpecialistSession:
                 "evidence_ids": list(lead.evidence_ids),
                 "next_action": lead.next_action,
                 "required_capability": lead.required_capability,
+                **({"prior_work": prior_work} if prior_work else {}),
             }, sort_keys=True)
+            + (
+                " Prior conclusions are not authoritative: verify or contradict them. "
+                "Full omitted source content is available through read_compacted_evidence "
+                "using this lead target; focus on the missing question rather than "
+                "repeating completed investigation."
+                if prior_work else ""
+            )
         )
         self.budget.reset_no_progress_streak("material investigation lead feedback")
 
