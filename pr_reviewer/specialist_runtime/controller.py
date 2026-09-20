@@ -23,7 +23,7 @@ import tempfile
 from threading import Event, RLock
 import time
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
 from pr_reviewer.conversation import Conversation
@@ -2445,6 +2445,7 @@ class ReviewController:
         event_sink: Callable[[RunEvent], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         artifact_writer: Callable[[Path, Mapping[str, object]], object] = _atomic_write_json,
+        performance_snapshot: Callable[[], Sequence[Mapping[str, int | float | None]]] | None = None,
         obligation_deriver: Callable[..., tuple[CoverageObligation, ...]] = derive_obligations,
         assignment_validator: Callable[..., AssignmentPlan] = validate_assignment_plan,
         scheduler_type: type[SessionScheduler] = SessionScheduler,
@@ -2500,6 +2501,7 @@ class ReviewController:
         self.event_sink = event_sink
         self.clock = clock
         self.artifact_writer = artifact_writer
+        self.performance_snapshot = performance_snapshot
         self._uses_atomic_writer = artifact_writer is _atomic_write_json
         self.obligation_deriver = obligation_deriver
         self.assignment_validator = assignment_validator
@@ -4005,6 +4007,7 @@ class ReviewController:
                 remaining_tool_calls=remaining_tools,
                 lease_remaining_sec=session.lease.remaining(now=self.clock()),
                 retained_evidence_count=len(session.evidence.snapshot().records),
+                allowed_diff_paths=tuple(getattr(session.session, "changed_files", ())),
                 advertised_tools=tuple(sorted(
                     str(item.get("name") or "").strip()
                     for item in getattr(
@@ -4066,6 +4069,7 @@ class ReviewController:
                 now=self.clock(),
             ),
             excluded_obligation_ids=tuple(sorted(set(excluded_obligation_ids))),
+            changed_files=state.inputs.changed_files,
             investigation_leads=tuple(
                 state.investigation_leads[key]
                 for key in sorted(state.investigation_leads)
@@ -4386,9 +4390,10 @@ class ReviewController:
                             path for item in selected
                             for path in item.seed_hints
                         )),
-                        boundary_paths=tuple(dict.fromkeys(
-                            path for item in selected for path in item.scope
-                        )),
+                        boundary_paths=tuple(dict.fromkeys((
+                            *(path for item in selected for path in item.scope),
+                            *lead.affected_paths,
+                        ))),
                         expected_evidence=tuple(sorted({
                             category for item in selected
                             for category in item.required_evidence_categories
@@ -4405,7 +4410,10 @@ class ReviewController:
                         tool_call_limit=tool_limit,
                         investigation_leads=(lead,),
                         owned_changed_paths=tuple(dict.fromkeys(
-                            path for item in selected for path in item.scope
+                            path for path in (
+                                *(path for item in selected for path in item.scope),
+                                *lead.affected_paths,
+                            ) if path in state.inputs.changed_files
                         )),
                     )
                 else:
@@ -4425,6 +4433,10 @@ class ReviewController:
                         model_turn_limit=turn_limit,
                         tool_call_limit=tool_limit,
                         investigation_leads=(lead,),
+                        owned_changed_paths=tuple(
+                            path for path in lead.affected_paths
+                            if path in state.inputs.changed_files
+                        ),
                     )
                 state.assignments[assignment.id] = assignment
                 expected_session_id = self._session_identity(state, assignment)
@@ -7653,6 +7665,9 @@ class ReviewController:
                 raise TypeError("emergency artifact projection must be an object")
             projected.update(complete_event_journal)
             artifact = projected
+            self._validate_artifact(artifact)
+        if self.performance_snapshot is not None:
+            artifact["model_performance"] = _json_value(self.performance_snapshot())
             self._validate_artifact(artifact)
         if path is None:
             write_error = path_error or "artifact output path rejected"
