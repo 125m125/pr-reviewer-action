@@ -670,6 +670,7 @@ class ScriptedController:
         self.inputs = inputs
         artifact = {
             "schema_version": 2,
+            "model_performance": [{"measured_prompt_tokens": 1234, "measured_completion_tokens": 56}],
             "evaluation_status": "degraded",
             "budgets": {"request_attempts": [{
                 "status": "completed", "performance_category": "checkpoint-resume",
@@ -783,10 +784,15 @@ def test_cli_writes_structured_handoff_notes_artifact_and_compatibility_output(
     assert controller.inputs.head_sha == "h" * 40
     assert controller.inputs.changed_files == ("src/app.py",)
     summary = (tmp_path / "specialist-review-summary.md").read_text()
+    artifact = json.loads((tmp_path / "specialist-review-artifact.json").read_text())
+    assert artifact["model_performance"][0]["measured_prompt_tokens"] == 1234
+    assert "## Overall model usage and performance" in summary
+    assert "| Overall (all model requests) | 1 |" in summary
+    assert "1,234 (1/1) | 56 (1/1)" in summary
     assert "- Detail review notes: 1" in summary
     assert "## Model cache and performance" in summary
     assert "Checkpoint resumes | 1 | 90.0% (1/1) | 900 / 1,000" in summary
-    assert "400.0 | 20.0 | 50.0%" in summary
+    assert "400.0 (1/1) | 20.0 (1/1) | 50.0%" in summary
     assert "- Review notes:" not in summary
     assert "- Assignment plan: `deterministic_fallback` (repaired: `false`)" in summary
     assert "| planner | invalid \\| plan \\#\\#\\# injected heading " in summary

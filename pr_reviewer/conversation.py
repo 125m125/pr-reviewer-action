@@ -704,11 +704,10 @@ class Conversation:
         """Append an assistant turn carrying tool-call requests.
 
         Each ``call`` is normalised to ``{"id", "name", "arguments"}``. Per
-        the #233 contract, ``arguments`` is treated as an opaque JSON string
-        end-to-end: a string is preserved verbatim (so malformed fragments
-        round-trip and the round-trip property holds for strict OpenAI
-        servers), and a dict/list is serialised **once at this boundary**
-        so the rest of the pipeline never has to think about it.
+        the #233 contract, ``arguments`` is stored as an opaque JSON string:
+        malformed fragments remain available for diagnostics and executor
+        rejection. Only the wire rendering substitutes rejected arguments
+        so strict servers can parse subsequent requests.
         """
         normalised: list[dict[str, Any]] = []
         for call in calls:
@@ -1203,6 +1202,44 @@ class Conversation:
 
     # ---- wire emission ---------------------------------------------------
 
+    def _wire_events(self) -> Iterable[dict[str, Any]]:
+        """Keep rejected calls paired without replaying unparseable arguments.
+
+        Invalid arguments use a history-only placeholder, never execution input.
+        Empty arguments mean an empty object to the executor and are encoded so.
+        Raw arguments and results remain unchanged in neutral event storage.
+        """
+        invalid_ids: set[str] = set()
+        for event in self.events:
+            if event["kind"] == "assistant_tool_calls":
+                calls = []
+                for call in event["calls"]:
+                    if call["arguments"] == "":
+                        call = {**call, "arguments": "{}"}
+                    try:
+                        args = json.loads(call["arguments"])
+                        valid = isinstance(args, dict)
+                    except (ValueError, TypeError):
+                        valid = False
+                    if not valid:
+                        invalid_ids.add(call["id"])
+                        call = {**call, "arguments": "{}"}
+                    calls.append(call)
+                yield {**event, "calls": calls}
+            elif event["kind"] == "tool_result" and event["call_id"] in invalid_ids:
+                yield {
+                    **event,
+                    "is_error": True,
+                    "content": (
+                        "This call was not executed: its arguments were not a complete "
+                        "JSON object. The empty object in history is only a placeholder, "
+                        "not repaired arguments. Submit a fresh complete tool call.\n"
+                        + event["content"]
+                    ),
+                }
+            else:
+                yield event
+
     def _render_openai_messages(self) -> list[dict[str, Any]]:
         """Render neutral events as an OpenAI-format messages list.
 
@@ -1214,7 +1251,7 @@ class Conversation:
         """
         messages: list[dict[str, Any]] = []
         assistant_turn_open = False
-        for e in self.events:
+        for e in self._wire_events():
             kind = e["kind"]
             if kind == "user":
                 messages.append({"role": "user", "content": e["content"]})
@@ -1317,7 +1354,7 @@ class Conversation:
                 messages.append({"role": "user", "content": pending_tool_results})
                 pending_tool_results = []
 
-        for e in self.events:
+        for e in self._wire_events():
             kind = e["kind"]
             if kind == "user":
                 _flush_tool_results()
@@ -1380,16 +1417,7 @@ class Conversation:
                 # current catalogue doesn't do interleaved text+tool_use, so
                 # we emit a tool_use-only turn here.
                 for c in e["calls"]:
-                    try:
-                        input_value = (
-                            json.loads(c["arguments"]) if c["arguments"] else {}
-                        )
-                    except (json.JSONDecodeError, ValueError):
-                        # Some local models return fragmentary JSON in
-                        # arguments; surface it as a string rather than
-                        # dropping the call — the model can still see what
-                        # it asked for.
-                        input_value = {"_raw": c["arguments"]}
+                    input_value = json.loads(c["arguments"] or "{}")
                     blocks.append(
                         {
                             "type": "tool_use",

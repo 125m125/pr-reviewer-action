@@ -83,6 +83,7 @@ class SessionResources:
     remaining_tool_calls: int
     retained_evidence_count: int = 0
     advertised_tools: tuple[str, ...] = ()
+    allowed_diff_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -133,6 +134,7 @@ class NegotiationState:
     new_session_tool_call_cap: int
     excluded_obligation_ids: tuple[str, ...] = ()
     investigation_leads: tuple[InvestigationLead, ...] = ()
+    changed_files: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         obligation_ids = [item.id for item in self.obligations]
@@ -351,8 +353,15 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
                 allowed_actions.insert(0, "resume")
             if any(session_id != origin for session_id in capable_sessions):
                 allowed_actions.insert(0, "consult")
+            required_tools = _required_tools(lead.required_capability)
+            # A fresh assignment can authorize the lead's paths even when no
+            # existing session has that scope or any exploration turns left.
+            capability_available = not required_tools or any(
+                required_tools.intersection(resource.advertised_tools)
+                for resource in state.session_resources
+            )
             if (
-                capable_sessions
+                capability_available
                 and state.current_session_count < state.max_sessions
                 and state.followup_sessions_started < state.max_followup_sessions
                 and state.new_session_turns_remaining > 0
@@ -494,6 +503,10 @@ def _capable_lead_sessions(
     lead: InvestigationLead, state: NegotiationState,
 ) -> tuple[str, ...]:
     required = _required_tools(lead.required_capability)
+    required_diff_paths = set(lead.affected_paths)
+    if state.changed_files is not None:
+        # Unchanged supporting sources use read_file, not the scoped PR diff.
+        required_diff_paths.intersection_update(state.changed_files)
     result = []
     for resource in sorted(state.session_resources, key=lambda item: item.session_id):
         if resource.remaining_model_turns <= _CHECKPOINT_TURN_RESERVE:
@@ -504,6 +517,8 @@ def _capable_lead_sessions(
             continue
         advertised = frozenset(resource.advertised_tools)
         if required and not required.intersection(advertised):
+            continue
+        if not required_diff_paths.issubset(resource.allowed_diff_paths):
             continue
         result.append(resource.session_id)
     return tuple(result)
@@ -810,7 +825,7 @@ def _parse_action(
                 if lead is not None else ""
             )
             if not capable:
-                errors.append(f"{label} session lacks the required lead capability")
+                errors.append(f"{label} session lacks the required lead capability or scope")
             elif kind == "resume" and session_id != origin:
                 errors.append(f"{label} resume session is not the lead origin")
             elif kind == "consult" and session_id == origin:

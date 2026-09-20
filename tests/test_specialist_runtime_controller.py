@@ -114,6 +114,16 @@ def test_controller_public_api_is_importable():
     assert ReviewResult
 
 
+def test_performance_snapshot_is_included_before_hardened_artifact_write(tmp_path):
+    rows = ({"measured_prompt_tokens": 1234, "measured_completion_tokens": 56},) * 2001
+    controller = _controller(tmp_path, performance_snapshot=lambda: rows)
+    result = controller.run(_inputs(tmp_path))
+    assert result.artifact_write_error is None
+    assert result.artifact["model_performance"][0]["measured_prompt_tokens"] == 1234
+    persisted = json.loads(result.artifact_path.read_text(encoding="utf-8"))
+    assert persisted["model_performance"] == list(rows)
+
+
 def test_component_plan_does_not_invoke_initial_planner(tmp_path):
     calls = []
     controller = _controller(tmp_path, planner=lambda request: calls.append(request))
@@ -6396,6 +6406,7 @@ def test_artifact_root_identity_swap_cannot_redirect_atomic_write(tmp_path):
         finalizer=_finalizer,
         clock=lambda: 0.0,
         artifact_output_root=root,
+        performance_snapshot=lambda: ({"measured_prompt_tokens": 10},),
     )
     result = controller.run(_inputs(tmp_path))
 

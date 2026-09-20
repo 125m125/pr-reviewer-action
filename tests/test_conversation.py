@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import sys
+from copy import deepcopy
 from pathlib import Path
 from unittest import main as unittest_main
+
+import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
@@ -1062,18 +1065,73 @@ class TestAnthropicPayload:
         assistant_turn = payload["messages"][0]
         assert assistant_turn["content"][0]["input"] == {"pattern": "auth"}
 
-    def test_anthropic_keeps_raw_arguments_on_invalid_json(self):
-        # Local models sometimes return fragmentary JSON in tool args. The
-        # wire shape must still carry the data through (Anthropic's input is
-        # typed as object, but receiving an unparseable value as a string
-        # marker is preferable to silently dropping the call).
+    @pytest.mark.parametrize("api_format", ["openai", "anthropic"])
+    @pytest.mark.parametrize("arguments", ['{"pattern":', '["not-an-object"]', 'null'])
+    @pytest.mark.parametrize("with_sibling", [False, True])
+    def test_invalid_arguments_are_not_replayed_as_callable_payload(
+        self, api_format, arguments, with_sibling,
+    ):
         c = Conversation()
-        c.add_assistant_tool_calls(
-            [{"id": "a", "name": "git_grep", "arguments": '{"pattern":'}]
-        )
-        payload = c.to_request_payload("anthropic", "claude-3-5-sonnet")
-        assistant_turn = payload["messages"][0]
-        assert assistant_turn["content"][0]["input"] == {"_raw": '{"pattern":'}
+        c.add_user("Review this change")
+        calls = [{"id": "bad", "name": "report_candidate", "arguments": arguments}]
+        if with_sibling:
+            calls.append({"id": "good", "name": "read_file", "arguments": '{"path": "a.py"}'})
+        c.add_assistant_turn(content="Investigating", calls=calls)
+        c.add_tool_result("bad", {"error": "Invalid tool arguments"}, is_error=True)
+        if with_sibling:
+            c.add_tool_result("good", "file contents")
+        original = deepcopy(c.events)
+
+        payload = c.to_request_payload(api_format, "test-model")
+
+        assert c.events == original
+        assert c.events[2]["calls"][0]["arguments"] == arguments
+        assert c.open_tool_call_ids() == set()
+        messages = payload["messages"]
+        assistant = next(m for m in messages if m["role"] == "assistant")
+        if api_format == "openai":
+            rendered_calls = assistant["tool_calls"]
+            inputs = [json.loads(call["function"]["arguments"]) for call in rendered_calls]
+            call_ids = [call["id"] for call in rendered_calls]
+            results = [m for m in messages if m["role"] == "tool"]
+            result_ids = [m["tool_call_id"] for m in results]
+        else:
+            rendered_calls = [b for b in assistant["content"] if b["type"] == "tool_use"]
+            inputs = [call["input"] for call in rendered_calls]
+            call_ids = [call["id"] for call in rendered_calls]
+            results = [b for m in messages if isinstance(m["content"], list)
+                       for b in m["content"] if b["type"] == "tool_result"]
+            result_ids = [b["tool_use_id"] for b in results]
+            assert results[0]["is_error"] is True
+        assert inputs[0] == {}
+        assert call_ids == result_ids == (["bad", "good"] if with_sibling else ["bad"])
+        assert "not executed" in results[0]["content"].lower()
+        assert "fresh complete" in results[0]["content"].lower()
+        if with_sibling:
+            assert inputs[1] == {"path": "a.py"}
+            assert "file contents" in results[1]["content"]
+
+    @pytest.mark.parametrize("api_format", ["openai", "anthropic"])
+    def test_empty_arguments_keep_successful_no_argument_call_history(self, api_format):
+        c = Conversation()
+        c.add_user("Inspect history")
+        c.add_assistant_tool_calls([{"id": "empty", "name": "git_log", "arguments": ""}])
+        c.add_tool_result("empty", "commit history")
+        original = deepcopy(c.events)
+
+        messages = c.to_request_payload(api_format, "test-model")["messages"]
+
+        if api_format == "openai":
+            assert json.loads(messages[1]["tool_calls"][0]["function"]["arguments"]) == {}
+            result = messages[2]
+        else:
+            assert messages[1]["content"][0]["input"] == {}
+            result = messages[2]["content"][0]
+            assert not result.get("is_error")
+        assert 'status="ok"' in result["content"]
+        assert "commit history" in result["content"]
+        assert "not executed" not in result["content"]
+        assert c.events == original
 
     def test_anthropic_tools_omit_input_schema_naming_differences(self):
         c = Conversation()
