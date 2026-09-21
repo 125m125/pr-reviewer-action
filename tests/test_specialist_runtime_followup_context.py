@@ -1,6 +1,7 @@
 from dataclasses import replace
 from types import SimpleNamespace
 import time
+import json
 
 import pytest
 
@@ -15,6 +16,29 @@ from pr_reviewer.specialist_runtime.negotiation import NegotiationAction
 from pr_reviewer.specialist_runtime.obligation_assessment import ObligationAssessment, ObligationDisposition
 from pr_reviewer.specialist_runtime.scheduler import WaveSnapshot
 from pr_reviewer.specialist_runtime.types import CandidateFinding, CoverageObligation, InvestigationLead, RunPhase, SessionCheckpoint, SessionState
+
+
+def test_real_session_followup_serializes_frozen_controller_hook_context(tmp_path):
+    from test_specialist_runtime_session import make_session, ScriptedGateway
+    from pr_reviewer.specialist_runtime.controller import _IsolatedSessionHandle
+    session = make_session(ScriptedGateway([]))
+    inputs = _inputs(tmp_path)
+    state = _RunState(inputs, EventJournal(),
+                      RunDeadline(time.monotonic(), 90, inputs.config.phase_shares), EvidenceStore())
+    state.sessions[session.session_id] = _IsolatedSessionHandle(
+        session.assignment, session, session.session_id, session.evidence_store,
+        session.coverage, session.lease,
+    )
+    lead = InvestigationLead("lead:hook", "Check consumer", ("a.py",), (),
+                             "Trace remaining consumer", "repository", "prior")
+    success, _ = ReviewController(artifact_output_root=tmp_path)._session_hook(
+        state, session.session_id, "apply_investigation_lead_feedback", RunPhase.FOLLOWUP,
+        "L1", lead, {"candidates": [{"claim": "prior claim"}], "evidence": []},
+    )
+    assert success
+    message = session.conversation.events[-1]["content"]
+    packet, _ = json.JSONDecoder().raw_decode(message[message.index('{'):])
+    assert packet["prior_work"]["candidates"] == [{"claim": "prior claim"}]
 
 
 @pytest.mark.parametrize("lead_id", ["boundary:api", "lead-api"])

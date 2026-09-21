@@ -5555,13 +5555,6 @@ class ReviewController:
         # summary because ``tool/secret`` resembles a path causes more harm
         # than accepting an imprecise component name here.
         normalized = " ".join(combined.casefold().split())
-        if re.search(
-            r"(?:^|\s)(?:blocker|major|minor|finding|defect)\b|"
-            r"(?:^|[\s`])[^`\s]+:\d+(?:\b|`)",
-            normalized,
-        ):
-            raise ValueError("detailed findings belong in review notes")
-
         # Do not let a candidate claim leak into the sticky handoff even when it
         # happens to use valid changed paths and components.
         detailed_claims = tuple(

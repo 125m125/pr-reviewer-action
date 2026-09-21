@@ -4123,7 +4123,7 @@ def test_handoff_change_summary_may_name_request_changes_behavior(tmp_path):
             "ai_reviewed_summary": "The AI traced the changed publishing branch.",
             "human_focus": (
                 "Recheck whether the request_changes verdict still creates the "
-                "resulting native review event."
+                "resulting native review event, including incomplete states and finding locations."
             ),
         }
 
@@ -4208,15 +4208,30 @@ def test_handoff_summarizer_does_not_reject_free_form_path_words(tmp_path):
     )
 
 
-def test_handoff_summarizer_gets_one_focused_semantic_repair(tmp_path):
+def test_handoff_summarizer_gets_one_focused_semantic_repair(tmp_path, monkeypatch):
+    from types import SimpleNamespace
     requests = []
+    original = ReviewController._apply_handoff_summary_proposal
+
+    def with_retained_claim(self, state, base, proposal):
+        # This fixture's fake source cannot authorize a real finding. Supply the
+        # already-adjudicated claim at the presentation boundary under test.
+        state.review = replace(state.review, accepted=(SimpleNamespace(
+            claim="A retry can process one delivery twice", user_visible_consequence="",
+        ),))
+        try:
+            return original(self, state, base, proposal)
+        finally:
+            state.review = replace(state.review, accepted=())
+
+    monkeypatch.setattr(ReviewController, "_apply_handoff_summary_proposal", with_retained_claim)
 
     def summarizer(request):
         requests.append(request)
         if len(requests) == 1:
             return {
                 "ai_reviewed_summary": (
-                    "The review found the blocker at src/worker.py:8."
+                    "The AI reviewed retry handling: A retry can process one delivery twice."
                 ),
                 "human_focus": "The blocker at src/worker.py:8 must be fixed.",
             }
@@ -4231,7 +4246,7 @@ def test_handoff_summarizer_gets_one_focused_semantic_repair(tmp_path):
 
     result = _controller(tmp_path, finalizer=summarizer).run(_inputs(tmp_path))
 
-    assert len(requests) == 2
+    assert len(requests) == 2, result.artifact["events"][-8:]
     assert result.handoff.ai_reviewed == (
         "The review traced retry handling through the supplied worker scope.",
     )

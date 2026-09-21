@@ -82,7 +82,7 @@
         "Model-provided values cannot escape repository, command-catalog, repository-API, or web-source boundaries"
       ],
       "invariants": [
-        "API keys never appear in process arguments or retained evidence",
+        "Credentials, including API keys, passwords, and private keys, are protected from disclosure in process arguments, model-facing tool output, and retained evidence",
         "Tool execution remains read-only and policy constrained",
         "Retries, watchdog recovery, and context compaction remain bounded"
       ]
@@ -113,7 +113,7 @@
         "Published findings are sanitized, deduplicated, and anchored only to valid diff lines"
       ],
       "invariants": [
-        "This repository policy cannot publish approvals or native verdict reviews",
+        "This repository's dogfood workflow must not publish approvals or native verdict reviews; the reusable action must still honor other callers' configured publishing modes, including REQUEST_CHANGES in review_verdict mode",
         "Open carried-forward blocking findings continue to prevent a positive recommendation",
         "Upstream references and reserved metadata cannot create notification spam or corrupt managed state"
       ]
@@ -337,7 +337,7 @@
         "tests/test_resolve_finding_threads.py"
       ],
       "invariants": [
-        "Policy and workflow keep publication non-approving",
+        "The dogfood policy and workflow remain non-approving without disabling the reusable action's explicitly configured publishing modes for other callers",
         "Detailed claims and evidence are not duplicated into the handoff summary",
         "Invalid anchors or cleanup failures cannot discard the underlying review"
       ],

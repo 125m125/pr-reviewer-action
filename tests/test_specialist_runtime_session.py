@@ -702,6 +702,22 @@ def test_failed_checkpoint_defers_accounting_until_checkpoint_recovery():
     assert not session._disposition_pass_diagnostics
 
 
+def test_stop_disposition_prompt_supplies_changed_scope_not_reference_paths():
+    obligation = CoverageObligation(
+        obligation_id="OB-code", origin="component", subject="publishing",
+        scope=("a.py",), seed_hints=("tests/test_a.py", "other/**"),
+    )
+    gateway = ScriptedGateway([invalid_response('{"obligation_updates":[]}')])
+    session = make_session(gateway, obligations=(obligation,))
+    session._settle_obligation_batch("exploration-stopped", ["O1"])
+    prompt = next(event["content"] for event in session.conversation.events
+                  if event.get("kind") == "user" and "pending_obligations" in event.get("content", ""))
+    packet = json.loads(prompt[prompt.index('{'):])
+    assert packet["pending_obligations"][0]["owned_changed_paths"] == ["a.py"]
+    assert packet["pending_obligations"][0]["owned_changed_path_count"] == 1
+    assert "unchanged" in packet["response_schema"]["properties"]["obligation_updates"]["items"]["properties"]["omitted_paths"]["description"]
+
+
 def test_invalid_stop_disposition_response_preserves_checkpoint():
     gateway = ScriptedGateway([invalid_response("<tool_call>")])
     session = make_session(gateway)
@@ -1596,7 +1612,10 @@ def test_followup_prior_work_exposes_only_selected_retained_evidence():
         "missing_question": "Does the consumer preserve the value?",
         "evidence": [{"evidence_id": record.id, "excerpt": "retained"}],
     }
-    session.apply_investigation_lead_feedback("L7", lead, prior_work)
+    from pr_reviewer.specialist_runtime.callbacks import freeze_callback_value
+    session.apply_investigation_lead_feedback(
+        *freeze_callback_value(("L7", lead, prior_work)),
+    )
     feedback = session.conversation.events[-1]["content"]
     assert "Does the consumer preserve the value?" in feedback
     assert "not authoritative" in feedback
@@ -1765,6 +1784,46 @@ def test_obligation_resolution_accepts_valid_candidate_siblings_independently():
     assert result["accepted"] is True
     assert [item["accepted"] for item in result["candidate_results"]] == [True, False]
     assert len(session.candidate_findings) == 1
+
+    # Reusing the retained candidate must not invent another investigation lead.
+    assessment = {"defect_assessment": {
+        "result": "candidates", "summary": "The retained candidate describes the defect.",
+        "candidate_drafts": [],
+    }}
+    payload, _ = session._process_defect_assessment(
+        target="O1", arguments={"defect_assessment": {
+            **assessment["defect_assessment"], "result": "needs_followup",
+        }}, evidence_ids=(evidence_id,),
+    )
+    assert payload["defect_assessment"]["lead_retained"] is True
+    payload, progressed = session._process_defect_assessment(
+        target="O1", arguments=assessment, evidence_ids=(evidence_id,),
+    )
+    assert payload["defect_assessment"]["lead_retained"] is False
+    assert progressed is False
+    assert len(session.candidate_findings) == 1
+    assert not any(item["target"] == "O1" for item in session._defect_leads)
+
+    payload, _ = session._process_defect_assessment(
+        target="O1", arguments={"defect_assessment": {
+            **assessment["defect_assessment"], "candidate_drafts": [invalid],
+        }}, evidence_ids=(evidence_id,),
+    )
+    assert payload["defect_assessment"]["lead_retained"] is True
+
+    payload, _ = session._process_defect_assessment(
+        target="O2", arguments=assessment, evidence_ids=(evidence_id,),
+    )
+    assert payload["defect_assessment"]["lead_retained"] is True
+
+    session._execute_candidate_tool("withdraw", "withdraw_candidate", {
+        "target": "C1", "reason": "Subsequent evidence disproved the claim.",
+        "evidence_ids": [evidence_id],
+    })
+    payload, _ = session._process_defect_assessment(
+        target="O1", arguments=assessment, evidence_ids=(evidence_id,),
+    )
+    assert payload["defect_assessment"]["lead_retained"] is True
 
 
 def test_candidate_draft_survives_rejected_obligation_resolution():
@@ -2925,7 +2984,7 @@ def test_provider_performance_reaches_attempts_and_checkpoint_resume_report(stre
 def test_rendered_admission_falls_back_without_valid_provider_usage(usage):
     gateway = EstimatingGateway(
         [checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])],
-        rendered_bytes=6_001,
+        rendered_bytes=12_001,
         usages=(usage,),
     )
     session = make_session(gateway, max_context_tokens=20_000)
@@ -2936,8 +2995,8 @@ def test_rendered_admission_falls_back_without_valid_provider_usage(usage):
     )
 
     assert estimate.source == "rendered-fallback"
-    assert estimate.input_tokens == 2_001
-    assert estimate.admission_tokens == 2_001 + 2_048 + 256
+    assert estimate.input_tokens == 4_001
+    assert estimate.admission_tokens == 4_001 + 2_048 + 256
 
 
 def test_provider_calibration_carries_from_structured_to_tools_mode():
@@ -3946,12 +4005,19 @@ def test_focused_unresolved_correction_preserves_existing_coverage_and_scope():
                              "candidate_updates": [], "new_candidates": []})
     assert session._checkpoint_from_text(
         correction, require_complete_pending=False, allowed_obligation_targets={"O2"},
-    ) is None
+    ) is not None
     result = session._checkpoint_from_text(
         correction, require_complete_pending=False, allowed_obligation_targets={"O1"},
     )
     assert result is not None
     assert session.coverage.snapshot() == before
+    session._checkpoint_from_text(json.dumps({
+        "unresolved": [], "new_candidates": [], "candidate_updates": [],
+        "obligation_updates": [{"target": "O1", "disposition": "blocked",
+                                "reason": "Missing input", "evidence_ids": [], "next_actions": []}],
+    }), require_complete_pending=False, allowed_obligation_targets=set())
+    assert session.coverage.snapshot() == before
+    assert session.obligation_assessments.assessment("O1").disposition.value == "pending"
     assert session._checkpoint_from_text(correction) is None
 
 
