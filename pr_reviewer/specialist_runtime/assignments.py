@@ -1086,7 +1086,12 @@ def component_assignment_plan(
         assignment = Assignment(
             id=f"{kind}-{owner}",
             title=f"Independent {owner} review" if independent else f"Review {owner} changed behavior",
-            objective=" ".join(dict.fromkeys(item.explanation + " " + item.recipe_objective for item in items)),
+            objective=(
+                f"{'Independently assess' if independent else 'Assess'} changed behavior "
+                f"for {owner} and trace affected dependencies as needed. "
+                "Use the obligation briefs for explicit requirements and relevant recipe guidance; "
+                "unchanged supporting files are not a separate whole-component audit."
+            ),
             obligation_ids=tuple(item.id for item in items),
             recipe_ids=tuple(sorted({recipe_id for item in items for recipe_id in (
                 *item.integrated_recipe_ids, *((item.recipe_id,) if item.recipe_id else ()),

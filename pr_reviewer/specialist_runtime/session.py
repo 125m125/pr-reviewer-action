@@ -206,7 +206,9 @@ _DEFECT_ASSESSMENT_SCHEMA: dict[str, Any] = {
     "description": (
         "Assess whether the evidence reviewed for this obligation reveals a "
         "concrete defect. Use candidates with one candidate_drafts item per "
-        "defect, needs_followup for a specific unresolved defect lead, or "
+        "new defect. If active retained candidates already describe this obligation's "
+        "defects, use candidates with an empty candidate_drafts array; do not resubmit "
+        "unchanged candidates. Use needs_followup for a specific unresolved defect lead, or "
         "none_observed when no defect indicator was found."
     ),
     "properties": {
@@ -1222,7 +1224,12 @@ def specialist_assignment_prompt(
             "changed_context only as bounded orientation. Then use read_file only "
             "for the minimum surrounding source needed to evaluate assigned "
             "predicates. Bounded, truncated, or omitted context does not prove "
-            "that other content is absent."
+            "that other content is absent. Assess changed behavior and trace affected "
+            "callers, consumers, and contracts as necessary. Component responsibilities, "
+            "recipe objectives, and seed paths guide relevance; they are not a checklist "
+            "to audit every unchanged neighboring mechanism. Explicit assigned predicates "
+            "and mandatory policy requirements still apply: explain non-applicability "
+            "or remaining gaps rather than silently treating them as covered."
         ),
         "obligation_protocol": _OBLIGATION_PROTOCOL_INSTRUCTION.strip(),
         "change_overview": _assignment_json_value(
@@ -3288,7 +3295,12 @@ class SpecialistSession:
                 "accepted": False,
                 "reason": "candidate draft limit exceeded",
             })
-        if result == "none_observed" or target in accepted_targets:
+        obligation_id = self.obligation_assessments.obligation_id(target)
+        reuses_active_candidate = result == "candidates" and not drafts and any(
+            obligation_id in candidate.related_obligation_ids
+            for candidate in self.candidate_findings
+        )
+        if result == "none_observed" or target in accepted_targets or reuses_active_candidate:
             self._defect_leads = [
                 lead for lead in self._defect_leads
                 if str(lead.get("target") or "") != target
@@ -3296,7 +3308,7 @@ class SpecialistSession:
         lead_retained = False
         should_retain_lead = (
             result == "needs_followup"
-            or (result == "candidates" and not any(
+            or (result == "candidates" and not reuses_active_candidate and not any(
                 item.get("accepted") is True for item in candidate_results
             ))
         )
@@ -5318,14 +5330,8 @@ class SpecialistSession:
             target for value in unresolved
             if (target := self.obligation_assessments.canonical_target(value))
         }
-        if allowed_obligation_targets is not None and any(
-            self.obligation_assessments.canonical_target(value)
-            not in allowed_obligation_targets for value in unresolved
-        ):
-            self._last_checkpoint_validation_error = (
-                "unresolved correction targets must belong to the rejected change set"
-            )
-            return None
+        # Repeated unresolved declarations are non-mutating in a focused repair.
+        # Restrict actual obligation_updates below, not this copied status list.
         obligation_updates = raw.get("obligation_updates", [])
         if not isinstance(obligation_updates, list):
             return None
@@ -6303,7 +6309,7 @@ class SpecialistSession:
                 "evidence_ids": list(lead.evidence_ids),
                 "next_action": lead.next_action,
                 "required_capability": lead.required_capability,
-                **({"prior_work": prior_work} if prior_work else {}),
+                **({"prior_work": _assignment_json_value(prior_work)} if prior_work else {}),
             }, sort_keys=True)
             + (
                 " Prior conclusions are not authoritative: verify or contradict them. "
@@ -7506,6 +7512,12 @@ class SpecialistSession:
             _CHECKPOINT_SCHEMA["properties"]["obligation_updates"]["items"],
         ))
         item_schema["properties"]["target"]["enum"] = targets
+        for field in ("assessed_paths", "omitted_paths"):
+            item_schema["properties"][field]["description"] = (
+                "Exact owned changed paths, never globs or unchanged reference files. "
+                "Use evidence_ids and reason for supporting source reads. "
+                "omitted_paths means owned changed paths left unassessed, not every unread file."
+            )
         schema = {
             "type": "object", "additionalProperties": False,
             "required": ["obligation_updates"],
@@ -7533,11 +7545,21 @@ class SpecialistSession:
             "blocked for an unavailable prerequisite, exhausted when bounded investigation "
             "cannot resolve it, or unresolved with a concrete, new next action when "
             "more investigation would help. Never claim coverage just to finish. "
+            "Owned changed paths below are capped at 40 per target; the count gives "
+            "the full size. A partial list is not the whole scope. Never expand it "
+            "with unread reference files or globs; use reason and next_actions for "
+            "remaining investigation questions. "
             "Missing or rejected updates remain pending.\n"
             + json.dumps({"pending_obligations": [
                 {"subject": self.coverage.obligation(
                     self.obligation_assessments.assessment(target).obligation_id,
                  ).subject,
+                 "owned_changed_paths": list(self.coverage.obligation(
+                     self.obligation_assessments.assessment(target).obligation_id,
+                 ).scope[:40]),
+                 "owned_changed_path_count": len(self.coverage.obligation(
+                     self.obligation_assessments.assessment(target).obligation_id,
+                 ).scope),
                  **{key: value for key, value in self.obligation_assessments.explain(target).items()
                     if key in {"target", "objective", "required_evidence", "disposition", "last_conclusion"}}}
                 for target in targets
