@@ -3950,7 +3950,7 @@ class ReviewController:
                     boundary.id, context["input_fingerprint"], "insufficient_evidence",
                     error or "boundary comparison did not complete", (),
                     missing_fact=error or "compatible participant behavior is not established",
-                    suggested_investigation=f"Check {boundary.objective} using the missing participant/contract source evidence.",
+                    suggested_investigation=context.get("suggested_investigation") or f"Investigate {error or boundary.objective}.",
                 )
             state.boundary_evaluations[boundary.id] = outcome
             supported = outcome.outcome == "supported"
@@ -3965,7 +3965,7 @@ class ReviewController:
                     lead_id=lead_id,
                     summary=(
                         "Boundary compatibility could not be established for "
-                        f"{boundary.objective}; inspect missing participant sources."
+                        f"{boundary.objective}; complete the remaining boundary assessment."
                     ),
                     affected_paths=combined.scope or boundary.contract_paths,
                     evidence_ids=outcome.evidence_ids,
@@ -4321,7 +4321,7 @@ class ReviewController:
             "semantics": (
                 "Prior candidates and assessments are unverified claims, not facts or coverage proof. "
                 "You may contradict them. Answer only the missing question; do not restart the whole "
-                "investigation. Candidate IDs identify other sessions' work, not local withdrawal handles. "
+                "investigation. Prior observations are not local candidate update or withdrawal targets. "
                 "Use retained source evidence to verify claims and avoid restating an existing defect."
             ),
             "candidates": candidates,

@@ -1410,7 +1410,6 @@ def test_investigation_lead_tool_is_bounded_and_resolution_is_assignment_scoped(
     prompt = json.loads(assigned._assignment_prompt().split("\n", 1)[1])
     assert prompt["investigation_lead_targets"] == [{
         "target": "L1",
-        "lead_id": "lead:abc123",
         "summary": "A caller may rely on the changed fallback.",
         "affected_paths": ["a.py"],
         "evidence_ids": [],
@@ -1767,6 +1766,14 @@ def test_obligation_resolution_accepts_valid_candidate_siblings_independently():
     invalid = dict(valid)
     invalid.pop("user_visible_consequence")
 
+    checkpoint_candidate, reason = session._validate_candidate_from_checkpoint(
+        valid,
+        retained={record.id: record for record in session.evidence_store.snapshot().records},
+        assigned={"OB-code", "OB-tests"},
+    )
+    assert checkpoint_candidate is not None, reason
+    assert checkpoint_candidate.related_obligation_ids == ("OB-code",)
+
     session._execute_calls(({
         "id": "resolve-with-drafts", "name": "propose_obligation_resolution",
         "arguments": json.dumps({
@@ -1784,6 +1791,9 @@ def test_obligation_resolution_accepts_valid_candidate_siblings_independently():
     assert result["accepted"] is True
     assert [item["accepted"] for item in result["candidate_results"]] == [True, False]
     assert len(session.candidate_findings) == 1
+    model_payload = session._model_candidate_payload(session.candidate_findings[0])
+    assert model_payload["related_targets"] == ["O1"]
+    assert "related_obligation_ids" not in model_payload
 
     # Reusing the retained candidate must not invent another investigation lead.
     assessment = {"defect_assessment": {
@@ -2162,9 +2172,11 @@ def test_specialist_assignment_exposes_controller_obligation_handles():
     payload = json.loads(prompt.split("\n", 1)[1])
 
     assert payload["obligation_targets"] == [
-        {"target": "O1", "obligation_id": "OB-code"},
-        {"target": "O2", "obligation_id": "OB-tests"},
+        {"target": "O1"},
+        {"target": "O2"},
     ]
+    assert "OB-code" not in prompt
+    assert "compatibility fallback" not in prompt
     assert "Use the short target handles" in payload["obligation_protocol"]
 
 
@@ -3722,10 +3734,15 @@ def test_cumulative_checkpoint_payload_materializes_omitted_candidates():
     assert payload["latest_checkpoint"]["completed_steps"] == [
         "Collected implementation evidence for a.py.",
     ]
-    assert payload["candidate_findings"][0]["candidate_id"] == "C1"
+    assert payload["active_candidates"][0]["candidate_id"] == "C1"
     assert payload["candidate_statuses"] == {"C1": "active"}
     assert payload["latest_checkpoint"]["evidence_ids"]
-    assert payload["coverage"]["obligation_statuses"]["OB-code"] == "pending"
+    assert payload["coverage"]["obligation_statuses"]["O1"] == "pending"
+    assert "OB-code" not in json.dumps(payload["coverage"])
+    assert all("obligation_id" not in item for item in payload["latest_checkpoint"]["obligation_assessments"])
+    feedback = [event["content"] for event in session.conversation.events
+                if event.get("kind") == "user" and event.get("content", "").startswith("Coverage feedback.")]
+    assert feedback and "O2" in feedback[-1] and "OB-tests" not in feedback[-1]
     assert payload["evidence_metadata"][0]["id"].startswith("evidence:")
     assert "content" not in payload["evidence_metadata"][0]
 
@@ -4492,12 +4509,14 @@ def test_candidate_handle_assignment_is_announced_once_and_model_state_is_canoni
     memory = session._model_checkpoint_memory()
     cumulative = session._cumulative_checkpoint_payload()
 
-    assert "candidate-old → C1" in receipt
+    assert "candidate-old →" not in receipt
+    assert "aliases" not in receipt
+    assert "C1" in receipt
     assert "Use C# handles for all subsequent candidate updates" in receipt
     assert session._candidate_alias_receipt() == ""
     assert memory["active_candidates"][0]["candidate_id"] == "C1"
-    assert cumulative["candidate_findings"][0]["candidate_id"] == "C1"
-    assert cumulative["latest_checkpoint"]["candidate_finding_ids"] == ["C1"]
+    assert cumulative["active_candidates"][0]["candidate_id"] == "C1"
+    assert "candidate_finding_ids" not in cumulative["latest_checkpoint"]
     assert cumulative["candidate_statuses"] == {"C1": "active"}
 
 
@@ -4516,7 +4535,8 @@ def test_checkpoint_feedback_announces_new_candidate_handle():
     assert result.degraded is False
     assert any(
         event.get("kind") == "user"
-        and "candidate-old → C1" in str(event.get("content") or "")
+        and "Candidate handles assigned" in str(event.get("content") or "")
+        and '"candidate_id": "C1"' in str(event.get("content") or "")
         for event in session.conversation.events
     )
 

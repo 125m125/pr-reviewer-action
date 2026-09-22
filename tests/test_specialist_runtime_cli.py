@@ -2241,7 +2241,7 @@ def test_specialist_assignment_message_serializes_semantic_brief_and_context(
 
     assert payload["obligation_briefs"] == [{
         "evidence_hints": [],
-        "obligation_id": "topology:worker:delivery",
+        "target": "O1",
         "subject": "worker delivery",
         "explanation": "Trace acknowledgement after persistence.",
         "risk_tier": "high",
@@ -2424,7 +2424,8 @@ def test_recovery_reuses_complete_semantic_assignment_prompt(
     payload = json.loads(recovered_assignment.split("\n", 1)[1])
     initial_payload = json.loads(initial_assignment.split("\n", 1)[1])
     assert all(payload[key] == value for key, value in initial_payload.items())
-    assert payload["obligation_briefs"][0]["obligation_id"] == obligation.id
+    assert payload["obligation_briefs"][0]["target"] == "O1"
+    assert obligation.id not in recovered_assignment
     assert payload["changed_context"][0]["path"] == "worker/delivery.py"
     assert payload["changed_context_omitted_paths"] == 3
     assert payload["change_overview"] == change_overview_orientation(
