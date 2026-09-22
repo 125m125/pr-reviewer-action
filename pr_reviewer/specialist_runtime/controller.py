@@ -5981,6 +5981,15 @@ class ReviewController:
                     },
                     "prepared_notes": {
                         "count": context.unresolved_thread_count,
+                        "accepted_findings": [
+                            {
+                                "claim": finding.claim[:1200],
+                                "affected_location": finding.affected_location,
+                                "user_visible_consequence": finding.user_visible_consequence[:1200],
+                            }
+                            for finding in state.review.accepted[:20]
+                        ],
+                        "omitted_accepted_findings": max(0, len(state.review.accepted) - 20),
                         "themes": tuple(sorted({
                             note.severity or note.kind.value
                             for note in state.notes

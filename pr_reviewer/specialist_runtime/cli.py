@@ -241,6 +241,11 @@ _ROLE_SYSTEM = {
         "behavior or external contract the AI could not establish. Do not merely repeat "
         "a recipe identifier or say evidence was insufficient. Clearly label this as "
         "an unverified question, not a confirmed defect. Omit unrelated completed checks. "
+        "Reconcile older specialist uncertainty with prepared_notes.accepted_findings: "
+        "these are final accepted defects, not pending hypotheses. Do not ask whether the "
+        "same behavior is a defect or merely intentional when an accepted finding already "
+        "establishes its consequence. Omit that redundant question; retain only distinct "
+        "unresolved aspects. Acceptance does not establish complete component coverage. "
         "Do not turn checkpoint hypotheses or unknowns into change claims. Orient a human reviewer around "
         "behavior and review scope; do not list files, findings, severities, exact defect "
         "claims, lists of unknowns or verification requests, verdicts, approvals, or merge safety. "
@@ -1197,6 +1202,7 @@ def build_controller(
         conversation.add_user(specialist_assignment_prompt(
             assignment,
             change_overview=change_overview,
+            obligations=obligations,
         ))
         search_result_registry = SearchResultRegistry()
         def execute(
