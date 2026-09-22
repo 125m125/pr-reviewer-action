@@ -143,6 +143,7 @@ def build_boundary_context(
             "assessed_paths": list(assessment.assessed_paths),
             "omitted_paths": list(assessment.omitted_paths),
             "assessment_version": assessment.assessment_version,
+            "next_actions": list(assessment.next_actions),
         }
         for participant, assessment in relevant
     ]
@@ -150,7 +151,7 @@ def build_boundary_context(
         participant: sorted({
             evidence_id
             for owner, assessment in relevant
-            if owner == participant and assessment.disposition in _COMPLETE_DISPOSITIONS
+            if owner == participant
             for evidence_id in assessment.evidence_ids
             if evidence_id in source_records
             and _participant_source(source_records[evidence_id], participant, assessment, boundary)
@@ -164,6 +165,7 @@ def build_boundary_context(
     }
     missing = []
     diagnostics = []
+    followups = []
     if mixed_revisions:
         diagnostics.append("source evidence contains mixed head_sha revisions")
     for participant in participants:
@@ -181,7 +183,20 @@ def build_boundary_context(
         ]
         if not usable:
             missing.append(participant)
-            diagnostics.append(f"missing usable source evidence for participant {participant}")
+            if not participant_evidence[participant]:
+                diagnostics.append(f"missing usable source evidence for participant {participant}")
+                followups.append(f"Inspect and cite usable source evidence for participant {participant}.")
+            else:
+                diagnostics.append(f"participant {participant} assessment remains incomplete or contradicted")
+                actions = list(dict.fromkeys(
+                    action for assessment in participant_assessments
+                    for action in assessment.next_actions
+                ))
+                followups.append(
+                    f"Complete participant {participant}'s assessment using its retained source evidence. "
+                    + (" ".join(actions) if actions else
+                       "Record the remaining assessment gap; do not reread sources merely because the assessment is incomplete.")
+                )
 
     contract_evidence_ids = sorted(
         record.id for record in selected
@@ -194,6 +209,7 @@ def build_boundary_context(
     )
     if boundary.contract_paths and not contract_evidence_ids:
         diagnostics.append("missing usable source evidence for boundary contract")
+        followups.append("Inspect and cite the boundary contract source.")
 
     invalid_evidence = sorted(
         record.id for record in selected if record.id not in source_records
@@ -237,6 +253,7 @@ def build_boundary_context(
             boundary.contract_paths and not contract_evidence_ids
         )),
         "diagnostics": diagnostics,
+        "suggested_investigation": " ".join(followups),
         "input_fingerprint": fingerprint,
         "controller_fingerprint": fingerprint,
         "source_limits": {
@@ -257,6 +274,10 @@ def build_boundary_context(
         context["incomplete"] = True
         context["diagnostics"].append(
             f"required boundary evidence exceeds max_bytes ({packet_bytes} > {max_bytes})"
+        )
+        context["suggested_investigation"] = (
+            "Reduce the cited boundary source packet to focused evidence for each participant "
+            "and contract; the existing packet exceeds the context budget."
         )
     return context
 
