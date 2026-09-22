@@ -33,12 +33,13 @@ def test_real_session_followup_serializes_frozen_controller_hook_context(tmp_pat
                              "Trace remaining consumer", "repository", "prior")
     success, _ = ReviewController(artifact_output_root=tmp_path)._session_hook(
         state, session.session_id, "apply_investigation_lead_feedback", RunPhase.FOLLOWUP,
-        "L1", lead, {"candidates": [{"claim": "prior claim"}], "evidence": []},
+        "L1", lead, {"candidates": [{"candidate_id": "foreign-C1", "claim": "prior claim"}], "evidence": []},
     )
     assert success
     message = session.conversation.events[-1]["content"]
     packet, _ = json.JSONDecoder().raw_decode(message[message.index('{'):])
     assert packet["prior_work"]["candidates"] == [{"claim": "prior claim"}]
+    assert "foreign-C1" not in message
 
 
 @pytest.mark.parametrize("lead_id", ["boundary:api", "lead-api"])

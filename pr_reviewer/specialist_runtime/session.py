@@ -582,9 +582,10 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
                         "type": "array", "maxItems": 12,
                         "items": {"type": "string", "maxLength": 256},
                     },
-                    "related_obligation_ids": {
+                    "related_targets": {
                         "type": "array", "maxItems": 12,
                         "items": {"type": "string", "maxLength": 256},
+                        "description": "Assigned obligation handles such as O1, as in report_candidate.",
                     },
                     "consequence_support": _CONSEQUENCE_SUPPORT_SCHEMA,
                     "user_visible_consequence": {"type": "string", "maxLength": 300},
@@ -593,7 +594,7 @@ _CHECKPOINT_SCHEMA: dict[str, Any] = {
                 "required": [
                     "claim", "affected_location",
                     "causal_chain", "supporting_evidence_ids",
-                    "related_obligation_ids", "consequence_support", "severity",
+                    "related_targets", "consequence_support", "severity",
                     "user_visible_consequence",
                     "manual_validation",
                 ],
@@ -752,15 +753,16 @@ _OBLIGATION_PROTOCOL_INSTRUCTION = (
     "look for a reachable failure, contradicted contract, or affected consumer rather "
     "than treating evidence collection as checklist completion. "
     "Use the short target handles from obligation_targets when calling "
-    "obligation tools; exact assigned obligation IDs are accepted only as a "
-    "compatibility fallback. "
+    "obligation tools. "
     "Use the obligation tools during exploration to record covered, "
     "partially_covered, not_applicable, exhausted, blocked, or unresolved "
     "group conclusions. Report exact assessed paths and explicit omissions; "
     "do not create one disposition per file or repeat the full inventory. "
     "Whenever proposing a resolution, explicitly assess whether the evidence "
-    "reveals concrete defects: submit up to three candidate drafts while the "
-    "evidence is fresh, retain a specific needs_followup lead, or state that "
+    "reveals concrete defects: submit up to three new candidate drafts while the "
+    "evidence is fresh; if active retained candidates already describe the defects, "
+    "use result=candidates with candidate_drafts=[] rather than resubmitting them. "
+    "Otherwise retain a specific needs_followup lead, or state that "
     "none was observed. "
     "Unchanged sources may explain a contract without proving changed behavior. "
     "Unresolved work must name a concrete novel next action. Accepted obligation "
@@ -1141,6 +1143,7 @@ def specialist_assignment_prompt(
     *,
     change_overview: Mapping[str, object] | None = None,
     obligations: tuple[CoverageObligation, ...] = (),
+    target_by_id: Mapping[str, str] | None = None,
 ) -> str:
     """Serialize the immutable semantic assignment for initial and recovery turns."""
     lenses = getattr(assignment, "analytical_lens", "")
@@ -1275,6 +1278,19 @@ def specialist_assignment_prompt(
                 if str(value).strip()
             )),
         }
+    handles = dict(target_by_id) if target_by_id is not None else {
+        item["obligation_id"]: item["target"] for item in payload["obligation_targets"]
+    }
+    payload["obligation_targets"] = [{"target": target} for target in handles.values()]
+    payload.pop("obligation_ids", None)
+    payload["independent_targets"] = [handles[item] for item in payload.pop("independent_obligation_ids") if item in handles]
+    payload["obligation_briefs"] = [
+        {**{key: value for key, value in item.items() if key != "obligation_id"},
+         "target": handles[item["obligation_id"]]}
+        for item in payload.get("obligation_briefs", ()) if item.get("obligation_id") in handles
+    ]
+    for lead in payload["investigation_lead_targets"]:
+        lead.pop("lead_id", None)
     return "Immutable specialist assignment:\n" + json.dumps(
         payload, sort_keys=True,
     )
@@ -1702,12 +1718,10 @@ class SpecialistSession:
             self.assignment,
             change_overview=self.change_overview,
             obligations=self._session_obligations(),
+            target_by_id={self.obligation_assessments.obligation_id(target): target
+                          for target in self.obligation_assessments.handles()},
         )
         payload = json.loads(prompt.split("\n", 1)[1])
-        payload["obligation_targets"] = [
-            {"target": target, "obligation_id": self.obligation_assessments.obligation_id(target)}
-            for target in self.obligation_assessments.handles()
-        ]
         payload["delegation_receipts"] = self._delegation_receipts
         payload["ownership_instruction"] = (
             "Only current owned_changed_paths and assigned targets are your responsibility. "
@@ -1717,8 +1731,9 @@ class SpecialistSession:
         # Assignment briefs were prepared before transfers; project scope from the live ledger.
         scopes = {item.id: item.scope for item in self._session_obligations()}
         for brief in payload.get("obligation_briefs", ()):
-            if brief.get("obligation_id") in scopes:
-                brief["scope"] = list(scopes[brief["obligation_id"]])
+            obligation_id = self.obligation_assessments.obligation_id(brief.get("target"))
+            if obligation_id in scopes:
+                brief["scope"] = list(scopes[obligation_id])
         return "Immutable specialist assignment:\n" + json.dumps(payload, sort_keys=True)
 
     def _session_obligations(self) -> tuple[CoverageObligation, ...]:
@@ -1887,7 +1902,7 @@ class SpecialistSession:
                     "objective": obligation.recipe_objective or obligation.explanation,
                     "invariants": list(obligation.recipe_invariants),
                     "assessed_paths": list(assessment.assessed_paths),
-                    "unassessed_paths": list(assessment.omitted_paths),
+                    "omitted_paths": list(assessment.omitted_paths),
                     "next_actions": list(assessment.next_actions),
                     "assessment_version": assessment.assessment_version,
                 })
@@ -1935,7 +1950,6 @@ class SpecialistSession:
         return [
             {
                 "target": assessment.target,
-                "obligation_id": assessment.obligation_id,
                 "disposition": assessment.disposition.value,
                 "reason": assessment.reason,
                 "evidence_ids": list(assessment.evidence_ids),
@@ -2129,24 +2143,28 @@ class SpecialistSession:
             if target in self._announced_candidate_targets:
                 continue
             self._announced_candidate_targets.add(target)
-            assignments.append(f"{candidate.candidate_id} → {target}")
+            assignments.append(json.dumps({"candidate_id": target, "claim": candidate.claim,
+                                           "affected_location": candidate.affected_location}))
         if not assignments:
             return ""
         return (
             "Candidate handles assigned (controller-authoritative): "
             + "; ".join(assignments)
             + ". Use C# handles for all subsequent candidate updates and "
-            "withdrawals. Previous candidate IDs remain accepted as aliases "
-            "but are no longer canonical."
+            "withdrawals."
         )
 
     def _model_candidate_payload(self, candidate: CandidateFinding) -> dict[str, object]:
-        payload = asdict(candidate)
-        payload["candidate_id"] = self._candidate_target(candidate.candidate_id)
-        payload["contributor_candidate_ids"] = [
-            self._known_candidate_target(value)
-            for value in candidate.contributor_candidate_ids
+        payload = {key: getattr(candidate, key) for key in (
+            "claim", "affected_location", "causal_chain", "severity", "category",
+            "supporting_evidence_ids", "contradicting_evidence_ids",
+            "confidence_rationale", "user_visible_consequence", "manual_validation",
+        )}
+        payload["related_targets"] = [
+            target for value in candidate.related_obligation_ids
+            if (target := self.obligation_assessments.canonical_target(value))
         ]
+        payload["candidate_id"] = self._candidate_target(candidate.candidate_id)
         return payload
 
     def _checkpoint_prompt(
@@ -5787,7 +5805,7 @@ class SpecialistSession:
             "candidate_id", "root_cause_fingerprint", "claim",
             "affected_location", "causal_chain", "severity", "category",
             "supporting_evidence_ids", "contradicting_evidence_ids",
-            "related_obligation_ids", "consequence_support",
+            "related_targets", "related_obligation_ids", "consequence_support",
             "user_visible_consequence", "manual_validation",
         }
         unsupported = sorted(set(value) - allowed)
@@ -5854,7 +5872,9 @@ class SpecialistSession:
         ))
         if not supporting:
             return None, "candidate has no retained supporting evidence"
-        raw_obligations = _strings(value.get("related_obligation_ids"))
+        if "related_targets" in value and "related_obligation_ids" in value:
+            return None, "use only related_targets, not both obligation linkage fields"
+        raw_obligations = _strings(value.get("related_targets", value.get("related_obligation_ids")))
         if not raw_obligations:
             return None, "candidate has no related obligation targets"
         obligations: list[str] = []
@@ -5987,7 +6007,7 @@ class SpecialistSession:
         if text == "candidate must be an object":
             return ["submit one JSON object with the advertised candidate fields, not text or an array"]
         if text == "candidate has no related obligation targets":
-            return ["include at least one assigned O# target in related_targets (related_obligation_ids in checkpoints)"]
+            return ["include at least one assigned O# target in related_targets"]
         if text.startswith("candidate references unavailable"):
             return ["use exact evidence IDs returned by the tools"]
         if text.startswith(("unknown related obligation target:", "unknown obligation target:")):
@@ -6249,13 +6269,18 @@ class SpecialistSession:
                 "Coverage feedback. The previous checkpoint proposed_next_actions "
                 "have expired; continue the same investigation only for these "
                 "controller-selected gaps: "
-                + json.dumps(normalized)
+                + json.dumps([target for value in normalized
+                              if (target := self.obligation_assessments.canonical_target(value))])
                 + (
                     ". Complete one of these controller-accepted novel actions: "
                     + json.dumps(next_actions)
                     if next_actions else
                     ". No novel action was accepted; conclude rather than repeat reads."
                 )
+                + " Once the selected action's outcome is recorded, respond briefly without "
+                "tool calls so the controller can checkpoint. Other obligations remain "
+                "controller-owned: do not reopen or resolve them during this follow-up. "
+                "An active finding does not prevent completion of the selected investigation."
             )
             self.obligation_assessments.consume_next_actions(normalized)
             self.budget.reset_no_progress_streak("material controller feedback")
@@ -6309,10 +6334,11 @@ class SpecialistSession:
                 "evidence_ids": list(lead.evidence_ids),
                 "next_action": lead.next_action,
                 "required_capability": lead.required_capability,
-                **({"prior_work": _assignment_json_value(prior_work)} if prior_work else {}),
+                **({"prior_work": self._model_prior_work(prior_work)} if prior_work else {}),
             }, sort_keys=True)
             + (
                 " Prior conclusions are not authoritative: verify or contradict them. "
+                "Prior candidates without a local C# are reference observations, not candidates you can update or withdraw. "
                 "Full omitted source content is available through read_compacted_evidence "
                 "using this lead target; focus on the missing question rather than "
                 "repeating completed investigation."
@@ -6320,6 +6346,22 @@ class SpecialistSession:
             )
         )
         self.budget.reset_no_progress_streak("material investigation lead feedback")
+
+    def _model_prior_work(self, prior_work: Mapping[str, object]) -> dict[str, object]:
+        payload = _assignment_json_value(prior_work)
+        for candidate in payload.get("candidates", ()):
+            candidate_id = candidate.pop("candidate_id", None)
+            # Never interpret another session's C1 as this session's C1.
+            target = next((key for key, value in self._candidate_targets.items()
+                           if value == candidate_id), None)
+            if target:
+                candidate["candidate_id"] = target
+        for assessment in payload.get("assessments", ()):
+            obligation_id = assessment.pop("obligation_id", None)
+            target = self.obligation_assessments.canonical_target(obligation_id)
+            if target:
+                assessment["target"] = target
+        return payload
 
     def update_lease(self, lease: SessionLease) -> None:
         """Advance the same durable session to a controller-issued later lease."""
@@ -6426,7 +6468,7 @@ class SpecialistSession:
                     for obligation_id, evidence_ids in by_obligation.items()
                 }
         active_candidate_ids = {
-            candidate.candidate_id for candidate in self.candidate_findings
+            self._known_candidate_target(candidate.candidate_id) for candidate in self.candidate_findings
         }
         statuses = payload.get("candidate_statuses")
         if isinstance(statuses, dict):
@@ -7145,13 +7187,10 @@ class SpecialistSession:
             "working_summary": checkpoint.working_summary,
             "completed_steps": list(checkpoint.completed_steps),
             "hypotheses": list(checkpoint.hypotheses),
-            "candidate_finding_ids": [
-                self._known_candidate_target(candidate_id)
-                for candidate_id in checkpoint.candidate_finding_ids
-            ],
             "obligation_statuses": {
-                obligation_id: status.value
+                target: status.value
                 for obligation_id, status in checkpoint.obligation_statuses
+                if (target := self.obligation_assessments.canonical_target(obligation_id))
             },
             "invariants_evaluated": list(checkpoint.invariants_evaluated),
             "unknowns": list(checkpoint.unknowns),
@@ -7167,7 +7206,7 @@ class SpecialistSession:
             evidence_metadata.append(metadata)
         return {
             "latest_checkpoint": checkpoint_payload,
-            "candidate_findings": [
+            "active_candidates": [
                 self._model_candidate_payload(candidate)
                 for candidate in self.candidate_findings
             ],
@@ -7182,13 +7221,15 @@ class SpecialistSession:
             "defect_leads": [dict(item) for item in self._defect_leads],
             "coverage": {
                 "obligation_statuses": {
-                    obligation_id: status.value
+                    target: status.value
                     for obligation_id, status in coverage.obligation_statuses
+                    if (target := self.obligation_assessments.canonical_target(obligation_id))
                 },
                 "recipe_statuses": dict(coverage.recipe_statuses),
                 "evidence_by_obligation": {
-                    obligation_id: list(evidence_ids)
+                    target: list(evidence_ids)
                     for obligation_id, evidence_ids in coverage.evidence_by_obligation
+                    if (target := self.obligation_assessments.canonical_target(obligation_id))
                 },
             },
             "evidence_metadata": evidence_metadata,
@@ -7451,7 +7492,8 @@ class SpecialistSession:
             "recovery_reason": normalized,
             **self._cumulative_checkpoint_payload(),
             "evidence": evidence,
-            "current_gaps": list(self._current_gaps),
+            "current_gaps": [target for value in self._current_gaps
+                             if (target := self.obligation_assessments.canonical_target(value))],
             "source_access_requests": [
                 item.as_dict() for item in self.source_access_requests
             ],

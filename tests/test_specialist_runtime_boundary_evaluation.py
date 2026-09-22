@@ -203,6 +203,30 @@ def _assessment(obligation_id, evidence_id, *, disposition=ObligationDisposition
     )
 
 
+def test_partial_boundary_assessment_does_not_request_source_already_retained():
+    from dataclasses import replace
+
+    store = EvidenceStore()
+    _record(store, path="contracts/message.proto", content="string showId = 1;")
+    producer = _record(store, path="backend/Producer.java", content="send(show.id)")
+    consumer = _record(store, path="worker/consumer.py", content="load(message.showId)")
+    partial = replace(
+        _assessment("OB-backend", producer.id,
+                    disposition=ObligationDisposition.PARTIALLY_COVERED),
+        next_actions=("Confirm the changed identifier conversion.",),
+    )
+    context = build_boundary_context(
+        _boundary(), (partial, _assessment("OB-worker", consumer.id)),
+        store.snapshot(), max_bytes=20_000,
+        obligations={"OB-backend": "backend", "OB-worker": "worker"},
+    )
+    assert context["incomplete"] is True
+    assert context["participant_evidence_ids"]["backend"] == [producer.id]
+    assert "missing usable source evidence for participant backend" not in context["diagnostics"]
+    assert "Confirm the changed identifier conversion." in context["suggested_investigation"]
+    assert "assessment" in context["suggested_investigation"]
+
+
 def test_build_boundary_context_retains_actual_source_and_revision_provenance():
     store = EvidenceStore()
     schema = _record(
