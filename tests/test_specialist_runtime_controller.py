@@ -3969,6 +3969,10 @@ def test_handoff_summarizer_writes_behavioral_review_handoff_from_validated_stat
             "successful_review_facts", "prepared_notes", "human_focus_facts",
         }
         assert request.context["human_focus_facts"] == ()
+        accepted = request.context["prepared_notes"]["accepted_findings"]
+        assert len(accepted) == 1
+        assert accepted[0]["claim"] == "A retry can process one delivery twice"
+        assert accepted[0]["affected_location"]
         assert "policy" not in request.context
         assert "coverage" not in request.context
         assert "review" not in request.context
