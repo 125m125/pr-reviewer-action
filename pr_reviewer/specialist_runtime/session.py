@@ -22,7 +22,7 @@ from pr_reviewer.conversation import (
 from pr_reviewer.tool_loop import decode_native_tool_arguments, native_tool_request_key
 from pr_reviewer.transport import ModelRequestError
 
-from .adjudication import candidate_authorization_reason
+from .adjudication import candidate_authorization_reason, obligation_contract_selectors
 from .budget import BudgetExhausted, BudgetLedger, SessionLease
 from .callbacks import (
     CALLBACK_POOL,
@@ -156,7 +156,7 @@ _CONSEQUENCE_SUPPORT_SCHEMA: dict[str, Any] = {
         "obligation_target": {"type": "string"},
         "contract": {
             "type": "string",
-            "description": "For violated_invariant: exact selector subject or predicate_index:N (zero-based) from the assigned obligation, not prose. Explain the contradiction in violation. A general invariant does not prove an external API requirement; retain evidence for that premise.",
+            "description": "For violated_invariant: use invariant_index:N (zero-based) for the assigned obligation's invariants list. subject or predicate_index:N select its subject or satisfaction predicates instead. Use the actual behavioral contract, not recorded_evidence as a substitute. Explain the contradiction in violation; retain evidence for external API premises.",
         },
         "violation": {"type": "string"},
         "producer_evidence_id": {"type": "string"},
@@ -1289,6 +1289,11 @@ def specialist_assignment_prompt(
          "target": handles[item["obligation_id"]]}
         for item in payload.get("obligation_briefs", ()) if item.get("obligation_id") in handles
     ]
+    contracts = {handles[item.id]: obligation_contract_selectors(item)
+                 for item in obligations if item.id in handles}
+    for brief in payload["obligation_briefs"]:
+        if brief["target"] in contracts:
+            brief["contract_selectors"] = contracts[brief["target"]]
     for lead in payload["investigation_lead_targets"]:
         lead.pop("lead_id", None)
     return "Immutable specialist assignment:\n" + json.dumps(
@@ -1541,6 +1546,7 @@ class SpecialistSession:
         self._candidate_retention_signal = _CandidateRetentionSignal()
         self.continuation_blocked = False
         self._prefill_unsupported = False
+        self._continuation_scope = ""
         self.latest_checkpoint = self._project_checkpoint(())
         self.source_access_requests: tuple[
             SourceAccessRequest | RepositoryAccessRequest, ...
@@ -2734,6 +2740,7 @@ class SpecialistSession:
                 self.conversation.add_user(
                     "The server cannot continue an assistant prefill. Continue "
                     "the investigation from the retained history; tools remain enabled."
+                    + self._continuation_scope
                 )
                 request_purpose = "exploration-prefill-fallback"
                 assistant_ended = False
@@ -3455,6 +3462,7 @@ class SpecialistSession:
                 arguments, rejection_reason, retained,
             ), False
         self.candidate_findings = (*self.candidate_findings, candidate)
+        self._retire_rejected_candidate_leads(candidate)
         self._candidate_statuses[candidate_id] = "active"
         self._candidate_targets[next_target] = candidate_id
         self._announced_candidate_targets.add(next_target)
@@ -5273,6 +5281,7 @@ class SpecialistSession:
                 self._rejected_candidate_ids.add(candidate.candidate_id)
                 continue
             candidates[candidate.candidate_id] = candidate
+            self._retire_rejected_candidate_leads(candidate)
             candidate_statuses[candidate.candidate_id] = "active"
             self._rejected_candidate_ids.discard(candidate.candidate_id)
 
@@ -5703,10 +5712,7 @@ class SpecialistSession:
                     "use a related assigned obligation target",
                 )
             obligation = next(item for item in self.coverage.obligations() if item.id == obligation_id)
-            selectors = {"subject": obligation.subject, **{
-                f"predicate_index:{index}": predicate
-                for index, predicate in enumerate(obligation.satisfaction_predicates)
-            }}
+            selectors = obligation_contract_selectors(obligation)
             contract = detail("contract").casefold()
             if contract == "subject:":
                 contract = "subject"
@@ -5957,7 +5963,7 @@ class SpecialistSession:
                     "(test-result category or test runner tool), not test source or a proposed test; "
                     "name the test and its observed failure",
                 "violated_invariant": "use a related assigned obligation and its exact contract selector "
-                    "(subject or predicate_index:N), describe violation, and cite retained support; "
+                    "(invariant_index:N for behavioral invariants; subject or predicate_index:N otherwise), describe violation, and cite retained support; "
                     "an invariant alone does not prove an external API premise",
                 "affected_consumer": "producer_evidence_id and consumer_evidence_id must both be "
                     "supporting retained records with source paths; describe the actual consumer consequence",
@@ -6116,7 +6122,7 @@ class SpecialistSession:
             if not obligation_id or obligation_id not in assigned:
                 hints.append("violated_invariant requires an assigned obligation_id")
             if not details.get("contract"):
-                hints.append("violated_invariant requires contract=subject or predicate_index:N")
+                hints.append("violated_invariant requires contract=invariant_index:N, subject, or predicate_index:N")
             if not details.get("violation"):
                 hints.append("violated_invariant requires violation=...")
         elif kind == "affected_consumer":
@@ -6133,6 +6139,16 @@ class SpecialistSession:
                 )
         return tuple(dict.fromkeys(hints))
 
+    def _retire_rejected_candidate_leads(self, candidate: CandidateFinding) -> None:
+        identity = (
+            candidate.claim.strip(),
+            candidate.affected_location.strip(),
+        )
+        self._defect_leads = [
+            lead for lead in self._defect_leads
+            if (lead.get("rejected_claim"), lead.get("rejected_location")) != identity
+        ]
+
     def _retain_rejected_candidate_lead(
         self,
         arguments: Mapping[str, Any],
@@ -6142,6 +6158,13 @@ class SpecialistSession:
         """Retain a compact rejected idea for checkpoint/follow-up synthesis."""
         claim = _bounded_text(arguments.get("claim"), max_length=280)
         location = _bounded_text(arguments.get("affected_location"), max_length=200)
+        if any(
+            candidate.claim.strip() == str(arguments.get("claim") or "").strip()
+            and candidate.affected_location.strip() == str(arguments.get("affected_location") or "").strip()
+            and self._candidate_statuses.get(candidate.candidate_id) == "active"
+            for candidate in self.candidate_findings
+        ):
+            return ""
         evidence_ids = tuple(dict.fromkeys(
             resolved
             for value in _tool_string_list(arguments.get("supporting_evidence_ids"))
@@ -6155,6 +6178,8 @@ class SpecialistSession:
             self._defect_leads.append({
                 "lead": lead,
                 "target": f"candidate-draft:{identity}",
+                "rejected_claim": str(arguments.get("claim") or "").strip(),
+                "rejected_location": str(arguments.get("affected_location") or "").strip(),
                 "summary": _bounded_text(
                     f"Rejected candidate at {location or 'unspecified location'}: "
                     f"{claim or 'claim omitted'}. {reason}",
@@ -6265,6 +6290,15 @@ class SpecialistSession:
                 if self.obligation_assessments.obligation_id(target) in normalized
                 for action in self.obligation_assessments.assessment(target).next_actions
             )
+            self._continuation_scope = (
+                " Continue only the latest controller-selected gaps: "
+                + json.dumps([target for value in normalized
+                              if (target := self.obligation_assessments.canonical_target(value))])
+                + ". Selected actions: " + json.dumps(next_actions)
+                + " Once that task is complete, stop without tool calls; the controller will "
+                "request a checkpoint. Do not reopen other gaps, repeat completed checks, "
+                "or resubmit active candidates. Resuming after compaction does not expand this task."
+            )
             self.conversation.add_user(
                 "Coverage feedback. The previous checkpoint proposed_next_actions "
                 "have expired; continue the same investigation only for these "
@@ -6323,10 +6357,19 @@ class SpecialistSession:
                 json.loads(json.dumps(schema))
             )
         self.state = SessionState.COVERAGE_EVALUATION
+        self._continuation_scope = (
+            " Continue only the controller-selected lead " + normalized_target
+            + ": " + lead.summary + ". Next action: " + lead.next_action
+            + ". Once the lead is resolved, stop without tool calls; the controller will "
+            "request a checkpoint. Do not reopen other gaps, repeat completed checks, "
+            "or resubmit active candidates. Resuming after compaction does not expand this task."
+        )
         self.conversation.add_user(
             "Controller-selected investigation lead. Tools are available again. "
             "Investigate only this lead, report a proven defect with report_candidate, "
-            "or explicitly close it with resolve_investigation_lead: "
+            "or explicitly close it with resolve_investigation_lead. Once resolved, "
+            "stop without tool calls so the controller can checkpoint; do not reopen "
+            "other obligations or resubmit active candidates. Lead: "
             + json.dumps({
                 "target": normalized_target,
                 "summary": lead.summary,
@@ -6646,8 +6689,8 @@ class SpecialistSession:
             "kind": "user",
             "content": (
                 "Validated checkpoint epoch compacted. Tool access is re-enabled "
-                "for exploration. Continue from the "
-                "proposed next actions; use read_compacted_evidence only for "
+                "for exploration. " + self._continuation_scope + " Use the "
+                "proposed next actions only within the selected task; use read_compacted_evidence only for "
                 "catalogued IDs:\n"
                 + json.dumps(continuation, sort_keys=True)
             ),

@@ -462,6 +462,55 @@ def test_affected_consumer_support_uses_evidence_ids_and_derives_paths():
     assert "outcome=Literal passwords reach the review model unredacted." in rationale
 
 
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_behavioral_invariant_repair_retires_only_matching_rejection_lead(checkpoint):
+    obligations = (
+        CoverageObligation(
+            obligation_id="OB-code", origin="component", subject="runtime",
+            scope=("a.py",), satisfaction_predicates=("recorded_evidence",),
+            recipe_invariants=("The operation preserves the requested state.",),
+        ),
+        CoverageObligation(obligation_id="OB-tests", origin="test", subject="tests"),
+    )
+    session = make_session(ScriptedGateway([]), obligations=obligations)
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "content": "return wrong_state"},
+        category="implementation", source="a.py",
+    )
+    draft = {
+        "claim": "The operation returns the wrong state.", "affected_location": "a.py:4",
+        "causal_chain": "The changed branch returns the wrong state.", "severity": "major",
+        "supporting_evidence_ids": [record.id], "related_targets": ["O1"],
+        "user_visible_consequence": "The requested state is lost.",
+        "manual_validation": "Check the returned state.",
+        "consequence_support": {"kind": "violated_invariant", "obligation_target": "O1",
+                                "contract": "invariant_index:9", "violation": "Wrong state is returned."},
+    }
+    feedback, accepted = session._admit_candidate(draft)
+    assert not accepted
+    assert "The operation preserves the requested state." in " ".join(feedback["repair_hints"])
+    session._admit_candidate({**draft, "claim": "A different concern."})
+    assert len(session._defect_leads) == 2
+    repaired = {**draft, "consequence_support": {
+        **draft["consequence_support"], "contract": "invariant_index:0",
+    }}
+    if checkpoint:
+        rejected = session._retain_checkpoint_candidates(
+            {"new_candidates": [{**repaired, "candidate_id": "fixed"}]},
+            {record.id: record}, {"OB-code", "OB-tests"}, account_rejections=True,
+        )
+        assert not rejected
+        assert len(session.candidate_findings) == 1
+    else:
+        _, accepted = session._admit_candidate(repaired)
+        assert accepted  # Includes the same consequence authorization used at final adjudication.
+    assert len(session._defect_leads) == 1
+    assert "A different concern." in session._defect_leads[0]["summary"]
+    session._admit_candidate(draft)
+    assert len(session._defect_leads) == 1
+
+
 def test_candidate_rejection_identifies_acceptable_evidence_and_failed_predicate():
     session = make_session(ScriptedGateway([]))
     record = session.evidence_store.add_tool_result(
@@ -4771,6 +4820,7 @@ def test_initial_compact_resume_repairs_missing_working_memory_before_compaction
     )
     gateway = ScriptedGateway([sparse, repaired])
     session = make_session(gateway, max_context_tokens=100_000)
+    session.apply_coverage_feedback(["OB-code"])
     seed_successful_tool_exchange(
         session,
         call_id="working-memory-repair",
@@ -4809,6 +4859,8 @@ def test_initial_compact_resume_repairs_missing_working_memory_before_compaction
         if event.get("epoch_continuation")
     )
     assert "Tool access is re-enabled for exploration." in continuation
+    assert "controller-selected gaps" in continuation
+    assert "stop without tool calls" in continuation
     continuation_payload = json.loads(continuation.split("catalogued IDs:\n", 1)[1])
     checkpoint_memory = continuation_payload["cumulative_checkpoint"]
     assert "coverage" not in checkpoint_memory
@@ -5305,6 +5357,7 @@ def test_rejected_reasoning_prefill_gets_one_user_continuation(repeat_error):
         ),
     ])
     session = make_session(gateway, model_turns=8)
+    session.apply_coverage_feedback(["OB-code"])
     if repeat_error:
         with pytest.raises(ModelRequestError):
             session.explore()
@@ -5314,6 +5367,9 @@ def test_rejected_reasoning_prefill_gets_one_user_continuation(repeat_error):
     messages = json.loads(gateway.requests[2].messages)
     assert messages[-1]["role"] == "user"
     assert "tools remain enabled" in messages[-1]["content"]
+    assert "controller-selected" in messages[-1]["content"]
+    assert "O1" in messages[-1]["content"]
+    assert "stop without tool calls" in messages[-1]["content"]
     assert "Still tracing the caller." in gateway.requests[2].messages
     assert gateway.requests[2].tools_enabled
     assert session.budget.remaining_model_turns() == 5

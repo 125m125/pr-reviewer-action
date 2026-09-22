@@ -912,6 +912,15 @@ def _citation(record: EvidenceRecord) -> EvidenceCitation:
     )
 
 
+def obligation_contract_selectors(obligation: CoverageObligation) -> dict[str, str]:
+    """Selectors shared by candidate admission and final proof authorization."""
+    return {
+        "subject": obligation.subject,
+        **{f"predicate_index:{i}": value for i, value in enumerate(obligation.satisfaction_predicates)},
+        **{f"invariant_index:{i}": value for i, value in enumerate(obligation.recipe_invariants)},
+    }
+
+
 def _consequence_support_reason(
     candidate: CandidateFinding,
     *,
@@ -996,10 +1005,9 @@ def _consequence_support_reason(
             separator = ":"
         authoritative_contracts = set()
         if obligation is not None:
-            authoritative_contracts.add(("subject", ""))
             authoritative_contracts.update(
-                ("predicate_index", str(index))
-                for index, _item in enumerate(obligation.satisfaction_predicates)
+                (selector.partition(":")[0], selector.partition(":")[2])
+                for selector in obligation_contract_selectors(obligation)
             )
         if all((
             cited_support,

@@ -2240,6 +2240,11 @@ def test_specialist_assignment_message_serializes_semantic_brief_and_context(
     payload = json.loads(content.split("\n", 1)[1])
 
     assert payload["obligation_briefs"] == [{
+        "contract_selectors": {
+            "subject": "worker delivery",
+            "predicate_index:0": "The acknowledgement ordering is verified.",
+            "invariant_index:0": "Failed work must not be acknowledged as successful.",
+        },
         "evidence_hints": [],
         "target": "O1",
         "subject": "worker delivery",
