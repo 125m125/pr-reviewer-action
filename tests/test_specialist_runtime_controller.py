@@ -198,6 +198,7 @@ def test_controller_admits_and_explicitly_resolves_session_investigation_lead(tm
     assert admitted.status is InvestigationLeadStatus.RESOLVED_NO_ISSUE
     assert admitted.assigned_session_id == "S2"
     assert admitted.resolution_reason.startswith("The only caller")
+    assert admitted.evidence_ids == ("evidence:1", "evidence:2")
 
 
 def test_handoff_focus_includes_only_blocked_investigation_leads(tmp_path):
@@ -2530,6 +2531,57 @@ def test_one_validated_change_overview_reaches_every_review_role(tmp_path):
     assert result.artifact["accepted_candidates"] == ()
 
 
+def test_lead_followup_reports_actual_attempt_and_new_evidence(tmp_path):
+    requests = []
+
+    class Gateway:
+        def complete(self, request):
+            payload = request.conversation.to_request_payload("openai", "m")
+            context = json.loads(payload["messages"][1]["content"])
+            target = next(item for item in context["negotiation_state"]["targets"]
+                          if item["handle"].startswith("L"))
+            requests.append(target)
+            raw = json.dumps({"kind": "resume" if len(requests) == 1 else "record_unknown",
+                              "target": target["handle"], "reason": "Check remaining consumer behavior."})
+            return ModelTurnResult(response={}, tool_calls=(), text=raw, text_source="content",
+                                   finish_reason="stop", usage={}, request_diagnostics={})
+
+    def factory(assignment, lease, snapshot, evidence_store, coverage, obligations, expected_session_id):
+        session = _factory(assignment, lease, snapshot, evidence_store, coverage, obligations, expected_session_id)
+        original = session.explore
+        calls = 0
+        def explore():
+            nonlocal calls
+            calls += 1
+            result = original()
+            record = evidence_store.add_tool_result(
+                session_id=expected_session_id, tool="read_file",
+                arguments={"path": "src/worker.py", "offset": calls},
+                result={"status": "ok", "content": f"consumer inspection {calls}"},
+            )
+            lead = InvestigationLead("lead:consumer", "Check consumer behavior.", ("src/worker.py",),
+                                     (), "Read the remaining consumer.", "repository", expected_session_id)
+            return replace(result, investigation_leads=(lead,), checkpoint=replace(
+                result.checkpoint, working_summary="Consumer checked; author confirmation remains.",
+                evidence_ids=(*result.checkpoint.evidence_ids, record.id),
+            ))
+        session.explore = explore
+        session.apply_investigation_lead_feedback = lambda *args: None
+        session.changed_files = ("src/worker.py",)
+        session.conversation = Conversation(system="Review", tool_schemas=[{
+            "name": "read_file", "parameters": {"type": "object"},
+        }])
+        return session
+
+    result = _controller(tmp_path, session_factory=factory,
+                         negotiator=GatewayRoleAdapter(Gateway())).run(_inputs(tmp_path))
+    assert len(requests) == 2
+    assert requests[1]["attempt_count"] == 1
+    assert requests[1]["evidence_delta"] == 1
+    assert requests[1]["last_conclusion"] == "Consumer checked; author confirmation remains."
+    assert any(event.kind == "investigation_lead_followup_completed" for event in result.events)
+
+
 def test_gateway_negotiator_receives_compact_targets_and_re_evaluates_each_wave(tmp_path):
     requests = []
 
@@ -4210,6 +4262,23 @@ def test_handoff_summarizer_does_not_reject_free_form_path_words(tmp_path):
         item["component"] == "handoff_summarizer"
         for item in result.artifact["degradation"]
     )
+
+
+def test_handoff_length_failure_gets_focused_repair(tmp_path):
+    requests = []
+
+    def summarizer(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return {"what_changed_summary": "x" * 603,
+                    "ai_reviewed_summary": "The AI reviewed worker changes.", "human_focus": ""}
+        assert "603" in request.context["semantic_repair"]["reason"]
+        return {"what_changed_summary": "The worker retries failed delivery.",
+                "ai_reviewed_summary": "The AI reviewed worker changes.", "human_focus": ""}
+
+    result = _controller(tmp_path, finalizer=summarizer).run(_inputs(tmp_path))
+    assert len(requests) == 2
+    assert "The worker retries failed delivery." in result.handoff.markdown
 
 
 def test_handoff_summarizer_gets_one_focused_semantic_repair(tmp_path, monkeypatch):

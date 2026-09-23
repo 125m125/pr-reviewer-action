@@ -127,3 +127,6 @@ def test_boundary_evaluator_uses_sources_and_does_not_repeat_unchanged_inputs(tm
     controller._evaluate_boundaries(state)
     assert len(requests) == 1
     assert state.coverage.obligation_statuses()[combined.id] is ObligationStatus.UNRESOLVED
+    failure = state.boundary_evaluations["api"]
+    assert "missing usable source evidence for participant" not in failure.reason
+    assert "assessment remains incomplete" in failure.reason
