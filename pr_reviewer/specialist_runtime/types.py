@@ -100,6 +100,9 @@ class InvestigationLead:
     child_assignment_id: str | None = None
     delegated_paths: tuple[str, ...] = ()
     delegated_obligation_ids: tuple[str, ...] = ()
+    attempt_count: int = 0
+    last_evidence_delta: int = 0
+    last_outcome: str = ""
 
 
 @dataclass(frozen=True)

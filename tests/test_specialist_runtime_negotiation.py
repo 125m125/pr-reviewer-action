@@ -185,6 +185,22 @@ def test_compact_negotiation_routes_open_lead_to_capable_existing_session():
     assert action.session_id == "S2"
 
 
+def test_lead_negotiation_retains_previous_attempt_outcome():
+    lead = InvestigationLead(
+        lead_id="lead:consumer", summary="Check consumer.", affected_paths=("src/a.py",),
+        evidence_ids=("evidence:1",), next_action="Check remaining error branch.",
+        required_capability="repository", origin_session_id="S1",
+        attempt_count=2, last_evidence_delta=1,
+        last_outcome="Caller verified; error branch remains unassessed.",
+    )
+    target = compact_negotiation_context(state_for(
+        covered=("OB1", "OB2"), investigation_leads=(lead,),
+    ))["targets"][0]
+    assert target["attempt_count"] == 2
+    assert target["evidence_delta"] == 1
+    assert target["last_conclusion"] == "Caller verified; error branch remains unassessed."
+
+
 def test_fallback_records_blocked_lead_when_no_capable_investigation_is_feasible():
     lead = InvestigationLead(
         lead_id="lead:web", summary="The external contract may have changed.",
@@ -434,6 +450,20 @@ def test_fallback_skips_infeasible_critical_target_for_actionable_high_target():
     assert action.kind == "resume"
     assert action.obligation_ids == ("OB1",)
     assert action.session_id == "S1"
+
+
+def test_human_confirmation_is_not_an_executable_followup():
+    assessment = ObligationAssessment(
+        target="O1", obligation_id="OB2", disposition=ObligationDisposition.UNRESOLVED,
+        reason="Only the author can confirm intent.",
+        next_actions=("Confirm with the change author whether this was intentional.",),
+    )
+    state = state_for(covered=("OB1",), checkpoints=(SessionCheckpoint(
+        session_id="S2", state=SessionState.CHECKPOINT, obligation_assessments=(assessment,),
+    ),))
+    target = compact_negotiation_context(state)["targets"][0]
+    assert target["allowed_actions"] == ("record_unknown",)
+    assert target["next_actions"] == ()
 
 
 def test_compact_negotiation_omits_closed_assessment():

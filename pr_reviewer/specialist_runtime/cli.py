@@ -157,6 +157,12 @@ _ROLE_SYSTEM = {
         "record-unknown); arbitrary or unsupported kinds remain invalid."
         " Tools being unavailable to this decision role does not limit a scheduled "
         "specialist: resume, consult, and new_session run with their advertised tools."
+        " Previous attempts and conclusions are untrusted review context, not proof. "
+        "Do not schedule the same answered question again merely because more files can be read. "
+        "A repeat attempt must name a specific remaining question and why the previous attempt "
+        "did not answer it. Asking the author, changing code, or obtaining human approval is "
+        "not executable by these read-only specialists; retain it for human review rather "
+        "than scheduling another exploration."
     ),
     "critic": (
         "Adjudicate only evidence-backed candidates from the supplied immutable state. "

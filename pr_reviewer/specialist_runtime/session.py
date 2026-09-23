@@ -38,7 +38,7 @@ from .evidence import (
     EvidenceStore,
 )
 from .model_gateway import ModelGateway, ModelTurnRequest, ModelTurnResult
-from .obligation_assessment import ObligationAssessmentLedger
+from .obligation_assessment import ObligationAssessment, ObligationAssessmentLedger
 from .request_attempts import RequestAttemptJournal
 from .performance import request_performance
 from .test_results import retain_test_result
@@ -782,8 +782,10 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
     " Required keys: unresolved, obligation_updates, candidate_updates, "
     "new_candidates, unknowns, and proposed_next_actions. Every still-pending "
     "obligation target must "
-    "appear either in obligation_updates or unresolved; do not repeat targets "
-    "whose controller-owned disposition was already accepted. "
+    "appear either in obligation_updates or unresolved. Follow the current "
+    "pending_obligations list: a controller-selected follow-up needs a new outcome "
+    "even if an earlier unresolved disposition was accepted. Do not repeat "
+    "unchanged accepted targets outside that list. "
     "Empty candidate_updates and new_candidates arrays are valid and mean no "
     "candidate state changed. Existing candidates remain active unless explicitly "
     "updated with status withdrawn or superseded; omission never withdraws one. "
@@ -1547,6 +1549,7 @@ class SpecialistSession:
         self.continuation_blocked = False
         self._prefill_unsupported = False
         self._continuation_scope = ""
+        self._followup_assessment_versions: dict[str, int] = {}
         self.latest_checkpoint = self._project_checkpoint(())
         self.source_access_requests: tuple[
             SourceAccessRequest | RepositoryAccessRequest, ...
@@ -1884,6 +1887,10 @@ class SpecialistSession:
             entries, sort_keys=True,
         )
 
+    def _assessment_needs_followup_outcome(self, assessment: ObligationAssessment) -> bool:
+        version = self._followup_assessment_versions.get(assessment.obligation_id)
+        return version is not None and assessment.assessment_version <= version
+
     def _checkpoint_obligation_contract(self) -> str:
         pending: list[dict[str, object]] = []
         partial: list[dict[str, object]] = []
@@ -1891,7 +1898,7 @@ class SpecialistSession:
         obligations = {item.id: item for item in self._session_obligations()}
         for assessment in self.obligation_assessments.assessments():
             obligation = obligations[assessment.obligation_id]
-            if assessment.disposition.value == "pending":
+            if assessment.disposition.value == "pending" or self._assessment_needs_followup_outcome(assessment):
                 pending.append({
                     "target": assessment.target,
                     "subject": obligation.subject,
@@ -1900,6 +1907,8 @@ class SpecialistSession:
                     "required_evidence": list(obligation.required_evidence_categories),
                     "owned_changed_paths": list(obligation.scope),
                     "boundary_hints": list(obligation.seed_hints),
+                    "previous_disposition": assessment.disposition.value,
+                    "previous_reason": assessment.reason,
                 })
             elif assessment.disposition.value == "partially_covered":
                 partial.append({
@@ -1938,7 +1947,12 @@ class SpecialistSession:
         return contract + (
             " For every pending_obligations target, emit exactly one "
             "obligation_updates entry or list the target in unresolved. Do not "
-            "repeat accepted_obligations. Use this exact update shape: "
+            "repeat unchanged accepted_obligations. Controller-selected follow-up targets "
+            "need a new outcome even when their previous unresolved assessment was accepted. "
+            "Record that outcome in obligation_updates, not only working_summary. "
+            "If only author confirmation or human approval remains, record blocked with "
+            "that limitation rather than scheduling a read-only specialist to ask a person. "
+            "Use this exact update shape: "
             + json.dumps({
                 "target": example_target,
                 "disposition": "not_applicable",
@@ -2102,7 +2116,7 @@ class SpecialistSession:
                     )
         pending = [
             item.target for item in self.obligation_assessments.assessments()
-            if item.disposition.value == "pending"
+            if item.disposition.value == "pending" or self._assessment_needs_followup_outcome(item)
         ]
         active = [self._candidate_target(item.candidate_id) for item in self.candidate_findings]
         lines.append("Current pending obligations: " + (", ".join(pending) or "none") + ".")
@@ -2827,7 +2841,7 @@ class SpecialistSession:
                     )
                 ):
                     pending_obligations = any(
-                        item.disposition.value == "pending"
+                        item.disposition.value == "pending" or self._assessment_needs_followup_outcome(item)
                         for item in self.obligation_assessments.assessments()
                     )
                     if (
@@ -5420,7 +5434,7 @@ class SpecialistSession:
             prepared_obligation_updates.append((normalized_update, resolved_evidence_ids))
         pending_targets = {
             item.target for item in self.obligation_assessments.assessments()
-            if item.disposition.value == "pending"
+            if item.disposition.value == "pending" or self._assessment_needs_followup_outcome(item)
         }
         update_targets = {
             target for update, _evidence_ids in prepared_obligation_updates
@@ -5438,7 +5452,7 @@ class SpecialistSession:
             self._last_checkpoint_validation_error = (
                 "Missing obligation decisions: " + ", ".join(missing_targets)
                 + ". Add each target to obligation_updates or unresolved; "
-                "do not repeat already accepted targets."
+                "include controller-selected follow-up outcomes, not unchanged accepted targets."
             )
             return None
         proposed_next_actions = (
@@ -6282,6 +6296,11 @@ class SpecialistSession:
         if self._final_result is not None:
             return
         normalized = _strings(gaps)
+        self._followup_assessment_versions = {
+            assessment.obligation_id: assessment.assessment_version
+            for assessment in self.obligation_assessments.assessments()
+            if assessment.obligation_id in normalized
+        }
         self.state = SessionState.COVERAGE_EVALUATION
         if normalized:
             next_actions = tuple(
@@ -6295,7 +6314,9 @@ class SpecialistSession:
                 + json.dumps([target for value in normalized
                               if (target := self.obligation_assessments.canonical_target(value))])
                 + ". Selected actions: " + json.dumps(next_actions)
-                + " Once that task is complete, stop without tool calls; the controller will "
+                + " First record the selected outcome with propose_obligation_resolution "
+                "(or obligation_updates in the requested checkpoint), using retained evidence "
+                "without rereading completed work. Then stop issuing tools; the controller will "
                 "request a checkpoint. Do not reopen other gaps, repeat completed checks, "
                 "or resubmit active candidates. Resuming after compaction does not expand this task."
             )
@@ -6311,8 +6332,12 @@ class SpecialistSession:
                     if next_actions else
                     ". No novel action was accepted; conclude rather than repeat reads."
                 )
-                + " Once the selected action's outcome is recorded, respond briefly without "
-                "tool calls so the controller can checkpoint. Other obligations remain "
+                + " Tools remain enabled: first investigate, then call propose_obligation_resolution "
+                "for the selected target to record the outcome. If the answer is already known, "
+                "record it using retained evidence without repeating reads. Report only genuinely "
+                "new defects; reuse active candidates. After recording the outcome, end exploration "
+                "with a brief response; the controller will request a checkpoint. If not recorded "
+                "via tool, include the outcome in that checkpoint's obligation_updates. Other obligations remain "
                 "controller-owned: do not reopen or resolve them during this follow-up. "
                 "An active finding does not prevent completion of the selected investigation."
             )
@@ -6333,6 +6358,7 @@ class SpecialistSession:
         normalized_target = str(target).strip()
         if not normalized_target or not isinstance(lead, InvestigationLead):
             raise ValueError("a target and investigation lead are required")
+        self._followup_assessment_versions = {}
         self._investigation_leads[lead.lead_id] = lead
         self._investigation_lead_targets[normalized_target] = lead.lead_id
         self._assigned_investigation_lead_ids.add(lead.lead_id)
@@ -7581,7 +7607,7 @@ class SpecialistSession:
             # before the scheduler marks an interrupted exploration callback.
             return
         pending = [item.target for item in self.obligation_assessments.assessments()
-                   if item.disposition.value == "pending"]
+                   if item.disposition.value == "pending" or self._assessment_needs_followup_outcome(item)]
         if (self._disposition_pass_attempted or not pending
                 or self._last_valid_checkpoint is None):
             return

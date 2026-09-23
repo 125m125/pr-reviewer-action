@@ -662,7 +662,7 @@ def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
         if not item:
             return ""
         if len(item) > 600:
-            raise ValueError("handoff summarizer what_changed_summary is invalid")
+            raise ValueError(f"handoff summarizer what_changed_summary exceeds 600 characters ({len(item)})")
         sentence_ends = list(re.finditer(r"[.!?](?:\s|$)", item))
         if len(sentence_ends) > 3:
             item = item[:sentence_ends[2].end()].strip()
@@ -3662,6 +3662,7 @@ class ReviewController:
                 assigned_session_id=session_result.session_id,
                 resolution_reason=resolution.reason,
                 candidate_ids=resolution.candidate_ids,
+                evidence_ids=tuple(dict.fromkeys((*lead.evidence_ids, *resolution.evidence_ids))),
             )
             state.journal.emit("investigation_lead_resolved", {
                 "lead_id": resolution.lead_id,
@@ -3880,10 +3881,7 @@ class ReviewController:
             locals_by_id = {item.id: item.participant_id for item in state.obligations if item.boundary_id == boundary.id and item.participant_id}
             assessments = tuple(
                 latest[key] for key in locals_by_id
-                if key in latest and latest[key].disposition in {
-                    ObligationDisposition.COVERED,
-                    ObligationDisposition.NOT_APPLICABLE,
-                }
+                if key in latest
             )
             context = build_boundary_context(
                 boundary, assessments, state.evidence.snapshot(),
@@ -3968,9 +3966,15 @@ class ReviewController:
                         f"{boundary.objective}; complete the remaining boundary assessment."
                     ),
                     affected_paths=combined.scope or boundary.contract_paths,
-                    evidence_ids=outcome.evidence_ids,
+                    evidence_ids=tuple(dict.fromkeys((
+                        *(old_lead.evidence_ids if old_lead else ()),
+                        *outcome.evidence_ids,
+                    ))),
                     next_action=outcome.suggested_investigation or f"Investigate {outcome.missing_fact}",
                     required_capability="repository", origin_session_id="boundary-evaluator",
+                    attempt_count=old_lead.attempt_count if old_lead else 0,
+                    last_evidence_delta=old_lead.last_evidence_delta if old_lead else 0,
+                    last_outcome=old_lead.last_outcome if old_lead else "",
                 )
             state.journal.emit("boundary_evaluation", {"boundary_id": boundary.id, "outcome": outcome.outcome, "reason": outcome.reason, "input_fingerprint": outcome.input_fingerprint})
 
@@ -6008,7 +6012,6 @@ class ReviewController:
                     context=handoff_request_context,
                 )
                 if isinstance(proposed, Mapping) and "ai_reviewed_summary" in proposed:
-                    summary = _handoff_summary_proposal(proposed)
                     allowed_summary_paths = {
                         _normalize_repository_path(path)
                         for path in (
@@ -6016,17 +6019,17 @@ class ReviewController:
                         )
                         if _normalize_repository_path(path)
                     }
-                    summary = replace(
-                        summary,
-                        referenced_paths=tuple(sorted(allowed_summary_paths))[:12],
-                        referenced_component_ids=context.component_ids[:12],
-                        referenced_obligation_ids=covered_obligation_ids[:12],
-                    )
                     try:
+                        summary = replace(
+                            _handoff_summary_proposal(proposed),
+                            referenced_paths=tuple(sorted(allowed_summary_paths))[:12],
+                            referenced_component_ids=context.component_ids[:12],
+                            referenced_obligation_ids=covered_obligation_ids[:12],
+                        )
                         context = self._apply_handoff_summary_proposal(
                             state, context, summary,
                         )
-                    except ValueError as exc:
+                    except (TypeError, ValueError) as exc:
                         repaired = self._model_request(
                             state,
                             role="finalizer",
@@ -6038,6 +6041,7 @@ class ReviewController:
                                 **handoff_request_context,
                                 "semantic_repair": {
                                     "reason": _bounded_error(exc),
+                                    "previous_response": proposed,
                                     "instruction": (
                                         "Rewrite only the concise human handoff. Do not "
                                         "state a verdict, coverage conclusion, finding, "
@@ -7216,6 +7220,34 @@ class ReviewController:
                     state, followup, followup_snapshot,
                 )
                 next_reconciliation = self._refresh_boundary_coverage(state, next_reconciliation)
+                new_records = tuple(
+                    record for record in state.evidence.snapshot().records
+                    if record.id not in before_evidence
+                )
+                for action in actions:
+                    for lead_id in action.lead_ids:
+                        lead = state.investigation_leads.get(lead_id)
+                        if lead is None or not followups:
+                            continue
+                        conclusions = tuple(
+                            item.session_result.checkpoint.working_summary
+                            for item in followup.results
+                            if item.session_result.checkpoint and item.session_result.checkpoint.working_summary
+                        )
+                        evidence_ids = tuple(record.id for record in new_records)
+                        state.investigation_leads[lead_id] = replace(
+                            lead, attempt_count=lead.attempt_count + 1,
+                            last_evidence_delta=len(evidence_ids),
+                            last_outcome=(" ".join(conclusions)[:1200] or
+                                          "Follow-up returned no recorded conclusion."),
+                            evidence_ids=tuple(dict.fromkeys((*lead.evidence_ids, *evidence_ids))),
+                        )
+                        journal.emit("investigation_lead_followup_completed", {
+                            "lead_id": lead_id,
+                            "attempt_count": lead.attempt_count + 1,
+                            "evidence_delta": len(evidence_ids),
+                            "outcome": state.investigation_leads[lead_id].last_outcome,
+                        })
                 # Evidence collection counts as progress even before it satisfies
                 # an obligation. A scheduled exploration that adds neither evidence
                 # nor coverage retires only its target so another gap can be tried;

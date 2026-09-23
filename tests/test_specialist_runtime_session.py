@@ -3932,6 +3932,38 @@ def test_checkpoint_prompt_contains_compact_active_candidate_register():
     assert "Active candidates" in prompt
 
 
+def test_followup_checkpoint_requires_selected_unresolved_outcome():
+    session = make_session(ScriptedGateway([]))
+    for target in session.obligation_assessments.handles():
+        session.obligation_assessments.propose(
+            target=target, disposition="unresolved", reason="Consumer inspection remains.",
+            evidence_ids=(), next_actions=("Read the consumer.",), evidence=session.evidence_store.snapshot(),
+            eligible=lambda record, obligation: True,
+        )
+    session.apply_coverage_feedback(["OB-tests"])
+    prompt = session._checkpoint_obligation_contract()
+    contract = json.JSONDecoder().raw_decode(prompt.split(": ", 1)[1])[0]
+    assert [item["target"] for item in contract["pending_obligations"]] == ["O2"]
+    assert "return empty obligation_updates" not in prompt
+    omitted = session._checkpoint_from_text(json.dumps({
+        "unresolved": [], "obligation_updates": [], "new_candidates": [],
+        "candidate_updates": [], "working_summary": "The tests were checked.",
+        "completed_steps": ["Read the failing tests."],
+    }))
+    assert omitted is None
+    assert "Missing obligation decisions: O2" in session._last_checkpoint_validation_error
+    recorded = session._checkpoint_from_text(json.dumps({
+        "unresolved": [], "new_candidates": [], "candidate_updates": [],
+        "obligation_updates": [{"target": "O2", "disposition": "blocked",
+                                "reason": "Author confirmation is the only remaining action.",
+                                "evidence_ids": [], "next_actions": []}],
+        "working_summary": "The tests were checked.", "completed_steps": ["Read the failing tests."],
+    }))
+    assert recorded is not None
+    assert session.obligation_assessments.assessment("O2").disposition.value == "blocked"
+    assert not session._assessment_needs_followup_outcome(session.obligation_assessments.assessment("O2"))
+
+
 def test_checkpoint_prompt_lists_controller_owned_obligation_state():
     gateway = ScriptedGateway([
         checkpoint_response(inspected=[], unresolved=["OB-tests"]),
@@ -4860,7 +4892,7 @@ def test_initial_compact_resume_repairs_missing_working_memory_before_compaction
     )
     assert "Tool access is re-enabled for exploration." in continuation
     assert "controller-selected gaps" in continuation
-    assert "stop without tool calls" in continuation
+    assert "Then stop issuing tools" in continuation
     continuation_payload = json.loads(continuation.split("catalogued IDs:\n", 1)[1])
     checkpoint_memory = continuation_payload["cumulative_checkpoint"]
     assert "coverage" not in checkpoint_memory
@@ -5369,7 +5401,7 @@ def test_rejected_reasoning_prefill_gets_one_user_continuation(repeat_error):
     assert "tools remain enabled" in messages[-1]["content"]
     assert "controller-selected" in messages[-1]["content"]
     assert "O1" in messages[-1]["content"]
-    assert "stop without tool calls" in messages[-1]["content"]
+    assert "Then stop issuing tools" in messages[-1]["content"]
     assert "Still tracing the caller." in gateway.requests[2].messages
     assert gateway.requests[2].tools_enabled
     assert session.budget.remaining_model_turns() == 5

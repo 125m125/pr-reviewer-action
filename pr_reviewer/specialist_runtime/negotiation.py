@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from math import isfinite
+import re
 from typing import Any
 
 from .assignments import Assignment
@@ -32,6 +33,16 @@ _ACTION_FIELDS = frozenset({
     "estimated_turns", "reason",
 })
 _RISK_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+
+
+def _requires_human_action(action: str) -> bool:
+    # Only explicit human interactions: inspecting author intent in history is
+    # still executable. Do not attempt to classify arbitrary prose as a task.
+    return bool(re.match(
+        r"\s*(?:confirm\s+with|ask|contact|consult\s+with|obtain\s+approval\s+from)\s+"
+        r"(?:the\s+)?(?:change\s+|PR\s+)?(?:author|maintainer|owner|human)\b",
+        action, re.IGNORECASE,
+    ))
 
 
 def _assignment_id(assignment: Assignment | SpecialistAssignment) -> str:
@@ -263,7 +274,8 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             for owner in owners if owner.session_id in checkpoints
         )
         next_actions = (
-            tuple(dict.fromkeys(assessment.next_actions))
+            tuple(action for action in dict.fromkeys(assessment.next_actions)
+                  if not _requires_human_action(action))
             if assessment is not None else ()
         )
         if assessment is not None and assessment.omitted_paths:
@@ -340,7 +352,9 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
     reserved_delegations = _reserved_delegation_lead_ids(state)
     for index, lead in enumerate(_negotiable_leads(state), start=1):
         allowed_actions = ["record_unknown"]
-        if lead.lead_id in reserved_delegations:
+        if _requires_human_action(lead.next_action):
+            pass
+        elif lead.lead_id in reserved_delegations:
             if (
                 state.new_session_turns_remaining > 0
                 and state.new_session_tool_call_cap > 0
@@ -375,11 +389,11 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             "subject": lead.affected_paths[0] if lead.affected_paths else "investigation lead",
             "summary": lead.summary,
             "allowed_actions": tuple(dict.fromkeys(allowed_actions)),
-            "last_conclusion": lead.resolution_reason,
-            "attempt_count": 0,
-            "evidence_delta": 0,
+            "last_conclusion": lead.resolution_reason or lead.last_outcome,
+            "attempt_count": lead.attempt_count,
+            "evidence_delta": lead.last_evidence_delta,
             "retained_evidence_count": len(lead.evidence_ids),
-            "next_actions": (lead.next_action,),
+            "next_actions": () if _requires_human_action(lead.next_action) else (lead.next_action,),
             "required_capability": lead.required_capability,
         })
     has_feasible_high_risk = any(
