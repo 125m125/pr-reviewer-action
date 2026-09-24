@@ -847,10 +847,13 @@ def _deduplication_key(candidate: CandidateFinding) -> str:
     return "dedup:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
-def _merge_compatible(source: CandidateFinding, target: CandidateFinding) -> bool:
+def _merge_compatible(
+    source: CandidateFinding, target: CandidateFinding,
+    added_diff_lines: Mapping[str, frozenset[int]],
+) -> bool:
     """Allow critic deduplication without making it an authorization bypass."""
-    source_file, _, source_state = _path(source.affected_location)
-    target_file, _, target_state = _path(target.affected_location)
+    source_file, source_line, source_state = _path(source.affected_location)
+    target_file, target_line, target_state = _path(target.affected_location)
     if source_state != "ok" or target_state != "ok" or source_file != target_file:
         return False
     return bool(
@@ -858,6 +861,11 @@ def _merge_compatible(source: CandidateFinding, target: CandidateFinding) -> boo
         and source.root_cause_fingerprint == target.root_cause_fingerprint
     ) or bool(
         set(source.supporting_evidence_ids) & set(target.supporting_evidence_ids)
+    ) or bool(
+        # This only permits an explicit critic merge, never automatic dedup.
+        # Each finding must still pass authorization independently.
+        source_line is not None and source_line == target_line
+        and source_line in added_diff_lines.get(source_file, frozenset())
     )
 
 
@@ -1382,7 +1390,7 @@ def merge_accepted_findings(
         source, target = accepted.get(source_id), accepted.get(target_id)
         if source is None or target is None or source_id == target_id:
             continue
-        if not _merge_compatible(_candidate_from_accepted(source), _candidate_from_accepted(target)):
+        if not _merge_compatible(_candidate_from_accepted(source), _candidate_from_accepted(target), added_lines):
             continue
         accepted[target_id] = _merge_findings((source, target), target_id, added_diff_lines=added_lines)
         del accepted[source_id]
@@ -1497,7 +1505,7 @@ def adjudicate_candidates(
             continue
         if action == "merge":
             target = candidate_by_id.get(target_id)
-            if target is None or not _merge_compatible(candidate, target):
+            if target is None or not _merge_compatible(candidate, target, added_diff_lines):
                 disposition = CandidateDisposition(
                     candidate_id, "keep", "invalid-merge-target-kept", target_id or None
                 )
