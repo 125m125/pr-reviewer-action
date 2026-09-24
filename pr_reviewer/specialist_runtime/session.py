@@ -296,7 +296,10 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "are admitted independently even if this resolution is rejected. "
             "For covered, cite at least one direct in-scope evidence ID. Tests "
             "and consumers may be cited as supplemental evidence; the controller "
-            "retains only the eligible subset for coverage."
+            "retains only the eligible subset for coverage. Covered means the "
+            "investigation is complete, not that the code is correct: report "
+            "supported defects and mark covered when no investigation remains. "
+            "Do not keep coverage partial pending a code fix or passing tests."
         ),
         "parameters": {"type": "object", "properties": {
             "target": {
@@ -749,6 +752,11 @@ _CHECKPOINT_CONTROLLER_STATE_INSTRUCTION = (
 )
 _OBLIGATION_PROTOCOL_INSTRUCTION = (
     " Coverage is not a request to find supporting evidence at all costs. "
+    "Covered means investigation complete, not defect-free code. A reported "
+    "candidate does not keep coverage open: use covered with result=candidates "
+    "when the assigned investigation is complete. Partially covered means a "
+    "specific investigation remains, not that a developer must fix the defect "
+    "or make failing tests pass. "
     "Actively attempt to falsify the changed behavior before resolving an obligation; "
     "look for a reachable failure, contradicted contract, or affected consumer rather "
     "than treating evidence collection as checklist completion. "
@@ -764,6 +772,13 @@ _OBLIGATION_PROTOCOL_INSTRUCTION = (
     "use result=candidates with candidate_drafts=[] rather than resubmitting them. "
     "Otherwise retain a specific needs_followup lead, or state that "
     "none was observed. "
+    "Once behavior and evidence are established, choose a disposition. Reconsider "
+    "it when new evidence changes the assessment, not merely because a different "
+    "intention is conceivable. Report a supported candidate promptly; revise or "
+    "withdraw it if later evidence disproves it. For a concrete concern missing "
+    "a decisive fact, record a focused investigation lead naming that fact and "
+    "how to check it. A merely hypothetical concern is a limitation, not a reason "
+    "to invent a candidate or repeatedly revisit the same question. "
     "Unchanged sources may explain a contract without proving changed behavior. "
     "Unresolved work must name a concrete novel next action. Accepted obligation "
     "state is controller-owned and need not be repeated in checkpoints."
@@ -1155,12 +1170,13 @@ def specialist_assignment_prompt(
     all_ids = tuple(getattr(assignment, "obligation_ids", ()))
     independent = tuple(getattr(assignment, "independent_obligation_ids", ()))
     investigation_leads = tuple(getattr(assignment, "investigation_leads", ()))
+    assigned_ids = set((*primary, *all_ids, *independent))
     component_obligations = tuple(
         item for item in obligations
-        if item.owner_component_id
+        if item.id in assigned_ids and (item.owner_component_id
         or item.boundary_id
         or item.participant_id
-        or item.evaluator_owned
+        or item.evaluator_owned)
     )
     obligation_briefs = tuple(
         value for item in getattr(assignment, "obligation_briefs", ())

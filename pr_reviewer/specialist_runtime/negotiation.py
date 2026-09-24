@@ -36,11 +36,19 @@ _RISK_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
 
 
 def _requires_human_action(action: str) -> bool:
-    # Only explicit human interactions: inspecting author intent in history is
-    # still executable. Do not attempt to classify arbitrary prose as a task.
+    # Only explicit human interaction or remediation: inspecting intent/history
+    # and checking evidence for a candidate remain executable review work.
     return bool(re.match(
         r"\s*(?:confirm\s+with|ask|contact|consult\s+with|obtain\s+approval\s+from)\s+"
         r"(?:the\s+)?(?:change\s+|PR\s+)?(?:author|maintainer|owner|human)\b",
+        action, re.IGNORECASE,
+    )) or bool(re.match(
+        r"\s*(?:(?:fix|repair)\s+(?:the\s+)?(?:reported\s+|identified\s+)?"
+        r"(?:defect|bug|issue|code)\b|"
+        r"(?:fix|repair)\s+(?:candidate\s+)?C\d+\b|"
+        r"resolve\s+(?:candidate\s+)?C\d+\s*(?:\(|by\s+)"
+        r"\s*(?:restore|replace|change|fix|repair)\b|"
+        r"wait\s+for\s+.{0,100}\b(?:fixed|repaired|merged)\b)",
         action, re.IGNORECASE,
     ))
 

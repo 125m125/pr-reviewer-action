@@ -452,11 +452,17 @@ def test_fallback_skips_infeasible_critical_target_for_actionable_high_target():
     assert action.session_id == "S1"
 
 
-def test_human_confirmation_is_not_an_executable_followup():
+@pytest.mark.parametrize("next_action", [
+    "Confirm with the change author whether this was intentional.",
+    "Resolve C1 (restore REQUEST_CHANGES) then re-verify the failing test passes.",
+    "Fix the reported defect and rerun the tests.",
+    "Wait for C1 to be fixed before reassessing coverage.",
+])
+def test_human_confirmation_is_not_an_executable_followup(next_action):
     assessment = ObligationAssessment(
         target="O1", obligation_id="OB2", disposition=ObligationDisposition.UNRESOLVED,
         reason="Only the author can confirm intent.",
-        next_actions=("Confirm with the change author whether this was intentional.",),
+        next_actions=(next_action,),
     )
     state = state_for(covered=("OB1",), checkpoints=(SessionCheckpoint(
         session_id="S2", state=SessionState.CHECKPOINT, obligation_assessments=(assessment,),
@@ -480,6 +486,24 @@ def test_compact_negotiation_omits_closed_assessment():
     targets = compact_negotiation_context(state)["targets"]
 
     assert all(item["subject"] != "src/a.py" for item in targets)
+
+
+@pytest.mark.parametrize("next_action", [
+    "Resolve C1 uncertainty by inspecting the caller and its tests.",
+    "Inspect the author intent in retained commit history.",
+    "Check whether the existing fix for C1 applies to this caller.",
+])
+def test_candidate_evidence_questions_remain_executable(next_action):
+    assessment = ObligationAssessment(
+        target="O1", obligation_id="OB2", disposition=ObligationDisposition.UNRESOLVED,
+        reason="The caller behavior needs checking.", next_actions=(next_action,),
+    )
+    state = state_for(covered=("OB1",), checkpoints=(SessionCheckpoint(
+        session_id="S2", state=SessionState.CHECKPOINT, obligation_assessments=(assessment,),
+    ),))
+    target = compact_negotiation_context(state)["targets"][0]
+    assert "resume" in target["allowed_actions"]
+    assert target["next_actions"] == (next_action,)
 
 
 def test_compact_negotiation_rejects_resume_without_novel_action():
