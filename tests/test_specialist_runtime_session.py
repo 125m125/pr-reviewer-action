@@ -2263,6 +2263,30 @@ def test_component_assignment_prompt_exposes_group_context_without_per_file_jobs
     assert len(payload["obligation_targets"]) == 1
 
 
+def test_boundary_followup_prompt_does_not_claim_other_obligations_paths():
+    assignment = SpecialistAssignment(
+        assignment_id="publishing-followup", objective="Check publication boundary",
+        primary_obligation_ids=("boundary",),
+        permitted_boundaries=("publishing.py",),
+    )
+    obligations = tuple(CoverageObligation(
+        obligation_id=key, origin="component", subject=key,
+        owner_component_id=key, scope=(path,), seed_hints=(hint,),
+        required_evidence_categories=("implementation",),
+        satisfaction_predicates=("recorded_evidence",),
+        risk_tier="normal", unresolved_policy="record_unknown",
+    ) for key, path, hint in (
+        ("boundary", "publishing.py", "contracts.py"),
+        ("other", "redact.py", "unrelated.py"),
+    ))
+    payload = json.loads(specialist_assignment_prompt(
+        assignment, obligations=obligations,
+    ).split("\n", 1)[1])
+    assert payload["group_context"]["owned_changed_paths"] == ["publishing.py"]
+    assert payload["permitted_boundaries"] == ["publishing.py", "contracts.py"]
+    assert len(payload["obligation_briefs"]) == 1
+
+
 def test_group_assessment_fields_and_partial_disposition_are_in_tool_and_checkpoint_schemas():
     gateway = ScriptedGateway([
         checkpoint_response(inspected=[], unresolved=["O1"]),

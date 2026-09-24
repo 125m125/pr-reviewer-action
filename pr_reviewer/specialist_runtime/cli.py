@@ -163,6 +163,10 @@ _ROLE_SYSTEM = {
         "did not answer it. Asking the author, changing code, or obtaining human approval is "
         "not executable by these read-only specialists; retain it for human review rather "
         "than scheduling another exploration."
+        " Coverage means investigation complete, not defect-free code. An active "
+        "finding or failing test does not by itself justify another attempt. "
+        "Schedule only a concrete unanswered evidence question, never a task to "
+        "fix a reported defect, wait for a fix, or prove the corrected tests pass."
     ),
     "critic": (
         "Adjudicate only evidence-backed candidates from the supplied immutable state. "
