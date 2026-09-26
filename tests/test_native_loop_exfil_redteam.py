@@ -147,7 +147,7 @@ def test_read_file_masks_secrets_in_allowed_file(tmp_path):
 )
 def test_web_fetch_blocks_unallowlisted_host(tmp_path, url):
     res = _exec("web_fetch", {"url": url}, tmp_path)
-    assert res["status"] == "error"
+    assert res["status"] == "rejected"
     assert "denied" in str(res["result"]).lower()
 
 
@@ -188,7 +188,7 @@ def test_web_search_query_cannot_change_host(tmp_path, monkeypatch):
 def test_gh_api_blocks_unallowlisted_repo(tmp_path, monkeypatch):
     monkeypatch.setenv("GH_TOKEN", "fake-not-used")  # validation precedes any network
     res = _exec("gh_api", {"endpoint": "repos/attacker/evil/contents/x"}, tmp_path)
-    assert res["status"] == "error"
+    assert res["status"] == "rejected"
     assert "not allowed" in str(res["result"]).lower()
 
 

@@ -5252,6 +5252,58 @@ def test_checkpoint_output_uses_spare_context_and_reserves_repair():
     assert first + repair < 9000
 
 
+def test_checkpoint_preserves_narrative_limits_through_projection_and_finalization():
+    response = checkpoint_response(inspected=[], unresolved=[])
+    payload = json.loads(response.content or response.text)
+    payload["unknowns"] = ["External XML schema could not be verified.", "O1"]
+    session = make_session(ScriptedGateway([invalid_response(json.dumps(payload))]))
+    result = session.request_checkpoint("controller-request")
+    assert "External XML schema could not be verified." in result.checkpoint.unknowns
+    assert "O1" not in result.checkpoint.unknowns
+    for obligation_id in ("OB-code", "OB-tests"):
+        session.coverage.attach_evidence(obligation_id, "retained-evidence")
+    session.latest_checkpoint = session._project_checkpoint(())
+    assert session.latest_checkpoint.unknowns == ("External XML schema could not be verified.",)
+    assert session.finalize().report["unknowns"] == ["External XML schema could not be verified."]
+
+
+@pytest.mark.parametrize("status,expected", [("rejected", "rejected"), ("error", "errors")])
+def test_tool_activity_distinguishes_rejections_from_execution_errors(status, expected):
+    session = make_session(ScriptedGateway([]))
+    session._tool_activity_call_names["denial"] = "web_fetch"
+    session._add_tool_result("denial", {"status": status, "error": "denied"}, is_error=True)
+    stats = session._tool_activity_snapshot()[0]
+    assert stats[expected] == 1
+    assert stats["calls"] == 1
+
+
+def test_line_range_survives_session_envelope_clipping():
+    from pr_reviewer.conversation import Conversation
+    conversation = Conversation(system="test")
+    conversation.add_tool_result("read", {
+        "content": ("abcd" * 1000 + "\n") * 3,
+        "range": {"offset": 1, "lines": 3, "next_offset": None, "has_more": False},
+    })
+    delivered = json.loads(conversation.events[-1]["content"])
+    assert delivered["content"] == "abcd" * 1000 + "\n"
+    assert delivered["range"]["lines"] == 1
+    assert delivered["range"]["next_offset"] == 2
+
+
+def test_batched_line_ranges_survive_session_envelope_clipping():
+    conversation = Conversation(system="test")
+    conversation.add_tool_result("read", {"evidence_slices": [
+        {"path": path, "content": ("abcd" * 500 + "\n") * 3,
+         "range": {"offset": 10, "lines": 3, "next_offset": None, "has_more": False}}
+        for path in ("a.py", "b.py")
+    ]})
+    delivered = json.loads(conversation.events[-1]["content"])
+    for item in delivered["evidence_slices"]:
+        count = item["range"]["lines"]
+        assert item["content"] == ("abcd" * 500 + "\n") * count
+        assert item["range"]["next_offset"] == 10 + count
+
+
 def test_checkpoint_pressure_reserves_next_exploration_response():
     session = make_session(
         EstimatingGateway([], rendered_bytes=59_213 * 3),

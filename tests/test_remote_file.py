@@ -72,7 +72,7 @@ def test_reads_allowlisted_remote_text_file_with_a_bounded_line_window(monkeypat
     assert result["content"] == "LINE 2 | second\nLINE 3 | third\n"
     assert result["range"] == {
         "offset": 2, "lines": 2, "total_lines": 3,
-        "truncated": False, "has_more": False,
+        "truncated": False, "has_more": False, "next_offset": None,
     }
     assert seen == {
         "endpoint": (
@@ -132,7 +132,9 @@ def test_remote_text_reports_byte_truncation(monkeypatch):
 
     assert result["range"]["truncated"] is True
     assert result["range"]["has_more"] is True
-    assert result["content"].endswith("[truncated]")
+    assert result["content"] == "line\n" * 16
+    assert result["range"]["lines"] == 16
+    assert result["range"]["next_offset"] == 17
 
 
 @pytest.mark.parametrize("length,body", ((None, b"x" * 100), ("999", b"x" * 100), ("5", b"hello")))

@@ -28,6 +28,20 @@ def _tool_names() -> set[str]:
     return {s["name"] for s in TOOL_SCHEMAS}
 
 
+@pytest.mark.parametrize("status", ["ok", "partial", "inconclusive"])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_search_wire_omits_nonactionable_warnings_without_mutating_evidence(status, wrapped):
+    payload = {"kind": "search_discovery", "search_status": status,
+               "engine_warnings": [{"engine": "brave", "reason": "rate_limited"}]}
+    result = {"content": json.dumps(payload), "evidence_id": "evidence:search"} if wrapped else {"result": payload}
+    original = deepcopy(result)
+    conversation = Conversation()
+    conversation.add_tool_result("search-call", result)
+    content = conversation.events[-1]["content"]
+    assert ("engine_warnings" in content) == (status != "ok")
+    assert result == original
+
+
 class TestToolSchemas:
     def test_covers_executor_catalogue(self):
         # Matches the executor surface in scripts/run_tool_harness.py
