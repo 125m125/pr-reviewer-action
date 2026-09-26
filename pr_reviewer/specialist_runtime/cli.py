@@ -2605,6 +2605,21 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
             )
     external_access = artifact.get("external_access", {})
     if isinstance(external_access, Mapping):
+        warnings = external_access.get("search_warnings", [])
+        if isinstance(warnings, (list, tuple)) and warnings:
+            summary_lines.extend((
+                "", "### Search provider warnings", "",
+                "Search results may be incomplete: these engines failed during retained searches. "
+                "This is separate from source authorization and suppressed results.", "",
+                "| Engine | Warning |", "| --- | --- |",
+            ))
+            for warning in warnings[:10]:
+                if isinstance(warning, Mapping):
+                    summary_lines.append(
+                        "| " + _summary_cell(warning.get("engine", "unknown"), limit=64)
+                        + " | " + _summary_cell(str(warning.get("reason", "unavailable")).replace("_", " "), limit=80)
+                        + " |"
+                    )
         sources = external_access.get("allowed_sources", [])
         source_rows = sources if isinstance(sources, (list, tuple)) else ()
         allowed_repositories = external_access.get(

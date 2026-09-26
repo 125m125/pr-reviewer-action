@@ -662,7 +662,7 @@ def test_forty_call_review_is_compacted_within_model_context(monkeypatch, tmp_pa
     calls = []
     for i in range(40):
         name = f"evidence-{i}.txt"
-        (tmp_path / name).write_text(f"material-{i}\n" + "x" * 11900)
+        (tmp_path / name).write_text(f"material-{i}\n" + ("x" * 118 + "\n") * 100)
         calls.append({
             "id": f"c{i}", "type": "function",
             "function": {"name": "read_file", "arguments": json.dumps({"path": name})},

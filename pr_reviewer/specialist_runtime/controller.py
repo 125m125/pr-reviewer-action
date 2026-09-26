@@ -115,6 +115,7 @@ from .web_evidence import (
     RepositoryAccessRequest,
     SourceAccessRequest,
     access_request_identity,
+    search_warning_summary,
 )
 from pr_reviewer.transport import is_model_endpoint_unavailable
 
@@ -6543,6 +6544,7 @@ class ReviewController:
                 tool_activity[key] for key in sorted(tool_activity)
             ],
             "external_access": {
+                "search_warnings": search_warning_summary(state.evidence.snapshot().records),
                 "search_configured": bool(
                     state.inputs.adapter_configuration.get("search_configured", False)
                 ),

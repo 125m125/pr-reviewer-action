@@ -28,6 +28,7 @@ from redact import mask_and_truncate, mask_secrets, mask_source_secrets  # noqa:
 # source of truth); _resolve_workspace_path reuses GH_DENY_SUBSTRINGS to block
 # the same sensitive segments in filesystem paths.
 from pr_reviewer.platform import GH_DENY_SUBSTRINGS  # noqa: E402
+from pr_reviewer.line_windows import line_window, bound_line_payload
 from pr_reviewer.specialist_runtime.web_evidence import (  # noqa: E402
     SearchProvider,
     SearchResultRegistry,
@@ -77,22 +78,11 @@ def _bound_batched_diff_result(patches, max_bytes):
         "path": item["path"],
         "status": item["status"],
         "patch": item.get("patch", ""),
+        "range": item.get("range"),
         "truncated": bool((item.get("range") or {}).get("truncated")),
     } for item in patches]
-    result = {"patches": compact, "shared_max_bytes": max_bytes}
-    encode = lambda: json.dumps(result, separators=(",", ":")).encode("utf-8")
-    while len(encode()) > max_bytes:
-        candidates = [item for item in compact if item["patch"]]
-        if not candidates:
-            break
-        largest = max(candidates, key=lambda item: len(item["patch"].encode("utf-8")))
-        excess = len(encode()) - max_bytes
-        current = len(largest["patch"].encode("utf-8"))
-        largest["patch"], _ = _truncate_utf8(
-            largest["patch"], max(0, current - max(excess, 1)), "",
-        )
-        largest["truncated"] = True
-    if len(encode()) > max_bytes:
+    result = bound_line_payload({"patches": compact, "shared_max_bytes": max_bytes}, max_bytes)
+    if len(json.dumps(result).encode("utf-8")) > max_bytes:
         return {"truncated": True}
     return result
 
@@ -176,7 +166,7 @@ def _resolve_workspace_path(path, workspace_root):
 
     return resolved, None
 
-def read_file(path, workspace_root, offset=None, limit=None, include_line_numbers=False):
+def read_file(path, workspace_root, offset=None, limit=None, include_line_numbers=False, max_response_bytes=12000):
     """Read a file, optionally a 1-based line window, with path protection.
 
     ``offset``/``limit`` let the model read a slice of a large file without
@@ -192,9 +182,6 @@ def read_file(path, workspace_root, offset=None, limit=None, include_line_number
     except Exception as exc:
         return {"error": str(exc)}
 
-    if offset is None and limit is None and not include_line_numbers:
-        return {"content": content[:12000]}
-
     lines = content.splitlines(keepends=True)
     start = max((offset or 1) - 1, 0)
     end = start + limit if limit is not None else len(lines)
@@ -206,10 +193,9 @@ def read_file(path, workspace_root, offset=None, limit=None, include_line_number
         )
         if include_line_numbers else "".join(selected)
     )
-    return {
-        "content": window[:12000],
-        "range": {"offset": start + 1, "lines": len(selected), "total_lines": len(lines)},
-    }
+    window, _ = mask_source_secrets(window)
+    window, page = line_window(window, start + 1, max_response_bytes, has_more=end < len(lines))
+    return {"content": window, "range": dict(page, total_lines=len(lines))}
 
 
 _DIFF_HUNK_COORDINATES_RE = re.compile(
@@ -261,14 +247,13 @@ def _read_bounded_line_window(stream, offset, limit, max_bytes):
                 return bytes(collected), returned_lines, True
             else:
                 include_current_line = True
-                returned_lines += 1
 
         if include_current_line:
             remaining = max_bytes - len(collected)
             if len(chunk) > remaining:
-                collected.extend(chunk[:remaining])
                 return bytes(collected), returned_lines, True
             collected.extend(chunk)
+            returned_lines += 1
 
         if chunk.endswith(b"\n"):
             current_line += 1
@@ -513,19 +498,11 @@ def read_remote_file(
     else:
         selected_text = "".join(selected)
     masked_text, _redaction_count = mask_source_secrets(selected_text)
-    selected_text, byte_truncated = _truncate_utf8(
-        masked_text, max_response_bytes,
-    )
-    has_more = line_end < len(lines) or byte_truncated
+    selected_text, page = line_window(masked_text, line_start + 1, max_response_bytes,
+                                      has_more=line_end < len(lines))
     return {
         "content": selected_text,
-        "range": {
-            "offset": line_start + 1,
-            "lines": len(selected),
-            "total_lines": len(lines),
-            "truncated": has_more,
-            "has_more": has_more,
-        },
+        "range": dict(page, total_lines=len(lines)),
         "repository": str(repository).strip().strip("/"),
         "path": normalized_path,
         "ref": revision,
@@ -708,10 +685,11 @@ def execute_tool_request(
             res = read_file(
                 path, workspace_root, _opt_int(args.get("offset")), _opt_int(args.get("limit")),
                 args.get("include_line_numbers") is True,
+                max_response_bytes,
             )
             if res.get("error"):
                 raise ValueError(res["error"])
-            text = _source_text(res.get("content", ""), max_response_bytes)
+            text = res.get("content", "")
             result_payload = {"content": text}
             if res.get("range"):
                 result_payload["range"] = res["range"]
@@ -852,28 +830,14 @@ def execute_tool_request(
             masked_patch, _redaction_count = mask_source_secrets(output)
             if args.get("include_line_numbers") is True:
                 masked_patch = _number_diff_lines(masked_patch)
-            encoded_patch = masked_patch.encode("utf-8", errors="replace")
-            if len(encoded_patch) > max_response_bytes:
-                marker = b"\n[truncated]"
-                if max_response_bytes <= len(marker):
-                    encoded_patch = marker[:max_response_bytes]
-                else:
-                    encoded_patch = (
-                        encoded_patch[:max_response_bytes - len(marker)].decode(
-                            "utf-8", errors="ignore"
-                        ).encode("utf-8")
-                        + marker
-                    )
-            patch = encoded_patch.decode("utf-8", errors="replace")
+            patch, page = line_window(masked_patch, offset, max_response_bytes, has_more=has_more)
+            if not raw_output and has_more:
+                page.update(omitted_lines=[offset], next_offset=offset + 1,
+                            omission_reason="line exceeds output byte limit")
             tool_result["result"] = {
                 "path": normalized_path,
                 "patch": patch,
-                "range": {
-                    "offset": offset,
-                    "returned_lines": returned_lines,
-                    "has_more": has_more,
-                    "truncated": has_more,
-                },
+                "range": dict(page, returned_lines=page["lines"]),
             }
 
         elif tool_name == "git_log":
@@ -959,7 +923,7 @@ def execute_tool_request(
             )
             if res.get("error"):
                 raise ValueError(res["error"])
-            content = _source_text(res.get("content", ""), max_response_bytes)
+            content = res.get("content", "")
             tool_result["result"] = {
                 "content": content,
                 "repository": res["repository"],
@@ -1084,6 +1048,8 @@ def execute_tool_request(
         # processes the markdown output. This is consistent with how
         # run_command error messages are redacted.
         tool_result["result"] = {"error": str(exc)}
+        if str(exc).startswith(("Repo not allowed:", "source denied:")):
+            tool_result["status"] = "rejected"
 
     return tool_result
 
