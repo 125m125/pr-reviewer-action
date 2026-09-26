@@ -38,7 +38,7 @@ _RE_KUBE_CRED = re.compile(
 
 _RE_SOURCE_KV_SECRET = re.compile(
     r"(?i)(?P<key>api[_-]?key|api[_-]?token|auth[_-]?token|access[_-]?key|"
-    r"token|password|secret)"
+    r"token|secret)"
     r"(?P<separator>\s*[:=]\s*)"
     r"(?P<quote>['\"]?)(?P<value>[^\s'\"]{8,})(?P=quote)"
 )
