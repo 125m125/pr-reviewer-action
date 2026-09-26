@@ -2436,7 +2436,9 @@ class SpecialistSession:
         return (min(self.max_tokens * 2, max(1, available * 2 // 3)),
                 min(self.max_tokens, max(1, available // 3)))
 
-    def _checkpoint_pressure_due(self, *, reserve_tool_result: bool = False) -> bool:
+    def _checkpoint_pressure_due(
+        self, *, reserve_tool_result: bool = False, reserve_response: bool = True,
+    ) -> bool:
         projected = Conversation(
             system=self.conversation.system,
             events=list(self.conversation.events),
@@ -2450,12 +2452,17 @@ class SpecialistSession:
             max_tokens=self.checkpoint_max_tokens,
             schema=_COMPACTING_CHECKPOINT_SCHEMA,
             conversation=projected,
+            thinking_budget_tokens=self.checkpoint_reasoning_budget_tokens,
         )
         repair_instruction_tokens = math.ceil(
-            len(_CHECKPOINT_REPAIR_INSTRUCTION.encode("utf-8")) / 3
+            len((_CHECKPOINT_REPAIR_INSTRUCTION
+                 + self._checkpoint_obligation_contract()).encode("utf-8")) / 3
         )
         reserved_tokens = (
             checkpoint.input_tokens
+            # Before exploration, leave room for its full response as well as
+            # the checkpoint. After a response, that growth is already counted.
+            + (self.max_tokens if reserve_response else 0)
             + (self.checkpoint_max_tokens * 2)
             + repair_instruction_tokens
             + self.wire_safety_tokens
@@ -4052,7 +4059,9 @@ class SpecialistSession:
         for index, call in enumerate(calls):
             call_id = str(call.get("id") or "")
             name = str(call.get("name") or "")
-            if self._tool_calls_deferred_for_checkpoint or self._checkpoint_pressure_due(reserve_tool_result=True):
+            if self._tool_calls_deferred_for_checkpoint or self._checkpoint_pressure_due(
+                reserve_tool_result=True, reserve_response=False,
+            ):
                 for deferred in calls[index:]:
                     self._add_tool_result(
                         str(deferred.get("id") or ""),
@@ -4927,7 +4936,9 @@ class SpecialistSession:
                     tools_enabled=False, max_tokens=checkpoint_repair_tokens,
                     schema=checkpoint_schema,
                 )
-                repair_tokens = min(checkpoint_repair_tokens, max(512,
+                # Strict repair can free tools/reasoning context retained by the
+                # first attempt; do not cap it at that attempt's stale split.
+                repair_tokens = min(self.max_tokens, max(512,
                     self.max_context_tokens - repair_admission.input_tokens - self.wire_safety_tokens))
                 repair = self._request(
                     tools_enabled=False,

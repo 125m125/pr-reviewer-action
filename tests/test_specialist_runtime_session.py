@@ -5252,6 +5252,52 @@ def test_checkpoint_output_uses_spare_context_and_reserves_repair():
     assert first + repair < 9000
 
 
+def test_checkpoint_pressure_reserves_next_exploration_response():
+    session = make_session(
+        EstimatingGateway([], rendered_bytes=59_213 * 3),
+        max_context_tokens=75_000, max_tokens=8192, recovery_max_tokens=2048,
+    )
+    assert session._checkpoint_pressure_due() is True
+    assert session._checkpoint_pressure_due(reserve_response=False) is False
+
+
+def test_checkpoint_pressure_accounts_for_cache_preserving_format():
+    class SizedGateway(ScriptedGateway):
+        def rendered_request_bytes(self, request):
+            return 59_213 * 3 if request.thinking_budget_tokens is not None else 30_000 * 3
+
+    session = make_session(
+        SizedGateway([]), max_context_tokens=75_000,
+        max_tokens=8192, recovery_max_tokens=2048,
+    )
+    assert session._checkpoint_pressure_due() is False
+    session.checkpoint_reasoning_budget_tokens = 256
+    assert session._checkpoint_pressure_due() is True
+
+
+@pytest.mark.parametrize("strict_input,repair_limit", [(64_491, 8192), (73_500, 1244)])
+def test_checkpoint_repair_reclaims_space_from_strict_request_format(strict_input, repair_limit):
+    class SizedGateway(ScriptedGateway):
+        def rendered_request_bytes(self, request):
+            return 70_650 * 3 if request.thinking_budget_tokens is not None else strict_input * 3
+
+    gateway = SizedGateway([
+        replace(invalid_response('{"working_summary":"unfinished'), usage={}),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(
+        gateway, max_context_tokens=75_000, max_tokens=8192, recovery_max_tokens=2048,
+    )
+    session.checkpoint_reasoning_budget_tokens = 256
+    result = session.request_checkpoint("context-pressure", disposition="compact_resume")
+
+    assert not result.degraded
+    assert gateway.requests[0].thinking_budget_tokens == 256
+    assert gateway.requests[1].thinking_budget_tokens is None
+    assert gateway.requests[1].max_tokens == repair_limit
+    assert strict_input + gateway.requests[1].max_tokens + 256 <= 75_000
+
+
 def test_checkpoint_diagnostic_projects_admission_and_regular_compaction_counts():
     gateway = EstimatingGateway(
         [
@@ -5349,7 +5395,8 @@ def test_direct_completion_diagnostic_owns_later_pressure_compaction():
     assert first_completion.finalization_diagnostics[0]["compaction_level"] == "none"
     assert first_completion.finalization_diagnostics[1]["disposition"] == "pause"
 
-    session.max_context_tokens = 8_000
+    # Leave space for the next response AND another checkpoint after compaction.
+    session.max_context_tokens = 12_000
     resumed = session.explore()
     diagnostics = resumed.finalization_diagnostics
 
@@ -5826,7 +5873,7 @@ def test_emergency_reconstruction_keeps_checkpoint_ledger_and_newest_exchange():
     session.conversation.add_tool_result(
         "post-checkpoint-new", "newest fitting result",
     )
-    session.max_context_tokens = 8_000
+    session.max_context_tokens = 12_000
 
     session.explore()
 
@@ -5973,16 +6020,17 @@ def test_pressure_requests_checkpoint_before_exploration():
     result = session.explore()
 
     assert result.state.value == "checkpoint"
-    assert len(gateway.requests) == 2
+    # This fixed-size renderer reports no relief after compaction: don't resume
+    # into a turn that can consume the space needed for the next checkpoint.
+    assert len(gateway.requests) == 1
     assert gateway.requests[0].tools_enabled is False
-    assert gateway.requests[1].tools_enabled is True
     assert 512 <= gateway.requests[0].max_tokens <= 2_048
     assert gateway.requests[0].reasoning_effort == "none"
     assert gateway.requests[0].messages_contain(
         "After validation, resume the specialist session."
     )
     assert [item.purpose for item in attempts.close_since(0)] == [
-        "checkpoint", "exploration",
+        "checkpoint",
     ]
 
 
