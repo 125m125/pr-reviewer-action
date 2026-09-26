@@ -47,15 +47,15 @@ def parse_migration_input_table() -> dict[str, dict[str, str]]:
     return rows
 
 
-def documented_v2_policy() -> dict[str, object]:
-    """Return the version-2 JSON fence from the policy-authoring guide."""
+def documented_v3_policy() -> dict[str, object]:
+    """Return the complete version-3 JSON fence from the authoring guide."""
     text = (ROOT / "docs" / "review-policy-authoring.md").read_text(encoding="utf-8")
     match = re.search(
-        r"## Complete version-2 policy example.*?```json\s*(\{.*?\})\s*```",
+        r"## Complete version-3 policy example.*?```json\s*(\{.*?\})\s*```",
         text,
         flags=re.DOTALL,
     )
-    assert match, "the policy-authoring guide must contain one version-2 policy JSON fence"
+    assert match, "the policy-authoring guide must contain one version-3 policy JSON fence"
     return json.loads(match.group(1))
 
 
@@ -97,7 +97,7 @@ def test_inert_legacy_limits_are_explicitly_deprecated_while_live_limits_remain_
         assert table[name]["status"] == "deprecated"
 
     text = MIGRATION.read_text(encoding="utf-8").lower()
-    assert "planner role does not expose tools" in text
+    assert "initial planner model call is removed" in text
     assert "durable sessions do not issue truncation-continuation turns" in text
 
 
@@ -112,14 +112,14 @@ def test_migration_recommends_tool_capacity_for_multi_call_turns():
     assert "controller-accounted" in text
 
 
-def test_documented_v2_policy_parses_with_real_policy_api_and_is_source_safe(tmp_path):
+def test_documented_v3_policy_parses_with_real_policy_api_and_is_source_safe(tmp_path):
     policy_path = tmp_path / "ai-review-policy.json"
-    policy_path.write_text(json.dumps(documented_v2_policy()), encoding="utf-8")
+    policy_path.write_text(json.dumps(documented_v3_policy()), encoding="utf-8")
 
     policy = load_review_policy(policy_path)
 
     assert {recipe.execution for recipe in policy.recipes} == {
-        "coverage", "dedicated", "independent",
+        "integrated", "independent",
     }
     assert policy.generated_artifacts[0]["id"] == "openapi-client"
     assert policy.verdict_policy["blocker_requires_request_changes"] is True
@@ -132,10 +132,10 @@ def test_documented_v2_policy_parses_with_real_policy_api_and_is_source_safe(tmp
         assert source.path_prefixes
 
 
-def test_migration_document_maps_v1_fields_and_semantics_to_v2():
+def test_migration_document_maps_old_fields_and_semantics_to_v3():
     text = MIGRATION.read_text(encoding="utf-8")
     required = (
-        "## Version-1 to version-2 mapping",
+        "## Version-1/2 to version-3 mapping",
         "`components`",
         "`recipes`",
         "`match`",
@@ -211,6 +211,27 @@ def test_migration_contains_copy_ready_tested_qwen_baseline():
         "needs_followup",
         "independently",
         "one bounded synthesis",
-        "Fresh version-2 adopters should not create this file",
+        "Fresh version-3 adopters should not create this file",
     ):
         assert required in normalized
+
+
+def test_documented_quickstart_and_moviehrdb_policy_are_executable(tmp_path):
+    text = (ROOT / "docs" / "review-policy-authoring.md").read_text(encoding="utf-8")
+    for title in ("Quick start: one owner", "movieHRdb-style ownership example"):
+        match = re.search(r"## " + re.escape(title) + r".*?```json\s*(\{.*?\})\s*```", text, re.DOTALL)
+        assert match, title
+        path = tmp_path / "policy.json"
+        path.write_text(match.group(1), encoding="utf-8")
+        policy = load_review_policy(path)
+        assert policy.version == 3
+        assert policy.components
+        if title.startswith("movieHRdb"):
+            assert policy.boundaries
+
+
+def test_self_policy_uses_integrated_reviews_and_keeps_security_independent():
+    policy = load_review_policy(ROOT / ".github" / "ai-review-policy.json")
+    assert policy.version == 3
+    assert {r.id for r in policy.recipes if r.execution == "independent"} == {"tool-and-secret-boundaries"}
+    assert policy.boundaries

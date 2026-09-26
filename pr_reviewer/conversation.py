@@ -96,7 +96,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "files (.env, .pem, credentials, id_rsa, …) are blocked. Output "
             "is truncated to ~12 KB. For a large file, pass offset/limit to "
             "read a line window (also the way to expand context around a "
-            "diff hunk) instead of blowing the cap."
+            "diff hunk) instead of blowing the cap. Continue at range.next_offset, "
+            "not the requested offset plus limit. Only complete lines are returned; "
+            "omitted_lines explicitly identifies oversized lines that could not fit."
         ),
         "parameters": {
             "type": "object",
@@ -134,6 +136,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "repositories. Files over 8 MiB are rejected before content download; "
             "offset/limit cannot bypass this transfer cap. Use offset/limit for a bounded line window and "
             "include_line_numbers when exact remote line references matter. "
+            "Continue at range.next_offset; oversized omitted_lines are not evidence. "
             "Do not use gh_api to read repository contents."
         ),
         "parameters": {
@@ -316,7 +319,9 @@ SPECIALIST_PR_DIFF_SCHEMA: dict[str, Any] = {
         "specialist's assignment. Prefer batching related production and test paths. "
         "The controller compares the immutable pull-request base merge-base "
         "to the immutable head (base...head); revisions cannot be supplied by "
-        "the model. Paths outside the assignment boundaries are rejected."
+        "the model. Paths outside the assignment boundaries are rejected. "
+        "Continue at range.next_offset (a patch-line offset, not a RIGHT file line). "
+        "Only complete lines are returned; omitted_lines identifies oversized lines."
     ),
     "parameters": {
         "type": "object",
@@ -478,6 +483,23 @@ VERDICT_USER_INSTRUCTION = (
 # ---------------------------------------------------------------------------
 # Message normalisation
 # ---------------------------------------------------------------------------
+
+
+def _model_tool_result(result: Any) -> Any:
+    """Hide nonactionable search warnings on the wire, not in retained evidence."""
+    if isinstance(result, str):
+        if '"engine_warnings"' not in result or '"search_discovery"' not in result:
+            return result
+        try:
+            return json.dumps(_model_tool_result(json.loads(result)), ensure_ascii=False)
+        except ValueError:
+            return result
+    if not isinstance(result, dict):
+        return result
+    if result.get("kind") == "search_discovery" and result.get("search_status") == "ok":
+        return {key: value for key, value in result.items() if key != "engine_warnings"}
+    return {key: _model_tool_result(value) if key in {"result", "content"} else value
+            for key, value in result.items()}
 
 
 def _stringify_tool_result(result: Any) -> str:
@@ -704,11 +726,10 @@ class Conversation:
         """Append an assistant turn carrying tool-call requests.
 
         Each ``call`` is normalised to ``{"id", "name", "arguments"}``. Per
-        the #233 contract, ``arguments`` is treated as an opaque JSON string
-        end-to-end: a string is preserved verbatim (so malformed fragments
-        round-trip and the round-trip property holds for strict OpenAI
-        servers), and a dict/list is serialised **once at this boundary**
-        so the rest of the pipeline never has to think about it.
+        the #233 contract, ``arguments`` is stored as an opaque JSON string:
+        malformed fragments remain available for diagnostics and executor
+        rejection. Only the wire rendering substitutes rejected arguments
+        so strict servers can parse subsequent requests.
         """
         normalised: list[dict[str, Any]] = []
         for call in calls:
@@ -753,6 +774,9 @@ class Conversation:
     ) -> None:
         if not isinstance(call_id, str) or not call_id:
             return
+        from pr_reviewer.line_windows import bound_line_payload
+        result = _model_tool_result(result)
+        result = bound_line_payload(result, max_bytes)
         body = _stringify_tool_result(result)
         body, truncated = truncate_text(body, max_bytes)
         metadata: dict[str, str] = {}
@@ -1203,6 +1227,44 @@ class Conversation:
 
     # ---- wire emission ---------------------------------------------------
 
+    def _wire_events(self) -> Iterable[dict[str, Any]]:
+        """Keep rejected calls paired without replaying unparseable arguments.
+
+        Invalid arguments use a history-only placeholder, never execution input.
+        Empty arguments mean an empty object to the executor and are encoded so.
+        Raw arguments and results remain unchanged in neutral event storage.
+        """
+        invalid_ids: set[str] = set()
+        for event in self.events:
+            if event["kind"] == "assistant_tool_calls":
+                calls = []
+                for call in event["calls"]:
+                    if call["arguments"] == "":
+                        call = {**call, "arguments": "{}"}
+                    try:
+                        args = json.loads(call["arguments"])
+                        valid = isinstance(args, dict)
+                    except (ValueError, TypeError):
+                        valid = False
+                    if not valid:
+                        invalid_ids.add(call["id"])
+                        call = {**call, "arguments": "{}"}
+                    calls.append(call)
+                yield {**event, "calls": calls}
+            elif event["kind"] == "tool_result" and event["call_id"] in invalid_ids:
+                yield {
+                    **event,
+                    "is_error": True,
+                    "content": (
+                        "This call was not executed: its arguments were not a complete "
+                        "JSON object. The empty object in history is only a placeholder, "
+                        "not repaired arguments. Submit a fresh complete tool call.\n"
+                        + event["content"]
+                    ),
+                }
+            else:
+                yield event
+
     def _render_openai_messages(self) -> list[dict[str, Any]]:
         """Render neutral events as an OpenAI-format messages list.
 
@@ -1214,7 +1276,7 @@ class Conversation:
         """
         messages: list[dict[str, Any]] = []
         assistant_turn_open = False
-        for e in self.events:
+        for e in self._wire_events():
             kind = e["kind"]
             if kind == "user":
                 messages.append({"role": "user", "content": e["content"]})
@@ -1317,7 +1379,7 @@ class Conversation:
                 messages.append({"role": "user", "content": pending_tool_results})
                 pending_tool_results = []
 
-        for e in self.events:
+        for e in self._wire_events():
             kind = e["kind"]
             if kind == "user":
                 _flush_tool_results()
@@ -1380,16 +1442,7 @@ class Conversation:
                 # current catalogue doesn't do interleaved text+tool_use, so
                 # we emit a tool_use-only turn here.
                 for c in e["calls"]:
-                    try:
-                        input_value = (
-                            json.loads(c["arguments"]) if c["arguments"] else {}
-                        )
-                    except (json.JSONDecodeError, ValueError):
-                        # Some local models return fragmentary JSON in
-                        # arguments; surface it as a string rather than
-                        # dropping the call — the model can still see what
-                        # it asked for.
-                        input_value = {"_raw": c["arguments"]}
+                    input_value = json.loads(c["arguments"] or "{}")
                     blocks.append(
                         {
                             "type": "tool_use",

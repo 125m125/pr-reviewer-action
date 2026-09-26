@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from math import isfinite
+import re
 from typing import Any
 
 from .assignments import Assignment
@@ -32,6 +33,24 @@ _ACTION_FIELDS = frozenset({
     "estimated_turns", "reason",
 })
 _RISK_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+
+
+def _requires_human_action(action: str) -> bool:
+    # Only explicit human interaction or remediation: inspecting intent/history
+    # and checking evidence for a candidate remain executable review work.
+    return bool(re.match(
+        r"\s*(?:confirm\s+with|ask|contact|consult\s+with|obtain\s+approval\s+from)\s+"
+        r"(?:the\s+)?(?:change\s+|PR\s+)?(?:author|maintainer|owner|human)\b",
+        action, re.IGNORECASE,
+    )) or bool(re.match(
+        r"\s*(?:(?:fix|repair)\s+(?:the\s+)?(?:reported\s+|identified\s+)?"
+        r"(?:defect|bug|issue|code)\b|"
+        r"(?:fix|repair)\s+(?:candidate\s+)?C\d+\b|"
+        r"resolve\s+(?:candidate\s+)?C\d+\s*(?:\(|by\s+)"
+        r"\s*(?:restore|replace|change|fix|repair)\b|"
+        r"wait\s+for\s+.{0,100}\b(?:fixed|repaired|merged)\b)",
+        action, re.IGNORECASE,
+    ))
 
 
 def _assignment_id(assignment: Assignment | SpecialistAssignment) -> str:
@@ -83,6 +102,7 @@ class SessionResources:
     remaining_tool_calls: int
     retained_evidence_count: int = 0
     advertised_tools: tuple[str, ...] = ()
+    allowed_diff_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -133,6 +153,7 @@ class NegotiationState:
     new_session_tool_call_cap: int
     excluded_obligation_ids: tuple[str, ...] = ()
     investigation_leads: tuple[InvestigationLead, ...] = ()
+    changed_files: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         obligation_ids = [item.id for item in self.obligations]
@@ -261,15 +282,19 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             for owner in owners if owner.session_id in checkpoints
         )
         next_actions = (
-            tuple(dict.fromkeys(assessment.next_actions))
+            tuple(action for action in dict.fromkeys(assessment.next_actions)
+                  if not _requires_human_action(action))
             if assessment is not None else ()
         )
+        if assessment is not None and assessment.omitted_paths:
+            next_actions = (*next_actions, "Inspect unassessed changed paths: " + ", ".join(assessment.omitted_paths[:20]))
         has_novel_action = (
             assessment is None
             or (
                 assessment.disposition in {
                     ObligationDisposition.PENDING,
                     ObligationDisposition.UNRESOLVED,
+                    ObligationDisposition.PARTIALLY_COVERED,
                 }
                 and bool(next_actions)
             )
@@ -332,34 +357,51 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             "retained_evidence_count": retained_evidence_count,
             "next_actions": next_actions,
         })
+    reserved_delegations = _reserved_delegation_lead_ids(state)
     for index, lead in enumerate(_negotiable_leads(state), start=1):
         allowed_actions = ["record_unknown"]
-        capable_sessions = _capable_lead_sessions(lead, state)
-        origin = lead.assigned_session_id or lead.origin_session_id
-        if origin in capable_sessions:
-            allowed_actions.insert(0, "resume")
-        if any(session_id != origin for session_id in capable_sessions):
-            allowed_actions.insert(0, "consult")
-        if (
-            capable_sessions
-            and state.current_session_count < state.max_sessions
-            and state.followup_sessions_started < state.max_followup_sessions
-            and state.new_session_turns_remaining > 0
-            and state.new_session_tool_call_cap > 0
-        ):
-            insert_at = max(0, len(allowed_actions) - 1)
-            allowed_actions.insert(insert_at, "new_session")
+        if _requires_human_action(lead.next_action):
+            pass
+        elif lead.lead_id in reserved_delegations:
+            if (
+                state.new_session_turns_remaining > 0
+                and state.new_session_tool_call_cap > 0
+            ):
+                allowed_actions.insert(0, "new_session")
+        else:
+            capable_sessions = _capable_lead_sessions(lead, state)
+            origin = lead.assigned_session_id or lead.origin_session_id
+            if origin in capable_sessions:
+                allowed_actions.insert(0, "resume")
+            if any(session_id != origin for session_id in capable_sessions):
+                allowed_actions.insert(0, "consult")
+            required_tools = _required_tools(lead.required_capability)
+            # A fresh assignment can authorize the lead's paths even when no
+            # existing session has that scope or any exploration turns left.
+            capability_available = not required_tools or any(
+                required_tools.intersection(resource.advertised_tools)
+                for resource in state.session_resources
+            )
+            if (
+                capability_available
+                and state.current_session_count < state.max_sessions
+                and state.followup_sessions_started < state.max_followup_sessions
+                and state.new_session_turns_remaining > 0
+                and state.new_session_tool_call_cap > 0
+            ):
+                insert_at = max(0, len(allowed_actions) - 1)
+                allowed_actions.insert(insert_at, "new_session")
         targets.append({
             "handle": f"L{index}",
             "risk_tier": "normal",
             "subject": lead.affected_paths[0] if lead.affected_paths else "investigation lead",
             "summary": lead.summary,
             "allowed_actions": tuple(dict.fromkeys(allowed_actions)),
-            "last_conclusion": lead.resolution_reason,
-            "attempt_count": 0,
-            "evidence_delta": 0,
+            "last_conclusion": lead.resolution_reason or lead.last_outcome,
+            "attempt_count": lead.attempt_count,
+            "evidence_delta": lead.last_evidence_delta,
             "retained_evidence_count": len(lead.evidence_ids),
-            "next_actions": (lead.next_action,),
+            "next_actions": () if _requires_human_action(lead.next_action) else (lead.next_action,),
             "required_capability": lead.required_capability,
         })
     has_feasible_high_risk = any(
@@ -406,6 +448,13 @@ def _negotiable_obligations(
     statuses = dict(state.coverage.obligation_statuses)
     assessments = _assessment_by_obligation(state)
     excluded = frozenset(state.excluded_obligation_ids)
+    split_obligation_ids = {
+        obligation_id
+        for assignment in state.assignments
+        if isinstance(assignment, Assignment)
+        and assignment.parent_assignment_id is not None
+        for obligation_id in assignment.obligation_ids
+    }
     terminal = {
         ObligationDisposition.COVERED,
         ObligationDisposition.NOT_APPLICABLE,
@@ -417,11 +466,14 @@ def _negotiable_obligations(
             item for item in state.obligations
             if item.id not in excluded
             and item.mandatory
+            and not item.evaluator_owned
             and item.required_evidence_categories
             and statuses.get(item.id, ObligationStatus.PENDING) in {
-                ObligationStatus.PENDING, ObligationStatus.UNRESOLVED,
+                ObligationStatus.PENDING, ObligationStatus.UNRESOLVED, ObligationStatus.PARTIALLY_COVERED,
             }
             and (
+                item.id in split_obligation_ids
+                or
                 item.id not in assessments
                 or assessments[item.id].disposition not in terminal
             )
@@ -443,6 +495,21 @@ def _negotiable_leads(state: NegotiationState) -> tuple[InvestigationLead, ...]:
     ))
 
 
+def _reserved_delegation_lead_ids(
+    state: NegotiationState,
+) -> frozenset[str]:
+    assignments = {
+        _assignment_id(item): item for item in state.assignments
+    }
+    return frozenset(
+        lead.lead_id for lead in state.investigation_leads
+        if lead.kind == "delegation"
+        and lead.child_assignment_id in assignments
+        and isinstance(assignments[lead.child_assignment_id], Assignment)
+        and assignments[lead.child_assignment_id].model_turn_limit == 0
+    )
+
+
 def _required_tools(capability: str) -> frozenset[str]:
     return {
         "none": frozenset(),
@@ -458,6 +525,10 @@ def _capable_lead_sessions(
     lead: InvestigationLead, state: NegotiationState,
 ) -> tuple[str, ...]:
     required = _required_tools(lead.required_capability)
+    required_diff_paths = set(lead.affected_paths)
+    if state.changed_files is not None:
+        # Unchanged supporting sources use read_file, not the scoped PR diff.
+        required_diff_paths.intersection_update(state.changed_files)
     result = []
     for resource in sorted(state.session_resources, key=lambda item: item.session_id):
         if resource.remaining_model_turns <= _CHECKPOINT_TURN_RESERVE:
@@ -468,6 +539,8 @@ def _capable_lead_sessions(
             continue
         advertised = frozenset(resource.advertised_tools)
         if required and not required.intersection(advertised):
+            continue
+        if not required_diff_paths.issubset(resource.allowed_diff_paths):
             continue
         result.append(resource.session_id)
     return tuple(result)
@@ -774,7 +847,7 @@ def _parse_action(
                 if lead is not None else ""
             )
             if not capable:
-                errors.append(f"{label} session lacks the required lead capability")
+                errors.append(f"{label} session lacks the required lead capability or scope")
             elif kind == "resume" and session_id != origin:
                 errors.append(f"{label} resume session is not the lead origin")
             elif kind == "consult" and session_id == origin:
@@ -846,7 +919,14 @@ def _validate_feasibility(
         if turns * state.seconds_per_turn > resource.lease_remaining_sec:
             errors.append(f"session '{session_id}' exceeds its remaining lease")
 
-    new_count = len(new_session_actions)
+    reserved_delegations = _reserved_delegation_lead_ids(state)
+    new_count = sum(
+        not (
+            len(item.lead_ids) == 1
+            and item.lead_ids[0] in reserved_delegations
+        )
+        for item in new_session_actions
+    )
     if state.current_session_count + new_count > state.max_sessions:
         errors.append("proposal exceeds hard session capacity")
     if state.followup_sessions_started + new_count > state.max_followup_sessions:

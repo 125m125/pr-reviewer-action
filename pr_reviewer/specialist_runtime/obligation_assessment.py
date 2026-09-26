@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from .callbacks import mask_runtime_text
 from .evidence import EvidenceRecord, EvidenceSnapshot
@@ -16,6 +17,7 @@ from .types import CoverageObligation
 class ObligationDisposition(str, Enum):
     PENDING = "pending"
     COVERED = "covered"
+    PARTIALLY_COVERED = "partially_covered"
     NOT_APPLICABLE = "not_applicable"
     EXHAUSTED = "exhausted"
     BLOCKED = "blocked"
@@ -34,6 +36,9 @@ class ObligationAttempt:
     validation_reason: str
     evidence_before_count: int = 0
     evidence_after_count: int = 0
+    assessed_paths: tuple[str, ...] = ()
+    omitted_paths: tuple[str, ...] = ()
+    assessment_version: int = 0
 
     @property
     def evidence_delta(self) -> int:
@@ -49,6 +54,9 @@ class ObligationAssessment:
     evidence_ids: tuple[str, ...] = ()
     next_actions: tuple[str, ...] = ()
     attempts: tuple[ObligationAttempt, ...] = ()
+    assessed_paths: tuple[str, ...] = ()
+    omitted_paths: tuple[str, ...] = ()
+    assessment_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -72,11 +80,109 @@ def _actions(values: Iterable[object]) -> tuple[str, ...]:
     ))[:8]
 
 
+def _paths(values: Iterable[object]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(
+        item for value in values if (item := str(value).strip())
+    ))
+
+
 def _fingerprint(actions: tuple[str, ...]) -> str:
     payload = json.dumps(
         [item.casefold() for item in actions], separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+
+
+def _missing_requirement_actions(
+    evidence: EvidenceSnapshot,
+    evidence_ids: tuple[str, ...],
+    obligation: CoverageObligation,
+) -> tuple[str, ...]:
+    categories = {
+        category.strip().casefold()
+        for evidence_id in evidence_ids
+        for _collection, association in evidence.associations_for(
+            evidence_id, obligation.id,
+        )
+        for category in association.categories
+        if category.strip()
+    }
+    categories.update(
+        record.category.strip().casefold()
+        for record in evidence.records
+        if record.id in evidence_ids and record.category.strip()
+    )
+    missing: list[str] = []
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for raw in obligation.evidence_requirements:
+        if not isinstance(raw, Mapping):
+            continue
+        mode = str(raw.get("mode", "required")).strip() or "required"
+        category = str(raw.get("category", "")).strip()
+        label = str(raw.get("id", "")).strip() or category or mode
+        if mode == "optional":
+            continue
+        if mode.startswith("one_of:"):
+            groups.setdefault(mode, []).append((label, category))
+        elif category.casefold() not in categories:
+            missing.append(f"Collect evidence requirement '{label}' ({category}).")
+    for mode, members in groups.items():
+        if not any(category.casefold() in categories for _label, category in members):
+            choices = ", ".join(category for _label, category in members)
+            missing.append(f"Collect evidence requirement '{mode}' ({choices}).")
+    return _actions(missing)
+
+
+def is_retained_empty_repository_search(record: EvidenceRecord) -> bool:
+    """A scoped not-affected observation, never affirmative coverage or defect proof."""
+    if (record.tool != "git_grep" or not record.is_usable_for_coverage
+            or record.truncated or not record.provenance.head_sha):
+        return False
+    try:
+        arguments = json.loads(record.arguments)
+        content = json.loads(record.content)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(arguments, Mapping) or not isinstance(arguments.get("pattern"), str) or not arguments["pattern"].strip():
+        return False
+    if isinstance(content, Mapping) and isinstance(content.get("result"), Mapping):
+        content = content["result"]
+    return isinstance(content, Mapping) and content.get("matches") == []
+
+
+def boundary_participant_source(
+    record: EvidenceRecord, endpoint_paths: tuple[str, ...],
+    contract_paths: tuple[str, ...], *, not_applicable: bool = False,
+) -> bool:
+    if not_applicable and is_retained_empty_repository_search(record):
+        return True
+    if not record.source_path:
+        return False
+    if endpoint_paths:
+        return any(fnmatch.fnmatchcase(record.source_path, pattern) for pattern in endpoint_paths)
+    return not any(fnmatch.fnmatchcase(record.source_path, pattern) for pattern in contract_paths)
+
+
+def boundary_source_diagnostic(
+    record: EvidenceRecord, expected_head_sha: str | None,
+) -> str | None:
+    if record.tool not in {"read_file", "read_pr_diff", "read_remote_file", "git_grep", "git_blame"} or (
+        not record.source_path and not is_retained_empty_repository_search(record)
+    ):
+        return "not retained repository source"
+    if not record.is_usable_for_coverage or not record.content:
+        return "unsuccessful or empty source read"
+    if record.truncated:
+        return "truncated source read"
+    actual_hash = hashlib.sha256(record.content.encode("utf-8")).hexdigest()
+    if actual_hash != record.content_hash:
+        return "content hash mismatch"
+    revision = record.provenance.head_sha
+    if not revision:
+        return "missing immutable head_sha provenance"
+    if expected_head_sha and revision != expected_head_sha:
+        return "head_sha provenance mismatch"
+    return None
 
 
 class ObligationAssessmentLedger:
@@ -88,6 +194,7 @@ class ObligationAssessmentLedger:
         session_id: str,
         obligations: Iterable[CoverageObligation],
         obligation_ids: Iterable[str],
+        expected_head_sha: str | None = None,
     ) -> None:
         if not str(session_id).strip():
             raise ValueError("session_id must be non-empty")
@@ -104,6 +211,7 @@ class ObligationAssessmentLedger:
                 explanation="Inspect the assigned obligation.",
             )
         self.session_id = str(session_id)
+        self.expected_head_sha = expected_head_sha
         self._obligations = {item: by_id[item] for item in owned}
         self._handle_to_id = {
             f"O{index}": obligation_id
@@ -113,6 +221,7 @@ class ObligationAssessmentLedger:
             obligation_id: target
             for target, obligation_id in self._handle_to_id.items()
         }
+        self._all_id_to_handle = dict(self._id_to_handle)
         self._assessments = {
             target: ObligationAssessment(target, obligation_id)
             for target, obligation_id in self._handle_to_id.items()
@@ -120,6 +229,37 @@ class ObligationAssessmentLedger:
 
     def handles(self) -> tuple[str, ...]:
         return tuple(self._handle_to_id)
+
+    def replace_owned_obligations(
+        self, obligations: Iterable[CoverageObligation], obligation_ids: Iterable[str],
+    ) -> None:
+        """Apply controller ownership changes without recycling existing short handles."""
+        by_id = {item.id: item for item in obligations}
+        selected = tuple(dict.fromkeys(obligation_ids))
+        if set(selected) - set(by_id):
+            raise ValueError("updated ownership contains unknown obligations")
+        next_handle = max((int(target[1:]) for target in self._all_id_to_handle.values()), default=0) + 1
+        handles = {}
+        for oid in selected:
+            if oid not in self._all_id_to_handle:
+                self._all_id_to_handle[oid] = f"O{next_handle}"
+                next_handle += 1
+            handles[self._all_id_to_handle[oid]] = oid
+        assessments = {}
+        for target, oid in handles.items():
+            previous = self._assessments.get(target, ObligationAssessment(target, oid))
+            obligation = by_id[oid]
+            if obligation.origin == "component":
+                owned = set(obligation.scope)
+                previous = replace(previous,
+                    assessed_paths=tuple(path for path in previous.assessed_paths if path in owned),
+                    omitted_paths=tuple(path for path in previous.omitted_paths if path in owned),
+                )
+            assessments[target] = previous
+        self._obligations = {oid: by_id[oid] for oid in selected}
+        self._handle_to_id = handles
+        self._id_to_handle = {oid: target for target, oid in handles.items()}
+        self._assessments = assessments
 
     def obligation_id(self, target: str) -> str | None:
         canonical = self.canonical_target(target)
@@ -156,6 +296,7 @@ class ObligationAssessmentLedger:
             target for target, assessment in self._assessments.items()
             if assessment.disposition in {
                 ObligationDisposition.PENDING,
+                ObligationDisposition.PARTIALLY_COVERED,
                 ObligationDisposition.UNRESOLVED,
             }
         )
@@ -184,6 +325,9 @@ class ObligationAssessmentLedger:
             "last_conclusion": assessment.reason,
             "attempt_count": len(assessment.attempts),
             "next_actions": list(assessment.next_actions),
+            "assessed_paths": list(assessment.assessed_paths),
+            "omitted_paths": list(assessment.omitted_paths),
+            "assessment_version": assessment.assessment_version,
             "permitted_dispositions": [item.value for item in ObligationDisposition if item is not ObligationDisposition.PENDING],
         }
 
@@ -197,6 +341,8 @@ class ObligationAssessmentLedger:
         next_actions: Iterable[object],
         evidence: EvidenceSnapshot,
         eligible: Callable[[EvidenceRecord, CoverageObligation], bool],
+        assessed_paths: Iterable[object] = (),
+        omitted_paths: Iterable[object] = (),
     ) -> AssessmentProposalResult:
         target = self.canonical_target(target) or str(target).strip()
         assessment = self._assessments.get(target)
@@ -209,19 +355,72 @@ class ObligationAssessmentLedger:
         if proposed is ObligationDisposition.PENDING:
             return AssessmentProposalResult(False, target, proposed, "pending cannot be proposed")
         conclusion = _bounded(reason, 600)
+        proposed_assessed = _paths(assessed_paths)
+        proposed_omitted = _paths(omitted_paths)
         retained_ids = tuple(dict.fromkeys(
             str(item).strip() for item in evidence_ids if str(item).strip()
         ))[:20]
         actions = _actions(next_actions)
-        fingerprint = _fingerprint(actions)
+        submitted_actions = actions
         records = {record.id: record for record in evidence.records}
         obligation = self._obligations[assessment.obligation_id]
+        component_scoped = bool(
+            obligation.owner_component_id
+            or obligation.recipe_execution == "independent"
+            or obligation.boundary_id
+            or obligation.participant_id
+            or obligation.evaluator_owned
+        )
+        owned_paths = tuple(dict.fromkeys(obligation.scope))
+        proposed_path_set = set((*proposed_assessed, *proposed_omitted))
+        contains_glob = any(
+            marker in path for path in proposed_path_set for marker in "*?["
+        )
+        invalid_paths = proposed_path_set - set(owned_paths)
+        if obligation.boundary_id and not obligation.evaluator_owned:
+            # Unchanged sources support the boundary conclusion, not changed-file coverage.
+            supporting_paths = {
+                records[item].source_path for item in retained_ids if item in records
+                and eligible(records[item], obligation)
+                and boundary_source_diagnostic(records[item], self.expected_head_sha) is None
+            }
+            invalid_paths = (
+                set(proposed_assessed) - set(owned_paths) - supporting_paths
+            ) | (set(proposed_omitted) - set(owned_paths))
+        overlap = set(proposed_assessed) & set(proposed_omitted)
+        accumulated_paths = (
+            set(assessment.assessed_paths) | set(proposed_assessed)
+        ) - set(proposed_omitted)
+        resolved_assessed = tuple(
+            path for path in owned_paths if path in accumulated_paths
+        ) if component_scoped else proposed_assessed
+        resolved_omitted = tuple(
+            path for path in owned_paths if path not in accumulated_paths
+        ) if component_scoped else proposed_omitted
+        supported = proposed in {
+            ObligationDisposition.COVERED,
+            ObligationDisposition.PARTIALLY_COVERED,
+        }
+        withdrawal = (
+            proposed is ObligationDisposition.PARTIALLY_COVERED
+            and not proposed_assessed
+            and bool(set(proposed_omitted) & set(assessment.assessed_paths))
+        )
+        effective = (
+            ObligationDisposition.PARTIALLY_COVERED
+            if component_scoped
+            and proposed is ObligationDisposition.COVERED
+            and resolved_omitted
+            else proposed
+        )
         eligible_ids = retained_ids
         ignored_ids: tuple[str, ...] = ()
         if (
-            proposed is ObligationDisposition.COVERED
+            supported
             and all(item in records for item in retained_ids)
         ):
+            # This gate checks retained provenance and owner scope, not the truth
+            # of the model's group claim or one evidence record per assessed path.
             eligible_ids = tuple(
                 item for item in retained_ids
                 if eligible(records[item], obligation)
@@ -229,10 +428,38 @@ class ObligationAssessmentLedger:
             ignored_ids = tuple(
                 item for item in retained_ids if item not in eligible_ids
             )
+        requirement_actions = (
+            _missing_requirement_actions(evidence, eligible_ids, obligation)
+            if supported else ()
+        )
+        if requirement_actions:
+            effective = ObligationDisposition.PARTIALLY_COVERED
+            actions = _actions((*actions, *requirement_actions))
+        fingerprint = _fingerprint(actions)
         error = ""
         if not conclusion:
             error = "a concise reason is required"
-        elif proposed in {
+        elif component_scoped and contains_glob:
+            error = "component assessments require exact paths, not globs"
+        elif component_scoped and invalid_paths:
+            error = "assessment paths fall outside owned changed scope"
+        elif component_scoped and overlap:
+            error = "a path cannot be both assessed and omitted"
+        elif obligation.evaluator_owned and proposed in {
+            ObligationDisposition.COVERED,
+            ObligationDisposition.NOT_APPLICABLE,
+            ObligationDisposition.EXHAUSTED,
+            ObligationDisposition.BLOCKED,
+        }:
+            error = "evaluator-owned obligation cannot be closed by a specialist"
+        elif (
+            component_scoped and owned_paths and supported
+            and not proposed_assessed and not withdrawal
+        ):
+            error = "supported component work requires explicit assessed_paths"
+        elif supported and len([item for item in conclusion if item.isalnum()]) < 8:
+            error = "supported work requires a substantive reason"
+        elif effective in {
             ObligationDisposition.COVERED,
             ObligationDisposition.NOT_APPLICABLE,
         } and actions:
@@ -242,11 +469,75 @@ class ObligationAssessmentLedger:
             )
         elif any(item not in records for item in retained_ids):
             error = "proposal references unknown retained evidence"
-        elif proposed is ObligationDisposition.COVERED and not retained_ids:
-            error = "covered requires retained evidence"
-        elif proposed is ObligationDisposition.COVERED and not eligible_ids:
-            error = "covered requires eligible retained evidence"
-        elif proposed is ObligationDisposition.NOT_APPLICABLE and not any(
+        elif supported and not retained_ids:
+            error = "supported work requires retained evidence"
+        elif supported and not eligible_ids:
+            error = "supported work requires eligible retained evidence"
+        elif (
+            obligation.boundary_id and obligation.participant_id
+            and effective in {ObligationDisposition.COVERED, ObligationDisposition.NOT_APPLICABLE}
+            and not any(
+                boundary_source_diagnostic(records[item], self.expected_head_sha) is None
+                and boundary_participant_source(
+                    records[item], obligation.boundary_endpoint_paths,
+                    obligation.boundary_contract_paths,
+                    not_applicable=effective is ObligationDisposition.NOT_APPLICABLE,
+                )
+                for item in eligible_ids
+            )
+        ):
+            error = (
+                "boundary closure requires usable retained participant source evidence; "
+                "inspect and cite " + (", ".join(obligation.boundary_endpoint_paths)
+                or "participant implementation outside the boundary contract")
+                + " with immutable current-head head_sha provenance"
+            )
+        elif (
+            proposed is ObligationDisposition.PARTIALLY_COVERED
+            and not resolved_omitted
+            and not submitted_actions
+        ):
+            error = (
+                "partially_covered with no omitted paths requires a concrete "
+                "next action"
+            )
+        elif (
+            proposed is ObligationDisposition.NOT_APPLICABLE
+            and obligation.boundary_id
+            and not any(
+                is_retained_empty_repository_search(records[item]) or (
+                records[item].is_usable_for_coverage
+                and not records[item].truncated
+                and eligible(records[item], obligation)
+                and (
+                    records[item].tool.startswith("read_")
+                    or any(marker in records[item].tool for marker in (
+                        "search", "grep", "lookup", "inspect", "blame",
+                    ))
+                    or records[item].tool == "gh_api"
+                )
+                )
+                for item in retained_ids
+            )
+        ):
+            error = (
+                "boundary not_applicable requires relevant successful untruncated "
+                "retained inspection or search evidence"
+            )
+        elif (
+            proposed is ObligationDisposition.NOT_APPLICABLE
+            and obligation.boundary_id
+            and any(
+                set(record.contradicts) & set(retained_ids)
+                or (
+                    record.id in retained_ids
+                    and set(record.contradicts) & set(records)
+                )
+                for record in records.values()
+            )
+        ):
+            error = "boundary not_applicable conflicts with retained evidence"
+        elif proposed is ObligationDisposition.NOT_APPLICABLE and not obligation.boundary_id and not any(
             records[item].is_usable_for_coverage
             and records[item].source_path in obligation.scope
             for item in retained_ids
@@ -266,12 +557,18 @@ class ObligationAssessmentLedger:
         ) >= (2 if obligation.risk_tier in {"high", "critical"} else 1):
             error = "unresolved follow-up attempt limit reached"
         attempt = ObligationAttempt(
-            target=target, disposition=proposed, reason=conclusion,
+            target=target, disposition=effective, reason=conclusion,
             evidence_ids=retained_ids, next_actions=actions,
             action_fingerprint=fingerprint, accepted=not error,
             validation_reason=error or "accepted",
             evidence_before_count=len(assessment.evidence_ids),
             evidence_after_count=len(eligible_ids),
+            assessed_paths=(resolved_assessed if not error else proposed_assessed),
+            omitted_paths=(resolved_omitted if not error else proposed_omitted),
+            assessment_version=(
+                assessment.assessment_version
+                if error else assessment.assessment_version + 1
+            ),
         )
         attempts = (*assessment.attempts, attempt)[-12:]
         if error:
@@ -284,10 +581,16 @@ class ObligationAssessmentLedger:
             )
         self._assessments[target] = ObligationAssessment(
             target=target, obligation_id=assessment.obligation_id,
-            disposition=proposed, reason=conclusion,
-            evidence_ids=eligible_ids, next_actions=actions, attempts=attempts,
+            disposition=effective, reason=conclusion,
+            evidence_ids=(
+                tuple(dict.fromkeys((*assessment.evidence_ids, *eligible_ids)))
+                if component_scoped else eligible_ids
+            ),
+            next_actions=actions, attempts=attempts,
+            assessed_paths=resolved_assessed, omitted_paths=resolved_omitted,
+            assessment_version=assessment.assessment_version + 1,
         )
         return AssessmentProposalResult(
-            True, target, proposed, "accepted",
+            True, target, effective, "accepted",
             eligible_ids, ignored_ids,
         )

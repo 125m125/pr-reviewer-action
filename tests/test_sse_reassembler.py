@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
+import pytest
 from pathlib import Path
 from unittest import main as unittest_main
 
@@ -43,6 +44,21 @@ def test_openai_preserves_final_cache_and_timing_snapshots_without_double_counti
     assert result["usage"]["prompt_tokens_details"]["cached_tokens"] == 900
     assert result["timings"]["predicted_n"] == 20
     assert result["timings"]["draft_n_accepted"] == 15
+
+
+@pytest.mark.parametrize("usage", [None, {}, {"prompt_tokens": 7}, {"completion_tokens": 0}])
+def test_openai_missing_stream_usage_is_unavailable_not_measured_zero(usage):
+    from pr_reviewer.specialist_runtime.performance import request_performance
+
+    result = reassemble_sse(_make_sse_line({
+        "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}],
+        "usage": usage,
+    }) + "\ndata: [DONE]\n", "openai")
+
+    assert result["usage"] == (usage or {})
+    measured = request_performance(result["usage"], {})
+    assert measured["measured_prompt_tokens"] == (usage or {}).get("prompt_tokens")
+    assert measured["measured_completion_tokens"] == (usage or {}).get("completion_tokens")
 
 
 class TestReassembleAnthropic:

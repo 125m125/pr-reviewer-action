@@ -55,8 +55,17 @@ from pr_reviewer.specialist_runtime.coverage import (
     derive_obligations,
 )
 from pr_reviewer.specialist_runtime.budget import BudgetLedger, RunDeadline
-from pr_reviewer.specialist_runtime.policy import RecipePolicy, ReviewPolicy, RuntimeConfig
+from pr_reviewer.specialist_runtime.policy import (
+    EvidenceRequirementPolicy,
+    RecipePolicy,
+    ReviewPolicy,
+    RuntimeConfig,
+)
 from pr_reviewer.specialist_runtime.model_gateway import ModelTurnResult
+from pr_reviewer.specialist_runtime.obligation_assessment import (
+    ObligationAssessment,
+    ObligationDisposition,
+)
 from pr_reviewer.specialist_runtime.scheduler import SessionScheduler
 from pr_reviewer.specialist_runtime.session import (
     SessionResult,
@@ -105,7 +114,33 @@ def test_controller_public_api_is_importable():
     assert ReviewResult
 
 
-def test_ci_failures_are_assigned_after_planner_without_becoming_findings(tmp_path):
+def test_performance_snapshot_is_included_before_hardened_artifact_write(tmp_path):
+    rows = ({"measured_prompt_tokens": 1234, "measured_completion_tokens": 56},) * 2001
+    controller = _controller(tmp_path, performance_snapshot=lambda: rows)
+    result = controller.run(_inputs(tmp_path))
+    assert result.artifact_write_error is None
+    assert result.artifact["model_performance"][0]["measured_prompt_tokens"] == 1234
+    persisted = json.loads(result.artifact_path.read_text(encoding="utf-8"))
+    assert persisted["model_performance"] == list(rows)
+
+
+def test_component_plan_does_not_invoke_initial_planner(tmp_path):
+    calls = []
+    controller = _controller(tmp_path, planner=lambda request: calls.append(request))
+    inputs = _inputs(tmp_path)
+    state = _RunState(
+        inputs=inputs, journal=EventJournal(),
+        deadline=RunDeadline(time.monotonic(), inputs.config.review_deadline_sec, inputs.config.phase_shares),
+        evidence=EvidenceStore(),
+        obligations=derive_obligations(inputs.topology, inputs.classification, inputs.policy),
+    )
+    plan = controller._plan(state)
+    assert calls == []
+    assert plan.assignments
+    assert state.plan_source == "component_owned"
+
+
+def test_ci_failures_are_assigned_after_component_plan_without_becoming_findings(tmp_path):
     observed = []
     def factory(assignment, *args):
         observed.append(assignment)
@@ -163,6 +198,7 @@ def test_controller_admits_and_explicitly_resolves_session_investigation_lead(tm
     assert admitted.status is InvestigationLeadStatus.RESOLVED_NO_ISSUE
     assert admitted.assigned_session_id == "S2"
     assert admitted.resolution_reason.startswith("The only caller")
+    assert admitted.evidence_ids == ("evidence:1", "evidence:2")
 
 
 def test_handoff_focus_includes_only_blocked_investigation_leads(tmp_path):
@@ -1224,7 +1260,7 @@ def _policy() -> ReviewPolicy:
         id="delivery",
         title="Delivery",
         objective="Trace delivery behavior",
-        execution="coverage",
+        execution="integrated",
         match={"file_roles_any": ("implementation",)},
         expected_evidence=("implementation",),
     ),))
@@ -1357,6 +1393,23 @@ class _SuccessfulSession:
             state=SessionState.CHECKPOINT,
             evidence_ids=tuple(evidence_ids),
             candidate_finding_ids=("candidate-delivery",),
+            obligation_assessments=tuple(
+                ObligationAssessment(
+                    target=f"O{index}",
+                    obligation_id=obligation_id,
+                    disposition=ObligationDisposition.COVERED,
+                    reason="The assigned scope was inspected with retained repository evidence.",
+                    evidence_ids=tuple(evidence_ids),
+                    assessed_paths=next(
+                        item.scope for item in self.obligations
+                        if item.id == obligation_id
+                    ),
+                    assessment_version=1,
+                )
+                for index, obligation_id in enumerate(
+                    self.assignment.obligation_ids, start=1,
+                )
+            ),
         )
         return SessionResult(
             session_id=self.session_id,
@@ -2442,7 +2495,8 @@ def test_one_validated_change_overview_reaches_every_review_role(tmp_path):
         artifact_output_root=tmp_path,
     ).run(inputs)
 
-    expected = observed["planner"]
+    assert "planner" not in observed
+    expected = observed["specialist"]
     assert controller_module._json_value(expected) == {
         "trust": "untrusted_orientation",
         "content": controller_module._json_value(proposal),
@@ -2459,8 +2513,12 @@ def test_one_validated_change_overview_reaches_every_review_role(tmp_path):
         ),
     }
     assert observed["specialist"] == controller_module._json_value(expected)
-    assert observed["negotiator"] == expected
-    assert observed["critic"] == expected
+    assert controller_module._json_value(observed["negotiator"]) == (
+        controller_module._json_value(expected)
+    )
+    assert controller_module._json_value(observed["critic"]) == (
+        controller_module._json_value(expected)
+    )
     assert controller_module._json_value(observed["finalizer"]) == (
         controller_module._json_value(proposal)
     )
@@ -2471,6 +2529,57 @@ def test_one_validated_change_overview_reaches_every_review_role(tmp_path):
         result.artifact["change_overview"]
     ) == controller_module._json_value(proposal)
     assert result.artifact["accepted_candidates"] == ()
+
+
+def test_lead_followup_reports_actual_attempt_and_new_evidence(tmp_path):
+    requests = []
+
+    class Gateway:
+        def complete(self, request):
+            payload = request.conversation.to_request_payload("openai", "m")
+            context = json.loads(payload["messages"][1]["content"])
+            target = next(item for item in context["negotiation_state"]["targets"]
+                          if item["handle"].startswith("L"))
+            requests.append(target)
+            raw = json.dumps({"kind": "resume" if len(requests) == 1 else "record_unknown",
+                              "target": target["handle"], "reason": "Check remaining consumer behavior."})
+            return ModelTurnResult(response={}, tool_calls=(), text=raw, text_source="content",
+                                   finish_reason="stop", usage={}, request_diagnostics={})
+
+    def factory(assignment, lease, snapshot, evidence_store, coverage, obligations, expected_session_id):
+        session = _factory(assignment, lease, snapshot, evidence_store, coverage, obligations, expected_session_id)
+        original = session.explore
+        calls = 0
+        def explore():
+            nonlocal calls
+            calls += 1
+            result = original()
+            record = evidence_store.add_tool_result(
+                session_id=expected_session_id, tool="read_file",
+                arguments={"path": "src/worker.py", "offset": calls},
+                result={"status": "ok", "content": f"consumer inspection {calls}"},
+            )
+            lead = InvestigationLead("lead:consumer", "Check consumer behavior.", ("src/worker.py",),
+                                     (), "Read the remaining consumer.", "repository", expected_session_id)
+            return replace(result, investigation_leads=(lead,), checkpoint=replace(
+                result.checkpoint, working_summary="Consumer checked; author confirmation remains.",
+                evidence_ids=(*result.checkpoint.evidence_ids, record.id),
+            ))
+        session.explore = explore
+        session.apply_investigation_lead_feedback = lambda *args: None
+        session.changed_files = ("src/worker.py",)
+        session.conversation = Conversation(system="Review", tool_schemas=[{
+            "name": "read_file", "parameters": {"type": "object"},
+        }])
+        return session
+
+    result = _controller(tmp_path, session_factory=factory,
+                         negotiator=GatewayRoleAdapter(Gateway())).run(_inputs(tmp_path))
+    assert len(requests) == 2
+    assert requests[1]["attempt_count"] == 1
+    assert requests[1]["evidence_delta"] == 1
+    assert requests[1]["last_conclusion"] == "Consumer checked; author confirmation remains."
+    assert any(event.kind == "investigation_lead_followup_completed" for event in result.events)
 
 
 def test_gateway_negotiator_receives_compact_targets_and_re_evaluates_each_wave(tmp_path):
@@ -2496,9 +2605,13 @@ def test_gateway_negotiator_receives_compact_targets_and_re_evaluates_each_wave(
         id="delivery",
         title="Delivery",
         objective="Trace delivery behavior",
-        execution="coverage",
+        execution="integrated",
         match={"file_roles_any": ("implementation",)},
         expected_evidence=("implementation", "tests"),
+        evidence_requirements=(
+            EvidenceRequirementPolicy(id="implementation", category="implementation"),
+            EvidenceRequirementPolicy(id="tests", category="tests"),
+        ),
     )
     inputs = replace(_inputs(tmp_path), policy=ReviewPolicy.minimal(recipes=(first,)))
 
@@ -2526,10 +2639,7 @@ def test_gateway_negotiator_receives_compact_targets_and_re_evaluates_each_wave(
     # second negotiation decision even though the unresolved ID is unchanged.
     assert len(requests) == 2
     assert all("obligation_id" not in target for target in requests[0]["negotiation_state"]["targets"])
-    assert any(
-        target["retained_evidence_count"] > 0
-        for target in requests[1]["negotiation_state"]["targets"]
-    )
+    assert result.artifact["evidence"]
     assert [event.payload["round"] for event in result.events if event.kind == "negotiation_round"] == [1, 2]
 
 
@@ -2582,7 +2692,19 @@ def test_unproductive_followup_retires_target_and_tries_a_different_one(tmp_path
         match={"file_roles_any": ("implementation",)},
         expected_evidence=("implementation", "tests"),
     )
-    inputs = replace(_inputs(tmp_path), policy=ReviewPolicy.minimal(recipes=(recipe,)))
+    inputs = replace(
+        _inputs(tmp_path),
+        policy=ReviewPolicy.minimal(recipes=(recipe,)),
+        changed_files=("src/worker.py", "src/helper.py"),
+        topology={
+            "changed_files": ["src/worker.py", "src/helper.py"],
+            "file_roles": ["implementation"],
+            "components": [
+                {"id": "worker", "changed_files": ["src/worker.py"]},
+                {"id": "helper", "changed_files": ["src/helper.py"]},
+            ],
+        },
+    )
 
     def factory(
         assignment, lease, snapshot, evidence_store, coverage, obligations,
@@ -2619,7 +2741,10 @@ def test_unproductive_followup_retires_target_and_tries_a_different_one(tmp_path
     ] == list(range(1, request_count + 1))
 
 
-def test_record_unknown_status_change_does_not_trigger_another_negotiation_round(tmp_path):
+@pytest.mark.parametrize("continuation_blocked", [False, True])
+def test_record_unknown_status_change_does_not_trigger_another_negotiation_round(
+    tmp_path, continuation_blocked,
+):
     calls = []
 
     def factory(
@@ -2627,9 +2752,11 @@ def test_record_unknown_status_change_does_not_trigger_another_negotiation_round
         expected_session_id,
     ):
         del lease, snapshot, coverage
-        return _ResumeSession(
+        session = _ResumeSession(
             assignment, evidence_store, obligations, expected_session_id,
         )
+        session.continuation_blocked = continuation_blocked
+        return session
 
     def record_unknown(request):
         calls.append(request)
@@ -2657,6 +2784,10 @@ def test_record_unknown_status_change_does_not_trigger_another_negotiation_round
     ).run(_inputs(tmp_path))
 
     assert len(calls) == 1
+    if continuation_blocked:
+        state = calls[0].context["negotiation_state"]
+        assert state.session_resources == ()
+        assert state.checkpoints  # Retained work remains available.
     assert [event.payload["round"] for event in result.events if event.kind == "negotiation_round"] == [1]
 
 
@@ -2676,16 +2807,12 @@ def test_malformed_change_summary_falls_back_to_bounded_facts(tmp_path):
         },
     )
 
-    def planner(request):
-        observed.update(request.context["change_overview"]["content"])
-        return {"transformations": []}
-
     result = _controller(
         tmp_path,
         change_summarizer=lambda _request: {"overview": 7},
-        planner=planner,
     ).run(inputs)
 
+    observed.update(result.artifact["change_overview"])
     assert observed["overview"]
     assert len(json.dumps(
         controller_module._json_value(observed)
@@ -2781,16 +2908,12 @@ def test_failed_immutable_diff_uses_explicit_degraded_fallback(tmp_path):
         summarizer_called = True
         return {}
 
-    def planner(request):
-        observed.update(request.context["change_overview"]["content"])
-        return {"transformations": []}
-
     result = _controller(
         tmp_path,
         change_summarizer=summarizer,
-        planner=planner,
     ).run(inputs)
 
+    observed.update(result.artifact["change_overview"])
     assert summarizer_called is False
     assert observed["key_changes"][0]["path"] == "src/worker.py"
     assert observed["key_changes"][0]["summary"] == "Changes"
@@ -2800,22 +2923,6 @@ def test_failed_immutable_diff_uses_explicit_degraded_fallback(tmp_path):
         and item["reason"] == "immutable diff range unavailable"
         for item in result.artifact["degradation"]
     )
-
-
-def test_planner_failure_uses_deterministic_assignment_plan(tmp_path):
-    def broken_planner(*args):
-        raise RuntimeError("planner unavailable")
-
-    result = _controller(tmp_path, planner=broken_planner).run(_inputs(tmp_path))
-
-    assert result.artifact["assignments"][0]["id"].startswith("fallback-")
-    assert result.artifact["evaluation_status"] == "complete"
-    assert result.artifact["assignment_plan"]["ignored_transformations"]
-    assert not any(
-        item["component"] == "planner" for item in result.artifact["degradation"]
-    )
-    assert "planner unavailable" not in result.handoff.markdown
-    assert result.publishing_ready is True
 
 
 def test_handoff_effects_render_summary_text_not_mapping_repr():
@@ -2850,317 +2957,6 @@ def test_handoff_fallback_clips_long_facts_at_word_boundaries():
 
     assert "additional behavi." not in " ".join(summary)
     assert "…" in summary[1]
-
-
-def test_optional_planner_absence_keeps_authoritative_base_without_degradation(tmp_path):
-    result = _controller(tmp_path, planner=None).run(_inputs(tmp_path))
-
-    assert result.artifact["assignment_plan"]["source"] == "deterministic_base"
-    assert not any(
-        item["component"] == "planner" for item in result.artifact["degradation"]
-    )
-    assert result.artifact["assignments"]
-
-
-def test_invalid_planner_items_are_diagnostic_and_valid_items_still_apply(tmp_path):
-    def planner(request):
-        base = request.context["base_plan"]
-        assignment = base.assignments[0]
-        return {"transformations": [
-            {
-                "kind": "improve",
-                "assignment_id": assignment.id,
-                "seed_paths": ["invented/outside.py"],
-            },
-            {
-                "kind": "improve",
-                "assignment_id": assignment.id,
-                "objective": "Trace the worker's reachable delivery behavior.",
-            },
-        ]}
-
-    result = _controller(tmp_path, planner=planner).run(_inputs(tmp_path))
-
-    assert result.artifact["assignment_plan"]["source"] == (
-        "deterministic_base_transformed"
-    )
-    assert result.artifact["assignment_plan"]["ignored_transformations"]
-    assert result.artifact["assignments"][0]["objective"] == (
-        "Trace the worker's reachable delivery behavior."
-    )
-    assert not any(
-        item["component"] == "planner" for item in result.artifact["degradation"]
-    )
-
-
-def test_planner_has_no_whole_plan_semantic_repair_loop(tmp_path):
-    calls = []
-
-    def planner(request):
-        calls.append(request.request_id)
-        return {"assignments": []}
-
-    result = _controller(tmp_path, planner=planner).run(_inputs(tmp_path))
-
-    assert calls == ["planner:1"]
-    assert result.artifact["assignment_plan"]["source"] == "deterministic_base"
-    assert result.artifact["assignments"]
-
-
-def test_invalid_planner_final_json_keeps_base_without_semantic_repair(
-    monkeypatch, tmp_path,
-):
-    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
-    monkeypatch.setenv("AI_MODEL", "local-model")
-    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
-    now = time.monotonic()
-    controller.clock = lambda: now
-    payloads = []
-    responses = iter((
-        {
-            "choices": [{
-                "finish_reason": "length",
-                "message": {"role": "assistant", "reasoning_content": "first reasoning"},
-            }],
-            "usage": {},
-        },
-        {
-            "choices": [{
-                "finish_reason": "length",
-                "message": {"role": "assistant", "reasoning_content": "second reasoning"},
-            }],
-            "usage": {},
-        },
-        {
-            "choices": [{
-                "finish_reason": "stop",
-                "message": {"role": "assistant", "content": '{"assignments":[]}'},
-            }],
-            "usage": {},
-        },
-        {
-            "choices": [{
-                "finish_reason": "stop",
-                "message": {"role": "assistant", "content": '{"assignments":[]}'},
-            }],
-            "usage": {},
-        },
-    ))
-
-    def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
-        payloads.append(payload)
-        return next(responses)
-
-    controller.planner.gateway.transport = transport
-    inputs = _inputs(tmp_path)
-    state = _RunState(
-        inputs=inputs,
-        journal=EventJournal(),
-        deadline=RunDeadline(
-            now, inputs.config.review_deadline_sec, inputs.config.phase_shares,
-        ),
-        evidence=EvidenceStore(),
-        obligations=derive_obligations(
-            inputs.topology, inputs.classification, inputs.policy,
-        ),
-    )
-
-    plan = controller._plan(state)
-
-    assert len(payloads) == 3
-    assert payloads[2]["reasoning_effort"] == "none"
-    assert state.plan_source == "deterministic_base"
-    assert state.planner_diagnostics
-    assert plan.assignments[0].id.startswith("fallback-")
-
-
-def test_planner_uses_continuations_but_no_whole_plan_semantic_repair(
-    monkeypatch, tmp_path,
-):
-    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
-    monkeypatch.setenv("AI_MODEL", "local-model")
-    monkeypatch.setenv("AI_REASONING_EFFORT", "high")
-    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
-    now = time.monotonic()
-    controller.clock = lambda: now
-    payloads = []
-    inputs = _inputs(tmp_path)
-    state = _RunState(
-        inputs=inputs,
-        journal=EventJournal(),
-        deadline=RunDeadline(
-            now, inputs.config.review_deadline_sec, inputs.config.phase_shares,
-        ),
-        evidence=EvidenceStore(),
-        obligations=derive_obligations(
-            inputs.topology, inputs.classification, inputs.policy,
-        ),
-    )
-    valid_repair = _planner(state.obligations, inputs.topology, inputs.config)
-    responses = iter((
-        {
-            "choices": [{
-                "finish_reason": "length",
-                "message": {"role": "assistant", "reasoning_content": "first reasoning"},
-            }],
-            "usage": {},
-        },
-        {
-            "choices": [{
-                "finish_reason": "length",
-                "message": {"role": "assistant", "reasoning_content": "second reasoning"},
-            }],
-            "usage": {},
-        },
-        {
-            "choices": [{
-                "finish_reason": "stop",
-                "message": {"role": "assistant", "content": '{"assignments":[]}'},
-            }],
-            "usage": {},
-        },
-        {
-            "choices": [{
-                "finish_reason": "stop",
-                "message": {"role": "assistant", "content": json.dumps(valid_repair)},
-            }],
-            "usage": {},
-        },
-    ))
-
-    def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
-        payloads.append(payload)
-        return next(responses)
-
-    controller.planner.gateway.transport = transport
-
-    plan = controller._plan(state)
-
-    assert len(payloads) == 3
-    assert payloads[2]["reasoning_effort"] == "none"
-    assert state.plan_source == "deterministic_base"
-    assert state.planner_repaired is False
-    assert plan.assignments[0].id.startswith("fallback-")
-
-
-def test_planner_continuation_stops_after_first_structured_response(
-    monkeypatch, tmp_path,
-):
-    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
-    monkeypatch.setenv("AI_MODEL", "local-model")
-    monkeypatch.setenv("AI_REASONING_EFFORT", "high")
-    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
-    now = time.monotonic()
-    controller.clock = lambda: now
-    payloads = []
-    responses = iter((
-        {
-            "choices": [{
-                "finish_reason": "length",
-                "message": {"role": "assistant", "reasoning_content": "initial reasoning"},
-            }],
-            "usage": {},
-        },
-        {
-            "choices": [{
-                "finish_reason": "stop",
-                "message": {"role": "assistant", "content": '{"assignments":[]}'},
-            }],
-            "usage": {},
-        },
-        {
-            "choices": [{
-                "finish_reason": "length",
-                "message": {"role": "assistant", "reasoning_content": "repair reasoning"},
-            }],
-            "usage": {},
-        },
-        {
-            "choices": [{
-                "finish_reason": "length",
-                "message": {"role": "assistant", "reasoning_content": "more repair reasoning"},
-            }],
-            "usage": {},
-        },
-    ))
-
-    def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
-        payloads.append(payload)
-        return next(responses)
-
-    controller.planner.gateway.transport = transport
-    inputs = _inputs(tmp_path)
-    state = _RunState(
-        inputs=inputs,
-        journal=EventJournal(),
-        deadline=RunDeadline(
-            now, inputs.config.review_deadline_sec, inputs.config.phase_shares,
-        ),
-        evidence=EvidenceStore(),
-        obligations=derive_obligations(
-            inputs.topology, inputs.classification, inputs.policy,
-        ),
-    )
-
-    plan = controller._plan(state)
-
-    assert len(payloads) == 2
-    assert state.plan_source == "deterministic_base"
-    assert state.planner_diagnostics
-    assert plan.assignments[0].id.startswith("fallback-")
-
-
-def test_planner_does_not_spend_a_second_request_on_semantic_repair(
-    monkeypatch, tmp_path,
-):
-    monkeypatch.setenv("AI_BASE_URL", "http://localhost:1234/v1")
-    monkeypatch.setenv("AI_MODEL", "local-model")
-    controller = cli.build_controller(cli.CliConfig.from_env(workspace=tmp_path))
-    now = time.monotonic()
-    controller.clock = lambda: now
-    payloads = []
-    inputs = _inputs(tmp_path)
-    state = _RunState(
-        inputs=inputs,
-        journal=EventJournal(),
-        deadline=RunDeadline(
-            now, inputs.config.review_deadline_sec, inputs.config.phase_shares,
-        ),
-        evidence=EvidenceStore(),
-        obligations=derive_obligations(
-            inputs.topology, inputs.classification, inputs.policy,
-        ),
-    )
-    valid_repair = _planner(state.obligations, inputs.topology, inputs.config)
-    responses = iter((
-        {
-            "choices": [{
-                "finish_reason": "stop",
-                "message": {"role": "assistant", "content": '{"assignments":[]}'},
-            }],
-            "usage": {},
-        },
-        {
-            "choices": [{
-                "finish_reason": "stop",
-                "message": {"role": "assistant", "content": json.dumps(valid_repair)},
-            }],
-            "usage": {},
-        },
-    ))
-
-    def transport(_base_url, _api_format, payload, _api_key, _timeout, **_kwargs):
-        payloads.append(payload)
-        return next(responses)
-
-    controller.planner.gateway.transport = transport
-
-    plan = controller._plan(state)
-
-    assert len(payloads) == 1
-    assert state.plan_source == "deterministic_base"
-    assert state.planner_repaired is False
-    assert plan.assignments[0].id.startswith("fallback-")
 
 
 def test_specialist_failure_gets_one_bounded_followup_reassignment(tmp_path):
@@ -3225,6 +3021,24 @@ class _ResumeSession:
             state=SessionState.CHECKPOINT,
             evidence_ids=evidence_ids,
             unknowns=() if evidence_ids else self.assignment.obligation_ids,
+            obligation_assessments=tuple(
+                ObligationAssessment(
+                    target=f"O{index}",
+                    obligation_id=obligation_id,
+                    disposition=ObligationDisposition.COVERED,
+                    reason="The resumed owner check inspected the assigned scope.",
+                    evidence_ids=evidence_ids,
+                    assessed_paths=next(
+                        item.scope for item in self.obligations
+                        if item.id == obligation_id
+                    ),
+                    assessment_version=1,
+                )
+                for index, obligation_id in enumerate(
+                    self.assignment.obligation_ids, start=1,
+                )
+                if evidence_ids
+            ),
         )
         return SessionResult(
             session_id=self.session_id,
@@ -3312,7 +3126,7 @@ def test_degraded_session_is_promoted_once_across_initial_followup_and_finalizat
     )
     assert result.artifact["evaluation_status"] == "degraded"
     assert specialist_degradations == ({
-        "component": "specialist:fallback-combined-1",
+        "component": "specialist:component-worker",
         "reason": "specialist completed with degraded retained state",
     },)
     status_events = [
@@ -3356,7 +3170,12 @@ def test_critic_receives_only_referenced_obligations_without_expanded_scopes(tmp
         seen.append(request.context)
         return _critic_role(request)
 
-    result = _controller(tmp_path, critic=critic).run(_inputs(tmp_path))
+    result = _controller(tmp_path, critic=critic).run(replace(
+        _inputs(tmp_path),
+        test_results=({
+            "name": "test_delivery", "status": "failed", "report": "pytest.xml",
+        },),
+    ))
     assert seen
     context = seen[0]
     expected_ids = {oid for candidate in context["candidates"]
@@ -4106,6 +3925,7 @@ def test_finalizer_failure_builds_useful_sparse_handoff_from_controller_state(tm
     assert result.handoff.recipe_focuses == ("Repository recipe: delivery",)
     assert result.handoff.coverage_boundaries == (
         "Runtime implementation behavior",
+        "Test coverage",
     )
     assert result.handoff.thread_status == (
         "1 detail review note prepared for publication; "
@@ -4201,6 +4021,10 @@ def test_handoff_summarizer_writes_behavioral_review_handoff_from_validated_stat
             "successful_review_facts", "prepared_notes", "human_focus_facts",
         }
         assert request.context["human_focus_facts"] == ()
+        accepted = request.context["prepared_notes"]["accepted_findings"]
+        assert len(accepted) == 1
+        assert accepted[0]["claim"] == "A retry can process one delivery twice"
+        assert accepted[0]["affected_location"]
         assert "policy" not in request.context
         assert "coverage" not in request.context
         assert "review" not in request.context
@@ -4332,9 +4156,7 @@ def test_handoff_summarizer_uses_full_overview_and_latest_checkpoint_summaries(
     assert checkpoint_summary["completed_steps"] == [
         "Compared the retry branch with its consumer.",
     ]
-    assert set(checkpoint_summary["covered_subjects"]) == {
-        "src/worker.py", "delivery",
-    }
+    assert set(checkpoint_summary["covered_subjects"]) == {"worker"}
     assert checkpoint_summary["unresolved_subjects"] == []
     assert checkpoint_summary["unknowns"] == [
         "External acknowledgement [REDACTED] remains unresolved.",
@@ -4357,7 +4179,7 @@ def test_handoff_change_summary_may_name_request_changes_behavior(tmp_path):
             "ai_reviewed_summary": "The AI traced the changed publishing branch.",
             "human_focus": (
                 "Recheck whether the request_changes verdict still creates the "
-                "resulting native review event."
+                "resulting native review event, including incomplete states and finding locations."
             ),
         }
 
@@ -4442,15 +4264,47 @@ def test_handoff_summarizer_does_not_reject_free_form_path_words(tmp_path):
     )
 
 
-def test_handoff_summarizer_gets_one_focused_semantic_repair(tmp_path):
+def test_handoff_length_failure_gets_focused_repair(tmp_path):
     requests = []
+
+    def summarizer(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return {"what_changed_summary": "x" * 603,
+                    "ai_reviewed_summary": "The AI reviewed worker changes.", "human_focus": ""}
+        assert "603" in request.context["semantic_repair"]["reason"]
+        return {"what_changed_summary": "The worker retries failed delivery.",
+                "ai_reviewed_summary": "The AI reviewed worker changes.", "human_focus": ""}
+
+    result = _controller(tmp_path, finalizer=summarizer).run(_inputs(tmp_path))
+    assert len(requests) == 2
+    assert "The worker retries failed delivery." in result.handoff.markdown
+
+
+def test_handoff_summarizer_gets_one_focused_semantic_repair(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    requests = []
+    original = ReviewController._apply_handoff_summary_proposal
+
+    def with_retained_claim(self, state, base, proposal):
+        # This fixture's fake source cannot authorize a real finding. Supply the
+        # already-adjudicated claim at the presentation boundary under test.
+        state.review = replace(state.review, accepted=(SimpleNamespace(
+            claim="A retry can process one delivery twice", user_visible_consequence="",
+        ),))
+        try:
+            return original(self, state, base, proposal)
+        finally:
+            state.review = replace(state.review, accepted=())
+
+    monkeypatch.setattr(ReviewController, "_apply_handoff_summary_proposal", with_retained_claim)
 
     def summarizer(request):
         requests.append(request)
         if len(requests) == 1:
             return {
                 "ai_reviewed_summary": (
-                    "The review found the blocker at src/worker.py:8."
+                    "The AI reviewed retry handling: A retry can process one delivery twice."
                 ),
                 "human_focus": "The blocker at src/worker.py:8 must be fixed.",
             }
@@ -4465,7 +4319,7 @@ def test_handoff_summarizer_gets_one_focused_semantic_repair(tmp_path):
 
     result = _controller(tmp_path, finalizer=summarizer).run(_inputs(tmp_path))
 
-    assert len(requests) == 2
+    assert len(requests) == 2, result.artifact["events"][-8:]
     assert result.handoff.ai_reviewed == (
         "The review traced retry handling through the supplied worker scope.",
     )
@@ -4628,7 +4482,9 @@ def test_finalizer_reuses_one_validated_whole_change_overview(tmp_path):
     assert result.handoff.what_changed[0] == (
         result.artifact["change_overview"]["overview"]
     )
-    assert len(result.handoff.what_changed) >= 2
+    assert result.handoff.what_changed == (
+        result.artifact["change_overview"]["overview"],
+    )
 
 
 def test_behavioral_handoff_candidates_prioritize_high_risk_beyond_file_prefix():
@@ -5020,7 +4876,7 @@ def test_controller_handoff_retains_reviewed_contract_fact_with_authorized_path(
 
     assert result.handoff.ai_reviewed == (
         "Reviewed the `process()` behavior in `src/worker.py` "
-        "and delivery contract.",
+        "and worker contract.",
     )
 
 
@@ -5103,10 +4959,14 @@ def test_deadline_stops_exploration_and_preserves_finalization_reserve(tmp_path)
     sessions_started = []
     finalizer_calls = []
 
-    def planner(request):
-        raw = _planner_role(request)
+    def summarizer(_request):
         clock.now = 90.0
-        return raw
+        return {
+            "overview": "Updates worker delivery behavior.",
+            "key_changes": [],
+            "cross_component_effects": [],
+            "uncertainties": [],
+        }
 
     def factory(*args):
         sessions_started.append(True)
@@ -5117,28 +4977,23 @@ def test_deadline_stops_exploration_and_preserves_finalization_reserve(tmp_path)
         return _finalizer(state)
 
     result = _controller(tmp_path,
-        planner=planner, session_factory=factory, finalizer=finalizer, clock=clock,
+        change_summarizer=summarizer,
+        session_factory=factory,
+        finalizer=finalizer,
+        clock=clock,
     ).run(_inputs(tmp_path))
 
     assert sessions_started == []
     assert len(finalizer_calls) == 1
     assert result.artifact["timing"]["finalization_reserve_seconds"] == 10
     assert result.artifact["unknowns"]
-    assert "Runtime implementation behavior" in result.handoff.change_map
+    assert "Component: worker" in result.handoff.change_map
     assert result.handoff.specialist_focuses == ()
     assert result.handoff.recipe_focuses == ()
     assert result.handoff.thread_status is None
-    assert any(
-        item["component"] == "deadline" for item in result.artifact["degradation"]
-    )
 
 
-def test_degraded_handoff_rejects_focus_from_failed_planned_assignment(tmp_path):
-    def planner(request):
-        raw = _planner_role(request)
-        raw["assignments"][0]["lenses"] = ["security"]
-        return raw
-
+def test_degraded_handoff_rejects_focus_from_failed_component_assignment(tmp_path):
     def broken_factory(*_args):
         raise RuntimeError("specialist unavailable")
 
@@ -5150,7 +5005,6 @@ def test_degraded_handoff_rejects_focus_from_failed_planned_assignment(tmp_path)
 
     result = _controller(
         tmp_path,
-        planner=planner,
         session_factory=broken_factory,
         finalizer=finalizer,
     ).run(_inputs(tmp_path))
@@ -5163,11 +5017,6 @@ def test_degraded_handoff_rejects_focus_from_failed_planned_assignment(tmp_path)
 def test_degraded_handoff_keeps_valid_model_prose_and_focus(
     tmp_path,
 ):
-    def planner(request):
-        raw = _planner_role(request)
-        raw["assignments"][0]["lenses"] = ["security"]
-        return raw
-
     def broken_factory(*_args):
         raise RuntimeError("specialist unavailable")
 
@@ -5184,7 +5033,6 @@ def test_degraded_handoff_keeps_valid_model_prose_and_focus(
 
     result = _controller(
         tmp_path,
-        planner=planner,
         session_factory=broken_factory,
         finalizer=finalizer,
     ).run(_inputs(tmp_path))
@@ -5855,22 +5703,6 @@ def test_semantic_artifact_is_stable_across_completion_order_and_clock_origin(tm
         del args
         return obligations
 
-    def planner(request):
-        items = request.context["obligations"]
-        return {"assignments": [{
-            "id": f"session-{item.subject}",
-            "title": item.subject,
-            "objective": f"Review {item.subject}",
-            "obligation_ids": [item.id],
-            "lenses": ["implementation"],
-            "seed_paths": list(item.scope),
-            "boundary_paths": [],
-            "expected_evidence": ["implementation"],
-            "estimated_turns": 1,
-            "priority": "normal",
-            "overlap_justification": "",
-        } for item in items]}
-
     def run(directory, delays, clock_origin):
         directory.mkdir(parents=True, exist_ok=True)
         by_id = {item.id: item for item in obligations}
@@ -5893,7 +5725,6 @@ def test_semantic_artifact_is_stable_across_completion_order_and_clock_origin(tm
             config=replace(_inputs(directory).config, concurrency=2),
         )
         return ReviewController(
-            planner=planner,
             session_factory=factory,
             critic=lambda request: {"decisions": []},
             finalizer=_finalizer,
@@ -6029,70 +5860,6 @@ def test_unexpected_controller_failure_returns_notice_without_fabricated_blocker
     assert "Approve" not in result.handoff.markdown
     assert result.artifact["accepted_candidates"] == ()
     assert result.artifact["verdict"]["blocking_finding_ids"] == ()
-
-
-def test_planner_receives_typed_phase_lease_request(tmp_path):
-    requests = []
-
-    def planner(request):
-        requests.append(request)
-        return _planner(
-            request.context["obligations"],
-            request.context["topology"],
-            request.context["config"],
-        )
-
-    result = _controller(tmp_path, planner=planner).run(replace(
-        _inputs(tmp_path),
-        pr_metadata={"title": "Preserve retry intent", "body": "No duplicate work"},
-    ))
-
-    assert result.artifact["assignment_plan"]["source"] == "deterministic_base"
-    assert len(requests) == 1
-    request = requests[0]
-    assert isinstance(request, RoleRequest)
-    assert request.phase.value == "planning"
-    assert request.request_id == "planner:1"
-    assert request.timeout_sec <= request.lease.remaining(now=0.0)
-    assert request.max_tokens > 0
-    assert request.context["policy"] == _policy()
-    assert request.context["pr_metadata"]["title"] == "Preserve retry intent"
-
-
-def test_hanging_planner_is_cut_off_and_late_result_is_ignored(tmp_path):
-    import threading
-
-    release = threading.Event()
-    returned = threading.Event()
-
-    def hanging_planner(request):
-        release.wait(2)
-        returned.set()
-        return _planner(
-            request.context["obligations"],
-            request.context["topology"],
-            request.context["config"],
-        )
-
-    inputs = replace(
-        _inputs(tmp_path),
-        config=replace(
-            _inputs(tmp_path).config,
-            review_deadline_sec=0.5,
-            model_request_timeout_sec=0.01,
-        ),
-    )
-    started = time.monotonic()
-    result = _controller(tmp_path, planner=hanging_planner, clock=time.monotonic).run(inputs)
-    elapsed = time.monotonic() - started
-    before = json.dumps(result.artifact, sort_keys=True)
-    release.set()
-    assert returned.wait(1)
-    time.sleep(0.02)
-
-    assert elapsed < 1
-    assert result.artifact["assignment_plan"]["source"] == "deterministic_base"
-    assert json.dumps(result.artifact, sort_keys=True) == before
 
 
 def test_slow_keyboard_interrupt_event_observer_never_blocks_or_escapes():
@@ -6344,10 +6111,9 @@ def test_finalizer_cannot_override_controller_owned_handoff_facts(tmp_path):
             material_coverage_limited=False,
         )
 
-    result = _controller(tmp_path,
-        finalizer=malicious_finalizer,
-        planner=lambda *args: (_ for _ in ()).throw(RuntimeError("degraded")),
-    ).run(_inputs(tmp_path))
+    result = _controller(tmp_path, finalizer=malicious_finalizer).run(
+        _inputs(tmp_path)
+    )
 
     assert "invented" not in result.handoff.markdown
     assert result.artifact["evaluation_status"] == "complete"
@@ -6728,6 +6494,7 @@ def test_artifact_root_identity_swap_cannot_redirect_atomic_write(tmp_path):
         finalizer=_finalizer,
         clock=lambda: 0.0,
         artifact_output_root=root,
+        performance_snapshot=lambda: ({"measured_prompt_tokens": 10},),
     )
     result = controller.run(_inputs(tmp_path))
 
@@ -7051,36 +6818,6 @@ def test_hostile_writer_and_observer_never_escape_terminal_result(tmp_path):
     assert result.artifact["publishing"]["ready"] is False
     assert result.artifact_write_error
     assert "private" not in json.dumps(result.artifact)
-
-
-def test_role_callback_receives_only_detached_bounded_role_request(tmp_path):
-    inputs = _inputs(tmp_path)
-    mutable_topology = {
-        **inputs.topology,
-        "changed_files": list(inputs.topology["changed_files"]),
-    }
-    inputs = replace(inputs, topology=mutable_topology)
-    observed = []
-
-    def planner(*args):
-        observed.append(args)
-        mutable_topology["changed_files"].append("src/late.py")
-        request = args[0]
-        assert tuple(request.context["topology"]["changed_files"]) == (
-            "src/worker.py",
-        )
-        return _planner(
-            request.context["obligations"],
-            request.context["topology"],
-            request.context["config"],
-        )
-
-    result = _controller(tmp_path, planner=planner).run(inputs)
-
-    assert result.artifact["assignment_plan"]["source"] == "deterministic_base"
-    assert len(observed) == 1
-    assert len(observed[0]) == 1
-    assert isinstance(observed[0][0], RoleRequest)
 
 
 @dataclass

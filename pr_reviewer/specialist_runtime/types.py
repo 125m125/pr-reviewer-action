@@ -95,6 +95,14 @@ class InvestigationLead:
     assigned_session_id: str | None = None
     resolution_reason: str = ""
     candidate_ids: tuple[str, ...] = ()
+    kind: str = "investigation"
+    parent_assignment_id: str | None = None
+    child_assignment_id: str | None = None
+    delegated_paths: tuple[str, ...] = ()
+    delegated_obligation_ids: tuple[str, ...] = ()
+    attempt_count: int = 0
+    last_evidence_delta: int = 0
+    last_outcome: str = ""
 
 
 @dataclass(frozen=True)
@@ -126,6 +134,15 @@ class CoverageObligation:
     requirement_id: str | None = None
     requirement_mode: str = "required"
     mandatory: bool = True
+    owner_component_id: str = ""
+    boundary_id: str = ""
+    participant_id: str = ""
+    evaluator_owned: bool = False
+    evidence_requirements: tuple[Mapping[str, object], ...] = ()
+    evidence_hints: tuple[str, ...] = ()
+    integrated_recipe_ids: tuple[str, ...] = ()
+    boundary_endpoint_paths: tuple[str, ...] = ()
+    boundary_contract_paths: tuple[str, ...] = ()
 
     @property
     def id(self) -> str:
@@ -152,6 +169,10 @@ class SpecialistAssignment:
     priority: int = 0
     overlap_justification: str = ""
     investigation_leads: tuple[InvestigationLead, ...] = ()
+    owner_component_id: str = ""
+    owned_changed_paths: tuple[str, ...] = ()
+    parent_assignment_id: str | None = None
+    delegation_depth: int = 0
 
 
 @dataclass(frozen=True)

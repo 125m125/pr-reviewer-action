@@ -1,10 +1,105 @@
 # Authoring an AI review policy
 
 This is the permanent guide for creating `.github/ai-review-policy.json`, selected
-by the action's `review_policy_file` input. It applies to version 2 specialist
+by the action's `review_policy_file` input. It applies to version 3 specialist
 reviews. For converting older configurations, see the
 [migration guide](migrations/specialist-session-runtime.md).
 The executable schema is [policy.py](../pr_reviewer/specialist_runtime/policy.py).
+
+## Quick start: one owner
+
+Create `.github/ai-review-policy.json` with this complete policy:
+
+```json
+{
+  "version": 3,
+  "components": [
+    {
+      "id": "repository",
+      "paths": ["*"],
+      "responsibilities": ["Review changed behavior and its relevant callers and tests"]
+    }
+  ],
+  "publishing": {"allowed_modes": ["review_comment"], "allow_approve": false}
+}
+```
+
+Keep `review_policy_file: .github/ai-review-policy.json` and begin with
+`review_strategy: specialists_evaluate`. Validate locally using the command
+below before running the workflow. A small repository needs no boundaries or
+recipes initially. Add them when concrete ownership or compatibility questions
+justify them, not to enumerate every file.
+
+## Owners and shared boundaries
+
+A component is an investigation owner, not a language. Two Java services can be
+two owners; multiple languages can be one coherent owner. Shared contracts do
+not need an extra specialist by default. When no component owns a changed
+contract path, its configured `contract_change_owner` owns that change.
+Unmatched changed files enter one `repository-remainder` owner and remain
+visible as missing ownership configuration.
+
+A boundary activates when a changed path matches `contract_paths` or explicit
+`endpoint_paths`; configured relationships alone are orientation. Local checks
+start for all configured participants, but unchanged participants do not each
+spawn a session: the primary investigation owner can inspect them. A relevant
+successful lookup and brief reason can support "not affected"; exhaustive
+negative proof is not required.
+
+Local boundary scope contains only changed contracts and that participant's
+endpoint matches. Other component behavior remains separate. A fresh bounded,
+tools-disabled evaluator compares retained local assessments and actual source
+excerpts, not only covered labels. It records supported, insufficient evidence,
+or a potential contradiction for the stated question. Missing/truncated evidence
+leaves the combined requirement incomplete; targeted leads may be scheduled,
+but neither an automatic finding nor a new specialist is implied. New material
+evidence invalidates stale support; evaluator costs share current limits.
+
+## movieHRdb-style ownership example
+
+This complete starting example demonstrates application owners and shared
+contracts without declaring every generated API as a separate owner. Adapt paths
+to the actual generator layout. Sources and publishing authority stay explicit.
+
+```json
+{
+  "version": 3,
+  "components": [
+    {"id": "backend", "paths": ["movieHRdb-backend/**"], "responsibilities": ["HTTP and message producers, application behavior"]},
+    {"id": "worker", "paths": ["movieHRdb-pythonworker/**"], "responsibilities": ["Message consumers and background persistence"]},
+    {"id": "frontend", "paths": ["movieHRdb-frontend/**"], "responsibilities": ["HTTP consumption and reactive state"]},
+    {"id": "database", "paths": ["movieHRdb-database/**"], "responsibilities": ["Migrations and database behavior"]},
+    {"id": "deployment", "paths": [".github/workflows/**", "ci/**", "movieHRdb-ansible/**"], "responsibilities": ["Build and runtime artifact delivery"]}
+  ],
+  "boundaries": [
+    {
+      "id": "http-api", "contract_paths": ["movieHRdb-openapi/**"],
+      "participants": ["backend", "frontend"], "contract_change_owner": "backend",
+      "objective": "Compare changed HTTP request and response meaning in producers and consumers."
+    },
+    {
+      "id": "worker-messages", "contract_paths": ["movieHRdb-asyncapi/**", "movieHRdb-protobuf-backend/**"],
+      "participants": ["backend", "worker"], "contract_change_owner": "backend",
+      "endpoint_paths": {"backend": ["movieHRdb-backend/**/messaging/**"], "worker": ["movieHRdb-pythonworker/**/messaging/**"]},
+      "objective": "Compare message identity, destination, payload, and failure semantics."
+    },
+    {
+      "id": "persistence", "contract_paths": ["movieHRdb-database/src/main/resources/db/changelog/**"],
+      "participants": ["database", "backend", "worker"], "contract_change_owner": "database",
+      "objective": "Check changed schema and its actual reads and writes preserve data meaning."
+    }
+  ],
+  "recipes": [
+    {
+      "id": "reactive-state", "execution": "integrated",
+      "match": {"component_ids_any": ["frontend"]},
+      "objective": "Check loading termination, cancellation, and stale state.",
+      "expected_evidence": ["changed state transitions", "relevant tests"]
+    }
+  ],
+  "publishing": {"allowed_modes": ["review_comment"], "allow_approve": false}
+}
+```
 
 ## Start with the repository, not a catalog of technologies
 
@@ -13,7 +108,7 @@ The executable schema is [policy.py](../pr_reviewer/specialist_runtime/policy.py
 2. Define a small set of components with real repository paths. Describe actual
    responsibilities and contracts, not everything a component might ever do.
 3. Add recipes for recurring, consequential review questions. Begin with
-   `execution: "coverage"`; isolate work only when there is a concrete reason.
+   `execution: "integrated"`; isolate work only when there is a concrete reason.
 4. Add narrowly triggered coverage rules only for investigations that must not
    be omitted. Explain why each is mandatory.
 5. Add conditional evidence requirements and only the source access needed for
@@ -26,7 +121,7 @@ settings belong in the workflow/action inputs, not invented policy fields.
 
 ## Schema reference and defaults
 
-Use JSON with `"version": 2` and at least one configuration section. Omitted
+Use JSON with `"version": 3` and at least one explicit owner in `components`. A missing policy file or version 1/2 fails before model calls; there is no legacy execution fallback. Omitted
 collection sections are empty. Unknown keys are rejected at the top level and
 inside the structured sections below; they are not comments or extension points.
 Use unique, stable lowercase-hyphenated IDs: identifiers are slug-normalized.
@@ -35,8 +130,10 @@ without drive letters, leading slashes, or `..` segments.
 
 | Section | Supported fields and behavior |
 | --- | --- |
-| `components[]` | Required `id`; `paths`, `responsibilities`, `related_components`, `contracts`, `invariants` default to empty arrays. Prefer non-overlapping paths: component lookup uses the first matching configured component. Relationships orient review; they are not a request to audit entire dependent components. |
-| `recipes[]` | Required `id`; `title` defaults to the ID; `objective` defaults to a generic correctness review. Set both explicitly. `execution` defaults to `coverage`; `match` defaults to an empty object; `lenses`, `seed_paths`, `related_paths`, `invariants`, `expected_evidence`, `evidence_requirements` default to empty arrays. `priority`: `critical`, `high`, `normal` (default), or `low`; unknown priorities currently fall back to `normal`. Legacy `source` is accepted but not needed. |
+| `components[]` | Required `id`; `paths`, `responsibilities`, `related_components`, `contracts`, `invariants` default to empty arrays. Use non-overlapping owner paths, or list all matching IDs in `ownership_precedence`; the first listed owner wins. An actual ambiguous match without that ordering is rejected. Relationships orient review; they are not a request to audit entire dependent components. |
+| `ownership_precedence` | Ordered component IDs used only when changed paths overlap. Does not grant access or add work. |
+| `boundaries[]` | Required `id`, `contract_paths`, `participants`, `contract_change_owner`, `objective`; optional `endpoint_paths` maps participant IDs to path globs. All participants and the contract-change owner must be declared components; the owner must be a participant. |
+| `recipes[]` | Required `id`; `title` defaults to the ID; `objective` defaults to a generic correctness review. Set both explicitly. `execution` defaults to `integrated`; `match` defaults to an empty object; `lenses`, `seed_paths`, `related_paths`, `invariants`, `expected_evidence`, `evidence_requirements` default to empty arrays. `priority`: `critical`, `high`, `normal` (default), or `low`; unknown priorities currently fall back to `normal`. Legacy `source` is accepted but not needed. |
 | `coverage_rules[]` | Required `id` and nonempty `required_recipe_ids` referencing existing recipes. Put matching filters directly on the rule, not inside `match`. `risk_tier`: `critical`, `high` (default), `normal`, `low`. `unresolved_policy`: `block_when_unresolved` (default) or `record_unknown`. |
 | `recipes[].evidence_requirements[]` | Required `id` (unique within recipe) and `category`; optional `when`, `seed_paths`, `related_paths`. `mode`: `required` (default), `optional`, or `one_of:<group>` with lowercase alphanumeric/hyphen group name. See examples below. |
 | `sources[]` | Required concrete lowercase DNS `host`. `schemes` must be `["https"]` (default). `include_subdomains` must remain `false` (default; true is currently unsupported). `path_prefixes` default to empty, allowing the whole host: specify narrow absolute URL paths. `classification` defaults to `reference`. Optional `max_age_hours` must be a positive integer. |
@@ -58,11 +155,12 @@ groups must match (AND). An explicit empty array cannot match. An empty recipe
 match. Avoid both when you mean a narrow trigger.
 
 Matching uses aggregate review topology and changed paths: a path filter and a
-role filter need not match the same file. Component IDs refer to configured or
-discovered components. File roles are fixed path heuristics, documented in the
+role filter need not match the same file. Component IDs refer to configured owners or the visible `repository-remainder` fallback. File roles are fixed path heuristics, documented in the
 [file-role reference](file-roles.md); arbitrary role strings are not new roles.
 Risk flags come from [the deterministic classifier](../pr_reviewer/classifier.py);
 check real classification output rather than inventing flag names.
+Integrated guidance is then matched against each owner's changed paths and roles;
+a match elsewhere in the repository does not require every owner to perform it.
 
 Policy path patterns use Python `fnmatchcase`, not gitignore rules:
 case-sensitive, `*` can match slashes, `?` matches one character, and brackets
@@ -79,20 +177,26 @@ and focused tests.
 
 | Execution | Meaning | When to choose |
 | --- | --- | --- |
-| `coverage` | Recipe obligations can be grouped with other compatible review work. | Default for most contracts, state transitions, and tests. |
-| `dedicated` | Preserves a recipe-specific assignment instead of folding it into ordinary combined work. | A genuinely separate investigation benefits from focused context. |
+| `integrated` | Adds objectives, invariants, and evidence guidance to affected owner work. | Default for contracts, state transitions, and tests. |
 | `independent` | Requires independent verification and preserves an independent assignment boundary. | A narrow critical boundary warrants additional independent scrutiny; expect overlap and extra cost. |
 
 These are scheduling constraints, not unlimited budgets or guarantees of
-completion. Many dedicated/independent recipes can consume capacity before
+completion. Many independent recipes can consume capacity before
 ordinary changed-code investigation.
 
-Final obligation accounting is tools-disabled and bounded: at most four targets
-per request and forty per exploration period, subject to the existing turn,
-context, and deadline budgets. It reuses retained evidence without repeating
-scope/seed-path catalogs. A failed checkpoint takes precedence over optional
-accounting; unprocessed targets remain pending/unresolved, never assumed covered.
+One initial assignment owns each affected component's changed paths. A group assessment
+names assessed paths and remaining gaps; a read or a covered status alone does not
+complete the whole inventory. Unassessed paths and unresolved behavior remain
+schedulable. `expected_evidence` is guidance; explicit `evidence_requirements`
+are checked within the question rather than creating one job per category.
 Failed tests do not automatically raise an assignment's scheduling priority.
+
+There is no initial planner model call. Specialists can request one-level subset
+delegation using `request_delegation`. The controller admits only feasible owned
+work while leaving substantive work with the parent; accepted work is queued
+with other leads, not guaranteed immediate execution. Children cannot delegate.
+Unscheduled owners/delegations remain incomplete. The negotiator schedules gaps
+and useful continuations within the existing shared limits, not a fixed round count.
 
 A matching coverage rule can **force** its required recipe even if the recipe's
 own `match` would not select it. Keep their triggers consistent. For example,
@@ -123,8 +227,7 @@ policy = parse_review_policy(json.loads(path.read_text(encoding="utf-8")))
 print(f"Valid v{policy.version}: {len(policy.recipes)} recipes")
 ```
 
-Use `parse_review_policy` rather than assuming a missing file will fail:
-`load_review_policy` intentionally returns a minimal policy for a missing file.
+Both `parse_review_policy` and `load_review_policy` validate v3; the loader rejects a missing policy with quick-start guidance.
 Successful parsing does not prove glob applicability, available evidence, or
 sensible workload.
 
@@ -142,13 +245,13 @@ does not publish.
 
 Copy this with the repository path and action revision you intend to use:
 
-> Inspect this repository and generate or update its version-2 AI review policy.
+> Inspect this repository and generate or update its version-3 AI review policy.
 > Read the pinned review action's policy-authoring guide and file-role reference;
 > do not infer schema fields or role meanings from their names.
 > Preserve existing user changes. Identify actual components, contracts, test
 > locations, generators, and build/deployment boundaries. Use a small number of
-> targeted recipes, coverage mode by default, and conditional evidence.
-> Explain why every mandatory coverage rule and dedicated/independent recipe is
+> targeted integrated recipes and conditional evidence. Model owners by repository responsibilities, not language; declare shared contract boundaries separately.
+> Explain why every mandatory coverage rule and independent recipe is
 > needed. Check that forcing rules do not broaden a recipe unintentionally.
 > Do not require unavailable generated output or assume every test can run.
 > Propose narrow official-source permissions separately; never grant broad
@@ -159,16 +262,15 @@ Copy this with the repository path and action revision you intend to use:
 > workflow/rules changes, rationale, unresolved assumptions, and validation
 > results. Do not commit or push unless requested.
 
-## Complete version-2 policy example
+## Complete version-3 policy example
 
-This JSON uses only fields accepted by the version-2 parser. Every populated
+This JSON uses only fields accepted by the version-3 parser. Every populated
 recipe `match` group must match; values within a group are alternatives. The
-three recipes show the supported execution modes: `coverage`, `dedicated`, and
-`independent`.
+recipes show ordinary `integrated` guidance and explicit `independent` verification.
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "components": [
     {
       "id": "api",
@@ -192,7 +294,7 @@ three recipes show the supported execution modes: `coverage`, `dedicated`, and
       "id": "api-coverage",
       "title": "API compatibility coverage",
       "objective": "Trace schema, authorization, and consumer compatibility.",
-      "execution": "coverage",
+      "execution": "integrated",
       "match": {"component_ids_any": ["api"]},
       "lenses": ["authorization", "backward-compatibility"],
       "seed_paths": ["services/api/**"],
@@ -205,7 +307,7 @@ three recipes show the supported execution modes: `coverage`, `dedicated`, and
       "id": "generated-client",
       "title": "Generated client integrity",
       "objective": "Verify the generator inputs and committed generated output agree.",
-      "execution": "dedicated",
+      "execution": "integrated",
       "match": {"paths_any": ["openapi/**", "clients/generated/**"]},
       "lenses": ["generated-artifact"],
       "seed_paths": ["openapi/openapi.yaml"],
@@ -322,7 +424,7 @@ listed category. For broad components or risk rules, prefer
   "id": "runtime-delivery",
   "title": "Runtime delivery",
   "objective": "Trace changed build and delivery behavior.",
-  "execution": "dedicated",
+  "execution": "integrated",
   "match": {"component_ids_any": ["review-infrastructure"]},
   "evidence_requirements": [
     {

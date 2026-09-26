@@ -13,16 +13,17 @@ from enum import Enum
 import hashlib
 import inspect
 import json
+import fnmatch
 from math import isfinite
 import os
 from pathlib import Path
 import re
 import secrets
 import tempfile
-from threading import Event
+from threading import Event, RLock
 import time
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
 from pr_reviewer.conversation import Conversation
@@ -45,11 +46,13 @@ from .adjudication import (
 from .assignments import (
     Assignment,
     AssignmentPlan,
-    apply_planner_transformations,
+    ObligationBrief,
+    component_assignment_plan,
     fallback_assignment_plan,
     validate_assignment_plan,
 )
-from .budget import BudgetLedger, RunDeadline, SessionLease
+from .budget import BudgetExhausted, BudgetLedger, RunDeadline, SessionLease
+from .boundary_evaluation import build_boundary_context, validate_boundary_evaluation, BoundaryEvaluation
 from .callbacks import (
     CALLBACK_POOL,
     CallbackTimedOut,
@@ -64,6 +67,13 @@ from .coverage import (
     derive_obligations,
     reconcile_wave,
     session_ownership_for_assignment,
+    _assessment_evidence_satisfies,
+    _associated_collections_satisfying,
+)
+from .delegation import (
+    DelegationLimits,
+    prepare_delegation_transfer,
+    validate_delegation,
 )
 from .evidence import EvidenceSnapshot, EvidenceStore
 from .events import EventJournal, RunEvent
@@ -76,6 +86,11 @@ from .negotiation import (
     fallback_next_action,
     validate_compact_negotiation,
     validate_negotiation,
+)
+from .obligation_assessment import (
+    ObligationAssessment,
+    ObligationAssessmentLedger,
+    ObligationDisposition,
 )
 from .model_gateway import ModelGateway, ModelTurnRequest
 from .policy import ReviewPolicy, RuntimeConfig
@@ -100,6 +115,7 @@ from .web_evidence import (
     RepositoryAccessRequest,
     SourceAccessRequest,
     access_request_identity,
+    search_warning_summary,
 )
 from pr_reviewer.transport import is_model_endpoint_unavailable
 
@@ -459,6 +475,8 @@ class RoleRequest:
     max_tokens: int
     context: Mapping[str, object]
     planner_request_budget: PlannerRequestBudget | None = None
+    attempt_admission: Callable[[], None] | None = None
+    max_attempts: int = 2
 
     def __post_init__(self) -> None:
         if not self.role.strip() or not self.request_id.strip():
@@ -645,7 +663,7 @@ def _handoff_summary_proposal(value: object) -> HandoffSummaryProposal:
         if not item:
             return ""
         if len(item) > 600:
-            raise ValueError("handoff summarizer what_changed_summary is invalid")
+            raise ValueError(f"handoff summarizer what_changed_summary exceeds 600 characters ({len(item)})")
         sentence_ends = list(re.finditer(r"[.!?](?:\s|$)", item))
         if len(sentence_ends) > 3:
             item = item[:sentence_ends[2].end()].strip()
@@ -1046,7 +1064,7 @@ class GatewayRoleAdapter:
     max_context_tokens: int | None = None
 
     def complete(self, request: RoleRequest) -> object:
-        return self._complete_recoverable_structured_role(request)
+        return self._complete_recoverable_structured_role(request, max_attempts=request.max_attempts)
 
     def _complete_recoverable_structured_role(
         self,
@@ -1135,6 +1153,8 @@ class GatewayRoleAdapter:
                         f"{request.role} rendered context exceeds token limit "
                         f"({admission}>{self.max_context_tokens}); request not sent"
                     )
+            if request.attempt_admission is not None:
+                request.attempt_admission()
             result = self.gateway.complete(turn_request)
             content = result.content
             if not content and result.text_source == "content":
@@ -1832,6 +1852,8 @@ class _RunState:
     assignment_sessions: dict[str, str] = field(default_factory=dict)
     session_generations: dict[str, int] = field(default_factory=dict)
     session_results: dict[tuple[str, str], object] = field(default_factory=dict)
+    session_result_revisions: dict[tuple[str, str], int] = field(default_factory=dict)
+    session_result_sequence: int = 0
     failed_session_budgets: dict[str, BudgetUsage] = field(default_factory=dict)
     quarantined_session_ids: set[str] = field(default_factory=set)
     preserved_session_ids: set[str] = field(default_factory=set)
@@ -1847,6 +1869,12 @@ class _RunState:
         SourceAccessRequest | RepositoryAccessRequest
     ] = field(default_factory=list)
     investigation_leads: dict[str, InvestigationLead] = field(default_factory=dict)
+    boundary_evaluations: dict[str, object] = field(default_factory=dict)
+    boundary_model_turns: int = 0
+    admission_lock: object = field(default_factory=RLock)
+    delegation_request_fingerprints: set[str] = field(default_factory=set)
+    admitted_specialist_model_turns: int = 0
+    admitted_specialist_tool_calls: int = 0
     retention_verification_requests: tuple[Mapping[str, object], ...] = ()
     coverage_verification_requests: tuple[Mapping[str, object], ...] = ()
     unknowns: list[dict[str, object]] = field(default_factory=list)
@@ -1949,6 +1977,28 @@ class _IsolatedSessionHandle:
         if not callable(callback):
             raise TypeError("resumed session must support apply_coverage_feedback")
         callback(tuple(gaps))
+
+    def apply_investigation_lead_feedback(
+        self, target: str, lead: InvestigationLead,
+        prior_work: Mapping[str, object] | None = None,
+        evidence: EvidenceSnapshot | None = None,
+    ) -> None:
+        callback = getattr(
+            self.session, "apply_investigation_lead_feedback", None,
+        )
+        if not callable(callback):
+            raise TypeError(
+                "resumed session must support apply_investigation_lead_feedback"
+            )
+        if evidence is not None:
+            self.evidence.merge_completed_snapshot(evidence)
+            for record in evidence.records:
+                self.evidence.import_into_session(self.session_id, record.id)
+            self.baseline_evidence_ids |= frozenset(evidence.evidence_ids)
+        if prior_work is None:
+            callback(target, lead)
+        else:
+            callback(target, lead, prior_work)
 
     def recover(self, reason: str) -> object:
         callback = getattr(self.session, "recover", None)
@@ -2394,6 +2444,7 @@ class ReviewController:
         planner_gateway: object | None = None,
         session_factory: Callable[..., object] | None = None,
         negotiator: object | None = None,
+        boundary_evaluator: object | None = None,
         critic: object | None = None,
         repairer: object | None = None,
         remediator: object | None = None,
@@ -2405,6 +2456,7 @@ class ReviewController:
         event_sink: Callable[[RunEvent], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         artifact_writer: Callable[[Path, Mapping[str, object]], object] = _atomic_write_json,
+        performance_snapshot: Callable[[], Sequence[Mapping[str, int | float | None]]] | None = None,
         obligation_deriver: Callable[..., tuple[CoverageObligation, ...]] = derive_obligations,
         assignment_validator: Callable[..., AssignmentPlan] = validate_assignment_plan,
         scheduler_type: type[SessionScheduler] = SessionScheduler,
@@ -2423,6 +2475,7 @@ class ReviewController:
         )
         self.session_factory = session_factory
         self.negotiator = negotiator
+        self.boundary_evaluator = boundary_evaluator
         self.critic = critic
         # Kept as a source-compatible constructor argument. Candidate proof
         # repair now happens at report/checkpoint admission, while the critic
@@ -2459,6 +2512,7 @@ class ReviewController:
         self.event_sink = event_sink
         self.clock = clock
         self.artifact_writer = artifact_writer
+        self.performance_snapshot = performance_snapshot
         self._uses_atomic_writer = artifact_writer is _atomic_write_json
         self.obligation_deriver = obligation_deriver
         self.assignment_validator = assignment_validator
@@ -2721,7 +2775,9 @@ class ReviewController:
                         "session_id": session_id, "reason": _bounded_error(exc),
                     })
                 else:
-                    state.session_results[(handle.assignment.id, session_id)] = result
+                    self._retain_session_result(
+                        state, handle.assignment.id, session_id, result,
+                    )
                     state.ownership[session_id] = self._ownership(handle.assignment, session_id, state)
                     self._admit_investigation_lead_state(state, result)
                     state.source_requests.extend(requests)
@@ -2902,6 +2958,8 @@ class ReviewController:
         method: str,
         context: Mapping[str, object],
         planner_request_budget: PlannerRequestBudget | None = None,
+        attempt_admission: Callable[[], None] | None = None,
+        max_attempts: int = 2,
     ) -> object:
         state.journal.emit("model_request_started", {
             "request_id": request_id,
@@ -2929,7 +2987,11 @@ class ReviewController:
                 max_tokens=state.inputs.config.session_limits.output_tokens or 4096,
                 context=frozen_context,
                 planner_request_budget=planner_request_budget,
+                attempt_admission=attempt_admission,
+                max_attempts=max_attempts,
             )
+            if attempt_admission is not None and not isinstance(component, GatewayRoleAdapter):
+                attempt_admission()
             value = CALLBACK_POOL.run(
                 lambda: self._call_role_component(component, method, request),
                 timeout_sec=timeout,
@@ -2977,58 +3039,10 @@ class ReviewController:
 
     def _plan(self, state: _RunState) -> AssignmentPlan:
         inputs = state.inputs
-        base_plan = fallback_assignment_plan(
+        state.plan_source = "component_owned"
+        return component_assignment_plan(
             state.obligations, inputs.topology, inputs.config,
         )
-        state.plan_source = "deterministic_base"
-        if self.planner is None or self.clock() >= state.deadline.cutoff_for(RunPhase.PLANNING):
-            return base_plan
-        request_budget = PlannerRequestBudget()
-        try:
-            raw = self._model_request(
-                state,
-                role="planner",
-                request_id="planner:1",
-                phase=RunPhase.PLANNING,
-                component=self.planner,
-                method="plan",
-                planner_request_budget=request_budget,
-                context={
-                    "base_plan": base_plan,
-                    "obligations": state.obligations,
-                    "topology": inputs.topology,
-                    "config": inputs.config,
-                    "pr_metadata": inputs.pr_metadata,
-                    "policy": inputs.policy,
-                    "change_overview": change_overview_orientation(
-                        state.change_overview,
-                    ),
-                },
-            )
-            result = apply_planner_transformations(
-                raw if isinstance(raw, Mapping) else {},
-                base_plan,
-                state.obligations,
-                inputs.config,
-                topology=inputs.topology,
-            )
-            state.planner_diagnostics.extend(result.ignored)
-            if result.plan != base_plan:
-                state.plan_source = "deterministic_base_transformed"
-            for diagnostic in result.ignored:
-                state.journal.emit("planner_transformation_ignored", {
-                    "reason": diagnostic,
-                })
-            return result.plan
-        except Exception as exc:
-            if is_model_endpoint_unavailable(exc):
-                raise
-            diagnostic = _bounded_error(exc)
-            state.planner_diagnostics.append(diagnostic)
-            state.journal.emit("planner_transformation_ignored", {
-                "reason": diagnostic,
-            })
-            return base_plan
 
     def _summarize_changes(self, state: _RunState) -> Mapping[str, object]:
         fallback = _deterministic_change_overview(state.inputs)
@@ -3144,6 +3158,205 @@ class ReviewController:
         })[:20]
         return f"session:{identity}:g{generation}"
 
+    @staticmethod
+    def _retain_session_result(
+        state: _RunState, assignment_id: str, session_id: str, result: object,
+    ) -> None:
+        key = (assignment_id, session_id)
+        state.session_result_sequence += 1
+        state.session_results[key] = result
+        state.session_result_revisions[key] = state.session_result_sequence
+
+    def _admit_global_specialist_budget(
+        self, state: _RunState, kind: str, count: int,
+    ) -> None:
+        if kind not in {"model_turn", "tool_calls"}:
+            raise ValueError("unknown global specialist budget kind")
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            raise ValueError("global specialist budget admission must be positive")
+        with state.admission_lock:
+            remaining_turns, remaining_tools = self._remaining_global_budget(state)
+            if kind == "model_turn":
+                if count > remaining_turns:
+                    raise BudgetExhausted("global model-turn budget exhausted")
+                state.admitted_specialist_model_turns += count
+            else:
+                if count > remaining_tools:
+                    raise BudgetExhausted("global tool-call budget exhausted")
+                state.admitted_specialist_tool_calls += count
+
+    def _admit_delegation_request(
+        self,
+        state: _RunState,
+        parent_assignment_id: str,
+        origin_session_id: str,
+        raw: object,
+    ) -> Mapping[str, object]:
+        with state.admission_lock:
+            parent = state.assignments.get(parent_assignment_id)
+            def rejected(reason: str) -> Mapping[str, object]:
+                bounded = _mask_runtime_text(reason)[:500]
+                state.journal.emit("delegation_rejected", {
+                    "parent_assignment_id": parent_assignment_id,
+                    "origin_session_id": origin_session_id,
+                    "reason": bounded,
+                })
+                return {
+                    "status": "rejected", "request_id": "",
+                    "child_assignment_id": None, "reason": bounded,
+                    **(
+                        {"parent_assignment": parent}
+                        if parent is not None else {}
+                    ),
+                }
+
+            if parent is None:
+                return rejected("delegation parent assignment is unavailable")
+            handle = state.sessions.get(origin_session_id)
+            if origin_session_id in state.quarantined_session_ids:
+                return rejected("delegation origin session is quarantined")
+            if not state.deadline.exploration_allowed(now=self.clock()):
+                return rejected("delegation exploration deadline has passed")
+            if (
+                isinstance(handle, _IsolatedSessionHandle)
+                and not handle.lease.active(now=self.clock())
+            ):
+                return rejected("delegation origin session lease has expired")
+            transferred_paths = {
+                path for lead in state.investigation_leads.values()
+                if lead.kind == "delegation"
+                and lead.parent_assignment_id == parent_assignment_id
+                for path in lead.delegated_paths
+            }
+            transferred_obligations = {
+                obligation_id for lead in state.investigation_leads.values()
+                if lead.kind == "delegation"
+                and lead.parent_assignment_id == parent_assignment_id
+                and not lead.delegated_paths
+                for obligation_id in lead.delegated_obligation_ids
+            }
+            store = state.evidence
+            if isinstance(handle, _IsolatedSessionHandle):
+                store = handle.evidence
+            accepted_evidence_ids = frozenset(
+                item.id for item in store.snapshot().records
+                if item.is_usable_for_coverage
+            )
+            declared_paths = {
+                *parent.seed_paths,
+                *parent.boundary_paths,
+                *parent.owned_changed_paths,
+                *(path for brief in parent.obligation_briefs for path in brief.scope),
+            }
+            tracked_paths = tuple(dict.fromkeys((
+                *state.inputs.tracked_paths,
+                *state.inputs.changed_files,
+            )))
+            authorized_paths = frozenset({
+                *declared_paths,
+                *(
+                    path for path in tracked_paths
+                    if any(
+                        fnmatch.fnmatchcase(path, pattern)
+                        for pattern in declared_paths
+                    )
+                ),
+            })
+            assessed_paths: set[str] = set()
+            ledger = getattr(
+                getattr(handle, "session", None),
+                "obligation_assessments", None,
+            )
+            assessments = getattr(ledger, "assessments", None)
+            if callable(assessments):
+                assessed_paths.update(
+                    path for item in assessments()
+                    if isinstance(item, ObligationAssessment)
+                    for path in item.assessed_paths
+                )
+            else:
+                retained = state.session_results.get(
+                    (parent_assignment_id, origin_session_id),
+                )
+                assessed_paths.update(
+                    path for item in getattr(
+                        getattr(retained, "checkpoint", None),
+                        "obligation_assessments", (),
+                    )
+                    if isinstance(item, ObligationAssessment)
+                    for path in item.assessed_paths
+                )
+            remaining_paths = tuple(
+                path for path in parent.owned_changed_paths
+                if path not in assessed_paths
+            )
+            lifetime_cap = (
+                state.inputs.config.max_sessions
+                + state.inputs.config.max_followup_sessions
+            )
+            remaining_capacity = max(0, lifetime_cap - len(state.assignments))
+            remaining_turns, remaining_tools = self._remaining_global_budget(state)
+            limits = DelegationLimits(
+                remaining_session_capacity=(
+                    remaining_capacity
+                    if remaining_turns > 0 and remaining_tools > 0 else 0
+                ),
+                accepted_evidence_ids=accepted_evidence_ids,
+                authorized_reference_paths=authorized_paths,
+                existing_request_fingerprints=frozenset(
+                    state.delegation_request_fingerprints
+                ),
+                transferred_paths=frozenset(transferred_paths),
+                transferred_obligation_ids=frozenset(transferred_obligations),
+            )
+            proposal = validate_delegation(
+                raw,
+                parent,
+                (*parent.owned_changed_paths, *transferred_paths),
+                remaining_paths,
+                limits,
+            )
+            if proposal.status != "accepted":
+                return rejected(proposal.reason)
+            sequence = 1 + sum(
+                lead.kind == "delegation"
+                and lead.parent_assignment_id == parent_assignment_id
+                for lead in state.investigation_leads.values()
+            )
+            request_id = f"delegation:{parent_assignment_id}:{sequence}"
+            child_assignment_id = f"{parent_assignment_id}-delegation-{sequence}"
+            transfer = prepare_delegation_transfer(
+                proposal,
+                parent,
+                request_id=request_id,
+                child_assignment_id=child_assignment_id,
+                origin_session_id=origin_session_id,
+            )
+            state.assignments[parent_assignment_id] = transfer.parent_assignment
+            state.assignments[child_assignment_id] = transfer.child_assignment
+            state.investigation_leads[request_id] = transfer.lead
+            state.delegation_request_fingerprints.add(
+                proposal.request_fingerprint
+            )
+            if isinstance(handle, _IsolatedSessionHandle):
+                handle.assignment = transfer.parent_assignment
+            state.journal.emit("delegation_admitted", {
+                "request_id": request_id,
+                "parent_assignment_id": parent_assignment_id,
+                "child_assignment_id": child_assignment_id,
+                "delegated_paths": transfer.lead.delegated_paths,
+                "delegated_obligation_ids": (
+                    transfer.lead.delegated_obligation_ids
+                ),
+            })
+            return {
+                "status": transfer.decision.status,
+                "request_id": request_id,
+                "child_assignment_id": child_assignment_id,
+                "reason": transfer.decision.reason,
+                "parent_assignment": transfer.parent_assignment,
+            }
+
     def _create_isolated_session(
         self,
         state: _RunState,
@@ -3161,7 +3374,34 @@ class ReviewController:
             return existing
         if self.session_factory is None:
             raise RuntimeError("no specialist session factory configured")
-        local_evidence = EvidenceStore.from_snapshot(snapshot.evidence)
+        evidence_snapshot = snapshot.evidence
+        if assignment.parent_assignment_id:
+            selected_ids = {
+                evidence_id
+                for lead in assignment.investigation_leads
+                if lead.kind == "delegation"
+                for evidence_id in lead.evidence_ids
+            }
+            collection_ids = {
+                item.id for item in evidence_snapshot.collections
+                if item.evidence_id in selected_ids
+            }
+            evidence_snapshot = EvidenceSnapshot(
+                tuple(
+                    item for item in evidence_snapshot.records
+                    if item.id in selected_ids
+                ),
+                tuple(
+                    item for item in evidence_snapshot.collections
+                    if item.id in collection_ids
+                ),
+                tuple(
+                    item for item in evidence_snapshot.associations
+                    if item.collection_id in collection_ids
+                ),
+                max_content_bytes=evidence_snapshot.max_content_bytes,
+            )
+        local_evidence = EvidenceStore.from_snapshot(evidence_snapshot)
         local_coverage = CoverageLedger(state.obligations)
         local_coverage.replace_reconciled_state(
             dict(snapshot.coverage.evidence_by_obligation),
@@ -3199,7 +3439,7 @@ class ReviewController:
             evidence=local_evidence,
             coverage=local_coverage,
             lease=lease,
-            baseline_evidence_ids=frozenset(snapshot.evidence.evidence_ids),
+            baseline_evidence_ids=frozenset(evidence_snapshot.evidence_ids),
         )
         # Register immediately so a worker that is interrupted at the phase
         # cutoff still has a durable handle for finalization recovery.
@@ -3208,6 +3448,35 @@ class ReviewController:
             session._accepted_work_observer = handle.retain_accepted_work
         state.sessions[session_id] = handle
         state.assignment_sessions[assignment.id] = session_id
+        if lease.phase is RunPhase.FOLLOWUP and callable(getattr(
+            session, "apply_investigation_lead_feedback", None,
+        )):
+            for index, lead in enumerate(assignment.investigation_leads, start=1):
+                if lead.kind == "delegation":
+                    continue
+                prior_work, sources = self._followup_prior_work(state, assignment, lead)
+                handle.apply_investigation_lead_feedback(
+                    f"L{index}", lead, prior_work, sources,
+                )
+        budget_binder = getattr(
+            session, "bind_global_budget_admission_handler", None,
+        )
+        if callable(budget_binder):
+            budget_binder(lambda kind, count: self._admit_global_specialist_budget(
+                state, kind, count,
+            ))
+        delegation_binder = getattr(
+            session, "bind_delegation_request_handler", None,
+        )
+        if (
+            callable(delegation_binder)
+            and assignment.owner_component_id
+            and assignment.parent_assignment_id is None
+            and assignment.delegation_depth == 0
+        ):
+            delegation_binder(lambda raw: self._admit_delegation_request(
+                state, assignment.id, session_id, raw,
+            ))
         return handle
 
     def _run_wave(
@@ -3267,7 +3536,10 @@ class ReviewController:
             state.evidence.merge_completed_snapshot(item.session.evidence.snapshot())
             state.sessions[expected_session_id] = item.session
             state.assignment_sessions[item.assignment_id] = expected_session_id
-            state.session_results[(item.assignment_id, expected_session_id)] = item.session_result
+            self._retain_session_result(
+                state, item.assignment_id, expected_session_id,
+                item.session_result,
+            )
             self._admit_investigation_lead_state(state, item.session_result)
             self._admit_specialist_request_events(state, item.session_result)
             state.ownership[item.session_result.session_id] = self._ownership(
@@ -3391,6 +3663,7 @@ class ReviewController:
                 assigned_session_id=session_result.session_id,
                 resolution_reason=resolution.reason,
                 candidate_ids=resolution.candidate_ids,
+                evidence_ids=tuple(dict.fromkeys((*lead.evidence_ids, *resolution.evidence_ids))),
             )
             state.journal.emit("investigation_lead_resolved", {
                 "lead_id": resolution.lead_id,
@@ -3407,9 +3680,16 @@ class ReviewController:
         wave_snapshot: WaveSnapshot,
     ) -> CoverageReconciliation:
         assert state.coverage is not None
-        checkpoints = tuple(item.session_result.checkpoint for item in result.results) + tuple(
-            res.checkpoint for (_, session_id), res in state.session_results.items()
-            if session_id in state.preserved_session_ids
+        checkpoints = tuple(
+            result.checkpoint
+            for key, result in sorted(
+                state.session_results.items(),
+                key=lambda item: (
+                    state.session_result_revisions.get(item[0], 0), item[0],
+                ),
+            )
+            if key[1] not in state.quarantined_session_ids
+            or key[1] in state.preserved_session_ids
         )
         try:
             reconciled = reconcile_wave(
@@ -3452,6 +3732,269 @@ class ReviewController:
             })
         return reconciled
 
+    @staticmethod
+    def _remaining_global_budget(state: _RunState) -> tuple[int, int]:
+        usage = dict(state.failed_session_budgets)
+        for result in state.session_results.values():
+            session_id = getattr(result, "session_id", "")
+            current = getattr(result, "budget", BudgetUsage())
+            previous = usage.get(session_id, BudgetUsage())
+            usage[session_id] = BudgetUsage(
+                model_turns=max(previous.model_turns, current.model_turns),
+                tool_calls=max(previous.tool_calls, current.tool_calls),
+                recoveries=max(previous.recoveries, current.recoveries),
+            )
+        recorded_turns = sum(item.model_turns for item in usage.values())
+        recorded_tools = sum(item.tool_calls for item in usage.values())
+        return (
+            max(
+                0,
+                state.inputs.config.max_total_model_turns
+                - state.boundary_model_turns
+                - max(state.admitted_specialist_model_turns, recorded_turns),
+            ),
+            max(
+                0,
+                state.inputs.config.max_total_tool_calls
+                - max(state.admitted_specialist_tool_calls, recorded_tools),
+            ),
+        )
+
+    @staticmethod
+    def _accepted_checkpoint_assessments(
+        state: _RunState,
+    ) -> tuple[tuple[int, str, ObligationAssessment], ...]:
+        evidence = state.evidence.snapshot()
+        obligations = {item.id: item for item in state.obligations}
+        accepted: list[tuple[int, str, ObligationAssessment]] = []
+        split_parents = {
+            item.parent_assignment_id for item in state.assignments.values()
+            if item.parent_assignment_id
+        }
+        ordered_results = sorted(
+            state.session_results.items(),
+            key=lambda item: (
+                state.session_result_revisions.get(item[0], 0), item[0],
+            ),
+        )
+        for (assignment_id, session_id), result in ordered_results:
+            if (
+                session_id in state.quarantined_session_ids
+                and session_id not in state.preserved_session_ids
+            ):
+                continue
+            for assessment in getattr(
+                getattr(result, "checkpoint", None),
+                "obligation_assessments", (),
+                ):
+                if not isinstance(assessment, ObligationAssessment):
+                    continue
+                obligation = obligations.get(assessment.obligation_id)
+                if obligation is None or obligation.evaluator_owned:
+                    continue
+                assignment = state.assignments.get(assignment_id)
+                if (
+                    assignment is not None
+                    and obligation.origin == "component"
+                    and (
+                        assignment.parent_assignment_id
+                        or assignment.id in split_parents
+                    )
+                ):
+                    owned_paths = set(assignment.owned_changed_paths)
+                    obligation = replace(
+                        obligation,
+                        scope=tuple(
+                            path for path in obligation.scope
+                            if path in owned_paths
+                        ),
+                        evidence_requirements=(),
+                    )
+                    assessment = replace(
+                        assessment,
+                        omitted_paths=tuple(
+                            path for path in assessment.omitted_paths
+                            if path in owned_paths
+                        ),
+                    )
+                validator = ObligationAssessmentLedger(
+                    session_id=session_id,
+                    expected_head_sha=state.inputs.head_sha,
+                    obligations=(obligation,),
+                    obligation_ids=(obligation.id,),
+                )
+                proposal = validator.propose(
+                    target="O1",
+                    disposition=assessment.disposition.value,
+                    reason=assessment.reason,
+                    evidence_ids=assessment.evidence_ids,
+                    next_actions=assessment.next_actions,
+                    assessed_paths=assessment.assessed_paths,
+                    omitted_paths=assessment.omitted_paths,
+                    evidence=evidence,
+                    eligible=lambda record, item, sid=session_id: bool(
+                        _associated_collections_satisfying(
+                            evidence, record, item, session_id=sid,
+                        )
+                    ) or _assessment_evidence_satisfies(record, item),
+                )
+                if not proposal.accepted:
+                    continue
+                validated = validator.assessment("O1")
+                accepted.append((
+                    state.session_result_revisions.get(
+                        (assignment_id, session_id), 0,
+                    ),
+                    assignment_id,
+                    replace(
+                        validated,
+                        assessment_version=assessment.assessment_version,
+                    ),
+                ))
+        return tuple(accepted)
+
+    @classmethod
+    def _accepted_boundary_assessments(
+        cls, state: _RunState,
+    ) -> dict[str, ObligationAssessment]:
+        participant_ids = {
+            item.id for item in state.obligations if item.participant_id
+        }
+        accepted: dict[str, ObligationAssessment] = {}
+        for _sequence, _assignment_id, assessment in (
+            cls._accepted_checkpoint_assessments(state)
+        ):
+            if assessment.obligation_id in participant_ids:
+                accepted[assessment.obligation_id] = assessment
+        return accepted
+
+    def _evaluate_boundaries(
+        self, state: _RunState, *, phase: RunPhase = RunPhase.FOLLOWUP,
+    ) -> None:
+        """Compare settled participant evidence; queue gaps without launching work."""
+        if state.coverage is None:
+            return
+        latest = self._accepted_boundary_assessments(state)
+        for boundary in state.inputs.policy.boundaries:
+            combined = next((item for item in state.obligations if item.boundary_id == boundary.id and item.evaluator_owned), None)
+            if combined is None:
+                continue
+            locals_by_id = {item.id: item.participant_id for item in state.obligations if item.boundary_id == boundary.id and item.participant_id}
+            assessments = tuple(
+                latest[key] for key in locals_by_id
+                if key in latest
+            )
+            context = build_boundary_context(
+                boundary, assessments, state.evidence.snapshot(),
+                max_bytes=getattr(self.boundary_evaluator, "max_context_bytes", None) or 60_000,
+                obligations=locals_by_id, expected_head_sha=state.inputs.head_sha,
+            )
+            previous = state.boundary_evaluations.get(boundary.id)
+            if previous is not None and previous.input_fingerprint == context["input_fingerprint"]:
+                continue
+            state.coverage.record_boundary_result(combined.id, (), supported=False)
+            outcome = None
+            error = ""
+            if context["incomplete"]:
+                error = "; ".join(context["diagnostics"])
+            elif self.boundary_evaluator is None:
+                error = "boundary evaluator is unavailable"
+            elif (
+                phase is RunPhase.FOLLOWUP
+                and not state.deadline.exploration_allowed(now=self.clock())
+            ) or (
+                phase is RunPhase.FINALIZATION
+                and state.deadline.remaining(now=self.clock()) <= 0
+            ):
+                error = f"{phase.value} deadline reached before boundary evaluation"
+            else:
+                attempts_left = 1 + state.inputs.config.session_limits.recoveries
+
+                def admit_attempt() -> None:
+                    nonlocal attempts_left
+                    with state.admission_lock:
+                        if attempts_left <= 0 or self._remaining_global_budget(state)[0] <= 0:
+                            raise ValueError("boundary evaluator model-call budget exhausted")
+                        attempts_left -= 1
+                        state.boundary_model_turns += 1
+
+                request_context = context
+                while attempts_left > 0:
+                    previous_attempts_left = attempts_left
+                    try:
+                        raw = self._model_request(
+                            state, role="boundary_evaluator", request_id=f"boundary:{boundary.id}:{state.boundary_model_turns + 1}",
+                            phase=phase, component=self.boundary_evaluator, method="evaluate",
+                            context=request_context, attempt_admission=admit_attempt, max_attempts=attempts_left,
+                        )
+                        outcome = validate_boundary_evaluation(raw, context)
+                        break
+                    except Exception as exc:
+                        if is_model_endpoint_unavailable(exc):
+                            raise
+                        error = _bounded_error(exc)
+                        if attempts_left == previous_attempts_left:
+                            attempts_left -= 1  # A pre-send rejection still consumes this recovery opportunity.
+                        state.journal.emit("boundary_evaluation_rejected", {"boundary_id": boundary.id, "reason": error, "attempts_remaining": attempts_left})
+                        phase_open = (
+                            state.deadline.exploration_allowed(now=self.clock())
+                            if phase is RunPhase.FOLLOWUP else
+                            state.deadline.remaining(now=self.clock()) > 0
+                        )
+                        if not phase_open or self._remaining_global_budget(state)[0] <= 0:
+                            break
+                        request_context = {**context, "repair": {"reason": error, "instruction": "Correct only the boundary evaluation JSON using supplied source evidence."}}
+            if outcome is None:
+                outcome = BoundaryEvaluation(
+                    boundary.id, context["input_fingerprint"], "insufficient_evidence",
+                    error or "boundary comparison did not complete", (),
+                    missing_fact=error or "compatible participant behavior is not established",
+                    suggested_investigation=context.get("suggested_investigation") or f"Investigate {error or boundary.objective}.",
+                )
+            state.boundary_evaluations[boundary.id] = outcome
+            supported = outcome.outcome == "supported"
+            state.coverage.record_boundary_result(combined.id, outcome.evidence_ids, supported=supported)
+            lead_id = f"boundary:{boundary.id}"
+            old_lead = state.investigation_leads.get(lead_id)
+            if supported:
+                if old_lead is not None:
+                    state.investigation_leads[lead_id] = replace(old_lead, status=InvestigationLeadStatus.RESOLVED_NO_ISSUE, resolution_reason=outcome.reason)
+            else:
+                state.investigation_leads[lead_id] = InvestigationLead(
+                    lead_id=lead_id,
+                    summary=(
+                        "Boundary compatibility could not be established for "
+                        f"{boundary.objective}; complete the remaining boundary assessment."
+                    ),
+                    affected_paths=combined.scope or boundary.contract_paths,
+                    evidence_ids=tuple(dict.fromkeys((
+                        *(old_lead.evidence_ids if old_lead else ()),
+                        *outcome.evidence_ids,
+                    ))),
+                    next_action=outcome.suggested_investigation or f"Investigate {outcome.missing_fact}",
+                    required_capability="repository", origin_session_id="boundary-evaluator",
+                    attempt_count=old_lead.attempt_count if old_lead else 0,
+                    last_evidence_delta=old_lead.last_evidence_delta if old_lead else 0,
+                    last_outcome=old_lead.last_outcome if old_lead else "",
+                )
+            state.journal.emit("boundary_evaluation", {"boundary_id": boundary.id, "outcome": outcome.outcome, "reason": outcome.reason, "input_fingerprint": outcome.input_fingerprint})
+
+    def _refresh_boundary_coverage(
+        self, state: _RunState, reconciliation: CoverageReconciliation,
+        *, phase: RunPhase = RunPhase.FOLLOWUP,
+    ) -> CoverageReconciliation:
+        self._evaluate_boundaries(state, phase=phase)
+        assert state.coverage is not None
+        snapshot = state.coverage.snapshot()
+        statuses = dict(snapshot.obligation_statuses)
+        uncovered = tuple(item.id for item in state.obligations if item.mandatory and statuses.get(item.id) in {
+            ObligationStatus.PENDING, ObligationStatus.UNRESOLVED, ObligationStatus.PARTIALLY_COVERED,
+        })
+        attempted = tuple(key for key in uncovered if statuses[key] is not ObligationStatus.PENDING)
+        return replace(reconciliation, snapshot=snapshot, uncovered_obligation_ids=uncovered,
+                       attempted_unresolved_obligation_ids=attempted,
+                       never_covered_obligation_ids=tuple(key for key in uncovered if key not in attempted))
+
     def _negotiation_state(
         self,
         state: _RunState,
@@ -3464,6 +4007,14 @@ class ReviewController:
             session = state.sessions.get(session_id)
             result = state.session_results.get((ownership.assignment_id, session_id))
             if session is None or result is None:
+                continue
+            if getattr(session.session, "continuation_blocked", False):
+                # Keep its checkpoint/evidence in negotiation, but do not offer
+                # a lease that can only repeat a failed compaction checkpoint.
+                state.journal.emit("session_continuation_blocked", {
+                    "session_id": session_id,
+                    "reason": "compaction checkpoint was not usable for continuation",
+                })
                 continue
             ledger = getattr(session, "budget", None)
             if isinstance(ledger, BudgetLedger):
@@ -3482,6 +4033,7 @@ class ReviewController:
                 remaining_tool_calls=remaining_tools,
                 lease_remaining_sec=session.lease.remaining(now=self.clock()),
                 retained_evidence_count=len(session.evidence.snapshot().records),
+                allowed_diff_paths=tuple(getattr(session.session, "changed_files", ())),
                 advertised_tools=tuple(sorted(
                     str(item.get("name") or "").strip()
                     for item in getattr(
@@ -3492,7 +4044,22 @@ class ReviewController:
                 )),
             ))
         checkpoints = tuple(
-            state.session_results[key].checkpoint for key in sorted(state.session_results)
+            result.checkpoint
+            for key, result in sorted(
+                state.session_results.items(),
+                key=lambda item: (
+                    state.session_result_revisions.get(item[0], 0), item[0],
+                ),
+            )
+            if key[1] not in state.quarantined_session_ids
+            or key[1] in state.preserved_session_ids
+        )
+        reserved_delegation_count = sum(
+            lead.kind == "delegation"
+            and bool(lead.child_assignment_id)
+            and lead.child_assignment_id in state.assignments
+            and state.assignments[lead.child_assignment_id].model_turn_limit == 0
+            for lead in state.investigation_leads.values()
         )
         return NegotiationState(
             obligations=state.obligations,
@@ -3514,8 +4081,13 @@ class ReviewController:
             max_followup_sessions=state.inputs.config.max_followup_sessions,
             new_session_turns_remaining=max(
                 0,
-                (state.inputs.config.max_followup_sessions - followup_started)
-                * state.inputs.config.session_limits.model_turns,
+                min(self._remaining_global_budget(state)[0],
+                    (
+                        state.inputs.config.max_followup_sessions
+                        - followup_started
+                        + reserved_delegation_count
+                    )
+                    * state.inputs.config.session_limits.model_turns),
             ),
             new_session_turn_cap=state.inputs.config.session_limits.model_turns,
             new_session_tool_call_cap=state.inputs.config.session_limits.tool_calls,
@@ -3523,6 +4095,7 @@ class ReviewController:
                 now=self.clock(),
             ),
             excluded_obligation_ids=tuple(sorted(set(excluded_obligation_ids))),
+            changed_files=state.inputs.changed_files,
             investigation_leads=tuple(
                 state.investigation_leads[key]
                 for key in sorted(state.investigation_leads)
@@ -3533,6 +4106,13 @@ class ReviewController:
         self, state: _RunState, reconciliation: CoverageReconciliation,
         *, attempt: int = 1, excluded_obligation_ids: Iterable[str] = (),
     ) -> tuple[NegotiationAction, ...]:
+        remaining_turns, remaining_tools = self._remaining_global_budget(state)
+        if remaining_turns <= 0 or remaining_tools <= 0:
+            state.journal.emit("negotiation_adjustment", {
+                "component": "negotiator", "action": "stop",
+                "reason": "global review model-turn or tool-call budget exhausted",
+            })
+            return ()
         if (
             not reconciliation.uncovered_obligation_ids
             and not any(
@@ -3544,10 +4124,8 @@ class ReviewController:
             )
         ):
             return ()
-        followup_started = sum(
-            1 for assignment in state.assignments.values()
-            if "-followup-" in assignment.id
-        )
+        initial_ids = {item.id for item in state.plan.assignments}
+        followup_started = len(set(state.assignments) - initial_ids)
         negotiation_state = self._negotiation_state(
             state, reconciliation, followup_started, excluded_obligation_ids,
         )
@@ -3660,6 +4238,105 @@ class ReviewController:
             self._degrade(state, "negotiator", _bounded_error(exc))
             return ()
 
+    def _followup_prior_work(
+        self, state: _RunState, assignment: Assignment, lead: InvestigationLead,
+    ) -> tuple[dict[str, object], EvidenceSnapshot]:
+        """Share bounded claims, never coverage authority or local candidate handles."""
+        paths = tuple(dict.fromkeys((
+            *assignment.seed_paths, *assignment.boundary_paths,
+            *assignment.owned_changed_paths, *lead.affected_paths,
+        )))
+
+        def relevant(path: str) -> bool:
+            return any(
+                fnmatch.fnmatchcase(path, pattern)
+                or path == pattern.rstrip("/")
+                or path.startswith(pattern.rstrip("/") + "/")
+                for pattern in paths
+            )
+
+        obligation_ids = set(assignment.obligation_ids)
+        obligation_ids.update(
+            item.id for item in state.obligations
+            if any(relevant(path) for path in item.scope)
+        )
+        evidence_ids = list(lead.evidence_ids[:12])
+        candidates = []
+        active_by_session = {
+            session_id: set(result.checkpoint.candidate_finding_ids)
+            for (_assignment_id, session_id), result in state.session_results.items()
+        }
+        for candidate in (*state.candidate_occurrences.values(), *state.inputs.candidate_findings):
+            if (
+                candidate.collector_session_id in active_by_session
+                and candidate.candidate_id not in active_by_session[candidate.collector_session_id]
+            ):
+                continue
+            if not (
+                candidate.candidate_id in lead.candidate_ids
+                or set(candidate.related_obligation_ids) & obligation_ids
+                or relevant(candidate.affected_location.split(":", 1)[0])
+            ):
+                continue
+            candidates.append({
+                "candidate_id": candidate.candidate_id[:160],
+                "claim": mask_runtime_text(candidate.claim, limit=600),
+                "causal_chain": mask_runtime_text(candidate.causal_chain, limit=600),
+                "affected_location": candidate.affected_location[:300],
+                "evidence_ids": list(dict.fromkeys((
+                    *candidate.supporting_evidence_ids,
+                    *candidate.contradicting_evidence_ids,
+                )))[:8],
+            })
+            evidence_ids.extend(candidates[-1]["evidence_ids"])
+            if len(candidates) == 6:
+                break
+        latest = {}
+        for _revision, _owner, assessment in self._accepted_checkpoint_assessments(state):
+            if assessment.obligation_id in obligation_ids:
+                latest[assessment.obligation_id] = assessment
+        assessments = []
+        for assessment in tuple(latest.values())[:8]:
+            assessments.append({
+                "obligation_id": assessment.obligation_id,
+                "disposition": assessment.disposition.value,
+                "reason": mask_runtime_text(assessment.reason, limit=600),
+                "evidence_ids": list(assessment.evidence_ids[:8]),
+                "next_actions": [mask_runtime_text(item, limit=300) for item in assessment.next_actions[:3]],
+            })
+            evidence_ids.extend(assessment.evidence_ids[:8])
+        sources = []
+        for evidence_id in dict.fromkeys(evidence_ids):
+            record = state.evidence.lookup_canonical(evidence_id)
+            if (
+                record is not None and record.source_path and relevant(record.source_path)
+                and record.provenance.head_sha == state.inputs.head_sha
+            ):
+                sources.append(record)
+            if len(sources) == 12:
+                break
+        retained_ids = {record.id for record in sources}
+        for item in (*candidates, *assessments):
+            item["evidence_ids"] = [value for value in item["evidence_ids"] if value in retained_ids]
+        evaluation = state.boundary_evaluations.get(lead.lead_id.removeprefix("boundary:"))
+        return {
+            "missing_question": mask_runtime_text(
+                getattr(evaluation, "missing_fact", "") or lead.next_action, limit=1000,
+            ),
+            "semantics": (
+                "Prior candidates and assessments are unverified claims, not facts or coverage proof. "
+                "You may contradict them. Answer only the missing question; do not restart the whole "
+                "investigation. Prior observations are not local candidate update or withdrawal targets. "
+                "Use retained source evidence to verify claims and avoid restating an existing defect."
+            ),
+            "candidates": candidates,
+            "assessments": assessments,
+            "evidence": [{
+                "evidence_id": record.id, "source": record.source_path,
+                "excerpt": record.content[:600],
+            } for record in sources],
+        }, EvidenceSnapshot(tuple(sources))
+
     def _followup_assignments(
         self, state: _RunState, actions: Iterable[NegotiationAction],
     ) -> tuple[Assignment, ...]:
@@ -3723,10 +4400,13 @@ class ReviewController:
                     lead_id = action.lead_ids[0]
                     lead = state.investigation_leads.get(lead_id)
                     lead_target = self._investigation_lead_target(state, lead_id)
+                    prior_work, sources = self._followup_prior_work(
+                        state, assignment, lead,
+                    ) if lead is not None else (None, None)
                     succeeded, _ = self._session_hook(
                         state, action.session_id,
                         "apply_investigation_lead_feedback",
-                        RunPhase.FOLLOWUP, lead_target, lead,
+                        RunPhase.FOLLOWUP, lead_target, lead, prior_work, sources,
                     ) if lead is not None else (False, None)
                     if succeeded and lead is not None:
                         state.investigation_leads[lead_id] = replace(
@@ -3760,21 +4440,132 @@ class ReviewController:
                 lead = state.investigation_leads.get(lead_id)
                 if lead is None:
                     continue
-                assignment = Assignment(
-                    id=f"investigation-lead-followup-{index}",
-                    title=f"Investigation lead follow-up {index}",
-                    objective=lead.next_action,
-                    obligation_ids=(), recipe_ids=(),
-                    lenses=("investigation-lead",),
-                    seed_paths=lead.affected_paths,
-                    boundary_paths=lead.affected_paths,
-                    expected_evidence=(lead.required_capability,),
-                    estimated_turns=max(2, action.estimated_turns),
-                    priority="high",
-                    model_turn_limit=state.inputs.config.session_limits.model_turns,
-                    tool_call_limit=state.inputs.config.session_limits.tool_calls,
-                    investigation_leads=(lead,),
+                remaining_turns, remaining_tools = self._remaining_global_budget(
+                    state,
                 )
+                if remaining_turns <= 0 or remaining_tools <= 0:
+                    state.journal.emit("negotiation_action_applied", {
+                        "kind": action.kind,
+                        "lead_ids": action.lead_ids,
+                        "outcome": "global_lease_exhausted",
+                    })
+                    continue
+                turn_limit = min(
+                    state.inputs.config.session_limits.model_turns,
+                    remaining_turns,
+                )
+                tool_limit = min(
+                    state.inputs.config.session_limits.tool_calls,
+                    remaining_tools,
+                )
+                if lead.kind == "delegation" and lead.child_assignment_id:
+                    queued = state.assignments.get(lead.child_assignment_id)
+                    if queued is None:
+                        state.journal.emit("negotiation_action_applied", {
+                            "kind": action.kind,
+                            "lead_ids": action.lead_ids,
+                            "outcome": "skipped_missing_delegation_assignment",
+                        })
+                        continue
+                    assignment = replace(
+                        queued,
+                        estimated_turns=min(
+                            max(1, action.estimated_turns), turn_limit,
+                        ),
+                        model_turn_limit=turn_limit,
+                        tool_call_limit=tool_limit,
+                    )
+                elif lead_id.startswith("boundary:"):
+                    boundary_id = lead_id.removeprefix("boundary:")
+                    selected = tuple(
+                        item for item in state.obligations
+                        if item.boundary_id == boundary_id
+                        and item.participant_id
+                        and not item.evaluator_owned
+                    )
+                    if not selected:
+                        continue
+                    brief_by_id = {
+                        brief.obligation_id: brief
+                        for item in state.assignments.values()
+                        for brief in item.obligation_briefs
+                    }
+                    briefs = tuple(
+                        brief_by_id.get(item.id) or ObligationBrief(
+                            item.id, item.subject, item.explanation,
+                            item.risk_tier,
+                            item.required_evidence_categories,
+                            item.satisfaction_predicates,
+                            item.scope,
+                            recipe_objective=item.recipe_objective,
+                            recipe_invariants=item.recipe_invariants,
+                            evidence_hints=item.evidence_hints,
+                        )
+                        for item in selected
+                    )
+                    assignment = Assignment(
+                        id=f"boundary-{boundary_id}-followup-{index}",
+                        title=f"Boundary {boundary_id} follow-up",
+                        objective=lead.next_action,
+                        obligation_ids=tuple(item.id for item in selected),
+                        primary_obligation_ids=(),
+                        recipe_ids=tuple(sorted({
+                            item.recipe_id for item in selected
+                            if item.recipe_id
+                        })),
+                        lenses=("boundary-participant-followup",),
+                        seed_paths=tuple(dict.fromkeys(
+                            path for item in selected
+                            for path in item.seed_hints
+                        )),
+                        boundary_paths=tuple(dict.fromkeys((
+                            *(path for item in selected for path in item.scope),
+                            *lead.affected_paths,
+                        ))),
+                        expected_evidence=tuple(sorted({
+                            category for item in selected
+                            for category in item.required_evidence_categories
+                        })),
+                        estimated_turns=min(
+                            max(1, action.estimated_turns), turn_limit,
+                        ),
+                        priority="high",
+                        overlap_justification=(
+                            "Focused boundary participant reassessment"
+                        ),
+                        obligation_briefs=briefs,
+                        model_turn_limit=turn_limit,
+                        tool_call_limit=tool_limit,
+                        investigation_leads=(lead,),
+                        owned_changed_paths=tuple(dict.fromkeys(
+                            path for path in (
+                                *(path for item in selected for path in item.scope),
+                                *lead.affected_paths,
+                            ) if path in state.inputs.changed_files
+                        )),
+                    )
+                else:
+                    assignment = Assignment(
+                        id=f"investigation-lead-followup-{index}",
+                        title=f"Investigation lead follow-up {index}",
+                        objective=lead.next_action,
+                        obligation_ids=(), recipe_ids=(),
+                        lenses=("investigation-lead",),
+                        seed_paths=lead.affected_paths,
+                        boundary_paths=lead.affected_paths,
+                        expected_evidence=(lead.required_capability,),
+                        estimated_turns=min(
+                            max(1, action.estimated_turns), turn_limit,
+                        ),
+                        priority="high",
+                        model_turn_limit=turn_limit,
+                        tool_call_limit=tool_limit,
+                        investigation_leads=(lead,),
+                        owned_changed_paths=tuple(
+                            path for path in lead.affected_paths
+                            if path in state.inputs.changed_files
+                        ),
+                    )
                 state.assignments[assignment.id] = assignment
                 expected_session_id = self._session_identity(state, assignment)
                 state.assignment_sessions[assignment.id] = expected_session_id
@@ -3800,7 +4591,7 @@ class ReviewController:
                 obligation_by_id[item] for item in action.obligation_ids
                 if item in obligation_by_id
             )
-            plan = fallback_assignment_plan(selected, state.inputs.topology, state.inputs.config)
+            plan = component_assignment_plan(selected, state.inputs.topology, state.inputs.config)
             if not plan.assignments:
                 for obligation in selected:
                     state.unknowns.append({
@@ -3816,32 +4607,7 @@ class ReviewController:
                     "outcome": "recorded_infeasible",
                 })
                 continue
-            latest_usage: dict[str, BudgetUsage] = {}
-            for session_result in state.session_results.values():
-                usage = getattr(session_result, "budget", BudgetUsage())
-                existing = latest_usage.get(session_result.session_id, BudgetUsage())
-                latest_usage[session_result.session_id] = BudgetUsage(
-                    model_turns=max(existing.model_turns, usage.model_turns),
-                    tool_calls=max(existing.tool_calls, usage.tool_calls),
-                    recoveries=max(existing.recoveries, usage.recoveries),
-                )
-            for session_id, usage in state.failed_session_budgets.items():
-                existing = latest_usage.get(session_id, BudgetUsage())
-                latest_usage[session_id] = BudgetUsage(
-                    model_turns=max(existing.model_turns, usage.model_turns),
-                    tool_calls=max(existing.tool_calls, usage.tool_calls),
-                    recoveries=max(existing.recoveries, usage.recoveries),
-                )
-            remaining_turns = max(
-                0,
-                state.inputs.config.max_total_model_turns
-                - sum(item.model_turns for item in latest_usage.values()),
-            )
-            remaining_tools = max(
-                0,
-                state.inputs.config.max_total_tool_calls
-                - sum(item.tool_calls for item in latest_usage.values()),
-            )
+            remaining_turns, remaining_tools = self._remaining_global_budget(state)
             if remaining_turns <= 0 or remaining_tools <= 0:
                 for obligation in selected:
                     state.unknowns.append({
@@ -4794,13 +5560,6 @@ class ReviewController:
         # summary because ``tool/secret`` resembles a path causes more harm
         # than accepting an imprecise component name here.
         normalized = " ".join(combined.casefold().split())
-        if re.search(
-            r"(?:^|\s)(?:blocker|major|minor|finding|defect)\b|"
-            r"(?:^|[\s`])[^`\s]+:\d+(?:\b|`)",
-            normalized,
-        ):
-            raise ValueError("detailed findings belong in review notes")
-
         # Do not let a candidate claim leak into the sticky handoff even when it
         # happens to use valid changed paths and components.
         detailed_claims = tuple(
@@ -5227,6 +5986,15 @@ class ReviewController:
                     },
                     "prepared_notes": {
                         "count": context.unresolved_thread_count,
+                        "accepted_findings": [
+                            {
+                                "claim": finding.claim[:1200],
+                                "affected_location": finding.affected_location,
+                                "user_visible_consequence": finding.user_visible_consequence[:1200],
+                            }
+                            for finding in state.review.accepted[:20]
+                        ],
+                        "omitted_accepted_findings": max(0, len(state.review.accepted) - 20),
                         "themes": tuple(sorted({
                             note.severity or note.kind.value
                             for note in state.notes
@@ -5245,7 +6013,6 @@ class ReviewController:
                     context=handoff_request_context,
                 )
                 if isinstance(proposed, Mapping) and "ai_reviewed_summary" in proposed:
-                    summary = _handoff_summary_proposal(proposed)
                     allowed_summary_paths = {
                         _normalize_repository_path(path)
                         for path in (
@@ -5253,17 +6020,17 @@ class ReviewController:
                         )
                         if _normalize_repository_path(path)
                     }
-                    summary = replace(
-                        summary,
-                        referenced_paths=tuple(sorted(allowed_summary_paths))[:12],
-                        referenced_component_ids=context.component_ids[:12],
-                        referenced_obligation_ids=covered_obligation_ids[:12],
-                    )
                     try:
+                        summary = replace(
+                            _handoff_summary_proposal(proposed),
+                            referenced_paths=tuple(sorted(allowed_summary_paths))[:12],
+                            referenced_component_ids=context.component_ids[:12],
+                            referenced_obligation_ids=covered_obligation_ids[:12],
+                        )
                         context = self._apply_handoff_summary_proposal(
                             state, context, summary,
                         )
-                    except ValueError as exc:
+                    except (TypeError, ValueError) as exc:
                         repaired = self._model_request(
                             state,
                             role="finalizer",
@@ -5275,6 +6042,7 @@ class ReviewController:
                                 **handoff_request_context,
                                 "semantic_repair": {
                                     "reason": _bounded_error(exc),
+                                    "previous_response": proposed,
                                     "instruction": (
                                         "Rewrite only the concise human handoff. Do not "
                                         "state a verdict, coverage conclusion, finding, "
@@ -5544,6 +6312,30 @@ class ReviewController:
             _evidence_projection(record)
             for record in state.evidence.snapshot().records
         ]
+        assessed_by_obligation: dict[str, set[str]] = {}
+        for _sequence, _assignment_id, assessment in (
+            self._accepted_checkpoint_assessments(state)
+        ):
+            assessed_by_obligation.setdefault(
+                assessment.obligation_id, set(),
+            ).update(assessment.assessed_paths)
+        ownership_warnings = tuple(
+            str(item).strip()
+            for item in state.inputs.topology.get("ownership_warnings", ())
+            if str(item).strip()
+        )
+        unmatched_paths = tuple(dict.fromkeys(
+            str(item).strip()
+            for item in state.inputs.topology.get(
+                "unmatched_changed_paths", (),
+            )
+            if str(item).strip()
+        ))
+        if unmatched_paths:
+            ownership_warnings = tuple(dict.fromkeys((
+                *ownership_warnings,
+                "Unmatched changed paths: " + ", ".join(unmatched_paths),
+            )))
         journal_events = state.journal.snapshot()
         events = [
             {
@@ -5563,6 +6355,19 @@ class ReviewController:
             "adapter": state.inputs.adapter_configuration,
         })
         run_id = _artifact_id(state.inputs)
+        recorded_session_turns = sum(
+            item["model_turns"] for item in session_budgets.values()
+        )
+        recorded_session_tools = sum(
+            item["tool_calls"] for item in session_budgets.values()
+        )
+        specialist_turns = max(
+            state.admitted_specialist_model_turns, recorded_session_turns,
+        )
+        specialist_tools = max(
+            state.admitted_specialist_tool_calls, recorded_session_tools,
+        )
+        total_model_turns = specialist_turns + state.boundary_model_turns
         artifact: dict[str, object] = {
             "accepted_candidates": [_json_value(item) for item in state.review.accepted],
             "candidate_dispositions": [
@@ -5625,12 +6430,12 @@ class ReviewController:
                     "model_turns": max(
                         0,
                         state.inputs.config.max_total_model_turns
-                        - sum(item["model_turns"] for item in session_budgets.values()),
+                        - total_model_turns,
                     ),
                     "tool_calls": max(
                         0,
                         state.inputs.config.max_total_tool_calls
-                        - sum(item["tool_calls"] for item in session_budgets.values()),
+                        - specialist_tools,
                     ),
                 },
                 "request_attempts": [
@@ -5638,12 +6443,8 @@ class ReviewController:
                     for key in sorted(state.request_attempts)
                 ],
                 "totals": {
-                    "model_turns": sum(
-                        item["model_turns"] for item in session_budgets.values()
-                    ),
-                    "tool_calls": sum(
-                        item["tool_calls"] for item in session_budgets.values()
-                    ),
+                    "model_turns": total_model_turns,
+                    "tool_calls": specialist_tools,
                     "recoveries": sum(
                         item["recoveries"] for item in session_budgets.values()
                     ),
@@ -5710,6 +6511,18 @@ class ReviewController:
                     "satisfaction_predicates": list(item.satisfaction_predicates),
                     "requires_independent_verification": item.requires_independent_verification,
                     "required_evidence_categories": list(item.required_evidence_categories),
+                    "owner_component_id": item.owner_component_id,
+                    "boundary_id": item.boundary_id,
+                    "participant_id": item.participant_id,
+                    "evaluator_owned": item.evaluator_owned,
+                    "assessed_paths": sorted(
+                        assessed_by_obligation.get(item.id, ()),
+                    ),
+                    "omitted_paths": [
+                        path for path in item.scope
+                        if path not in assessed_by_obligation.get(item.id, ())
+                    ] if item.id in assessed_by_obligation else [],
+                    "evidence_hints": list(item.evidence_hints),
                     "evidence_ids": list(evidence_by_obligation.get(item.id, ())),
                 }
                 for item in state.obligations
@@ -5718,8 +6531,11 @@ class ReviewController:
                 "runtime": _json_value(state.inputs.config),
                 "adapter": _json_value(state.inputs.adapter_configuration),
             },
+            "ownership_warnings": list(ownership_warnings),
             "degradation": list(state.degradations),
             "evaluation_status": self._review_status(state),
+            "boundary_evaluations": [_json_value(state.boundary_evaluations[key]) for key in sorted(state.boundary_evaluations)],
+            "boundary_model_turns": state.boundary_model_turns,
             "investigation_leads": [
                 _json_value(state.investigation_leads[key])
                 for key in sorted(state.investigation_leads)
@@ -5728,6 +6544,7 @@ class ReviewController:
                 tool_activity[key] for key in sorted(tool_activity)
             ],
             "external_access": {
+                "search_warnings": search_warning_summary(state.evidence.snapshot().records),
                 "search_configured": bool(
                     state.inputs.adapter_configuration.get("search_configured", False)
                 ),
@@ -5855,6 +6672,7 @@ class ReviewController:
             "assignment_plan",
             "coverage", "recipes", "unknowns", "source_access_requests",
             "investigation_leads", "tool_activity", "external_access",
+            "ownership_warnings",
             "accepted_candidates", "rejected_candidates", "handoff", "notes",
             "coverage_verification_requests", "retention_verification_requests",
             "candidate_dispositions", "candidate_unknowns",
@@ -6088,6 +6906,9 @@ class ReviewController:
             }],
             "source_access_requests": [],
             "investigation_leads": [],
+            "ownership_warnings": [],
+            "boundary_evaluations": [],
+            "boundary_model_turns": 0,
             "tool_activity": [],
             "external_access": {
                 "search_configured": False,
@@ -6338,6 +7159,7 @@ class ReviewController:
 
             self._complete_phase(state)
             self._transition(state, "followup")
+            reconciliation = self._refresh_boundary_coverage(state, reconciliation)
             followup_lease = state.deadline.lease_for(RunPhase.FOLLOWUP)
             for session_id in sorted(state.sessions):
                 self._session_hook(
@@ -6347,16 +7169,10 @@ class ReviewController:
             # Negotiation is deliberately one-action-at-a-time.  Recompute the
             # authoritative state after each bounded wave so the next proposal
             # cannot rely on stale obligations, leases, or coverage gains.
-            max_rounds = max(
-                1,
-                state.inputs.config.max_followup_sessions
-                + len(state.obligations),
-                state.inputs.config.max_followup_sessions
-                + len(state.obligations)
-                + min(32, len(state.investigation_leads)),
-            )
             unproductive_obligation_ids: set[str] = set()
-            for round_index in range(max_rounds):
+            round_index = -1
+            while state.deadline.exploration_allowed(now=self.clock()):
+                round_index += 1
                 open_lead_ids = {
                     item.lead_id for item in state.investigation_leads.values()
                     if item.status in {
@@ -6405,6 +7221,35 @@ class ReviewController:
                 next_reconciliation = self._reconcile(
                     state, followup, followup_snapshot,
                 )
+                next_reconciliation = self._refresh_boundary_coverage(state, next_reconciliation)
+                new_records = tuple(
+                    record for record in state.evidence.snapshot().records
+                    if record.id not in before_evidence
+                )
+                for action in actions:
+                    for lead_id in action.lead_ids:
+                        lead = state.investigation_leads.get(lead_id)
+                        if lead is None or not followups:
+                            continue
+                        conclusions = tuple(
+                            item.session_result.checkpoint.working_summary
+                            for item in followup.results
+                            if item.session_result.checkpoint and item.session_result.checkpoint.working_summary
+                        )
+                        evidence_ids = tuple(record.id for record in new_records)
+                        state.investigation_leads[lead_id] = replace(
+                            lead, attempt_count=lead.attempt_count + 1,
+                            last_evidence_delta=len(evidence_ids),
+                            last_outcome=(" ".join(conclusions)[:1200] or
+                                          "Follow-up returned no recorded conclusion."),
+                            evidence_ids=tuple(dict.fromkeys((*lead.evidence_ids, *evidence_ids))),
+                        )
+                        journal.emit("investigation_lead_followup_completed", {
+                            "lead_id": lead_id,
+                            "attempt_count": lead.attempt_count + 1,
+                            "evidence_delta": len(evidence_ids),
+                            "outcome": state.investigation_leads[lead_id].last_outcome,
+                        })
                 # Evidence collection counts as progress even before it satisfies
                 # an obligation. A scheduled exploration that adds neither evidence
                 # nor coverage retires only its target so another gap can be tried;
@@ -6481,6 +7326,9 @@ class ReviewController:
 
             self._complete_phase(state)
             self._transition(state, "finalization")
+            finalization_snapshot = WaveSnapshot(
+                state.evidence.snapshot(), state.coverage.snapshot(),
+            )
             for key in sorted(state.sessions):
                 session = state.sessions[key]
                 if state.deadline.remaining(now=self.clock()) <= 0:
@@ -6516,7 +7364,9 @@ class ReviewController:
                     state.evidence.merge_completed_snapshot(
                         session.evidence.snapshot(),
                     )
-                    state.session_results[(session.assignment.id, result.session_id)] = result
+                    self._retain_session_result(
+                        state, session.assignment.id, result.session_id, result,
+                    )
                     self._admit_investigation_lead_state(state, result)
                     self._promote_degraded_session_result(
                         state, session.assignment.id, result,
@@ -6617,6 +7467,22 @@ class ReviewController:
                             "specialist finalization completed at the absolute deadline",
                         )
                         break
+            reconciliation = self._reconcile(
+                state, initial, finalization_snapshot,
+            )
+            reconciliation = self._refresh_boundary_coverage(
+                state, reconciliation, phase=RunPhase.FINALIZATION,
+            )
+            covered_ids = {
+                obligation_id
+                for obligation_id, status
+                in reconciliation.snapshot.obligation_statuses
+                if status is ObligationStatus.COVERED
+            }
+            state.unknowns = [
+                item for item in state.unknowns
+                if item.get("obligation_id") not in covered_ids
+            ]
             # A checkpoint can be marked degraded while the worker is still
             # recoverable.  Only promote the final retained result (or a
             # session that could not be finalized) to the run-level status;
@@ -6848,6 +7714,11 @@ class ReviewController:
                     _json_value(state.investigation_leads[key])
                     for key in sorted(state.investigation_leads)
                 ],
+                "ownership_warnings": list(
+                    state.inputs.topology.get("ownership_warnings", ())
+                ),
+                "boundary_evaluations": [_json_value(state.boundary_evaluations[key]) for key in sorted(state.boundary_evaluations)],
+                "boundary_model_turns": state.boundary_model_turns,
                 "tool_activity": [],
                 "external_access": {
                     "search_configured": bool(
@@ -6953,6 +7824,9 @@ class ReviewController:
                 raise TypeError("emergency artifact projection must be an object")
             projected.update(complete_event_journal)
             artifact = projected
+            self._validate_artifact(artifact)
+        if self.performance_snapshot is not None:
+            artifact["model_performance"] = _json_value(self.performance_snapshot())
             self._validate_artifact(artifact)
         if path is None:
             write_error = path_error or "artifact output path rejected"
