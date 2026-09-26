@@ -96,7 +96,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "files (.env, .pem, credentials, id_rsa, …) are blocked. Output "
             "is truncated to ~12 KB. For a large file, pass offset/limit to "
             "read a line window (also the way to expand context around a "
-            "diff hunk) instead of blowing the cap."
+            "diff hunk) instead of blowing the cap. Continue at range.next_offset, "
+            "not the requested offset plus limit. Only complete lines are returned; "
+            "omitted_lines explicitly identifies oversized lines that could not fit."
         ),
         "parameters": {
             "type": "object",
@@ -134,6 +136,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "repositories. Files over 8 MiB are rejected before content download; "
             "offset/limit cannot bypass this transfer cap. Use offset/limit for a bounded line window and "
             "include_line_numbers when exact remote line references matter. "
+            "Continue at range.next_offset; oversized omitted_lines are not evidence. "
             "Do not use gh_api to read repository contents."
         ),
         "parameters": {
@@ -316,7 +319,9 @@ SPECIALIST_PR_DIFF_SCHEMA: dict[str, Any] = {
         "specialist's assignment. Prefer batching related production and test paths. "
         "The controller compares the immutable pull-request base merge-base "
         "to the immutable head (base...head); revisions cannot be supplied by "
-        "the model. Paths outside the assignment boundaries are rejected."
+        "the model. Paths outside the assignment boundaries are rejected. "
+        "Continue at range.next_offset (a patch-line offset, not a RIGHT file line). "
+        "Only complete lines are returned; omitted_lines identifies oversized lines."
     ),
     "parameters": {
         "type": "object",
@@ -478,6 +483,23 @@ VERDICT_USER_INSTRUCTION = (
 # ---------------------------------------------------------------------------
 # Message normalisation
 # ---------------------------------------------------------------------------
+
+
+def _model_tool_result(result: Any) -> Any:
+    """Hide nonactionable search warnings on the wire, not in retained evidence."""
+    if isinstance(result, str):
+        if '"engine_warnings"' not in result or '"search_discovery"' not in result:
+            return result
+        try:
+            return json.dumps(_model_tool_result(json.loads(result)), ensure_ascii=False)
+        except ValueError:
+            return result
+    if not isinstance(result, dict):
+        return result
+    if result.get("kind") == "search_discovery" and result.get("search_status") == "ok":
+        return {key: value for key, value in result.items() if key != "engine_warnings"}
+    return {key: _model_tool_result(value) if key in {"result", "content"} else value
+            for key, value in result.items()}
 
 
 def _stringify_tool_result(result: Any) -> str:
@@ -752,6 +774,9 @@ class Conversation:
     ) -> None:
         if not isinstance(call_id, str) or not call_id:
             return
+        from pr_reviewer.line_windows import bound_line_payload
+        result = _model_tool_result(result)
+        result = bound_line_payload(result, max_bytes)
         body = _stringify_tool_result(result)
         body, truncated = truncate_text(body, max_bytes)
         metadata: dict[str, str] = {}

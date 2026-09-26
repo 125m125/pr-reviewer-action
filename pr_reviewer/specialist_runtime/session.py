@@ -4407,6 +4407,7 @@ class SpecialistSession:
                         "evidence_id": slice_record.id,
                         "status": slice_record.status,
                         "content": slice_record.content,
+                        "range": patch_item.get("range"),
                     })
                 if representative is None or representative_collection is None:
                     self._add_tool_result(
@@ -4443,6 +4444,9 @@ class SpecialistSession:
                     "evidence_id": record.id,
                     "status": record.status,
                     "content": record.content,
+                    **({"range": dict(payload["range"])}
+                       if isinstance(payload, Mapping) and isinstance(payload.get("range"), Mapping)
+                       else {}),
                     "changed": bool(
                         record.source_path
                         and any(
@@ -5669,7 +5673,7 @@ class SpecialistSession:
                 if "invariants_evaluated" in raw
                 else previous.invariants_evaluated
             ),
-            unknowns=self._current_gaps,
+            unknowns=self._checkpoint_unknowns(raw.get("unknowns", previous.unknowns)),
             proposed_next_actions=(proposed_next_actions or self._current_gaps),
             obligation_assessments=(
                 ()
@@ -6272,6 +6276,13 @@ class SpecialistSession:
             }
         )
 
+    def _checkpoint_unknowns(self, values) -> tuple[str, ...]:
+        # Model limitations are context, never authority to open/close obligations.
+        identifiers = set(self.coverage.obligation_statuses()) | set(self.obligation_assessments.handles())
+        narrative = tuple(item for item in _bounded_strings(values, max_items=20, max_length=500)
+                          if item not in identifiers and not re.fullmatch(r"O\d+", item))
+        return tuple(dict.fromkeys((*self._current_gaps, *narrative)))
+
     def _project_checkpoint(
         self,
         gaps: tuple[str, ...],
@@ -6305,7 +6316,7 @@ class SpecialistSession:
             invariants_evaluated=(
                 previous.invariants_evaluated if previous is not None else ()
             ),
-            unknowns=self._current_gaps,
+            unknowns=self._checkpoint_unknowns(previous.unknowns if previous is not None else ()),
             proposed_next_actions=(
                 previous.proposed_next_actions
                 if previous is not None else self._current_gaps
@@ -7187,7 +7198,9 @@ class SpecialistSession:
             self._tool_calls_deferred_for_checkpoint = True
         name = self._tool_activity_call_names.get(call_id, "")
         if name:
-            if is_error:
+            if isinstance(result, Mapping) and result.get("status") in {"rejected", "blocked"}:
+                outcome = "rejected"
+            elif is_error:
                 outcome = "errors"
             elif isinstance(result, Mapping) and result.get("status") == "deferred":
                 outcome = "deferred"

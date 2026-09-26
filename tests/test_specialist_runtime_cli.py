@@ -706,6 +706,7 @@ class ScriptedController:
             }],
             "external_access": {
                 "search_configured": True,
+                "search_warnings": [{"engine": "brave", "reason": "rate_limited"}],
                 "web_search_advertised_sessions": 2,
                 "web_fetch_advertised_sessions": 1,
                 "github_api_advertised_sessions": 2,
@@ -806,6 +807,8 @@ def test_cli_writes_structured_handoff_notes_artifact_and_compatibility_output(
     assert "Candidate proposal attempts (including corrections): 0; admission-rejected attempts 0; admitted candidates 0" in summary
     assert "CI test evidence: unavailable" in summary
     assert "## AI specialist tools" in summary
+    assert "| brave | rate limited |" in summary
+    assert "Search results may be incomplete" in summary
     assert "| web\\_search | 2 | 3 | 1 | 1 | 1 | 0 | 1 |" in summary
     assert "<summary>External access policy</summary>" in summary
     assert "`docs\\.example\\.com`" in summary

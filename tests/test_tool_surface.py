@@ -45,12 +45,31 @@ def git_repo(tmp_path):
 
 
 # ── read_file line ranges ────────────────────────────────────────────────────
+def test_file_pagination_counts_only_complete_utf8_lines(tmp_path):
+    (tmp_path / "f.txt").write_text(("é" * 2000 + "\n") * 4, encoding="utf-8")
+    first = _exec("read_file", {"path": "f.txt", "offset": 1, "limit": 4}, tmp_path)["result"]
+    assert first["content"] == ("é" * 2000 + "\n") * 2
+    assert first["range"]["lines"] == 2
+    assert first["range"]["next_offset"] == 3
+    second = _exec("read_file", {"path": "f.txt", "offset": 3}, tmp_path)["result"]
+    assert first["content"] + second["content"] == (tmp_path / "f.txt").read_text(encoding="utf-8")
+
+
+def test_oversized_file_line_is_explicitly_omitted(tmp_path):
+    (tmp_path / "f.txt").write_text("x" * 15000 + "\ntail\n", encoding="utf-8")
+    result = _exec("read_file", {"path": "f.txt"}, tmp_path)["result"]
+    assert result["content"] == ""
+    assert result["range"]["lines"] == 0
+    assert result["range"]["omitted_lines"] == [1]
+    assert result["range"]["next_offset"] == 2
+
 def test_read_file_offset_limit_returns_window(tmp_path):
     (tmp_path / "big.txt").write_text("\n".join(f"row{i}" for i in range(1, 101)) + "\n", encoding="utf-8")
     res = _exec("read_file", {"path": "big.txt", "offset": 10, "limit": 3}, tmp_path)
     assert res["status"] == "ok"
     assert res["result"]["content"] == "row10\nrow11\nrow12\n"
-    assert res["result"]["range"] == {"offset": 10, "lines": 3, "total_lines": 100}
+    assert res["result"]["range"] == {"offset": 10, "lines": 3, "total_lines": 100,
+                                      "has_more": True, "truncated": True, "next_offset": 13}
 
 
 def test_read_file_no_range_reads_whole_file(tmp_path):
@@ -58,7 +77,8 @@ def test_read_file_no_range_reads_whole_file(tmp_path):
     res = _exec("read_file", {"path": "f.txt"}, tmp_path)
     assert res["status"] == "ok"
     assert res["result"]["content"] == "a\nb\n"
-    assert "range" not in res["result"]
+    assert res["result"]["range"]["lines"] == 2
+    assert res["result"]["range"]["next_offset"] is None
 
 
 def test_read_file_offset_string_coerced(tmp_path):
