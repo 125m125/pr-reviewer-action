@@ -11,6 +11,7 @@ from typing import Any
 from .assignments import Assignment
 from .coverage import CoverageSnapshot, SessionOwnership
 from .obligation_assessment import ObligationAssessment, ObligationDisposition
+from .web_evidence import RepositoryAccessRequest, SourceAccessRequest
 from .types import (
     CoverageObligation,
     InvestigationLead,
@@ -38,7 +39,10 @@ _RISK_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
 def _requires_human_action(action: str) -> bool:
     # Only explicit human interaction or remediation: inspecting intent/history
     # and checking evidence for a candidate remain executable review work.
-    return bool(re.match(
+    return action.startswith("Policy configuration blocked:") or bool(re.match(
+        r"\s*(?:remove|delete|replace|change|restore|update)\b.{1,240}\bthen\s+"
+        r"(?:re-?run|run)\b.{0,80}\btests?\b", action, re.IGNORECASE,
+    )) or bool(re.match(
         r"\s*(?:confirm\s+with|ask|contact|consult\s+with|obtain\s+approval\s+from)\s+"
         r"(?:the\s+)?(?:change\s+|PR\s+)?(?:author|maintainer|owner|human)\b",
         action, re.IGNORECASE,
@@ -154,6 +158,7 @@ class NegotiationState:
     excluded_obligation_ids: tuple[str, ...] = ()
     investigation_leads: tuple[InvestigationLead, ...] = ()
     changed_files: tuple[str, ...] | None = None
+    source_access_requests: tuple[SourceAccessRequest | RepositoryAccessRequest, ...] = ()
 
     def __post_init__(self) -> None:
         obligation_ids = [item.id for item in self.obligations]
@@ -283,7 +288,9 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
         )
         next_actions = (
             tuple(action for action in dict.fromkeys(assessment.next_actions)
-                  if not _requires_human_action(action))
+                  if not _requires_human_action(action)
+                  and action != "candidate_updates"
+                  and not _blocked_source_action(action, item.id, state))
             if assessment is not None else ()
         )
         if assessment is not None and assessment.omitted_paths:
@@ -356,6 +363,10 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             "evidence_delta": assessment_delta,
             "retained_evidence_count": retained_evidence_count,
             "next_actions": next_actions,
+            "blocked_sources": tuple(
+                request.as_dict() for request in state.source_access_requests
+                if request.obligation_id == item.id
+            ),
         })
     reserved_delegations = _reserved_delegation_lead_ids(state)
     for index, lead in enumerate(_negotiable_leads(state), start=1):
@@ -440,6 +451,44 @@ def _assessment_by_obligation(
             if isinstance(item, ObligationAssessment):
                 result[item.obligation_id] = item
     return result
+
+
+def _blocked_source_action(
+    action: str, obligation_id: str, state: NegotiationState,
+) -> bool:
+    # ponytail: match explicit source identities, not arbitrary prose semantics;
+    # structured action dependencies can replace this when the protocol has them.
+    local_route = bool(re.match(
+        r"\s*(?:read|inspect|check|review|compare)\s+(?:the\s+)?"
+        r"(?:(?:local|retained|vendored|installed)\b|node_modules/)",
+        action, re.IGNORECASE,
+    )) and not re.search(r"\b(?:fetch|download|retrieve|request)\b", action, re.IGNORECASE)
+    if local_route:
+        return False
+    external_route = bool(re.search(
+        r"\b(?:authoritative|upstream|remote|external|docs|documentation|source)\b",
+        action, re.IGNORECASE,
+    ))
+    for request in state.source_access_requests:
+        if request.obligation_id != obligation_id:
+            continue
+        if isinstance(request, RepositoryAccessRequest):
+            identities = (request.repository,)
+            if external_route and not local_route:
+                identities += (request.repository.rsplit("/", 1)[-1],)
+        else:
+            host = request.host.removeprefix("www.")
+            identities = (request.candidate_url, host)
+            if external_route and not local_route:
+                name = host.removeprefix("docs.").removeprefix("api.").split(".")[0]
+                identities += (name,)
+        if any(
+            identity and re.search(r"(?<![\w-])" + re.escape(identity) + r"(?![\w-])",
+                                  action, re.IGNORECASE)
+            for identity in identities
+        ):
+            return True
+    return False
 
 
 def _negotiable_obligations(
@@ -788,6 +837,16 @@ def _parse_action(
     unknown_leads = sorted(set(lead_ids) - set(lead_by_id))
     if unknown_leads:
         errors.append(f"{label} contains unknown investigation leads: {', '.join(unknown_leads)}")
+    if kind != "record_unknown" and state.source_access_requests:
+        targets = compact_negotiation_context(state)["targets"]
+        executable_ids = {
+            obligation.id
+            for handle, obligation in _compact_target_obligations(state).items()
+            if any(target["handle"] == handle and kind in target["allowed_actions"]
+                   for target in targets)
+        }
+        if set(obligation_ids) - executable_ids:
+            errors.append(f"{label} has no executable permitted evidence route")
 
     required_union: set[str] = set()
     no_gain: list[str] = []

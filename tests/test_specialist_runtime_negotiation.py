@@ -26,6 +26,7 @@ from pr_reviewer.specialist_runtime.negotiation import (
     validate_negotiation,
 )
 from pr_reviewer.specialist_runtime.policy import RuntimeConfig
+from pr_reviewer.specialist_runtime.web_evidence import RepositoryAccessRequest, SourceAccessRequest
 from pr_reviewer.specialist_runtime.types import (
     CoverageObligation,
     InvestigationLead,
@@ -54,6 +55,75 @@ def obligation(
         unresolved_policy=unresolved_policy,
         scope=(path,),
     )
+
+
+@pytest.mark.parametrize("local_route", [False, True])
+@pytest.mark.parametrize("access_request", [
+    RepositoryAccessRequest(
+        repository="microsoft/playwright", endpoint="contents/fixtureRunner.ts",
+        obligation_id="OB1", purpose="Establish timeout semantics",
+        authority_reason="Repository is not allowlisted",
+    ),
+    SourceAccessRequest(
+        host="playwright.dev", candidate_url="https://playwright.dev/docs/test-fixtures",
+        obligation_id="OB1", purpose="Establish timeout semantics",
+        authority_reason="Source is not allowlisted",
+    ),
+])
+def test_denied_source_is_not_a_route_but_unrelated_local_work_remains(local_route, access_request):
+    actions = ("Establish Playwright timeout semantics from Playwright source.", "candidate_updates")
+    if local_route:
+        actions += ("Inspect local node_modules/playwright/package.json for the timeout contract.",)
+    state = replace(state_for(covered=("OB2",), checkpoints=(SessionCheckpoint(
+        session_id="S1", state=SessionState.CHECKPOINT,
+        obligation_assessments=(ObligationAssessment(
+            "O1", "OB1", ObligationDisposition.PARTIALLY_COVERED,
+            "External timeout contract remains unresolved.", next_actions=actions,
+        ),),
+    ),)), source_access_requests=(access_request,))
+    target = compact_negotiation_context(state)["targets"][0]
+    assert ("resume" in target["allowed_actions"]) is local_route
+    assert not any(action.startswith("Establish Playwright") for action in target["next_actions"])
+    assert fallback_next_action(state).kind == ("resume" if local_route else "record_unknown")
+    if not local_route:
+        with pytest.raises(NegotiationError, match="executable"):
+            validate_negotiation(resume_raw(), state)
+    unrelated = replace(state, source_access_requests=(replace(access_request, obligation_id="OB2"),))
+    assert fallback_next_action(unrelated).kind == "resume"
+
+
+@pytest.mark.parametrize("action", [
+    "Remove stale entry ShowSimilaritySyncCursor from KNOWN_ENTITIES, then rerun tests.",
+    "Policy configuration blocked: evidence requirement has no source selectors.",
+])
+def test_non_executable_remediation_is_not_a_followup(action):
+    state = state_for(covered=("OB2",), checkpoints=(SessionCheckpoint(
+        session_id="S1", state=SessionState.CHECKPOINT,
+        obligation_assessments=(ObligationAssessment(
+            "O1", "OB1", ObligationDisposition.UNRESOLVED,
+            "Needs action outside review", next_actions=(action,),
+        ),),
+    ),))
+    assert fallback_next_action(state).kind == "record_unknown"
+
+
+@pytest.mark.parametrize(("action", "expected"), [
+    ("Inspect retained documentation from playwright.dev for fixture timeout semantics.", "resume"),
+    ("Fetch playwright.dev and compare with retained sources.", "record_unknown"),
+])
+def test_retained_source_read_does_not_reopen_network_access(action, expected):
+    state = replace(state_for(covered=("OB2",), checkpoints=(SessionCheckpoint(
+        session_id="S1", state=SessionState.CHECKPOINT,
+        obligation_assessments=(ObligationAssessment(
+            "O1", "OB1", ObligationDisposition.PARTIALLY_COVERED,
+            "Timeout semantics unresolved", next_actions=(action,),
+        ),),
+    ),)), source_access_requests=(SourceAccessRequest(
+        host="playwright.dev", candidate_url="https://playwright.dev/docs/test-fixtures",
+        obligation_id="OB1", purpose="Establish timeout semantics",
+        authority_reason="Source is not allowlisted",
+    ),))
+    assert fallback_next_action(state).kind == expected
 
 
 def assignment(
