@@ -1570,7 +1570,16 @@ def _validated_change_overview(
         prose_paths = _prose_path_references(text, tracked_paths)
         for reference in prose_paths:
             path = _normalize_repository_path(reference)
+            if "/" not in path and path not in tracked_paths:
+                matches = [known for known in tracked_paths if known.rsplit("/", 1)[-1] == path]
+                if len(matches) == 1:
+                    path = matches[0]
             if path not in changed_paths and path not in context_paths:
+                raise ValueError(
+                    "change overview contains an unchanged path reference "
+                    f"in {label}: {path}"
+                )
+            if path not in changed_paths and _direct_change_references(text, {reference}):
                 raise ValueError(
                     "change overview contains an unchanged path reference "
                     f"in {label}: {path}"
@@ -4038,7 +4047,10 @@ class ReviewController:
                 remaining_model_turns=remaining_turns,
                 remaining_tool_calls=remaining_tools,
                 lease_remaining_sec=session.lease.remaining(now=self.clock()),
-                retained_evidence_count=len(session.evidence.snapshot().records),
+                retained_evidence_count=sum(
+                    record.is_usable_for_coverage
+                    for record in session.evidence.snapshot().records
+                ),
                 allowed_diff_paths=tuple(getattr(session.session, "changed_files", ())),
                 advertised_tools=tuple(sorted(
                     str(item.get("name") or "").strip()
@@ -4080,6 +4092,7 @@ class ReviewController:
             max(1.0, median(durations) if durations else 60.0),
         )
         return NegotiationState(
+            source_access_requests=tuple(state.source_requests),
             obligations=state.obligations,
             coverage=reconciliation.snapshot,
             assignments=tuple(state.assignments[key] for key in sorted(state.assignments)),
@@ -5565,19 +5578,14 @@ class ReviewController:
         state: _RunState,
         base: ReviewHandoffContext,
         proposal: HandoffSummaryProposal,
+        *, allow_partial: bool = False,
     ) -> ReviewHandoffContext:
         """Admit concise presentation prose without treating words as authority."""
-        combined = " ".join((
-            proposal.what_changed_summary,
-            proposal.ai_reviewed_summary,
-            proposal.human_focus,
-        ))
         # Path-looking words and the optional reference arrays are orientation
         # prose, not review authority. Findings, coverage and changed-line
         # locations remain controller-validated elsewhere; rejecting a human
         # summary because ``tool/secret`` resembles a path causes more harm
         # than accepting an imprecise component name here.
-        normalized = " ".join(combined.casefold().split())
         # Do not let a candidate claim leak into the sticky handoff even when it
         # happens to use valid changed paths and components.
         detailed_claims = tuple(
@@ -5593,16 +5601,24 @@ class ReviewController:
             )
             if len(" ".join(str(value).split())) >= 16
         )
-        if any(claim in normalized for claim in detailed_claims):
-            raise ValueError("detailed finding claim belongs in a review note")
-        summary_words = set(re.findall(r"[a-z0-9_]+", normalized))
-        if any(
-            len(claim_words) >= 4
-            and len(summary_words.intersection(claim_words)) / len(claim_words) >= 0.7
-            for claim in detailed_claims
-            if (claim_words := set(re.findall(r"[a-z0-9_]+", claim)))
-        ):
-            raise ValueError("candidate-shaped consequence belongs in a review note")
+        for field_name in ("what_changed_summary", "ai_reviewed_summary", "human_focus"):
+            normalized = " ".join(getattr(proposal, field_name).casefold().split())
+            summary_words = set(re.findall(r"[a-z0-9_]+", normalized))
+            if not any(
+                claim in normalized or (
+                    len(claim_words := set(re.findall(r"[a-z0-9_]+", claim))) >= 4
+                    and len(summary_words.intersection(claim_words)) / len(claim_words) >= 0.7
+                )
+                for claim in detailed_claims
+            ):
+                continue
+            reason = f"{field_name}: detailed finding claim belongs in a review note"
+            if not allow_partial:
+                raise ValueError(reason)
+            state.journal.emit("handoff_summary_field_rejected", {
+                "field": field_name, "reason": reason, "action": "retain-controller-fallback",
+            })
+            proposal = replace(proposal, **{field_name: ""})
 
         overview = str(state.change_overview.get("overview") or "").strip()
         if not overview:
@@ -5615,7 +5631,7 @@ class ReviewController:
                 else base.what_changed
             ),
             what_changed_is_validated_overview=True,
-            ai_reviewed=(proposal.ai_reviewed_summary,),
+            ai_reviewed=(proposal.ai_reviewed_summary,) if proposal.ai_reviewed_summary else base.ai_reviewed,
             ai_reviewed_is_validated_summary=True,
             review_emphasis_topics=(),
             human_focus=(
@@ -5791,7 +5807,10 @@ class ReviewController:
             raise ValueError("exact remediation contains unsupported fields")
         start = value.get("start_line")
         end = value.get("end_line")
-        replacement = str(value.get("replacement") or "").rstrip("\n")
+        replacement = value.get("replacement")
+        if not isinstance(replacement, str):
+            raise ValueError("exact remediation requires a string replacement")
+        replacement = replacement.rstrip("\n")
         if (
             not isinstance(start, int) or isinstance(start, bool)
             or not isinstance(end, int) or isinstance(end, bool)
@@ -5813,7 +5832,7 @@ class ReviewController:
         if end not in added_lines:
             raise ValueError("exact remediation must end on an added right-side diff line")
         if (
-            not replacement or len(replacement.encode("utf-8")) > 4_000
+            len(replacement.encode("utf-8")) > 4_000
             or len(replacement.splitlines()) > 40
             or "```" in replacement
             or "<!-- ai-pr-review" in replacement.lower()
@@ -5900,8 +5919,54 @@ class ReviewController:
             state.remediation_diagnostics.append(diagnostic)
             state.journal.emit("remediation_completed", diagnostic)
 
+    def _resolve_reported_leads(self, state: _RunState) -> None:
+        """Do not present a reported candidate/test failure as an unknown lead."""
+        for lead_id, lead in tuple(state.investigation_leads.items()):
+            if lead.status not in {
+                InvestigationLeadStatus.OPEN, InvestigationLeadStatus.SCHEDULED,
+                InvestigationLeadStatus.BLOCKED,
+            }:
+                continue
+            for finding in state.review.accepted:
+                linked = set(lead.candidate_ids).intersection((
+                    finding.candidate_id, *finding.contributor_candidate_ids,
+                ))
+                test = re.search(r"(?:^|;)\s*test=([^;]+)", finding.confidence_rationale)
+                same_test = False
+                if test and "consequence_support:failing_behavioral_test" in finding.confidence_rationale:
+                    # Require the test's class and method, not a shared file or a
+                    # word-overlap guess. Retained test evidence ties the reports.
+                    test_name = test.group(1).strip().split("::")
+                    identifier = "::".join((test_name[0].rsplit(".", 1)[-1], *test_name[1:]))
+                    same_test = (
+                        len(test_name) == 2
+                        and re.search(
+                            r"(?<![\w])" + re.escape(identifier) + r"(?![\w\[:])",
+                            lead.summary + " " + lead.next_action,
+                        )
+                        and finding.affected_file in lead.affected_paths
+                        and any(
+                            (record := state.evidence.lookup_canonical(evidence_id)) is not None
+                            and record.is_usable_for_coverage and record.category == "test-result"
+                            for evidence_id in set(lead.evidence_ids).intersection(finding.supporting_evidence_ids)
+                        )
+                    )
+                if not linked and not same_test:
+                    continue
+                state.investigation_leads[lead_id] = replace(
+                    lead, status=InvestigationLeadStatus.RESOLVED_CANDIDATE,
+                    candidate_ids=(finding.candidate_id,),
+                    resolution_reason="Reported in an accepted finding; not an unresolved review question.",
+                )
+                state.journal.emit("investigation_lead_resolved", {
+                    "lead_id": lead_id, "status": InvestigationLeadStatus.RESOLVED_CANDIDATE.value,
+                    "candidate_ids": (finding.candidate_id,), "reason": "accepted-finding",
+                })
+                break
+
     def _finalize_products(self, state: _RunState) -> None:
         assert state.coverage is not None
+        self._resolve_reported_leads(state)
         obligation_map = {item.id: item for item in state.obligations}
         statuses = state.coverage.obligation_statuses()
         unresolved = tuple(
@@ -6062,23 +6127,33 @@ class ReviewController:
                                     "reason": _bounded_error(exc),
                                     "previous_response": proposed,
                                     "instruction": (
-                                        "Rewrite only the concise human handoff. Do not "
+                                        "Correct the named invalid field and preserve the other "
+                                        "valid summaries; return the complete handoff object. "
+                                        "Accepted findings already have review notes: do not "
+                                        "present them again as unresolved human-focus questions. Do not "
                                         "state a verdict, coverage conclusion, finding, "
                                         "severity, or exact defect location."
                                     ),
                                 },
                             },
                         )
-                        summary = _handoff_summary_proposal(repaired)
-                        summary = replace(
-                            summary,
-                            referenced_paths=tuple(sorted(allowed_summary_paths))[:12],
-                            referenced_component_ids=context.component_ids[:12],
-                            referenced_obligation_ids=covered_obligation_ids[:12],
-                        )
-                        context = self._apply_handoff_summary_proposal(
-                            state, context, summary,
-                        )
+                        try:
+                            summary = replace(
+                                _handoff_summary_proposal(repaired),
+                                referenced_paths=tuple(sorted(allowed_summary_paths))[:12],
+                                referenced_component_ids=context.component_ids[:12],
+                                referenced_obligation_ids=covered_obligation_ids[:12],
+                            )
+                            context = self._apply_handoff_summary_proposal(
+                                state, context, summary,
+                            )
+                        except (TypeError, ValueError):
+                            # A bad focus must not erase independently valid change
+                            # and review summaries after the bounded repair failed.
+                            context = self._apply_handoff_summary_proposal(
+                                state, context, _handoff_summary_proposal(proposed),
+                                allow_partial=True,
+                            )
                     state.journal.emit("handoff_summary_applied", {
                         "referenced_paths": summary.referenced_paths,
                         "referenced_component_ids": (
@@ -7243,6 +7318,7 @@ class ReviewController:
                 new_records = tuple(
                     record for record in state.evidence.snapshot().records
                     if record.id not in before_evidence
+                    and record.is_usable_for_coverage
                 )
                 for action in actions:
                     for lead_id in action.lead_ids:
@@ -7278,14 +7354,13 @@ class ReviewController:
                     for obligation_id, status in reconciliation.snapshot.obligation_statuses
                     if status is ObligationStatus.COVERED
                 }
-                after_evidence = frozenset(state.evidence.snapshot().evidence_ids)
                 after_lead_statuses = {
                     key: value.status
                     for key, value in state.investigation_leads.items()
                 }
                 made_progress = (
                     bool(after_covered - before_covered)
-                    or before_evidence != after_evidence
+                    or bool(new_records)
                     or before_lead_statuses != after_lead_statuses
                 )
                 if not made_progress:

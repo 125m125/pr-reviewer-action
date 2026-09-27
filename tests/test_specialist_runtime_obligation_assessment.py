@@ -674,6 +674,83 @@ def test_custom_requirement_uses_matching_retained_source_not_category_label(cat
         assert ledger.assessment("O1").disposition.value == expected
 
 
+@pytest.mark.parametrize("mode", ["required", "one_of:delivery"])
+@pytest.mark.parametrize("selector", [None, "seed_paths", "related_paths"])
+def test_prefixed_ansible_requirement_needs_explicit_source_selector(mode, selector):
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations, _assessment_evidence_satisfies
+    from pr_reviewer.specialist_runtime.policy import parse_review_policy
+    from pr_reviewer.specialist_runtime.obligation_assessment import ObligationAssessmentLedger
+
+    path = "movieHRdb-ansible/playbook.yml"
+    requirement = {
+        "id": "delivery-source", "category": "workflow or deployment",
+        "mode": mode, "when": {"paths_any": ["movieHRdb-ansible/**"]},
+    }
+    if selector:
+        requirement[selector] = ["movieHRdb-ansible/**"]
+    policy = parse_review_policy({"version": 3, "recipes": [{
+        "id": "delivery", "evidence_requirements": [requirement],
+    }]})
+    obligation = next(item for item in derive_obligations({
+        "changed_files": [path], "components": [],
+    }, {}, policy) if item.origin == "component")
+    ledger = ObligationAssessmentLedger(
+        session_id="session-1", obligations=(obligation,), obligation_ids=(obligation.id,),
+    )
+    store, record = _store_with_path(path)
+    result = ledger.propose(
+        target="O1", disposition="covered", reason="Reviewed deployment behavior from its source.",
+        evidence_ids=(record.id,), assessed_paths=(path,), next_actions=(),
+        evidence=store.snapshot(), eligible=_assessment_evidence_satisfies,
+    )
+    assert result.accepted
+    assessment = ledger.assessment("O1")
+    if selector:
+        assert assessment.disposition.value == "covered"
+        assert assessment.next_actions == ()
+    else:
+        assert assessment.disposition.value == "partially_covered"
+        assert len(assessment.next_actions) == 1
+        assert assessment.next_actions[0].startswith("Policy configuration blocked:")
+        assert "seed_paths" in assessment.next_actions[0]
+
+
+@pytest.mark.parametrize("requirements,expected", [
+    ([{"id": "result", "category": "test-result", "source_paths": ()}], "Collect"),
+    ([{"id": "source", "category": "workflow or deployment", "source_paths": (),
+       "mode": "optional"}], "covered"),
+    ([{"id": "source", "category": "workflow or deployment", "source_paths": (),
+       "mode": "one_of:proof"},
+      {"id": "result", "category": "test-result", "source_paths": (),
+       "mode": "one_of:proof"}], "Collect"),
+    ([{"id": "source", "category": "workflow or deployment", "source_paths": (),
+       "mode": "one_of:proof"},
+      {"id": "result", "category": "tool-result", "source_paths": (),
+       "mode": "one_of:proof"}], "covered"),
+])
+def test_unresolved_source_diagnostic_preserves_category_and_one_of_semantics(requirements, expected):
+    path = "movieHRdb-ansible/playbook.yml"
+    ledger = _ledger(scope=(path,), owner_component_id="deployment",
+                     evidence_requirements=tuple(requirements))
+    store, record = _store_with_path(path)
+    result = ledger.propose(
+        target="O1", disposition="covered", reason="Reviewed deployment behavior from its source.",
+        evidence_ids=(record.id,), assessed_paths=(path,), next_actions=(),
+        evidence=store.snapshot(), eligible=lambda _record, _obligation: True,
+    )
+    assert result.accepted
+    assessment = ledger.assessment("O1")
+    if expected == "covered":
+        assert assessment.disposition.value == "covered"
+        assert assessment.next_actions == ()
+    else:
+        assert assessment.disposition.value == "partially_covered"
+        assert len(assessment.next_actions) == 1
+        assert assessment.next_actions[0].startswith("Collect")
+        assert "test-result" in assessment.next_actions[0]
+        assert "workflow or deployment" not in assessment.next_actions[0]
+
+
 def test_component_partial_with_no_omitted_paths_requires_explicit_next_action_and_preserves_state():
     paths = ("backend/a.py", "backend/b.py")
     ledger = _ledger(scope=paths, owner_component_id="backend")

@@ -2696,10 +2696,11 @@ def _finding_note(
     start_line = None
     note_line = finding.line
     if remediation is not None and remediation.kind == "exact":
+        replacement = remediation.replacement.rstrip("\n")
         markdown += (
             "\n\n**Suggested change:**\n\n```suggestion\n"
-            + remediation.replacement.rstrip("\n")
-            + "\n```"
+            + (replacement + "\n" if replacement else "")
+            + "```"
         )
         start_line = remediation.start_line
         note_line = remediation.end_line
