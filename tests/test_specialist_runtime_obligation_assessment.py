@@ -1,3 +1,5 @@
+import pytest
+
 from pr_reviewer.specialist_runtime.evidence import EvidenceStore
 from pr_reviewer.specialist_runtime.types import CoverageObligation
 
@@ -628,6 +630,48 @@ def test_component_partial_retains_missing_collective_evidence_hints():
     assert assessment.next_actions == (
         "Collect evidence requirement 'tests' (tests).",
     )
+
+
+@pytest.mark.parametrize("category,mode,seeds,source_path", [
+    ("workflow or deployment", "required", (), ".github/workflows/test.yml"),
+    ("workflow or deployment", "one_of:delivery", (), ".github/workflows/test.yml"),
+    ("project-specific delivery contract", "required", ("contracts/**",), "contracts/delivery.txt"),
+])
+def test_custom_requirement_uses_matching_retained_source_not_category_label(category, mode, seeds, source_path):
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations
+    from pr_reviewer.specialist_runtime.coverage import _assessment_evidence_satisfies
+    from pr_reviewer.specialist_runtime.policy import ReviewPolicy, RecipePolicy, EvidenceRequirementPolicy
+    from pr_reviewer.specialist_runtime.obligation_assessment import ObligationAssessmentLedger
+
+    paths = (".github/workflows/test.yml", "src/other.py")
+    policy = ReviewPolicy.minimal(recipes=(RecipePolicy(
+        id="delivery", title="Delivery", objective="Check delivery.", execution="integrated",
+        match={"paths_any": (".github/workflows/**",)},
+        evidence_requirements=(EvidenceRequirementPolicy(
+            id="source", category=category, mode=mode, seed_paths=seeds,
+            when={"paths_any": (".github/workflows/**",)},
+        ),),
+    ),))
+    obligations = derive_obligations({
+        "changed_files": paths, "components": [{"id": "ci", "changed_files": paths}],
+        "file_roles": ("deployment",),
+    }, {}, policy)
+    obligation = next(item for item in obligations if item.owner_component_id)
+    ledger = ObligationAssessmentLedger(session_id="session-1", obligations=(obligation,),
+                                       obligation_ids=(obligation.id,))
+    store, unrelated = _store_with_path(paths[1])
+    source, _ = store.add_tool_result_with_collection(
+        session_id="session-1", tool="read_file", arguments={"path": source_path},
+        result={"status": "ok", "content": "permissions: contents: read"},
+    )
+    for evidence_id, expected in ((unrelated.id, "partially_covered"), (source.id, "covered")):
+        result = ledger.propose(
+            target="O1", disposition="covered", reason="Reviewed changed workflow permissions.",
+            evidence_ids=(evidence_id,), assessed_paths=paths, omitted_paths=(), next_actions=(),
+            evidence=store.snapshot(), eligible=_assessment_evidence_satisfies,
+        )
+        assert result.accepted
+        assert ledger.assessment("O1").disposition.value == expected
 
 
 def test_component_partial_with_no_omitted_paths_requires_explicit_next_action_and_preserves_state():

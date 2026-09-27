@@ -6465,6 +6465,68 @@ def test_emergency_projection_is_terminal_schema_valid_and_not_publishable(tmp_p
     json.dumps(result.artifact, allow_nan=False)
 
 
+def test_emergency_projection_preserves_candidates_when_coverage_is_still_pending(tmp_path):
+    class InterruptedCoverageController(ReviewController):
+        def _artifact(self, state, path):
+            state.coverage = CoverageLedger(state.obligations)
+            raise ValueError("coverage reconciliation interrupted")
+
+    controller = InterruptedCoverageController(
+        session_factory=_factory, critic=_critic_role, finalizer=_finalizer,
+        clock=lambda: 0.0, artifact_output_root=tmp_path,
+    )
+    result = controller.run(_inputs(tmp_path))
+
+    assert result.artifact_path.is_file()
+    assert result.artifact["accepted_candidates"]
+    assert result.artifact["sessions"]
+    assert result.artifact["evidence"]
+    assert not result.publishing_ready
+    assert all(row["status"] not in {"pending", "assigned"}
+               for row in result.artifact["coverage"].values())
+    assert all(row["status"] != "assigned" for row in result.artifact["recipes"].values())
+
+
+def test_retained_session_has_ownership_even_before_wave_admission(tmp_path):
+    registered = []
+    class OwnershipController(ReviewController):
+        def _retain_session_result(self, state, assignment_id, session_id, result):
+            # A recovered first checkpoint has no prior admitted-wave ownership.
+            state.ownership.pop(session_id, None)
+            super()._retain_session_result(state, assignment_id, session_id, result)
+            registered.append(state.ownership.get(session_id))
+
+    controller = OwnershipController(
+        session_factory=_factory, critic=_critic_role, finalizer=_finalizer,
+        clock=lambda: 0.0, artifact_output_root=tmp_path,
+    )
+    controller.run(_inputs(tmp_path))
+    assert registered and all(registered)
+
+
+@pytest.mark.parametrize("durations,expected", [([], 60), ([20, 40, 90], 40)])
+def test_followup_turn_estimate_uses_completed_requests_not_timeout(tmp_path, durations, expected):
+    from pr_reviewer.specialist_runtime.request_attempts import RequestAttempt
+
+    inputs = replace(_inputs(tmp_path), config=replace(
+        _inputs(tmp_path).config, model_request_timeout_sec=1200,
+    ))
+    state = _RunState(inputs=inputs, journal=EventJournal(),
+                      deadline=RunDeadline(0, 100, PhaseShares()), evidence=EvidenceStore(),
+                      coverage=CoverageLedger(()))
+    state.request_attempts = {
+        str(index): RequestAttempt(
+            sequence=index, request_id=str(index), session_id="S1", assignment_id="A1",
+            phase="initial", turn=index, input_tokens=0, max_output_tokens=8192,
+            admission_tokens=8192, admission_source="test", started_at=0,
+            terminal_at=duration, status="completed",
+        ) for index, duration in enumerate(durations)
+    }
+    reconciliation = CoverageReconciliation(state.coverage.snapshot(), (), (), (), ())
+    proposal = _controller(tmp_path)._negotiation_state(state, reconciliation, 0)
+    assert proposal.seconds_per_turn == expected
+
+
 def test_artifact_root_identity_swap_cannot_redirect_atomic_write(tmp_path):
     root = tmp_path / "owned-root"
     moved = tmp_path / "moved-owned-root"
