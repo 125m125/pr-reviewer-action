@@ -315,10 +315,27 @@ def derive_obligations(
         active_recipes.append((recipe, risk, unresolved))
 
     def requirements(recipes: Iterable[RecipePolicy], local: Mapping[str, Any]) -> tuple[Mapping[str, object], ...]:
+        def source_paths(item) -> tuple[str, ...]:
+            explicit = tuple(dict.fromkeys((*item.seed_paths, *item.related_paths)))
+            if explicit:
+                return explicit
+            # `when` activates a requirement; it does not make arbitrary changed
+            # code test evidence. Infer only recognizable source-role labels.
+            aliases = {"workflow": "deployment", "tests": "test", "generated output": "generated"}
+            roles = {
+                aliases.get(label, label.replace(" ", "-"))
+                for label in item.category.strip().casefold().split(" or ")
+            }
+            return tuple(
+                path for path in _paths(local.get("changed_files"))
+                if roles.intersection(classify_file_roles(path))
+            )
+
         return tuple(
             {"id": f"{recipe.id}:{item.id}", "category": item.category,
              "mode": f"one_of:{recipe.id}:{item.mode[7:]}" if item.mode.startswith("one_of:") else item.mode,
-             "seed_paths": item.seed_paths, "related_paths": item.related_paths}
+             "seed_paths": item.seed_paths, "related_paths": item.related_paths,
+             "source_paths": source_paths(item)}
             for recipe in recipes for item in recipe.evidence_requirements
             if not item.when or _rule_matches(item.when, local, risks)
         )
@@ -340,6 +357,7 @@ def derive_obligations(
             *(invariant for recipe, _, _ in recipes for invariant in recipe.invariants),
         )))
         risk = max(("normal", *(risk for _, risk, _ in recipes)), key=rank.__getitem__)
+        owner_requirements = requirements((recipe for recipe, _, _ in recipes), local)
         obligations.append(CoverageObligation(
             obligation_id=_obligation_id("component", owner, "changed-behavior"),
             origin="component", subject=owner, owner_component_id=owner,
@@ -347,14 +365,17 @@ def derive_obligations(
             satisfaction_predicates=("recorded_evidence",), risk_tier=risk,
             unresolved_policy="block_when_unresolved" if any(v == "block_when_unresolved" for _, _, v in recipes) else "record_unknown",
             scope=paths,
-            seed_hints=tuple(dict.fromkeys((*paths, *(p for recipe, _, _ in recipes for p in (*recipe.seed_paths, *recipe.related_paths))))),
+            seed_hints=tuple(dict.fromkeys((
+                *paths, *(p for recipe, _, _ in recipes for p in (*recipe.seed_paths, *recipe.related_paths)),
+                *(p for requirement in owner_requirements for p in requirement["source_paths"]),
+            ))),
             explanation=("Review changed behavior owned by " + owner
                          + "; unassessed paths and unresolved behavior stay incomplete. "
                          + " ".join(component.get("responsibilities", ()))),
             recipe_objective=" ".join(questions),
             integrated_recipe_ids=tuple(recipe.id for recipe, _, _ in recipes),
             recipe_invariants=invariants,
-            evidence_requirements=requirements((recipe for recipe, _, _ in recipes), local),
+            evidence_requirements=owner_requirements,
             evidence_hints=tuple(dict.fromkeys(hint for recipe, _, _ in recipes for hint in recipe.expected_evidence)),
         ))
 
@@ -368,6 +389,7 @@ def derive_obligations(
                 path in owner_paths.get(owner, ()) for owner in recipe.match["component_ids_any"]
             )
         ))
+        recipe_requirements = requirements((recipe,), active_topology)
         obligations.append(CoverageObligation(
             obligation_id=_obligation_id("recipe", recipe.id, "independent-review"),
             origin="recipe", subject=recipe.id, recipe_id=recipe.id,
@@ -376,9 +398,12 @@ def derive_obligations(
             required_evidence_categories=("tool-result", "implementation", "tests", "test-result", "review"),
             satisfaction_predicates=("recorded_evidence",), risk_tier=risk,
             unresolved_policy=unresolved, scope=paths,
-            seed_hints=tuple(dict.fromkeys((*paths, *recipe.seed_paths, *recipe.related_paths))),
+            seed_hints=tuple(dict.fromkeys((
+                *paths, *recipe.seed_paths, *recipe.related_paths,
+                *(p for requirement in recipe_requirements for p in requirement["source_paths"]),
+            ))),
             explanation=recipe.objective,
-            evidence_requirements=requirements((recipe,), active_topology),
+            evidence_requirements=recipe_requirements,
             evidence_hints=recipe.expected_evidence,
         ))
 

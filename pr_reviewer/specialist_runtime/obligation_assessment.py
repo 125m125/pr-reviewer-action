@@ -113,7 +113,7 @@ def _missing_requirement_actions(
         if record.id in evidence_ids and record.category.strip()
     )
     missing: list[str] = []
-    groups: dict[str, list[tuple[str, str]]] = {}
+    groups: dict[str, list[tuple[str, bool]]] = {}
     for raw in obligation.evidence_requirements:
         if not isinstance(raw, Mapping):
             continue
@@ -122,13 +122,23 @@ def _missing_requirement_actions(
         label = str(raw.get("id", "")).strip() or category or mode
         if mode == "optional":
             continue
+        source_paths = tuple(raw.get("source_paths", ()))
+        # Categories are project-authored labels. Explicit source selectors
+        # take precedence over broad collection category associations.
+        satisfied = any(
+            record.id in evidence_ids and record.is_usable_for_coverage
+            and bool(record.content) and bool(record.source_path)
+            and record.tool in {"read_file", "read_pr_diff", "read_remote_file", "git_grep", "git_blame"}
+            and any(fnmatch.fnmatchcase(record.source_path, pattern) for pattern in source_paths)
+            for record in evidence.records
+        ) if source_paths else category.casefold() in categories
         if mode.startswith("one_of:"):
-            groups.setdefault(mode, []).append((label, category))
-        elif category.casefold() not in categories:
+            groups.setdefault(mode, []).append((category, satisfied))
+        elif not satisfied:
             missing.append(f"Collect evidence requirement '{label}' ({category}).")
     for mode, members in groups.items():
-        if not any(category.casefold() in categories for _label, category in members):
-            choices = ", ".join(category for _label, category in members)
+        if not any(satisfied for _category, satisfied in members):
+            choices = ", ".join(category for category, _satisfied in members)
             missing.append(f"Collect evidence requirement '{mode}' ({choices}).")
     return _actions(missing)
 

@@ -462,3 +462,15 @@ semantics. The permanent [file-role reference](file-roles.md) documents all
 A coverage rule may force the recipe and raise its risk tier, but it
 does not bypass a requirement's `when`. Modes are `required`, `optional`, and
 `one_of:<group>`; one matching evidence category satisfies a `one_of` group.
+
+For source-backed requirements, `category` can be a human-readable label such
+as `workflow or deployment`. The controller checks cited, eligible retained
+source reads against the requirement's `seed_paths`/`related_paths`; when those
+are absent, recognizable file-role labels use changed paths of that role
+(`workflow` maps to `deployment`, `tests` to `test`, `generated output` to
+`generated`; `or` combines alternatives). Reading an unrelated file does not
+satisfy it. For other custom labels, supply explicit source paths. `when` only
+activates the requirement; it does not turn implementation code into test
+evidence. Requirements without source selectors continue to use retained
+evidence categories (for example `test-result`).
+This checks evidence availability, not the truth of the specialist's conclusion.
