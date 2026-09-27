@@ -15,6 +15,7 @@ import inspect
 import json
 import fnmatch
 from math import isfinite
+from statistics import median
 import os
 from pathlib import Path
 import re
@@ -3162,6 +3163,11 @@ class ReviewController:
     def _retain_session_result(
         state: _RunState, assignment_id: str, session_id: str, result: object,
     ) -> None:
+        # Finalization can recover the first usable checkpoint after a wave
+        # cutoff. Register its ownership at the same acceptance point.
+        state.ownership[session_id] = session_ownership_for_assignment(
+            state.assignments[assignment_id], state.obligations, session_id=session_id,
+        )
         key = (assignment_id, session_id)
         state.session_result_sequence += 1
         state.session_results[key] = result
@@ -4061,6 +4067,18 @@ class ReviewController:
             and state.assignments[lead.child_assignment_id].model_turn_limit == 0
             for lead in state.investigation_leads.values()
         )
+        # The timeout is a hard ceiling, not the expected cost of every turn.
+        durations = [
+            item.terminal_at - item.started_at
+            for item in state.request_attempts.values()
+            if item.status == "completed" and item.terminal_at is not None
+            and isfinite(item.terminal_at - item.started_at)
+            and item.terminal_at > item.started_at
+        ]
+        seconds_per_turn = min(
+            float(state.inputs.config.model_request_timeout_sec),
+            max(1.0, median(durations) if durations else 60.0),
+        )
         return NegotiationState(
             obligations=state.obligations,
             coverage=reconciliation.snapshot,
@@ -4069,7 +4087,7 @@ class ReviewController:
             session_ownership=tuple(state.ownership[key] for key in sorted(state.ownership)),
             session_resources=tuple(resources),
             remaining_deadline_sec=state.deadline.remaining_for_exploration(now=self.clock()),
-            seconds_per_turn=float(state.inputs.config.model_request_timeout_sec),
+            seconds_per_turn=seconds_per_turn,
             current_session_count=len(state.assignments),
             # Follow-up sessions run after the initial wave and have their own
             # explicit cap, so include those bounded slots in lifetime capacity.
@@ -7622,7 +7640,12 @@ class ReviewController:
                     existing["model_turns"] = charged_turns
                     emergency_budget_map[session_id] = existing
             emergency_coverage = state.coverage.snapshot()
-            emergency_statuses = dict(emergency_coverage.obligation_statuses)
+            emergency_statuses = {
+                key: ObligationStatus.UNRESOLVED
+                if status in {ObligationStatus.PENDING, ObligationStatus.ASSIGNED}
+                else status
+                for key, status in emergency_coverage.obligation_statuses
+            }
             emergency_evidence = dict(emergency_coverage.evidence_by_obligation)
             artifact = {
                 "schema_version": _SCHEMA_VERSION,
@@ -7700,11 +7723,10 @@ class ReviewController:
                 },
                 "recipes": {
                     item.id: {
-                        "status": state.coverage.recipe_statuses().get(
-                            item.id, "not_applicable",
-                        ),
+                        "status": ("unresolved" if status == "assigned" else status),
                     }
                     for item in inputs.policy.recipes
+                    for status in (state.coverage.recipe_statuses().get(item.id, "not_applicable"),)
                 },
                 "unknowns": list(state.unknowns),
                 "source_access_requests": [
