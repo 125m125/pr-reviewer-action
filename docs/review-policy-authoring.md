@@ -473,4 +473,25 @@ satisfy it. For other custom labels, supply explicit source paths. `when` only
 activates the requirement; it does not turn implementation code into test
 evidence. Requirements without source selectors continue to use retained
 evidence categories (for example `test-result`).
+Prefer explicit requirement-level selectors for repository-specific layouts;
+recipe-level hints do not select evidence for an individual requirement. For
+example, an Ansible folder with a project-name prefix need not classify as
+`deployment`, so select its sources explicitly:
+
+```json
+{
+  "id": "delivery-source",
+  "category": "workflow or deployment",
+  "when": {"paths_any": ["ci/**", ".github/workflows/**", "movieHRdb-ansible/**"]},
+  "seed_paths": ["ci/**", ".github/workflows/**", "movieHRdb-ansible/**"],
+  "mode": "required"
+}
+```
+
+When a human-readable label containing whitespace has no explicit or inferred
+source selectors, unmet coverage reports `Policy configuration blocked` instead
+of repeatedly requesting more collection. Coverage remains incomplete until the
+policy is corrected. Optional requirements remain optional; a `one_of` group
+still accepts another satisfiable alternative. Exact retained-evidence categories
+such as `test-result` keep their category-based behavior.
 This checks evidence availability, not the truth of the specialist's conclusion.

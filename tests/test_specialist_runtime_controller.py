@@ -844,6 +844,17 @@ def test_change_overview_rejects_non_authoritative_claims(proposal, tmp_path):
         controller_module._validated_change_overview(proposal, inputs)
 
 
+@pytest.mark.parametrize("tracked", [("ci/capture-e2e.sh",), ("ci/capture-e2e.sh", "other/capture-e2e.sh")])
+def test_change_overview_resolves_only_unique_basename(tmp_path, tracked):
+    inputs = replace(_inputs(tmp_path), changed_files=("ci/capture-e2e.sh",), tracked_paths=tracked)
+    proposal = {"overview": "Updates capture-e2e.sh to retain browser diagnostics."}
+    if len(tracked) == 1:
+        assert controller_module._validated_change_overview(proposal, inputs)["overview"] == proposal["overview"]
+    else:
+        with pytest.raises(ValueError, match="path reference"):
+            controller_module._validated_change_overview(proposal, inputs)
+
+
 def test_change_overview_accepts_descriptive_verdict_and_coverage_terms(tmp_path):
     inputs = replace(
         _inputs(tmp_path),
@@ -1583,7 +1594,20 @@ def test_invalid_remediation_is_omitted_without_losing_finding(tmp_path):
     assert result.artifact["remediation"]["diagnostics"][0]["status"] == "rejected"
 
 
-def test_controller_generates_exact_remediation_from_retained_diff(tmp_path):
+@pytest.mark.parametrize("replacement_fields, expected_suggestion", [
+    ({"replacement": "def process(): return process_once()"},
+     "```suggestion\ndef process(): return process_once()\n```"),
+    ({"replacement": ""}, "```suggestion\n```"),
+    ({}, None),
+    ({"replacement": None}, None),
+    ({"replacement": 123}, None),
+    ({"replacement": False}, None),
+    ({"replacement": []}, None),
+    ({"replacement": {}}, None),
+])
+def test_controller_generates_exact_remediation_from_retained_diff(
+    tmp_path, replacement_fields, expected_suggestion,
+):
     class DiffSession(_SuccessfulSession):
         def explore(self):
             result = super().explore()
@@ -1631,12 +1655,32 @@ def test_controller_generates_exact_remediation_from_retained_diff(tmp_path):
         session_factory=factory,
         remediator=lambda _request: {
             "kind": "exact", "start_line": 7, "end_line": 7,
-            "replacement": "def process(): return process_once()",
+            **replacement_fields,
         },
     ).run(_inputs(tmp_path))
 
-    assert "```suggestion" in result.notes[0].markdown
-    assert result.artifact["remediation"]["generated"] == 1
+    if expected_suggestion is None:
+        assert "```suggestion" not in result.notes[0].markdown
+        assert result.artifact["remediation"]["generated"] == 0
+        assert result.artifact["remediation"]["diagnostics"][0]["status"] == "rejected"
+    else:
+        from pr_reviewer.github_review_notes import (
+            build_review_thread_variables, normalize_note,
+        )
+
+        assert expected_suggestion in result.notes[0].markdown
+        assert result.artifact["remediation"]["generated"] == 1
+        normalized = normalize_note(
+            result.notes[0],
+            "diff --git a/src/worker.py b/src/worker.py\n"
+            "--- a/src/worker.py\n+++ b/src/worker.py\n"
+            "@@ -6,2 +6,2 @@\n context\n+def process(): pass\n",
+            ("src/worker.py",),
+        )
+        payload = build_review_thread_variables("review-id", normalized)
+        assert expected_suggestion in payload["body"]
+        assert payload["line"] == 7
+        assert payload["side"] == "RIGHT"
 
 
 def test_exact_remediation_uses_authoritative_diff_even_when_finding_did_not_cite_it(
@@ -2643,7 +2687,8 @@ def test_gateway_negotiator_receives_compact_targets_and_re_evaluates_each_wave(
     assert [event.payload["round"] for event in result.events if event.kind == "negotiation_round"] == [1, 2]
 
 
-def test_unproductive_followup_retires_target_and_tries_a_different_one(tmp_path):
+@pytest.mark.parametrize("failed_evidence", [False, True])
+def test_unproductive_followup_retires_target_and_tries_a_different_one(tmp_path, failed_evidence):
     request_count = 0
 
     class Gateway:
@@ -2672,6 +2717,13 @@ def test_unproductive_followup_retires_target_and_tries_a_different_one(tmp_path
     class NoProgressSession(_ResumeSession):
         def explore(self):
             self.calls += 1
+            if failed_evidence:
+                self.evidence_store.add_tool_result(
+                    session_id=self.session_id, tool="read_file",
+                    arguments={"path": f"missing-{self.calls}.py"},
+                    result={"status": "error", "error": "file not found"},
+                    category="implementation",
+                )
             checkpoint = SessionCheckpoint(
                 session_id=self.session_id,
                 state=SessionState.CHECKPOINT,
@@ -4279,6 +4331,73 @@ def test_handoff_length_failure_gets_focused_repair(tmp_path):
     result = _controller(tmp_path, finalizer=summarizer).run(_inputs(tmp_path))
     assert len(requests) == 2
     assert "The worker retries failed delivery." in result.handoff.markdown
+
+
+def test_handoff_preserves_good_fields_when_focus_repair_repeats_claim(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    original = ReviewController._apply_handoff_summary_proposal
+    claim = "A retry can process one delivery twice"
+
+    def with_claim(self, state, base, proposal, **kwargs):
+        state.review = replace(state.review, accepted=(SimpleNamespace(
+            claim=claim, user_visible_consequence="",
+        ),))
+        try:
+            return original(self, state, base, proposal, **kwargs)
+        finally:
+            state.review = replace(state.review, accepted=())
+
+    monkeypatch.setattr(ReviewController, "_apply_handoff_summary_proposal", with_claim)
+    proposal = {
+        "what_changed_summary": "The worker now retries transient delivery failures.",
+        "ai_reviewed_summary": "The review traced worker cancellation and cleanup.",
+        "human_focus": claim,
+    }
+    result = _controller(tmp_path, finalizer=lambda _request: proposal).run(_inputs(tmp_path))
+    assert result.handoff.what_changed == (proposal["what_changed_summary"],)
+    assert result.handoff.ai_reviewed == (proposal["ai_reviewed_summary"],)
+    assert claim not in " ".join(result.handoff.human_focus)
+    assert any(e["kind"] == "handoff_summary_field_rejected" for e in result.artifact["events"])
+
+
+def test_accepted_finding_resolves_only_linked_or_same_test_leads(tmp_path):
+    from types import SimpleNamespace
+    state = _RunState(
+        inputs=_inputs(tmp_path), journal=EventJournal(),
+        deadline=RunDeadline(0.0, 90.0, PhaseShares()), evidence=EvidenceStore(),
+    )
+    record = state.evidence.add_tool_result(
+        session_id="s1", tool="read_test_results", arguments={},
+        result={"status": "ok", "content": "pkg.SchemaTest::validEntities failed"},
+        category="test-result",
+    )
+    finding = SimpleNamespace(
+        candidate_id="root:1", contributor_candidate_ids=("draft:1",),
+        affected_file="tests/SchemaTest.java", supporting_evidence_ids=(record.id,),
+        confidence_rationale="consequence_support:failing_behavioral_test; test=pkg.SchemaTest::validEntities; observed=missing entity",
+    )
+    state.review = replace(state.review, accepted=(finding,))
+    lead = InvestigationLead(
+        lead_id="same-test", summary="SchemaTest::validEntities fails because an entity is missing",
+        affected_paths=("tests/SchemaTest.java",), evidence_ids=(record.id,),
+        next_action="Inspect the expectation", required_capability="repository",
+        origin_session_id="s2", status=InvestigationLeadStatus.BLOCKED,
+    )
+    state.investigation_leads = {
+        "same-test": lead,
+        "linked": replace(lead, lead_id="linked", summary="Original candidate", candidate_ids=("draft:1",)),
+        "different": replace(lead, lead_id="different", summary="SchemaTest::anotherTest has an unrelated failure"),
+        "prefix": replace(lead, lead_id="prefix", summary="SchemaTest::validEntitiesAfterMigration fails"),
+        "parameterized": replace(lead, lead_id="parameterized", summary="SchemaTest::validEntities[other] fails"),
+        "no-evidence": replace(lead, lead_id="no-evidence", evidence_ids=()),
+    }
+    _controller(tmp_path)._resolve_reported_leads(state)
+    assert state.investigation_leads["same-test"].status is InvestigationLeadStatus.RESOLVED_CANDIDATE
+    assert state.investigation_leads["linked"].candidate_ids == ("root:1",)
+    assert state.investigation_leads["different"].status is InvestigationLeadStatus.BLOCKED
+    assert state.investigation_leads["prefix"].status is InvestigationLeadStatus.BLOCKED
+    assert state.investigation_leads["parameterized"].status is InvestigationLeadStatus.BLOCKED
+    assert state.investigation_leads["no-evidence"].status is InvestigationLeadStatus.BLOCKED
 
 
 def test_handoff_summarizer_gets_one_focused_semantic_repair(tmp_path, monkeypatch):

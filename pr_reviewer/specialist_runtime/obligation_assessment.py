@@ -113,7 +113,15 @@ def _missing_requirement_actions(
         if record.id in evidence_ids and record.category.strip()
     )
     missing: list[str] = []
-    groups: dict[str, list[tuple[str, bool]]] = {}
+    groups: dict[str, list[tuple[str, bool, bool]]] = {}
+
+    def policy_blocked(label: str) -> str:
+        return (
+            f"Policy configuration blocked: evidence requirement '{label}' has no "
+            "resolved source selectors; configure requirement seed_paths or related_paths. "
+            "Further collection cannot resolve this source requirement."
+        )
+
     for raw in obligation.evidence_requirements:
         if not isinstance(raw, Mapping):
             continue
@@ -132,14 +140,22 @@ def _missing_requirement_actions(
             and any(fnmatch.fnmatchcase(record.source_path, pattern) for pattern in source_paths)
             for record in evidence.records
         ) if source_paths else category.casefold() in categories
+        # Derivation always supplies source_paths. Friendly source labels are
+        # not executable category names when their source inference found none.
+        unresolved_source = (
+            "source_paths" in raw and not source_paths
+            and any(character.isspace() for character in category)
+        )
         if mode.startswith("one_of:"):
-            groups.setdefault(mode, []).append((category, satisfied))
+            groups.setdefault(mode, []).append((category, satisfied, unresolved_source))
         elif not satisfied:
-            missing.append(f"Collect evidence requirement '{label}' ({category}).")
+            missing.append(policy_blocked(label) if unresolved_source else
+                           f"Collect evidence requirement '{label}' ({category}).")
     for mode, members in groups.items():
-        if not any(satisfied for _category, satisfied in members):
-            choices = ", ".join(category for category, _satisfied in members)
-            missing.append(f"Collect evidence requirement '{mode}' ({choices}).")
+        if not any(satisfied for _category, satisfied, _unresolved in members):
+            choices = ", ".join(category for category, _satisfied, unresolved in members if not unresolved)
+            missing.append(f"Collect evidence requirement '{mode}' ({choices})."
+                           if choices else policy_blocked(mode))
     return _actions(missing)
 
 
