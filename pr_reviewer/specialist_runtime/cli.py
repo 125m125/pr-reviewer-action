@@ -1929,11 +1929,14 @@ def _component_coverage_summary(artifact: Mapping[str, object]) -> list[str]:
     rows = [item for item in coverage.values() if isinstance(item, Mapping)] if isinstance(coverage, Mapping) else []
     if not rows:
         return []
-    lines = ["", "## Component coverage", "", "| Owner / boundary | Status | Assessed / changed paths |", "| --- | --- | ---: |"]
+    lines = ["", "## Component coverage", "", "| Component or boundary / participant | Status | Assessed / changed paths |", "| --- | --- | ---: |"]
     for item in rows[:40]:
         name = item.get("owner_component_id") or item.get("boundary_id") or item.get("subject", "other")
         if item.get("participant_id"):
-            name = f"{name} / {item['participant_id']}"
+            name = f"{item.get('boundary_id') or item.get('subject', 'boundary')} / {item['participant_id']}"
+            owner = item.get("owner_component_id")
+            if owner and owner != item["participant_id"]:
+                name += f" (owner: {owner})"
         assessed = len(item.get("assessed_paths", ()))
         total = len(item.get("scope", ()))
         counts = "—" if item.get("evaluator_owned") else f"{assessed}/{total}"

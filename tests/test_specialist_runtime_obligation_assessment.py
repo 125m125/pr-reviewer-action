@@ -123,6 +123,33 @@ def test_closed_disposition_rejects_next_actions():
         )
 
 
+def test_unknown_evidence_rejection_only_advertises_eligible_known_ids():
+    ledger = _ledger()
+    store, direct = _store_with_path()
+    supplemental, _collection = store.add_tool_result_with_collection(
+        session_id="session-1", tool="read_pr_diff",
+        arguments={"path": "tests/test_workflow.py"},
+        result={"status": "ok", "content": "supporting test"},
+    )
+    unknown_ids = ("evidence:missing", direct.id + "-typo")
+
+    result = ledger.propose(
+        target="O1", disposition="covered", reason="Wiring is correct.",
+        evidence_ids=(direct.id, *unknown_ids, supplemental.id), next_actions=(),
+        evidence=store.snapshot(),
+        eligible=lambda record, _obligation: record.id == direct.id,
+    )
+
+    assert result.accepted is False
+    assert result.eligible_evidence_ids == (direct.id,)
+    assert result.ignored_supplemental_evidence_ids == (supplemental.id,)
+    assert all(evidence_id in result.reason for evidence_id in unknown_ids)
+    assessment = ledger.assessment("O1")
+    assert assessment.disposition.value == "pending"
+    assert assessment.evidence_ids == ()
+    assert assessment.attempts[-1].validation_reason == result.reason
+
+
 def test_open_dispositions_retain_next_actions():
     for disposition in ("unresolved", "blocked", "exhausted"):
         ledger = _ledger(risk_tier="high")
@@ -533,7 +560,8 @@ def test_boundary_not_applicable_rejects_unknown_evidence_without_crashing():
     )
 
     assert result.accepted is False
-    assert result.reason == "proposal references unknown retained evidence"
+    assert result.reason == "proposal references unknown retained evidence: evidence:missing"
+    assert result.eligible_evidence_ids == ()
 
 
 def test_component_covered_downgrades_until_collective_evidence_requirements_are_met():

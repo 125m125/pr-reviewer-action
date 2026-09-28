@@ -43,6 +43,7 @@ from .request_attempts import RequestAttemptJournal
 from .performance import request_performance
 from .test_results import retain_test_result
 from .types import (
+    CHECKPOINT_TURN_RESERVE as _CHECKPOINT_TURN_RESERVE,
     BudgetUsage,
     CandidateFinding,
     change_overview_orientation,
@@ -704,7 +705,6 @@ _RECOVERY_REASONS = frozenset({
     "invalid-provider-history",
     "transport-incompatibility",
 })
-_CHECKPOINT_TURN_RESERVE = 2
 _CANDIDATE_RETENTION_UNKNOWN = "candidate-retention-unknown"
 _MAX_CHECKPOINT_CANDIDATE_IDS = 20
 _MAX_CHECKPOINT_CANDIDATE_ID_CHARS = 256
@@ -1585,6 +1585,7 @@ class SpecialistSession:
         self._compacted_evidence_generation = 0
         self._last_compact_progress_fingerprint = ""
         self._disposition_pass_attempted = False
+        self._disposition_pass_interrupted = False
         self._disposition_pass_diagnostics: list[dict[str, object]] = []
         self._last_checkpoint_should_resume = True
         self._last_checkpoint_dropped_keys: tuple[str, ...] = ()
@@ -2488,6 +2489,10 @@ class SpecialistSession:
         # Freeze accepted ledgers before handing control to a fallible callback.
         # This excludes conversation history and partially parsed responses.
         self._snapshot()
+        if (purpose == "checkpoint-change-correction"
+                and self.lease.phase is not RunPhase.FINALIZATION
+                and self.budget.remaining_model_turns() <= 1):
+            raise BudgetExhausted("final accounting model turn reserved")
         remaining_output_tokens = self.budget.remaining_output_tokens()
         if remaining_output_tokens is not None and remaining_output_tokens <= 0:
             raise BudgetExhausted("output token limit exhausted")
@@ -2576,6 +2581,8 @@ class SpecialistSession:
             self.request_timeout_sec, now=self.clock(),
         )
         self._reserve_model_turn()
+        if tools_enabled:
+            self._disposition_pass_interrupted = False
         self._request_turn += 1
         request_id = f"{self.session_id}:model:{self._request_turn}"
         schema_name = self._request_schema_name(schema)
@@ -7653,6 +7660,10 @@ class SpecialistSession:
             return
         self._disposition_pass_attempted = True
         for offset in range(0, min(len(pending), 40), 4):
+            if reason != "completion" and self.budget.remaining_model_turns() <= 1:
+                # Keep the final turn for accounting under the finalization lease.
+                self._disposition_pass_attempted = False
+                break
             self._settle_obligation_batch(reason, pending[offset:offset + 4])
             if self._disposition_pass_diagnostics[-1]["status"] != "completed":
                 break
@@ -7731,6 +7742,7 @@ class SpecialistSession:
             )
         except Exception as exc:
             diagnostic.update(status="unavailable", error=format_callback_error(exc, limit=300))
+            self._disposition_pass_interrupted = isinstance(exc, TimeoutError)
             if isinstance(exc, BudgetExhausted):
                 del self.conversation.events[request_start:]
             # Failure diagnostics belong in the artifact, not another prompt.
@@ -7789,7 +7801,7 @@ class SpecialistSession:
         self.lease.request_timeout(
             self.request_timeout_sec, now=self.clock(),
         )
-        if self._checkpoint_recovery_required:
+        if self._checkpoint_recovery_required and not self._disposition_pass_interrupted:
             # Exploration may have been interrupted after the previous
             # checkpoint. Give the same session one bounded, tools-disabled
             # checkpoint turn so conclusions from that tail are not silently
@@ -7799,6 +7811,11 @@ class SpecialistSession:
                 "interrupted-exploration",
                 disposition=CheckpointDisposition.PAUSE,
             )
+        if self._disposition_pass_interrupted:
+            # No research followed the retained checkpoint: retry only its
+            # interrupted accounting, once, within the remaining hard budgets.
+            self._disposition_pass_attempted = False
+            self._disposition_pass_interrupted = False
         self.state = SessionState.FINALIZING
         self._settle_pending_obligations("completion")
         self._synthesize_defect_leads()

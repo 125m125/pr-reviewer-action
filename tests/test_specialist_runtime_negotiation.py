@@ -186,11 +186,11 @@ def state_for(
         ),
         session_resources=resources or (
             SessionResources(
-                "S1", remaining_model_turns=4, remaining_tool_calls=3,
+                "S1", remaining_model_turns=5, remaining_tool_calls=3,
                 lease_remaining_sec=100.0,
             ),
             SessionResources(
-                "S2", remaining_model_turns=4, remaining_tool_calls=3,
+                "S2", remaining_model_turns=5, remaining_tool_calls=3,
                 lease_remaining_sec=100.0,
             ),
         ),
@@ -206,6 +206,15 @@ def state_for(
         new_session_lease_remaining_sec=new_session_lease_remaining_sec,
         investigation_leads=investigation_leads,
     )
+
+
+def test_followup_keeps_checkpoint_repair_and_accounting_capacity():
+    state = state_for(max_sessions=2)
+    state = replace(state, session_resources=tuple(
+        replace(resource, remaining_model_turns=3)
+        for resource in state.session_resources
+    ))
+    assert fallback_next_action(state).kind == "record_unknown"
 
 
 def test_compact_negotiation_routes_open_lead_to_capable_existing_session():
@@ -1119,11 +1128,11 @@ def test_planner_secondary_owner_can_be_selected_for_consultation():
         session_ownership=ownership,
         resources=(
             SessionResources(
-                "S1", remaining_model_turns=3, lease_remaining_sec=100.0,
+                "S1", remaining_model_turns=4, lease_remaining_sec=100.0,
                 remaining_tool_calls=3,
             ),
             SessionResources(
-                "S2", remaining_model_turns=3, lease_remaining_sec=100.0,
+                "S2", remaining_model_turns=4, lease_remaining_sec=100.0,
                 remaining_tool_calls=3,
             ),
         ),
@@ -1384,7 +1393,7 @@ def test_negotiation_uses_explicit_session_to_specialist_assignment_ownership():
             primary_obligation_ids=("OB1",),
         ),),
         resources=(SessionResources(
-            "durable-session-9", remaining_model_turns=4, lease_remaining_sec=100.0,
+            "durable-session-9", remaining_model_turns=5, lease_remaining_sec=100.0,
             remaining_tool_calls=3,
         ),),
     )
