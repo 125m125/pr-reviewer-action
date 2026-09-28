@@ -110,6 +110,43 @@ class TestMaskSecrets:
 
 
 class TestMaskSourceSecrets:
+    @pytest.mark.parametrize("separator", (" ", "\t", "\n"))
+    def test_empty_shell_password_preserves_following_assignment(self, separator):
+        source = f"export NEXUS_PASSWORD={separator}MOVIEHRDB_TEST_VALUE=123"
+
+        assert mask_source_secrets(source) == (source, 0)
+
+    def test_empty_shell_password_does_not_hide_following_secret(self):
+        source = "export NEXUS_PASSWORD= API_TOKEN=actual_secret_value"
+
+        assert mask_source_secrets(source) == (
+            "export NEXUS_PASSWORD= API_TOKEN=[REDACTED_VALUE]", 1
+        )
+
+    def test_unclosed_quote_does_not_consume_next_source_line(self):
+        source = 'password="short\nnext_setting="visible_value"'
+
+        assert mask_source_secrets(source) == (source, 0)
+
+    @pytest.mark.parametrize("source, expected", (
+        ('password="literal with spaces" NEXT=123',
+         'password="[REDACTED_VALUE]" NEXT=123'),
+        (r'password="literal\" with spaces" NEXT=123',
+         'password="[REDACTED_VALUE]" NEXT=123'),
+        ("password='literal with spaces' NEXT=123",
+         "password='[REDACTED_VALUE]' NEXT=123"),
+        ('password: "literal with spaces"', 'password: "[REDACTED_VALUE]"'),
+        ("password: literal_secret", "password: [REDACTED_VALUE]"),
+        ("password = literal_secret", "password = [REDACTED_VALUE]"),
+        ("password = literal_secret==", "password = [REDACTED_VALUE]"),
+        ("password= ABCDEFGH==", "password= [REDACTED_VALUE]"),
+        ('password="NEXT=actual_secret"', 'password="[REDACTED_VALUE]"'),
+        ("password=literal_secret==", "password=[REDACTED_VALUE]"),
+        (r'password="abcdef\\"', 'password="[REDACTED_VALUE]"'),
+    ))
+    def test_literal_password_remains_fully_redacted(self, source, expected):
+        assert mask_source_secrets(source) == (expected, 1)
+
     @pytest.mark.parametrize("reference", (
         "{api_token}", "$TOKEN", "${TOKEN}", "%TOKEN%", "api_token",
         "settings.auth.api_token",

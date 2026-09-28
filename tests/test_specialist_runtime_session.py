@@ -545,6 +545,94 @@ def test_candidate_rejection_identifies_acceptable_evidence_and_failed_predicate
     assert any(record.id in hint and "a.py" in hint for hint in payload["repair_hints"])
 
 
+def test_candidate_repair_includes_pathless_tests_not_truncated_proof():
+    session = make_session(ScriptedGateway([]))
+    test = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="ci_test_results", arguments={"name": "test_cursor"},
+        result={"status": "ok", "content": "test_cursor failed: expected 2, got 3"},
+        category="test-result", source="retained-tool-result",
+    )
+    pom = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file", arguments={"path": "pom.xml"},
+        result={"status": "ok", "content": "<project>"}, category="implementation", source="pom.xml",
+    )
+    pom = replace(pom, truncated=True)
+    diagnostic = session._candidate_rejection_diagnostic(
+        "consequence-not-supported", retained={test.id: test, pom.id: pom}, lead="",
+        candidate={"supporting_evidence_ids": [test.id, pom.id]},
+    )
+    assert [item["evidence_id"] for item in diagnostic["acceptable_evidence"]] == [test.id]
+    assert diagnostic["acceptable_evidence"][0]["test_name"] == "test_cursor"
+    assert any(pom.id in hint and "truncated" in hint for hint in diagnostic["repair_hints"])
+
+
+def test_checkpoint_admits_nested_candidate_drafts_without_shape_repair():
+    session = make_session(ScriptedGateway([]))
+    session._execute_calls(({
+        "id": "read-nested", "name": "read_file", "arguments": json.dumps({"path": "a.py"}),
+    },))
+    raw = json.loads(candidate_checkpoint_response(["nested-defect"]).text)
+    draft = raw["new_candidates"][0]
+    raw["new_candidates"] = []
+    raw["obligation_updates"] = [{
+        "target": "O1", "disposition": "covered", "reason": "Implementation inspected.",
+        "evidence_ids": draft["supporting_evidence_ids"], "next_actions": [],
+        "defect_assessment": {"result": "candidates", "summary": "Defect identified.",
+                              "candidate_drafts": [draft]},
+    }]
+    assert session._checkpoint_from_text(json.dumps(raw)) is not None
+    assert len(session.candidate_findings) == 1
+    raw["new_candidates"] = [draft]
+    assert session._checkpoint_from_text(json.dumps(raw)) is not None
+    assert len(session.candidate_findings) == 1
+    assert not session.gateway.requests
+    invalid = dict(draft, candidate_id="invalid-nested")
+    invalid.pop("severity")
+    raw["obligation_updates"][0]["defect_assessment"]["candidate_drafts"] = [invalid]
+    assert session._checkpoint_from_text(json.dumps(raw)) is not None
+    assert len(session.candidate_findings) == 1
+    assert len(session._last_checkpoint_rejections) == 1
+    assert "severity" in session._last_checkpoint_rejections[0].reason
+
+
+def test_completed_followup_checkpoint_does_not_resume_stale_actions():
+    response = checkpoint_response(
+        inspected=[], unresolved=[], obligation_updates=[{
+            "target": "O2", "disposition": "blocked", "reason": "Needs author confirmation.",
+            "evidence_ids": [], "next_actions": [],
+        }],
+    )
+    session = make_session(ScriptedGateway([response]))
+    for target in session.obligation_assessments.handles():
+        session.obligation_assessments.propose(
+            target=target, disposition="unresolved", reason="Consumer inspection remains.",
+            evidence_ids=(), next_actions=("Read the consumer.",), evidence=session.evidence_store.snapshot(),
+            eligible=lambda record, obligation: True,
+        )
+    session.apply_coverage_feedback(["OB-tests"])
+    result = session._checkpoint_and_resume("context-pressure")
+    assert not result.degraded
+    assert len(session.gateway.requests) == 1
+    assert not session._last_checkpoint_should_resume
+
+
+def test_prefill_incompatibility_is_shared_between_sessions_not_gateways():
+    error = ModelRequestError("provider rejected request", status=500,
+                             body="Assistant response prefill is incompatible with enable_thinking.")
+    done = checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])
+    gateway = ScriptedGateway([error, done, done])
+    first, second = make_session(gateway), make_session(gateway)
+    for session in (first, second):
+        session.conversation.add_assistant_turn(reasoning="Continue investigation", content="Partial", calls=())
+        session.explore()
+    assert json.loads(gateway.requests[2].messages)[-1]["role"] == "user"
+    other_gateway = ScriptedGateway([done])
+    other = make_session(other_gateway)
+    other.conversation.add_assistant_turn(reasoning="Continue investigation", content="Partial", calls=())
+    other.explore()
+    assert json.loads(other_gateway.requests[0].messages)[-1]["role"] == "assistant"
+
+
 @pytest.mark.parametrize("proof,expected", [
     ({"kind": "violated_invariant", "obligation_target": "O1", "contract": "permissions must suffice", "violation": "wrong result"}, "exact selector"),
     ({"kind": "violated_invariant", "obligation_target": "O1", "contract": "predicate_index:99", "violation": "wrong result"}, "available for O1"),

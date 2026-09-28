@@ -101,6 +101,8 @@ class OpenAIModelGateway:
     stream_watchdog: bool = True
     structured_chat_template_kwargs: Mapping[str, Any] = field(default_factory=dict)
     transport: Transport | None = None
+    # Shared by specialist sessions in this run; never persisted across endpoints.
+    assistant_prefill_unsupported: bool = field(default=False, init=False)
     _performance_rows: list[dict[str, int | float | None]] = field(default_factory=list, init=False, repr=False, compare=False)
     _performance_lock: Any = field(default_factory=Lock, init=False, repr=False, compare=False)
 

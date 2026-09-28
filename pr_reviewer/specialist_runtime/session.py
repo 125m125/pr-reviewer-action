@@ -1563,7 +1563,6 @@ class SpecialistSession:
         }
         self._candidate_retention_signal = _CandidateRetentionSignal()
         self.continuation_blocked = False
-        self._prefill_unsupported = False
         self._continuation_scope = ""
         self._followup_assessment_versions: dict[str, int] = {}
         self.latest_checkpoint = self._project_checkpoint(())
@@ -1907,6 +1906,21 @@ class SpecialistSession:
     def _assessment_needs_followup_outcome(self, assessment: ObligationAssessment) -> bool:
         version = self._followup_assessment_versions.get(assessment.obligation_id)
         return version is not None and assessment.assessment_version <= version
+
+    def _followup_outcome_recorded(self) -> bool:
+        return bool(self._followup_assessment_versions) and all(
+            not self._assessment_needs_followup_outcome(assessment)
+            for assessment in self.obligation_assessments.assessments()
+            if assessment.obligation_id in self._followup_assessment_versions
+        )
+
+    def _current_continuation_scope(self) -> str:
+        if self._followup_outcome_recorded():
+            return (
+                " The selected follow-up outcome is already recorded. Do not repeat its "
+                "actions or reopen remaining gaps; end exploration for controller checkpointing."
+            )
+        return self._continuation_scope
 
     def _checkpoint_obligation_contract(self) -> str:
         pending: list[dict[str, object]] = []
@@ -2780,11 +2794,11 @@ class SpecialistSession:
                 and self.conversation.events[-2]["kind"]
                 in {"assistant_reasoning", "assistant_text"}
             )
-            if self._prefill_unsupported and assistant_ended:
+            if getattr(self.gateway, "assistant_prefill_unsupported", False) and assistant_ended:
                 self.conversation.add_user(
                     "The server cannot continue an assistant prefill. Continue "
                     "the investigation from the retained history; tools remain enabled."
-                    + self._continuation_scope
+                    + self._current_continuation_scope()
                 )
                 request_purpose = "exploration-prefill-fallback"
                 assistant_ended = False
@@ -2802,12 +2816,11 @@ class SpecialistSession:
                     and "assistant response prefill is incompatible with enable_thinking"
                     in f"{exc} {exc.body}".casefold()
                     and assistant_ended
-                    and not self._prefill_unsupported
                 ):
                     # Some thinking templates cannot continue an assistant prefill.
                     # Keep the partial reasoning, but start a new assistant turn.
                     # The loop still enforces the normal context/time/turn budget.
-                    self._prefill_unsupported = True
+                    self.gateway.assistant_prefill_unsupported = True
                     continue
                 if (isinstance(exc, TimeoutError)
                     and isinstance(exc.__cause__, ModelRequestError)
@@ -3585,16 +3598,30 @@ class SpecialistSession:
             *retained,
         )))
         acceptable_evidence = [
-            {"evidence_id": record.id, "source_path": record.source_path}
+            {"evidence_id": record.id, "source_path": record.source_path,
+             **({"category": record.category, "tool": record.tool, "source": record.source_identity}
+                if not record.source_path else {}),
+             **({"test_name": str(json.loads(record.arguments).get("name", ""))[:200]}
+                if record.tool == "ci_test_results" else {})}
             for evidence_id in ordered_ids
             if (record := retained[evidence_id]).is_usable_for_coverage
-            and record.source_path
+            and record.content.strip() and not record.truncated
         ][:12]
         hints = self._candidate_repair_hints(reason)
+        for value in preferred:
+            evidence_id = _resolve_retained_evidence_id(value, retained)
+            if evidence_id is not None:
+                record = retained[evidence_id]
+                if record.truncated or not record.content.strip():
+                    hints.append(
+                        f"{record.id} is {'truncated' if record.truncated else 'empty'}: "
+                        "retain it as background if useful, but remove it from consequence-proof "
+                        "citations or retrieve complete evidence. Keep other valid proof citations."
+                    )
         if acceptable_evidence:
             hints.append(
                 "available retained evidence (availability alone does not prove the consequence): " + ", ".join(
-                    f"{item['evidence_id']} ({item['source_path']})"
+                    f"{item['evidence_id']} ({item['source_path'] or item.get('tool') or item.get('source')})"
                     for item in acceptable_evidence
                 )
             )
@@ -5241,6 +5268,10 @@ class SpecialistSession:
                 self.budget.reset_no_progress_streak("checkpoint semantic progress")
                 self._compacted_evidence_generation += 1
                 self._last_checkpoint_should_resume = True
+            if self._followup_outcome_recorded():
+                # Completing a selected follow-up does not close remaining component gaps.
+                # Return those to the scheduler instead of replaying the original task.
+                self._last_checkpoint_should_resume = False
             self._checkpoint_spans.append(_CheckpointSpan(
                 request_start=checkpoint_request_start,
                 response_end=len(self.conversation.events),
@@ -5288,6 +5319,14 @@ class SpecialistSession:
             return ()
         else:
             candidate_payloads = []
+        # Tolerate the obligation tool's draft envelope without advertising a
+        # second checkpoint format. Admission and rejection diagnostics stay shared.
+        updates = raw.get("obligation_updates", [])
+        for update in updates if isinstance(updates, list) else ():
+            assessment = update.get("defect_assessment") if isinstance(update, Mapping) else None
+            drafts = assessment.get("candidate_drafts") if isinstance(assessment, Mapping) else None
+            if isinstance(drafts, list):
+                candidate_payloads.extend(value for value in drafts if value not in candidate_payloads)
         for index, value in enumerate(candidate_payloads, start=1):
             candidate_label = (
                 str(value.get("candidate_id") or "").strip()
@@ -6760,7 +6799,7 @@ class SpecialistSession:
             "kind": "user",
             "content": (
                 "Validated checkpoint epoch compacted. Tool access is re-enabled "
-                "for exploration. " + self._continuation_scope + " Use the "
+                "for exploration. " + self._current_continuation_scope() + " Use the "
                 "proposed next actions only within the selected task; use read_compacted_evidence only for "
                 "catalogued IDs:\n"
                 + json.dumps(continuation, sort_keys=True)
