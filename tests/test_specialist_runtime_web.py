@@ -681,9 +681,82 @@ def test_search_provider_uses_dns_pinned_transport_and_canonical_endpoint():
         resolver=public_resolver,
     )
 
-    assert provider.search("api support", limit=5) == ()
+    assert tuple(provider.search("api support", limit=5)) == ()
     assert transport.requests[0].url == expected
     assert transport.requests[0].resolved_ip == PUBLIC_IP
+
+
+@pytest.mark.parametrize("results, expected", [([], "inconclusive"), ([{
+    "title": "Docs", "url": "https://docs.example.com/api", "content": "API",
+}], "partial")])
+def test_search_surfaces_engine_failures_without_leaking_provider_messages(results, expected):
+    transport = FakeHttpTransport({
+        "https://search.example.com/search?q=api&format=json": HttpResponse(
+            200, {"content-type": "application/json"}, json.dumps({
+                "results": results,
+                "unresponsive_engines": [["duckduckgo", "CAPTCHA"],
+                    ["brave", "Suspended: too many requests"],
+                    ["duckduckgo", "CAPTCHA"],
+                    ["other", "internal URL with secret"], None],
+            }).encode(),
+        ),
+    })
+    payload = discover("api", SearxngSearchProvider(
+        "https://search.example.com/search", transport=transport, resolver=public_resolver,
+    ), source_policy()).as_dict()
+    assert payload["search_status"] == expected
+    assert payload["engine_warnings"] == [
+        {"engine": "duckduckgo", "reason": "captcha"},
+        {"engine": "brave", "reason": "rate_limited"},
+        {"engine": "other", "reason": "unavailable"},
+    ]
+    assert payload["suppressed_result_count"] == 0
+    assert "internal URL" not in json.dumps(payload)
+    assert "absence" in payload["search_limitation"]
+    if expected == "inconclusive":
+        assert "avoid repeated similar searches" in payload["search_limitation"]
+    else:
+        assert "Use relevant results" in payload["search_limitation"]
+
+
+def test_filled_search_quota_preserves_diagnostics_without_partial_warning():
+    provider = FakeSearchProvider(web.SearchResponse((
+        SearchCandidate("Docs", "https://docs.example.com/api", "API"),
+        SearchCandidate("Other", "https://other.example.com/api", "Other"),
+    ), (("brave", "rate_limited"),)))
+    payload = discover("api", provider, source_policy(), tool_max_search_results=2).as_dict()
+    assert payload["search_status"] == "ok"
+    assert len(payload["approved"]) == len(payload["unapproved"]) == 1
+    assert payload["engine_warnings"] == [{"engine": "brave", "reason": "rate_limited"}]
+    assert "search_limitation" not in payload
+
+
+def test_clean_empty_search_is_not_a_provider_failure():
+    assert discover("api", FakeSearchProvider([]), source_policy()).as_dict()["search_status"] == "empty"
+
+
+def test_search_engine_warnings_are_bounded_and_reject_unsafe_engine_labels():
+    warnings = web._engine_warnings([
+        ["<script>bad</script>", "timeout"],
+        *[[f"engine-{i}", "CAPTCHA"] for i in range(30)],
+    ])
+    assert len(warnings) == 10
+    assert warnings[0] == ("unknown", "timeout")
+    assert "<script>" not in str(warnings)
+
+
+def test_search_warning_summary_deduplicates_retained_searches_only():
+    store = EvidenceStore()
+    for tool, engine, query in [("web_search", "brave", "one"),
+                                ("web_search", "brave", "two"),
+                                ("read_file", "not-a-search", "three")]:
+        store.add_tool_result(session_id="s1", tool=tool, arguments={"query": query}, result={
+            "status": "ok", "result": {"kind": "search_discovery", "query": query,
+                "engine_warnings": [{"engine": engine, "reason": "rate_limited"}]},
+        })
+    assert web.search_warning_summary(store.snapshot().records) == [
+        {"engine": "brave", "reason": "rate_limited"},
+    ]
 
 
 def test_search_redirect_cannot_leak_query_to_another_host():

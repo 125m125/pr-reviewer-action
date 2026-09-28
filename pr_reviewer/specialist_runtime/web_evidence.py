@@ -95,6 +95,61 @@ class SearchResultRegistry:
         return url
 
 
+@dataclass(frozen=True)
+class SearchResponse(Sequence[SearchCandidate]):
+    """Per-request diagnostics, never mutable state on a shared provider."""
+
+    candidates: tuple[SearchCandidate, ...]
+    engine_warnings: tuple[tuple[str, str], ...] = ()
+
+    def __len__(self):
+        return len(self.candidates)
+
+    def __getitem__(self, index):
+        return self.candidates[index]
+
+
+def _engine_warnings(items) -> tuple[tuple[str, str], ...]:
+    warnings = []
+    for item in items if isinstance(items, (list, tuple)) else ():
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        engine, message = item
+        if not isinstance(engine, str) or not re.fullmatch(r"[a-zA-Z0-9_. -]{1,64}", engine):
+            engine = "unknown"
+        message = str(message).lower()
+        reason = ("captcha" if "captcha" in message else
+                  "rate_limited" if "too many requests" in message or "rate_limited" in message else
+                  "timeout" if "timeout" in message else "unavailable")
+        warning = (engine, reason)
+        if warning not in warnings:
+            warnings.append(warning)
+        if len(warnings) == 10:
+            break
+    return tuple(warnings)
+
+
+def search_warning_summary(records) -> list[dict[str, str]]:
+    """Bounded, deduplicated provider health for the action summary only."""
+    warnings: set[tuple[str, str]] = set()
+    for record in records:
+        if record.tool != "web_search":
+            continue
+        try:
+            payload = json.loads(record.content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("kind") != "search_discovery":
+            continue
+        items = payload.get("engine_warnings", [])
+        if isinstance(items, list):
+            warnings.update(_engine_warnings([
+                (item.get("engine"), item.get("reason"))
+                for item in items if isinstance(item, dict)
+            ]))
+    return [{"engine": engine, "reason": reason} for engine, reason in sorted(warnings)[:10]]
+
+
 class SearchProvider(Protocol):
     """A fixed-endpoint discovery provider."""
 
@@ -222,7 +277,7 @@ class SearxngSearchProvider:
                 url=str(item.get("url") or ""),
                 snippet=str(item.get("content") or ""),
             ))
-        return tuple(candidates)
+        return SearchResponse(tuple(candidates), _engine_warnings(payload.get("unresponsive_engines")))
 
 
 @dataclass(frozen=True)
@@ -288,6 +343,8 @@ class SearchDiscovery:
     approved: tuple[SearchCandidate, ...]
     unapproved: tuple[SearchCandidate, ...]
     suppressed_result_count: int = 0
+    engine_warnings: tuple[tuple[str, str], ...] = ()
+    requested_result_count: int = DEFAULT_MAX_SEARCH_RESULTS
 
     def as_dict(self) -> dict[str, object]:
         def approved(candidate: SearchCandidate) -> dict[str, object]:
@@ -317,12 +374,30 @@ class SearchDiscovery:
                 "fetch_allowed": False,
             }
 
+        count = len(self.approved) + len(self.unapproved)
+        degraded = bool(self.engine_warnings) and count < self.requested_result_count
+        limitation = (
+            "Search coverage is reduced because some engines were unavailable. "
+            "Use relevant results; missing results do not establish absence."
+            if count else
+            "Search returned no results while some engines were unavailable. "
+            "This does not establish absence. Prefer known documentation URLs or "
+            "authorized repository sources; avoid repeated similar searches."
+        )
         return {
             "kind": "search_discovery",
             "query": self.redacted_query,
             "approved": [approved(item) for item in self.approved],
             "unapproved": [unapproved(item) for item in self.unapproved],
             "suppressed_result_count": self.suppressed_result_count,
+            "search_status": (
+                ("partial" if count else "inconclusive") if degraded else
+                ("ok" if count else "empty")
+            ),
+            "engine_warnings": [
+                {"engine": engine, "reason": reason} for engine, reason in self.engine_warnings
+            ],
+            **({"search_limitation": limitation} if degraded else {}),
             "evidentiary": False,
         }
 
@@ -719,7 +794,8 @@ def discover(
     if search_scan_limit <= 0 or tool_max_search_results <= 0:
         raise ValueError("search result limits must be positive")
     clean_query = _validated_query(query)
-    candidates = tuple(provider.search(clean_query, limit=search_scan_limit))[
+    response = provider.search(clean_query, limit=search_scan_limit)
+    candidates = tuple(response)[
         :search_scan_limit
     ]
     approved: list[SearchCandidate] = []
@@ -789,6 +865,8 @@ def discover(
         approved=tuple(approved),
         unapproved=tuple(unapproved),
         suppressed_result_count=suppressed,
+        engine_warnings=response.engine_warnings if isinstance(response, SearchResponse) else (),
+        requested_result_count=tool_max_search_results,
     )
 
 

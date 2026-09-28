@@ -25,6 +25,7 @@ def request_performance(usage: object, timings: object) -> dict[str, int | float
         cached = timings.get("cache_n")
     return {
         "measured_prompt_tokens": _number(usage.get("prompt_tokens"), integer=True),
+        "measured_completion_tokens": _number(usage.get("completion_tokens"), integer=True),
         "cached_prompt_tokens": _number(cached, integer=True),
         "prefill_tokens": _number(timings.get("prompt_n"), integer=True),
         "prefill_ms": _number(timings.get("prompt_ms")),
@@ -49,9 +50,13 @@ def performance_category(purpose: str, previous: str) -> str:
     return "other"
 
 
-def performance_summary(attempts: Sequence[Mapping[str, object]]) -> list[str]:
-    """Render weighted measurements for completed logical specialist requests."""
-    completed = [item for item in attempts if item.get("status") == "completed"]
+def performance_summary(
+    attempts: Sequence[Mapping[str, object]], *, all_model_requests: bool = False,
+) -> list[str]:
+    """Render weighted specialist measurements or a whole-gateway snapshot."""
+    completed = list(attempts) if all_model_requests else [
+        item for item in attempts if item.get("status") == "completed"
+    ]
     if not completed:
         return []
     categories = {
@@ -65,11 +70,21 @@ def performance_summary(attempts: Sequence[Mapping[str, object]]) -> list[str]:
     lines = [
         "", "## Model cache and performance", "",
         "Completed specialist requests only; measurements describe the final provider response "
-        "of each logical request, excluding retry costs. Cache coverage is measured requests / "
-        "completed requests. Missing or invalid measurements are unavailable, not cache misses.", "",
-        "| Call type | Calls | Cache hit (coverage) | Cached / prompt tokens | Prefilled tokens | Prefill seconds | Prefill tok/s | Generation tok/s | Draft acceptance |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "of each logical request, excluding retry costs and non-specialist role calls "
+        "(planner, negotiator, critic, and other controller roles). "
+        "Coverage is measured requests / completed requests. Missing or invalid measurements "
+        "are unavailable, not cache misses. Totals are for this table, not the whole run.", "",
+        "| Call type | Calls | Cache hit (coverage) | Cached / prompt tokens | Prefilled tokens | Prefill seconds | Prefill tok/s | Generation tok/s | Draft acceptance | Prompt tokens incl. cached (coverage) | Completion tokens (coverage) |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
+    if all_model_requests:
+        lines[1] = "## Overall model usage and performance"
+        lines[3] = (
+            "All provider requests started by this run, across every role and physical retry, "
+            "as of the final snapshot. Coverage is measured requests / started requests; "
+            "failed or still-running requests without returned measurements are unavailable, "
+            "not zero. This includes the specialist requests below; do not add the tables together."
+        )
 
     def pairs(rows, first, second, *, bounded=False):
         values = []
@@ -85,8 +100,19 @@ def performance_summary(attempts: Sequence[Mapping[str, object]]) -> list[str]:
             return "unavailable"
         return f"{scale * sum(a for a, _ in values) / denominator:.1f}{suffix}"
 
-    for category, label in categories.items():
-        rows = [row for row in completed if row.get("performance_category", "other") == category]
+    def token_total(rows, key):
+        values = [_number(row.get(key), integer=True) for row in rows]
+        measured = [value for value in values if value is not None]
+        total = f"{sum(measured):,}" if measured else "unavailable"
+        return total + f" ({len(measured)}/{len(rows)})"
+
+    groups = ((None, "Overall (all model requests)"),) if all_model_requests else (
+        *categories.items(), (None, "Total (completed specialist requests)"),
+    )
+    for category, label in groups:
+        rows = completed if category is None else [
+            row for row in completed if row.get("performance_category", "other") == category
+        ]
         if not rows:
             continue
         cache = pairs(rows, "cached_prompt_tokens", "measured_prompt_tokens", bounded=True)
@@ -102,14 +128,25 @@ def performance_summary(attempts: Sequence[Mapping[str, object]]) -> list[str]:
         prefill_seconds = f"{sum(b for _, b in prefill) / 1000:.2f}" if prefill else "unavailable"
         lines.append("| " + " | ".join((
             label, str(len(rows)), cache_hit, cache_tokens, prefill_tokens,
-            prefill_seconds, rate(prefill, 1000), rate(generation, 1000), rate(draft, 100, "%"),
+            prefill_seconds,
+            rate(prefill, 1000) + f" ({len(prefill)}/{len(rows)})",
+            rate(generation, 1000) + f" ({len(generation)}/{len(rows)})",
+            rate(draft, 100, "%"),
+            token_total(rows, "measured_prompt_tokens"),
+            token_total(rows, "measured_completion_tokens"),
         )) + " |")
     lines.extend((
-        "", "Rates use summed tokens / summed time for requests reporting both. "
+        "", "Rates use summed tokens / summed provider processing time for requests reporting both, "
+        "not wall-clock run throughput. "
+        "Prompt totals include cached tokens even when cache statistics are unavailable; "
+        "completion totals use provider usage, independently of timing coverage. "
         "Prefill and draft totals also include only paired measurements. "
-        "Resume rows are the first exploration request after that session's helper or checkpoint "
-        "request. Checkpoints disable tools; checkpoint resumes re-enable them. "
-        "Low reuse shows reprocessing, but does not identify its cause or distinguish RAM restoration "
-        "from an already resident cache.",
     ))
+    if not all_model_requests:
+        lines.append(
+            "Resume rows are the first exploration request after that session's helper or checkpoint "
+            "request. Checkpoints disable tools; checkpoint resumes re-enable them. "
+            "Low reuse shows reprocessing, but does not identify its cause or distinguish RAM restoration "
+            "from an already resident cache."
+        )
     return lines

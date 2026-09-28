@@ -36,6 +36,7 @@ class RequestAttempt:
     error: str = ""
     performance_category: str = "other"
     measured_prompt_tokens: int | None = None
+    measured_completion_tokens: int | None = None
     cached_prompt_tokens: int | None = None
     prefill_tokens: int | None = None
     prefill_ms: float | None = None
@@ -125,6 +126,7 @@ class RequestAttemptJournal:
         error: str = "",
         cached_prompt_tokens: int | None = None,
         measured_prompt_tokens: int | None = None,
+        measured_completion_tokens: int | None = None,
         prefill_tokens: int | None = None,
         prefill_ms: float | None = None,
         generated_tokens: int | None = None,
@@ -157,6 +159,7 @@ class RequestAttemptJournal:
                 error=str(error or ""),
                 cached_prompt_tokens=cached_prompt_tokens if status == "completed" else None,
                 measured_prompt_tokens=measured_prompt_tokens if status == "completed" else None,
+                measured_completion_tokens=measured_completion_tokens if status == "completed" else None,
                 prefill_tokens=prefill_tokens if status == "completed" else None,
                 prefill_ms=prefill_ms if status == "completed" else None,
                 generated_tokens=generated_tokens if status == "completed" else None,

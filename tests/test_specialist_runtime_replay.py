@@ -51,21 +51,26 @@ def test_multilingual_replay_accounts_for_every_expected_obligation():
     )["passed"] is True
 
 
-def test_multilingual_fixture_exercises_cross_stack_and_v1_recipe_migration():
+def test_multilingual_fixture_exercises_cross_stack_component_ownership():
     result = replay_fixture(FIXTURES / "multilingual-pr")
     fixture = result.fixture
 
-    assert fixture["policy_input_version"] == 1
-    assert result.artifact["policy"]["version"] == 2
+    assert fixture["policy_input_version"] == 3
+    assert result.artifact["policy"]["version"] == 3
     assert result.artifact["assignment_plan"] == {
-        "source": "deterministic_base_transformed",
+        "source": "component_owned",
         "planner_repaired": False,
         "ignored_transformations": [],
         "unassigned_obligation_ids": [],
         "unassigned_obligation_reasons": {},
     }
     assert [item["id"] for item in result.artifact["assignments"]] == [
-        "fallback-combined-1",
+        "component-java-api",
+        "component-order-contract",
+        "component-order-deployment",
+        "component-order-store",
+        "component-python-messaging",
+        "component-typescript-consumer",
     ]
     assert {
         item["language"] for item in fixture["representative_changes"]
@@ -111,7 +116,7 @@ def test_recorded_failure_injections_have_deterministic_terminal_behavior():
     assert failures["reconstruction"]["reason"] == "repetitive-transcript"
     assert failures["reconstruction"]["recoveries"] == 1
     assert failures["planner_repair"]["repair_requests"] == 0
-    assert failures["planner_repair"]["source"] == "deterministic_base_transformed"
+    assert failures["planner_repair"]["source"] == "component_owned"
     assert failures["failed_critic"]["terminal"] is True
     assert failures["failed_critic"]["fallback"] == "conservative"
     assert failures["deadline_cutoff"]["deadline_violation"] is False
@@ -160,17 +165,30 @@ def test_provider_fixture_contains_only_explicit_openai_responses():
     scenario = provider["scenarios"]["multilingual"]
 
     assert scenario["request_order"] == [
-        "planner-initial",
-        "specialist-tools",
-        "specialist-checkpoint",
+        "java-tools",
+        "java-checkpoint",
+        "contract-tools",
+        "contract-checkpoint",
+        "python-tools",
+        "python-checkpoint",
+        "typescript-tools",
+        "typescript-checkpoint",
+        "deployment-tools",
+        "deployment-checkpoint",
+        "store-tools",
+        "store-checkpoint",
+        "boundary-order-event",
+        "boundary-order-storage",
+        "boundary-worker-deployment",
         "critic",
+        "critic-retry",
         "finalizer",
     ]
     assert set(scenario["responses"]) == set(scenario["request_order"])
     for turn_id, turn in scenario["responses"].items():
         assert set(turn) == {"expect", "response"}, turn_id
         assert turn["expect"]["role"] in {
-            "planner", "specialist", "critic", "finalizer",
+            "specialist", "boundary_evaluator", "critic", "finalizer",
         }
         assert isinstance(turn["expect"]["tools_enabled"], bool)
         assert "choices" in turn["response"] or "error" in turn["response"]
@@ -193,14 +211,17 @@ def test_recorded_candidate_is_collected_by_session_not_review_inputs(tmp_path):
     provider_path = copied / "provider-turns.json"
     provider = json.loads(provider_path.read_text(encoding="utf-8"))
     checkpoint = provider["scenarios"]["multilingual"]["responses"][
-        "specialist-checkpoint"
+        "typescript-checkpoint"
     ]["response"]["choices"][0]["message"]
     payload = json.loads(checkpoint["content"])
-    payload["candidate_findings"] = []
-    payload["candidate_finding_ids"] = []
+    assert [item["candidate_id"] for item in payload["new_candidates"]] == [
+        "candidate-schema-enum",
+    ]
+    payload["new_candidates"] = []
     checkpoint["content"] = json.dumps(payload, sort_keys=True)
-    provider["scenarios"]["multilingual"]["request_order"].remove("critic")
-    provider["scenarios"]["multilingual"]["responses"].pop("critic")
+    for turn_id in ("critic", "critic-retry", "finalizer"):
+        provider["scenarios"]["multilingual"]["request_order"].remove(turn_id)
+        provider["scenarios"]["multilingual"]["responses"].pop(turn_id)
     provider_path.write_text(json.dumps(provider), encoding="utf-8")
 
     replay = replay_fixture(copied / "multilingual-pr")
@@ -221,7 +242,7 @@ def test_replay_rejects_wrong_recorded_request_shape(tmp_path):
     shutil.copytree(FIXTURES, copied)
     provider_path = copied / "provider-turns.json"
     provider = json.loads(provider_path.read_text(encoding="utf-8"))
-    provider["scenarios"]["multilingual"]["responses"]["planner-initial"][
+    provider["scenarios"]["multilingual"]["responses"]["java-tools"][
         "expect"
     ]["role"] = "critic"
     provider_path.write_text(json.dumps(provider), encoding="utf-8")
@@ -230,18 +251,22 @@ def test_replay_rejects_wrong_recorded_request_shape(tmp_path):
         replay_fixture(copied / "multilingual-pr")
 
 
-def test_replay_rejects_wrong_recorded_turn_shape(tmp_path):
+def test_replay_degrades_terminally_for_failed_recorded_turn(tmp_path):
     copied = tmp_path / "specialist_runtime"
     shutil.copytree(FIXTURES, copied)
     provider_path = copied / "provider-turns.json"
     provider = json.loads(provider_path.read_text(encoding="utf-8"))
-    provider["scenarios"]["multilingual"]["responses"]["specialist-checkpoint"][
+    provider["scenarios"]["multilingual"]["responses"]["java-tools"][
         "response"
-    ]["choices"][0]["message"]["content"] = "{}"
+    ]["choices"] = []
     provider_path.write_text(json.dumps(provider), encoding="utf-8")
 
-    with pytest.raises(AssertionError, match="recorded request|recorded turns"):
-        replay_fixture(copied / "multilingual-pr")
+    replay = replay_fixture(copied / "multilingual-pr")
+
+    assert replay.artifact["evaluation_status"] == "degraded"
+    assert replay.artifact["coverage"][
+        "obligation:component:java-api:changed-behavior:d172f949fd3c"
+    ]["status"] == "unresolved"
 
 
 @pytest.mark.parametrize("surface", ["handoff", "note", "accepted_finding"])
@@ -658,7 +683,7 @@ def test_eval_harness_runs_offline_specialist_corpus_and_returns_acceptance_stat
     replay = report["offline_specialist_replays"][0]
     assert replay["id"] == "multilingual-specialist-runtime"
     assert replay["passed"] is True
-    assert replay["metrics"]["obligation_accounting"]["observed"] == 22
+    assert replay["metrics"]["obligation_accounting"]["observed"] == 17
     assert replay["metrics"]["review_note_anchor_types"]["line"] == 1
     assert replay["metrics"]["finalization_reserve_seconds"] == 30
     web = report["offline_specialist_replays"][1]
