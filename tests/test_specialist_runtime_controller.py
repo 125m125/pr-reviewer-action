@@ -785,24 +785,6 @@ def test_deterministic_reviewed_summary_does_not_claim_unretained_changed_paths(
             "uncertainties": [],
         },
         {
-            "overview": "Also changes `src/unchanged.py`.",
-            "key_changes": [],
-            "cross_component_effects": [],
-            "uncertainties": [],
-        },
-        {
-            "overview": "Also changes src/unchanged.py.",
-            "key_changes": [],
-            "cross_component_effects": [],
-            "uncertainties": [],
-        },
-        {
-            "overview": "Also changes README.md.",
-            "key_changes": [],
-            "cross_component_effects": [],
-            "uncertainties": [],
-        },
-        {
             "overview": "Updates worker delivery.",
             "key_changes": [{
                 "path": "src/worker.py",
@@ -845,14 +827,16 @@ def test_change_overview_rejects_non_authoritative_claims(proposal, tmp_path):
 
 
 @pytest.mark.parametrize("tracked", [("ci/capture-e2e.sh",), ("ci/capture-e2e.sh", "other/capture-e2e.sh")])
-def test_change_overview_resolves_only_unique_basename(tmp_path, tracked):
+def test_change_overview_accepts_filename_mentions_without_resolving_basename(tmp_path, tracked):
     inputs = replace(_inputs(tmp_path), changed_files=("ci/capture-e2e.sh",), tracked_paths=tracked)
     proposal = {"overview": "Updates capture-e2e.sh to retain browser diagnostics."}
-    if len(tracked) == 1:
-        assert controller_module._validated_change_overview(proposal, inputs)["overview"] == proposal["overview"]
-    else:
-        with pytest.raises(ValueError, match="path reference"):
-            controller_module._validated_change_overview(proposal, inputs)
+    assert controller_module._validated_change_overview(proposal, inputs)["overview"] == proposal["overview"]
+
+
+def test_change_overview_accepts_supported_filename_patterns(tmp_path):
+    inputs = replace(_inputs(tmp_path), changed_files=("renovate.json",))
+    proposal = {"overview": "Adds a regex manager for jqassistant.yml and jqassistant.yaml files."}
+    assert controller_module._validated_change_overview(proposal, inputs)["overview"] == proposal["overview"]
 
 
 def test_change_overview_accepts_descriptive_verdict_and_coverage_terms(tmp_path):
@@ -893,7 +877,7 @@ def test_change_overview_accepts_descriptive_verdict_and_coverage_terms(tmp_path
     "field",
     ["overview", "key_change", "cross_component_effect", "uncertainty"],
 )
-def test_change_overview_rejects_plain_unchanged_paths_in_every_prose_field(
+def test_change_overview_accepts_plain_unchanged_paths_in_every_prose_field(
     field,
     tmp_path,
 ):
@@ -913,7 +897,7 @@ def test_change_overview_rejects_plain_unchanged_paths_in_every_prose_field(
             "change_facts": _change_facts_payload({}),
         },
     )
-    invalid = "References src/unchanged.py and README.md."
+    references = "References src/unchanged.py and README.md."
     proposal = {
         "overview": "Updates worker delivery and documentation.",
         "key_changes": [{
@@ -928,16 +912,15 @@ def test_change_overview_rejects_plain_unchanged_paths_in_every_prose_field(
         "uncertainties": ["Runtime intent remains bounded to changed facts."],
     }
     if field == "overview":
-        proposal["overview"] = invalid
+        proposal["overview"] = references
     elif field == "key_change":
-        proposal["key_changes"][0]["summary"] = invalid
+        proposal["key_changes"][0]["summary"] = references
     elif field == "cross_component_effect":
-        proposal["cross_component_effects"][0]["summary"] = invalid
+        proposal["cross_component_effects"][0]["summary"] = references
     else:
-        proposal["uncertainties"][0] = invalid
+        proposal["uncertainties"][0] = references
 
-    with pytest.raises(ValueError, match="unchanged path"):
-        controller_module._validated_change_overview(proposal, inputs)
+    assert references in str(controller_module._validated_change_overview(proposal, inputs))
 
 
 @pytest.mark.parametrize(
@@ -950,7 +933,7 @@ def test_change_overview_rejects_plain_unchanged_paths_in_every_prose_field(
         "UNKNOWN.txt",
     ],
 )
-def test_change_overview_rejects_tracked_and_unknown_path_like_tokens(
+def test_change_overview_accepts_tracked_and_unknown_path_like_tokens(
     tmp_path,
     reference,
 ):
@@ -974,17 +957,7 @@ def test_change_overview_rejects_tracked_and_unknown_path_like_tokens(
         "uncertainties": [],
     }
 
-    with pytest.raises(ValueError, match="unchanged path"):
-        controller_module._validated_change_overview(proposal, inputs)
-
-
-def test_summary_path_detection_does_not_treat_method_names_as_files():
-    assert controller_module._prose_path_references(
-        "Updates test.setTimeout without changing test.afterEach; see UNKNOWN.txt."
-    ) == ("UNKNOWN.txt",)
-    assert controller_module._prose_path_references(
-        "Updates custom.settings.", ("custom.settings",),
-    ) == ("custom.settings",)
+    assert controller_module._validated_change_overview(proposal, inputs)["overview"] == proposal["overview"]
 
 
 def test_change_overview_accepts_controller_supplied_context_path_without_claiming_change(
@@ -1040,7 +1013,7 @@ def test_change_overview_allows_direct_claim_when_context_path_is_also_changed(t
     assert validated["overview"] == proposal["overview"]
 
 
-def test_change_overview_rejects_direct_change_claim_for_context_path(tmp_path):
+def test_change_overview_keeps_context_path_prose_non_authoritative(tmp_path):
     inputs = replace(
         _inputs(tmp_path),
         tracked_paths=("src/worker.py", "src/consumer.py"),
@@ -1062,8 +1035,7 @@ def test_change_overview_rejects_direct_change_claim_for_context_path(tmp_path):
         "uncertainties": [],
     }
 
-    with pytest.raises(ValueError, match="unchanged path"):
-        controller_module._validated_change_overview(proposal, inputs)
+    assert controller_module._validated_change_overview(proposal, inputs)["overview"] == proposal["overview"]
 
 
 @pytest.mark.parametrize(
@@ -1077,7 +1049,7 @@ def test_change_overview_rejects_direct_change_claim_for_context_path(tmp_path):
         "The src/consumer.py file was changed.",
     ),
 )
-def test_change_overview_rejects_common_direct_context_path_claims(
+def test_change_overview_does_not_classify_prose_context_path_claims(
     tmp_path, overview,
 ):
     inputs = replace(
@@ -1101,8 +1073,7 @@ def test_change_overview_rejects_common_direct_context_path_claims(
         "uncertainties": [],
     }
 
-    with pytest.raises(ValueError, match="unchanged path"):
-        controller_module._validated_change_overview(proposal, inputs)
+    assert controller_module._validated_change_overview(proposal, inputs)["overview"] == overview
 
 
 def test_handoff_accepts_direct_context_path_claim_as_non_authoritative_prose(tmp_path):

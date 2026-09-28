@@ -13,6 +13,7 @@ from .coverage import CoverageSnapshot, SessionOwnership
 from .obligation_assessment import ObligationAssessment, ObligationDisposition
 from .web_evidence import RepositoryAccessRequest, SourceAccessRequest
 from .types import (
+    CHECKPOINT_TURN_RESERVE as _CHECKPOINT_TURN_RESERVE,
     CoverageObligation,
     InvestigationLead,
     InvestigationLeadStatus,
@@ -28,7 +29,6 @@ _ACTION_ALIASES = {
     "new-session": "new_session",
 }
 _ACTION_RANK = {"resume": 0, "consult": 1, "new_session": 2, "record_unknown": 3}
-_CHECKPOINT_TURN_RESERVE = 2
 _ACTION_FIELDS = frozenset({
     "kind", "session_id", "obligation_ids", "lead_ids", "expected_evidence",
     "estimated_turns", "reason",

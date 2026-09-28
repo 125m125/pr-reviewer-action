@@ -7,6 +7,10 @@ from enum import Enum
 from typing import Mapping
 
 
+# Shared by exploration and follow-up admission: checkpoint, repair, accounting.
+CHECKPOINT_TURN_RESERVE = 3
+
+
 def change_overview_orientation(
     value: Mapping[str, object] | None,
 ) -> dict[str, object]:

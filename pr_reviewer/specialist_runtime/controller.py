@@ -25,7 +25,6 @@ from threading import Event, RLock
 import time
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
-from urllib.parse import urlsplit
 
 from pr_reviewer.conversation import Conversation
 from pr_reviewer.specialists import classify_file_roles
@@ -145,27 +144,6 @@ _PROHIBITED_OVERVIEW_CLAIM = re.compile(
     r"(?:fully\s+)?(?:verified|validated|tested|covered)|"
     r"every\s+(?:branch|path|case)\s+(?:is\s+)?tested|"
     r"(?:all|fully|completely)\b.{0,40}\b(?:covered|reviewed|verified|tested))\b"
-)
-_PATH_WITH_DIRECTORY = re.compile(
-    r"(?<![A-Za-z0-9_./:-])"
-    r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+"
-)
-_ROOT_FILE_REFERENCE = re.compile(
-    r"(?<![A-Za-z0-9_./:-])"
-    r"(?:[A-Za-z0-9_-]+\.[A-Za-z][A-Za-z0-9_-]{0,62}"
-    r"|\.[A-Za-z0-9_-]+)\b"
-)
-_PROSE_TOKEN = re.compile(
-    r"(?<![A-Za-z0-9_./-])[A-Za-z0-9_.-]+"
-    r"(?:/[A-Za-z0-9_.-]+)*(?![A-Za-z0-9_./-])"
-)
-_URL_CANDIDATE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_.-])(?:"
-    r"https?://[^\s<>()]+|"
-    r"www\.(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}(?:/[^\s<>()]*)?|"
-    r"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}/[^\s<>()]*|"
-    r"(?:[A-Za-z0-9-]+\.){2,}[A-Za-z]{2,63}"
-    r")"
 )
 _DETERMINISTIC_CONTEXT_KEYS = frozenset({
     "context_paths", "related_paths", "affected_paths", "affected_consumers",
@@ -1323,85 +1301,6 @@ def _overview_text(value: object, label: str, *, limit: int) -> str:
     return text
 
 
-def _domain_name(value: str) -> bool:
-    labels = value.rstrip(".").split(".")
-    if len(labels) < 2 or not 2 <= len(labels[-1]) <= 63:
-        return False
-    if not labels[-1].isalpha():
-        return False
-    label_pattern = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-    return all(bool(re.fullmatch(label_pattern, label)) for label in labels)
-
-
-def _url_reference_spans(value: str) -> tuple[tuple[int, int], ...]:
-    spans: list[tuple[int, int]] = []
-    for match in _URL_CANDIDATE.finditer(value):
-        candidate = match.group(0).rstrip(".,;:!?)]}")
-        parsed = urlsplit(
-            candidate if "://" in candidate else f"https://{candidate}",
-        )
-        hostname = parsed.hostname or ""
-        if hostname == "localhost" or _domain_name(hostname):
-            spans.append((match.start(), match.start() + len(candidate)))
-    return tuple(spans)
-
-
-def _prose_path_references(
-    value: str,
-    tracked_paths: Iterable[str] = (),
-) -> tuple[str, ...]:
-    normalized = value.replace("\\", "/")
-    references: list[str] = []
-    occupied: list[tuple[int, int]] = []
-    url_spans = _url_reference_spans(normalized)
-
-    def is_url_span(start: int) -> bool:
-        return any(span_start <= start < span_end for span_start, span_end in url_spans)
-
-    tracked = {
-        str(path).replace("\\", "/").strip("/")
-        for path in tracked_paths
-        if str(path).strip()
-    }
-    for match in _PROSE_TOKEN.finditer(normalized):
-        if is_url_span(match.start()):
-            continue
-        reference = match.group(0).rstrip(".,;:!?)]}")
-        if reference in tracked:
-            if reference not in references:
-                references.append(reference)
-            occupied.append(match.span())
-    for match in _PATH_WITH_DIRECTORY.finditer(normalized):
-        if is_url_span(match.start()):
-            continue
-        reference = match.group(0).rstrip(".,;:!?)]}")
-        if reference and reference not in references:
-            references.append(reference)
-        occupied.append(match.span())
-    for match in _ROOT_FILE_REFERENCE.finditer(normalized):
-        if any(start <= match.start() < end for start, end in occupied):
-            continue
-        if is_url_span(match.start()):
-            continue
-        reference = match.group(0).rstrip(".,;:!?)]}")
-        if reference.lower().startswith("www."):
-            continue
-        # An arbitrary dotted identifier (test.afterEach, policy.verdict) is
-        # not a file. Exact tracked names were handled above, including unusual
-        # extensions; infer untracked root files only for common file suffixes.
-        if not reference.startswith(".") and reference.rsplit(".", 1)[-1].lower() not in {
-            "py", "pyi", "js", "jsx", "ts", "tsx", "java", "kt", "go", "rs",
-            "c", "h", "cpp", "hpp", "cs", "rb", "php", "sh", "ps1", "bat",
-            "cmd", "md", "adoc", "asciidoc", "txt", "json", "yaml", "yml",
-            "toml", "xml", "ini", "conf", "properties", "sql", "html", "css",
-            "scss", "dart", "proto", "lock",
-        }:
-            continue
-        if reference and reference not in references:
-            references.append(reference)
-    return tuple(references)
-
-
 def _normalize_repository_path(value: object) -> str:
     return str(value or "").replace("\\", "/").strip("/")
 
@@ -1467,57 +1366,6 @@ def _deterministic_context_paths(
     return frozenset(path for path in candidates if path and path in tracked)
 
 
-def _direct_change_references(
-    value: str,
-    references: Iterable[str],
-) -> frozenset[str]:
-    """Find references used as direct change claims, not contextual effects."""
-    normalized = value.replace("\\", "/")
-    direct: set[str] = set()
-    for reference in references:
-        path = _normalize_repository_path(reference)
-        if not path:
-            continue
-        start = 0
-        while True:
-            index = normalized.find(path, start)
-            if index < 0:
-                break
-            before = normalized[max(0, index - 40):index]
-            after = normalized[index + len(path):index + len(path) + 64]
-            before = before.rstrip(" `'\"(")
-            after = after.lstrip(" `'\")(")
-            before_claim = re.search(
-                r"(?:^|[\s,;])(?:"
-                r"(?:the\s+)?(?:add|change|modif(?:y|ies|ied)|update|"
-                r"remov(?:e|es|ed)|introduc(?:e|es|ed)|"
-                r"rewrit(?:e|es|ten)|refactor(?:s|ed|ing)?|renam(?:e|es|ed))"
-                r"(?:s|d)?\s+(?:in|to|of)"
-                r"|add(?:s|ed)?\s+(?:behavior|changes?)\s+(?:in|to|of)"
-                r"|(?:the\s+)?(?:add|change|modif(?:y|ies|ied)|update|"
-                r"remov(?:e|es|ed)|introduc(?:e|es|ed)|"
-                r"rewrit(?:e|es|ten)|refactor(?:s|ed|ing)?|renam(?:e|es|ed))"
-                r"(?:s|d)?"
-                r")(?:\s+(?:the|its|a|an|new|updated|changed))?$",
-                before,
-                re.IGNORECASE,
-            )
-            after_claim = re.match(
-                r"(?:(?:the\s+)?file\s+)?"
-                r"(?:is|are|was|were|has been|have been)?\s*"
-                r"(?:add(?:s|ed)?|change(?:s|d)?|modif(?:y|ies|ied)|"
-                r"update(?:s|d)?|remov(?:e|es|ed)|introduc(?:e|es|ed)|"
-                r"rewrit(?:e|es|ten)|refactor(?:s|ed)?|renam(?:e|es|ed))\b",
-                after,
-                re.IGNORECASE,
-            )
-            if before_claim or after_claim:
-                direct.add(path)
-                break
-            start = index + len(path)
-    return frozenset(direct)
-
-
 def _authoritative_change_facts(
     topology: Mapping[str, Any],
 ) -> tuple[Mapping[str, object], Mapping[str, object] | None]:
@@ -1541,7 +1389,7 @@ def _validated_change_overview(
     value: object,
     inputs: ReviewInputs,
 ) -> dict[str, object]:
-    """Admit only bounded orientation backed by changed paths/components."""
+    """Validate bounded prose and authoritative structured path/component bindings."""
     if not isinstance(value, Mapping):
         raise ValueError("change overview must be an object")
     fields = {
@@ -1554,47 +1402,10 @@ def _validated_change_overview(
         for path in inputs.changed_files
         if str(path).strip()
     }
-    tracked_paths = {
-        _normalize_repository_path(path)
-        for path in (*inputs.tracked_paths, *inputs.changed_files)
-        if _normalize_repository_path(path)
-    }
-    context_paths = _deterministic_context_paths(
-        inputs.topology,
-        tracked_paths,
-    )
     component_ids, path_components = _change_components(inputs)
-
-    def admitted_text(raw: object, label: str, *, limit: int) -> str:
-        text = _overview_text(raw, label, limit=limit)
-        prose_paths = _prose_path_references(text, tracked_paths)
-        for reference in prose_paths:
-            path = _normalize_repository_path(reference)
-            if "/" not in path and path not in tracked_paths:
-                matches = [known for known in tracked_paths if known.rsplit("/", 1)[-1] == path]
-                if len(matches) == 1:
-                    path = matches[0]
-            if path not in changed_paths and path not in context_paths:
-                raise ValueError(
-                    "change overview contains an unchanged path reference "
-                    f"in {label}: {path}"
-                )
-            if path not in changed_paths and _direct_change_references(text, {reference}):
-                raise ValueError(
-                    "change overview contains an unchanged path reference "
-                    f"in {label}: {path}"
-                )
-        direct_context_paths = _direct_change_references(
-            text, context_paths - changed_paths,
-        )
-        if direct_context_paths:
-            raise ValueError(
-                "change overview contains an unchanged path reference "
-                f"in {label}: {sorted(direct_context_paths)[0]}"
-            )
-        return text
-
-    overview = admitted_text(value.get("overview"), "overview", limit=1000)
+    # Filename patterns and unchanged consumers are legitimate prose context,
+    # not authoritative assertions that those paths changed.
+    overview = _overview_text(value.get("overview"), "overview", limit=1000)
 
     raw_changes = value.get("key_changes", ())
     if (
@@ -1619,7 +1430,7 @@ def _validated_change_overview(
         expected_component = path_components.get(path)
         if expected_component and component != expected_component:
             raise ValueError("change overview path/component binding is invalid")
-        summary = admitted_text(
+        summary = _overview_text(
             row.get("summary"), f"summary for {path}", limit=500,
         )
         key_changes.append({
@@ -1658,7 +1469,7 @@ def _validated_change_overview(
             raise ValueError("change overview contains unknown component")
         effects.append({
             "components": selected,
-            "summary": admitted_text(
+            "summary": _overview_text(
                 row.get("summary"), "cross-component summary", limit=500,
             ),
         })
@@ -1671,7 +1482,7 @@ def _validated_change_overview(
     ):
         raise ValueError("change overview uncertainties must be a bounded array")
     uncertainties = tuple(
-        admitted_text(item, "uncertainty", limit=400)
+        _overview_text(item, "uncertainty", limit=400)
         for item in raw_uncertainties
     )
     return {
