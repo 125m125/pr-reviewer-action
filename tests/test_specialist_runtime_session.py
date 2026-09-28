@@ -751,6 +751,90 @@ def test_failed_checkpoint_defers_accounting_until_checkpoint_recovery():
     assert not session._disposition_pass_diagnostics
 
 
+@pytest.mark.parametrize("remaining_turns", [1, 2])
+def test_final_accounting_survives_cutoff_without_exceeding_session_cap(remaining_turns):
+    disposition = invalid_response(json.dumps({"obligation_updates": [
+        {"target": "O1", "disposition": "blocked", "reason": "Source unavailable",
+         "evidence_ids": [], "next_actions": []},
+    ]}))
+    gateway = ScriptedGateway(
+        ([TimeoutError("initial phase cutoff")] if remaining_turns == 2 else [])
+        + [disposition],
+    )
+    session = make_session(gateway, model_turns=32)
+    checkpoint = session._checkpoint_from_text(json.dumps({
+        "unresolved": ["O1", "O2"], "obligation_updates": [],
+        "working_summary": "Retained substantive behavioral checks.",
+        "completed_steps": ["Checked changed contracts"],
+        "proposed_next_actions": ["Check the missing source"],
+    }))
+    assert checkpoint is not None
+    session.latest_checkpoint = session._last_valid_checkpoint = checkpoint
+    for _ in range(32 - remaining_turns):
+        session.budget.reserve_model_turn()
+
+    session.settle_for_scheduling()
+    assert session.budget.remaining_model_turns() == 1
+    assert session.obligation_assessments.assessment("O1").disposition.value == "pending"
+    if remaining_turns == 2:
+        session.mark_exploration_interrupted()
+    session.lease = SessionLease(RunPhase.FINALIZATION, time.monotonic() + 60)
+    result = session.finalize()
+
+    assert session.finalize() is result
+    assert result.budget.model_turns == 32
+    assert session.obligation_assessments.assessment("O1").disposition.value == "blocked"
+    assert session.obligation_assessments.assessment("O2").disposition.value == "pending"
+    assert result.checkpoint.working_summary == checkpoint.working_summary
+    assert len(gateway.requests) == remaining_turns
+    assert all(request.response_schema["required"] == ["obligation_updates"]
+               and not request.tools_enabled for request in gateway.requests)
+
+
+@pytest.mark.parametrize("failure", ["timeout", "global-limit", "session-limit"])
+def test_final_accounting_retry_is_bounded_and_keeps_unassessed_work_pending(failure):
+    gateway = ScriptedGateway([TimeoutError("phase cutoff"), TimeoutError("final cutoff")])
+    session = make_session(gateway)
+    session._last_valid_checkpoint = session.latest_checkpoint
+    global_budget = BudgetLedger(BudgetLimits(model_turns=1, tool_calls=1, recoveries=1))
+    if failure == "global-limit":
+        session.bind_global_budget_admission_handler(
+            lambda kind, count: global_budget.reserve_model_turn(),
+        )
+    session.settle_for_scheduling()
+    session.mark_exploration_interrupted()
+    if failure == "session-limit":
+        while session.budget.remaining_model_turns():
+            session.budget.reserve_model_turn()
+    result = session.finalize()
+
+    assert session.finalize() is result
+    assert len(gateway.requests) == (2 if failure == "timeout" else 1)
+    assert all(item.disposition.value == "pending"
+               for item in session.obligation_assessments.assessments())
+    assert session._disposition_pass_diagnostics[-1]["status"] == "unavailable"
+    if failure == "global-limit":
+        assert global_budget.snapshot().model_turns == 1
+        assert result.budget.model_turns == 1
+
+
+def test_accounting_timeout_does_not_skip_recovery_of_later_interrupted_exploration():
+    gateway = ScriptedGateway([
+        TimeoutError("accounting cutoff"), TimeoutError("exploration cutoff"),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway)
+    session._last_valid_checkpoint = session.latest_checkpoint
+    session.settle_for_scheduling()
+    with pytest.raises(TimeoutError, match="exploration cutoff"):
+        session.explore()
+    session.mark_exploration_interrupted()
+    session.finalize()
+
+    assert len(gateway.requests) == 3
+    assert gateway.requests[-1].messages_contain("Checkpoint reason: interrupted-exploration.")
+
+
 def test_stop_disposition_prompt_supplies_changed_scope_not_reference_paths():
     obligation = CoverageObligation(
         obligation_id="OB-code", origin="component", subject="publishing",
@@ -4510,7 +4594,7 @@ def test_repeated_textual_tool_markup_checkpoints_and_pauses():
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
         checkpoint_response(inspected=[], unresolved=["OB-code"]),
     ])
-    session = make_session(gateway, model_turns=4)
+    session = make_session(gateway, model_turns=5)
 
     result = session.explore()
 
@@ -6029,7 +6113,7 @@ def test_exploration_reserves_checkpoint_and_repair_turns():
         invalid_response("malformed-checkpoint"),
         checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
     ])
-    session = make_session(gateway, model_turns=4)
+    session = make_session(gateway, model_turns=5)
 
     result = session.explore()
 
@@ -6039,6 +6123,37 @@ def test_exploration_reserves_checkpoint_and_repair_turns():
         True, True, False, False,
     ]
     assert result.budget.model_turns == 4
+    assert session.budget.remaining_model_turns() == 1
+
+
+@pytest.mark.parametrize("rejected_update", [False, True])
+def test_checkpoint_repair_leaves_final_accounting_turn(rejected_update):
+    repaired = checkpoint_response(
+        inspected=[], unresolved=["OB-tests"] if rejected_update else ["OB-code", "OB-tests"],
+        obligation_updates=([{
+            "target": "O1", "disposition": "covered", "reason": "Checked source",
+            "evidence_ids": [], "next_actions": [],
+        }] if rejected_update else []),
+    )
+    gateway = ScriptedGateway([
+        invalid_response("malformed-checkpoint"),
+        repaired,
+        invalid_response(json.dumps({"obligation_updates": [
+            {"target": "O1", "disposition": "blocked", "reason": "Source unavailable",
+             "evidence_ids": [], "next_actions": []},
+        ]})),
+    ])
+    session = make_session(gateway, model_turns=32)
+    for _ in range(29):
+        session.budget.reserve_model_turn()
+
+    session.explore()
+    session.settle_for_scheduling()
+    assert session.budget.remaining_model_turns() == 1
+    result = session.finalize()
+    assert result.budget.model_turns == 32
+    assert session.obligation_assessments.assessment("O1").disposition.value == "blocked"
+    assert all(not request.tools_enabled for request in gateway.requests)
 
 
 def test_pressure_requests_checkpoint_before_exploration():
@@ -6382,7 +6497,7 @@ def test_tool_turn_candidate_signal_survives_resume_and_clean_checkpoint():
         clean,
         clean,
     ])
-    session = make_session(gateway, model_turns=7)
+    session = make_session(gateway, model_turns=8)
 
     first = session.explore()
     session.apply_coverage_feedback(["OB-tests"])
@@ -7157,14 +7272,14 @@ def test_no_progress_guard_requests_checkpoint_instead_of_final_report():
     assert len(gateway.requests) == 5
 
 
-def test_no_progress_guard_projects_checkpoint_when_no_model_turn_remains():
+def test_invalid_checkpoint_projects_without_spending_accounting_reserve():
     repeated = tool_call_response("read_file", {"path": "a.py"}, call_id="repeat")
     gateway = ScriptedGateway([
         tool_call_response("read_file", {"path": "a.py"}, call_id="first"),
         repeated,
         repeated,
     ])
-    session = make_session(gateway, tool_calls=4, model_turns=3)
+    session = make_session(gateway, tool_calls=4, model_turns=4)
 
     result = session.explore()
 
@@ -7173,6 +7288,7 @@ def test_no_progress_guard_projects_checkpoint_when_no_model_turn_remains():
     assert result.budget.model_turns == 3
     assert result.budget.tool_calls == 1
     assert len(gateway.requests) == 3
+    assert session.budget.remaining_model_turns() == 1
 
 
 def test_checkpoint_attaches_only_successful_retained_evidence_ids():

@@ -2738,3 +2738,22 @@ def test_unknown_fork_identity_disables_specialist_tools(
     )
 
     assert session.conversation.tool_schemas == []
+
+
+def test_component_coverage_labels_identify_boundary_and_participant():
+    from pr_reviewer.specialist_runtime.cli import _component_coverage_summary
+
+    coverage = {
+        boundary: {"owner_component_id": "java-backend", "participant_id": "java-backend",
+                   "boundary_id": boundary, "status": "unresolved", "scope": []}
+        for boundary in ("http-api", "persistence", "worker-messages")
+    }
+    coverage["mobile"] = {
+        "owner_component_id": "java-backend", "participant_id": "mobile-client",
+        "boundary_id": "http-api", "status": "partially_covered", "scope": [],
+    }
+    text = "\n".join(_component_coverage_summary({"coverage": coverage})).replace("\\", "")
+    for boundary in ("http-api", "persistence", "worker-messages"):
+        assert f"{boundary} / java-backend" in text
+    assert "http-api / mobile-client (owner: java-backend)" in text
+    assert "java-backend / java-backend" not in text

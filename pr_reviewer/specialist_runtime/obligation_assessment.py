@@ -439,20 +439,19 @@ class ObligationAssessmentLedger:
             and resolved_omitted
             else proposed
         )
-        eligible_ids = retained_ids
+        known_ids = tuple(item for item in retained_ids if item in records)
+        unknown_ids = tuple(item for item in retained_ids if item not in records)
+        eligible_ids = known_ids
         ignored_ids: tuple[str, ...] = ()
-        if (
-            supported
-            and all(item in records for item in retained_ids)
-        ):
+        if supported:
             # This gate checks retained provenance and owner scope, not the truth
             # of the model's group claim or one evidence record per assessed path.
             eligible_ids = tuple(
-                item for item in retained_ids
+                item for item in known_ids
                 if eligible(records[item], obligation)
             )
             ignored_ids = tuple(
-                item for item in retained_ids if item not in eligible_ids
+                item for item in known_ids if item not in eligible_ids
             )
         requirement_actions = (
             _missing_requirement_actions(evidence, eligible_ids, obligation)
@@ -493,8 +492,8 @@ class ObligationAssessmentLedger:
                 "closed disposition cannot carry next_actions; "
                 "use an empty next_actions array"
             )
-        elif any(item not in records for item in retained_ids):
-            error = "proposal references unknown retained evidence"
+        elif unknown_ids:
+            error = "proposal references unknown retained evidence: " + ", ".join(unknown_ids)
         elif supported and not retained_ids:
             error = "supported work requires retained evidence"
         elif supported and not eligible_ids:
