@@ -57,6 +57,7 @@ class ObligationAssessment:
     assessed_paths: tuple[str, ...] = ()
     omitted_paths: tuple[str, ...] = ()
     assessment_version: int = 0
+    next_actions_consumed: bool = False
 
 
 @dataclass(frozen=True)
@@ -332,9 +333,8 @@ class ObligationAssessmentLedger:
         for target, assessment in tuple(self._assessments.items()):
             if assessment.obligation_id not in selected or not assessment.next_actions:
                 continue
-            self._assessments[target] = ObligationAssessment(
-                **{**assessment.__dict__, "next_actions": ()}
-            )
+            # Scheduling must not invalidate the accepted unresolved conclusion.
+            self._assessments[target] = replace(assessment, next_actions_consumed=True)
 
     def explain(self, target: str) -> dict[str, object]:
         assessment = self.assessment(target)
@@ -581,6 +581,18 @@ class ObligationAssessmentLedger:
             for item in assessment.attempts
         ) >= (2 if obligation.risk_tier in {"high", "critical"} else 1):
             error = "unresolved follow-up attempt limit reached"
+        if component_scoped and (contains_glob or invalid_paths or overlap):
+            rejected = invalid_paths | overlap | {
+                path for path in proposed_path_set if any(marker in path for marker in "*?[")
+            }
+            error += "; invalid entries: " + "; ".join(
+                name + "=" + json.dumps([path for path in paths if path in rejected][:12])
+                for name, paths in (("assessed_paths", proposed_assessed), ("omitted_paths", proposed_omitted))
+            )
+            error += "; allowed owned changed paths=" + json.dumps(owned_paths[:20])
+            if len(owned_paths) > 20:
+                error += f" (first 20 of {len(owned_paths)}; see assigned scope for the rest)"
+            error += ". Supporting reads outside this inventory are evidence, not changed-path coverage."
         attempt = ObligationAttempt(
             target=target, disposition=effective, reason=conclusion,
             evidence_ids=retained_ids, next_actions=actions,

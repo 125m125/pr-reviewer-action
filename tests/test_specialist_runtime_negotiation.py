@@ -432,6 +432,14 @@ def test_compact_negotiation_offers_resume_only_for_novel_checkpoint_action():
     assert target["attempt_count"] == 0
     assert "resume" in target["allowed_actions"]
 
+    consumed = replace(assessment, next_actions_consumed=True)
+    consumed_state = replace(state, checkpoints=(replace(state.checkpoints[0], obligation_assessments=(consumed,)),))
+    consumed_targets = compact_negotiation_context(consumed_state)["targets"]
+    assert not any(
+        item["handle"] == target["handle"] and "resume" in item["allowed_actions"]
+        for item in consumed_targets
+    )
+
 
 def test_compact_negotiation_does_not_promote_checkpoint_todos_to_scheduler_actions():
     checkpoint = SessionCheckpoint(

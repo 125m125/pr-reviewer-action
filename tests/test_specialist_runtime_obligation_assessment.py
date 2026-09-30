@@ -220,7 +220,15 @@ def test_consuming_followup_action_prevents_same_gap_from_being_resumed_again():
 
     ledger.consume_next_actions(("OB-workflow",))
 
-    assert ledger.assessment("O1").next_actions == ()
+    assert ledger.assessment("O1").next_actions == ("read consumer.py diff",)
+    assert ledger.assessment("O1").next_actions_consumed is True
+    validator = _ledger()
+    saved = ledger.assessment("O1")
+    assert validator.propose(
+        target="O1", disposition=saved.disposition.value, reason=saved.reason,
+        evidence_ids=saved.evidence_ids, next_actions=saved.next_actions,
+        evidence=store.snapshot(), eligible=lambda _record, _obligation: True,
+    ).accepted
     assert ledger.assessment("O1").attempts[0].next_actions == (
         "read consumer.py diff",
     )
@@ -261,6 +269,19 @@ def test_high_risk_accepts_one_additional_distinct_followup_attempt():
 
     assert [item.accepted for item in results] == [True, True, False]
     assert "attempt limit" in results[-1].reason
+
+
+def test_new_accepted_assessment_reenables_novel_actions():
+    ledger = _ledger(risk_tier="high")
+    store, _ = _store_with_path()
+    for index in range(2):
+        assert ledger.propose(
+            target="O1", disposition="unresolved", reason="Inspect the next consumer.",
+            evidence_ids=(), next_actions=(f"Read consumer{index}.py",),
+            evidence=store.snapshot(), eligible=lambda *_: True,
+        ).accepted
+        assert ledger.assessment("O1").next_actions_consumed is False
+        ledger.consume_next_actions(("OB-workflow",))
 
 
 def test_attempt_records_bounded_evidence_before_after_and_delta():
@@ -368,7 +389,7 @@ def test_component_group_rejects_paths_outside_ownership_and_overlap():
     invalid_ledger = _ledger(scope=paths, owner_component_id="backend")
     invalid = invalid_ledger.propose(
         target="O1", disposition="covered", reason="The path was inspected.",
-        assessed_paths=("frontend/view.py",), omitted_paths=(),
+        assessed_paths=("frontend/view.py",), omitted_paths=("pom.xml",),
         evidence_ids=(record.id,), next_actions=(), evidence=store.snapshot(),
         eligible=lambda _record, _obligation: True,
     )
@@ -389,6 +410,9 @@ def test_component_group_rejects_paths_outside_ownership_and_overlap():
 
     assert invalid.accepted is False
     assert "outside owned changed scope" in invalid.reason
+    assert 'assessed_paths=["frontend/view.py"]' in invalid.reason
+    assert 'omitted_paths=["pom.xml"]' in invalid.reason
+    assert all(path in invalid.reason for path in paths)
     assert overlap.accepted is False
     assert "both assessed and omitted" in overlap.reason
     assert glob.accepted is False

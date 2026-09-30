@@ -110,6 +110,13 @@ class TestMaskSecrets:
 
 
 class TestMaskSourceSecrets:
+    @pytest.mark.parametrize("prefix", ("export", "env"))
+    def test_chained_empty_shell_assignments(self, prefix):
+        source = f"{prefix} NEXUS_USERNAME= NEXUS_PASSWORD= MOVIEHRDB_TEST_VALUE='literal $value & spaces'"
+        assert mask_source_secrets(source) == (source, 0)
+        source += " API_TOKEN=actual_secret_value"
+        assert mask_source_secrets(source) == (source.replace("actual_secret_value", "[REDACTED_VALUE]"), 1)
+
     @pytest.mark.parametrize("separator", (" ", "\t", "\n"))
     def test_empty_shell_password_preserves_following_assignment(self, separator):
         source = f"export NEXUS_PASSWORD={separator}MOVIEHRDB_TEST_VALUE=123"
