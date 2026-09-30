@@ -616,6 +616,56 @@ def test_completed_followup_checkpoint_does_not_resume_stale_actions():
     assert not session._last_checkpoint_should_resume
 
 
+@pytest.mark.parametrize("pending_lead", (False, True))
+def test_completed_assignment_checkpoint_only_resumes_for_selected_unfinished_lead(pending_lead):
+    done = checkpoint_response(
+        inspected=[], unresolved=[], proposed_next_actions=["An obsolete private todo"],
+        unknowns=["A documented external limitation"],
+        obligation_updates=[{
+            "target": target, "disposition": "blocked", "reason": "Requires unavailable runtime access.",
+            "evidence_ids": [], "next_actions": [],
+        } for target in ("O1", "O2")],
+    )
+    gateway = ScriptedGateway([done, done] if pending_lead else [done])
+    session = make_session(gateway, max_context_tokens=100_000)
+    if pending_lead:
+        session._assigned_investigation_lead_ids.add("selected-lead")
+    result = session._checkpoint_and_resume("context-pressure")
+    assert not result.degraded
+    assert [request.tools_enabled for request in gateway.requests] == (
+        [False, True] if pending_lead else [False]
+    )
+    assert session._last_checkpoint_should_resume is pending_lead
+
+
+@pytest.mark.parametrize("correction_kind", ("invalid", "rejected", "omitted", "tool_call"))
+def test_completion_guard_preserves_rejected_correction_work(correction_kind):
+    rejected = {"target": "O1", "disposition": "covered", "reason": "Everything works.",
+                "evidence_ids": [], "next_actions": []}
+    correction = {
+        "invalid": invalid_response("not-json"),
+        "rejected": invalid_response(json.dumps({"obligation_updates": [rejected]})),
+        "omitted": invalid_response('{"obligation_updates": []}'),
+        "tool_call": tool_call_response("read_file", {"path": "a.py"}, call_id="forbidden-correction-read"),
+    }[correction_kind]
+    session = make_session(ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=[], obligation_updates=[rejected]), correction,
+    ]), max_context_tokens=100_000)
+    for target in ("O1", "O2"):
+        assert session.obligation_assessments.propose(
+            target=target, disposition="blocked", reason="Runtime access is unavailable.",
+            evidence_ids=(), next_actions=(), evidence=session.evidence_store.snapshot(),
+            eligible=lambda *_: True,
+        ).accepted
+    result = session.request_checkpoint("context-pressure", disposition="compact_resume")
+    assert not result.degraded
+    assert session._last_checkpoint_should_resume
+    assert "resume_skipped" not in result.finalization_diagnostics[-1]
+    assert result.finalization_diagnostics[-1]["compaction_level"] == "regular"
+    assert not session.conversation.open_tool_call_ids()
+    assert not any(event.get("kind") == "assistant_tool_calls" for event in session.conversation.events)
+
+
 @pytest.mark.parametrize("explored", (False, True))
 def test_compaction_only_completes_partial_followup_after_exploration(explored):
     session = make_session(ScriptedGateway([]), max_context_tokens=100_000)
@@ -4396,6 +4446,90 @@ def test_checkpoint_repairs_only_obligation_declared_updated_and_unresolved():
     )
 
 
+@pytest.mark.parametrize("disposition", ("partially_covered", "unresolved"))
+def test_checkpoint_accepts_valid_unfinished_overlap_without_repair(disposition):
+    session = make_component_group_session(ScriptedGateway([]))
+    record = seed_successful_tool_exchange(
+        session, call_id="source", path="backend/a.py", content="request validation",
+    )
+    session.gateway.responses = [checkpoint_response(
+        inspected=[], unresolved=["O1"], proposed_next_actions=[],
+        obligation_updates=[{
+            "target": "O1", "disposition": disposition,
+            "reason": "Checked the request entry; consumer still needs inspection.",
+            "assessed_paths": ["backend/a.py"], "evidence_ids": [record.id],
+            "next_actions": ["Inspect backend/b.py for request identity propagation."],
+        }],
+    )]
+
+    result = session.request_checkpoint("controller-request")
+
+    assert not result.degraded
+    assert len(session.gateway.requests) == 1
+    assert not session._last_checkpoint_rejections
+    assert session.obligation_assessments.assessment("O1").disposition.value == disposition
+    assert session.obligation_assessments.assessment("O1").assessed_paths == ("backend/a.py",)
+
+
+def test_checkpoint_duplicate_canonical_updates_do_not_mutate_assessment():
+    session = make_component_group_session(ScriptedGateway([]))
+    before = session.obligation_assessments.assessment("O1")
+    result = session._checkpoint_from_text(checkpoint_response(
+        inspected=[], unresolved=[], obligation_updates=[
+            {"target": target, "disposition": "blocked", "reason": "Missing repository access."}
+            for target in ("O1", "OB-backend")
+        ],
+    ).text)
+
+    assert result is not None
+    assert session.obligation_assessments.assessment("O1") == before
+    assert session._last_checkpoint_rejections
+    assert all("multiple updates" in item.reason for item in session._last_checkpoint_rejections)
+
+
+@pytest.mark.parametrize("correction_kind", ("accepted", "rejected", "omitted"))
+def test_obligation_correction_receipt_distinguishes_new_acceptance_from_retention(correction_kind):
+    session = make_component_group_session(ScriptedGateway([]))
+    record = seed_successful_tool_exchange(
+        session, call_id="source", path="backend/a.py", content="request validation",
+    )
+    update = {
+        "target": "O1", "disposition": "partially_covered",
+        "reason": "Checked the request entry; consumer still needs inspection.",
+        "assessed_paths": ["backend/a.py"], "evidence_ids": [record.id],
+        "next_actions": ["Inspect backend/b.py for request identity propagation."],
+    }
+    session.latest_checkpoint = session._checkpoint_from_text(checkpoint_response(
+        inspected=[], unresolved=[], obligation_updates=[update],
+    ).text)
+    before = session.obligation_assessments.assessment("O1")
+    bad = {**update, "evidence_ids": []}
+    correction_update = {**update, "reason": "Additional source review confirms the remaining consumer check."}
+    if correction_kind == "rejected":
+        correction_update = bad
+    session.gateway.responses = [
+        checkpoint_response(inspected=[], unresolved=[], obligation_updates=[bad]),
+        invalid_response(json.dumps({
+            "unresolved": [], "candidate_updates": [], "new_candidates": [],
+            "obligation_updates": [] if correction_kind == "omitted" else [correction_update],
+        })),
+    ]
+
+    session.request_checkpoint("controller-request")
+
+    receipt = session.conversation.events[-1]["content"]
+    after = session.obligation_assessments.assessment("O1")
+    if correction_kind == "accepted":
+        assert "O1 correction accepted" in receipt
+        assert after.assessment_version > before.assessment_version
+    else:
+        assert "previous assessment retained" in receipt
+        assert "correction accepted" not in receipt
+        assert replace(after, attempts=before.attempts) == before
+        if correction_kind == "rejected":
+            assert "supported work requires retained evidence" in receipt
+
+
 def test_checkpoint_rejects_terminal_obligation_update_with_next_actions():
     initial = checkpoint_response(
         inspected=[], unresolved=["O2"],
@@ -5146,7 +5280,7 @@ def test_initial_compact_resume_repairs_missing_working_memory_before_compaction
     assert "coverage" not in checkpoint_memory
     assert "evidence_metadata" not in checkpoint_memory
     assert "obligation_statuses" not in checkpoint_memory
-    assert "candidate_statuses" not in checkpoint_memory
+    assert checkpoint_memory["candidate_statuses"] == {}
 
 
 def test_context_pressure_checkpoint_compacts_and_resumes_same_specialist():
@@ -5800,6 +5934,9 @@ def test_checkpoint_candidate_without_id_is_retained_and_compacted():
     del draft["new_candidates"][0]["candidate_id"]
     gateway = ScriptedGateway([invalid_response(json.dumps(draft))])
     session = make_session(gateway, model_turns=8)
+    session.conversation.add_assistant_turn(calls=[{
+        "id": "read", "name": "read_file", "arguments": '{"path":"a.py"}',
+    }])
     session._execute_calls(({
         "id": "read", "name": "read_file", "arguments": '{"path":"a.py"}',
     },))
@@ -6023,7 +6160,7 @@ def test_resumed_pressure_pause_checkpoint_compacts_existing_boundary():
         )
     session.request_checkpoint("controller-request", disposition="pause")
     request_count = len(gateway.requests)
-    session.max_context_tokens = 8_000
+    session.max_context_tokens = 9_000
 
     session.explore()
 
@@ -6062,17 +6199,27 @@ def test_resumed_compacted_checkpoint_does_not_bypass_unrelieved_repair_reserve(
     assert session._checkpoint_pressure_due() is True
 
 
-def test_epoch_compaction_prunes_only_noncheckpoint_events_before_prior_boundary():
+def test_epoch_compaction_rolls_checkpoint_memory_without_accumulating_old_todos():
     gateway = ScriptedGateway([
+        invalid_response("first checkpoint failed attempt"),
         checkpoint_response(
             inspected=["first.py"],
             unresolved=["OB-tests"],
             working_summary="first cumulative checkpoint",
+            proposed_next_actions=["obsolete first private todo"],
         ),
+        invalid_response("second checkpoint failed attempt"),
         checkpoint_response(
             inspected=["second.py"],
             unresolved=["OB-tests"],
             working_summary="second cumulative checkpoint",
+            completed_steps=["First and second grouped checks completed"],
+            proposed_next_actions=["obsolete second private todo"],
+        ),
+        checkpoint_response(
+            inspected=["third.py"], unresolved=["OB-tests"],
+            working_summary="third cumulative checkpoint",
+            proposed_next_actions=["current private todo"],
         ),
     ])
     session = make_session(gateway, max_context_tokens=100_000)
@@ -6097,19 +6244,133 @@ def test_epoch_compaction_prunes_only_noncheckpoint_events_before_prior_boundary
     transcript = json.dumps(session.conversation.events, sort_keys=True)
     assert "discardable epoch-zero note" not in transcript
     assert "Immutable specialist assignment" in transcript
-    assert "Checkpoint reason: first-boundary." in transcript
+    assert "Checkpoint reason: first-boundary." not in transcript
     assert "first cumulative checkpoint" in transcript
+    assert "first checkpoint failed attempt" not in transcript
+    assert "second checkpoint failed attempt" in transcript
+    assert "obsolete first private todo" not in transcript
     assert "Checkpoint reason: second-boundary." in transcript
     assert "second cumulative checkpoint" in transcript
     assert removed_record.id in session._compacted_evidence
     assert session.conversation.open_tool_call_ids() == set()
-    assert len(session._checkpoint_spans) == 2
+    assert len(session._checkpoint_spans) == 1
     for span in session._checkpoint_spans:
         protected = session.conversation.events[
             span.request_start:span.response_end
         ]
         assert protected[0]["kind"] == "user"
         assert protected[-1]["kind"] == "assistant_turn_boundary"
+    session.conversation.add_user("latest epoch investigation")
+    latest_record = seed_successful_tool_exchange(session, call_id="call-latest", path="latest.py", content="latest evidence")
+    raw = json.loads(gateway.responses[0].text)
+    raw["evidence_ids"] = [latest_record.id]
+    gateway.responses[0] = invalid_response(json.dumps(raw))
+    session.request_checkpoint("third-boundary", disposition="compact_resume")
+    transcript = json.dumps(session.conversation.events, sort_keys=True)
+    assert "first cumulative checkpoint" not in transcript
+    assert "second checkpoint failed attempt" not in transcript
+    assert "Checkpoint reason: second-boundary." not in transcript
+    assert "previous epoch investigation" not in transcript
+    assert "obsolete second private todo" not in transcript
+    assert "second cumulative checkpoint" in transcript
+    assert "First and second grouped checks completed" in transcript
+    assert "latest epoch investigation" in transcript
+    assert "current private todo" in transcript
+    assert sum(bool(event.get("historical_checkpoint")) for event in session.conversation.events) == 1
+    assert sum(bool(event.get("epoch_continuation")) for event in session.conversation.events) == 1
+    assert len(session._checkpoint_spans) == 1
+    assert session.conversation.open_tool_call_ids() == set()
+
+
+@pytest.mark.parametrize("broken_kind", ("orphan_result", "missing_result"))
+def test_epoch_compaction_rejects_invalid_tool_pairing_without_partial_mutation(broken_kind):
+    session = make_session(ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+    ]), max_context_tokens=100_000)
+    if broken_kind == "orphan_result":
+        session.conversation.add_tool_result("unknown-call", "unmatched result")
+    else:
+        session.conversation.add_assistant_turn(calls=[{
+            "id": "missing-result", "name": "read_file", "arguments": '{"path":"a.py"}',
+        }])
+    # Establish a valid checkpoint without triggering compaction or repairing the deliberately bad history.
+    session.request_checkpoint("controller-request", disposition="pause")
+    events = list(session.conversation.events)
+    spans = list(session._checkpoint_spans)
+    catalogue = dict(session._compacted_evidence)
+    session._compact_validated_epoch()
+    assert session.conversation.events == events
+    assert session._checkpoint_spans == spans
+    assert session._compacted_evidence == catalogue
+    assert session._checkpoint_spans[-1].diagnostic["compaction_skipped"] == "invalid-tool-pairing"
+
+
+def test_rolling_checkpoint_keeps_accepted_state_after_raw_updates_are_retired():
+    gateway = ScriptedGateway([])
+    session = make_component_group_session(gateway)
+    source = seed_successful_tool_exchange(
+        session, call_id="source", path="backend/a.py", content="accepted source",
+    )
+    first = checkpoint_response(inspected=[], unresolved=[], obligation_updates=[{
+        "target": "O1", "disposition": "partially_covered", "reason": "Checked the first handler.",
+        "assessed_paths": ["backend/a.py"], "omitted_paths": ["backend/b.py"],
+        "evidence_ids": [source.id], "next_actions": ["Inspect the second handler."],
+    }])
+    gateway.responses = [first] + [
+        checkpoint_response(inspected=[], unresolved=[], obligation_updates=[])
+        for _ in range(2)
+    ]
+    session._candidate_statuses["retired-candidate"] = "withdrawn"
+    session._candidate_targets["C1"] = "retired-candidate"
+    session._candidate_withdrawals["retired-candidate"] = {
+        "reason": "The guarded caller disproves the issue.", "evidence_ids": [source.id],
+    }
+    # Ensure the candidate evidence wins over irrelevant earlier catalogue entries.
+    for index in range(25):
+        session._compacted_evidence[f"evidence:000{index}"] = source
+    session.request_checkpoint("first", disposition="pause")
+    for index in range(2):
+        record = seed_successful_tool_exchange(
+            session, call_id=f"later-{index}", path="backend/b.py", content=f"later evidence {index}",
+        )
+        raw = json.loads(gateway.responses[0].text)
+        raw["evidence_ids"] = [record.id]
+        gateway.responses[0] = invalid_response(json.dumps(raw))
+        session.request_checkpoint(f"boundary-{index}", disposition="compact_resume")
+    continuation = next(event for event in session.conversation.events if event.get("epoch_continuation"))
+    state = json.loads(continuation["content"].split("catalogued IDs:\n", 1)[1])
+    memory = state["cumulative_checkpoint"]
+    assert memory["candidate_statuses"] == {"C1": "withdrawn"}
+    assert memory["candidate_withdrawals"]["C1"]["reason"].startswith("The guarded caller")
+    assert memory["obligation_assessments"][0]["assessed_paths"] == ["backend/a.py"]
+    assert memory["obligation_assessments"][0]["omitted_paths"] == ["backend/b.py"]
+    assert memory["obligation_assessments"][0]["evidence_ids"] == [source.id]
+    assert source.id in {item["evidence_id"] for item in state["compacted_evidence"]}
+    assert "Checkpoint reason: first." not in json.dumps(session.conversation.events)
+
+
+def test_epoch_compaction_stages_admission_before_installing_projection(monkeypatch):
+    session = make_session(ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-tests"]),
+    ]), max_context_tokens=100_000)
+    session.request_checkpoint("controller-request", disposition="pause")
+    events = list(session.conversation.events)
+    spans = list(session._checkpoint_spans)
+    catalogue = dict(session._compacted_evidence)
+    original = session._estimate_admission
+
+    def fail_projection(**kwargs):
+        if kwargs.get("conversation") is not None:
+            raise RuntimeError("projection failure")
+        return original(**kwargs)
+
+    monkeypatch.setattr(session, "_estimate_admission", fail_projection)
+    with pytest.raises(RuntimeError, match="projection failure"):
+        session._compact_validated_epoch()
+    assert session.conversation.events == events
+    assert session._checkpoint_spans == spans
+    assert session._compacted_evidence == catalogue
+    assert session.latest_checkpoint.working_summary
 
 
 def test_emergency_reconstruction_keeps_checkpoint_ledger_and_newest_exchange():
@@ -6382,6 +6643,12 @@ def test_checkpoint_request_includes_compact_schema_contract():
     assert '"candidate_findings"' not in checkpoint_request
     assert 'new_candidates' in checkpoint_request
     assert "Use the controller C# handles" in checkpoint_request
+    assert "working_summary: <=2000 characters" in checkpoint_request
+    assert "completed_steps: <=12 items, <=500 characters/item" in checkpoint_request
+    assert "obligation_updates.next_actions: <=8 items, <=300 characters/item" in checkpoint_request
+    assert "one update per target" in checkpoint_request
+    assert "empty update arrays mean no change" in checkpoint_request
+    assert "(previous assessed_paths + new assessed_paths) minus explicit omitted_paths" in checkpoint_request
     assert (
         "evidence_by_obligation"
         not in gateway.requests[2].response_schema["properties"]
@@ -7311,9 +7578,10 @@ def test_recovery_rebases_checkpoint_span_before_later_pressure_compaction():
         "context-pressure", disposition="compact_resume",
     )
 
-    assert len(session._checkpoint_spans) == 2
+    assert len(session._checkpoint_spans) == 1
     transcript = json.dumps(session.conversation.events, sort_keys=True)
-    assert "Recovery reconstruction." in transcript
+    assert "Recovery reconstruction." not in transcript
+    assert "checkpoint before recovery" in transcript
     assert "checkpoint after recovery" in transcript
 
 

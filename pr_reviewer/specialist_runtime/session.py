@@ -851,9 +851,35 @@ def _checkpoint_shape_instruction(schema: dict[str, Any]) -> str:
     if "working_summary" in example:
         example["working_summary"] = "Current conclusions and remaining uncertainty."
         example["completed_steps"] = ["Grouped check and its conclusion."]
+    properties = schema.get("properties", {})
+    fields = [(name, properties[name]) for name in (
+        "working_summary", "completed_steps", "hypotheses", "unknowns",
+        "proposed_next_actions", "new_candidates", "obligation_updates",
+    ) if name in properties] + [
+        ("obligation_updates." + key, value)
+        for key, value in properties.get("obligation_updates", {}).get("items", {}).get("properties", {}).items()
+    ]
+    bounds = []
+    for name, field in fields:
+        limits = []
+        if "maxLength" in field:
+            limits.append(f"<={field['maxLength']} characters")
+        if "maxItems" in field:
+            limits.append(f"<={field['maxItems']} items")
+        if "maxLength" in field.get("items", {}):
+            limits.append(f"<={field['items']['maxLength']} characters/item")
+        if limits:
+            bounds.append(name + ": " + ", ".join(limits))
     return (
         " Required keys: " + ", ".join(required) + "."
         " JSON shape starts with " + json.dumps(example) + "."
+        " Field limits: " + "; ".join(bounds) + "."
+        " Working memory replaces the previous memory: summarize cumulative conclusions,"
+        " completed work and only current private next steps; do not append a diary."
+        " Update arrays are deltas: one update per target; empty update arrays mean no change."
+        " Assessed path state is (previous assessed_paths + new assessed_paths) minus explicit omitted_paths."
+        " Omitted evidence is not proof of coverage. An unresolved or partially_covered update may"
+        " also appear in unresolved; a closed disposition must not."
     )
 
 
@@ -1411,6 +1437,7 @@ class _CheckpointSpan:
     disposition: CheckpointDisposition
     compacted: bool = False
     diagnostic: dict[str, object] | None = None
+    memory: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -2131,19 +2158,27 @@ class SpecialistSession:
             if item.kind != "obligation":
                 continue
             assessment = self.obligation_assessments.assessment(item.target)
-            if assessment.disposition.value == "pending":
-                lines.append(f"- {item.target} remains unresolved.")
-            else:
+            if (item.kind, item.target) in accepted_corrections:
                 lines.append(
-                    f"- {item.target} accepted as {assessment.disposition.value}."
+                    f"- {item.target} correction accepted; current assessment is "
+                    f"{assessment.disposition.value}."
                 )
+            else:
+                detail = rejection_detail(item)
+                lines.append(
+                    f"- {item.target} "
+                    + (f"correction rejected: {detail}; " if detail else "no replacement accepted; ")
+                    + f"previous assessment retained ({assessment.disposition.value})."
+                )
+                if assessment.disposition.value == "pending":
+                    lines.append(f"- {item.target} remains unresolved.")
         for assessment in self.obligation_assessments.assessments():
             if assessment.disposition.value != "pending" and not any(
                 item.kind == "obligation" and item.target == assessment.target
                 for item in rejections
             ):
                 lines.append(
-                    f"- {assessment.target} accepted as {assessment.disposition.value}."
+                    f"- {assessment.target} retained as {assessment.disposition.value}."
                 )
         for item in sorted(
             (item for item in rejections if item.kind.startswith("candidate")),
@@ -2967,6 +3002,7 @@ class SpecialistSession:
                     response_end=len(self.conversation.events),
                     disposition=CheckpointDisposition.PAUSE,
                     diagnostic=diagnostic,
+                    memory=copy.deepcopy(self._model_checkpoint_memory()),
                 ))
                 self.state = SessionState.CHECKPOINT
                 return self._snapshot()
@@ -5113,7 +5149,8 @@ class SpecialistSession:
                     self.conversation.add_assistant_turn(
                         reasoning=correction.reasoning,
                         content=correction.content,
-                        calls=correction.tool_calls,
+                        # A tools-disabled correction never executes these calls.
+                        calls=(),
                     )
                     completion_tokens = (
                         correction.usage.get("completion_tokens", 0)
@@ -5152,6 +5189,10 @@ class SpecialistSession:
                                             value.get("candidate_id") or ""
                                         ).strip())
                                     )
+                        previous_versions = {
+                            item.target: item.assessment_version
+                            for item in self.obligation_assessments.assessments()
+                        }
                         corrected = self._checkpoint_from_text(
                             correction.content,
                             require_complete_pending=False,
@@ -5161,6 +5202,11 @@ class SpecialistSession:
                             },
                         )
                         if corrected is not None:
+                            accepted_corrections.update(
+                                ("obligation", item.target)
+                                for item in self.obligation_assessments.assessments()
+                                if item.assessment_version > previous_versions[item.target]
+                            )
                             checkpoint = corrected
                             evidence_receipts.extend(
                                 self._last_checkpoint_evidence_receipts
@@ -5309,15 +5355,32 @@ class SpecialistSession:
                 self.budget.reset_no_progress_streak("checkpoint semantic progress")
                 self._compacted_evidence_generation += 1
                 self._last_checkpoint_should_resume = True
-            if self._followup_outcome_recorded():
+            unfinished_lead = bool(
+                self._assigned_investigation_lead_ids - self._investigation_lead_resolutions.keys()
+            )
+            assignment_complete = (
+                not self.obligation_assessments.open_targets()
+                and not any(self._assessment_needs_followup_outcome(item)
+                            for item in self.obligation_assessments.assessments())
+            )
+            unfinished_corrections = any(
+                (item.kind, item.target) not in accepted_corrections
+                for item in change_rejections
+            ) or bool(self._last_checkpoint_rejections)
+            if (not unfinished_lead and not unfinished_corrections
+                    and (self._followup_outcome_recorded() or assignment_complete)):
                 # Completing a selected follow-up does not close remaining component gaps.
                 # Return those to the scheduler instead of replaying the original task.
                 self._last_checkpoint_should_resume = False
+                checkpoint_diagnostic["resume_skipped"] = (
+                    "assignment-complete" if assignment_complete else "selected-followup-complete"
+                )
             self._checkpoint_spans.append(_CheckpointSpan(
                 request_start=checkpoint_request_start,
                 response_end=len(self.conversation.events),
                 disposition=disposition,
                 diagnostic=checkpoint_diagnostic,
+                memory=copy.deepcopy(self._model_checkpoint_memory()),
             ))
             if disposition is CheckpointDisposition.COMPACT_RESUME and not repeated_no_progress:
                 self._last_compact_progress_fingerprint = progress_fingerprint
@@ -5496,6 +5559,12 @@ class SpecialistSession:
             return None
         prepared_obligation_updates: list[tuple[Mapping[str, Any], tuple[str, ...]]] = []
         declared_update_targets: set[str] = set()
+        update_counts: dict[str, int] = {}
+        for update in obligation_updates:
+            if isinstance(update, Mapping):
+                target = self.obligation_assessments.canonical_target(update.get("target"))
+                if target:
+                    update_counts[target] = update_counts.get(target, 0) + 1
         for update in obligation_updates:
             if not isinstance(update, Mapping):
                 self._last_checkpoint_validation_error = (
@@ -5538,7 +5607,16 @@ class SpecialistSession:
                 declared_update_targets.add(canonical_target)
                 continue
             declared_update_targets.add(canonical_target)
-            if canonical_target in unresolved_targets:
+            if update_counts[canonical_target] > 1:
+                rejections.append(_CheckpointChangeRejection(
+                    "obligation", canonical_target,
+                    "multiple updates for the same target; submit one replacement assessment",
+                    normalized_update,
+                ))
+                continue
+            if (canonical_target in unresolved_targets
+                    and str(normalized_update.get("disposition", "")).strip().casefold()
+                    not in {"partially_covered", "unresolved"}):
                 rejections.append(_CheckpointChangeRejection(
                     "obligation", canonical_target,
                     "target appears in both unresolved and obligation_updates",
@@ -5596,7 +5674,10 @@ class SpecialistSession:
             if action.strip().casefold() not in unresolved_action_labels
             and len(action.split()) >= 2
         )
-        if allowed_obligation_targets is None and unresolved_targets and not concrete_next_actions:
+        # Updates carry their own next actions and pass normal admission below.
+        # An overlapping marker must not overwrite retained state if that fails.
+        unchanged_unresolved_targets = unresolved_targets - declared_update_targets
+        if allowed_obligation_targets is None and unchanged_unresolved_targets and not concrete_next_actions:
             self._last_checkpoint_validation_error = (
                 "Unresolved obligations require at least one concrete "
                 "proposed_next_actions entry describing the next repository "
@@ -5605,7 +5686,7 @@ class SpecialistSession:
             return None
         # In a focused correction, unresolved declines the proposed update;
         # it must not downgrade an existing accepted assessment or coverage.
-        for target in unresolved_targets if allowed_obligation_targets is None else ():
+        for target in unchanged_unresolved_targets if allowed_obligation_targets is None else ():
             obligation_id = self.obligation_assessments.obligation_id(target)
             if obligation_id in assigned:
                 self.coverage.mark_unresolved(obligation_id)
@@ -6604,18 +6685,20 @@ class SpecialistSession:
         *,
         max_bytes: int | None = None,
         priority_evidence_ids: tuple[str, ...] = (),
+        records: Mapping[str, EvidenceRecord] | None = None,
     ) -> list[dict[str, object]]:
+        records = self._compacted_evidence if records is None else records
         entries = []
         ordered_ids = tuple(dict.fromkeys((
             *(
                 evidence_id
                 for evidence_id in priority_evidence_ids
-                if evidence_id in self._compacted_evidence
+                if evidence_id in records
             ),
-            *sorted(self._compacted_evidence),
+            *sorted(records),
         )))
         for evidence_id in ordered_ids[:20]:
-            record = self._compacted_evidence[evidence_id]
+            record = records[evidence_id]
             entry = {
                 "evidence_id": evidence_id,
                 "source_path": record.source_path or record.source_identity,
@@ -6710,22 +6793,17 @@ class SpecialistSession:
             tools_enabled=True, max_tokens=self.max_tokens,
         )
         old_events = list(self.conversation.events)
-        span_markers = [
-            (old_events[span.request_start], old_events[span.response_end - 1])
-            for span in self._checkpoint_spans
-        ]
+        latest_start_event = old_events[latest.request_start]
+        latest_end_event = old_events[latest.response_end - 1]
         protected_ids = {id(old_events[0])} if old_events else set()
-        for span in self._checkpoint_spans:
-            protected_ids.update(
-                id(event)
-                for event in old_events[span.request_start:span.response_end]
-            )
-
-        prune_before = (
-            self._checkpoint_spans[-2].request_start
-            if len(self._checkpoint_spans) >= 2
-            else 0
+        protected_ids.update(
+            id(event) for event in old_events[latest.request_start:latest.response_end]
         )
+
+        previous = self._checkpoint_spans[-2] if len(self._checkpoint_spans) >= 2 else None
+        # Never invent old working memory from today's state. Recovery spans also
+        # retain their own snapshot, so every production boundary is self-contained.
+        prune_before = previous.response_end if previous and previous.memory is not None else 0
         removed_old_events = 0
         removed_old_exchanges = 0
         removed_pruned_reasoning = 0
@@ -6733,8 +6811,7 @@ class SpecialistSession:
         working: list[dict[str, Any]] = []
         for index, event in enumerate(old_events):
             if (
-                prune_before
-                and index < prune_before
+                (index < prune_before or event.get("epoch_continuation") or event.get("historical_checkpoint"))
                 and id(event) not in protected_ids
             ):
                 removed_old_events += 1
@@ -6755,7 +6832,18 @@ class SpecialistSession:
             else:
                 working.append(event)
 
-        latest_start_event = old_events[latest.request_start]
+        if prune_before:
+            historical = copy.deepcopy(previous.memory)
+            historical.pop("proposed_next_actions", None)
+            working.insert(1, {
+                "kind": "user",
+                "historical_checkpoint": True,
+                "content": (
+                    "Historical checkpoint before the retained investigation. This is background memory,"
+                    " not a task list; the latest authoritative continuation state overrides it:\n"
+                    + json.dumps(historical, sort_keys=True)
+                ),
+            })
         boundary = next(
             index
             for index, event in enumerate(working)
@@ -6778,7 +6866,7 @@ class SpecialistSession:
             replacements,
             keep_newest_results=2,
         )
-        self.conversation.events = [
+        projected.events = [
             event["event"]
             if event.get("kind") == "checkpoint_protected"
             else event
@@ -6786,51 +6874,43 @@ class SpecialistSession:
         ]
         after_results = {
             str(event.get("call_id") or ""): str(event.get("content", ""))
-            for event in self.conversation.events
+            for event in projected.events
             if event.get("kind") == "tool_result"
         }
         retained = {
             record.id: record for record in self.evidence_store.snapshot().records
         }
+        compacted_evidence = dict(self._compacted_evidence)
         for evidence_id in pruned_evidence_ids:
             record = retained.get(evidence_id)
             if record is not None and record.is_usable_for_coverage:
-                self._compacted_evidence[evidence_id] = record
+                compacted_evidence[evidence_id] = record
         for call_id, old_content in before_results.items():
             if after_results.get(call_id) == old_content:
                 continue
             evidence_id = self._tool_call_evidence_ids.get(call_id, "")
             record = retained.get(evidence_id)
             if record is not None and record.is_usable_for_coverage:
-                self._compacted_evidence[evidence_id] = record
+                compacted_evidence[evidence_id] = record
 
-        rebuilt_spans: list[_CheckpointSpan] = []
-        for span, (start_event, end_event) in zip(
-            self._checkpoint_spans, span_markers,
-        ):
-            start = next(
-                index for index, event in enumerate(self.conversation.events)
-                if event is start_event
-            )
-            end = next(
-                index for index, event in enumerate(self.conversation.events)
-                if event is end_event
-            ) + 1
-            rebuilt_spans.append(_CheckpointSpan(
-                request_start=start,
-                response_end=end,
-                disposition=span.disposition,
-                compacted=span.compacted,
-                diagnostic=span.diagnostic,
-            ))
-        rebuilt_spans[-1] = replace(rebuilt_spans[-1], compacted=True)
-        self._checkpoint_spans = rebuilt_spans
+        start = next(index for index, event in enumerate(projected.events) if event is latest_start_event)
+        end = next(index for index, event in enumerate(projected.events) if event is latest_end_event) + 1
+        rebuilt_spans = [replace(latest, request_start=start, response_end=end, compacted=True)]
+        priority_ids = tuple(dict.fromkeys((
+            *(evidence_id for candidate in self.candidate_findings
+              for evidence_id in (*candidate.supporting_evidence_ids, *candidate.contradicting_evidence_ids)),
+            *(evidence_id for assessment in self.obligation_assessments.assessments()
+              for evidence_id in assessment.evidence_ids),
+            *sorted(pruned_evidence_ids),
+        )))
 
         continuation = {
             "cumulative_checkpoint": self._model_checkpoint_memory(),
             "current_owned_changed_paths": list(getattr(self.assignment, "owned_changed_paths", ())),
             "delegation_receipts": self._delegation_receipts,
-            "compacted_evidence": self._compacted_evidence_catalogue(),
+            "compacted_evidence": self._compacted_evidence_catalogue(
+                priority_evidence_ids=priority_ids, records=compacted_evidence,
+            ),
             "removal_summary": {
                 **asdict(stats),
                 "removed_old_events": removed_old_events,
@@ -6839,7 +6919,7 @@ class SpecialistSession:
                 self.latest_checkpoint.proposed_next_actions
             ),
         }
-        self.conversation.events.append({
+        projected.events.append({
             "kind": "user",
             "content": (
                 "Validated checkpoint epoch compacted. Tool access is re-enabled "
@@ -6850,9 +6930,33 @@ class SpecialistSession:
             ),
             "epoch_continuation": True,
         })
+        # Stage the whole projection before installing any of it. Check both sides:
+        # open_tool_call_ids alone does not detect orphaned result messages.
+        pending: set[str] = set()
+        invalid_pairing = False
+        for event in projected.events:
+            if event.get("kind") == "assistant_tool_calls":
+                ids = [str(call.get("id") or "") for call in event.get("calls", ())]
+                if pending or not all(ids) or len(set(ids)) != len(ids):
+                    invalid_pairing = True
+                    break
+                pending.update(ids)
+            elif event.get("kind") == "tool_result":
+                call_id = str(event.get("call_id") or "")
+                if call_id not in pending:
+                    invalid_pairing = True
+                    break
+                pending.remove(call_id)
+        if invalid_pairing or pending:
+            if latest.diagnostic is not None:
+                latest.diagnostic["compaction_skipped"] = "invalid-tool-pairing"
+            return EpochCompactionStats()
         after = self._estimate_admission(
-            tools_enabled=True, max_tokens=self.max_tokens,
+            tools_enabled=True, max_tokens=self.max_tokens, conversation=projected,
         )
+        self.conversation.events = projected.events
+        self._checkpoint_spans = rebuilt_spans
+        self._compacted_evidence = compacted_evidence
         if latest.diagnostic is not None:
             latest.diagnostic.update({
                 "compaction_level": str(compaction_level)[:40],
@@ -7021,6 +7125,7 @@ class SpecialistSession:
             response_end=checkpoint_response_end,
             disposition=CheckpointDisposition.COMPACT_RESUME,
             compacted=True,
+            memory=copy.deepcopy(self._model_checkpoint_memory()),
         )]
         return True
 
@@ -7435,7 +7540,7 @@ class SpecialistSession:
         }
 
     def _model_checkpoint_memory(self) -> dict[str, object]:
-        """Return only model-owned memory needed after regular compaction."""
+        """Bounded working memory plus accepted state needed after compaction."""
         checkpoint = self.latest_checkpoint
         return {
             "working_summary": checkpoint.working_summary,
@@ -7445,6 +7550,14 @@ class SpecialistSession:
                 self._model_candidate_payload(candidate)
                 for candidate in self.candidate_findings
             ],
+            "candidate_statuses": {
+                self._known_candidate_target(candidate_id): status
+                for candidate_id, status in self._candidate_statuses.items()
+            },
+            "candidate_withdrawals": {
+                self._known_candidate_target(candidate_id): dict(value)
+                for candidate_id, value in self._candidate_withdrawals.items()
+            },
             "defect_leads": [dict(item) for item in self._defect_leads],
             "unknowns": list(checkpoint.unknowns),
             "proposed_next_actions": list(checkpoint.proposed_next_actions),
@@ -7718,6 +7831,7 @@ class SpecialistSession:
             response_end=len(rebuilt.events),
             disposition=CheckpointDisposition.COMPACT_RESUME,
             compacted=True,
+            memory=copy.deepcopy(self._model_checkpoint_memory()),
         )]
         self._recovery_turn_pending = True
         self.state = SessionState.EXPLORING
