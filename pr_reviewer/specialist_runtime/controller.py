@@ -3675,6 +3675,7 @@ class ReviewController:
                     replace(
                         validated,
                         assessment_version=assessment.assessment_version,
+                        next_actions_consumed=assessment.next_actions_consumed,
                     ),
                 ))
         return tuple(accepted)

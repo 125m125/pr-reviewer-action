@@ -5067,6 +5067,11 @@ def test_initial_compact_resume_repairs_missing_working_memory_before_compaction
     for prompt in (initial_prompt, repair_prompt):
         assert "non-empty working_summary" in prompt
         assert "non-empty completed_steps" in prompt
+        assert "Do not reopen the investigation" in prompt
+        assert "Actively attempt to falsify" not in prompt
+        assert "not a chronological list of reads" in prompt
+        assert "decisive evidence references" in prompt
+    assert json.loads(gateway.requests[0].messages)[0] == json.loads(gateway.requests[1].messages)[0]
     assert set(gateway.requests[0].response_schema["required"]) >= {
         "unresolved", "working_summary", "completed_steps",
     }
@@ -5089,6 +5094,8 @@ def test_initial_compact_resume_repairs_missing_working_memory_before_compaction
     assert "Tool access is re-enabled for exploration." in continuation
     assert "controller-selected gaps" in continuation
     assert "Then stop issuing tools" in continuation
+    assert "first investigate" in continuation
+    assert "First record the selected outcome" not in continuation
     continuation_payload = json.loads(continuation.split("catalogued IDs:\n", 1)[1])
     checkpoint_memory = continuation_payload["cumulative_checkpoint"]
     assert "coverage" not in checkpoint_memory
