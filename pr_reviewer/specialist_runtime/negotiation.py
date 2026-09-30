@@ -291,7 +291,7 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
                   if not _requires_human_action(action)
                   and action != "candidate_updates"
                   and not _blocked_source_action(action, item.id, state))
-            if assessment is not None else ()
+            if assessment is not None and not assessment.next_actions_consumed else ()
         )
         if assessment is not None and assessment.omitted_paths:
             next_actions = (*next_actions, "Inspect unassessed changed paths: " + ", ".join(assessment.omitted_paths[:20]))

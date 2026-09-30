@@ -3994,6 +3994,50 @@ def test_handoff_receives_unresolved_assessment_reason_without_private_todos():
     assert "private TODO" not in json.dumps(summaries)
 
 
+def test_consumed_followup_preserves_accepted_paths_after_failed_continuation():
+    from types import SimpleNamespace
+    from pr_reviewer.specialist_runtime.obligation_assessment import ObligationAssessmentLedger
+
+    paths = tuple(f"backend/file{index}.py" for index in range(24))
+    obligation = CoverageObligation(
+        "O-backend", "component", "backend", scope=paths, owner_component_id="backend",
+    )
+    evidence = EvidenceStore()
+    record = evidence.add_tool_result(
+        session_id="S1", tool="read_file", arguments={"path": paths[0]},
+        result={"status": "ok", "content": "retained implementation"},
+    )
+    ledger = ObligationAssessmentLedger(
+        session_id="S1", obligations=(obligation,), obligation_ids=(obligation.id,),
+    )
+    assert ledger.propose(
+        target="O1", disposition="unresolved", reason="Four changed consumers remain to inspect.",
+        evidence_ids=(record.id,), next_actions=("Read the remaining changed consumers.",),
+        assessed_paths=paths[:20], omitted_paths=paths[20:], evidence=evidence.snapshot(),
+        eligible=lambda *_: True,
+    ).accepted
+    ledger.consume_next_actions((obligation.id,))
+    # Continuation is interrupted: no replacement assessment, only retained state.
+    state = SimpleNamespace(
+        evidence=evidence, obligations=(obligation,), inputs=SimpleNamespace(head_sha="head"),
+        assignments={"A1": SimpleNamespace(parent_assignment_id="", id="A1")},
+        quarantined_session_ids={"S1"}, preserved_session_ids={"S1"},
+        session_result_revisions={("A1", "S1"): 2},
+        session_results={("A1", "S1"): SimpleNamespace(checkpoint=SessionCheckpoint(
+            session_id="S1", state=SessionState.CHECKPOINT,
+            obligation_assessments=ledger.assessments(),
+        ))},
+    )
+    accepted = ReviewController._accepted_checkpoint_assessments(state)
+    assert len(accepted) == 1
+    assessment = accepted[0][2]
+    assert assessment.assessed_paths == paths[:20]
+    assert assessment.omitted_paths == paths[20:]
+    assert assessment.evidence_ids == (record.id,)
+    assert assessment.disposition is ObligationDisposition.UNRESOLVED
+    assert assessment.next_actions_consumed is True
+
+
 def test_finalizer_can_only_select_controller_backed_behavioral_summaries(tmp_path):
     def finalizer(request):
         assert request.context["handoff_summary_candidates"]["what_changed"] == (

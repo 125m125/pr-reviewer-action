@@ -791,7 +791,19 @@ _CHECKPOINT_TOOL_STATE_INSTRUCTION = (
 _CHECKPOINT_WORKING_MEMORY_INSTRUCTION = (
     " For compact_resume, provide a non-empty working_summary describing the "
     "current understanding and a non-empty completed_steps array describing "
-    "what was checked and concluded."
+    "what was checked and concluded. Keep working memory concise: group related "
+    "checks by conclusion, not a chronological list of reads. Preserve decisive "
+    "evidence references, current conclusions, and remaining questions with their "
+    "next concrete check. Do not duplicate full candidate proofs in working memory; "
+    "keep required candidate evidence in the candidate fields."
+)
+_CHECKPOINT_RECORDING_INSTRUCTION = (
+    " Record current conclusions from already collected evidence. Do not reopen "
+    "the investigation or settle outstanding questions during this turn. Preserve "
+    "uncertainty and the next concrete check instead. Covered means investigation "
+    "complete, not defect-free; an active candidate does not keep coverage open. "
+    "Record only changes to accepted obligation or candidate state, using the "
+    "controller targets below."
 )
 _CHECKPOINT_RETENTION_INSTRUCTION = (
     " Required keys: unresolved, obligation_updates, candidate_updates, "
@@ -830,6 +842,7 @@ _CHECKPOINT_REPAIR_INSTRUCTION = (
     "Repair the previous checkpoint as one JSON object matching the schema."
     + " " + _CHECKPOINT_TOOL_STATE_INSTRUCTION
     + _CHECKPOINT_CONTROLLER_STATE_INSTRUCTION
+    + _CHECKPOINT_RECORDING_INSTRUCTION
     + _CHECKPOINT_WORKING_MEMORY_INSTRUCTION
     + _CHECKPOINT_RETENTION_INSTRUCTION
 )
@@ -2234,7 +2247,7 @@ class SpecialistSession:
             + "\n"
             + _CHECKPOINT_TOOL_STATE_INSTRUCTION
             + _CHECKPOINT_CONTROLLER_STATE_INSTRUCTION
-            + _OBLIGATION_PROTOCOL_INSTRUCTION
+            + _CHECKPOINT_RECORDING_INSTRUCTION
             + (
                 " For compact_resume, tool access will be re-enabled after "
                 "the checkpoint validates."
@@ -6391,6 +6404,7 @@ class SpecialistSession:
                 action
                 for target in self.obligation_assessments.handles()
                 if self.obligation_assessments.obligation_id(target) in normalized
+                if not self.obligation_assessments.assessment(target).next_actions_consumed
                 for action in self.obligation_assessments.assessment(target).next_actions
             )
             self._continuation_scope = (
@@ -6398,9 +6412,10 @@ class SpecialistSession:
                 + json.dumps([target for value in normalized
                               if (target := self.obligation_assessments.canonical_target(value))])
                 + ". Selected actions: " + json.dumps(next_actions)
-                + " First record the selected outcome with propose_obligation_resolution "
-                "(or obligation_updates in the requested checkpoint), using retained evidence "
-                "without rereading completed work. Then stop issuing tools; the controller will "
+                + " Tools remain enabled: first investigate the selected unfinished actions, "
+                "then record the outcome with propose_obligation_resolution "
+                "(or obligation_updates in the requested checkpoint). If the answer is already "
+                "known, use retained evidence without rereading completed work. Then stop issuing tools; the controller will "
                 "request a checkpoint. Do not reopen other gaps, repeat completed checks, "
                 "or resubmit active candidates. Resuming after compaction does not expand this task."
             )

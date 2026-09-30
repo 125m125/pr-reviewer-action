@@ -39,6 +39,7 @@ _RE_KUBE_CRED = re.compile(
 _RE_SOURCE_KV_SECRET = re.compile(
     # Only explicit shell commands disambiguate an empty assignment from config.
     r"(?i)(?P<empty_shell>\b(?:export|env)[ \t]+[A-Za-z_][A-Za-z0-9_]*="
+    r"(?:[ \t]+[A-Za-z_][A-Za-z0-9_]*=)*"
     r"(?=\s+[A-Za-z_][A-Za-z0-9_]*=))|"
     r"(?P<key>api[_-]?key|api[_-]?token|auth[_-]?token|access[_-]?key|"
     r"token|password|secret)"
