@@ -147,6 +147,19 @@ checkpoint, checkpoint repair may correct that candidate or leave it as a
 bounded next action. A compact-resume checkpoint continues the same session
 only when it demonstrates meaningful progress; reworded informal TODOs do not
 count as progress. No-progress checkpoints pause instead of restarting exploration.
+An accepted checkpoint also pauses when all assigned work has a closed disposition
+and no selected follow-up, lead, or correction remains unfinished. Private TODOs
+and active findings alone do not keep exploration running; finalization still runs.
+
+Compaction keeps one historical snapshot from the preceding valid checkpoint,
+the investigation since that boundary, and the complete latest checkpoint exchange.
+Older checkpoint requests and repairs are retired only after a new valid checkpoint.
+Accepted assessments and candidate status survive; historical private TODOs do not.
+Working summaries replace earlier memory rather than accumulating a diary. Update
+arrays are deltas: an empty array changes nothing, and each obligation has at most
+one update per checkpoint. Valid unfinished updates can also be listed as unresolved;
+rejected updates retain their prior accepted state and receive per-target feedback.
+
 Before a stopped session reaches the negotiator (or finalization), one bounded,
 tools-disabled pass can record still-pending obligation dispositions without
 regenerating the checkpoint. Accepted updates survive rejected siblings; missing
