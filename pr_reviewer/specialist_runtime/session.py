@@ -806,8 +806,7 @@ _CHECKPOINT_RECORDING_INSTRUCTION = (
     "controller targets below."
 )
 _CHECKPOINT_RETENTION_INSTRUCTION = (
-    " Required keys: unresolved, obligation_updates, candidate_updates, "
-    "new_candidates, unknowns, and proposed_next_actions. Every still-pending "
+    " Every still-pending "
     "obligation target must "
     "appear either in obligation_updates or unresolved. Follow the current "
     "pending_obligations list: a controller-selected follow-up needs a new outcome "
@@ -835,8 +834,6 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
     "Use only exact "
     "retained evidence IDs (evidence:<hash>) from successful tool results in "
     "evidence_ids and supporting_evidence_ids; repository paths are not evidence IDs."
-    " JSON shape starts with {\"unresolved\":[\"O1\"],"
-    "\"obligation_updates\":[],\"candidate_updates\":[]}."
 )
 _CHECKPOINT_REPAIR_INSTRUCTION = (
     "Repair the previous checkpoint as one JSON object matching the schema."
@@ -846,6 +843,22 @@ _CHECKPOINT_REPAIR_INSTRUCTION = (
     + _CHECKPOINT_WORKING_MEMORY_INSTRUCTION
     + _CHECKPOINT_RETENTION_INSTRUCTION
 )
+
+
+def _checkpoint_shape_instruction(schema: dict[str, Any]) -> str:
+    required = schema.get("required", ())
+    example = {key: [] for key in required}
+    if "working_summary" in example:
+        example["working_summary"] = "Current conclusions and remaining uncertainty."
+        example["completed_steps"] = ["Grouped check and its conclusion."]
+    return (
+        " Required keys: " + ", ".join(required) + "."
+        " JSON shape starts with " + json.dumps(example) + "."
+    )
+
+
+def _checkpoint_repair_instruction(schema: dict[str, Any]) -> str:
+    return _CHECKPOINT_REPAIR_INSTRUCTION + _checkpoint_shape_instruction(schema)
 
 
 def _strings(value: object) -> tuple[str, ...]:
@@ -1578,6 +1591,7 @@ class SpecialistSession:
         self.continuation_blocked = False
         self._continuation_scope = ""
         self._followup_assessment_versions: dict[str, int] = {}
+        self._followup_explored = False
         self.latest_checkpoint = self._project_checkpoint(())
         self.source_access_requests: tuple[
             SourceAccessRequest | RepositoryAccessRequest, ...
@@ -2259,6 +2273,10 @@ class SpecialistSession:
             + self._checkpoint_obligation_contract()
             + _CHECKPOINT_WORKING_MEMORY_INSTRUCTION
             + _CHECKPOINT_RETENTION_INSTRUCTION
+            + _checkpoint_shape_instruction(
+                _COMPACTING_CHECKPOINT_SCHEMA
+                if disposition is CheckpointDisposition.COMPACT_RESUME else _CHECKPOINT_SCHEMA
+            )
         )
 
     @staticmethod
@@ -2450,7 +2468,7 @@ class SpecialistSession:
         )
         # Include the repair instruction/contract before splitting free space.
         repair_overhead = math.ceil(len((
-            _CHECKPOINT_REPAIR_INSTRUCTION + self._checkpoint_obligation_contract()
+            _checkpoint_repair_instruction(schema) + self._checkpoint_obligation_contract()
         ).encode("utf-8")) / 3)
         available = max(0, self.max_context_tokens - admission.input_tokens
                         - self.wire_safety_tokens - repair_overhead)
@@ -2483,7 +2501,7 @@ class SpecialistSession:
             thinking_budget_tokens=self.checkpoint_reasoning_budget_tokens,
         )
         repair_instruction_tokens = math.ceil(
-            len((_CHECKPOINT_REPAIR_INSTRUCTION
+            len((_checkpoint_repair_instruction(_COMPACTING_CHECKPOINT_SCHEMA)
                  + self._checkpoint_obligation_contract()).encode("utf-8")) / 3
         )
         reserved_tokens = (
@@ -2845,6 +2863,7 @@ class SpecialistSession:
                     raise
                 return self._recover_from_provider_context_limit(exc)
             request_purpose = "exploration"
+            self._followup_explored = True
             self._candidate_retention_signal = (
                 self._candidate_retention_signal.merged(
                     _candidate_retention_signal(turn.content)
@@ -4775,7 +4794,7 @@ class SpecialistSession:
                     thinking_budget_tokens=proposed_budget,
                 )
                 repair_overhead = math.ceil(len((
-                    _CHECKPOINT_REPAIR_INSTRUCTION + self._checkpoint_obligation_contract()
+                    _checkpoint_repair_instruction(checkpoint_schema) + self._checkpoint_obligation_contract()
                 ).encode("utf-8")) / 3)
                 if (optimized_output >= 512 and optimized_repair >= 512
                     and admission.admission_tokens + optimized_repair + repair_overhead <= self.max_context_tokens):
@@ -4959,7 +4978,7 @@ class SpecialistSession:
                 )
             else:
                 repair_instruction = (
-                    _CHECKPOINT_REPAIR_INSTRUCTION
+                    _checkpoint_repair_instruction(checkpoint_schema)
                     + "\n"
                     + self._checkpoint_obligation_contract()
                 )
@@ -5258,6 +5277,15 @@ class SpecialistSession:
             "rejected_correction_changes": tuple(rejected_correction_changes),
         })
         self.latest_checkpoint = checkpoint
+        if (disposition is CheckpointDisposition.COMPACT_RESUME
+                and not self._followup_explored):
+            # A state-saving restatement before exploration is not the selected
+            # follow-up's outcome. Keep the accepted state, but require a fresh
+            # outcome for still-open work after resuming.
+            for assessment in self.obligation_assessments.assessments():
+                if (assessment.obligation_id in self._followup_assessment_versions
+                        and assessment.disposition.value in {"unresolved", "partially_covered"}):
+                    self._followup_assessment_versions[assessment.obligation_id] = assessment.assessment_version
         if (
             not fallback_projection
             and not retention_unknown
@@ -6393,6 +6421,7 @@ class SpecialistSession:
         if self._final_result is not None:
             return
         normalized = _strings(gaps)
+        self._followup_explored = False
         self._followup_assessment_versions = {
             assessment.obligation_id: assessment.assessment_version
             for assessment in self.obligation_assessments.assessments()

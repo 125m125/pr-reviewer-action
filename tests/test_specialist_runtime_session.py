@@ -616,6 +616,45 @@ def test_completed_followup_checkpoint_does_not_resume_stale_actions():
     assert not session._last_checkpoint_should_resume
 
 
+@pytest.mark.parametrize("explored", (False, True))
+def test_compaction_only_completes_partial_followup_after_exploration(explored):
+    session = make_session(ScriptedGateway([]), max_context_tokens=100_000)
+    record = session.evidence_store.add_tool_result(
+        session_id="S1", tool="read_file", arguments={"path": "tests/test_a.py"},
+        result={"status": "ok", "content": "test source, execution provenance still unknown"},
+        category="tests",
+    )
+    partial = checkpoint_response(inspected=[], unresolved=["OB-code"], obligation_updates=[{
+        "target": "O2", "disposition": "partially_covered", "reason": "Provenance still needs checking.",
+        "evidence_ids": [record.id], "next_actions": ["Check the test report provenance."],
+    }])
+    done = checkpoint_response(inspected=[], unresolved=["OB-code"], obligation_updates=[{
+        "target": "O2", "disposition": "blocked", "reason": "No retained report has provenance metadata.",
+        "evidence_ids": [], "next_actions": [],
+    }])
+    session.gateway.responses = [partial, partial, done] if explored else [partial, done]
+    assert session.obligation_assessments.propose(
+        target="O2", disposition="partially_covered", reason="Provenance still needs checking.",
+        evidence_ids=(record.id,), next_actions=("Check the test report provenance.",),
+        evidence=session.evidence_store.snapshot(), eligible=lambda *_: True,
+    ).accepted
+    session.apply_coverage_feedback(["OB-tests"])
+    if explored:
+        # A legitimate conclusion can use retained evidence without any tool call.
+        session.explore()
+    result = session._checkpoint_and_resume("context-pressure")
+    assert not result.degraded
+    if explored:
+        assert [request.tools_enabled for request in session.gateway.requests] == [True, False]
+        assert not session._last_checkpoint_should_resume
+        return
+    assert [request.tools_enabled for request in session.gateway.requests] == [False, True]
+    continuation = json.loads(session.gateway.requests[1].messages)[-1]["content"]
+    assert "already recorded" not in continuation
+    assert "first investigate" in continuation
+    assert "Check the test report provenance." in continuation
+
+
 def test_prefill_incompatibility_is_shared_between_sessions_not_gateways():
     error = ModelRequestError("provider rejected request", status=500,
                              body="Assistant response prefill is incompatible with enable_thinking.")
@@ -5023,6 +5062,10 @@ def test_checkpoint_disposition_is_explicit_in_cumulative_prompt(
     assert "remaining budget" not in prompt.lower()
     assert "Tool access is disabled for this checkpoint turn." in prompt
     assert "Do not emit native tool calls or XML/function-call markup." in prompt
+    listed = prompt.split("Required keys: ", 1)[1].split(".", 1)[0].split(", ")
+    assert set(listed) == set(gateway.requests[0].response_schema["required"])
+    example = json.JSONDecoder().raw_decode(prompt.split("JSON shape starts with ", 1)[1])[0]
+    assert set(example) == set(listed)
     if disposition == "compact_resume":
         assert "tool access will be re-enabled" in prompt
     required = set(gateway.requests[0].response_schema["required"])
@@ -5071,6 +5114,8 @@ def test_initial_compact_resume_repairs_missing_working_memory_before_compaction
         assert "Actively attempt to falsify" not in prompt
         assert "not a chronological list of reads" in prompt
         assert "decisive evidence references" in prompt
+        listed = prompt.split("Required keys: ", 1)[1].split(".", 1)[0].split(", ")
+        assert {"working_summary", "completed_steps"} <= set(listed)
     assert json.loads(gateway.requests[0].messages)[0] == json.loads(gateway.requests[1].messages)[0]
     assert set(gateway.requests[0].response_schema["required"]) >= {
         "unresolved", "working_summary", "completed_steps",
