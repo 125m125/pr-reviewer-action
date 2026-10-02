@@ -235,7 +235,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "web_fetch",
         "description": (
-            "Fetch an HTTPS URL approved by the current source policy. The "
+            "Fetch an HTTPS URL approved by the current source policy. Optional search_terms "
+            "select literal case-insensitive matches with bounded section context, even on small pages. "
+            "Excerpts and no-match results do not prove absence. HTML anchors select a real section; "
+            "navigation result IDs can retrieve linked chapters. The "
             "executor rechecks host/path policy and public DNS addresses on "
             "every redirect, normalizes and masks content, and returns typed "
             "external evidence with provenance. Prefer a structured API "
@@ -255,6 +258,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "url": {
                     "type": "string",
                     "description": "Absolute https URL on an allowlisted host.",
+                },
+                "search_terms": {
+                    "type": "array", "minItems": 1, "maxItems": 8,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "description": "Optional literal OR search terms; retains existing output limit, not full-page coverage.",
                 },
                 "purpose": {
                     "type": "string",
@@ -406,7 +414,9 @@ WEB_SEARCH_SCHEMA: dict[str, Any] = {
 WEB_FETCH_SEARCH_RESULT_SCHEMA: dict[str, Any] = {
     "name": "web_fetch_search_result",
     "description": (
-        "Retrieve one approved web_search result by its result_id. The controller "
+        "Retrieve one approved search or page-navigation result by its result_id. "
+        "Optional search_terms filter website passages (not repository results), using literal "
+        "case-insensitive OR matches and bounded context. Excerpts are incomplete evidence. The controller "
         "selects website or repository retrieval and rechecks permission. Visible "
         "URLs are descriptive, not alternate retrieval instructions. For another "
         "version/resource use a new search or the appropriate direct tool; permission "
@@ -417,7 +427,11 @@ WEB_FETCH_SEARCH_RESULT_SCHEMA: dict[str, Any] = {
         "properties": {
             "result_id": {
                 "type": "string",
-                "description": "Opaque session-scoped ID returned by web_search.",
+                "description": "Opaque session-scoped ID returned by search or page navigation.",
+            },
+            "search_terms": {
+                "type": "array", "minItems": 1, "maxItems": 8,
+                "items": {"type": "string", "minLength": 1, "maxLength": 128},
             },
             "purpose": {
                 "type": "string",
@@ -450,13 +464,16 @@ def web_tool_schemas(
     schemas = [schema for schema in TOOL_SCHEMAS if schema["name"] != "web_fetch"]
     if has_sources:
         schemas.append(next(schema for schema in TOOL_SCHEMAS if schema["name"] == "web_fetch"))
+        schemas.append(WEB_FETCH_SEARCH_RESULT_SCHEMA)
     from pr_reviewer.platform import resolve_platform
     has_repository_route = bool(tuple(allowed_repos)) and resolve_platform() == "github"
     if (has_sources or has_repository_route) and SearxngSearchProvider.is_valid_endpoint(
         str(search_url or "").strip(),
         allow_private_search_url=allow_private_search_url,
     ):
-        schemas.extend((WEB_SEARCH_SCHEMA, WEB_FETCH_SEARCH_RESULT_SCHEMA))
+        schemas.append(WEB_SEARCH_SCHEMA)
+        if not has_sources:
+            schemas.append(WEB_FETCH_SEARCH_RESULT_SCHEMA)
     return schemas
 
 # Per-tool result cap applied when re-adding tool output to the conversation

@@ -548,6 +548,47 @@ def test_secure_fetch_prefers_markdown_then_plain_text_then_html():
     assert result.content == "# API\n\nSupported."
 
 
+def test_selected_fetch_reaches_late_content_and_keeps_payload_bounded():
+    url = 'https://docs.example.com/manual'
+    body = ('<h1>Manual</h1><h2>Other</h2><p>' + 'filler ' * 20_000 +
+            '</p><h2 id="invoke">Invocation</h2><p>needle argument semantics</p>').encode()
+    transport = FakeHttpTransport({url: HttpResponse(200, {'Content-Type': 'text/html'}, body)})
+    fetcher = SecureFetcher(source_policy(), transport=transport, resolver=public_resolver, max_bytes=3000)
+    result = fetcher.fetch(url, search_terms=('needle',))
+    assert 'needle argument semantics' in result.content
+    assert 'filler filler' not in result.content
+    assert transport.requests[0].max_bytes == 8 * 1024 * 1024
+    assert len(result.to_tool_result().encode()) <= 3000
+    assert result.selection['download_truncated'] is False
+    assert result.truncated is True
+    assert result.selection['passages']
+
+
+@pytest.mark.parametrize('terms', [[], [''], ['x'] * 9, ['x' * 129], 'needle', [42]])
+def test_bad_selector_rejected_before_transport(terms):
+    transport = FakeHttpTransport({})
+    with pytest.raises(ValueError, match='search_terms'):
+        SecureFetcher(source_policy(), transport=transport, resolver=public_resolver).fetch(
+            'https://docs.example.com/manual', search_terms=terms)
+    assert not transport.requests
+
+
+def test_navigation_uses_real_links_and_rechecks_permissions_without_fetching():
+    url = 'https://docs.example.com/start'
+    final = 'https://docs.example.com/guide/manual'
+    body = b'<h2 id="invoke">Invocation</h2><p>needle <a href="chapter#part">chapter</a> <a href="https://evil.example/no">secret denied label</a></p>'
+    transport = FakeHttpTransport({url: HttpResponse(302, {'Location': final}, b''),
+        final: HttpResponse(200, {'Content-Type': 'text/html'}, body)})
+    registry = SearchResultRegistry()
+    result = SecureFetcher(source_policy(), transport=transport, resolver=public_resolver, max_bytes=5000).fetch(
+        url + '#invoke', search_terms=('needle',), result_registry=registry)
+    assert len(transport.requests) == 2
+    allowed = next(link for link in result.navigation if link.get('fetch_allowed'))
+    assert registry.resolve(allowed['result_id']) == 'https://docs.example.com/guide/chapter#part'
+    assert 'secret denied label' not in json.dumps(result.navigation)
+    assert any(link.get('fetch_allowed') is False for link in result.navigation)
+
+
 def test_documentation_redirect_accepts_underscore_slug_without_relaxing_host_policy():
     start = "https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs"
     destination = (

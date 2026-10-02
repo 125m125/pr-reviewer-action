@@ -28,6 +28,7 @@ from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlsplit, urlun
 
 from .evidence import EvidenceProvenance, EvidenceStore
 from .policy import ReviewPolicy, SourceRule
+from .web_passages import normalize_document, select_passages, validate_search_terms
 
 _SCRIPTS_DIR = str(Path(__file__).parents[2] / "scripts")
 if _SCRIPTS_DIR not in sys.path:
@@ -443,6 +444,8 @@ class FetchedEvidence:
     truncated: bool
     provenance: EvidenceProvenance
     evidence_id: str | None = None
+    selection: Mapping[str, object] | None = None
+    navigation: tuple[dict, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -465,6 +468,8 @@ class FetchedEvidence:
                 "truncated": self.truncated,
             },
             "evidentiary": True,
+            **({"selection": dict(self.selection), "navigation": list(self.navigation)}
+               if self.selection is not None else {}),
         }
 
     def to_tool_result(self) -> str:
@@ -935,10 +940,31 @@ def discover(
     candidates = tuple(response)[
         :search_scan_limit
     ]
+    return _route_candidates(candidates, source_policy, result_registry=result_registry,
+        allowed_repos=allowed_repos, current_repo=current_repo,
+        tool_max_search_results=tool_max_search_results, clean_query=clean_query,
+        engine_warnings=response.engine_warnings if isinstance(response, SearchResponse) else ())
+
+
+def _web_resource(url):
+    """Fragments select local content; validate them without weakening URL policy."""
+    parsed = urlsplit(url)
+    fragment = unquote(parsed.fragment) if parsed.fragment else None
+    if fragment is not None and (len(fragment) > 256 or '%' in fragment or any(ord(c) < 32 or ord(c) == 127 for c in fragment)):
+        raise SourceDenied("unsafe or oversized section anchor")
+    return urlunsplit(parsed._replace(fragment="")), fragment
+
+
+def _route_candidates(candidates, source_policy, *, result_registry, allowed_repos=(),
+                      current_repo="", tool_max_search_results=8, clean_query="", engine_warnings=()):
     approved: list[SearchCandidate] = []
     unapproved: list[SearchCandidate] = []
     for candidate in candidates:
-        decision = source_policy.classify(candidate.url)
+        try:
+            resource, fragment = _web_resource(candidate.url)
+        except ValueError:
+            resource, fragment = candidate.url, None
+        decision = source_policy.classify(resource)
         target = None
         route_error = None
         try:
@@ -957,7 +983,8 @@ def discover(
         if decision.approved:
             if result_registry is None:
                 raise SourceDenied("search result registry is required for approved discovery")
-            target = target or SearchRetrievalTarget(decision.canonical_url or candidate.url)
+            target = target or SearchRetrievalTarget((decision.canonical_url or resource) +
+                ("#" + urlsplit(candidate.url).fragment if fragment is not None else ""))
             title, _ = mask_and_truncate(str(candidate.title or ""), 300)
             snippet, _ = mask_and_truncate(str(candidate.snippet or ""), 500)
             details = {k: str(v) for k, v in target.arguments if k in {"repository", "path", "ref"}}
@@ -969,7 +996,7 @@ def discover(
             normalized = replace(
                 candidate,
                 title=title,
-                url=decision.canonical_url or "",
+                url=target.url,
                 snippet=snippet,
                 host=decision.host,
                 path=decision.path,
@@ -986,7 +1013,7 @@ def discover(
                 and decision.reason == "unsafe high-entropy URL payload"
             ):
                 opaque_decision = source_policy.classify(
-                    candidate.url, allow_opaque=True,
+                    resource, allow_opaque=True,
                 )
             if (
                 opaque_decision is not None
@@ -994,8 +1021,8 @@ def discover(
                 and opaque_decision.canonical_url
             ):
                 _, _, safe_path = _safe_discovery_url(candidate.url)
-                title, _ = mask_and_truncate(str(candidate.title or ""), 300)
-                snippet, _ = mask_and_truncate(str(candidate.snippet or ""), 500)
+                title, _ = mask_and_truncate(_redact_opaque_url_content(str(candidate.title or ""), candidate.url), 300)
+                snippet, _ = mask_and_truncate(_redact_opaque_url_content(str(candidate.snippet or ""), candidate.url), 500)
                 approved.append(SearchCandidate(
                     title=title,
                     url="",
@@ -1004,8 +1031,8 @@ def discover(
                     path=safe_path,
                     classification=opaque_decision.classification,
                     result_id=result_registry.register(
-                        opaque_decision.canonical_url,
-                        SearchRetrievalTarget(opaque_decision.canonical_url, opaque=True),
+                        candidate.url,
+                        SearchRetrievalTarget(candidate.url, opaque=True),
                     ),
                 ))
                 continue
@@ -1028,7 +1055,7 @@ def discover(
         approved=tuple(approved),
         unapproved=tuple(unapproved),
         suppressed_result_count=suppressed,
-        engine_warnings=response.engine_warnings if isinstance(response, SearchResponse) else (),
+        engine_warnings=engine_warnings,
         requested_result_count=tool_max_search_results,
     )
 
@@ -1526,9 +1553,18 @@ class SecureFetcher:
         public_reference: str | None = None,
         evidence_tool: str = "web_fetch",
         evidence_arguments: Mapping[str, object] | None = None,
+        search_terms: tuple[str, ...] | None = None,
+        result_registry: SearchResultRegistry | None = None,
+        allowed_repos: Iterable[str] = (),
+        current_repo: str = "",
+        output_max_bytes: int | None = None,
     ) -> FetchedEvidence:
+        search_terms = validate_search_terms(search_terms)
         original_url = str(url).strip()
-        current_url = original_url
+        current_url, fragment = _web_resource(original_url)
+        selection_requested = search_terms is not None or fragment is not None
+        output_limit = min(self.max_bytes, output_max_bytes) if output_max_bytes is not None else self.max_bytes
+        download_limit = 8 * 1024 * 1024 if selection_requested else self.max_bytes
         deadline = self.monotonic() + self.timeout
         if deadline_at is not None:
             deadline = min(deadline, float(deadline_at))
@@ -1554,7 +1590,7 @@ class SecureFetcher:
                 url=current_url,
                 resolved_ip=addresses[0],
                 timeout=remaining,
-                max_bytes=self.max_bytes,
+                max_bytes=download_limit,
                 deadline=deadline,
                 headers={
                     "Accept": (
@@ -1580,7 +1616,11 @@ class SecureFetcher:
                 raise SourceDenied("redirect response omitted Location")
             if redirect_count >= self.max_redirects:
                 raise SourceDenied("secure fetch redirect limit exceeded")
-            current_url = urljoin(current_url, location)
+            current_url, redirect_fragment = _web_resource(urljoin(current_url, location))
+            if redirect_fragment is not None:
+                fragment = redirect_fragment
+                selection_requested = True
+                download_limit = 8 * 1024 * 1024
         if response is None or final_decision is None:
             raise SourceDenied("secure fetch did not produce a response")
         if not 200 <= response.status < 300:
@@ -1592,17 +1632,17 @@ class SecureFetcher:
         mime_type = _mime_type(response.headers)
         if mime_type not in self.allowed_mime_types:
             raise SourceDenied(f"response MIME type is not approved: {mime_type or '(missing)'}")
-        raw_truncated = len(response.body) > self.max_bytes
-        raw_body = response.body[:self.max_bytes]
+        raw_truncated = len(response.body) > download_limit
+        raw_body = response.body[:download_limit]
         text = _decode_body(raw_body, content_type)
-        if mime_type in {"text/html", "application/xhtml+xml"}:
+        if not selection_requested and mime_type in {"text/html", "application/xhtml+xml"}:
             parser = _HtmlTextExtractor()
             parser.feed(text)
             parser.close()
             text = parser.text()
         if public_reference is not None:
             text = _redact_opaque_url_content(text, original_url, current_url)
-        bounded, normalized_truncated = mask_and_truncate(text, self.max_bytes)
+        bounded, normalized_truncated = mask_and_truncate(text, output_limit)
         truncated = raw_truncated or normalized_truncated
         content_hash = hashlib.sha256(bounded.encode("utf-8")).hexdigest()
         public_original_url = public_reference or original_url
@@ -1620,13 +1660,45 @@ class SecureFetcher:
             retrieved_at=float(self.clock()),
             max_age_hours=final_decision.max_age_hours,
         )
+        selection, navigation = None, ()
+        if selection_requested:
+            check = lambda: _remaining(deadline, self.monotonic)
+            document = normalize_document(text, mime_type, check_deadline=check)
+            shell = FetchedEvidence('', '0' * 64, mime_type, True, provenance, 'evidence:' + '0' * 64)
+            # Leave room for source metadata, its download flag, and executor envelope.
+            passage_budget = output_limit - len(shell.to_tool_result().encode('utf-8')) - 256
+            passages = select_passages(document, search_terms=search_terms, fragment=fragment,
+                max_bytes=passage_budget, check_deadline=check)
+            bounded, selection = passages.content, dict(passages.selection)
+            selection['download_truncated'] = raw_truncated
+            if raw_truncated:
+                selection['limitations'].append('download ceiling reached; document is incomplete')
+            if passages.navigation and result_registry is not None:
+                candidates = tuple(SearchCandidate(title=link['label'], url=urljoin(current_url, link['url']), snippet='')
+                    for link in passages.navigation)
+                check()
+                routed = _route_candidates(candidates, self.policy, result_registry=result_registry,
+                    allowed_repos=allowed_repos, current_repo=current_repo).as_dict()
+                navigation = tuple(routed['approved'] + routed['unapproved'])
+            truncated = raw_truncated or bool(selection['excerpted'])
+            content_hash = hashlib.sha256(bounded.encode('utf-8')).hexdigest()
+            candidate = FetchedEvidence(bounded, content_hash, mime_type, truncated, provenance,
+                'evidence:' + '0' * 64, selection, navigation)
+            while navigation and len(candidate.to_tool_result().encode('utf-8')) > output_limit - 128:
+                navigation = navigation[:-1]
+                candidate = replace(candidate, navigation=navigation)
+            if len(candidate.to_tool_result().encode('utf-8')) > output_limit - 128:
+                raise SourceDenied('response budget too small for selected evidence metadata')
+            check()
         evidence_id = None
         if self.evidence_store is not None:
             record = self.evidence_store.add_tool_result(
                 session_id=session_id,
                 tool=evidence_tool,
-                arguments=dict(evidence_arguments or {"url": original_url}),
-                result={"status": "ok", "content": bounded, "truncated": truncated},
+                arguments=dict(evidence_arguments or {"url": original_url,
+                    **({'search_terms': search_terms} if search_terms is not None else {})}),
+                result={"status": "ok", "content": bounded, "truncated": truncated,
+                    **({'selection': selection} if selection is not None else {})},
                 category="external-source",
                 model_identity=model_identity,
                 source=public_final_url,
@@ -1643,4 +1715,6 @@ class SecureFetcher:
             truncated=truncated,
             provenance=provenance,
             evidence_id=evidence_id,
+            selection=selection,
+            navigation=navigation,
         )
