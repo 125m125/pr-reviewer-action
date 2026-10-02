@@ -55,6 +55,8 @@ class _DocumentParser(HTMLParser):
         self.links = []
         self.link = None
         self.table_header = False
+        self.primary_depth = 0
+        self.has_primary = False
 
     def flush(self):
         text = "".join(self.parts)
@@ -66,7 +68,7 @@ class _DocumentParser(HTMLParser):
             for anchor in self.pending_anchors:
                 self.anchors.setdefault(anchor, len(self.records))
             self.pending_anchors = []
-            self.records.append((self.kind, text))
+            self.records.append((self.kind, text, bool(self.primary_depth)))
 
     def handle_starttag(self, tag, attrs):
         self.check()
@@ -82,12 +84,15 @@ class _DocumentParser(HTMLParser):
             self.flush()
             self.nav += 1
         if tag == "a" and attrs.get("href"):
-            self.link = {"url": attrs["href"], "label": "", "record": len(self.records)}
+            self.link = {"url": attrs["href"], "label": "", "record": len(self.records), "navigation": bool(self.nav)}
         if self.nav:
             return
         if tag in {"p", "div", "pre", "li", "tr", "blockquote", "main", "article"} or re.fullmatch(r"h[1-6]", tag):
             self.flush()
             self.kind = {"pre": "code", "li": "list", "tr": "table", "blockquote": "quote"}.get(tag, "paragraph")
+        if tag in {'main', 'article'}:
+            self.primary_depth += 1
+            self.has_primary = True
         if tag == "pre":
             self.pre = True
         if re.fullmatch(r"h[1-6]", tag):
@@ -123,6 +128,8 @@ class _DocumentParser(HTMLParser):
             return
         if tag in {"p", "div", "pre", "li", "tr", "blockquote", "main", "article"} or re.fullmatch(r"h[1-6]", tag):
             self.flush()
+        if tag in {'main', 'article'}:
+            self.primary_depth = max(0, self.primary_depth - 1)
         if tag == "pre":
             self.pre = False
         if re.fullmatch(r"h[1-6]", tag):
@@ -153,18 +160,20 @@ def normalize_document(text: str, mime_type: str, *, check_deadline: Callable[[]
             parser.feed(text[offset:offset + 16384])
         parser.close()
         parser.flush()
-        lines, blocks, starts = [], [], []
-        for kind, content in parser.records:
+        lines, blocks, starts = [], [], {}
+        for index, (kind, content, primary) in enumerate(parser.records):
             check_deadline()
+            if parser.has_primary and not primary:
+                continue
             if lines:
                 lines.append("")
             start = len(lines) + 1
-            starts.append(start)
+            starts[index] = start
             lines.extend(mask_secrets(content).splitlines())
             blocks.append(_Block(start, len(lines), kind))
-        anchors = {key: starts[index] for key, index in parser.anchors.items() if index < len(starts)}
+        anchors = {key: starts[index] for key, index in parser.anchors.items() if index in starts}
         links = [{"url": item["url"], "label": mask_secrets(item["label"]),
-                  "line": starts[item["record"]] if item["record"] < len(starts) else 1}
+                  "line": 0 if item['navigation'] else starts.get(item['record'], 0)}
                  for item in parser.links]
     else:
         lines = mask_secrets(text).splitlines()
@@ -238,12 +247,13 @@ def validate_search_terms(value):
     return tuple(dict.fromkeys(term.strip() for term in value))
 
 
-def _merged(ranges):
+def _merged(ranges, lines=None):
     result = []
     for start, end in sorted(ranges):
         if start > end:
             continue
-        if result and start <= result[-1][1] + 1:
+        if result and (start <= result[-1][1] + 1 or (lines is not None and
+                all(not line.strip() for line in lines[result[-1][1]:start - 1]))):
             result[-1] = (result[-1][0], max(result[-1][1], end))
         else:
             result.append((start, end))
@@ -284,7 +294,7 @@ def select_passages(document: NormalizedDocument, *, search_terms: tuple[str, ..
     def render(ranges, navigation=()):
         check_deadline()
         chunks, passages, retained = [], [], 0
-        for start, end in _merged(ranges):
+        for start, end in _merged(ranges, lines):
             if chunks:
                 chunks.append("[... omitted source lines ...]")
             output_start = sum(chunk.count("\n") + 1 for chunk in chunks) + 1
@@ -293,7 +303,7 @@ def select_passages(document: NormalizedDocument, *, search_terms: tuple[str, ..
                              "source_start_line": start, "source_end_line": end,
                              "matched_lines": counts[end] - counts[start - 1]})
             retained += counts[end] - counts[start - 1]
-        excerpted = _merged(ranges) != ([(1, len(lines))] if lines else [])
+        excerpted = _merged(ranges, lines) != ([(1, len(lines))] if lines else [])
         return PassageSelection("\n".join(chunks), {
             "document_hash": digest, "excerpted": excerpted,
             "matched_lines": counts[-1], "returned_matches": retained,
@@ -304,7 +314,7 @@ def select_passages(document: NormalizedDocument, *, search_terms: tuple[str, ..
     selected = []
 
     def fits(ranges):
-        merged = _merged(ranges)
+        merged = _merged(ranges, lines)
         if sum(sizes[end] - sizes[start - 1] for start, end in merged) > max_bytes:
             return False
         return len(json.dumps(render(merged).as_dict(), ensure_ascii=False).encode("utf-8")) <= max_bytes
@@ -326,7 +336,7 @@ def select_passages(document: NormalizedDocument, *, search_terms: tuple[str, ..
         nonlocal selected
         start, end = max(lower, start), min(upper, end)
         if start <= end and fits(selected + [(start, end)]):
-            selected = _merged(selected + [(start, end)])
+            selected = _merged(selected + [(start, end)], lines)
             return True
         return False
 
@@ -378,11 +388,12 @@ def select_passages(document: NormalizedDocument, *, search_terms: tuple[str, ..
         intro_end = min((document.sections[c].start - 1 for c in children[owner]), default=section.start)
         add(section.start, intro_end)
     navigation = []
+    relevant_headings = [document.sections[i].title.casefold() for i in ancestors]
     for link in document.links:
         check_deadline()
         if len(navigation) >= 8:
             break
-        if any(a <= link["line"] <= b for a, b in selected) or any(t in link['label'].casefold() for t in folded):
+        if any(a <= link["line"] <= b for a, b in selected) or any(t in link['label'].casefold() for t in (*folded, *relevant_headings)):
             proposed = navigation + [link]
             if len(json.dumps(render(selected, proposed).as_dict(), ensure_ascii=False).encode("utf-8")) <= max_bytes:
                 navigation = proposed

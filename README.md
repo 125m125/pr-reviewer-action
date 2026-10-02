@@ -399,6 +399,40 @@ All inputs share one source budget. Top-level `tool_name`/`arguments` are no
 longer accepted. Prefer delegation over manual pagination for narrow reference
 questions, such as input compatibility; keep the main investigation direct.
 
+For a narrow question about a large documentation page, website readers accept
+optional literal, case-insensitive `search_terms` (1–8 strings, OR matching):
+
+```json
+{
+  "target": "shell invocation",
+  "question": "How are arguments after the command string assigned?",
+  "tool_requests": [{
+    "tool_name": "web_fetch",
+    "arguments": {
+      "url": "https://www.gnu.org/software/bash/manual/bash.html",
+      "search_terms": ["Invoking Bash", "command_string"]
+    }
+  }]
+}
+```
+
+Selectors allow a bounded download of up to 8 MiB but do not increase the
+returned-result budget. Matching blocks expand within their heading-defined
+section; a parent is included only when all child branches are represented and
+it fits. Selection also applies to small pages: unused space does not pull in
+unrelated chapters. An explicit HTML anchor can select a section; Markdown
+anchor slugs are not guessed. No-match means only no literal match in the
+downloaded text, not proof that a behavior is absent.
+
+Results distinguish incomplete downloads from selected excerpts and retain
+normalized, redacted **document** line ranges, not HTML or repository lines.
+Delegated quotes cannot cross omitted passages. Relevant real links receive
+session-scoped result IDs after authorization, usable with
+`web_fetch_search_result` even without a search engine. Links are never followed
+automatically and do not inherit permission from their parent page. Selectors
+are not supported on repository-routed result IDs; use the repository reader's
+own parameters instead.
+
 Remote text reads check GitHub file metadata before raw retrieval and reject
 files over 8 MiB without downloading their contents. The transfer also enforces
 that ceiling, independently of returned excerpts and delegated context budgets.
