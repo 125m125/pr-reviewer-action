@@ -6437,6 +6437,34 @@ def test_emergency_reconstruction_keeps_checkpoint_ledger_and_newest_exchange():
     ) == 1
 
 
+@pytest.mark.parametrize("completed", (False, True))
+def test_emergency_reconstruction_preserves_selected_followup_scope(completed):
+    session = make_session(ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"],
+                            proposed_next_actions=["Reinvestigate unrelated code."]),
+    ]), max_context_tokens=100_000)
+    session.request_checkpoint("controller-request", disposition="pause")
+    session.apply_coverage_feedback(["OB-tests"])
+    if completed:
+        assert session.obligation_assessments.propose(
+            target="O2", disposition="blocked", reason="CI provenance is unavailable.",
+            evidence_ids=(), next_actions=(), evidence=session.evidence_store.snapshot(),
+            eligible=lambda *_: True,
+        ).accepted
+
+    assert session._reconstruct_from_valid_checkpoint()
+
+    instruction = session.conversation.events[-1]["content"]
+    assert "from proposed_next_actions" not in instruction
+    if completed:
+        assert "outcome is already recorded" in instruction
+        assert "end exploration" in instruction
+    else:
+        assert 'controller-selected gaps: ["O2"]' in instruction
+        assert "first investigate" in instruction
+        assert "Do not reopen other gaps" in instruction
+
+
 def test_emergency_reconstruction_bounds_retained_evidence_metadata():
     gateway = ScriptedGateway([
         checkpoint_response(inspected=[], unresolved=["OB-tests"]),
