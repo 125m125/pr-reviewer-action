@@ -93,6 +93,34 @@ def test_large_first_hit_does_not_starve_late_match():
     assert len(json.dumps(result.as_dict(), ensure_ascii=False).encode('utf-8')) <= 1100
 
 
+@pytest.mark.parametrize('large_line_size', [500, 600])
+def test_omission_notice_budget_does_not_discard_smaller_late_hits(large_line_size):
+    doc = web_passages.normalize_document('# Big\nneedle ' + 'x' * large_line_size +
+        '\n# Later\nneedle late\n# Last\nneedle last', 'text/markdown', check_deadline=lambda: None)
+    result = select(doc, ('needle',), budget=1000)
+    assert 'needle late' in result.content and 'needle last' in result.content
+    assert len(json.dumps(result.as_dict(), ensure_ascii=False).encode()) <= 1000
+
+
+def test_conversation_clipping_updates_visible_integrity_metadata():
+    import hashlib
+    from pr_reviewer.line_windows import bound_line_payload
+    content = 'needle\n' + 'short line of context\n' * 360
+    digest = hashlib.sha256(content.encode()).hexdigest()
+    payload = {'content': content, 'content_hash': digest, 'truncated': False,
+        'provenance': {'content_hash': digest, 'truncated': False},
+        'selection': {'document_hash': digest, 'excerpted': False,
+            'limitations': ['download ceiling reached'], 'passages': [
+                {'start_line': 1, 'end_line': 361, 'source_start_line': 1,
+                 'source_end_line': 361, 'matched_lines': 1}]}}
+    result = bound_line_payload(payload, 2000)
+    assert result['content'] != content
+    assert result['content_hash'] == hashlib.sha256(result['content'].encode()).hexdigest()
+    assert result['provenance']['content_hash'] == result['content_hash']
+    assert result['provenance']['truncated'] is True
+    assert 'download ceiling reached' in result['selection']['limitations']
+
+
 def test_table_header_and_matching_row_keep_separate_ranges():
     result = select(document('timeouts-like.html'), ('Upload',), budget=1000)
     assert 'Operation | Duration' in result.content

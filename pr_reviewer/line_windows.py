@@ -1,5 +1,6 @@
 """Byte-bounded complete-line windows with honest continuation metadata."""
 
+import hashlib
 import json
 
 
@@ -40,13 +41,22 @@ def bound_line_payload(payload, max_bytes):
             end = passages[-1]['end_line'] if passages else 0
             result['content'] = '\n'.join(result['content'].splitlines()[:end])
             selection['excerpted'] = result['truncated'] = True
+            digest = hashlib.sha256(result['content'].encode('utf-8')).hexdigest()
+            if 'content_hash' in result:
+                result['content_hash'] = digest
+            if isinstance(result.get('provenance'), dict):
+                result['provenance']['truncated'] = True
+                if 'content_hash' in result['provenance']:
+                    result['provenance']['content_hash'] = digest
             if 'matched_lines' in removed:
                 selection['returned_matches'] = max(0, selection.get('returned_matches', 0) - removed['matched_lines'])
                 selection['omitted_matches'] = selection.get('omitted_matches', 0) + removed['matched_lines']
             else:
                 selection.pop('returned_matches', None)
                 selection.pop('omitted_matches', None)
-            selection['limitations'] = ['additional passages omitted by serialized response budget']
+            notice = 'additional passages omitted by serialized response budget'
+            if notice not in selection.setdefault('limitations', []):
+                selection['limitations'].append(notice)
         if size() > max_bytes:
             return {'error': 'response budget too small for passage metadata'}
         return result

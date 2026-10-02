@@ -308,7 +308,8 @@ def select_passages(document: NormalizedDocument, *, search_terms: tuple[str, ..
             "document_hash": digest, "excerpted": excerpted,
             "matched_lines": counts[-1], "returned_matches": retained,
             "omitted_matches": counts[-1] - retained, "passages": passages,
-            "limitations": list(limitations),
+            "limitations": list(limitations) + (["some matching lines omitted because of the response budget"]
+                if retained < min(counts[-1], 256) else []),
         }, tuple(navigation))
 
     selected = []
@@ -321,16 +322,13 @@ def select_passages(document: NormalizedDocument, *, search_terms: tuple[str, ..
 
     if not fits([]):
         raise ValueError("response budget too small for passage metadata")
-    for hit in hits:
+    # Admit compact hits first so one long line cannot crowd out several
+    # independent matches. Rendering still follows original source order.
+    for hit in sorted(hits, key=lambda line: sizes[line] - sizes[line - 1]):
         check_deadline()
         if fits(selected + [(hit, hit)]):
             selected.append((hit, hit))
     admitted = {h for h in hits if any(a <= h <= b for a, b in selected)}
-    if len(admitted) < len(hits):
-        limitations.append("some matching lines omitted because of the response budget")
-        while selected and not fits(selected):
-            selected.pop()
-        admitted = {h for h in hits if any(a <= h <= b for a, b in selected)}
 
     def add(start, end):
         nonlocal selected

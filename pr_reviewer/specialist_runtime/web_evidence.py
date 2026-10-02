@@ -430,6 +430,7 @@ class HttpResponse:
     status: int
     headers: Mapping[str, str]
     body: bytes
+    incomplete: bool = False
 
 
 class HttpTransport(Protocol):
@@ -852,16 +853,17 @@ def opaque_reference_url(url: str) -> str:
     return f"https://{host}/[opaque-search-result]" if host else "[opaque-search-result]"
 
 
-def _redact_opaque_url_content(text: str, *urls: str) -> str:
+def _redact_opaque_url_content(text: str, *urls: str, redact_full_url: bool = True) -> str:
     redacted = text
     for url in urls:
-        redacted = redacted.replace(url, "[OPAQUE_SEARCH_RESULT_URL]")
+        if redact_full_url:
+            redacted = redacted.replace(url, "[OPAQUE_SEARCH_RESULT_URL]")
         try:
             parsed = urlsplit(url)
         except ValueError:
             continue
-        for token in re.split(r"[/&=?]", f"{parsed.path}?{parsed.query}"):
-            if _looks_high_entropy(token):
+        for token in re.split(r"[/&=?#]", unquote(f"{parsed.path}?{parsed.query}#{parsed.fragment}")):
+            if _looks_high_entropy_url_token(token):
                 redacted = redacted.replace(token, "[OPAQUE_URL_TOKEN]")
     return redacted
 
@@ -950,7 +952,9 @@ def _web_resource(url):
     """Fragments select local content; validate them without weakening URL policy."""
     parsed = urlsplit(url)
     fragment = unquote(parsed.fragment) if parsed.fragment else None
-    if fragment is not None and (len(fragment) > 256 or '%' in fragment or any(ord(c) < 32 or ord(c) == 127 for c in fragment)):
+    if fragment is not None and (len(fragment) > 256 or '%' in fragment
+            or mask_secrets(fragment) != fragment or _looks_high_entropy_url_token(fragment)
+            or any(ord(c) < 32 or ord(c) == 127 for c in fragment)):
         raise SourceDenied("unsafe or oversized section anchor")
     return urlunsplit(parsed._replace(fragment="")), fragment
 
@@ -1445,7 +1449,10 @@ class StdlibHttpTransport:
                     break
                 chunks.append(chunk)
                 size += len(chunk)
-            return HttpResponse(response.status, headers, b"".join(chunks))
+            declared = headers.get('content-length', '')
+            incomplete = (not headers.get('transfer-encoding') and declared.isascii()
+                and declared.isdigit() and size <= request.max_bytes and size < int(declared))
+            return HttpResponse(response.status, headers, b"".join(chunks), bool(incomplete))
         except SourceDenied:
             raise
         except (TimeoutError, socket.timeout) as exc:
@@ -1632,7 +1639,7 @@ class SecureFetcher:
         mime_type = _mime_type(response.headers)
         if mime_type not in self.allowed_mime_types:
             raise SourceDenied(f"response MIME type is not approved: {mime_type or '(missing)'}")
-        raw_truncated = len(response.body) > download_limit
+        raw_truncated = response.incomplete or len(response.body) > download_limit
         raw_body = response.body[:download_limit]
         text = _decode_body(raw_body, content_type)
         if not selection_requested and mime_type in {"text/html", "application/xhtml+xml"}:
@@ -1640,7 +1647,7 @@ class SecureFetcher:
             parser.feed(text)
             parser.close()
             text = parser.text()
-        if public_reference is not None:
+        if public_reference is not None and not selection_requested:
             text = _redact_opaque_url_content(text, original_url, current_url)
         bounded, normalized_truncated = mask_and_truncate(text, output_limit)
         truncated = raw_truncated or normalized_truncated
@@ -1664,6 +1671,22 @@ class SecureFetcher:
         if selection_requested:
             check = lambda: _remaining(deadline, self.monotonic)
             document = normalize_document(text, mime_type, check_deadline=check)
+            # HTML entities are decoded by normalization. Mask URL reflections
+            # afterward, before hashing/selection/storage; keep real link targets
+            # private for the existing authorization + opaque-ID routing.
+            link_urls = tuple(link['url'] for link in document.links)
+            def redact_content(content, urls):
+                content = _redact_opaque_url_content(content, *urls, redact_full_url=False)
+                return (_redact_opaque_url_content(content, original_url, current_url)
+                        if public_reference is not None else content)
+            safe_text = redact_content(document.text, link_urls)
+            safe_lines = safe_text.split('\n')
+            document = replace(document,
+                text=safe_text,
+                sections=tuple(replace(section, title=safe_lines[section.start - 1].lstrip('#').strip())
+                               for section in document.sections),
+                links=tuple({**link, 'label': redact_content(link['label'], (link['url'],))}
+                            for link in document.links))
             shell = FetchedEvidence('', '0' * 64, mime_type, True, provenance, 'evidence:' + '0' * 64)
             # Leave room for source metadata, its download flag, and executor envelope.
             passage_budget = output_limit - len(shell.to_tool_result().encode('utf-8')) - 256
@@ -1672,7 +1695,8 @@ class SecureFetcher:
             bounded, selection = passages.content, dict(passages.selection)
             selection['download_truncated'] = raw_truncated
             if raw_truncated:
-                selection['limitations'].append('download ceiling reached; document is incomplete')
+                selection['limitations'].append('download ended before declared Content-Length; document is incomplete'
+                    if response.incomplete else 'download ceiling reached; document is incomplete')
             if passages.navigation and result_registry is not None:
                 candidates = tuple(SearchCandidate(title=link['label'], url=urljoin(current_url, link['url']), snippet='')
                     for link in passages.navigation)
