@@ -1,6 +1,7 @@
 # Bounded web passage retrieval
 
-Status: refined design for approval. Search-result routing is committed in
+Status: approved design, including the subsequent section-boundary refinements.
+Search-result routing is committed in
 `025b5fa`; passage retrieval is not implemented yet.
 
 ## Intended outcome
@@ -24,6 +25,8 @@ ranking model, browser rendering, automatic retries across links, or a new cache
 
 No terms means the existing bounded fetch behavior. Explicit selection enables
 a larger bounded download but does not increase the model-facing response cap.
+Apply explicit selection even when the complete document would fit: unused
+capacity is not a reason to include unrelated sections.
 Repository-file retrieval is unchanged; selectors on repository-routed result
 IDs return an actionable unsupported-selector error, not a different route.
 
@@ -78,14 +81,35 @@ it must not leave malformed JSON or silently cut a quoted source line.
 3. Find matching lines/blocks; count matching lines across the downloaded text,
    but keep at most 256 candidate hit locations for bounded selection work.
    Report the omitted count when this ceiling is reached.
-4. Start with matching paragraphs/code blocks and their heading breadcrumbs.
+4. Start with matching content blocks and their heading breadcrumbs.
    Share space across distinct matches instead of letting the first large section
    consume everything. Merge overlapping windows and return passages in source
-   order. Expand context outward through neighboring blocks and enclosing
-   sections only while the payload budget permits.
+   order. Expand through neighboring blocks within the nearest heading-defined
+   section only while the payload budget permits. An unmatched child subsection
+   remains a separate branch, even when a match occurs in its parent's introduction.
+   Promote to the complete parent section only when every child branch is
+   represented recursively and the complete parent fits. A match somewhere in
+   a branch does not represent all of its descendants. Do not count context
+   added during expansion as new matches that authorize further promotion.
 5. If a block cannot fit, keep a complete-line window around the match. If the
    matching line itself cannot fit, report that omission rather than emit a
    partial line. Do not add synthetic closing fences to quoted source content.
+
+Section boundaries are H1-H6 or equivalent Markdown headings: a section ends
+at the next heading of equal or higher level. Skipped heading levels attach to
+the nearest existing lower-numbered ancestor. Headings inside fenced code are
+not section boundaries. HTML div/span/section wrappers alone do not create
+sections. Main/article regions help separate content from navigation; actual
+navigation links remain available as metadata, not surrounding source prose.
+
+Preserve paragraphs, list items with nested children, code/preformatted blocks,
+table rows with their column headers, and blockquotes/admonitions with their
+labels. Expand a matching list item or table row to its full container only if
+it fits. Nonadjacent table headers and rows retain separate source ranges.
+Ancestor breadcrumbs are metadata; bounded introductory source text may be
+included separately, nearest ancestor first. No headings means bounded
+neighboring blocks rather than invented sections. Expansion never has to fill
+the available budget.
 
 The extraction is a convenience view, not an exhaustive interpretation. No
 matches means only that the literal terms did not match the downloaded text;
@@ -161,6 +185,26 @@ authorized/denied/opaque links; same-page/unknown anchors; redirects; unsupporte
 repository selectors; retained evidence/quote mapping; and direct, result-ID and
 delegated equivalence. Include navigation-ID retrieval without a search engine.
 Assert no new destination requests during link discovery.
+
+Use small, checked-in, synthetic structural fixtures based on pages encountered
+in previous investigations, not full copied manuals or live-test dependencies:
+
+- GNU Bash manual / Invoking Bash: late matches, nested headings, anchors and
+  real chapter links (`https://www.gnu.org/software/bash/manual/bash.html`).
+- Playwright fixtures: nested sections, preformatted code and fixture-options
+  anchor (`https://playwright.dev/docs/test-fixtures`).
+- Playwright timeouts: table headers, rows and explanatory context
+  (`https://playwright.dev/docs/test-timeouts`).
+- GitHub job permissions: parent qualifications, YAML examples and admonitions
+  (`https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs`).
+- GitHub artifact-v4 announcement: short prose with few headings
+  (`https://github.blog/changelog/2023-12-14-github-actions-artifacts-v4-is-now-generally-available`).
+
+Explicitly test both matching H4 siblings permitting H3 promotion, one matching
+sibling preventing it, and partial matches in another H3 preventing H2 promotion.
+Test the same cases under budgets that permit or prevent complete promotion and
+when the complete document fits. Record real-page checks separately from unit
+tests; previously observed URLs can move or negotiate different MIME types.
 
 Run the affected suites and full pytest suite. Record the existing Windows-only
 baseline failures separately. A real model review is a subsequent evaluation,
