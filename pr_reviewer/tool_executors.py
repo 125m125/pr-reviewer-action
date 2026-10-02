@@ -571,6 +571,11 @@ def web_fetch(
     public_reference=None,
     evidence_tool="web_fetch",
     evidence_arguments=None,
+    search_terms=None,
+    result_registry=None,
+    allowed_repos=(),
+    current_repo="",
+    output_max_bytes=None,
 ):
     """Retrieve typed evidence through the redirect- and DNS-safe boundary."""
     try:
@@ -587,6 +592,11 @@ def web_fetch(
             public_reference=public_reference,
             evidence_tool=evidence_tool,
             evidence_arguments=evidence_arguments,
+            search_terms=search_terms,
+            result_registry=result_registry,
+            allowed_repos=allowed_repos,
+            current_repo=current_repo,
+            output_max_bytes=output_max_bytes,
         ).as_dict()
     except Exception as exc:
         return {"error": str(exc)}
@@ -992,6 +1002,8 @@ def execute_tool_request(
             url = args.get("url", "")
             if not url:
                 raise ValueError("Missing 'url' argument")
+            if 'search_terms' in args and args['search_terms'] is None:
+                raise ValueError('search_terms must be omitted or a nonempty array')
             registered = search_result_registry.find(url) if search_result_registry else None
             if registered and search_result_registry.resolve_target(registered).route != "web":
                 tool_result["result"] = {"error": "Use web_fetch_search_result for this registered repository source",
@@ -1007,12 +1019,16 @@ def execute_tool_request(
                 session_id=session_id,
                 model_identity=model_identity,
                 deadline_at=deadline_at,
+                search_terms=args.get('search_terms'),
+                result_registry=search_result_registry,
+                allowed_repos=allowed_gh_repos,
+                current_repo=current_repo,
+                output_max_bytes=max_response_bytes,
             )
             if res.get("error"):
                 raise ValueError(res["error"])
-            content_text, truncated = mask_and_truncate(
-                res.get("content", ""), max_response_bytes
-            )
+            content_text, truncated = ((res.get('content', ''), False) if res.get('selection') is not None
+                else mask_and_truncate(res.get("content", ""), max_response_bytes))
             tool_result["result"] = {
                 **res,
                 "content": content_text,
@@ -1045,8 +1061,10 @@ def execute_tool_request(
             tool_result["result"] = res
 
         elif tool_name == "web_fetch_search_result":
-            if set(args) - {"result_id", "purpose"}:
+            if set(args) - {"result_id", "purpose", "search_terms"}:
                 raise ValueError("Search-result retrieval accepts no target overrides")
+            if 'search_terms' in args and args['search_terms'] is None:
+                raise ValueError('search_terms must be omitted or a nonempty array')
             result_id = args.get("result_id", "")
             if not result_id:
                 raise ValueError("Missing 'result_id' argument")
@@ -1055,6 +1073,8 @@ def execute_tool_request(
             target = search_result_registry.resolve_target(result_id)
             url = target.url
             if target.route != "web":
+                if 'search_terms' in args:
+                    raise ValueError('search_terms is supported only for website results; use repository reader parameters')
                 effective_name = "read_remote_file" if target.route == "github_file" else "gh_api"
                 effective_args = dict(target.arguments)
                 tool_result["effective_tool"] = effective_name
@@ -1082,12 +1102,16 @@ def execute_tool_request(
                 public_reference=opaque_reference_url(url) if target.opaque else None,
                 evidence_tool="web_fetch_search_result",
                 evidence_arguments={"result_id": result_id},
+                search_terms=args.get('search_terms'),
+                result_registry=search_result_registry,
+                allowed_repos=allowed_gh_repos,
+                current_repo=current_repo,
+                output_max_bytes=max_response_bytes,
             )
             if res.get("error"):
                 raise ValueError(res["error"])
-            content_text, truncated = mask_and_truncate(
-                res.get("content", ""), max_response_bytes
-            )
+            content_text, truncated = ((res.get('content', ''), False) if res.get('selection') is not None
+                else mask_and_truncate(res.get("content", ""), max_response_bytes))
             tool_result["result"] = {
                 **res,
                 "content": content_text,
