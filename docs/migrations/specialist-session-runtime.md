@@ -495,9 +495,11 @@ specific lead that needs follow-up. Candidate drafts are accepted or rejected
 independently from both the obligation resolution and their sibling drafts.
 Repository prompts should explain domain priorities, not reproduce this schema.
 
-Valid dispositions are `covered`, `not_applicable`, `exhausted`, `blocked`, and
-`unresolved`. Only `unresolved` names concrete novel next actions. Once an action
-has been attempted, the controller does not offer the same resume again. Tools
+Valid dispositions are `covered`, `partially_covered`, `not_applicable`, `exhausted`,
+`blocked`, and `unresolved`. Unresolved updates require a concrete remaining action;
+the same action can accompany new eligible retained evidence or changed assessed
+paths. Saving checkpoint progress does not consume a follow-up attempt allowance:
+the scheduler controls further investigation and retires unproductive targets. Tools
 are disabled during checkpoint turns, so `obligation_updates` is retained only
 as a compact compatibility/emergency fallback; accepted interactive state does
 not need to be repeated in checkpoints.

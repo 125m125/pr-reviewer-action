@@ -234,28 +234,9 @@ def test_consuming_followup_action_prevents_same_gap_from_being_resumed_again():
     )
 
 
-def test_normal_risk_accepts_only_one_unresolved_followup_attempt():
-    ledger = _ledger()
-    store, _record = _store_with_path()
-
-    first = ledger.propose(
-        target="O1", disposition="unresolved", reason="Trace the consumer.",
-        evidence_ids=(), next_actions=("read consumer.py diff",),
-        evidence=store.snapshot(), eligible=lambda _record, _obligation: True,
-    )
-    second = ledger.propose(
-        target="O1", disposition="unresolved", reason="Inspect its test.",
-        evidence_ids=(), next_actions=("read consumer test",),
-        evidence=store.snapshot(), eligible=lambda _record, _obligation: True,
-    )
-
-    assert first.accepted is True
-    assert second.accepted is False
-    assert "attempt limit" in second.reason
-
-
-def test_high_risk_accepts_one_additional_distinct_followup_attempt():
-    ledger = _ledger(risk_tier="high")
+@pytest.mark.parametrize("risk_tier", ("normal", "high", "critical"))
+def test_unresolved_state_updates_do_not_consume_scheduler_attempts(risk_tier):
+    ledger = _ledger(risk_tier=risk_tier)
     store, _record = _store_with_path()
 
     results = [
@@ -264,11 +245,56 @@ def test_high_risk_accepts_one_additional_distinct_followup_attempt():
             evidence_ids=(), next_actions=(f"read path {index}",),
             evidence=store.snapshot(), eligible=lambda _record, _obligation: True,
         )
-        for index in range(1, 4)
+        for index in range(1, 5)
     ]
 
-    assert [item.accepted for item in results] == [True, True, False]
-    assert "attempt limit" in results[-1].reason
+    assert all(item.accepted for item in results)
+    assert ledger.assessment("O1").assessment_version == 4
+
+
+@pytest.mark.parametrize("progress", ("paths", "evidence"))
+def test_unresolved_retains_incremental_progress_with_same_remaining_action(progress):
+    paths = ("backend/a.py", "backend/b.py", "backend/c.py")
+    ledger = _ledger(scope=paths, owner_component_id="backend")
+    store, first = _store_with_path(paths[0])
+    for index, path in enumerate(paths):
+        record = first
+        if progress == "evidence" and index:
+            record = store.add_tool_result(
+                session_id="session-1", tool="read_file", arguments={"path": path},
+                result={"status": "ok", "content": f"source for {path}"},
+            )
+        result = ledger.propose(
+            target="O1", disposition="unresolved", reason="Consumer trace remains incomplete.",
+            assessed_paths=(path,) if progress == "paths" else (),
+            evidence_ids=(record.id,), next_actions=("Finish tracing the consumer.",),
+            evidence=store.snapshot(), eligible=lambda *_: True,
+        )
+        assert result.accepted, result.reason
+    saved = ledger.assessment("O1")
+    assert saved.assessment_version == 3
+    assert saved.assessed_paths == (paths if progress == "paths" else ())
+    assert len(saved.evidence_ids) == (3 if progress == "evidence" else 1)
+
+    repeated = ledger.propose(
+        target="O1", disposition="unresolved", reason="Still needs tracing.",
+        assessed_paths=saved.assessed_paths, evidence_ids=saved.evidence_ids,
+        next_actions=saved.next_actions, evidence=store.snapshot(), eligible=lambda *_: True,
+    )
+    assert not repeated.accepted
+    assert ledger.assessment("O1").assessment_version == 3
+
+
+def test_unresolved_unrelated_evidence_does_not_bypass_no_progress_guard():
+    ledger = _ledger()
+    store, record = _store_with_path("unrelated.py")
+    for evidence_ids, accepted in (((), True), ((record.id,), False)):
+        result = ledger.propose(
+            target="O1", disposition="unresolved", reason="Consumer trace remains incomplete.",
+            evidence_ids=evidence_ids, next_actions=("Finish tracing the consumer.",),
+            evidence=store.snapshot(), eligible=lambda *_: False,
+        )
+        assert result.accepted is accepted
 
 
 def test_new_accepted_assessment_reenables_novel_actions():

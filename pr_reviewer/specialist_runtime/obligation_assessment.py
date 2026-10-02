@@ -461,6 +461,17 @@ class ObligationAssessmentLedger:
             effective = ObligationDisposition.PARTIALLY_COVERED
             actions = _actions((*actions, *requirement_actions))
         fingerprint = _fingerprint(actions)
+        # Checkpoints record incremental state, not scheduler attempts. Even an
+        # unchanged remaining action can accompany new evidence or path coverage.
+        made_progress = (
+            set(resolved_assessed) != set(assessment.assessed_paths)
+            or any(
+                item not in assessment.evidence_ids
+                and records[item].is_usable_for_coverage
+                and eligible(records[item], obligation)
+                for item in known_ids
+            )
+        )
         error = ""
         if not conclusion:
             error = "a concise reason is required"
@@ -570,17 +581,14 @@ class ObligationAssessmentLedger:
             error = "not_applicable requires changed-state evidence"
         elif proposed is ObligationDisposition.UNRESOLVED and not actions:
             error = "unresolved requires a concrete next action"
-        elif proposed is ObligationDisposition.UNRESOLVED and any(
+        elif proposed is ObligationDisposition.UNRESOLVED and not made_progress and any(
             item.accepted and item.action_fingerprint == fingerprint
             for item in assessment.attempts
         ):
-            error = "unresolved requires a novel next action"
-        elif proposed is ObligationDisposition.UNRESOLVED and sum(
-            item.accepted
-            and item.disposition is ObligationDisposition.UNRESOLVED
-            for item in assessment.attempts
-        ) >= (2 if obligation.risk_tier in {"high", "critical"} else 1):
-            error = "unresolved follow-up attempt limit reached"
+            error = (
+                "unresolved requires new eligible retained evidence, changed assessed "
+                "paths, or a novel next action"
+            )
         if component_scoped and (contains_glob or invalid_paths or overlap):
             rejected = invalid_paths | overlap | {
                 path for path in proposed_path_set if any(marker in path for marker in "*?[")

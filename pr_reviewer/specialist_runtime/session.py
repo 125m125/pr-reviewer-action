@@ -780,7 +780,8 @@ _OBLIGATION_PROTOCOL_INSTRUCTION = (
     "how to check it. A merely hypothetical concern is a limitation, not a reason "
     "to invent a candidate or repeatedly revisit the same question. "
     "Unchanged sources may explain a contract without proving changed behavior. "
-    "Unresolved work must name a concrete novel next action. Accepted obligation "
+    "Unresolved work must name a concrete remaining action. Repeating an action "
+    "requires new eligible retained evidence or changed assessed paths. Accepted obligation "
     "state is controller-owned and need not be repeated in checkpoints."
 )
 _CHECKPOINT_TOOL_STATE_INSTRUCTION = (
@@ -7111,8 +7112,9 @@ class SpecialistSession:
         rebuilt.events.append({
             "kind": "user",
             "content": (
-                "Tool access is re-enabled for exploration. Continue the same "
-                "specialist assignment from proposed_next_actions. "
+                "Tool access is re-enabled for exploration. "
+                + (self._current_continuation_scope() or "Continue the same specialist assignment.")
+                + " Use proposed next actions only within the selected task. "
                 "Treat the cumulative checkpoint as continuation memory and use only "
                 "the bounded compacted-evidence catalogue for retrieval."
             ),
