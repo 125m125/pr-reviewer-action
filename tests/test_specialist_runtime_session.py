@@ -1425,6 +1425,33 @@ def test_delegated_summary_retains_raw_source_but_returns_only_focused_result(so
     assert session.budget.snapshot().model_turns == 1
 
 
+def test_delegated_web_summary_preserves_upstream_truncation():
+    gateway = ScriptedGateway([delegated_summary_response()])
+    session = make_session(
+        gateway,
+        execute_tool=lambda name, arguments, **kwargs: {
+            "tool": name, "status": "ok",
+            "result": {"content": "preface\nfeature=true\n", "truncated": True},
+        },
+        tool_schemas=[{"name": "web_fetch", "parameters": {"type": "object"}}],
+    )
+    session._execute_calls(({
+        "id": "summary", "name": DELEGATE_TOOL_SUMMARY_NAME,
+        "arguments": json.dumps({
+            "target": "feature", "question": "Is the feature enabled?",
+            "tool_requests": [{"tool_name": "web_fetch", "arguments": {
+                "url": "https://docs.example.com/manual",
+            }}],
+        }),
+    },))
+    prompt = json.loads(json.loads(gateway.requests[0].messages)[0]["content"])
+    visible = json.loads(session.conversation.events[-1]["content"])
+    assert prompt["source_metadata"]["source_truncated"] is True
+    assert prompt["source_metadata"]["prompt_truncated"] is False
+    assert visible["source_truncated"] is True
+    assert visible["source_metadata"] == prompt["source_metadata"]
+
+
 def test_delegated_summary_repairs_an_invalid_source_range_once():
     gateway = ScriptedGateway([
         delegated_summary_response(start_line=99, end_line=99),
