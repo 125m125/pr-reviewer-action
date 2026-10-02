@@ -564,6 +564,36 @@ def test_selected_fetch_reaches_late_content_and_keeps_payload_bounded():
     assert result.selection['passages']
 
 
+@pytest.mark.parametrize('opaque_source', [False, True])
+def test_selected_html_masks_decoded_opaque_tokens_before_retention(opaque_source):
+    token = '0123456789abcdef' * 4
+    url = 'https://docs.example.com/' + (token if opaque_source else 'manual')
+    encoded = ''.join(f'&#{ord(c)};' for c in token)
+    body = f'<h2>Needle</h2><p>needle <a href="/{token}">{encoded}</a></p>'.encode()
+    transport = FakeHttpTransport({url: HttpResponse(200, {'Content-Type': 'text/html'}, body)})
+    store = EvidenceStore()
+    result = SecureFetcher(source_policy(), transport=transport, resolver=public_resolver,
+        evidence_store=store, max_bytes=5000).fetch(url, search_terms=('needle',),
+        allow_opaque_url=opaque_source, public_reference='opaque source' if opaque_source else None,
+        result_registry=SearchResultRegistry())
+    assert token not in result.to_tool_result()
+    assert token not in store.snapshot().records[0].content
+
+
+def test_high_entropy_fragment_is_denied_in_fetch_and_navigation():
+    token = '0123456789abcdef' * 4
+    url = 'https://docs.example.com/manual'
+    transport = FakeHttpTransport({url: HttpResponse(200, {'Content-Type': 'text/html'},
+        f'<h2>Needle</h2><p>needle <a href="#{token}">{token}</a></p>'.encode())})
+    fetcher = SecureFetcher(source_policy(), transport=transport, resolver=public_resolver, max_bytes=5000)
+    with pytest.raises(SourceDenied, match='anchor'):
+        fetcher.fetch(url + '#' + token)
+    assert not transport.requests
+    result = fetcher.fetch(url, search_terms=('needle',), result_registry=SearchResultRegistry())
+    assert token not in result.to_tool_result()
+    assert not any(link.get('fetch_allowed') for link in result.navigation)
+
+
 @pytest.mark.parametrize('terms', [[], [''], ['x'] * 9, ['x' * 129], 'needle', [42]])
 def test_bad_selector_rejected_before_transport(terms):
     transport = FakeHttpTransport({})
@@ -1077,6 +1107,25 @@ def _transport_request(timeout: float) -> HttpRequest:
         timeout=timeout, deadline=time.monotonic() + timeout, max_bytes=1024,
         headers={},
     )
+
+
+def test_premature_http_eof_cannot_be_reported_as_complete():
+    import http.client
+    import io
+    class BodySocket:
+        def makefile(self, *args):
+            return io.BytesIO(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n'
+                b'Content-Length: 1000\r\n\r\nneedle useful partial document')
+    response = http.client.HTTPResponse(BodySocket())
+    response.begin()
+    connection = _ImmediateConnection(response)
+    transport = StdlibHttpTransport(connection_factory=lambda *args: connection)
+    result = SecureFetcher(source_policy(), transport=transport, resolver=public_resolver).fetch(
+        'https://docs.example.com/manual', search_terms=('needle',))
+    assert 'needle useful partial document' in result.content
+    assert result.truncated is True
+    assert result.selection['download_truncated'] is True
+    assert any('incomplete' in text for text in result.selection['limitations'])
 
 
 def test_transport_slow_headers_obey_elapsed_hard_deadline_and_close_socket():

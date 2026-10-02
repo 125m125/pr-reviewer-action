@@ -1,8 +1,7 @@
 # Bounded web passage retrieval
 
-Status: approved design, including the subsequent section-boundary refinements.
-Search-result routing is committed in
-`025b5fa`; passage retrieval is not implemented yet.
+Status: implemented, including the subsequent section-boundary refinements and
+final independent review fixes. Search-result routing is committed in `025b5fa`.
 
 ## Intended outcome
 

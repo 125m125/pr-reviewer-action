@@ -4020,14 +4020,24 @@ class SpecialistSession:
         )
 
         def visible_payload(value: Mapping[str, object]) -> dict[str, object]:
+            def compact_metadata(metadata):
+                result = dict(metadata)
+                if isinstance(result.get('selection'), Mapping):
+                    # Full maps remain in retained evidence and the helper prompt.
+                    # Return only limitations/identity plus each validated quote's
+                    # coordinates, not thousands of bytes of unquoted passages.
+                    result['selection'] = {k: v for k, v in result['selection'].items() if k != 'passages'}
+                if 'sources' in result:
+                    result['sources'] = [compact_metadata(item) for item in result['sources']]
+                return result
             return {
                 "status": "ok", "evidence_id": record.id,
                 "source_evidence_id": record.id, **value,
                 "source_truncated": bool(any(item[0].truncated for item in sources) or prompt_truncated),
                 "source_metadata": {
-                    **source_metadata, "supplied_lines": len(source.splitlines()),
+                    **compact_metadata(source_metadata), "supplied_lines": len(source.splitlines()),
                 },
-                **({"sources": source_spans, "source_evidence_ids": [item[0].id for item in sources]} if len(sources) > 1 else {}),
+                **({"sources": [compact_metadata(item) for item in source_spans], "source_evidence_ids": [item[0].id for item in sources]} if len(sources) > 1 else {}),
                 "eligible_targets": list(requested_targets),
                 "coverage_effect": "derived_summary; cite source_evidence_id",
             }
