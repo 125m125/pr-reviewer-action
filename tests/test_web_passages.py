@@ -129,3 +129,17 @@ def test_oversized_line_and_hit_limit_are_explicit():
     assert result.selection['returned_matches'] <= 256
     assert result.selection['omitted_matches'] == 300 - result.selection['returned_matches']
     assert len(json.dumps(result.as_dict(), ensure_ascii=False).encode('utf-8')) <= 1500
+
+
+def test_conversation_budget_keeps_selection_json_and_source_boundaries():
+    from pr_reviewer.conversation import Conversation
+    result = select(document('permissions-like.md'), ('artifacts',))
+    state = Conversation(system='test')
+    payload = result.as_dict()
+    payload['navigation'] = [{'label': 'x' * 2000}]
+    state.add_tool_result('c', payload, max_bytes=900)
+    visible = json.loads(state.events[-1]['content'])
+    assert len(state.events[-1]['content'].encode()) <= 900
+    assert visible['selection']['excerpted']
+    for passage in visible['selection']['passages']:
+        assert passage['end_line'] <= len(visible['content'].splitlines())

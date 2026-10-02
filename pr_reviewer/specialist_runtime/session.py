@@ -110,6 +110,8 @@ _DELEGATED_SUMMARY_SYSTEM = (
     "The 1-based L-numbers are excerpt-local source references, not repository or "
     "GitHub review line numbers. The controller extracts the original text without "
     "these labels. Long paragraphs may occupy one source line. Use source_metadata "
+    "selection.passages to keep each quote within a real contiguous passage; never quote "
+    "omission markers or join across omitted source lines. Document source lines are not repository lines. "
     "to distinguish a requested file slice from source or prompt truncation; missing "
     "range metadata does not establish whole-file completeness. State material "
     "limits in uncertainties. Controller source_metadata is authoritative about truncation: "
@@ -3984,6 +3986,7 @@ class SpecialistSession:
                     "start_line": next_line, "end_line": next_line + len(content.splitlines()) - 1,
                     "source_truncated": item.truncated, "prompt_truncated": clipped,
                     "supplied_bytes": len(content.encode("utf-8")),
+                    **({'selection': item.selection} if item.selection is not None else {}),
                     "range": {key: value for key, value in raw_range.items()
                               if key in {"offset", "lines", "total_lines", "has_more", "truncated"}
                               and isinstance(value, (int, bool))} if isinstance(raw_range, Mapping) else {},
@@ -4007,6 +4010,7 @@ class SpecialistSession:
             } if isinstance(source_range, Mapping) else {},
             "source_truncated": any(item[0].truncated for item in sources),
             "prompt_truncated": prompt_truncated,
+            **({'selection': record.selection} if len(sources) == 1 and record.selection is not None else {}),
             **({"sources": source_spans} if len(sources) > 1 else {}),
         }
         conversation = self._delegated_summary_conversation(
@@ -4033,19 +4037,31 @@ class SpecialistSession:
 
         def prepare_result(text: str) -> tuple[dict[str, object] | None, str]:
             parsed, validation_error = self._validated_delegated_summary(text, source)
-            if parsed is not None and len(sources) > 1:
+            if parsed is not None:
                 raw_excerpts = _json_object(text)["relevant_excerpts"]
                 for excerpt, selected in zip(parsed["relevant_excerpts"], raw_excerpts):
                     span = next((item for item in source_spans if item["start_line"] <= selected["start_line"] <= selected["end_line"] <= item["end_line"]), None)
                     if span is None:
                         validation_error = "excerpt must stay inside one labelled source, excluding headers"
                         break
-                    excerpt["source_evidence_id"] = span["source_evidence_id"]
-                    excerpt["locator"] = f"lines {selected['start_line'] - span['start_line'] + 1}-{selected['end_line'] - span['start_line'] + 1}"
+                    if len(sources) > 1:
+                        excerpt["source_evidence_id"] = span["source_evidence_id"]
+                        excerpt["locator"] = f"lines {selected['start_line'] - span['start_line'] + 1}-{selected['end_line'] - span['start_line'] + 1}"
                     original = next(item[0] for item in sources if item[0].id == span["source_evidence_id"])
                     if excerpt["text"] not in original.content:
                         validation_error = "quote original source text, not a truncation marker"
                         break
+                    if original.selection is not None:
+                        start = selected['start_line'] - span['start_line'] + 1
+                        end = selected['end_line'] - span['start_line'] + 1
+                        passage = next((p for p in original.selection.get('passages', ())
+                            if p['start_line'] <= start <= end <= p['end_line']), None)
+                        if passage is None:
+                            validation_error = 'quote must stay inside one source passage; do not cross omitted lines or quote metadata'
+                            break
+                        excerpt['source_start_line'] = passage['source_start_line'] + start - passage['start_line']
+                        excerpt['source_end_line'] = passage['source_start_line'] + end - passage['start_line']
+                        excerpt['document_hash'] = original.selection.get('document_hash')
             errors = [validation_error] if validation_error else []
             # Even an invalid excerpt must not hide an oversized required answer
             # until after the sole repair. Measure the quote-free envelope too.
@@ -4547,6 +4563,10 @@ class SpecialistSession:
                     "evidence_id": record.id,
                     "status": record.status,
                     "content": record.content,
+                    **({'selection': record.selection, 'truncated': record.truncated}
+                       if record.selection is not None else {}),
+                    **({'navigation': payload['navigation']}
+                       if isinstance(payload, Mapping) and payload.get('navigation') else {}),
                     **({key: payload[key] for key in (
                         "repository", "path", "requested_ref", "resolved_sha",
                     ) if key in payload}
