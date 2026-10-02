@@ -7496,6 +7496,44 @@ def test_denied_remote_file_creates_revision_bound_repository_access_request():
     )
 
 
+def test_search_result_session_keeps_effective_evidence_and_revision(monkeypatch, tmp_path):
+    from pr_reviewer.tool_executors import execute_tool_request
+    from pr_reviewer.specialist_runtime.web_evidence import SearchCandidate, SearchResultRegistry, SourcePolicy
+    from pr_reviewer.conversation import web_tool_schemas
+    policy, registry = SourcePolicy(()), SearchResultRegistry()
+    allowed = ["vendor/action"]
+    class Provider:
+        def search(self, query, *, limit):
+            return [SearchCandidate("Action", "https://api.github.com/repos/vendor/action/contents/action.yml?ref=main")]
+    def api(endpoint, *args):
+        return {"data": {"sha": "a" * 40} if "/commits/" in endpoint else {"type": "file", "size": 12}}
+    monkeypatch.setattr("pr_reviewer.platform.gh_api", api)
+    monkeypatch.setattr("pr_reviewer.platform.gh_raw_file", lambda *args: {"content": b"name: action"})
+    def execute(name, args, **kwargs):
+        return execute_tool_request(name, args, str(tmp_path), allowed, "own/repo", (), 12000, 10,
+            search_url="https://search.example.com", source_policy=policy,
+            search_provider=Provider(), search_result_registry=registry)
+    session = make_session(ScriptedGateway([]), execute_tool=execute,
+        tool_schemas=web_tool_schemas("https://search.example.com", policy, allowed_repos=allowed))
+    session._execute_calls(tool_call_response("web_search", {"query": "contract"}).tool_calls)
+    discovery = json.loads(session.evidence_store.snapshot().records[0].content)
+    result_id = discovery["approved"][0]["result_id"]
+    session._execute_calls(tool_call_response("web_fetch_search_result", {"result_id": result_id}).tool_calls)
+    records = [r for r in session.evidence_store.snapshot().records if r.tool == "read_remote_file"]
+    assert len(records) == 1, session.conversation.events[-1]
+    record = records[0]
+    assert record.source_path == "@remote/vendor/action@" + "a" * 40 + "/action.yml"
+    assert '"resolved_sha": "' + "a" * 40 in session.conversation.events[-1]["content"]
+    assert session.source_access_requests == ()
+    allowed.clear()
+    # Exercise denial handling directly: normal successful duplicate replay is unrelated.
+    result = execute("web_fetch_search_result", {"result_id": result_id})
+    session._record_source_access_requests("web_fetch_search_result", {"result_id": result_id},
+        result, ("OB-code",), model_purpose="Verify the pinned dependency")
+    assert len(session.source_access_requests) == 1
+    assert session.source_access_requests[0].repository == "vendor/action"
+
+
 @pytest.mark.parametrize("error", (
     "Missing GH_TOKEN",
     "Endpoint prefix not allowed: /repos/a/b/actions",

@@ -390,8 +390,8 @@ tool_allowed_gh_api_repos: "125m125/pr-reviewer-action"
 Do not use `*` unless unrestricted repository metadata access is an intentional
 trust decision. A specifically named repository entry permits safe read-only
 metadata through `gh_api` and UTF-8 source text through `read_remote_file`;
-the wildcard never grants source-text access. The latter requires an exact
-immutable commit SHA, rejects the repository currently under review, and rejects
+the wildcard never grants source-text access. The latter accepts a branch, tag,
+or immutable commit SHA, rejects the repository currently under review, and rejects
 binary content. Generic `gh_api` rejects repository-content and Git-blob
 endpoints so base64 payloads never enter the model as accidental source text.
 Remote text retrieval uses raw GitHub content after checking metadata size;
@@ -411,6 +411,41 @@ request lives in the structured artifact and, for review publishing modes, a
 resolvable general note. A human can then review the repository/authors and add
 the narrow allowlist entry on the current branch before manually rerunning the
 review.
+
+### Search results and retrieval
+
+Every approved search result advertises `web_fetch_search_result(result_id)`.
+Safe URLs, repository names, resource identifiers and file revisions remain
+visible for orientation, not as alternative retrieval instructions. Opaque URLs
+remain hidden. Search snippets are discovery metadata, not proof.
+
+The controller chooses the authorized website or GitHub repository reader and
+rechecks permission when retrieving. Website rules do not grant repository
+permission, and repository permission does not enable generic web fetch. A
+configured search endpoint plus repository access can enable search even without
+website rules. Fork restrictions still apply. Approval means retrieval may be
+attempted; it does not establish that a resource exists or that the token can
+access it. A 404 is not an allowlist denial.
+
+Repository routing supports public GitHub repository roots, issue/PR details,
+full-SHA commits, release tags, supported issue/review-comment anchors, and source
+files. API equivalents and immutable raw-file links are supported. File line
+anchors select the requested range (at most 400 lines); unknown anchors and
+query semantics are rejected rather than silently ignored. Nested URL path
+escapes and commit-history URLs are also unsupported. Symbolic `blob`/raw URLs
+have ambiguous ref/path boundaries and are not guessed: use the direct
+`read_remote_file` tool with separate `repository`, `ref`, and `path` fields,
+or a contents API URL with an explicit `?ref=`. Public GitHub URLs never route
+to a Forgejo repository with the same name; ordinary web retrieval requires its
+own explicit source rule.
+
+Symbolic file revisions resolve only on retrieval, not during search. Successful
+resolutions are cached per session/repository/ref, and all file reads use the
+resolved immutable SHA. Results include `requested_ref` and `resolved_sha`; use
+the latter for subsequent pages or files of that version. For a dependency
+pinned to `v2.4.1` when search found `main`, directly request that tag instead.
+New targets receive independent authorization; result-ID calls cannot override
+the URL, repository, path, endpoint, or revision.
 
 ## Make evidence requirements conditional
 

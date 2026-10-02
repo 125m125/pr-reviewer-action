@@ -1197,11 +1197,18 @@ def build_controller(
                 ).strip().lower() == "true"
             )
         )
+        allowed_repos = tuple(dict.fromkeys(
+            item.strip() for item in (
+                config.environment.get("REPO", ""),
+                *config.environment.get("TOOL_ALLOWED_GH_API_REPOS", "").split(","),
+            ) if item.strip()
+        ))
         tools = (
             web_tool_schemas(
                 config.search_url,
                 policy,
                 config.allow_private_search_url,
+                allowed_repos=allowed_repos,
             )
             if tools_allowed else []
         )
@@ -1235,12 +1242,6 @@ def build_controller(
                     else float(config.tool_request_timeout_sec),
                 ),
             )
-            allowed_repos = tuple(dict.fromkeys(
-                item.strip() for item in (
-                    config.environment.get("REPO", ""),
-                    *config.environment.get("TOOL_ALLOWED_GH_API_REPOS", "").split(","),
-                ) if item.strip()
-            ))
             response_bytes = (
                 config.tool_response_bytes
                 if max_response_bytes is None

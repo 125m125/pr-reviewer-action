@@ -4547,6 +4547,10 @@ class SpecialistSession:
                     "evidence_id": record.id,
                     "status": record.status,
                     "content": record.content,
+                    **({key: payload[key] for key in (
+                        "repository", "path", "requested_ref", "resolved_sha",
+                    ) if key in payload}
+                       if isinstance(payload, Mapping) else {}),
                     **({"range": dict(payload["range"])}
                        if isinstance(payload, Mapping) and isinstance(payload.get("range"), Mapping)
                        else {}),
@@ -4580,6 +4584,11 @@ class SpecialistSession:
         *,
         model_purpose: str = "",
     ) -> None:
+        if (tool_name == "web_fetch_search_result"
+                and result.get("effective_tool") in {"gh_api", "read_remote_file"}
+                and isinstance(result.get("effective_arguments"), Mapping)):
+            tool_name = result["effective_tool"]
+            arguments = result["effective_arguments"]
         obligation_ids = requested_obligation_ids or self._current_gaps
         retained = {
             self._source_access_request_key(item): item

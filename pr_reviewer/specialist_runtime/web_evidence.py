@@ -21,6 +21,7 @@ import socket
 import ssl
 import sys
 import threading
+import uuid
 import time
 from typing import Callable, Iterable, Mapping, Protocol, Sequence
 from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlsplit, urlunsplit
@@ -66,25 +67,158 @@ class SearchCandidate:
     classification: str | None = None
     denial_reason: str | None = None
     result_id: str | None = None
+    source_details: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class SearchRetrievalTarget:
+    url: str
+    route: str = "web"
+    arguments: tuple[tuple[str, object], ...] = ()
+    opaque: bool = False
+
+
+def github_search_target(url: str) -> SearchRetrievalTarget | None:
+    """Parse only supported public GitHub resources; never perform discovery I/O."""
+    parsed = urlsplit(url)
+    if parsed.hostname not in {"github.com", "api.github.com", "raw.githubusercontent.com"}:
+        return None
+    if parsed.scheme != "https" or parsed.netloc != parsed.hostname:
+        raise SourceDenied("GitHub search URLs require credential-free HTTPS without a custom port")
+    if "%" in unquote(parsed.path):
+        raise SourceDenied("nested GitHub URL path encoding is unsupported")
+    safe_path, path_error = _safe_path(parsed.path)
+    if path_error:
+        raise SourceDenied(path_error)
+    segments = safe_path.strip("/").split("/")
+    if any(not p or unquote(p) in {".", ".."} or re.search(r"[\\\x00-\x20]", unquote(p)) for p in segments):
+        raise SourceDenied("unsupported GitHub path")
+    api = parsed.hostname == "api.github.com"
+    if api:
+        if segments[0] != "repos":
+            raise SourceDenied("unsupported GitHub API resource")
+        segments = segments[1:]
+    if len(segments) < 2 or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", p) for p in segments[:2]):
+        raise SourceDenied("unsupported GitHub repository identity")
+    repo = "/".join(segments[:2])
+    rest = segments[2:]
+    endpoint = f"repos/{repo}"
+    file_args = None
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    if api and rest[:1] == ["contents"]:
+        if len(rest) < 2 or len(query) != 1 or query[0][0] != "ref" or not query[0][1]:
+            raise SourceDenied("GitHub file search URL requires an explicit ref")
+        file_args = {"repository": repo, "ref": query[0][1], "path": unquote("/".join(rest[1:]))}
+        query = []
+    elif parsed.hostname == "raw.githubusercontent.com" or (not api and rest[:1] == ["blob"]):
+        tail = rest if parsed.hostname == "raw.githubusercontent.com" else rest[1:]
+        if len(tail) < 2:
+            raise SourceDenied("unsupported GitHub file URL")
+        # A symbolic ref/path boundary in a web URL can be ambiguous. Use the
+        # direct reader's separate ref/path fields (or contents?ref=) instead.
+        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", tail[0]):
+            raise SourceDenied("ambiguous symbolic ref/path; use read_remote_file with separate ref and path")
+        file_args = {"repository": repo, "ref": tail[0], "path": unquote("/".join(tail[1:]))}
+    elif not rest:
+        pass
+    elif len(rest) == 2 and rest[0] in {"issues", "pulls" if api else "pull"} and rest[1].isdigit():
+        kind = "pulls" if rest[0] in {"pull", "pulls"} else "issues"
+        endpoint += f"/{kind}/{rest[1]}"
+    elif len(rest) == 2 and rest[0] == ("commits" if api else "commit") and re.fullmatch(r"[0-9a-fA-F]{40,64}", rest[1]):
+        endpoint += f"/commits/{rest[1]}"
+    elif len(rest) == 3 and rest[:2] == ["releases", "tags" if api else "tag"]:
+        endpoint += "/releases/tags/" + rest[2]
+    elif api and len(rest) == 3 and rest[:2] in (["issues", "comments"], ["pulls", "comments"]) and rest[2].isdigit():
+        endpoint += "/" + "/".join(rest)
+    else:
+        raise SourceDenied("unsupported GitHub search resource")
+    if query:
+        raise SourceDenied("unsupported GitHub search query parameters")
+    # Repository permission is not permission to expose credential-like URL
+    # payloads. Only a commit-position SHA gets the public revision exemption.
+    visible_parts = list(segments)
+    if file_args is not None:
+        visible_parts = [repo, file_args["path"]]
+        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", file_args["ref"]):
+            visible_parts.append(file_args["ref"])
+    elif len(rest) == 2 and rest[0] in {"commit", "commits"}:
+        visible_parts = [repo]
+    if any(mask_secrets(value) != value or _looks_high_entropy_url_token(value)
+           for value in visible_parts):
+        raise SourceDenied("unsafe credential-like GitHub URL payload")
+    if file_args is not None:
+        if parsed.fragment:
+            match = re.fullmatch(r"L([1-9]\d*)(?:-L([1-9]\d*))?", parsed.fragment)
+            if not match:
+                raise SourceDenied("unsupported GitHub file anchor")
+            start, end = int(match[1]), int(match[2] or match[1])
+            if end < start or end - start >= 400:
+                raise SourceDenied("unsupported GitHub line range")
+            file_args.update(offset=start, limit=end - start + 1, include_line_numbers=True)
+        return SearchRetrievalTarget(url, "github_file", tuple(file_args.items()))
+    if parsed.fragment:
+        anchor = re.fullmatch(r"(issuecomment-|discussion_r)(\d+)", parsed.fragment)
+        if not anchor or not (len(rest) == 2 and rest[0] in {"issues", "pull", "pulls"}):
+            raise SourceDenied("unsupported GitHub metadata anchor")
+        endpoint = f"repos/{repo}/{'issues' if anchor[1] == 'issuecomment-' else 'pulls'}/comments/{anchor[2]}"
+    return SearchRetrievalTarget(url, "github_metadata", (("endpoint", endpoint),))
+
+
+def authorize_search_target(target, allowed_repos, current_repo):
+    from pr_reviewer.platform import _validate_endpoint, resolve_platform
+    from pr_reviewer.tool_executors import _remote_repo_allowed, _remote_path, _valid_remote_ref
+    if resolve_platform() != "github":
+        raise SourceDenied("public GitHub retrieval is unsupported on the configured platform")
+    args = dict(target.arguments)
+    if target.route == "github_file":
+        allowed, error = _remote_repo_allowed(args["repository"], allowed_repos, current_repo)
+        if not allowed:
+            raise SourceDenied(error)
+        _, error = _remote_path(args["path"])
+        if not error and not _valid_remote_ref(args["ref"]):
+            error = "Remote file ref must be a valid branch, tag or commit object ID"
+    else:
+        error = _validate_endpoint(args["endpoint"], allowed_repos, current_repo).get("error")
+    if error:
+        raise SourceDenied(error)
 
 
 class SearchResultRegistry:
-    """Session-local mapping for fetchable search URLs hidden from the model."""
+    """Session-local controller-owned retrieval targets; IDs confer no permission."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._namespace = uuid.uuid4().hex[:12]
         self._urls: dict[str, str] = {}
         self._ids: dict[str, str] = {}
+        self._targets: dict[str, SearchRetrievalTarget] = {}
+        self._resolved_refs: dict[tuple[str, str, str], str] = {}
 
-    def register(self, url: str) -> str:
+    def resolve_ref(self, key, lookup):
+        with self._lock:
+            if key not in self._resolved_refs:
+                self._resolved_refs[key] = lookup()
+            return self._resolved_refs[key]
+
+    def register(self, url: str, target: SearchRetrievalTarget | None = None) -> str:
         canonical = str(url).strip()
         with self._lock:
             result_id = self._ids.get(canonical)
             if result_id is None:
-                result_id = f"search-result-{len(self._urls) + 1}"
+                result_id = f"search-result-{self._namespace}-{len(self._urls) + 1}"
                 self._urls[result_id] = canonical
                 self._ids[canonical] = result_id
+            self._targets[result_id] = target or SearchRetrievalTarget(canonical)
             return result_id
+
+    def resolve_target(self, result_id: str) -> SearchRetrievalTarget:
+        self.resolve(result_id)
+        with self._lock:
+            return self._targets[str(result_id).strip()]
+
+    def find(self, url: str) -> str | None:
+        with self._lock:
+            return self._ids.get(str(url).strip())
 
     def resolve(self, result_id: str) -> str:
         key = str(result_id or "").strip()
@@ -355,12 +489,13 @@ class SearchDiscovery:
                 "snippet": candidate.snippet,
                 "classification": candidate.classification,
                 "fetch_allowed": True,
-                "fetch_method": "result_id" if candidate.result_id else "url",
+                "fetch_method": "result_id",
             }
             if candidate.result_id:
                 result["result_id"] = candidate.result_id
-            else:
+            if candidate.url:
                 result["url"] = candidate.url
+            result.update(dict(candidate.source_details))
             return result
 
         def unapproved(candidate: SearchCandidate) -> dict[str, object]:
@@ -790,6 +925,8 @@ def discover(
     search_scan_limit: int = DEFAULT_SEARCH_SCAN_LIMIT,
     tool_max_search_results: int = DEFAULT_MAX_SEARCH_RESULTS,
     result_registry: SearchResultRegistry | None = None,
+    allowed_repos: Iterable[str] = (),
+    current_repo: str = "",
 ) -> SearchDiscovery:
     if search_scan_limit <= 0 or tool_max_search_results <= 0:
         raise ValueError("search result limits must be positive")
@@ -802,9 +939,33 @@ def discover(
     unapproved: list[SearchCandidate] = []
     for candidate in candidates:
         decision = source_policy.classify(candidate.url)
+        target = None
+        route_error = None
+        try:
+            target = github_search_target(candidate.url)
+            if target is not None:
+                authorize_search_target(target, allowed_repos, current_repo)
+        except (ValueError, SourceDenied) as exc:
+            route_error = str(exc)
+            target = None
+        if target is not None:
+            parsed = urlsplit(candidate.url)
+            decision = SourceDecision(True, parsed.hostname or "", parsed.path,
+                classification="authorized-github-repository", canonical_url=candidate.url)
+        elif route_error and not decision.approved:
+            decision = replace(decision, reason=route_error)
         if decision.approved:
+            if result_registry is None:
+                raise SourceDenied("search result registry is required for approved discovery")
+            target = target or SearchRetrievalTarget(decision.canonical_url or candidate.url)
             title, _ = mask_and_truncate(str(candidate.title or ""), 300)
             snippet, _ = mask_and_truncate(str(candidate.snippet or ""), 500)
+            details = {k: str(v) for k, v in target.arguments if k in {"repository", "path", "ref"}}
+            if target.route == "github_metadata":
+                resource = dict(target.arguments)["endpoint"].split("/")
+                details = {"repository": "/".join(resource[1:3]),
+                           "resource_type": resource[3] if len(resource) > 3 else "repository",
+                           "resource_id": "/".join(resource[4:])}
             normalized = replace(
                 candidate,
                 title=title,
@@ -814,7 +975,8 @@ def discover(
                 path=decision.path,
                 classification=decision.classification,
                 denial_reason=None,
-                result_id=None,
+                result_id=result_registry.register(target.url, target),
+                source_details=tuple(details.items()),
             )
             approved.append(normalized)
         else:
@@ -843,6 +1005,7 @@ def discover(
                     classification=opaque_decision.classification,
                     result_id=result_registry.register(
                         opaque_decision.canonical_url,
+                        SearchRetrievalTarget(opaque_decision.canonical_url, opaque=True),
                     ),
                 ))
                 continue

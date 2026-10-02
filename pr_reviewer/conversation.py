@@ -130,9 +130,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "read_remote_file",
         "description": (
             "Read a UTF-8 text file from an explicitly allowlisted remote "
-            "repository at an immutable commit SHA. This tool is only for "
+            "repository at a branch, tag or commit SHA. Symbolic refs resolve once "
+            "per session; use returned resolved_sha for subsequent reads. This tool is only for "
             "repositories other than the one under review; it rejects the "
-            "current repository, branches/tags, binary files, and unallowlisted "
+            "current repository, binary files, and unallowlisted "
             "repositories. Files over 8 MiB are rejected before content download; "
             "offset/limit cannot bypass this transfer cap. Use offset/limit for a bounded line window and "
             "include_line_numbers when exact remote line references matter. "
@@ -152,8 +153,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 },
                 "ref": {
                     "type": "string",
-                    "pattern": "^[0-9a-fA-F]{40,64}$",
-                    "description": "Immutable 40–64 character commit object ID.",
+                    "description": "Branch, tag or immutable commit SHA; use resolved_sha from prior reads for the same version.",
                 },
                 "offset": {
                     "type": "integer",
@@ -368,16 +368,15 @@ SPECIALIST_PR_DIFF_SCHEMA: dict[str, Any] = {
 
 # Opt-in tool: advertised only when a search endpoint is configured (see
 # run_native_loop). web_search lets a weaker model discover the right source;
-# it then uses web_fetch for a visible URL or web_fetch_search_result when the
-# controller hid an opaque URL payload.
+# it then retrieves the controller-authorized target by result ID.
 WEB_SEARCH_SCHEMA: dict[str, Any] = {
     "name": "web_search",
     "description": (
         "Discover URLs through the action's fixed search provider. Search is "
         "not evidence: approved-source results may include bounded snippets, "
         "while unapproved results contain metadata only. Every result states "
-        "fetch_allowed and its fetch_method. Use web_fetch for a visible URL "
-        "or web_fetch_search_result for an opaque result ID before relying on "
+        "fetch_allowed and its fetch_method. Use web_fetch_search_result with "
+        "the returned result_id, regardless of URL visibility, before relying on "
         "it. Never probe unavailable alternatives; request access only for at "
         "most one result that appears to be an authoritative primary source "
         "and is materially necessary."
@@ -407,11 +406,11 @@ WEB_SEARCH_SCHEMA: dict[str, Any] = {
 WEB_FETCH_SEARCH_RESULT_SCHEMA: dict[str, Any] = {
     "name": "web_fetch_search_result",
     "description": (
-        "Fetch one approved web_search result whose URL was hidden because it "
-        "contained an opaque path or query value. Pass only the result_id "
-        "returned by web_search. The controller resolves the session-scoped "
-        "URL, preserves safe navigation parameters, revalidates every redirect, "
-        "and keeps the hidden URL out of model context and artifacts."
+        "Retrieve one approved web_search result by its result_id. The controller "
+        "selects website or repository retrieval and rechecks permission. Visible "
+        "URLs are descriptive, not alternate retrieval instructions. For another "
+        "version/resource use a new search or the appropriate direct tool; permission "
+        "does not transfer. Hidden URLs stay hidden. No target overrides are accepted."
     ),
     "parameters": {
         "type": "object",
@@ -439,6 +438,7 @@ def web_tool_schemas(
     search_url: str,
     source_policy: Any,
     allow_private_search_url: bool = False,
+    allowed_repos: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
     """Build the catalogue, advertising discovery only when it can be safe."""
     from pr_reviewer.specialist_runtime.web_evidence import SearxngSearchProvider
@@ -450,7 +450,9 @@ def web_tool_schemas(
     schemas = [schema for schema in TOOL_SCHEMAS if schema["name"] != "web_fetch"]
     if has_sources:
         schemas.append(next(schema for schema in TOOL_SCHEMAS if schema["name"] == "web_fetch"))
-    if has_sources and SearxngSearchProvider.is_valid_endpoint(
+    from pr_reviewer.platform import resolve_platform
+    has_repository_route = bool(tuple(allowed_repos)) and resolve_platform() == "github"
+    if (has_sources or has_repository_route) and SearxngSearchProvider.is_valid_endpoint(
         str(search_url or "").strip(),
         allow_private_search_url=allow_private_search_url,
     ):

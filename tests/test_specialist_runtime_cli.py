@@ -2681,11 +2681,14 @@ def test_deleting_v3_policy_cannot_switch_automatic_run_to_legacy_authority(
     assert "non-widening" in " ".join(workspace.inputs.configuration_warnings)
 
 
-def test_fork_sessions_do_not_advertise_tools_without_explicit_opt_in(monkeypatch, tmp_path):
+@pytest.mark.parametrize("fork_state", ["true", "false"])
+def test_fork_sessions_do_not_advertise_tools_without_explicit_opt_in(monkeypatch, tmp_path, fork_state):
     monkeypatch.setenv("AI_BASE_URL", "http://model.invalid/v1")
     monkeypatch.setenv("AI_MODEL", "model")
-    monkeypatch.setenv("IS_FORK_PR", "true")
+    monkeypatch.setenv("IS_FORK_PR", fork_state)
     monkeypatch.setenv("TOOL_ENABLE_FOR_FORKS", "false")
+    monkeypatch.setenv("SEARCH_URL", "https://search.example.com/search")
+    monkeypatch.setenv("TOOL_ALLOWED_GH_API_REPOS", "vendor/action")
     config = cli.CliConfig.from_env(workspace=tmp_path)
     controller = cli.build_controller(config)
     factory = controller._cli_session_factory
@@ -2705,7 +2708,12 @@ def test_fork_sessions_do_not_advertise_tools_without_explicit_opt_in(monkeypatc
         assignment, SessionLease(RunPhase.INITIAL, 10**20), None,
         EvidenceStore(), CoverageLedger(()), (), "session:test:g0",
     )
-    assert session.conversation.tool_schemas == []
+    if fork_state == "true":
+        assert session.conversation.tool_schemas == []
+    else:
+        names = {schema["name"] for schema in session.conversation.tool_schemas}
+        assert {"web_search", "web_fetch_search_result"} <= names
+        assert "web_fetch" not in names
 
 
 @pytest.mark.parametrize("fork_state", ["unknown", ""])

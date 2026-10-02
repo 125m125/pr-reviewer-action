@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 import hashlib
 import json
+import re
 from pathlib import Path, PurePosixPath
 import sys
 import time
@@ -563,6 +564,30 @@ class EvidenceStore:
         contradicts: tuple[str, ...] | list[str] = (),
         now: float | None = None,
     ) -> tuple[EvidenceRecord, EvidenceCollection]:
+        # Effective routing is controller-owned outer metadata, never fields
+        # from an untrusted API/document payload.
+        if (tool == "web_fetch_search_result"
+                and result.get("effective_tool") in {"gh_api", "read_remote_file"}
+                and isinstance(result.get("effective_arguments"), Mapping)):
+            tool = result["effective_tool"]
+            arguments = result["effective_arguments"]
+        payload = result.get("result")
+        if (tool in {"web_fetch", "web_fetch_search_result"}
+                and isinstance(payload, Mapping)
+                and payload.get("kind") == "external_evidence"
+                and isinstance(payload.get("provenance"), Mapping)):
+            # SecureFetcher produces this envelope; it is not document content.
+            provenance = EvidenceProvenance(**{
+                field.name: payload["provenance"].get(field.name)
+                for field in fields(EvidenceProvenance)
+            })
+            source = provenance.final_url
+            mime_type = payload.get("mime_type")
+            category = "external-source"
+        if tool == "read_remote_file" and isinstance(payload, Mapping):
+            resolved = payload.get("resolved_sha")
+            if isinstance(resolved, str) and re.fullmatch(r"[0-9a-fA-F]{40,64}", resolved):
+                arguments = {**arguments, "ref": resolved}
         record = self._add_record(
             session_id=session_id,
             tool=tool,
