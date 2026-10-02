@@ -1476,6 +1476,26 @@ def test_delegated_quotes_cannot_cross_passage_gap():
     assert quote['source_start_line'] == quote['source_end_line'] == 40
 
 
+def test_delegated_summary_does_not_repeat_unquoted_passage_maps():
+    selection = {'document_hash': 'a' * 64, 'excerpted': True,
+        'download_truncated': False, 'limitations': [],
+        'passages': [{'start_line': i, 'end_line': i, 'source_start_line': i * 10,
+                     'source_end_line': i * 10, 'matched_lines': 1} for i in range(1, 121)]}
+    gateway = ScriptedGateway([delegated_summary_response(start_line=1, end_line=1)])
+    session = make_session(gateway,
+        execute_tool=lambda name, arguments, **kwargs: {'tool': name, 'status': 'ok', 'result': {
+            'content': '\n'.join(['fact'] * 120), 'truncated': True, 'selection': selection}},
+        tool_schemas=[{'name': 'web_fetch', 'parameters': {'type': 'object'}}])
+    session._execute_calls(({'id': 'summary', 'name': DELEGATE_TOOL_SUMMARY_NAME,
+        'arguments': json.dumps({'target': 'question', 'question': 'What is stated?',
+            'tool_requests': [{'tool_name': 'web_fetch', 'arguments': {'url': 'https://example.com/doc'}}]})},))
+    visible = json.loads(session.conversation.events[-1]['content'])
+    assert visible['status'] == 'ok'
+    assert len(gateway.requests) == 1
+    assert 'passages' not in visible['source_metadata']['selection']
+    assert visible['relevant_excerpts'][0]['source_start_line'] == 10
+
+
 def test_selected_web_metadata_survives_direct_feedback_and_multi_source_delegate():
     selection = {'document_hash': 'c' * 64, 'excerpted': True, 'download_truncated': False,
         'passages': [{'start_line': 1, 'end_line': 1, 'source_start_line': 90, 'source_end_line': 90}],
