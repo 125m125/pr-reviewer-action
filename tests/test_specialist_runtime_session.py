@@ -1452,6 +1452,57 @@ def test_delegated_web_summary_preserves_upstream_truncation():
     assert visible["source_metadata"] == prompt["source_metadata"]
 
 
+def test_delegated_quotes_cannot_cross_passage_gap():
+    selection = {'document_hash': 'a' * 64, 'excerpted': True, 'download_truncated': False,
+        'passages': [
+            {'start_line': 1, 'end_line': 1, 'source_start_line': 10, 'source_end_line': 10},
+            {'start_line': 3, 'end_line': 3, 'source_start_line': 40, 'source_end_line': 40}],
+        'limitations': []}
+    gateway = ScriptedGateway([delegated_summary_response(start_line=1, end_line=3),
+        delegated_summary_response(start_line=3, end_line=3)])
+    session = make_session(gateway,
+        execute_tool=lambda name, arguments, **kwargs: {'tool': name, 'status': 'ok', 'result': {
+            'content': 'first\n[... omitted source lines ...]\nlast', 'truncated': True, 'selection': selection}},
+        tool_schemas=[{'name': 'web_fetch', 'parameters': {'type': 'object'}}])
+    session._execute_calls(({'id': 'summary', 'name': DELEGATE_TOOL_SUMMARY_NAME,
+        'arguments': json.dumps({'target': 'question', 'question': 'What is stated?',
+            'tool_requests': [{'tool_name': 'web_fetch', 'arguments': {'url': 'https://example.com/doc'}}]})},))
+    assert len(gateway.requests) == 2
+    prompt = json.loads(json.loads(gateway.requests[0].messages)[0]['content'])
+    assert prompt['source_metadata']['selection'] == selection
+    visible = json.loads(session.conversation.events[-1]['content'])
+    quote = visible['relevant_excerpts'][0]
+    assert quote['text'] == 'last'
+    assert quote['source_start_line'] == quote['source_end_line'] == 40
+
+
+def test_selected_web_metadata_survives_direct_feedback_and_multi_source_delegate():
+    selection = {'document_hash': 'c' * 64, 'excerpted': True, 'download_truncated': False,
+        'passages': [{'start_line': 1, 'end_line': 1, 'source_start_line': 90, 'source_end_line': 90}],
+        'limitations': []}
+    gateway = ScriptedGateway([delegated_summary_response(start_line=4, end_line=4)])
+    def execute(name, args, **kwargs):
+        return {'tool': name, 'status': 'ok', 'result': {'content': 'web fact',
+            'selection': selection, 'truncated': True,
+            'navigation': [{'result_id': 'chapter', 'fetch_allowed': True}]}}
+    session = make_session(gateway, execute_tool=execute,
+        tool_schemas=[{'name': 'web_fetch', 'parameters': {'type': 'object'}}])
+    session._execute_calls(({'id': 'web', 'name': 'web_fetch', 'arguments': json.dumps({'url': 'https://example.com'})},))
+    visible = json.loads(session.conversation.events[-1]['content'])
+    assert visible['selection'] == selection
+    assert visible['navigation'][0]['result_id'] == 'chapter'
+    web_id = visible['evidence_id']
+    plain = session.evidence_store.add_tool_result(session_id=session.session_id,
+        tool='read_file', arguments={'path': 'a.py'}, result={'status': 'ok', 'content': 'plain fact'})
+    session._execute_calls(({'id': 'delegated', 'name': DELEGATE_TOOL_SUMMARY_NAME,
+        'arguments': json.dumps({'evidence_ids': [plain.id, web_id], 'target': 'facts', 'question': 'Compare facts'})},))
+    visible = json.loads(session.conversation.events[-1]['content'])
+    assert visible['source_truncated']
+    assert visible['relevant_excerpts'][0]['source_start_line'] == 90
+    assert visible['relevant_excerpts'][0]['source_evidence_id'] == web_id
+
+
+
 def test_delegated_summary_repairs_an_invalid_source_range_once():
     gateway = ScriptedGateway([
         delegated_summary_response(start_line=99, end_line=99),

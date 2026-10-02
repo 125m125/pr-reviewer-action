@@ -27,6 +27,29 @@ def bound_line_payload(payload, max_bytes):
     """Keep pagination valid when the serialized tool envelope also needs space."""
     if not isinstance(payload, dict):
         return payload
+    if isinstance(payload.get('selection'), dict) and isinstance(payload.get('content'), str):
+        result = json.loads(json.dumps(payload))
+        size = lambda: len(json.dumps(result, ensure_ascii=False).encode('utf-8'))
+        navigation = result.get('navigation', [])
+        while navigation and size() > max_bytes:
+            navigation.pop()
+        selection = result['selection']
+        passages = selection.get('passages', [])
+        while passages and size() > max_bytes:
+            removed = passages.pop()
+            end = passages[-1]['end_line'] if passages else 0
+            result['content'] = '\n'.join(result['content'].splitlines()[:end])
+            selection['excerpted'] = result['truncated'] = True
+            if 'matched_lines' in removed:
+                selection['returned_matches'] = max(0, selection.get('returned_matches', 0) - removed['matched_lines'])
+                selection['omitted_matches'] = selection.get('omitted_matches', 0) + removed['matched_lines']
+            else:
+                selection.pop('returned_matches', None)
+                selection.pop('omitted_matches', None)
+            selection['limitations'] = ['additional passages omitted by serialized response budget']
+        if size() > max_bytes:
+            return {'error': 'response budget too small for passage metadata'}
+        return result
     for batch_key in ("patches", "evidence_slices"):
         if isinstance(payload.get(batch_key), list):
             result = dict(payload)
