@@ -1502,6 +1502,48 @@ def test_selected_web_metadata_survives_direct_feedback_and_multi_source_delegat
     assert visible['relevant_excerpts'][0]['source_evidence_id'] == web_id
 
 
+def test_real_fetch_navigation_and_delegated_quote_round_trip(tmp_path):
+    from pr_reviewer.tool_executors import execute_tool_request
+    from pr_reviewer.specialist_runtime.web_evidence import SecureFetcher, SourcePolicy, SearchResultRegistry, HttpResponse
+    policy = SourcePolicy.from_hosts(['docs.example.com'])
+    registry = SearchResultRegistry()
+    requests = []
+    class Transport:
+        def request(self, request):
+            requests.append(request)
+            if request.url.endswith('/chapter'):
+                body = b'<h2>Chapter</h2><p>needle exact statement</p>'
+            else:
+                body = ('<h2>Unrelated</h2><p>' + 'filler ' * 10_000 +
+                    '</p><h2>Useful</h2><p>needle <a href="/chapter">focused chapter</a></p>').encode()
+            return HttpResponse(200, {'content-type': 'text/html'}, body)
+    fetcher = SecureFetcher(policy, transport=Transport(), resolver=lambda *_: ['93.184.216.34'], max_bytes=32_000)
+    def execute(name, args, **kwargs):
+        return execute_tool_request(name, args, tmp_path, (), 'org/current', (),
+            kwargs.get('max_response_bytes', 4000), 10, source_policy=policy,
+            secure_fetcher=fetcher, search_result_registry=registry)
+    gateway = ScriptedGateway([delegated_summary_response(start_line=3, end_line=3)])
+    session = make_session(gateway, execute_tool=execute,
+        tool_schemas=[{'name': name, 'parameters': {'type': 'object'}}
+            for name in ['web_fetch', 'web_fetch_search_result']])
+    session._execute_calls(({'id': 'first', 'name': 'web_fetch', 'arguments': json.dumps({
+        'url': 'https://docs.example.com/manual', 'search_terms': ['needle']})},))
+    visible = json.loads(session.conversation.events[-1]['content'])
+    assert visible['selection']['excerpted']
+    assert len(requests) == 1
+    result_id = visible['navigation'][0]['result_id']
+    session._execute_calls(({'id': 'delegate', 'name': DELEGATE_TOOL_SUMMARY_NAME,
+        'arguments': json.dumps({'target': 'contract', 'question': 'What does the chapter state?',
+            'tool_requests': [{'tool_name': 'web_fetch_search_result', 'arguments': {
+                'result_id': result_id, 'search_terms': ['needle']}}]})},))
+    assert len(requests) == 2
+    visible = json.loads(session.conversation.events[-1]['content'])
+    quote = visible['relevant_excerpts'][0]
+    assert quote['text'] == 'needle exact statement'
+    assert quote['source_start_line'] == quote['source_end_line'] == 3
+    assert len(quote['document_hash']) == 64
+
+
 
 def test_delegated_summary_repairs_an_invalid_source_range_once():
     gateway = ScriptedGateway([

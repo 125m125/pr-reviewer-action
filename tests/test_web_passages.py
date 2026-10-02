@@ -143,3 +143,27 @@ def test_conversation_budget_keeps_selection_json_and_source_boundaries():
     assert visible['selection']['excerpted']
     for passage in visible['selection']['passages']:
         assert passage['end_line'] <= len(visible['content'].splitlines())
+
+
+def test_main_content_excludes_site_chrome_but_retains_navigation_links():
+    doc = web_passages.normalize_document('<header>needle site header</header>'
+        '<nav><a href="/chapter">needle chapter</a></nav>'
+        '<main><h1>Document</h1><p>needle actual content</p><p>Relevant context.</p></main>'
+        '<footer>needle footer</footer>', 'text/html', check_deadline=lambda: None)
+    assert 'site header' not in doc.text and 'footer' not in doc.text
+    result = select(doc, ('needle',))
+    assert 'actual content' in result.content
+    assert result.navigation[0]['url'] == '/chapter'
+
+
+def test_adjacent_html_blocks_do_not_create_artificial_omission_gaps():
+    doc = web_passages.normalize_document('<p>needle</p><p>explanation</p><p>more</p>', 'text/html', check_deadline=lambda: None)
+    result = select(doc, ('needle',))
+    assert '[... omitted' not in result.content
+    assert result.selection['excerpted'] is False
+
+
+def test_unmatched_navigation_does_not_become_selected_source_link():
+    doc = web_passages.normalize_document('<nav><a href="/unrelated">Unrelated</a></nav>'
+        '<main><h1>Document</h1><p>needle</p></main>', 'text/html', check_deadline=lambda: None)
+    assert not select(doc, ('needle',)).navigation
