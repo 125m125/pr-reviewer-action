@@ -26,6 +26,33 @@ SEARCH = "https://search.example.com/search"
 POLICY = SourcePolicy.from_hosts(["a.example", "b.example", "u.example"])
 
 
+def test_navigation_reader_available_without_search_engine():
+    names = {schema['name'] for schema in web_tool_schemas('', POLICY)}
+    assert 'web_fetch_search_result' in names
+    assert 'web_search' not in names
+
+
+def test_direct_and_registered_selector_have_same_source_ranges(tmp_path):
+    class Transport:
+        def request(self, request):
+            return HttpResponse(200, {'content-type': 'text/markdown'},
+                b'# Root\n## Target\nneedle\n## Other\nunrelated')
+    registry = SearchResultRegistry()
+    result_id = registry.register('https://a.example/doc')
+    fetcher = SecureFetcher(POLICY, transport=Transport(), resolver=lambda *_: ['93.184.216.34'], max_bytes=3000)
+    results = []
+    for name, args in [('web_fetch', {'url': 'https://a.example/doc'}),
+                       ('web_fetch_search_result', {'result_id': result_id})]:
+        result = rth.execute_tool_request(name, {**args, 'search_terms': ['needle']},
+            tmp_path, (), 'org/current', (), 3000, 10,
+            source_policy=POLICY, secure_fetcher=fetcher, search_result_registry=registry)
+        assert result['status'] == 'ok', result
+        assert len(json.dumps(result, ensure_ascii=False).encode()) <= 3000
+        results.append(result['result'])
+    assert results[0]['content'] == results[1]['content']
+    assert results[0]['selection'] == results[1]['selection']
+
+
 class _SearchTransport:
     def __init__(self, payload=None, error=None):
         self.payload = payload or {"results": []}
@@ -172,7 +199,7 @@ def test_fetch_search_result_rejects_unknown_session_handle():
         source_policy=SourcePolicy.from_hosts(["u.example"]),
         search_result_registry=SearchResultRegistry(),
     )
-
+    
     assert tr["status"] == "error"
     assert "unknown search result" in tr["result"]["error"]
 
