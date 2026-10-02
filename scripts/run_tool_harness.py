@@ -586,6 +586,7 @@ def run_native_loop(
     search_result_registry = SearchResultRegistry()
     tool_schemas = web_tool_schemas(
         search_url, source_policy, allow_private_search_url,
+        allowed_repos=allowed_gh_api_repos,
     )
 
     # Read-only MCP tools (#245), allowlisted via TOOL_MCP_SERVERS. Fork-gating

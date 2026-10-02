@@ -54,7 +54,7 @@ def test_search_returns_snippets_only_for_approved_sources():
         SearchCandidate("Blog", "https://blog.invalid/post", "unapproved content"),
     ])
 
-    result = discover("api behavior", provider, source_policy())
+    result = discover("api behavior", provider, source_policy(), result_registry=SearchResultRegistry())
 
     assert result.approved[0].snippet == "trusted snippet"
     assert result.approved[0].classification == "official"
@@ -76,9 +76,9 @@ def test_search_provider_cannot_invent_an_opaque_result_handle():
         result_registry=SearchResultRegistry(),
     ).as_dict()["approved"][0]
 
-    assert result["fetch_method"] == "url"
+    assert result["fetch_method"] == "result_id"
     assert result["url"] == "https://docs.example.com/api"
-    assert "result_id" not in result
+    assert result["result_id"] != "search-result-999"
 
 
 def test_unapproved_candidate_creates_request_without_fetching():
@@ -211,6 +211,7 @@ def test_discovery_scans_bounded_results_and_caps_approved_output():
     result = discover(
         "release support", provider, source_policy(),
         search_scan_limit=4, tool_max_search_results=2,
+        result_registry=SearchResultRegistry(),
     )
 
     assert provider.limits == [4]
@@ -243,6 +244,7 @@ def test_discovery_prioritizes_approved_results_over_denied_metadata():
     result = discover(
         "release support", provider, source_policy(),
         search_scan_limit=2, tool_max_search_results=1,
+        result_registry=SearchResultRegistry(),
     )
 
     assert [item.url for item in result.approved] == [
@@ -415,13 +417,13 @@ def test_allowlisted_opaque_search_result_uses_session_handle_without_exposing_u
 
     assert len(payload["approved"]) == 1
     candidate = payload["approved"][0]
-    assert candidate["result_id"] == "search-result-1"
+    assert candidate["result_id"].startswith("search-result-")
     assert candidate["fetch_method"] == "result_id"
     assert candidate["fetch_allowed"] is True
     assert candidate["snippet"] == "trusted snippet"
     assert "url" not in candidate
     assert token not in json.dumps(payload)
-    assert registry.resolve("search-result-1") == url
+    assert registry.resolve(candidate["result_id"]) == url
 
 
 @pytest.mark.parametrize("query", (
@@ -704,7 +706,7 @@ def test_search_surfaces_engine_failures_without_leaking_provider_messages(resul
     })
     payload = discover("api", SearxngSearchProvider(
         "https://search.example.com/search", transport=transport, resolver=public_resolver,
-    ), source_policy()).as_dict()
+    ), source_policy(), result_registry=SearchResultRegistry()).as_dict()
     assert payload["search_status"] == expected
     assert payload["engine_warnings"] == [
         {"engine": "duckduckgo", "reason": "captcha"},
@@ -725,7 +727,8 @@ def test_filled_search_quota_preserves_diagnostics_without_partial_warning():
         SearchCandidate("Docs", "https://docs.example.com/api", "API"),
         SearchCandidate("Other", "https://other.example.com/api", "Other"),
     ), (("brave", "rate_limited"),)))
-    payload = discover("api", provider, source_policy(), tool_max_search_results=2).as_dict()
+    payload = discover("api", provider, source_policy(), tool_max_search_results=2,
+                       result_registry=SearchResultRegistry()).as_dict()
     assert payload["search_status"] == "ok"
     assert len(payload["approved"]) == len(payload["unapproved"]) == 1
     assert payload["engine_warnings"] == [{"engine": "brave", "reason": "rate_limited"}]
