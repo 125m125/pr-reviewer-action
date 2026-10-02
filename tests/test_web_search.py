@@ -61,6 +61,7 @@ def test_returns_capped_policy_filtered_discovery():
     res = rth.web_search(
         "talos support matrix", SEARCH, max_results=2, source_policy=POLICY,
         provider=provider,
+        search_result_registry=SearchResultRegistry(),
     )
     assert "error" not in res
     assert res["kind"] == "search_discovery"
@@ -101,6 +102,7 @@ def test_execute_tool_request_dispatches_web_search():
         ".", set(), "o/r", ["u.example"], 12000, 20, SEARCH, 5,
         source_policy=SourcePolicy.from_hosts(["u.example"]),
         search_provider=provider,
+        search_result_registry=SearchResultRegistry(),
     )
     assert tr["status"] == "ok"
     assert tr["result"]["kind"] == "search_discovery"

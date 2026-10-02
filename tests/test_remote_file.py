@@ -92,7 +92,7 @@ def test_reads_allowlisted_remote_text_file_with_a_bounded_line_window(monkeypat
         ({"repository": "unknown/project"}, "not allowed"),
         ({"allowed_repos": {"*"}}, "not allowed"),
         ({"current_repo": ""}, "current repository identity"),
-        ({"ref": "main"}, "immutable"),
+        ({"ref": "../main"}, "valid branch"),
         ({"path": "../secret.txt"}, "path"),
     ],
 )

@@ -596,12 +596,14 @@ def replay_web_policy_fixture(fixture_dir: Path | str) -> dict[str, Any]:
                 for name in ("approved_source", "unapproved_source")
             )[:limit]
 
+    from .web_evidence import SearchResultRegistry
     discovery = discover(
         "runtime compatibility",
         Provider(),
         policy,
         search_scan_limit=5,
         tool_max_search_results=5,
+        result_registry=SearchResultRegistry(),
     )
 
     class Transport:
