@@ -3563,6 +3563,52 @@ def test_coverage_only_incompleteness_publishes_notice_without_detail_notes(tmp_
     )
     assert result.artifact["coverage_verification_requests"]
     assert result.handoff.recommendation == "Human review required"
+    assert result.handoff.status == "AI review incomplete"
+    assert result.handoff.coverage_warning
+
+
+def test_partial_high_risk_coverage_remains_incomplete_without_findings(tmp_path):
+    class PartialSession(_SuccessfulSession):
+        def apply_coverage_feedback(self, gaps):
+            self.gaps = tuple(gaps)
+
+        def explore(self):
+            result = super().explore()
+            self.candidate_findings = ()
+            return replace(result, checkpoint=replace(
+                result.checkpoint, candidate_finding_ids=(),
+                obligation_assessments=tuple(
+                    replace(
+                        assessment,
+                        disposition=ObligationDisposition.PARTIALLY_COVERED,
+                        reason="Changed paths inspected; external contract remains unverified.",
+                        next_actions=("Check the external contract documentation.",),
+                    )
+                    for assessment in result.checkpoint.obligation_assessments
+                ),
+            ))
+
+    def factory(assignment, lease, snapshot, evidence_store, coverage, obligations,
+                expected_session_id):
+        return PartialSession(assignment, evidence_store, obligations, expected_session_id)
+
+    inputs = _inputs(tmp_path)
+    result = _controller(tmp_path, session_factory=factory).run(replace(
+        inputs, policy=replace(
+            inputs.policy,
+            recipes=(replace(inputs.policy.recipes[0], priority="high"),),
+        ),
+    ))
+    assert any(
+        item["status"] == "partially_covered" and item["risk_tier"] == "high"
+        for item in result.artifact["coverage"].values()
+    )
+    assert result.verdict == "notice"
+    assert result.verdict_source == "incomplete-high-risk-coverage"
+    assert result.artifact["evaluation_status"] == "incomplete", result.artifact["degradation"]
+    assert result.handoff.status == "AI review incomplete"
+    assert result.handoff.coverage_warning
+    assert result.notes == ()
 
 
 @pytest.mark.parametrize(

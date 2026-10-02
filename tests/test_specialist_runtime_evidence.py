@@ -99,7 +99,12 @@ def test_evidence_retains_redaction_and_truncation_state():
     assert "supersecretvalue" not in record.content
 
 
-def test_diff_evidence_retains_executor_range_truncation():
+@pytest.mark.parametrize("metadata", (
+    {"range": {"truncated": True}},
+    {"range": {"has_more": True}},
+    {"truncated": True},
+))
+def test_diff_evidence_retains_executor_range_truncation(metadata):
     store = EvidenceStore()
 
     record = store.add_tool_result(
@@ -108,7 +113,7 @@ def test_diff_evidence_retains_executor_range_truncation():
             "status": "ok",
             "result": {
                 "path": "src/app.py", "patch": "@@ -1 +1 @@\n-old\n+new\n",
-                "range": {"truncated": True},
+                **metadata,
             },
         },
     )

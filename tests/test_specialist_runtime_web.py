@@ -642,6 +642,7 @@ def test_secure_fetch_normalizes_masks_truncates_and_records_evidence():
     record = store.snapshot().get(result.evidence_id)
     assert record is not None
     assert record.content_hash == result.content_hash
+    assert record.truncated is True
     assert record.mime_type == "text/html"
     assert record.provenance == result.provenance
 
