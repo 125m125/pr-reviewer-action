@@ -152,6 +152,23 @@ def _result_truncated(result: Mapping[str, Any]) -> bool:
     )
 
 
+def _retained_selection(tool: str, result: Mapping[str, Any], content: str) -> dict | None:
+    if tool not in {'web_fetch', 'web_fetch_search_result'}:
+        return None
+    payload = result.get('result') if isinstance(result.get('result'), Mapping) else result
+    selection = payload.get('selection')
+    if not isinstance(selection, Mapping):
+        return None
+    # Metadata comes from the executor, not text supplied by the website/model.
+    selection = json.loads(_canonical_json(selection))
+    if content != _result_content(result):
+        selection['passages'] = []
+        selection['excerpted'] = True
+        selection['limitations'] = list(selection.get('limitations', ())) + [
+            'retention changed source text; original passage coordinates are unavailable']
+    return selection
+
+
 def _source_identity(arguments: Mapping[str, Any], source: str | None = None) -> str:
     if source is not None and str(source).strip():
         text = str(source).strip()
@@ -289,6 +306,9 @@ def canonical_evidence_key(
         "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         "provenance": _provenance_identity(sanitized_provenance),
     }
+    selection = _retained_selection(tool, result, content)
+    if selection is not None:
+        identity['selection'] = selection
     digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
     return f"evidence:{digest}"
 
@@ -317,6 +337,7 @@ class EvidenceRecord:
     redaction_types: tuple[str, ...] = ()
     supersedes: tuple[str, ...] = ()
     contradicts: tuple[str, ...] = ()
+    selection: Mapping[str, Any] | None = None
 
     @property
     def is_usable_for_coverage(self) -> bool:
@@ -698,6 +719,7 @@ class EvidenceStore:
             redaction_types=redaction_types,
             supersedes=canonical_supersedes,
             contradicts=canonical_contradicts,
+            selection=_retained_selection(tool, result, content),
         )
         self._records[record.id] = record
         if record.is_usable_for_coverage:

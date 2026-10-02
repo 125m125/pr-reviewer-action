@@ -199,7 +199,7 @@ def test_fetch_search_result_rejects_unknown_session_handle():
         source_policy=SourcePolicy.from_hosts(["u.example"]),
         search_result_registry=SearchResultRegistry(),
     )
-    
+
     assert tr["status"] == "error"
     assert "unknown search result" in tr["result"]["error"]
 

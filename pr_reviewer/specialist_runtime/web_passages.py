@@ -290,7 +290,8 @@ def select_passages(document: NormalizedDocument, *, search_terms: tuple[str, ..
             output_start = sum(chunk.count("\n") + 1 for chunk in chunks) + 1
             chunks.append("\n".join(lines[start - 1:end]))
             passages.append({"start_line": output_start, "end_line": output_start + end - start,
-                             "source_start_line": start, "source_end_line": end})
+                             "source_start_line": start, "source_end_line": end,
+                             "matched_lines": counts[end] - counts[start - 1]})
             retained += counts[end] - counts[start - 1]
         excerpted = _merged(ranges) != ([(1, len(lines))] if lines else [])
         return PassageSelection("\n".join(chunks), {
