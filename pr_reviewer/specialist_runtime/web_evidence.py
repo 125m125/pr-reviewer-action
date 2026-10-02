@@ -1463,7 +1463,7 @@ class SecureFetcher:
                 session_id=session_id,
                 tool=evidence_tool,
                 arguments=dict(evidence_arguments or {"url": original_url}),
-                result={"status": "ok", "content": bounded},
+                result={"status": "ok", "content": bounded, "truncated": truncated},
                 category="external-source",
                 model_identity=model_identity,
                 source=public_final_url,

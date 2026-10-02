@@ -138,8 +138,12 @@ def _result_content(result: Mapping[str, Any]) -> str:
 
 def _result_truncated(result: Mapping[str, Any]) -> bool:
     nested = result.get("result")
+    if result.get("truncated") is True:
+        return True
     if not isinstance(nested, Mapping):
         return False
+    if nested.get("truncated") is True:
+        return True
     value = nested.get("range")
     return bool(
         isinstance(value, Mapping)

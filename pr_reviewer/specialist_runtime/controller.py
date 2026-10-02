@@ -5786,6 +5786,7 @@ class ReviewController:
             if item.mandatory and statuses.get(item.id) in {
                 ObligationStatus.PENDING,
                 ObligationStatus.UNRESOLVED,
+                ObligationStatus.PARTIALLY_COVERED,
                 ObligationStatus.EXHAUSTED,
                 ObligationStatus.BLOCKED,
             }
