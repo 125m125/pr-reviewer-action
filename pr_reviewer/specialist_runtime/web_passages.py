@@ -217,3 +217,172 @@ def normalize_document(text: str, mime_type: str, *, check_deadline: Callable[[]
         stack.append(len(sections) - 1)
     check_deadline()
     return NormalizedDocument("\n".join(lines), tuple(blocks), tuple(_Section(*s) for s in sections), anchors, tuple(links))
+
+
+@dataclass(frozen=True)
+class PassageSelection:
+    content: str
+    selection: dict
+    navigation: tuple[dict, ...] = ()
+
+    def as_dict(self):
+        return {"content": self.content, "selection": self.selection, "navigation": list(self.navigation)}
+
+
+def validate_search_terms(value):
+    if value is None:
+        return None
+    if (not isinstance(value, (list, tuple)) or not 1 <= len(value) <= 8
+            or any(not isinstance(term, str) or not term.strip() or len(term) > 128 for term in value)):
+        raise ValueError("search_terms requires 1-8 nonempty strings of at most 128 characters")
+    return tuple(dict.fromkeys(term.strip() for term in value))
+
+
+def _merged(ranges):
+    result = []
+    for start, end in sorted(ranges):
+        if start > end:
+            continue
+        if result and start <= result[-1][1] + 1:
+            result[-1] = (result[-1][0], max(result[-1][1], end))
+        else:
+            result.append((start, end))
+    return result
+
+
+def select_passages(document: NormalizedDocument, *, search_terms: tuple[str, ...] | None,
+                    fragment: str | None, max_bytes: int,
+                    check_deadline: Callable[[], None]) -> PassageSelection:
+    """Expand actual hits, never using added context as proof of relevance."""
+    terms = validate_search_terms(search_terms)
+    lines = document.text.splitlines()
+    lower, upper = 1, len(lines)
+    limitations = []
+    if fragment is not None:
+        anchor = document.anchors.get(fragment)
+        if anchor is None:
+            upper = 0
+            limitations.append("unknown or unsupported anchor")
+        else:
+            containing = [s for s in document.sections if s.start <= anchor <= s.end]
+            lower, upper = (containing[-1].start, containing[-1].end) if containing else (anchor, len(lines))
+    folded = tuple(term.casefold() for term in terms or ())
+    hits, counts, sizes = [], [0], [0]
+    for number, line in enumerate(lines, 1):
+        check_deadline()
+        matched = lower <= number <= upper and (not folded or any(t in line.casefold() for t in folded))
+        counts.append(counts[-1] + int(matched))
+        sizes.append(sizes[-1] + len(json.dumps(line, ensure_ascii=False).encode("utf-8")) + 2)
+        if matched and len(hits) < 256:
+            hits.append(number)
+    if not counts[-1] and not limitations:
+        limitations.append("no literal matches in downloaded text; not proof of semantic absence")
+    if counts[-1] > 256:
+        limitations.append("selection considered the first 256 matching lines")
+    digest = hashlib.sha256(document.text.encode("utf-8")).hexdigest()
+
+    def render(ranges, navigation=()):
+        check_deadline()
+        chunks, passages, retained = [], [], 0
+        for start, end in _merged(ranges):
+            if chunks:
+                chunks.append("[... omitted source lines ...]")
+            output_start = sum(chunk.count("\n") + 1 for chunk in chunks) + 1
+            chunks.append("\n".join(lines[start - 1:end]))
+            passages.append({"start_line": output_start, "end_line": output_start + end - start,
+                             "source_start_line": start, "source_end_line": end})
+            retained += counts[end] - counts[start - 1]
+        excerpted = _merged(ranges) != ([(1, len(lines))] if lines else [])
+        return PassageSelection("\n".join(chunks), {
+            "document_hash": digest, "excerpted": excerpted,
+            "matched_lines": counts[-1], "returned_matches": retained,
+            "omitted_matches": counts[-1] - retained, "passages": passages,
+            "limitations": list(limitations),
+        }, tuple(navigation))
+
+    selected = []
+
+    def fits(ranges):
+        merged = _merged(ranges)
+        if sum(sizes[end] - sizes[start - 1] for start, end in merged) > max_bytes:
+            return False
+        return len(json.dumps(render(merged).as_dict(), ensure_ascii=False).encode("utf-8")) <= max_bytes
+
+    if not fits([]):
+        raise ValueError("response budget too small for passage metadata")
+    for hit in hits:
+        check_deadline()
+        if fits(selected + [(hit, hit)]):
+            selected.append((hit, hit))
+    admitted = {h for h in hits if any(a <= h <= b for a, b in selected)}
+    if len(admitted) < len(hits):
+        limitations.append("some matching lines omitted because of the response budget")
+        while selected and not fits(selected):
+            selected.pop()
+        admitted = {h for h in hits if any(a <= h <= b for a, b in selected)}
+
+    def add(start, end):
+        nonlocal selected
+        start, end = max(lower, start), min(upper, end)
+        if start <= end and fits(selected + [(start, end)]):
+            selected = _merged(selected + [(start, end)])
+            return True
+        return False
+
+    blocks = document.blocks
+    owners = {}
+    for hit in sorted(admitted):
+        check_deadline()
+        containing = [i for i, s in enumerate(document.sections) if s.start <= hit <= s.end]
+        owners[hit] = containing[-1] if containing else None
+        for index, block in enumerate(blocks):
+            if block.start <= hit <= block.end:
+                add(block.start, block.end)
+                if block.kind == "table":
+                    for previous in reversed(blocks[:index]):
+                        if previous.kind == "table-header":
+                            add(previous.start, previous.end)
+                            break
+                        if previous.kind != "table":
+                            break
+                break
+    children = {i: [] for i in range(len(document.sections))}
+    for i, section in enumerate(document.sections):
+        if section.parent is not None:
+            children[section.parent].append(i)
+    represented = {}
+    for i in reversed(range(len(document.sections))):
+        check_deadline()
+        represented[i] = all(represented[c] for c in children[i]) if children[i] else i in owners.values()
+        if represented[i]:
+            section = document.sections[i]
+            add(section.start, section.end)
+    # Nearby blocks may expand only in the owner's direct body, not unmatched children.
+    for hit, owner in owners.items():
+        section = document.sections[owner] if owner is not None else None
+        body_start = section.start if section else lower
+        body_end = min((document.sections[c].start - 1 for c in children.get(owner, ())), default=section.end if section else upper)
+        for block in sorted((b for b in blocks if body_start <= b.start <= b.end <= body_end),
+                            key=lambda b: min(abs(hit - b.start), abs(hit - b.end))):
+            check_deadline()
+            add(block.start, block.end)
+    # A real heading and ancestor introduction remain source; no synthetic breadcrumb quote.
+    ancestors = set()
+    for owner in owners.values():
+        while owner is not None:
+            ancestors.add(owner)
+            owner = document.sections[owner].parent
+    for owner in sorted(ancestors, reverse=True):
+        section = document.sections[owner]
+        intro_end = min((document.sections[c].start - 1 for c in children[owner]), default=section.start)
+        add(section.start, intro_end)
+    navigation = []
+    for link in document.links:
+        check_deadline()
+        if len(navigation) >= 8:
+            break
+        if any(a <= link["line"] <= b for a, b in selected) or any(t in link['label'].casefold() for t in folded):
+            proposed = navigation + [link]
+            if len(json.dumps(render(selected, proposed).as_dict(), ensure_ascii=False).encode("utf-8")) <= max_bytes:
+                navigation = proposed
+    return render(selected, navigation)
