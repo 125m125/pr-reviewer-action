@@ -781,6 +781,10 @@ def test_truncated_proof_is_identified_instead_of_generic_authorization_failure(
     assert not accepted
     assert feedback["failed_check"] == "consequence_support.evidence_completeness"
     assert any(record.id in hint and "complete bounded excerpt" in hint for hint in feedback["repair_hints"])
+    rejection = session._snapshot().candidate_rejections[0]
+    assert rejection["claim"] == "Changed branch returns the wrong state."
+    assert rejection["evidence_ids"] == (record.id,)
+    assert "evidence_completeness" in rejection["reason"]
 
 
 def test_search_proof_rejection_tells_specialist_to_fetch_source():
@@ -1327,6 +1331,26 @@ def test_evidence_only_delegation_preserves_quote_source_and_costs_no_tool_calls
     assert quote["locator"] == "lines 2-2"
     assert session.budget.snapshot().tool_calls == 0
     assert session._snapshot().delegated_excerpts[0]["text"] == "feature=true"
+
+
+def test_delegated_caveat_survives_without_quote_for_critic_context():
+    session = make_session(ScriptedGateway([invalid_response(json.dumps({
+        "summary": "The invocation section is missing.", "relevant_excerpts": [],
+        "uncertainties": ["Cannot settle argument semantics."], "source_truncated": True,
+    }))]), tool_schemas=[{"name": "read_file", "parameters": {"type": "object"}}])
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file", arguments={"path": "manual.md"},
+        result={"status": "ok", "content": "unrelated documentation"},
+    )
+    session._execute_calls(({
+        "id": "summary", "name": DELEGATE_TOOL_SUMMARY_NAME,
+        "arguments": json.dumps({"target": "invocation", "question": "Which argument becomes zero?",
+                                 "evidence_ids": [record.id]}),
+    },))
+    result = session._snapshot()
+    assert not result.delegated_excerpts
+    assert result.delegated_assessments[0]["source_evidence_ids"] == (record.id,)
+    assert result.delegated_assessments[0]["uncertainties"] == ("Cannot settle argument semantics.",)
 
 
 @pytest.mark.parametrize("extra", [
@@ -7609,11 +7633,12 @@ def test_denied_remote_file_creates_revision_bound_repository_access_request():
     )
 
 
-def test_search_result_session_keeps_effective_evidence_and_revision(monkeypatch, tmp_path):
+@pytest.mark.parametrize("direct", [False, True])
+def test_search_result_session_keeps_effective_evidence_and_revision(monkeypatch, tmp_path, direct):
     from pr_reviewer.tool_executors import execute_tool_request
     from pr_reviewer.specialist_runtime.web_evidence import SearchCandidate, SearchResultRegistry, SourcePolicy
     from pr_reviewer.conversation import web_tool_schemas
-    policy, registry = SourcePolicy(()), SearchResultRegistry()
+    policy, registry = SourcePolicy.from_hosts(["docs.example.com"]), SearchResultRegistry()
     allowed = ["vendor/action"]
     class Provider:
         def search(self, query, *, limit):
@@ -7631,7 +7656,9 @@ def test_search_result_session_keeps_effective_evidence_and_revision(monkeypatch
     session._execute_calls(tool_call_response("web_search", {"query": "contract"}).tool_calls)
     discovery = json.loads(session.evidence_store.snapshot().records[0].content)
     result_id = discovery["approved"][0]["result_id"]
-    session._execute_calls(tool_call_response("web_fetch_search_result", {"result_id": result_id}).tool_calls)
+    name, arguments = (("web_fetch", {"url": "https://api.github.com/repos/vendor/action/contents/action.yml?ref=main"})
+                       if direct else ("web_fetch_search_result", {"result_id": result_id}))
+    session._execute_calls(tool_call_response(name, arguments).tool_calls)
     records = [r for r in session.evidence_store.snapshot().records if r.tool == "read_remote_file"]
     assert len(records) == 1, session.conversation.events[-1]
     record = records[0]
@@ -7640,8 +7667,8 @@ def test_search_result_session_keeps_effective_evidence_and_revision(monkeypatch
     assert session.source_access_requests == ()
     allowed.clear()
     # Exercise denial handling directly: normal successful duplicate replay is unrelated.
-    result = execute("web_fetch_search_result", {"result_id": result_id})
-    session._record_source_access_requests("web_fetch_search_result", {"result_id": result_id},
+    result = execute(name, arguments)
+    session._record_source_access_requests(name, arguments,
         result, ("OB-code",), model_purpose="Verify the pinned dependency")
     assert len(session.source_access_requests) == 1
     assert session.source_access_requests[0].repository == "vendor/action"

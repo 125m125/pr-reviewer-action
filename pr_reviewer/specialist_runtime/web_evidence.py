@@ -85,7 +85,7 @@ def github_search_target(url: str) -> SearchRetrievalTarget | None:
     if parsed.hostname not in {"github.com", "api.github.com", "raw.githubusercontent.com"}:
         return None
     if parsed.scheme != "https" or parsed.netloc != parsed.hostname:
-        raise SourceDenied("GitHub search URLs require credential-free HTTPS without a custom port")
+        raise SourceDenied("GitHub URLs require credential-free HTTPS without a custom port")
     if "%" in unquote(parsed.path):
         raise SourceDenied("nested GitHub URL path encoding is unsupported")
     safe_path, path_error = _safe_path(parsed.path)
@@ -108,7 +108,7 @@ def github_search_target(url: str) -> SearchRetrievalTarget | None:
     query = parse_qsl(parsed.query, keep_blank_values=True)
     if api and rest[:1] == ["contents"]:
         if len(rest) < 2 or len(query) != 1 or query[0][0] != "ref" or not query[0][1]:
-            raise SourceDenied("GitHub file search URL requires an explicit ref")
+            raise SourceDenied("GitHub file URL requires an explicit ref; use read_remote_file with separate repository, ref and path fields")
         file_args = {"repository": repo, "ref": query[0][1], "path": unquote("/".join(rest[1:]))}
         query = []
     elif parsed.hostname == "raw.githubusercontent.com" or (not api and rest[:1] == ["blob"]):
@@ -118,7 +118,7 @@ def github_search_target(url: str) -> SearchRetrievalTarget | None:
         # A symbolic ref/path boundary in a web URL can be ambiguous. Use the
         # direct reader's separate ref/path fields (or contents?ref=) instead.
         if not re.fullmatch(r"[0-9a-fA-F]{40,64}", tail[0]):
-            raise SourceDenied("ambiguous symbolic ref/path; use read_remote_file with separate ref and path")
+            raise SourceDenied("ambiguous symbolic ref/path; use read_remote_file with separate repository, ref and path fields (branch names may contain '/')")
         file_args = {"repository": repo, "ref": tail[0], "path": unquote("/".join(tail[1:]))}
     elif not rest:
         pass
@@ -132,9 +132,9 @@ def github_search_target(url: str) -> SearchRetrievalTarget | None:
     elif api and len(rest) == 3 and rest[:2] in (["issues", "comments"], ["pulls", "comments"]) and rest[2].isdigit():
         endpoint += "/" + "/".join(rest)
     else:
-        raise SourceDenied("unsupported GitHub search resource")
+        raise SourceDenied("unsupported GitHub resource")
     if query:
-        raise SourceDenied("unsupported GitHub search query parameters")
+        raise SourceDenied("unsupported GitHub query parameters")
     # Repository permission is not permission to expose credential-like URL
     # payloads. Only a commit-position SHA gets the public revision exemption.
     visible_parts = list(segments)

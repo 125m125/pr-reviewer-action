@@ -2420,6 +2420,8 @@ class ReviewController:
             }
             source_note_count = len(build_source_access_request_notes(
                 state.source_requests, obligations=obligation_map,
+                allowed_github_repositories=state.inputs.adapter_configuration.get(
+                    "allowed_github_repositories", ()),
             ))
         return (
             len(state.review.accepted)
@@ -4786,6 +4788,8 @@ class ReviewController:
                         "working_summary": mask_runtime_text(checkpoint.working_summary, limit=2400),
                         "unknowns": tuple(mask_runtime_text(item, limit=600) for item in checkpoint.unknowns[:8]),
                         "completed_steps": tuple(mask_runtime_text(item, limit=300) for item in checkpoint.completed_steps[:5]),
+                        "prior_candidate_rejections": getattr(result, "candidate_rejections", ())[-8:],
+                        "delegated_assessments": getattr(result, "delegated_assessments", ())[-8:],
                     } for (_, session_id), result in state.session_results.items()
                         if (session_id not in state.quarantined_session_ids or session_id in state.preserved_session_ids)
                         and (checkpoint := getattr(result, "checkpoint", None)) is not None
@@ -5291,6 +5295,8 @@ class ReviewController:
             ),
             source_access_requests=tuple(state.source_requests),
             what_changed=what_changed,
+            allowed_github_repositories=tuple(state.inputs.adapter_configuration.get(
+                "allowed_github_repositories", ())),
             what_changed_is_validated_overview=bool(overview),
             ai_reviewed=ai_reviewed,
             human_focus=human_focus,
@@ -5829,6 +5835,8 @@ class ReviewController:
                 ),
                 source_access_requests=state.source_requests,
                 remediations=state.remediations,
+                allowed_github_repositories=state.inputs.adapter_configuration.get(
+                    "allowed_github_repositories", ()),
                 policy_file=str(state.inputs.adapter_configuration.get(
                     "review_policy_file", ".github/ai-review-policy.json")),
             )
@@ -6092,6 +6100,8 @@ class ReviewController:
                     ),
                     source_access_requests=state.source_requests,
                     remediations=state.remediations,
+                    allowed_github_repositories=state.inputs.adapter_configuration.get(
+                        "allowed_github_repositories", ()),
                     policy_file=str(state.inputs.adapter_configuration.get(
                         "review_policy_file", ".github/ai-review-policy.json")),
                 )

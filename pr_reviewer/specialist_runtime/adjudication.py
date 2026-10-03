@@ -182,6 +182,7 @@ class ReviewHandoffContext:
         SourceAccessRequest | RepositoryAccessRequest, ...
     ] = ()
     access_request_url: str | None = None
+    allowed_github_repositories: tuple[str, ...] = ()
     what_changed: tuple[str, ...] = ()
     what_changed_is_validated_overview: bool = False
     ai_reviewed: tuple[str, ...] = ()
@@ -2056,6 +2057,7 @@ def project_review_handoff(
     valid_source_notes = build_source_access_request_notes(
         context.source_access_requests,
         obligations=obligation_map,
+        allowed_github_repositories=context.allowed_github_repositories,
     )
     access_count = len(valid_source_notes)
     access = _canonical_request_url(context.access_request_url or "")
@@ -2459,11 +2461,13 @@ def build_source_access_request_notes(
     *,
     obligations: Mapping[str, CoverageObligation],
     policy_file: str = ".github/ai-review-policy.json",
+    allowed_github_repositories: Iterable[str] = (),
 ) -> tuple[ReviewNote, ...]:
     """Project valid source requests using the production authorization rules."""
     notes: dict[str, ReviewNote] = {}
     sources: dict[tuple[str, str], list[SourceAccessRequest]] = {}
     repositories: dict[str, list[RepositoryAccessRequest]] = {}
+    allowed = {str(item).strip().strip("/").casefold() for item in allowed_github_repositories}
     for value in values:
         request = _source_request(value)
         if request is None or request.obligation_id not in obligations:
@@ -2530,6 +2534,11 @@ def build_source_access_request_notes(
         notes[note.fingerprint] = note
 
     for repository, requests in repositories.items():
+        # A denied web route is not a missing repository grant. Keep the raw
+        # attempt in diagnostics, but do not ask users to authorize it again.
+        # Wildcards deliberately do not grant source-file access.
+        if repository.casefold() in allowed:
+            continue
         revision, endpoint = requests[0].revision or "", requests[0].endpoint
         obligation_ids = tuple(dict.fromkeys(
             request.obligation_id for request in requests
@@ -2730,6 +2739,7 @@ def build_review_notes(
     source_access_requests: Iterable[object] = (),
     remediations: Mapping[str, FindingRemediation] | None = None,
     policy_file: str = ".github/ai-review-policy.json",
+    allowed_github_repositories: Iterable[str] = (),
 ) -> tuple[ReviewNote, ...]:
     """Build typed notes only after defensive controller-state revalidation."""
     if publishing_mode == "comment":
@@ -2772,6 +2782,7 @@ def build_review_notes(
         source_access_requests,
         obligations=obligation_map,
         policy_file=policy_file,
+        allowed_github_repositories=allowed_github_repositories,
     ))
     unique = {(note.kind.value, note.fingerprint): note for note in notes}
     return tuple(unique[key] for key in sorted(unique))

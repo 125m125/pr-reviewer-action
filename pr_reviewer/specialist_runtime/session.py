@@ -1461,6 +1461,8 @@ class SessionResult:
     tool_activity: tuple[Mapping[str, object], ...] = ()
     candidate_admission_statistics: Mapping[str, int] | None = None
     delegated_excerpts: tuple[Mapping[str, object], ...] = ()
+    candidate_rejections: tuple[Mapping[str, object], ...] = ()
+    delegated_assessments: tuple[Mapping[str, object], ...] = ()
 
 
 class SpecialistSession:
@@ -1598,6 +1600,7 @@ class SpecialistSession:
             "admission_passed_attempts": 0,
         }
         self._rejected_candidate_ids: set[str] = set()
+        self._candidate_rejections: list[Mapping[str, object]] = []
         self._candidate_targets: dict[str, str] = {}
         self._announced_candidate_targets: set[str] = set()
         self._candidate_withdrawals: dict[str, dict[str, object]] = {}
@@ -3686,8 +3689,11 @@ class SpecialistSession:
                 if record.truncated or not record.content.strip():
                     hints.append(
                         f"{record.id} is {'truncated' if record.truncated else 'empty'}: "
-                        "retain it as background if useful, but remove it from consequence-proof "
-                        "citations or retrieve complete evidence. Keep other valid proof citations."
+                        "retrieve complete evidence for any essential premise it was meant to establish. "
+                        "Remove it from consequence-proof citations only if the remaining evidence "
+                        "independently establishes that premise; removing a citation does not resolve "
+                        "uncertainty about runtime or external-contract behavior. Otherwise retain "
+                        "the limitation as an unknown or investigation lead, not a proven defect."
                     )
         if acceptable_evidence:
             hints.append(
@@ -4614,7 +4620,7 @@ class SpecialistSession:
         *,
         model_purpose: str = "",
     ) -> None:
-        if (tool_name == "web_fetch_search_result"
+        if (tool_name in {"web_fetch", "web_fetch_search_result"}
                 and result.get("effective_tool") in {"gh_api", "read_remote_file"}
                 and isinstance(result.get("effective_arguments"), Mapping)):
             tool_name = result["effective_tool"]
@@ -6049,6 +6055,18 @@ class SpecialistSession:
         self._candidate_admission_statistics[
             "admission_rejected_attempts" if candidate is None else "admission_passed_attempts"
         ] += 1
+        if candidate is None and isinstance(value, Mapping):
+            submitted = json.dumps(value, ensure_ascii=False)
+            rejection = {
+                "claim": mask_runtime_text(str(value.get("claim") or ""), limit=600),
+                "affected_location": mask_runtime_text(str(value.get("affected_location") or ""), limit=300),
+                "reason": mask_runtime_text(reason, limit=800),
+                "evidence_ids": tuple(eid for eid in retained
+                    if eid in submitted)[:12],
+            }
+            if rejection not in self._candidate_rejections:
+                self._candidate_rejections.append(rejection)
+                self._candidate_rejections = self._candidate_rejections[-8:]
         return candidate, reason
 
     def _validate_candidate_from_checkpoint(
@@ -7371,6 +7389,14 @@ class SpecialistSession:
             })),
             tool_activity=self._tool_activity_snapshot(),
             candidate_admission_statistics=dict(self._candidate_admission_statistics),
+            candidate_rejections=tuple(dict(item) for item in self._candidate_rejections),
+            delegated_assessments=tuple({
+                "source_evidence_ids": tuple(payload.get("source_evidence_ids", (payload["source_evidence_id"],))),
+                "summary": mask_runtime_text(str(payload.get("summary", "")), limit=800),
+                "uncertainties": tuple(mask_runtime_text(str(item), limit=400)
+                    for item in payload.get("uncertainties", ())[:4]),
+                "source_truncated": bool(payload.get("source_truncated")),
+            } for payload in tuple(self._delegated_summary_cache.values())[-4:]),
             delegated_excerpts=tuple({
                 **excerpt,
                 "source_evidence_id": excerpt.get("source_evidence_id", payload["source_evidence_id"]),

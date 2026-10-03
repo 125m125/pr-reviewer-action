@@ -38,6 +38,7 @@ from pr_reviewer.specialist_runtime.web_evidence import (  # noqa: E402
     SourcePolicy,
     discover,
     authorize_search_target,
+    github_search_target,
     opaque_reference_url,
 )
 
@@ -739,6 +740,25 @@ def execute_tool_request(
     """
     tool_result = {"tool": tool_name, "status": "error", "result": {}}
 
+    def retrieve_repository_target(target):
+        if 'search_terms' in args:
+            raise ValueError('search_terms is supported only for website results; use repository reader parameters')
+        effective_name = "read_remote_file" if target.route == "github_file" else "gh_api"
+        effective_args = dict(target.arguments)
+        # Set routing metadata before authorization so denied requests also
+        # retain the correct repository identity and access-request type.
+        tool_result["effective_tool"] = effective_name
+        tool_result["effective_arguments"] = effective_args
+        authorize_search_target(target, allowed_gh_repos, current_repo)
+        routed = execute_tool_request(
+            effective_name, effective_args, workspace_root, allowed_gh_repos,
+            current_repo, allowed_hosts, max_response_bytes, request_timeout,
+            source_policy=source_policy, search_result_registry=search_result_registry,
+            deadline_at=deadline_at,
+        )
+        return {**routed, "tool": tool_name, "effective_tool": effective_name,
+                "effective_arguments": effective_args}
+
     try:
         if tool_name == "read_file":
             path = args.get("path", "")
@@ -1005,10 +1025,11 @@ def execute_tool_request(
             if 'search_terms' in args and args['search_terms'] is None:
                 raise ValueError('search_terms must be omitted or a nonempty array')
             registered = search_result_registry.find(url) if search_result_registry else None
-            if registered and search_result_registry.resolve_target(registered).route != "web":
-                tool_result["result"] = {"error": "Use web_fetch_search_result for this registered repository source",
-                    "result_id": registered, "retry_with": "web_fetch_search_result"}
-                return tool_result
+            target = search_result_registry.resolve_target(registered) if registered else None
+            if target is None or target.route == "web":
+                target = github_search_target(url)
+            if target is not None and target.route != "web":
+                return retrieve_repository_target(target)
             res = web_fetch(
                 url,
                 allowed_hosts,
@@ -1073,21 +1094,7 @@ def execute_tool_request(
             target = search_result_registry.resolve_target(result_id)
             url = target.url
             if target.route != "web":
-                if 'search_terms' in args:
-                    raise ValueError('search_terms is supported only for website results; use repository reader parameters')
-                effective_name = "read_remote_file" if target.route == "github_file" else "gh_api"
-                effective_args = dict(target.arguments)
-                tool_result["effective_tool"] = effective_name
-                tool_result["effective_arguments"] = effective_args
-                authorize_search_target(target, allowed_gh_repos, current_repo)
-                routed = execute_tool_request(
-                    effective_name, effective_args, workspace_root, allowed_gh_repos,
-                    current_repo, allowed_hosts, max_response_bytes, request_timeout,
-                    source_policy=source_policy, search_result_registry=search_result_registry,
-                    deadline_at=deadline_at,
-                )
-                return {**routed, "tool": tool_name, "effective_tool": effective_name,
-                        "effective_arguments": effective_args}
+                return retrieve_repository_target(target)
             res = web_fetch(
                 url,
                 allowed_hosts,
