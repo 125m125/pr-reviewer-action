@@ -111,7 +111,10 @@ _DELEGATED_SUMMARY_SYSTEM = (
     "these labels. Long paragraphs may occupy one source line. Use source_metadata "
     "selection.passages to keep each quote within a real contiguous passage; never quote "
     "omission markers or join across omitted source lines. Document source lines are not repository lines. "
-    "to distinguish a requested file slice from source or prompt truncation; missing "
+    "For file slices, range.offset is the original file's first supplied line; L-numbers "
+    "still start at 1 (or the source's start_line in multi-source input). Use original "
+    "file coordinates when describing a slice in prose, but L-numbers for excerpt selection. "
+    "Use source_metadata.range to distinguish a requested file slice from source or prompt truncation; missing "
     "range metadata does not establish whole-file completeness. State material "
     "limits in uncertainties. Controller source_metadata is authoritative about truncation: "
     "do not describe content as cut off merely because the requested information is absent. "
@@ -1636,6 +1639,7 @@ class SpecialistSession:
         self._delegated_summary_cache: dict[str, dict[str, object]] = {}
         self._deferred_tool_results: dict[str, tuple[dict[str, Any], str]] = {}
         self._tool_call_keys: dict[str, str] = {}
+        self._delegation_hint_sources: set[tuple[str, str, str]] = set()
         self._tool_call_evidence_ids: dict[str, str] = {}
         self._tool_activity_call_names: dict[str, str] = {}
         self._tool_activity_outcomes: dict[str, str] = {}
@@ -3926,6 +3930,10 @@ class SpecialistSession:
                 "source_evidence_id": record.id,
             }, record, collection
 
+        if tool_name == "read_remote_file":
+            identity = self._remote_source_identity(result.get("result"))
+            if identity:
+                self._delegation_hint_sources.add(identity)
         return result, record, collection
 
     def _execute_delegated_summary(
@@ -4000,7 +4008,8 @@ class SpecialistSession:
                     pieces.append(f"SOURCE {item.id}\n")
                     next_line += 1
                 payload = raw.get("result", {})
-                raw_range = payload.get("range", {}) if isinstance(payload, Mapping) else {}
+                raw_range = ((item.source_range or {}) if item.tool in {"read_file", "read_remote_file"}
+                             else payload.get("range", {}) if isinstance(payload, Mapping) else {})
                 span = {
                     "source_evidence_id": item.id, "source_path": item.source_path,
                     "start_line": next_line, "end_line": next_line + len(content.splitlines()) - 1,
@@ -4008,8 +4017,8 @@ class SpecialistSession:
                     "supplied_bytes": len(content.encode("utf-8")),
                     **({'selection': item.selection} if item.selection is not None else {}),
                     "range": {key: value for key, value in raw_range.items()
-                              if key in {"offset", "lines", "total_lines", "has_more", "truncated"}
-                              and isinstance(value, (int, bool))} if isinstance(raw_range, Mapping) else {},
+                              if key in {"offset", "lines", "total_lines", "next_offset", "has_more", "truncated"}
+                              and (value is None or isinstance(value, (int, bool)))} if isinstance(raw_range, Mapping) else {},
                 }
                 source_spans.append(span)
                 pieces.append(content + ("\n" if not content.endswith("\n") else ""))
@@ -4020,14 +4029,15 @@ class SpecialistSession:
         prompt_truncated = any(item["prompt_truncated"] for item in source_spans)
         result_payload = result.get("result", {})
         source_range = (
-            result_payload.get("range", {}) if isinstance(result_payload, Mapping) else {}
+            (record.source_range or {}) if record.tool in {"read_file", "read_remote_file"}
+            else result_payload.get("range", {}) if isinstance(result_payload, Mapping) else {}
         )
         source_metadata = {
             **({"source_failures": source_failures} if source_failures else {}),
             "range": {
                 key: value for key, value in source_range.items()
-                if key in {"offset", "lines", "total_lines", "has_more", "truncated"}
-                and isinstance(value, (int, bool))
+                if key in {"offset", "lines", "total_lines", "next_offset", "has_more", "truncated"}
+                and (value is None or isinstance(value, (int, bool)))
             } if isinstance(source_range, Mapping) else {},
             "source_truncated": any(item[0].truncated for item in sources),
             "prompt_truncated": prompt_truncated,
@@ -4102,6 +4112,11 @@ class SpecialistSession:
                         excerpt['source_start_line'] = passage['source_start_line'] + start - passage['start_line']
                         excerpt['source_end_line'] = passage['source_start_line'] + end - passage['start_line']
                         excerpt['document_hash'] = original.selection.get('document_hash')
+                    elif original.source_range is not None:
+                        offset = original.source_range.get('offset')
+                        if isinstance(offset, int) and not isinstance(offset, bool) and offset > 0:
+                            excerpt['source_start_line'] = offset + selected['start_line'] - span['start_line']
+                            excerpt['source_end_line'] = offset + selected['end_line'] - span['start_line']
             errors = [validation_error] if validation_error else []
             # Even an invalid excerpt must not hide an oversized required answer
             # until after the sole repair. Measure the quote-free envelope too.
@@ -4232,29 +4247,16 @@ class SpecialistSession:
                     )
                 self._tool_calls_deferred_for_checkpoint = True
                 break
-            key = self._tool_call_keys.get(call_id, "")
-            cached_result = self._deferred_tool_results.pop(key, None)
-            if cached_result is not None:
-                event, evidence_id = cached_result
-                if evidence_id:
-                    self._tool_call_evidence_ids[call_id] = evidence_id
-                try:
-                    payload = json.loads(event["content"])
-                except ValueError:
-                    # A bounded tool result may intentionally end mid-JSON.
-                    payload = event["content"]
-                self._add_tool_result(call_id, payload, is_error=event["is_error"],
-                                      max_bytes=self.max_tool_result_bytes)
-                if key not in self._deferred_tool_results:
-                    self.conversation.events[-1]["metadata"] = event["metadata"]
-                progressed = True
-                continue
             try:
                 arguments = decode_native_tool_arguments(call.get("arguments"))
             except (json.JSONDecodeError, ValueError, TypeError) as exc:
                 self.budget.record_tool_rejection("invalid tool arguments")
                 self._add_tool_result(call_id, {"error": str(exc)}, is_error=True)
                 continue
+            if name in _OBLIGATION_LOCAL_TOOL_NAMES or name == COMPACTED_EVIDENCE_TOOL_NAME:
+                if self._replay_deferred_result(call_id, self._tool_call_keys.get(call_id, "")):
+                    progressed = True
+                    continue
             if name == COMPACTED_EVIDENCE_TOOL_NAME:
                 recovered = self._read_compacted_evidence(arguments)
                 recovered_evidence_id = str(
@@ -4331,9 +4333,10 @@ class SpecialistSession:
                     if item in lead_targets:
                         continue
                     try:
-                        resolved.append(
-                            self.obligation_assessments.obligation_id(item)
-                        )
+                        obligation_id = self.obligation_assessments.obligation_id(item)
+                        if obligation_id is None:
+                            raise KeyError(item)
+                        resolved.append(obligation_id)
                     except KeyError:
                         invalid_targets.append(item)
                 if invalid_targets:
@@ -4381,6 +4384,17 @@ class SpecialistSession:
                     if self.obligation_assessments.obligation_id(target)
                     in requested_obligation_ids
                 )
+            # Descriptive purpose and validated target association do not change
+            # the retrieval. Share this identity with duplicate detection, so an
+            # undelivered result survives reworded retries after compaction.
+            key = native_tool_request_key(name, arguments)
+            self._tool_call_keys[call_id] = key
+            if self._replay_deferred_result(
+                call_id, key, requested_targets=requested_targets,
+                requested_obligation_ids=requested_obligation_ids,
+            ):
+                progressed = True
+                continue
             if name == DELEGATE_TOOL_SUMMARY_NAME:
                 requests = arguments.get("tool_requests", [])
                 if ("tool_name" in arguments or "arguments" in arguments):
@@ -4623,6 +4637,7 @@ class SpecialistSession:
                     ),
                     "eligible_targets": list(requested_targets),
                     "coverage_effect": "neutral_evidence_retained",
+                    **self._remote_delegation_hint(name, record, payload),
                 },
                 is_error=is_error,
             )
@@ -4634,6 +4649,74 @@ class SpecialistSession:
                 self._tool_lease_exhausted = True
                 break
         return progressed
+
+    def _replay_deferred_result(
+        self, call_id: str, key: str, *,
+        requested_targets: tuple[str, ...] | None = None,
+        requested_obligation_ids: tuple[str, ...] = (),
+    ) -> bool:
+        cached = self._deferred_tool_results.pop(key, None)
+        if cached is None:
+            return False
+        event, evidence_id = cached
+        if evidence_id:
+            self._tool_call_evidence_ids[call_id] = evidence_id
+        retained_metadata = None
+        try:
+            payload = json.loads(event["content"])
+        except ValueError:
+            payload = event["content"]
+            # Mid-JSON clipping can hide citation fields from the body. Keep
+            # their original envelope, including the original truncation flag.
+            retained_metadata = dict(event["metadata"])
+            if requested_targets is not None:
+                retained_metadata["eligible_targets"] = ",".join(requested_targets)
+        if requested_targets is not None:
+            if isinstance(payload, dict):
+                payload["eligible_targets"] = list(requested_targets)
+            record = self._successful_requests.get(key)
+            collection_id = self._successful_collections.get(key)
+            if record is not None and collection_id:
+                self._associate_collection(collection_id, record, requested_obligation_ids)
+        self._add_tool_result(call_id, payload, is_error=event["is_error"])
+        if retained_metadata is not None:
+            replayed_event = (
+                self._deferred_tool_results[key][0] if key in self._deferred_tool_results
+                else self.conversation.events[-1]
+            )
+            replayed_event["metadata"] = retained_metadata
+        return True
+
+    @staticmethod
+    def _remote_source_identity(payload: object) -> tuple[str, str, str] | None:
+        if not isinstance(payload, Mapping):
+            return None
+        identity = tuple(str(payload.get(key) or "").strip()
+                         for key in ("repository", "resolved_sha", "path"))
+        return identity if all(identity) else None
+
+    def _remote_delegation_hint(
+        self, name: str, record: EvidenceRecord, payload: object,
+    ) -> dict[str, str]:
+        if (name != "read_remote_file" or not record.is_usable_for_coverage
+            or not isinstance(payload, Mapping)
+            or not any(item.get("name") == DELEGATE_TOOL_SUMMARY_NAME
+                       for item in self.conversation.tool_schemas)):
+            return {}
+        source_range = payload.get("range")
+        identity = self._remote_source_identity(payload)
+        if (not identity or identity in self._delegation_hint_sources
+            or not isinstance(source_range, Mapping)
+            or not (source_range.get("has_more") or source_range.get("truncated"))):
+            return {}
+        self._delegation_hint_sources.add(identity)
+        return {"delegation_hint": (
+            "This is a partial file result. For a narrow reference question, consider "
+            "delegate_tool_summary with a nested read_remote_file request; omit offset "
+            "and limit to use its larger source budget. Ask for relevant declarations "
+            "or constraints and supporting excerpts. Continue direct paging when "
+            "detailed inspection is needed."
+        )}
 
     def _record_source_access_requests(
         self,
