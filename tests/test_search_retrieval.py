@@ -139,8 +139,9 @@ def test_search_metadata_keeps_resource_identity():
     assert result["resource_id"] == "12"
 
 
+@pytest.mark.parametrize("direct", [False, True])
 @pytest.mark.parametrize("ref", ["a" * 40, "v2.4.1", "feature/topic"])
-def test_file_search_roundtrip_retains_immutable_identity(monkeypatch, tmp_path, ref):
+def test_file_search_roundtrip_retains_immutable_identity(monkeypatch, tmp_path, ref, direct):
     from urllib.parse import quote
     from pr_reviewer.specialist_runtime.evidence import EvidenceStore
     calls = []
@@ -151,18 +152,24 @@ def test_file_search_roundtrip_retains_immutable_identity(monkeypatch, tmp_path,
     monkeypatch.setattr("pr_reviewer.platform.gh_raw_file", lambda *args: {"content": b"one\ntwo\n"})
     registry = SearchResultRegistry()
     url = "https://api.github.com/repos/other/repo/contents/README.md?ref=" + quote(ref, safe="") + "#L2"
-    hit = discover("contract", Provider(url), SourcePolicy(()), result_registry=registry,
-        allowed_repos=("other/repo",), current_repo="own/repo").as_dict()["approved"][0]
+    if direct:
+        tool, arguments = "web_fetch", {"url": url}
+    else:
+        hit = discover("contract", Provider(url), SourcePolicy(()), result_registry=registry,
+            allowed_repos=("other/repo",), current_repo="own/repo").as_dict()["approved"][0]
+        tool, arguments = "web_fetch_search_result", {"result_id": hit["result_id"]}
     assert calls == []
-    result = execute_tool_request("web_fetch_search_result", {"result_id": hit["result_id"]},
+    result = execute_tool_request(tool, arguments,
         str(tmp_path), ("other/repo",), "own/repo", (), 12000, 10, search_result_registry=registry)
     assert result["status"] == "ok", result
     assert result["result"]["content"] == "LINE 2 | two\n"
     assert result["result"]["resolved_sha"] == "a" * 40
     assert result["result"]["requested_ref"] == ref
     assert len(calls) == (1 if ref == "a" * 40 else 2)
-    record = EvidenceStore().add_tool_result(session_id="s", tool="web_fetch_search_result",
-        arguments={"result_id": hit["result_id"]}, result=result)
+    assert result["tool"] == tool
+    assert result["effective_tool"] == "read_remote_file"
+    record = EvidenceStore().add_tool_result(session_id="s", tool=tool,
+        arguments=arguments, result=result)
     assert record.tool == "read_remote_file"
     assert record.source_path == "@remote/other/repo@" + "a" * 40 + "/README.md"
 
@@ -214,7 +221,8 @@ def test_platform_and_permission_rechecked_and_wrong_tool_redirected(monkeypatch
         return execute_tool_request(name, args, str(tmp_path), (), "own/repo", (),
             12000, 10, search_result_registry=registry)
     hint = execute("web_fetch", {"url": url})
-    assert hint["result"]["result_id"] == hit["result_id"]
+    assert hint["result"]["error"] == "Repo not allowed: other/repo"
+    assert hint["effective_tool"] == "gh_api"
     denied = execute("web_fetch_search_result", {"result_id": hit["result_id"]})
     assert denied["effective_tool"] == "gh_api"
     assert denied["result"]["error"] == "Repo not allowed: other/repo"
@@ -224,6 +232,54 @@ def test_platform_and_permission_rechecked_and_wrong_tool_redirected(monkeypatch
     discovery = discover("contract", Provider(url), SourcePolicy(()), result_registry=registry,
         allowed_repos=("other/repo",), current_repo="own/repo").as_dict()
     assert discovery["approved"] == []
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/other/repo/blob/" + "a" * 40 + "/README.md",
+    "https://raw.githubusercontent.com/other/repo/" + "a" * 40 + "/README.md",
+])
+def test_direct_file_url_uses_bounded_reader_without_web_permission(monkeypatch, tmp_path, url):
+    monkeypatch.setattr("pr_reviewer.platform.gh_api", lambda *args: {"data": {"type": "file", "size": 8}})
+    monkeypatch.setattr("pr_reviewer.platform.gh_raw_file", lambda *args: {"content": b"one\ntwo\n"})
+    monkeypatch.setattr("pr_reviewer.tool_executors.web_fetch",
+        lambda *args, **kwargs: pytest.fail("Must use repository transport"))
+    result = execute_tool_request("web_fetch", {"url": url + "#L2"},
+        str(tmp_path), ("other/repo",), "own/repo", (), 100, 10)
+    assert result["status"] == "ok", result
+    assert result["result"]["content"] == "LINE 2 | two\n"
+    assert result["effective_arguments"]["ref"] == "a" * 40
+    assert result["effective_tool"] == "read_remote_file"
+
+
+@pytest.mark.parametrize("allowed,current,error", [
+    ((), "own/repo", "Repo not allowed"),
+    (("*",), "own/repo", "Repo not allowed"),
+    (("other/repo",), "other/repo", "current repository"),
+])
+def test_direct_file_url_cannot_bypass_repository_guard(monkeypatch, tmp_path, allowed, current, error):
+    monkeypatch.setattr("pr_reviewer.platform.gh_api", lambda *args: pytest.fail("No API call allowed"))
+    monkeypatch.setattr("pr_reviewer.tool_executors.web_fetch",
+        lambda *args, **kwargs: pytest.fail("No web fallback allowed"))
+    result = execute_tool_request("web_fetch", {
+        "url": "https://raw.githubusercontent.com/other/repo/" + "a" * 40 + "/README.md",
+    }, str(tmp_path), allowed, current, ("raw.githubusercontent.com",), 1000, 10)
+    assert error in result["result"]["error"]
+    assert result["effective_tool"] == "read_remote_file"
+
+
+@pytest.mark.parametrize("url", [
+    "https://raw.githubusercontent.com/other/repo/feature/topic/README.md",
+    "https://github.com/other/repo/blob/main/README.md",
+    "https://api.github.com/repos/other/repo/contents/README.md",
+])
+def test_ambiguous_direct_file_url_requests_explicit_fields_without_guessing(monkeypatch, tmp_path, url):
+    monkeypatch.setattr("pr_reviewer.tool_executors.web_fetch",
+        lambda *args, **kwargs: pytest.fail("Must not guess or fall back to web"))
+    result = execute_tool_request("web_fetch", {"url": url}, str(tmp_path),
+        ("other/repo",), "own/repo", (), 1000, 10)
+    error = result["result"]["error"]
+    assert "read_remote_file" in error
+    assert all(field in error for field in ("repository", "ref", "path"))
 
 
 def test_ref_resolution_failure_not_cached_and_deadline_is_shared(monkeypatch):
@@ -273,12 +329,18 @@ def test_expired_remote_deadline_never_starts_network(monkeypatch):
     "https://github.com/other/repo/blob/" + "a" * 40 + "/literal%2541.txt",
     "https://api.github.com/repos/other/repo/contents/literal%2541.txt?ref=main",
 ])
-def test_search_routes_never_reinterpret_host_spellings_or_nested_escapes(url):
+def test_search_routes_never_reinterpret_host_spellings_or_nested_escapes(url, monkeypatch, tmp_path):
     result = discover("contract", Provider(url), SourcePolicy(()),
         result_registry=SearchResultRegistry(), allowed_repos=("other/repo",),
         current_repo="own/repo").as_dict()
     assert result["approved"] == []
     assert result["unapproved"][0]["denial_reason"]
+    monkeypatch.setattr("pr_reviewer.tool_executors.web_fetch",
+        lambda *args, **kwargs: pytest.fail("Invalid repository URLs must not fall back to web"))
+    direct = execute_tool_request("web_fetch", {"url": url}, str(tmp_path),
+        ("other/repo",), "own/repo", (), 1000, 10)
+    assert direct["status"] != "ok"
+    assert direct["result"]["error"]
 
 
 @pytest.mark.parametrize("url,endpoint", [

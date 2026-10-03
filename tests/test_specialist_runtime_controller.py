@@ -1237,6 +1237,43 @@ def test_critic_receives_latest_collector_doubts_not_private_todos(tmp_path):
     assert excerpt["truncated"] is False
 
 
+def test_critic_keeps_uncited_helper_caveats_and_prior_rejections(tmp_path):
+    observed = {}
+
+    class RepairedSession(_SuccessfulSession):
+        def explore(self):
+            result = super().explore()
+            return replace(result, candidate_rejections=({
+                "claim": "Runtime rejects this invocation.",
+                "reason": "consequence proof is truncated",
+                "evidence_ids": ("evidence:old-manual",),
+            },), delegated_assessments=({
+                "source_evidence_ids": ("evidence:old-manual",),
+                "question": "Does the runtime reject this invocation?",
+                "summary": "The invocation section was not supplied.",
+                "uncertainties": ("The argument semantics remain unverified.",),
+                "source_truncated": True,
+            },))
+
+        def finalize(self):
+            return replace(self.explore(), state=SessionState.COMPLETE)
+
+    def factory(assignment, lease, snapshot, evidence_store, coverage, obligations, expected_session_id):
+        return RepairedSession(assignment, evidence_store, obligations, expected_session_id)
+
+    def critic(request):
+        observed.update(request.context)
+        return _critic_role(request)
+
+    _controller(tmp_path, critic=critic, session_factory=factory).run(_inputs(tmp_path))
+    assessment = observed["candidate_assessments"]["candidate-delivery"][0]
+    assert assessment["prior_candidate_rejections"][0]["reason"] == "consequence proof is truncated"
+    helper = assessment["delegated_assessments"][0]
+    assert helper["uncertainties"] == ("The argument semantics remain unverified.",)
+    assert helper["source_truncated"] is True
+    assert "evidence:old-manual" not in str(observed["candidate_evidence"])
+
+
 def _policy() -> ReviewPolicy:
     return ReviewPolicy.minimal(recipes=(RecipePolicy(
         id="delivery",
@@ -5944,6 +5981,25 @@ def test_controller_retains_and_emits_typed_source_access_requests(tmp_path):
         "1 detail review note prepared for publication; "
         "highest proposed finding severity: minor."
     )
+
+
+@pytest.mark.parametrize("host,path", [
+    ("raw.githubusercontent.com", "/microsoft/playwright/main/README.md"),
+    ("api.github.com", "/repos/microsoft/playwright/contents/README.md"),
+    ("github.com", "/microsoft/playwright/blob/main/README.md"),
+])
+def test_authorized_repository_web_denial_is_not_a_permission_request(tmp_path, host, path):
+    inputs = _inputs(tmp_path)
+    obligation = derive_obligations(inputs.topology, inputs.classification, inputs.policy)[0]
+    request = SourceAccessRequest(host=host, candidate_url="https://" + host + path,
+        obligation_id=obligation.id, purpose="Inspect the library contract.",
+        authority_reason="Web host not allowed; use repository tools.")
+    result = _controller(tmp_path).run(replace(inputs, source_access_requests=(request,),
+        adapter_configuration={"allowed_github_repositories": ("Microsoft/Playwright",)}))
+    assert result.artifact["source_access_requests"]  # Preserve the actual denied attempt.
+    assert not any(note.kind is ReviewNoteKind.SOURCE_ACCESS_REQUEST for note in result.notes)
+    assert result.artifact["publishing"]["required_note_count"] == len(result.notes)
+    assert result.handoff.access_request_count == 0
 
 
 def test_controller_retains_repository_access_request_in_artifact_and_event(tmp_path):
