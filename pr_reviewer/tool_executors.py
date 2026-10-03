@@ -11,6 +11,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +29,7 @@ from redact import mask_and_truncate, mask_secrets, mask_source_secrets  # noqa:
 # source of truth); _resolve_workspace_path reuses GH_DENY_SUBSTRINGS to block
 # the same sensitive segments in filesystem paths.
 from pr_reviewer.platform import GH_DENY_SUBSTRINGS  # noqa: E402
+from pr_reviewer.line_windows import line_window, bound_line_payload
 from pr_reviewer.specialist_runtime.web_evidence import (  # noqa: E402
     SearchProvider,
     SearchResultRegistry,
@@ -35,6 +37,8 @@ from pr_reviewer.specialist_runtime.web_evidence import (  # noqa: E402
     SearxngSearchProvider,
     SourcePolicy,
     discover,
+    authorize_search_target,
+    github_search_target,
     opaque_reference_url,
 )
 
@@ -77,22 +81,11 @@ def _bound_batched_diff_result(patches, max_bytes):
         "path": item["path"],
         "status": item["status"],
         "patch": item.get("patch", ""),
+        "range": item.get("range"),
         "truncated": bool((item.get("range") or {}).get("truncated")),
     } for item in patches]
-    result = {"patches": compact, "shared_max_bytes": max_bytes}
-    encode = lambda: json.dumps(result, separators=(",", ":")).encode("utf-8")
-    while len(encode()) > max_bytes:
-        candidates = [item for item in compact if item["patch"]]
-        if not candidates:
-            break
-        largest = max(candidates, key=lambda item: len(item["patch"].encode("utf-8")))
-        excess = len(encode()) - max_bytes
-        current = len(largest["patch"].encode("utf-8"))
-        largest["patch"], _ = _truncate_utf8(
-            largest["patch"], max(0, current - max(excess, 1)), "",
-        )
-        largest["truncated"] = True
-    if len(encode()) > max_bytes:
+    result = bound_line_payload({"patches": compact, "shared_max_bytes": max_bytes}, max_bytes)
+    if len(json.dumps(result).encode("utf-8")) > max_bytes:
         return {"truncated": True}
     return result
 
@@ -176,7 +169,7 @@ def _resolve_workspace_path(path, workspace_root):
 
     return resolved, None
 
-def read_file(path, workspace_root, offset=None, limit=None, include_line_numbers=False):
+def read_file(path, workspace_root, offset=None, limit=None, include_line_numbers=False, max_response_bytes=12000):
     """Read a file, optionally a 1-based line window, with path protection.
 
     ``offset``/``limit`` let the model read a slice of a large file without
@@ -192,9 +185,6 @@ def read_file(path, workspace_root, offset=None, limit=None, include_line_number
     except Exception as exc:
         return {"error": str(exc)}
 
-    if offset is None and limit is None and not include_line_numbers:
-        return {"content": content[:12000]}
-
     lines = content.splitlines(keepends=True)
     start = max((offset or 1) - 1, 0)
     end = start + limit if limit is not None else len(lines)
@@ -206,10 +196,9 @@ def read_file(path, workspace_root, offset=None, limit=None, include_line_number
         )
         if include_line_numbers else "".join(selected)
     )
-    return {
-        "content": window[:12000],
-        "range": {"offset": start + 1, "lines": len(selected), "total_lines": len(lines)},
-    }
+    window, _ = mask_source_secrets(window)
+    window, page = line_window(window, start + 1, max_response_bytes, has_more=end < len(lines))
+    return {"content": window, "range": dict(page, total_lines=len(lines))}
 
 
 _DIFF_HUNK_COORDINATES_RE = re.compile(
@@ -261,14 +250,13 @@ def _read_bounded_line_window(stream, offset, limit, max_bytes):
                 return bytes(collected), returned_lines, True
             else:
                 include_current_line = True
-                returned_lines += 1
 
         if include_current_line:
             remaining = max_bytes - len(collected)
             if len(chunk) > remaining:
-                collected.extend(chunk[:remaining])
                 return bytes(collected), returned_lines, True
             collected.extend(chunk)
+            returned_lines += 1
 
         if chunk.endswith(b"\n"):
             current_line += 1
@@ -386,7 +374,7 @@ def gh_api(endpoint, allowed_repos, current_repo, request_timeout=25):
         return {
             "error": (
                 "gh_api does not read repository files; use read_remote_file "
-                "with an allowlisted repository and immutable ref"
+                "with an allowlisted repository and a branch, tag or commit ref"
             )
         }
     # Imported lazily so this module can still be loaded when the
@@ -432,6 +420,14 @@ def _remote_path(path):
     return value, None
 
 
+def _valid_remote_ref(revision):
+    return bool(
+        re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./-]*", revision)
+        and ".." not in revision and "//" not in revision
+        and not revision.endswith(("/", ".", ".lock"))
+    )
+
+
 def read_remote_file(
     repository,
     path,
@@ -443,8 +439,11 @@ def read_remote_file(
     include_line_numbers=False,
     request_timeout=25,
     max_response_bytes=12000,
+    *,
+    ref_cache=None,
+    deadline_at=None,
 ):
-    """Read a UTF-8 text file from an explicitly allowlisted remote SHA.
+    """Resolve a permitted remote revision, then read immutable UTF-8 text.
 
     This is deliberately separate from ``gh_api``: the generic API tool must
     not expose GitHub's base64 ``contents`` representation, and this helper
@@ -461,8 +460,8 @@ def read_remote_file(
     if err:
         return {"error": err}
     revision = str(ref or "").strip()
-    if not _GIT_OBJECT_ID_RE.fullmatch(revision):
-        return {"error": "Remote file ref must be an immutable commit object ID"}
+    if not _valid_remote_ref(revision):
+        return {"error": "Remote file ref must be a valid branch, tag or commit object ID"}
     start = _opt_int(offset)
     count = _opt_int(limit)
     if start is not None and start < 1:
@@ -470,11 +469,41 @@ def read_remote_file(
     if count is not None and not 1 <= count <= 400:
         return {"error": "Remote file limit must be between 1 and 400 lines"}
 
-    quoted_path = urllib.parse.quote(normalized_path, safe="/:@!$&'()*+,;=-._~")
-    endpoint = f"repos/{repository}/contents/{quoted_path}?ref={revision}"
     # Route through the shared platform seam after the stricter remote-only
     # validation above. Generic gh_api deliberately blocks this endpoint.
     from pr_reviewer.platform import gh_api as _platform_gh_api
+    from pr_reviewer.platform import resolve_platform
+    if resolve_platform() != "github":
+        return {"error": "Remote text retrieval is only supported on GitHub"}
+    deadline = min(time.monotonic() + request_timeout,
+                   deadline_at if deadline_at is not None else float("inf"))
+    def remaining():
+        seconds = deadline - time.monotonic()
+        if seconds <= 0:
+            raise ValueError("Remote file request deadline exceeded")
+        return seconds
+    requested_ref = revision
+    def resolve():
+        response = _platform_gh_api(
+            f"repos/{repository}/commits/{urllib.parse.quote(requested_ref, safe='')}",
+            {repository}, "", remaining(),
+        )
+        if response.get("error"):
+            raise ValueError(str(response["error"]))
+        data = response.get("data")
+        sha = data.get("sha") if isinstance(data, dict) else None
+        if not isinstance(sha, str) or not _GIT_OBJECT_ID_RE.fullmatch(sha):
+            raise ValueError("Remote ref resolution did not return an immutable commit SHA")
+        return sha.lower()
+    try:
+        if not _GIT_OBJECT_ID_RE.fullmatch(revision):
+            revision = (ref_cache.resolve_ref(("github.com", repository.casefold(), revision), resolve)
+                        if ref_cache is not None else resolve())
+        request_timeout = remaining()
+    except ValueError as exc:
+        return {"error": str(exc)}
+    quoted_path = urllib.parse.quote(normalized_path, safe="/:@!$&'()*+,;=-._~")
+    endpoint = f"repos/{repository}/contents/{quoted_path}?ref={revision}"
     response = _platform_gh_api(
         endpoint, {str(repository).strip().strip("/")}, "", request_timeout,
     )
@@ -490,7 +519,10 @@ def read_remote_file(
     if size > download_limit:
         return {"error": f"Remote file exceeds download limit ({size}>{download_limit} bytes); use smaller source files instead"}
     from pr_reviewer.platform import gh_raw_file
-    response = gh_raw_file(endpoint, {repository}, request_timeout, download_limit)
+    try:
+        response = gh_raw_file(endpoint, {repository}, remaining(), download_limit)
+    except ValueError as exc:
+        return {"error": str(exc)}
     if response.get("error"):
         return {"error": str(response["error"])}
     raw = response["content"]
@@ -513,22 +545,16 @@ def read_remote_file(
     else:
         selected_text = "".join(selected)
     masked_text, _redaction_count = mask_source_secrets(selected_text)
-    selected_text, byte_truncated = _truncate_utf8(
-        masked_text, max_response_bytes,
-    )
-    has_more = line_end < len(lines) or byte_truncated
+    selected_text, page = line_window(masked_text, line_start + 1, max_response_bytes,
+                                      has_more=line_end < len(lines))
     return {
         "content": selected_text,
-        "range": {
-            "offset": line_start + 1,
-            "lines": len(selected),
-            "total_lines": len(lines),
-            "truncated": has_more,
-            "has_more": has_more,
-        },
+        "range": dict(page, total_lines=len(lines)),
         "repository": str(repository).strip().strip("/"),
         "path": normalized_path,
         "ref": revision,
+        "requested_ref": requested_ref,
+        "resolved_sha": revision,
     }
 
 def web_fetch(
@@ -546,6 +572,11 @@ def web_fetch(
     public_reference=None,
     evidence_tool="web_fetch",
     evidence_arguments=None,
+    search_terms=None,
+    result_registry=None,
+    allowed_repos=(),
+    current_repo="",
+    output_max_bytes=None,
 ):
     """Retrieve typed evidence through the redirect- and DNS-safe boundary."""
     try:
@@ -562,6 +593,11 @@ def web_fetch(
             public_reference=public_reference,
             evidence_tool=evidence_tool,
             evidence_arguments=evidence_arguments,
+            search_terms=search_terms,
+            result_registry=result_registry,
+            allowed_repos=allowed_repos,
+            current_repo=current_repo,
+            output_max_bytes=output_max_bytes,
         ).as_dict()
     except Exception as exc:
         return {"error": str(exc)}
@@ -577,6 +613,8 @@ def web_search(
     search_scan_limit=25,
     allow_private_search_url=False,
     search_result_registry: SearchResultRegistry | None = None,
+    allowed_repos=(),
+    current_repo="",
 ):
     """Return policy-filtered discovery metadata, never raw search output."""
     if not search_url:
@@ -595,6 +633,8 @@ def web_search(
             search_scan_limit=search_scan_limit,
             tool_max_search_results=max_results,
             result_registry=search_result_registry,
+            allowed_repos=allowed_repos,
+            current_repo=current_repo,
         ).as_dict()
     except Exception as exc:
         return {"error": str(exc)}
@@ -700,6 +740,25 @@ def execute_tool_request(
     """
     tool_result = {"tool": tool_name, "status": "error", "result": {}}
 
+    def retrieve_repository_target(target):
+        if 'search_terms' in args:
+            raise ValueError('search_terms is supported only for website results; use repository reader parameters')
+        effective_name = "read_remote_file" if target.route == "github_file" else "gh_api"
+        effective_args = dict(target.arguments)
+        # Set routing metadata before authorization so denied requests also
+        # retain the correct repository identity and access-request type.
+        tool_result["effective_tool"] = effective_name
+        tool_result["effective_arguments"] = effective_args
+        authorize_search_target(target, allowed_gh_repos, current_repo)
+        routed = execute_tool_request(
+            effective_name, effective_args, workspace_root, allowed_gh_repos,
+            current_repo, allowed_hosts, max_response_bytes, request_timeout,
+            source_policy=source_policy, search_result_registry=search_result_registry,
+            deadline_at=deadline_at,
+        )
+        return {**routed, "tool": tool_name, "effective_tool": effective_name,
+                "effective_arguments": effective_args}
+
     try:
         if tool_name == "read_file":
             path = args.get("path", "")
@@ -708,10 +767,11 @@ def execute_tool_request(
             res = read_file(
                 path, workspace_root, _opt_int(args.get("offset")), _opt_int(args.get("limit")),
                 args.get("include_line_numbers") is True,
+                max_response_bytes,
             )
             if res.get("error"):
                 raise ValueError(res["error"])
-            text = _source_text(res.get("content", ""), max_response_bytes)
+            text = res.get("content", "")
             result_payload = {"content": text}
             if res.get("range"):
                 result_payload["range"] = res["range"]
@@ -852,28 +912,14 @@ def execute_tool_request(
             masked_patch, _redaction_count = mask_source_secrets(output)
             if args.get("include_line_numbers") is True:
                 masked_patch = _number_diff_lines(masked_patch)
-            encoded_patch = masked_patch.encode("utf-8", errors="replace")
-            if len(encoded_patch) > max_response_bytes:
-                marker = b"\n[truncated]"
-                if max_response_bytes <= len(marker):
-                    encoded_patch = marker[:max_response_bytes]
-                else:
-                    encoded_patch = (
-                        encoded_patch[:max_response_bytes - len(marker)].decode(
-                            "utf-8", errors="ignore"
-                        ).encode("utf-8")
-                        + marker
-                    )
-            patch = encoded_patch.decode("utf-8", errors="replace")
+            patch, page = line_window(masked_patch, offset, max_response_bytes, has_more=has_more)
+            if not raw_output and has_more:
+                page.update(omitted_lines=[offset], next_offset=offset + 1,
+                            omission_reason="line exceeds output byte limit")
             tool_result["result"] = {
                 "path": normalized_path,
                 "patch": patch,
-                "range": {
-                    "offset": offset,
-                    "returned_lines": returned_lines,
-                    "has_more": has_more,
-                    "truncated": has_more,
-                },
+                "range": dict(page, returned_lines=page["lines"]),
             }
 
         elif tool_name == "git_log":
@@ -944,7 +990,7 @@ def execute_tool_request(
             path = args.get("path", "")
             ref = args.get("ref", "")
             if not repository or not path or not ref:
-                raise ValueError("read_remote_file requires repository, path, and immutable ref")
+                raise ValueError("read_remote_file requires repository, path, and ref")
             res = read_remote_file(
                 repository,
                 path,
@@ -956,15 +1002,19 @@ def execute_tool_request(
                 args.get("include_line_numbers") is True,
                 request_timeout,
                 max_response_bytes,
+                ref_cache=search_result_registry,
+                deadline_at=deadline_at,
             )
             if res.get("error"):
                 raise ValueError(res["error"])
-            content = _source_text(res.get("content", ""), max_response_bytes)
+            content = res.get("content", "")
             tool_result["result"] = {
                 "content": content,
                 "repository": res["repository"],
                 "path": res["path"],
                 "ref": res["ref"],
+                "requested_ref": res.get("requested_ref", ref),
+                "resolved_sha": res["ref"],
                 "range": res["range"],
             }
 
@@ -972,6 +1022,14 @@ def execute_tool_request(
             url = args.get("url", "")
             if not url:
                 raise ValueError("Missing 'url' argument")
+            if 'search_terms' in args and args['search_terms'] is None:
+                raise ValueError('search_terms must be omitted or a nonempty array')
+            registered = search_result_registry.find(url) if search_result_registry else None
+            target = search_result_registry.resolve_target(registered) if registered else None
+            if target is None or target.route == "web":
+                target = github_search_target(url)
+            if target is not None and target.route != "web":
+                return retrieve_repository_target(target)
             res = web_fetch(
                 url,
                 allowed_hosts,
@@ -982,12 +1040,16 @@ def execute_tool_request(
                 session_id=session_id,
                 model_identity=model_identity,
                 deadline_at=deadline_at,
+                search_terms=args.get('search_terms'),
+                result_registry=search_result_registry,
+                allowed_repos=allowed_gh_repos,
+                current_repo=current_repo,
+                output_max_bytes=max_response_bytes,
             )
             if res.get("error"):
                 raise ValueError(res["error"])
-            content_text, truncated = mask_and_truncate(
-                res.get("content", ""), max_response_bytes
-            )
+            content_text, truncated = ((res.get('content', ''), False) if res.get('selection') is not None
+                else mask_and_truncate(res.get("content", ""), max_response_bytes))
             tool_result["result"] = {
                 **res,
                 "content": content_text,
@@ -1009,6 +1071,8 @@ def execute_tool_request(
                 search_scan_limit=search_scan_limit,
                 allow_private_search_url=allow_private_search_url,
                 search_result_registry=search_result_registry,
+                allowed_repos=allowed_gh_repos,
+                current_repo=current_repo,
             )
             if res.get("error"):
                 raise ValueError(res["error"])
@@ -1018,12 +1082,19 @@ def execute_tool_request(
             tool_result["result"] = res
 
         elif tool_name == "web_fetch_search_result":
+            if set(args) - {"result_id", "purpose", "search_terms"}:
+                raise ValueError("Search-result retrieval accepts no target overrides")
+            if 'search_terms' in args and args['search_terms'] is None:
+                raise ValueError('search_terms must be omitted or a nonempty array')
             result_id = args.get("result_id", "")
             if not result_id:
                 raise ValueError("Missing 'result_id' argument")
             if search_result_registry is None:
                 raise ValueError("search result registry is unavailable")
-            url = search_result_registry.resolve(result_id)
+            target = search_result_registry.resolve_target(result_id)
+            url = target.url
+            if target.route != "web":
+                return retrieve_repository_target(target)
             res = web_fetch(
                 url,
                 allowed_hosts,
@@ -1034,16 +1105,20 @@ def execute_tool_request(
                 session_id=session_id,
                 model_identity=model_identity,
                 deadline_at=deadline_at,
-                allow_opaque_url=True,
-                public_reference=opaque_reference_url(url),
+                allow_opaque_url=target.opaque,
+                public_reference=opaque_reference_url(url) if target.opaque else None,
                 evidence_tool="web_fetch_search_result",
                 evidence_arguments={"result_id": result_id},
+                search_terms=args.get('search_terms'),
+                result_registry=search_result_registry,
+                allowed_repos=allowed_gh_repos,
+                current_repo=current_repo,
+                output_max_bytes=max_response_bytes,
             )
             if res.get("error"):
                 raise ValueError(res["error"])
-            content_text, truncated = mask_and_truncate(
-                res.get("content", ""), max_response_bytes
-            )
+            content_text, truncated = ((res.get('content', ''), False) if res.get('selection') is not None
+                else mask_and_truncate(res.get("content", ""), max_response_bytes))
             tool_result["result"] = {
                 **res,
                 "content": content_text,
@@ -1084,6 +1159,8 @@ def execute_tool_request(
         # processes the markdown output. This is consistent with how
         # run_command error messages are redacted.
         tool_result["result"] = {"error": str(exc)}
+        if str(exc).startswith(("Repo not allowed:", "source denied:")):
+            tool_result["status"] = "rejected"
 
     return tool_result
 

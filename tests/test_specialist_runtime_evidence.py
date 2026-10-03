@@ -99,7 +99,12 @@ def test_evidence_retains_redaction_and_truncation_state():
     assert "supersecretvalue" not in record.content
 
 
-def test_diff_evidence_retains_executor_range_truncation():
+@pytest.mark.parametrize("metadata", (
+    {"range": {"truncated": True}},
+    {"range": {"has_more": True}},
+    {"truncated": True},
+))
+def test_diff_evidence_retains_executor_range_truncation(metadata):
     store = EvidenceStore()
 
     record = store.add_tool_result(
@@ -108,7 +113,7 @@ def test_diff_evidence_retains_executor_range_truncation():
             "status": "ok",
             "result": {
                 "path": "src/app.py", "patch": "@@ -1 +1 @@\n-old\n+new\n",
-                "range": {"truncated": True},
+                **metadata,
             },
         },
     )
@@ -407,3 +412,38 @@ def test_exported_canonical_key_sanitizes_non_url_source_before_hashing():
     assert first == second
     assert "supersecretvalue" not in first
     assert "anothersecretvalue" not in first
+def test_web_selection_survives_evidence_round_trip_and_changes_identity():
+    from dataclasses import asdict
+    selection = {'document_hash': 'a' * 64, 'excerpted': True, 'download_truncated': False,
+        'passages': [{'start_line': 1, 'end_line': 1, 'source_start_line': 20, 'source_end_line': 20}],
+        'limitations': []}
+    store = EvidenceStore()
+    first = store.add_tool_result(session_id='s', tool='web_fetch', arguments={'url': 'https://example.com/doc'},
+        result={'status': 'ok', 'content': 'quoted', 'selection': selection, 'truncated': True})
+    assert asdict(first)['selection'] == selection
+    copied = EvidenceStore.from_snapshot(store.snapshot()).snapshot().records[0]
+    assert copied.selection == selection
+    second = store.add_tool_result(session_id='s', tool='web_fetch', arguments={'url': 'https://example.com/doc'},
+        result={'status': 'ok', 'content': 'quoted', 'selection': {**selection, 'document_hash': 'b' * 64}, 'truncated': True})
+    assert second.id != first.id
+
+
+def test_retention_limit_cannot_leave_stale_selection_ranges():
+    store = EvidenceStore(max_content_bytes=12)
+    record = store.add_tool_result(session_id='s', tool='web_fetch', arguments={},
+        result={'status': 'ok', 'content': 'first line\nsecond line\nthird line', 'selection': {
+            'document_hash': 'a' * 64, 'passages': [{'start_line': 1, 'end_line': 3,
+                'source_start_line': 10, 'source_end_line': 12}], 'limitations': []}})
+    assert record.truncated
+    assert record.selection['passages'] == []
+    assert record.selection['limitations']
+
+
+def test_second_redaction_cannot_leave_stale_selection_ranges():
+    record = EvidenceStore().add_tool_result(session_id='s', tool='web_fetch', arguments={},
+        result={'status': 'ok', 'content': 'password=literal-secret-value', 'selection': {
+            'document_hash': 'a' * 64, 'passages': [{'start_line': 1, 'end_line': 1,
+                'source_start_line': 10, 'source_end_line': 10}], 'limitations': []}})
+    assert 'literal-secret-value' not in record.content
+    assert record.selection['passages'] == []
+    assert record.selection['excerpted']

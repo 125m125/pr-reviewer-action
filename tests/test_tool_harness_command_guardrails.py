@@ -252,7 +252,7 @@ def test_read_pr_diff_batches_authorized_paths_under_one_shared_cap(
 
     result = tool_executors.execute_tool_request(
         "read_pr_diff", {"paths": ["src/a.py", "tests/test_a.py"]},
-        str(tmp_path), set(), "", (), 180, 15,
+        str(tmp_path), set(), "", (), 800, 15,
         base_sha=base_sha, head_sha=head_sha,
         allowed_diff_paths=("src/a.py", "tests/test_a.py"),
     )
@@ -261,7 +261,7 @@ def test_read_pr_diff_batches_authorized_paths_under_one_shared_cap(
     assert [item["path"] for item in result["result"]["patches"]] == [
         "src/a.py", "tests/test_a.py",
     ]
-    assert len(json.dumps(result["result"], separators=(",", ":")).encode()) <= 180
+    assert len(json.dumps(result["result"], separators=(",", ":")).encode()) <= 800
 
 
 def test_read_pr_diff_rejects_oversized_or_unauthorized_batches(tmp_path):
@@ -398,7 +398,10 @@ def test_read_pr_diff_bounds_capture_before_large_single_line_is_materialized(
     assert max(observed["read_sizes"]) == 12001
     assert process.killed is True
     assert len(result["result"]["patch"].encode("utf-8")) <= 12000
-    assert result["result"]["range"]["returned_lines"] == 1
+    assert result["result"]["patch"] == ""
+    assert result["result"]["range"]["returned_lines"] == 0
+    assert result["result"]["range"]["omitted_lines"] == [1]
+    assert result["result"]["range"]["next_offset"] == 2
     assert result["result"]["range"]["has_more"] is True
     assert result["result"]["range"]["truncated"] is True
 
@@ -447,6 +450,8 @@ def test_read_pr_diff_streams_to_later_offset_beyond_response_byte_cap(
     assert result["result"]["patch"] == "".join(late_lines[:3])
     assert result["result"]["range"] == {
         "offset": 181,
+        "lines": 3,
+        "next_offset": 184,
         "returned_lines": 3,
         "has_more": True,
         "truncated": True,

@@ -21,12 +21,14 @@ import socket
 import ssl
 import sys
 import threading
+import uuid
 import time
 from typing import Callable, Iterable, Mapping, Protocol, Sequence
 from urllib.parse import parse_qsl, urlencode, unquote, urljoin, urlsplit, urlunsplit
 
 from .evidence import EvidenceProvenance, EvidenceStore
 from .policy import ReviewPolicy, SourceRule
+from .web_passages import normalize_document, select_passages, validate_search_terms
 
 _SCRIPTS_DIR = str(Path(__file__).parents[2] / "scripts")
 if _SCRIPTS_DIR not in sys.path:
@@ -66,25 +68,158 @@ class SearchCandidate:
     classification: str | None = None
     denial_reason: str | None = None
     result_id: str | None = None
+    source_details: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class SearchRetrievalTarget:
+    url: str
+    route: str = "web"
+    arguments: tuple[tuple[str, object], ...] = ()
+    opaque: bool = False
+
+
+def github_search_target(url: str) -> SearchRetrievalTarget | None:
+    """Parse only supported public GitHub resources; never perform discovery I/O."""
+    parsed = urlsplit(url)
+    if parsed.hostname not in {"github.com", "api.github.com", "raw.githubusercontent.com"}:
+        return None
+    if parsed.scheme != "https" or parsed.netloc != parsed.hostname:
+        raise SourceDenied("GitHub URLs require credential-free HTTPS without a custom port")
+    if "%" in unquote(parsed.path):
+        raise SourceDenied("nested GitHub URL path encoding is unsupported")
+    safe_path, path_error = _safe_path(parsed.path)
+    if path_error:
+        raise SourceDenied(path_error)
+    segments = safe_path.strip("/").split("/")
+    if any(not p or unquote(p) in {".", ".."} or re.search(r"[\\\x00-\x20]", unquote(p)) for p in segments):
+        raise SourceDenied("unsupported GitHub path")
+    api = parsed.hostname == "api.github.com"
+    if api:
+        if segments[0] != "repos":
+            raise SourceDenied("unsupported GitHub API resource")
+        segments = segments[1:]
+    if len(segments) < 2 or not all(re.fullmatch(r"[A-Za-z0-9_.-]+", p) for p in segments[:2]):
+        raise SourceDenied("unsupported GitHub repository identity")
+    repo = "/".join(segments[:2])
+    rest = segments[2:]
+    endpoint = f"repos/{repo}"
+    file_args = None
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    if api and rest[:1] == ["contents"]:
+        if len(rest) < 2 or len(query) != 1 or query[0][0] != "ref" or not query[0][1]:
+            raise SourceDenied("GitHub file URL requires an explicit ref; use read_remote_file with separate repository, ref and path fields")
+        file_args = {"repository": repo, "ref": query[0][1], "path": unquote("/".join(rest[1:]))}
+        query = []
+    elif parsed.hostname == "raw.githubusercontent.com" or (not api and rest[:1] == ["blob"]):
+        tail = rest if parsed.hostname == "raw.githubusercontent.com" else rest[1:]
+        if len(tail) < 2:
+            raise SourceDenied("unsupported GitHub file URL")
+        # A symbolic ref/path boundary in a web URL can be ambiguous. Use the
+        # direct reader's separate ref/path fields (or contents?ref=) instead.
+        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", tail[0]):
+            raise SourceDenied("ambiguous symbolic ref/path; use read_remote_file with separate repository, ref and path fields (branch names may contain '/')")
+        file_args = {"repository": repo, "ref": tail[0], "path": unquote("/".join(tail[1:]))}
+    elif not rest:
+        pass
+    elif len(rest) == 2 and rest[0] in {"issues", "pulls" if api else "pull"} and rest[1].isdigit():
+        kind = "pulls" if rest[0] in {"pull", "pulls"} else "issues"
+        endpoint += f"/{kind}/{rest[1]}"
+    elif len(rest) == 2 and rest[0] == ("commits" if api else "commit") and re.fullmatch(r"[0-9a-fA-F]{40,64}", rest[1]):
+        endpoint += f"/commits/{rest[1]}"
+    elif len(rest) == 3 and rest[:2] == ["releases", "tags" if api else "tag"]:
+        endpoint += "/releases/tags/" + rest[2]
+    elif api and len(rest) == 3 and rest[:2] in (["issues", "comments"], ["pulls", "comments"]) and rest[2].isdigit():
+        endpoint += "/" + "/".join(rest)
+    else:
+        raise SourceDenied("unsupported GitHub resource")
+    if query:
+        raise SourceDenied("unsupported GitHub query parameters")
+    # Repository permission is not permission to expose credential-like URL
+    # payloads. Only a commit-position SHA gets the public revision exemption.
+    visible_parts = list(segments)
+    if file_args is not None:
+        visible_parts = [repo, file_args["path"]]
+        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", file_args["ref"]):
+            visible_parts.append(file_args["ref"])
+    elif len(rest) == 2 and rest[0] in {"commit", "commits"}:
+        visible_parts = [repo]
+    if any(mask_secrets(value) != value or _looks_high_entropy_url_token(value)
+           for value in visible_parts):
+        raise SourceDenied("unsafe credential-like GitHub URL payload")
+    if file_args is not None:
+        if parsed.fragment:
+            match = re.fullmatch(r"L([1-9]\d*)(?:-L([1-9]\d*))?", parsed.fragment)
+            if not match:
+                raise SourceDenied("unsupported GitHub file anchor")
+            start, end = int(match[1]), int(match[2] or match[1])
+            if end < start or end - start >= 400:
+                raise SourceDenied("unsupported GitHub line range")
+            file_args.update(offset=start, limit=end - start + 1, include_line_numbers=True)
+        return SearchRetrievalTarget(url, "github_file", tuple(file_args.items()))
+    if parsed.fragment:
+        anchor = re.fullmatch(r"(issuecomment-|discussion_r)(\d+)", parsed.fragment)
+        if not anchor or not (len(rest) == 2 and rest[0] in {"issues", "pull", "pulls"}):
+            raise SourceDenied("unsupported GitHub metadata anchor")
+        endpoint = f"repos/{repo}/{'issues' if anchor[1] == 'issuecomment-' else 'pulls'}/comments/{anchor[2]}"
+    return SearchRetrievalTarget(url, "github_metadata", (("endpoint", endpoint),))
+
+
+def authorize_search_target(target, allowed_repos, current_repo):
+    from pr_reviewer.platform import _validate_endpoint, resolve_platform
+    from pr_reviewer.tool_executors import _remote_repo_allowed, _remote_path, _valid_remote_ref
+    if resolve_platform() != "github":
+        raise SourceDenied("public GitHub retrieval is unsupported on the configured platform")
+    args = dict(target.arguments)
+    if target.route == "github_file":
+        allowed, error = _remote_repo_allowed(args["repository"], allowed_repos, current_repo)
+        if not allowed:
+            raise SourceDenied(error)
+        _, error = _remote_path(args["path"])
+        if not error and not _valid_remote_ref(args["ref"]):
+            error = "Remote file ref must be a valid branch, tag or commit object ID"
+    else:
+        error = _validate_endpoint(args["endpoint"], allowed_repos, current_repo).get("error")
+    if error:
+        raise SourceDenied(error)
 
 
 class SearchResultRegistry:
-    """Session-local mapping for fetchable search URLs hidden from the model."""
+    """Session-local controller-owned retrieval targets; IDs confer no permission."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._namespace = uuid.uuid4().hex[:12]
         self._urls: dict[str, str] = {}
         self._ids: dict[str, str] = {}
+        self._targets: dict[str, SearchRetrievalTarget] = {}
+        self._resolved_refs: dict[tuple[str, str, str], str] = {}
 
-    def register(self, url: str) -> str:
+    def resolve_ref(self, key, lookup):
+        with self._lock:
+            if key not in self._resolved_refs:
+                self._resolved_refs[key] = lookup()
+            return self._resolved_refs[key]
+
+    def register(self, url: str, target: SearchRetrievalTarget | None = None) -> str:
         canonical = str(url).strip()
         with self._lock:
             result_id = self._ids.get(canonical)
             if result_id is None:
-                result_id = f"search-result-{len(self._urls) + 1}"
+                result_id = f"search-result-{self._namespace}-{len(self._urls) + 1}"
                 self._urls[result_id] = canonical
                 self._ids[canonical] = result_id
+            self._targets[result_id] = target or SearchRetrievalTarget(canonical)
             return result_id
+
+    def resolve_target(self, result_id: str) -> SearchRetrievalTarget:
+        self.resolve(result_id)
+        with self._lock:
+            return self._targets[str(result_id).strip()]
+
+    def find(self, url: str) -> str | None:
+        with self._lock:
+            return self._ids.get(str(url).strip())
 
     def resolve(self, result_id: str) -> str:
         key = str(result_id or "").strip()
@@ -93,6 +228,61 @@ class SearchResultRegistry:
         if url is None:
             raise SourceDenied("unknown search result ID for this session")
         return url
+
+
+@dataclass(frozen=True)
+class SearchResponse(Sequence[SearchCandidate]):
+    """Per-request diagnostics, never mutable state on a shared provider."""
+
+    candidates: tuple[SearchCandidate, ...]
+    engine_warnings: tuple[tuple[str, str], ...] = ()
+
+    def __len__(self):
+        return len(self.candidates)
+
+    def __getitem__(self, index):
+        return self.candidates[index]
+
+
+def _engine_warnings(items) -> tuple[tuple[str, str], ...]:
+    warnings = []
+    for item in items if isinstance(items, (list, tuple)) else ():
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        engine, message = item
+        if not isinstance(engine, str) or not re.fullmatch(r"[a-zA-Z0-9_. -]{1,64}", engine):
+            engine = "unknown"
+        message = str(message).lower()
+        reason = ("captcha" if "captcha" in message else
+                  "rate_limited" if "too many requests" in message or "rate_limited" in message else
+                  "timeout" if "timeout" in message else "unavailable")
+        warning = (engine, reason)
+        if warning not in warnings:
+            warnings.append(warning)
+        if len(warnings) == 10:
+            break
+    return tuple(warnings)
+
+
+def search_warning_summary(records) -> list[dict[str, str]]:
+    """Bounded, deduplicated provider health for the action summary only."""
+    warnings: set[tuple[str, str]] = set()
+    for record in records:
+        if record.tool != "web_search":
+            continue
+        try:
+            payload = json.loads(record.content)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("kind") != "search_discovery":
+            continue
+        items = payload.get("engine_warnings", [])
+        if isinstance(items, list):
+            warnings.update(_engine_warnings([
+                (item.get("engine"), item.get("reason"))
+                for item in items if isinstance(item, dict)
+            ]))
+    return [{"engine": engine, "reason": reason} for engine, reason in sorted(warnings)[:10]]
 
 
 class SearchProvider(Protocol):
@@ -222,7 +412,7 @@ class SearxngSearchProvider:
                 url=str(item.get("url") or ""),
                 snippet=str(item.get("content") or ""),
             ))
-        return tuple(candidates)
+        return SearchResponse(tuple(candidates), _engine_warnings(payload.get("unresponsive_engines")))
 
 
 @dataclass(frozen=True)
@@ -240,6 +430,7 @@ class HttpResponse:
     status: int
     headers: Mapping[str, str]
     body: bytes
+    incomplete: bool = False
 
 
 class HttpTransport(Protocol):
@@ -254,6 +445,8 @@ class FetchedEvidence:
     truncated: bool
     provenance: EvidenceProvenance
     evidence_id: str | None = None
+    selection: Mapping[str, object] | None = None
+    navigation: tuple[dict, ...] = ()
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -276,6 +469,8 @@ class FetchedEvidence:
                 "truncated": self.truncated,
             },
             "evidentiary": True,
+            **({"selection": dict(self.selection), "navigation": list(self.navigation)}
+               if self.selection is not None else {}),
         }
 
     def to_tool_result(self) -> str:
@@ -288,6 +483,8 @@ class SearchDiscovery:
     approved: tuple[SearchCandidate, ...]
     unapproved: tuple[SearchCandidate, ...]
     suppressed_result_count: int = 0
+    engine_warnings: tuple[tuple[str, str], ...] = ()
+    requested_result_count: int = DEFAULT_MAX_SEARCH_RESULTS
 
     def as_dict(self) -> dict[str, object]:
         def approved(candidate: SearchCandidate) -> dict[str, object]:
@@ -298,12 +495,13 @@ class SearchDiscovery:
                 "snippet": candidate.snippet,
                 "classification": candidate.classification,
                 "fetch_allowed": True,
-                "fetch_method": "result_id" if candidate.result_id else "url",
+                "fetch_method": "result_id",
             }
             if candidate.result_id:
                 result["result_id"] = candidate.result_id
-            else:
+            if candidate.url:
                 result["url"] = candidate.url
+            result.update(dict(candidate.source_details))
             return result
 
         def unapproved(candidate: SearchCandidate) -> dict[str, object]:
@@ -317,12 +515,30 @@ class SearchDiscovery:
                 "fetch_allowed": False,
             }
 
+        count = len(self.approved) + len(self.unapproved)
+        degraded = bool(self.engine_warnings) and count < self.requested_result_count
+        limitation = (
+            "Search coverage is reduced because some engines were unavailable. "
+            "Use relevant results; missing results do not establish absence."
+            if count else
+            "Search returned no results while some engines were unavailable. "
+            "This does not establish absence. Prefer known documentation URLs or "
+            "authorized repository sources; avoid repeated similar searches."
+        )
         return {
             "kind": "search_discovery",
             "query": self.redacted_query,
             "approved": [approved(item) for item in self.approved],
             "unapproved": [unapproved(item) for item in self.unapproved],
             "suppressed_result_count": self.suppressed_result_count,
+            "search_status": (
+                ("partial" if count else "inconclusive") if degraded else
+                ("ok" if count else "empty")
+            ),
+            "engine_warnings": [
+                {"engine": engine, "reason": reason} for engine, reason in self.engine_warnings
+            ],
+            **({"search_limitation": limitation} if degraded else {}),
             "evidentiary": False,
         }
 
@@ -637,16 +853,17 @@ def opaque_reference_url(url: str) -> str:
     return f"https://{host}/[opaque-search-result]" if host else "[opaque-search-result]"
 
 
-def _redact_opaque_url_content(text: str, *urls: str) -> str:
+def _redact_opaque_url_content(text: str, *urls: str, redact_full_url: bool = True) -> str:
     redacted = text
     for url in urls:
-        redacted = redacted.replace(url, "[OPAQUE_SEARCH_RESULT_URL]")
+        if redact_full_url:
+            redacted = redacted.replace(url, "[OPAQUE_SEARCH_RESULT_URL]")
         try:
             parsed = urlsplit(url)
         except ValueError:
             continue
-        for token in re.split(r"[/&=?]", f"{parsed.path}?{parsed.query}"):
-            if _looks_high_entropy(token):
+        for token in re.split(r"[/&=?#]", unquote(f"{parsed.path}?{parsed.query}#{parsed.fragment}")):
+            if _looks_high_entropy_url_token(token):
                 redacted = redacted.replace(token, "[OPAQUE_URL_TOKEN]")
     return redacted
 
@@ -715,30 +932,82 @@ def discover(
     search_scan_limit: int = DEFAULT_SEARCH_SCAN_LIMIT,
     tool_max_search_results: int = DEFAULT_MAX_SEARCH_RESULTS,
     result_registry: SearchResultRegistry | None = None,
+    allowed_repos: Iterable[str] = (),
+    current_repo: str = "",
 ) -> SearchDiscovery:
     if search_scan_limit <= 0 or tool_max_search_results <= 0:
         raise ValueError("search result limits must be positive")
     clean_query = _validated_query(query)
-    candidates = tuple(provider.search(clean_query, limit=search_scan_limit))[
+    response = provider.search(clean_query, limit=search_scan_limit)
+    candidates = tuple(response)[
         :search_scan_limit
     ]
+    return _route_candidates(candidates, source_policy, result_registry=result_registry,
+        allowed_repos=allowed_repos, current_repo=current_repo,
+        tool_max_search_results=tool_max_search_results, clean_query=clean_query,
+        engine_warnings=response.engine_warnings if isinstance(response, SearchResponse) else ())
+
+
+def _web_resource(url):
+    """Fragments select local content; validate them without weakening URL policy."""
+    parsed = urlsplit(url)
+    fragment = unquote(parsed.fragment) if parsed.fragment else None
+    if fragment is not None and (len(fragment) > 256 or '%' in fragment
+            or mask_secrets(fragment) != fragment or _looks_high_entropy_url_token(fragment)
+            or any(ord(c) < 32 or ord(c) == 127 for c in fragment)):
+        raise SourceDenied("unsafe or oversized section anchor")
+    return urlunsplit(parsed._replace(fragment="")), fragment
+
+
+def _route_candidates(candidates, source_policy, *, result_registry, allowed_repos=(),
+                      current_repo="", tool_max_search_results=8, clean_query="", engine_warnings=()):
     approved: list[SearchCandidate] = []
     unapproved: list[SearchCandidate] = []
     for candidate in candidates:
-        decision = source_policy.classify(candidate.url)
+        try:
+            resource, fragment = _web_resource(candidate.url)
+        except ValueError:
+            resource, fragment = candidate.url, None
+        decision = source_policy.classify(resource)
+        target = None
+        route_error = None
+        try:
+            target = github_search_target(candidate.url)
+            if target is not None:
+                authorize_search_target(target, allowed_repos, current_repo)
+        except (ValueError, SourceDenied) as exc:
+            route_error = str(exc)
+            target = None
+        if target is not None:
+            parsed = urlsplit(candidate.url)
+            decision = SourceDecision(True, parsed.hostname or "", parsed.path,
+                classification="authorized-github-repository", canonical_url=candidate.url)
+        elif route_error and not decision.approved:
+            decision = replace(decision, reason=route_error)
         if decision.approved:
+            if result_registry is None:
+                raise SourceDenied("search result registry is required for approved discovery")
+            target = target or SearchRetrievalTarget((decision.canonical_url or resource) +
+                ("#" + urlsplit(candidate.url).fragment if fragment is not None else ""))
             title, _ = mask_and_truncate(str(candidate.title or ""), 300)
             snippet, _ = mask_and_truncate(str(candidate.snippet or ""), 500)
+            details = {k: str(v) for k, v in target.arguments if k in {"repository", "path", "ref"}}
+            if target.route == "github_metadata":
+                resource = dict(target.arguments)["endpoint"].split("/")
+                details = {"repository": "/".join(resource[1:3]),
+                           "resource_type": resource[3] if len(resource) > 3 else "repository",
+                           "resource_id": "/".join(resource[4:])}
             normalized = replace(
                 candidate,
                 title=title,
-                url=decision.canonical_url or "",
+                url=target.url,
                 snippet=snippet,
                 host=decision.host,
                 path=decision.path,
                 classification=decision.classification,
                 denial_reason=None,
-                result_id=None,
+                result_id=result_registry.register(target.url, target),
+                source_details=tuple(details.items()),
             )
             approved.append(normalized)
         else:
@@ -748,7 +1017,7 @@ def discover(
                 and decision.reason == "unsafe high-entropy URL payload"
             ):
                 opaque_decision = source_policy.classify(
-                    candidate.url, allow_opaque=True,
+                    resource, allow_opaque=True,
                 )
             if (
                 opaque_decision is not None
@@ -756,8 +1025,8 @@ def discover(
                 and opaque_decision.canonical_url
             ):
                 _, _, safe_path = _safe_discovery_url(candidate.url)
-                title, _ = mask_and_truncate(str(candidate.title or ""), 300)
-                snippet, _ = mask_and_truncate(str(candidate.snippet or ""), 500)
+                title, _ = mask_and_truncate(_redact_opaque_url_content(str(candidate.title or ""), candidate.url), 300)
+                snippet, _ = mask_and_truncate(_redact_opaque_url_content(str(candidate.snippet or ""), candidate.url), 500)
                 approved.append(SearchCandidate(
                     title=title,
                     url="",
@@ -766,7 +1035,8 @@ def discover(
                     path=safe_path,
                     classification=opaque_decision.classification,
                     result_id=result_registry.register(
-                        opaque_decision.canonical_url,
+                        candidate.url,
+                        SearchRetrievalTarget(candidate.url, opaque=True),
                     ),
                 ))
                 continue
@@ -789,6 +1059,8 @@ def discover(
         approved=tuple(approved),
         unapproved=tuple(unapproved),
         suppressed_result_count=suppressed,
+        engine_warnings=engine_warnings,
+        requested_result_count=tool_max_search_results,
     )
 
 
@@ -1177,7 +1449,10 @@ class StdlibHttpTransport:
                     break
                 chunks.append(chunk)
                 size += len(chunk)
-            return HttpResponse(response.status, headers, b"".join(chunks))
+            declared = headers.get('content-length', '')
+            incomplete = (not headers.get('transfer-encoding') and declared.isascii()
+                and declared.isdigit() and size <= request.max_bytes and size < int(declared))
+            return HttpResponse(response.status, headers, b"".join(chunks), bool(incomplete))
         except SourceDenied:
             raise
         except (TimeoutError, socket.timeout) as exc:
@@ -1285,9 +1560,18 @@ class SecureFetcher:
         public_reference: str | None = None,
         evidence_tool: str = "web_fetch",
         evidence_arguments: Mapping[str, object] | None = None,
+        search_terms: tuple[str, ...] | None = None,
+        result_registry: SearchResultRegistry | None = None,
+        allowed_repos: Iterable[str] = (),
+        current_repo: str = "",
+        output_max_bytes: int | None = None,
     ) -> FetchedEvidence:
+        search_terms = validate_search_terms(search_terms)
         original_url = str(url).strip()
-        current_url = original_url
+        current_url, fragment = _web_resource(original_url)
+        selection_requested = search_terms is not None or fragment is not None
+        output_limit = min(self.max_bytes, output_max_bytes) if output_max_bytes is not None else self.max_bytes
+        download_limit = 8 * 1024 * 1024 if selection_requested else self.max_bytes
         deadline = self.monotonic() + self.timeout
         if deadline_at is not None:
             deadline = min(deadline, float(deadline_at))
@@ -1313,7 +1597,7 @@ class SecureFetcher:
                 url=current_url,
                 resolved_ip=addresses[0],
                 timeout=remaining,
-                max_bytes=self.max_bytes,
+                max_bytes=download_limit,
                 deadline=deadline,
                 headers={
                     "Accept": (
@@ -1339,7 +1623,11 @@ class SecureFetcher:
                 raise SourceDenied("redirect response omitted Location")
             if redirect_count >= self.max_redirects:
                 raise SourceDenied("secure fetch redirect limit exceeded")
-            current_url = urljoin(current_url, location)
+            current_url, redirect_fragment = _web_resource(urljoin(current_url, location))
+            if redirect_fragment is not None:
+                fragment = redirect_fragment
+                selection_requested = True
+                download_limit = 8 * 1024 * 1024
         if response is None or final_decision is None:
             raise SourceDenied("secure fetch did not produce a response")
         if not 200 <= response.status < 300:
@@ -1351,17 +1639,17 @@ class SecureFetcher:
         mime_type = _mime_type(response.headers)
         if mime_type not in self.allowed_mime_types:
             raise SourceDenied(f"response MIME type is not approved: {mime_type or '(missing)'}")
-        raw_truncated = len(response.body) > self.max_bytes
-        raw_body = response.body[:self.max_bytes]
+        raw_truncated = response.incomplete or len(response.body) > download_limit
+        raw_body = response.body[:download_limit]
         text = _decode_body(raw_body, content_type)
-        if mime_type in {"text/html", "application/xhtml+xml"}:
+        if not selection_requested and mime_type in {"text/html", "application/xhtml+xml"}:
             parser = _HtmlTextExtractor()
             parser.feed(text)
             parser.close()
             text = parser.text()
-        if public_reference is not None:
+        if public_reference is not None and not selection_requested:
             text = _redact_opaque_url_content(text, original_url, current_url)
-        bounded, normalized_truncated = mask_and_truncate(text, self.max_bytes)
+        bounded, normalized_truncated = mask_and_truncate(text, output_limit)
         truncated = raw_truncated or normalized_truncated
         content_hash = hashlib.sha256(bounded.encode("utf-8")).hexdigest()
         public_original_url = public_reference or original_url
@@ -1379,13 +1667,62 @@ class SecureFetcher:
             retrieved_at=float(self.clock()),
             max_age_hours=final_decision.max_age_hours,
         )
+        selection, navigation = None, ()
+        if selection_requested:
+            check = lambda: _remaining(deadline, self.monotonic)
+            document = normalize_document(text, mime_type, check_deadline=check)
+            # HTML entities are decoded by normalization. Mask URL reflections
+            # afterward, before hashing/selection/storage; keep real link targets
+            # private for the existing authorization + opaque-ID routing.
+            link_urls = tuple(link['url'] for link in document.links)
+            def redact_content(content, urls):
+                content = _redact_opaque_url_content(content, *urls, redact_full_url=False)
+                return (_redact_opaque_url_content(content, original_url, current_url)
+                        if public_reference is not None else content)
+            safe_text = redact_content(document.text, link_urls)
+            safe_lines = safe_text.split('\n')
+            document = replace(document,
+                text=safe_text,
+                sections=tuple(replace(section, title=safe_lines[section.start - 1].lstrip('#').strip())
+                               for section in document.sections),
+                links=tuple({**link, 'label': redact_content(link['label'], (link['url'],))}
+                            for link in document.links))
+            shell = FetchedEvidence('', '0' * 64, mime_type, True, provenance, 'evidence:' + '0' * 64)
+            # Leave room for source metadata, its download flag, and executor envelope.
+            passage_budget = output_limit - len(shell.to_tool_result().encode('utf-8')) - 256
+            passages = select_passages(document, search_terms=search_terms, fragment=fragment,
+                max_bytes=passage_budget, check_deadline=check)
+            bounded, selection = passages.content, dict(passages.selection)
+            selection['download_truncated'] = raw_truncated
+            if raw_truncated:
+                selection['limitations'].append('download ended before declared Content-Length; document is incomplete'
+                    if response.incomplete else 'download ceiling reached; document is incomplete')
+            if passages.navigation and result_registry is not None:
+                candidates = tuple(SearchCandidate(title=link['label'], url=urljoin(current_url, link['url']), snippet='')
+                    for link in passages.navigation)
+                check()
+                routed = _route_candidates(candidates, self.policy, result_registry=result_registry,
+                    allowed_repos=allowed_repos, current_repo=current_repo).as_dict()
+                navigation = tuple(routed['approved'] + routed['unapproved'])
+            truncated = raw_truncated or bool(selection['excerpted'])
+            content_hash = hashlib.sha256(bounded.encode('utf-8')).hexdigest()
+            candidate = FetchedEvidence(bounded, content_hash, mime_type, truncated, provenance,
+                'evidence:' + '0' * 64, selection, navigation)
+            while navigation and len(candidate.to_tool_result().encode('utf-8')) > output_limit - 128:
+                navigation = navigation[:-1]
+                candidate = replace(candidate, navigation=navigation)
+            if len(candidate.to_tool_result().encode('utf-8')) > output_limit - 128:
+                raise SourceDenied('response budget too small for selected evidence metadata')
+            check()
         evidence_id = None
         if self.evidence_store is not None:
             record = self.evidence_store.add_tool_result(
                 session_id=session_id,
                 tool=evidence_tool,
-                arguments=dict(evidence_arguments or {"url": original_url}),
-                result={"status": "ok", "content": bounded},
+                arguments=dict(evidence_arguments or {"url": original_url,
+                    **({'search_terms': search_terms} if search_terms is not None else {})}),
+                result={"status": "ok", "content": bounded, "truncated": truncated,
+                    **({'selection': selection} if selection is not None else {})},
                 category="external-source",
                 model_identity=model_identity,
                 source=public_final_url,
@@ -1402,4 +1739,6 @@ class SecureFetcher:
             truncated=truncated,
             provenance=provenance,
             evidence_id=evidence_id,
+            selection=selection,
+            navigation=navigation,
         )
