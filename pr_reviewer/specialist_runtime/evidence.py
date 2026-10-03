@@ -587,7 +587,7 @@ class EvidenceStore:
     ) -> tuple[EvidenceRecord, EvidenceCollection]:
         # Effective routing is controller-owned outer metadata, never fields
         # from an untrusted API/document payload.
-        if (tool == "web_fetch_search_result"
+        if (tool in {"web_fetch", "web_fetch_search_result"}
                 and result.get("effective_tool") in {"gh_api", "read_remote_file"}
                 and isinstance(result.get("effective_arguments"), Mapping)):
             tool = result["effective_tool"]

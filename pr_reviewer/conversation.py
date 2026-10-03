@@ -235,7 +235,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "web_fetch",
         "description": (
-            "Fetch an HTTPS URL approved by the current source policy. Optional search_terms "
+            "Fetch an HTTPS URL approved by the current source policy. Unambiguous GitHub URLs "
+            "automatically use repository tools under repository permissions; ambiguous file refs "
+            "require read_remote_file with separate repository, ref and path fields. Optional search_terms "
             "select literal case-insensitive matches with bounded section context, even on small pages. "
             "Excerpts and no-match results do not prove absence. HTML anchors select a real section; "
             "navigation result IDs can retrieve linked chapters. The "
@@ -244,7 +246,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "external evidence with provenance. Prefer a structured API "
             "endpoint over an HTML "
             "release/compare page (HTML often 404s or is JS-rendered): for "
-            "github.com use gh_api; for a Gitea/Forgejo host fetch its "
+            "github.com metadata use gh_api; for a Gitea/Forgejo host fetch its "
             "/api/v1/... JSON (e.g. .../releases/tags/TAG or "
             ".../compare/BASE...HEAD), not the web page. Do not probe URLs "
             "marked fetch_allowed=false by web_search. If external access is "
@@ -257,7 +259,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "Absolute https URL on an allowlisted host.",
+                    "description": "Absolute HTTPS URL allowed by website policy, or a supported GitHub URL authorized by repository policy.",
                 },
                 "search_terms": {
                     "type": "array", "minItems": 1, "maxItems": 8,
