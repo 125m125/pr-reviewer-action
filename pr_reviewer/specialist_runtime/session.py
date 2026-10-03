@@ -17,7 +17,6 @@ from typing import Any, Callable, Mapping
 from pr_reviewer.conversation import (
     Conversation,
     EpochCompactionStats,
-    TOOL_RESULT_MAX_BYTES,
 )
 from pr_reviewer.tool_loop import decode_native_tool_arguments, native_tool_request_key
 from pr_reviewer.transport import ModelRequestError
@@ -116,6 +115,9 @@ _DELEGATED_SUMMARY_SYSTEM = (
     "range metadata does not establish whole-file completeness. State material "
     "limits in uncertainties. Controller source_metadata is authoritative about truncation: "
     "do not describe content as cut off merely because the requested information is absent. "
+    "source_metadata.source_failures lists requested inputs that could not be retrieved; "
+    "answer only from the available sources and do not claim a complete comparison when "
+    "an input is missing. Failed-source diagnostics are not source evidence. "
     "A page can be fully fetched yet not answer the question. Verify the question's premise "
     "rather than inventing a missing section, endpoint, or requirement. Report 'not stated "
     "in this source' when appropriate; this does not prove the claim true or false. "
@@ -3955,14 +3957,26 @@ class SpecialistSession:
             if record is None or not record.is_usable_for_coverage or record.tool == "web_search":
                 return {"error": "evidence_ids must reference usable retained primary sources"}, None, None
             sources.append((record, None, {}))
-        for request in requests:
+        source_failures = []
+        for request_index, request in enumerate(requests, 1):
             result, record, collection = self._fetch_delegated_source(
                 {**request, "target": target, "question": question}, timeout=timeout,
                 requested_obligation_ids=requested_obligation_ids, requested_targets=requested_targets,
             )
             if record is None or not record.is_usable_for_coverage:
-                return result, record, collection
+                source_failures.append({
+                    "request_index": request_index,
+                    "tool": request["tool_name"],
+                    "source_path": mask_runtime_text(record.source_path or "", limit=300) if record else "",
+                    "source_identity": mask_runtime_text(record.source_identity, limit=300) if record else "",
+                    "source_evidence_id": record.id if record else None,
+                    "error": mask_runtime_text(str(result.get("error") or "source unavailable"), limit=300),
+                })
+                continue
             sources.append((record, collection, result))
+        if not sources:
+            return {"error": "No requested sources could be retrieved",
+                    "source_failures": source_failures}, record, collection
         source_limit = self._delegated_source_byte_limit(target, question)
         record, collection, result = sources[0]
         if len(sources) > 1 and source_limit <= len(sources) * 180:
@@ -4009,6 +4023,7 @@ class SpecialistSession:
             result_payload.get("range", {}) if isinstance(result_payload, Mapping) else {}
         )
         source_metadata = {
+            **({"source_failures": source_failures} if source_failures else {}),
             "range": {
                 key: value for key, value in source_range.items()
                 if key in {"offset", "lines", "total_lines", "has_more", "truncated"}
@@ -4026,6 +4041,10 @@ class SpecialistSession:
         )
 
         def visible_payload(value: Mapping[str, object]) -> dict[str, object]:
+            # Also used to size invalid responses before their schema repair.
+            uncertainties = value.get("uncertainties")
+            if not isinstance(uncertainties, list):
+                uncertainties = []
             def compact_metadata(metadata):
                 result = dict(metadata)
                 if isinstance(result.get('selection'), Mapping):
@@ -4039,6 +4058,11 @@ class SpecialistSession:
             return {
                 "status": "ok", "evidence_id": record.id,
                 "source_evidence_id": record.id, **value,
+                **({"source_incomplete": True, "uncertainties": [
+                    f"Source set incomplete: {len(source_failures)} requested input(s) unavailable; "
+                    "conclusions apply only to the supplied sources, not the complete comparison.",
+                    *uncertainties,
+                ]} if source_failures else {}),
                 "source_truncated": bool(any(item[0].truncated for item in sources) or prompt_truncated),
                 "source_metadata": {
                     **compact_metadata(source_metadata), "supplied_lines": len(source.splitlines()),
@@ -7435,9 +7459,11 @@ class SpecialistSession:
 
     def _add_tool_result(
         self, call_id: str, result: object, *, is_error: bool = False,
-        max_bytes: int = TOOL_RESULT_MAX_BYTES,
+        max_bytes: int | None = None,
     ) -> None:
         """Persist privacy-safe tool outcome counters across transcript compaction."""
+        if max_bytes is None:
+            max_bytes = self.max_tool_result_bytes
         event_count = len(self.conversation.events)
         self.conversation.add_tool_result(
             call_id, result, is_error=is_error, max_bytes=max_bytes,

@@ -1312,6 +1312,107 @@ def test_delegated_comparison_combines_retained_evidence_and_multiple_reads():
     assert "second.yml" in gateway.requests[0].messages
 
 
+@pytest.mark.parametrize("paths", [
+    ["missing.py", "a.py"], ["a.py", "missing.py"],
+])
+@pytest.mark.parametrize("invalid_first", [False, True])
+def test_partial_delegation_summarizes_success_and_keeps_failure_visible(paths, invalid_first):
+    responses = [delegated_summary_response(start_line=1, end_line=1)]
+    if invalid_first:
+        responses.insert(0, invalid_response(json.dumps({
+            "summary": "Partial answer", "relevant_excerpts": [],
+            "uncertainties": None, "source_truncated": False,
+        })))
+    gateway = ScriptedGateway(responses)
+    def execute(name, arguments, **kwargs):
+        if arguments["path"] == "missing.py":
+            return {"status": "error", "error": "404 Not Found"}
+        return {"status": "ok", "content": "retained source\n"}
+    session = make_session(gateway, execute_tool=execute)
+    session._execute_calls(({
+        "id": "partial", "name": DELEGATE_TOOL_SUMMARY_NAME,
+        "arguments": json.dumps({"target": "contract", "question": "Compare sources",
+            "tool_requests": [{"tool_name": "read_file", "arguments": {"path": path}}
+                              for path in paths]}),
+    },))
+    payload = json.loads(session.conversation.events[-1]["content"])
+    assert payload["status"] == "ok"
+    assert payload["source_incomplete"] is True
+    failure = payload["source_metadata"]["source_failures"][0]
+    assert failure["request_index"] == paths.index("missing.py") + 1
+    assert failure["source_path"] == "missing.py"
+    assert "404" in failure["error"]
+    prompt = json.loads(json.loads(gateway.requests[0].messages)[-1]["content"])
+    assert prompt["source_metadata"]["source_failures"] == [failure]
+    assert "404" not in prompt["numbered_source"]
+    assert "retained source" in prompt["numbered_source"]
+    assert payload["relevant_excerpts"][0]["text"] == "retained source"
+    assert "incomplete" in payload["uncertainties"][0].lower()
+    assert session._snapshot().delegated_assessments[0]["uncertainties"]
+    assert len(session.evidence_store.snapshot().records) == 2
+    assert session.budget.snapshot().tool_calls == 2
+
+
+def test_all_failed_delegated_sources_return_each_failure_without_model_call():
+    gateway = ScriptedGateway([])
+    session = make_session(gateway, execute_tool=lambda *args, **kwargs: {
+        "status": "error", "error": "404 Not Found",
+    })
+    payload, _, _ = session._execute_delegated_summary({
+        "target": "contract", "question": "Compare sources",
+        "tool_requests": [{"tool_name": "read_file", "arguments": {"path": path}}
+                          for path in ("missing.py", "other.py")],
+    }, timeout=1, requested_obligation_ids=(), requested_targets=())
+    assert payload["error"]
+    assert [item["source_path"] for item in payload["source_failures"]] == ["missing.py", "other.py"]
+    assert not gateway.requests
+
+
+def test_partial_delegation_identifies_failed_url_without_exposing_credentials():
+    gateway = ScriptedGateway([delegated_summary_response(start_line=1, end_line=1)])
+    def execute(name, arguments, **kwargs):
+        if name == "web_fetch":
+            return {"status": "error", "error": "source denied"}
+        return {"status": "ok", "content": "available reference\n"}
+    session = make_session(gateway, execute_tool=execute)
+    payload, _, _ = session._execute_delegated_summary({
+        "target": "contract", "question": "Compare sources",
+        "tool_requests": [
+            {"tool_name": "web_fetch", "arguments": {"url": "https://docs.example.com/manual?token=private-token-value"}},
+            {"tool_name": "read_file", "arguments": {"path": "a.py"}},
+        ],
+    }, timeout=1, requested_obligation_ids=(), requested_targets=())
+    failure = payload["source_metadata"]["source_failures"][0]
+    assert "https://docs.example.com/manual" in failure["source_identity"]
+    assert "https://docs.example.com/manual" in gateway.requests[0].messages
+    assert "private-token-value" not in gateway.requests[0].messages
+    assert "private-token-value" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("budget,expected_matches", [(12_000, 2), (6_000, 1), (4_000, 0)])
+def test_direct_web_passages_use_configured_session_result_budget(budget, expected_matches):
+    content = "first " + "a" * 4400 + "\nsecond " + "b" * 4400
+    selection = {
+        "excerpted": False, "matched_lines": 2, "returned_matches": 2,
+        "omitted_matches": 0, "limitations": [], "passages": [
+            {"start_line": 1, "end_line": 1, "source_start_line": 1, "source_end_line": 1, "matched_lines": 1},
+            {"start_line": 2, "end_line": 2, "source_start_line": 2, "source_end_line": 2, "matched_lines": 1},
+        ],
+    }
+    session = make_session(ScriptedGateway([]), max_tool_result_bytes=budget,
+        execute_tool=lambda *args, **kwargs: {"status": "ok", "result": {
+            "content": content, "selection": selection, "truncated": False,
+        }})
+    session._execute_calls(({"id": "web", "name": "web_fetch", "arguments": json.dumps({
+        "url": "https://example.com/manual", "search_terms": ["first", "second"],
+    })},))
+    body = session.conversation.events[-1]["content"]
+    payload = json.loads(body)
+    assert len(body.encode("utf-8")) <= budget
+    assert payload["selection"]["returned_matches"] == expected_matches
+    assert ("second" in payload["content"]) == (expected_matches == 2)
+
+
 def test_evidence_only_delegation_preserves_quote_source_and_costs_no_tool_calls():
     gateway = ScriptedGateway([delegated_summary_response(start_line=3, end_line=3)])
     session = make_session(gateway, tool_schemas=[{"name": "read_file", "parameters": {"type": "object"}}])
