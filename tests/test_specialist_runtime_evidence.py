@@ -11,6 +11,15 @@ from pr_reviewer.specialist_runtime.evidence import (
 )
 
 
+def test_retention_truncation_does_not_advertise_original_file_coordinates():
+    store = EvidenceStore(max_content_bytes=12)
+    record = store.add_tool_result(session_id="S1", tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "result": {"content": "12345678901234567890\nsecond\n",
+                "range": {"offset": 258, "lines": 2, "has_more": False, "truncated": False}}})
+    assert record.truncated is True
+    assert record.source_range is None
+
+
 def test_duplicate_success_reuses_evidence_without_claiming_independence():
     store = EvidenceStore()
 

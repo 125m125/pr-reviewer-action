@@ -169,6 +169,25 @@ def _retained_selection(tool: str, result: Mapping[str, Any], content: str) -> d
     return selection
 
 
+def _retained_file_range(
+    tool: str, result: Mapping[str, Any], content: str, *, truncated: bool,
+) -> dict | None:
+    """Keep executor coordinates, never derive file positions from source prose."""
+    if tool not in {"read_file", "read_remote_file"}:
+        return None
+    payload = result.get("result", result)
+    raw = payload.get("range") if isinstance(payload, Mapping) else None
+    if not isinstance(raw, Mapping):
+        return None
+    # Redaction/retention can change line structure. Do not advertise a mapping
+    # unless each retained line still corresponds to the executor's file slice.
+    if truncated or len(content.splitlines()) != len(_result_content(result).splitlines()):
+        return None
+    return {key: value for key, value in raw.items()
+            if key in {"offset", "lines", "total_lines", "next_offset", "has_more", "truncated"}
+            and (value is None or isinstance(value, (int, bool)))}
+
+
 def _source_identity(arguments: Mapping[str, Any], source: str | None = None) -> str:
     if source is not None and str(source).strip():
         text = str(source).strip()
@@ -338,6 +357,7 @@ class EvidenceRecord:
     supersedes: tuple[str, ...] = ()
     contradicts: tuple[str, ...] = ()
     selection: Mapping[str, Any] | None = None
+    source_range: Mapping[str, Any] | None = None
 
     @property
     def is_usable_for_coverage(self) -> bool:
@@ -720,6 +740,7 @@ class EvidenceStore:
             supersedes=canonical_supersedes,
             contradicts=canonical_contradicts,
             selection=_retained_selection(tool, result, content),
+            source_range=_retained_file_range(tool, result, content, truncated=truncated),
         )
         self._records[record.id] = record
         if record.is_usable_for_coverage:

@@ -1258,6 +1258,174 @@ def make_component_group_session(gateway):
     )
 
 
+def test_deferred_remote_read_replays_content_after_purpose_and_target_change():
+    session = make_session(ScriptedGateway([]))
+    arguments = {"repository": "owner/other", "path": "a.py", "ref": "a" * 40,
+                 "offset": 258, "limit": 200, "purpose": "original question", "targets": ["O1"]}
+    session._checkpoint_pressure_due = lambda **kw: not kw.get("reserve_tool_result", False)
+    session._execute_calls(({"id": "first", "name": "read_remote_file",
+                             "arguments": json.dumps(arguments)},))
+    assert json.loads(session.conversation.events[-1]["content"])["result_retained"] is True
+
+    session._checkpoint_pressure_due = lambda **kw: False
+    session._tool_calls_deferred_for_checkpoint = False
+    # Validation still runs before returning the cached evidence.
+    session._execute_calls(({"id": "invalid", "name": "read_remote_file",
+                             "arguments": json.dumps({**arguments, "targets": ["O999"]})},))
+    assert "unassigned" in json.loads(session.conversation.events[-1]["content"])["error"]
+    before = session.budget.snapshot()
+    session._execute_calls(({"id": "retry", "name": "read_remote_file",
+                             "arguments": json.dumps({**arguments, "purpose": "reworded question",
+                                                      "targets": ["O2"]})},))
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["content"] == "contents:a.py"
+    assert result["eligible_targets"] == ["O2"]
+    assert session.conversation.events[-1]["metadata"]["eligible_targets"] == "O2"
+    assert session.budget.snapshot().tool_calls == before.tool_calls
+    assert session.budget.snapshot().tool_rejections == before.tool_rejections
+    assert not session._deferred_tool_results
+
+
+def test_truncated_deferred_result_preserves_metadata_through_repeated_deferral():
+    session = make_session(
+        ScriptedGateway([]), max_tool_result_bytes=1000,
+        execute_tool=lambda name, args: {
+            "tool": name, "status": "ok", "result": {"content": "x" * 2000},
+        },
+    )
+    arguments = {"endpoint": "repos/owner/other/releases", "targets": ["O1"]}
+    session._checkpoint_pressure_due = lambda **kw: not kw.get("reserve_tool_result", False)
+    for call_id, target in (("first", "O1"), ("second", "O2")):
+        session._tool_calls_deferred_for_checkpoint = False
+        session._execute_calls(({"id": call_id, "name": "gh_api",
+                                 "arguments": json.dumps({**arguments, "targets": [target]})},))
+        cached, evidence_id = next(iter(session._deferred_tool_results.values()))
+        assert cached["metadata"]["truncated"] == "true"
+        assert cached["metadata"]["evidence_id"] == evidence_id
+        assert cached["metadata"]["eligible_targets"] == target
+    session._checkpoint_pressure_due = lambda **kw: False
+    session._tool_calls_deferred_for_checkpoint = False
+    session._execute_calls(({"id": "third", "name": "gh_api",
+                             "arguments": json.dumps(arguments)},))
+    metadata = session.conversation.events[-1]["metadata"]
+    assert metadata["truncated"] == "true"
+    assert metadata["evidence_id"] == evidence_id
+    assert metadata["eligible_targets"] == "O1"
+    assert session.budget.snapshot().tool_calls == 1
+
+
+def test_deferred_read_can_be_deferred_again_without_becoming_a_duplicate():
+    session = make_session(ScriptedGateway([]))
+    arguments = {"path": "a.py", "targets": ["O1"]}
+    session._checkpoint_pressure_due = lambda **kw: not kw.get("reserve_tool_result", False)
+    for call_id, targets in (("first", ["O1"]), ("second", ["O2"])):
+        session._tool_calls_deferred_for_checkpoint = False
+        session._execute_calls(({"id": call_id, "name": "read_file",
+                                 "arguments": json.dumps({**arguments, "targets": targets})},))
+        assert json.loads(session.conversation.events[-1]["content"])["status"] == "deferred"
+    session._checkpoint_pressure_due = lambda **kw: False
+    session._tool_calls_deferred_for_checkpoint = False
+    session._execute_calls(({"id": "third", "name": "read_file", "arguments": json.dumps(arguments)},))
+    assert json.loads(session.conversation.events[-1]["content"])["content"] == "contents:a.py"
+    assert session.budget.snapshot().tool_calls == 1
+    assert session.budget.snapshot().tool_rejections == 0
+
+
+@pytest.mark.parametrize("multiple", [False, True])
+def test_delegating_retained_file_preserves_original_source_coordinates(multiple):
+    gateway = ScriptedGateway([delegated_summary_response(start_line=2 if not multiple else 3,
+                                                         end_line=2 if not multiple else 3)])
+    session = make_session(gateway, tool_schemas=[{"name": "read_remote_file", "parameters": {"type": "object"}}])
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_remote_file",
+        arguments={"repository": "owner/other", "path": "a.py", "ref": "a" * 40,
+                   "offset": 258, "limit": 3},
+        result={"status": "ok", "result": {"content": "preface\nfeature=true\ntail\n",
+                "range": {"offset": 258, "lines": 3, "total_lines": 900,
+                          "has_more": True, "truncated": True, "next_offset": 261}}},
+    )
+    ids = [record.id]
+    if multiple:
+        other = session.evidence_store.add_tool_result(
+            session_id=session.session_id, tool="read_file", arguments={"path": "b.py"},
+            result={"status": "ok", "result": {"content": "other\n"}},
+        )
+        ids.append(other.id)
+    session._execute_calls(({"id": "summary", "name": DELEGATE_TOOL_SUMMARY_NAME,
+        "arguments": json.dumps({"evidence_ids": ids, "target": "feature", "question": "Is it enabled?"})},))
+    prompt = json.loads(json.loads(gateway.requests[0].messages)[0]["content"])
+    metadata = prompt["source_metadata"]
+    source_range = metadata["sources"][0]["range"] if multiple else metadata["range"]
+    assert source_range == {"offset": 258, "lines": 3, "total_lines": 900,
+                            "has_more": True, "truncated": True, "next_offset": 261}
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["relevant_excerpts"][0]["text"] == "feature=true"
+    assert result["relevant_excerpts"][0]["source_start_line"] == 259
+    assert result["relevant_excerpts"][0]["source_end_line"] == 259
+    assert result["source_metadata"] == metadata
+    assert session.budget.snapshot().tool_calls == 0
+
+
+def test_partial_remote_read_gets_one_optional_delegation_hint_per_source():
+    def execute(name, arguments, **kwargs):
+        return {"tool": name, "status": "ok", "result": {
+            "content": "one\ntwo\n", "repository": "owner/other", "path": arguments["path"],
+            "resolved_sha": "a" * 40, "range": {"offset": arguments.get("offset", 1),
+                "lines": 2, "total_lines": 1000, "has_more": True, "truncated": True}}}
+    session = make_session(ScriptedGateway([]), execute_tool=execute,
+        tool_schemas=[{"name": "read_remote_file", "parameters": {"type": "object"}}])
+    arguments = {"repository": "owner/other", "ref": "main", "path": "README.md"}
+    for call_id, path, offset, expected in (("first", "README.md", 1, True),
+            ("next", "README.md", 3, False), ("other", "action.yml", 1, True)):
+        session._execute_calls(({"id": call_id, "name": "read_remote_file",
+            "arguments": json.dumps({**arguments, "path": path, "offset": offset})},))
+        result = json.loads(session.conversation.events[-1]["content"])
+        assert bool(result.get("delegation_hint")) is expected
+        assert result["content"] == "one\ntwo\n"
+        # Losing transcript messages (as at compaction) must not reset the hint.
+        session.conversation.events.clear()
+
+
+@pytest.mark.parametrize("available,partial,status", [(False, True, "ok"), (True, False, "ok"), (True, True, "error")])
+def test_delegation_hint_requires_available_tool_and_successful_partial_read(available, partial, status):
+    session = make_session(ScriptedGateway([]),
+        tool_schemas=[{"name": "read_remote_file", "parameters": {"type": "object"}}] if available else [],
+        execute_tool=lambda name, arguments, **kw: {"tool": name, "status": status, "result": {
+            "content": "source", "repository": "owner/other", "path": "a.py", "resolved_sha": "a" * 40,
+            "range": {"offset": 1, "lines": 1, "has_more": partial, "truncated": partial}}})
+    session._execute_calls(({"id": "read", "name": "read_remote_file", "arguments": json.dumps({
+        "repository": "owner/other", "path": "a.py", "ref": "a" * 40})},))
+    assert "delegation_hint" not in json.loads(session.conversation.events[-1]["content"])
+
+
+def test_remote_source_already_delegated_does_not_get_a_paging_hint():
+    gateway = ScriptedGateway([delegated_summary_response()])
+    session = make_session(gateway, tool_schemas=[{"name": "read_remote_file", "parameters": {"type": "object"}}],
+        execute_tool=lambda name, arguments, **kw: {"tool": name, "status": "ok", "result": {
+            "content": "preface\nfeature=true\ntail", "repository": "owner/other", "path": "a.py",
+            "resolved_sha": "a" * 40, "range": {"offset": 1, "lines": 3, "has_more": True}}})
+    arguments = {"repository": "owner/other", "path": "a.py", "ref": "main"}
+    session._execute_calls(({"id": "summary", "name": DELEGATE_TOOL_SUMMARY_NAME, "arguments": json.dumps({
+        "target": "feature", "question": "Is it enabled?",
+        "tool_requests": [{"tool_name": "read_remote_file", "arguments": arguments}]})},))
+    assert "delegation_hint" not in gateway.requests[0].messages
+    session._execute_calls(({"id": "direct", "name": "read_remote_file",
+                             "arguments": json.dumps({**arguments, "offset": 4})},))
+    assert "delegation_hint" not in json.loads(session.conversation.events[-1]["content"])
+
+
+def test_changed_read_window_does_not_replay_a_different_deferred_slice():
+    session = make_session(ScriptedGateway([]), execute_tool=lambda name, arguments: {
+        "tool": name, "status": "ok", "result": {"content": str(arguments["offset"])}})
+    session._checkpoint_pressure_due = lambda **kw: not kw.get("reserve_tool_result", False)
+    session._execute_calls(({"id": "first", "name": "read_file", "arguments": '{"path":"a.py","offset":1}'},))
+    session._checkpoint_pressure_due = lambda **kw: False
+    session._tool_calls_deferred_for_checkpoint = False
+    session._execute_calls(({"id": "next", "name": "read_file", "arguments": '{"path":"a.py","offset":20}'},))
+    assert json.loads(session.conversation.events[-1]["content"])["content"] == "20"
+    assert session.budget.snapshot().tool_calls == 2
+
+
 def delegated_summary_response(
     *, start_line=2, end_line=2, summary="The feature is enabled.",
 ):
