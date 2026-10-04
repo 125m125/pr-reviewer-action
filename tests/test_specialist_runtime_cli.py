@@ -361,6 +361,18 @@ def test_runtime_event_line_reports_request_purpose_and_suppresses_duplicate_adm
     ) is None
 
 
+def test_runtime_event_line_reports_repetition_watchdog_reason():
+    from pr_reviewer.specialist_runtime.events import RunEvent
+
+    line = cli._runtime_event_line(RunEvent(1, "llm_request_completed", {
+        "session_id": "session:test", "purpose": "exploration",
+        "finish_reason": "incomplete", "stream_watchdog_reason": "repeated-block",
+    }))
+
+    assert "finish_reason=incomplete" in line
+    assert "watchdog=repeated-block" in line
+
+
 def test_runtime_event_line_reports_bounded_admission_and_actual_usage():
     from pr_reviewer.specialist_runtime.events import RunEvent
 

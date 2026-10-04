@@ -2057,6 +2057,9 @@ def _runtime_event_line(
                     suffix += f" {label}={_compact_text(value, 60)}"
         if finish:
             suffix += f" finish_reason={finish}"
+        watchdog = _compact_text(payload.get("stream_watchdog_reason"), 80)
+        if watchdog:
+            suffix += f" watchdog={watchdog}"
         if error_text:
             suffix += f": {error_text}"
         return f"{subject} llm request {status} turn={turn}{suffix}"

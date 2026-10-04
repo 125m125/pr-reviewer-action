@@ -29,6 +29,7 @@ class RequestAttempt:
     in_flight: bool = False
     purpose: str = "unknown"
     finish_reason: str = ""
+    stream_watchdog_reason: str = ""
     text_source: str = ""
     tool_call_count: int = 0
     actual_prompt_tokens: int = 0
@@ -119,6 +120,7 @@ class RequestAttemptJournal:
         status: str,
         *,
         finish_reason: str = "",
+        stream_watchdog_reason: str = "",
         text_source: str = "",
         tool_call_count: int = 0,
         actual_prompt_tokens: int = 0,
@@ -146,6 +148,7 @@ class RequestAttemptJournal:
                 terminal_at=self._now(),
                 in_flight=False,
                 finish_reason=str(finish_reason or ""),
+                stream_watchdog_reason=str(stream_watchdog_reason or ""),
                 text_source=str(text_source or ""),
                 tool_call_count=max(0, int(tool_call_count or 0)),
                 actual_prompt_tokens=(
