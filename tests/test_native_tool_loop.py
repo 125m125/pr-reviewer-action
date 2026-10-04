@@ -884,21 +884,34 @@ def test_request_error_mid_loop_keeps_evidence():
 
 
 def test_malformed_arguments_get_repairable_error():
-    """Bad JSON arguments answer with is_error so the model can self-correct."""
+    """Strict history parsing still lets the model submit a fresh valid call."""
     conv = fresh_conversation()
-    post = scripted_post(
+    next_response = scripted_post(
         [
             openai_tool_call_response([("c1", "read_file", '{"path": broken')]),
             openai_tool_call_response([("c2", "read_file", '{"path": "a.txt"}')]),
             openai_text_response("done"),
         ]
     )
+
+    def post(payload):
+        # Local servers parse historical arguments before generating a reply.
+        for message in payload["messages"]:
+            for call in message.get("tool_calls", []):
+                assert isinstance(json.loads(call["function"]["arguments"]), dict)
+        errors = [message for message in payload["messages"]
+                  if message.get("tool_call_id") == "c1"]
+        if errors:
+            assert "not executed" in errors[0]["content"]
+            assert "fresh complete" in errors[0]["content"]
+        return next_response(payload)
+
     execute, log = recording_execute()
     outcome = drive_tool_loop(
         conv, post, execute, api_format="openai", model="m", budgets=LoopBudgets()
     )
     assert outcome.stop_reason == STOP_MODEL_DONE
-    assert len(log) == 1  # only the repaired call executed
+    assert log == [("read_file", {"path": "a.txt"})]
     assert outcome.tool_calls_issued == 2
     assert conv.open_tool_call_ids() == set()
 

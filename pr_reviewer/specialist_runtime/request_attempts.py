@@ -29,6 +29,7 @@ class RequestAttempt:
     in_flight: bool = False
     purpose: str = "unknown"
     finish_reason: str = ""
+    stream_watchdog_reason: str = ""
     text_source: str = ""
     tool_call_count: int = 0
     actual_prompt_tokens: int = 0
@@ -36,6 +37,7 @@ class RequestAttempt:
     error: str = ""
     performance_category: str = "other"
     measured_prompt_tokens: int | None = None
+    measured_completion_tokens: int | None = None
     cached_prompt_tokens: int | None = None
     prefill_tokens: int | None = None
     prefill_ms: float | None = None
@@ -118,6 +120,7 @@ class RequestAttemptJournal:
         status: str,
         *,
         finish_reason: str = "",
+        stream_watchdog_reason: str = "",
         text_source: str = "",
         tool_call_count: int = 0,
         actual_prompt_tokens: int = 0,
@@ -125,6 +128,7 @@ class RequestAttemptJournal:
         error: str = "",
         cached_prompt_tokens: int | None = None,
         measured_prompt_tokens: int | None = None,
+        measured_completion_tokens: int | None = None,
         prefill_tokens: int | None = None,
         prefill_ms: float | None = None,
         generated_tokens: int | None = None,
@@ -144,6 +148,7 @@ class RequestAttemptJournal:
                 terminal_at=self._now(),
                 in_flight=False,
                 finish_reason=str(finish_reason or ""),
+                stream_watchdog_reason=str(stream_watchdog_reason or ""),
                 text_source=str(text_source or ""),
                 tool_call_count=max(0, int(tool_call_count or 0)),
                 actual_prompt_tokens=(
@@ -157,6 +162,7 @@ class RequestAttemptJournal:
                 error=str(error or ""),
                 cached_prompt_tokens=cached_prompt_tokens if status == "completed" else None,
                 measured_prompt_tokens=measured_prompt_tokens if status == "completed" else None,
+                measured_completion_tokens=measured_completion_tokens if status == "completed" else None,
                 prefill_tokens=prefill_tokens if status == "completed" else None,
                 prefill_ms=prefill_ms if status == "completed" else None,
                 generated_tokens=generated_tokens if status == "completed" else None,

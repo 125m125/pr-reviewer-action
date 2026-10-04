@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 import hashlib
 import json
+import re
 from pathlib import Path, PurePosixPath
 import sys
 import time
@@ -138,13 +139,53 @@ def _result_content(result: Mapping[str, Any]) -> str:
 
 def _result_truncated(result: Mapping[str, Any]) -> bool:
     nested = result.get("result")
+    if result.get("truncated") is True:
+        return True
     if not isinstance(nested, Mapping):
         return False
+    if nested.get("truncated") is True:
+        return True
     value = nested.get("range")
     return bool(
         isinstance(value, Mapping)
         and (value.get("truncated") is True or value.get("has_more") is True)
     )
+
+
+def _retained_selection(tool: str, result: Mapping[str, Any], content: str) -> dict | None:
+    if tool not in {'web_fetch', 'web_fetch_search_result'}:
+        return None
+    payload = result.get('result') if isinstance(result.get('result'), Mapping) else result
+    selection = payload.get('selection')
+    if not isinstance(selection, Mapping):
+        return None
+    # Metadata comes from the executor, not text supplied by the website/model.
+    selection = json.loads(_canonical_json(selection))
+    if content != _result_content(result):
+        selection['passages'] = []
+        selection['excerpted'] = True
+        selection['limitations'] = list(selection.get('limitations', ())) + [
+            'retention changed source text; original passage coordinates are unavailable']
+    return selection
+
+
+def _retained_file_range(
+    tool: str, result: Mapping[str, Any], content: str, *, truncated: bool,
+) -> dict | None:
+    """Keep executor coordinates, never derive file positions from source prose."""
+    if tool not in {"read_file", "read_remote_file"}:
+        return None
+    payload = result.get("result", result)
+    raw = payload.get("range") if isinstance(payload, Mapping) else None
+    if not isinstance(raw, Mapping):
+        return None
+    # Redaction/retention can change line structure. Do not advertise a mapping
+    # unless each retained line still corresponds to the executor's file slice.
+    if truncated or len(content.splitlines()) != len(_result_content(result).splitlines()):
+        return None
+    return {key: value for key, value in raw.items()
+            if key in {"offset", "lines", "total_lines", "next_offset", "has_more", "truncated"}
+            and (value is None or isinstance(value, (int, bool)))}
 
 
 def _source_identity(arguments: Mapping[str, Any], source: str | None = None) -> str:
@@ -284,6 +325,9 @@ def canonical_evidence_key(
         "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         "provenance": _provenance_identity(sanitized_provenance),
     }
+    selection = _retained_selection(tool, result, content)
+    if selection is not None:
+        identity['selection'] = selection
     digest = hashlib.sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
     return f"evidence:{digest}"
 
@@ -312,6 +356,8 @@ class EvidenceRecord:
     redaction_types: tuple[str, ...] = ()
     supersedes: tuple[str, ...] = ()
     contradicts: tuple[str, ...] = ()
+    selection: Mapping[str, Any] | None = None
+    source_range: Mapping[str, Any] | None = None
 
     @property
     def is_usable_for_coverage(self) -> bool:
@@ -559,6 +605,30 @@ class EvidenceStore:
         contradicts: tuple[str, ...] | list[str] = (),
         now: float | None = None,
     ) -> tuple[EvidenceRecord, EvidenceCollection]:
+        # Effective routing is controller-owned outer metadata, never fields
+        # from an untrusted API/document payload.
+        if (tool in {"web_fetch", "web_fetch_search_result"}
+                and result.get("effective_tool") in {"gh_api", "read_remote_file"}
+                and isinstance(result.get("effective_arguments"), Mapping)):
+            tool = result["effective_tool"]
+            arguments = result["effective_arguments"]
+        payload = result.get("result")
+        if (tool in {"web_fetch", "web_fetch_search_result"}
+                and isinstance(payload, Mapping)
+                and payload.get("kind") == "external_evidence"
+                and isinstance(payload.get("provenance"), Mapping)):
+            # SecureFetcher produces this envelope; it is not document content.
+            provenance = EvidenceProvenance(**{
+                field.name: payload["provenance"].get(field.name)
+                for field in fields(EvidenceProvenance)
+            })
+            source = provenance.final_url
+            mime_type = payload.get("mime_type")
+            category = "external-source"
+        if tool == "read_remote_file" and isinstance(payload, Mapping):
+            resolved = payload.get("resolved_sha")
+            if isinstance(resolved, str) and re.fullmatch(r"[0-9a-fA-F]{40,64}", resolved):
+                arguments = {**arguments, "ref": resolved}
         record = self._add_record(
             session_id=session_id,
             tool=tool,
@@ -669,6 +739,8 @@ class EvidenceStore:
             redaction_types=redaction_types,
             supersedes=canonical_supersedes,
             contradicts=canonical_contradicts,
+            selection=_retained_selection(tool, result, content),
+            source_range=_retained_file_range(tool, result, content, truncated=truncated),
         )
         self._records[record.id] = record
         if record.is_usable_for_coverage:

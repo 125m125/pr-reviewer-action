@@ -102,7 +102,7 @@ follow-up waves and may schedule one bounded action at a time.
 flowchart TD
     P[Precheck and immutable PR snapshot] --> S[Collect context and deterministic obligations]
     S --> SUM[Change summarizer<br/><small>LLM, bounded structured role</small>]
-    SUM --> PLAN[Planner<br/><small>LLM optional; deterministic plan is fallback</small>]
+    SUM --> PLAN[Component owners<br/><small>Deterministic assignments and explicit independent checks</small>]
     PLAN --> W1
 
     subgraph W1[Initial specialist wave]
@@ -125,9 +125,10 @@ flowchart TD
         CP -->|compact-resume when progress exists| SP1
     end
 
-    W1 --> N[Negotiator / continuation selector<br/><small>LLM proposal + deterministic validation</small>]
+    W1 --> B[Boundary evaluator<br/><small>LLM compares retained participant evidence when ready</small>]
+    B --> N[Negotiator / continuation selector<br/><small>LLM proposal + deterministic validation</small>]
     N -->|resume or consult existing session| W2[Follow-up wave]
-    N -->|start bounded new session| W2
+    N -->|schedule a gap, lead, or bounded delegation| W2
     N -->|record unknown / no feasible action| F[Finalization]
     W2 --> N
 
@@ -146,6 +147,23 @@ checkpoint, checkpoint repair may correct that candidate or leave it as a
 bounded next action. A compact-resume checkpoint continues the same session
 only when it demonstrates meaningful progress; reworded informal TODOs do not
 count as progress. No-progress checkpoints pause instead of restarting exploration.
+An accepted checkpoint also pauses when all assigned work has a closed disposition
+and no selected follow-up, lead, or correction remains unfinished. Private TODOs
+and active findings alone do not keep exploration running; finalization still runs.
+
+Normal compaction keeps one historical snapshot from the preceding valid checkpoint,
+the investigation since that boundary, and the complete latest checkpoint exchange.
+Older checkpoint requests and repairs are retired only after a new valid checkpoint.
+Accepted assessments and candidate status survive; historical private TODOs do not.
+If this leaves too little continuation space, the controller reconstructs from the
+assignment and one accepted cumulative checkpoint instead of requesting another
+model checkpoint. Deferred requests remain listed for retry: already-fetched
+results replay without refetching or duplicate penalties, subject to context limits.
+Working summaries replace earlier memory rather than accumulating a diary. Update
+arrays are deltas: an empty array changes nothing, and each obligation has at most
+one update per checkpoint. Valid unfinished updates can also be listed as unresolved;
+rejected updates retain their prior accepted state and receive per-target feedback.
+
 Before a stopped session reaches the negotiator (or finalization), one bounded,
 tools-disabled pass can record still-pending obligation dispositions without
 regenerating the checkpoint. Accepted updates survive rejected siblings; missing
@@ -295,7 +313,7 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `review_strategy` | `single` preserves the existing path; `specialists_evaluate` runs without publishing; `specialists` enables publication only when `publish_review_comment` is also `true` | No | `single` |
-| `review_policy_file` | Current-branch version-2 specialist policy; source and publishing restrictions are authoritative | No | `.github/ai-review-policy.json` |
+| `review_policy_file` | Required current-branch version-3 owner/boundary policy; old policies require explicit migration | No | `.github/ai-review-policy.json` |
 | `specialist_review_deadline_sec` | Absolute specialist run deadline including finalization and artifact production | No | `7200` |
 | `specialist_phase_shares` | JSON percentage allocation for planning, initial, follow-up, and finalization; must total 100 | No | `{"planning":10,"initial":60,"followup":20,"finalization":10}` |
 | `specialist_concurrency` | Maximum concurrent specialist sessions | No | `1` |
@@ -307,14 +325,14 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_max_total_tool_calls` | Global read-only tool-call lease shared by all specialist sessions in one review | No | `640` |
 | `specialist_remediator_max_evidence_chars` | Maximum cited-evidence characters supplied to each accepted-finding remediation request | No | `32000` |
 | `specialist_max_recoveries_per_session` | Lifetime reconstruction limit for one logical specialist session | No | `1` |
-| `specialist_config_file` | Deprecated one-release alias for a version-1 policy; migrate to `review_policy_file` | No | `.github/ai-review-specialists.json` |
-| `specialist_planner_max_tool_calls` | Deprecated no-op; the planner role does not expose tools. Use `specialist_max_tool_calls_per_session` | No | `2` |
-| `specialist_planner_max_tokens` | Completion-token ceiling for the bounded planning scout | No | `2048` |
+| `specialist_config_file` | Obsolete legacy path; migrate explicitly to version-3 `review_policy_file` | No | `.github/ai-review-specialists.json` |
+| `specialist_planner_max_tool_calls` | Deprecated no-op; no initial assignment-planner call runs. Use `specialist_max_tool_calls_per_session` | No | `2` |
+| `specialist_planner_max_tokens` | Completion-token ceiling for the change summarizer; no initial assignment-planner call | No | `2048` |
 | `specialist_max_initial_passes` | Deprecated one-release alias for `specialist_max_sessions` | No | `6` |
 | `specialist_max_followup_passes` | Deprecated one-release alias for `specialist_max_followup_sessions` | No | `2` |
 | `specialist_max_tool_calls_per_pass` | Deprecated one-release alias for `specialist_max_tool_calls_per_session` | No | `128` |
 | `specialist_tool_mode` | `native_loop` uses durable read-only specialist sessions; `packet` is deprecated | No | `native_loop` |
-| `specialist_planner_model` | Planning/scout model; empty inherits `ai_model` | No | `""` |
+| `specialist_planner_model` | Change-summarizer model; empty inherits `ai_model`; no assignment-planner call | No | `""` |
 | `specialist_model` | Specialist model; empty inherits `ai_model` | No | `""` |
 | `specialist_critic_model` | Critic model; empty inherits `specialist_model`, then `ai_model` | No | `""` |
 | `specialist_aggregator_model` | Candidate-ranking model; empty inherits `ai_model` | No | `""` |
@@ -329,10 +347,10 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `specialist_structured_chat_template_kwargs` | Optional JSON `chat_template_kwargs` added only to no-tool specialist structured turns; leave empty unless the provider supports it | No | `""` |
 | `specialist_checkpoint_reasoning_budget_tokens` | Opt-in cache-preserving first checkpoint: retains tool schemas/thinking settings and sends nonstandard `thinking_budget_tokens`. Requires server enforcement; tested with ik_llama at `256`. Empty preserves strict checkpoints; `0` requests immediate end of thinking. Repairs remain strict and no checkpoint tool calls execute. | No | `""` |
 | `specialist_max_truncation_continuations` | Deprecated no-op; durable sessions checkpoint instead of issuing truncation-continuation turns | No | `2` |
-| `specialist_planner_max_context_bytes` | Diff/context bytes supplied to the planner before tool exploration | No | `60000` |
+| `specialist_planner_max_context_bytes` | Change-summarizer input byte cap; retained despite removal of the initial planner | No | `60000` |
 | `specialist_packet_max_bytes` | Deprecated no-op; durable sessions do not build packet-mode specialist inputs | No | `90000` |
 
-For an executable version-2 migration, policy example, workflow conversion,
+For an executable version-3 migration, policy example, workflow conversion,
 artifact expectations, and troubleshooting, see the
 [specialist session runtime migration handoff](docs/migrations/specialist-session-runtime.md).
 
@@ -344,14 +362,21 @@ conversation bounded. A practical baseline is `ai_stream: "true"`,
 repeated paragraphs or blocks, discards the polluted partial turn, and performs
 one compact recovery request instead of continuing the same transcript.
 
-Specialist mode derives a generic component topology and deterministic review
-obligations from manifests, paths, file roles, contracts, recipes, and risk
-flags. See the [file-role reference](docs/file-roles.md) for every supported
-`file_roles_any` value, its exact path-matching rules, and limitations.
-A bounded planner assigns those obligations to durable specialist
-sessions. Sessions gather read-only evidence, checkpoint their progress, and
-finish on the same logical conversation; the coverage ledger and scheduler
-decide whether a bounded follow-up is justified. Deterministic adjudication
+Specialist mode requires an explicit version-3 policy. Start with the
+[one-owner quick start](docs/review-policy-authoring.md#quick-start-one-owner),
+then add owner components and shared contract boundaries where useful.
+Deterministic assignments group changed behavior by owner rather than creating
+jobs for every file, inferred edge, or evidence category. Ordinary recipes use
+`integrated`; `independent` explicitly requests separate corroboration.
+See the [file-role reference](docs/file-roles.md) for supported matching heuristics.
+
+Group assessments retain assessed paths and unresolved gaps. Unmatched paths go
+to a visible remainder owner; capacity overflow is incomplete, never silently
+covered. Specialists can request bounded one-level subset delegation through
+the existing lead queue. The negotiator prioritizes gaps and continuations
+within shared budgets. For configured boundaries, a fresh tools-disabled
+evaluator compares actual retained participant evidence; local completion does
+not itself establish cross-component compatibility. Deterministic adjudication
 accepts only evidence-backed, in-scope notes, and the finalizer produces the
 sparse human handoff without reopening findings or starting gap conversations.
 
@@ -377,6 +402,40 @@ and up to eight retained `evidence_ids`; evidence-only summaries are also suppor
 All inputs share one source budget. Top-level `tool_name`/`arguments` are no
 longer accepted. Prefer delegation over manual pagination for narrow reference
 questions, such as input compatibility; keep the main investigation direct.
+
+For a narrow question about a large documentation page, website readers accept
+optional literal, case-insensitive `search_terms` (1–8 strings, OR matching):
+
+```json
+{
+  "target": "shell invocation",
+  "question": "How are arguments after the command string assigned?",
+  "tool_requests": [{
+    "tool_name": "web_fetch",
+    "arguments": {
+      "url": "https://www.gnu.org/software/bash/manual/bash.html",
+      "search_terms": ["Invoking Bash", "command_string"]
+    }
+  }]
+}
+```
+
+Selectors allow a bounded download of up to 8 MiB but do not increase the
+returned-result budget. Matching blocks expand within their heading-defined
+section; a parent is included only when all child branches are represented and
+it fits. Selection also applies to small pages: unused space does not pull in
+unrelated chapters. An explicit HTML anchor can select a section; Markdown
+anchor slugs are not guessed. No-match means only no literal match in the
+downloaded text, not proof that a behavior is absent.
+
+Results distinguish incomplete downloads from selected excerpts and retain
+normalized, redacted **document** line ranges, not HTML or repository lines.
+Delegated quotes cannot cross omitted passages. Relevant real links receive
+session-scoped result IDs after authorization, usable with
+`web_fetch_search_result` even without a search engine. Links are never followed
+automatically and do not inherit permission from their parent page. Selectors
+are not supported on repository-routed result IDs; use the repository reader's
+own parameters instead.
 
 Remote text reads check GitHub file metadata before raw retrieval and reject
 files over 8 MiB without downloading their contents. The transfer also enforces
@@ -411,11 +470,11 @@ For new configurations, start with the permanent
 matching rules, bounded recipes, access configuration, validation, and a
 copyable brief for configuration-generating agents.
 
-`review_policy_file` is a current-branch version-2 policy. The older
-`specialist_config_file` remains a one-release version-1 migration input, but
-version-2 recipes/policy control deterministic obligations and specialist
-selection. See the [migration handoff](docs/migrations/specialist-session-runtime.md)
-for the version-1 conversion checklist.
+`review_policy_file` must contain version 3; missing files and version-1/2
+policies fail before model calls. The old `specialist_config_file` is not a
+runtime fallback. See the [migration handoff](docs/migrations/specialist-session-runtime.md)
+for property-by-property recommendations. Ownership does not widen tool, source,
+or publishing authority.
 
 </details>
 
@@ -547,9 +606,9 @@ for the version-1 conversion checklist.
 | `tool_planning_max_context_bytes` | Maximum corpus bytes passed to planning | No | `50000` |
 | `tool_planning_max_tokens` | Maximum completion tokens for tool harness planning call | No | `400` |
 | `tool_max_response_bytes` | Maximum bytes captured from each tool response | No | `12000` |
-| `tool_allowed_gh_api_repos` | Comma-separated owner/repo allowlist for `gh_api` metadata and `read_remote_file` text reads. `read_remote_file` requires an explicitly named other repository plus an immutable commit SHA; it rejects both the repository under review and the `*` wildcard. `*` broadens metadata-only `gh_api` access while retaining endpoint guards (empty = current-repo `gh_api` metadata only) | No | `""` |
+| `tool_allowed_gh_api_repos` | Comma-separated owner/repo allowlist for `gh_api` metadata and `read_remote_file` text reads. `read_remote_file` requires an explicitly named other repository; branches/tags resolve to an immutable commit once per session. It rejects both the repository under review and the `*` wildcard. `*` broadens metadata-only `gh_api` access while retaining endpoint guards (empty = current-repo `gh_api` metadata only) | No | `""` |
 | `tool_request_timeout_sec` | Timeout in seconds for each tool execution request | No | `20` |
-| `search_url` | Search-engine endpoint (e.g. a SearXNG `/search` URL) that enables the read-only `web_search` tool in the native tool loop. When set, the model can search for a page and then `web_fetch` the best result; empty leaves `web_search` un-advertised. The model supplies only the query — the host is fixed by this setting. Subject to the same fork gating as the rest of the tool harness | No | `""` |
+| `search_url` | Search-engine endpoint (e.g. a SearXNG `/search` URL) that enables read-only `web_search` when website or GitHub repository retrieval is available. Approved results are retrieved with `web_fetch_search_result(result_id)`; empty leaves search un-advertised. The model supplies only the query — the host is fixed by this setting. Subject to the same fork gating as the rest of the tool harness | No | `""` |
 | `allow_private_search_url` | Explicitly allow the configured `search_url` to use private HTTP(S) endpoints and non-standard ports; intended for trusted self-hosted runners and still subject to fork gating | No | `false` |
 | `tool_max_search_results` | Maximum results returned per `web_search` call | No | `5` |
 | `tool_failure_enforcement` | Force `request_changes` when tool harness planning fails | No | `false` |
@@ -806,9 +865,11 @@ Before synthesis and verdict, older tool results are compacted while recent evid
 - `gh_api` with a repo-local path like `repos/owner/repo/pulls/123/files`
 - `read_file` for files inside the checked-out repository
 - `read_remote_file` for UTF-8 text in an explicitly allowlisted *other*
-  repository at an immutable commit SHA; generic `gh_api` does not return file
+  repository, resolving a branch/tag to an immutable commit SHA; generic `gh_api` does not return file
   contents or Git blobs
 - `web_fetch` for allowlisted hosts from `allowed_source_hosts`
+- `web_search` and `web_fetch_search_result` for discovery and controller-routed
+  retrieval; result IDs recheck website or repository permission independently
 - `git_grep` for local repository content search
 - `run_command` for a fixed catalog of named read-only commands
 
@@ -1262,7 +1323,7 @@ Example `.github/ai-review-diff-priorities.json`:
 - Tool harness output is appended to the review corpus under `Tool Harness Findings`.
 - Tool harness planning treats corpus content as untrusted data and uses strict tool/path/host allowlists with output redaction. The `run_command` tool does not execute arbitrary shell text; it accepts only named read-only command definitions (`git_status_short`, `git_diff_stat`, `git_diff_name_only`) and runs them argv-only without `bash -lc`.
 - Evidence providers and tool harness are both disabled by default on cross-repository PRs (`*_enable_for_forks=false`).
-- `gh_api` defaults to current-repo metadata only. Use `tool_allowed_gh_api_repos` to allow specific upstream repositories. A specifically named entry also enables `read_remote_file`, which decodes only UTF-8 text at an immutable commit and refuses the repository under review. Generic `gh_api` rejects file-content and Git-blob endpoints. `*` broadens metadata access only and never grants remote source-text access.
+- `gh_api` defaults to current-repo metadata only. Use `tool_allowed_gh_api_repos` to allow specific upstream repositories. A specifically named entry also enables `read_remote_file`, which resolves branches/tags once per session, reads UTF-8 text at the resulting immutable commit, and refuses the repository under review. Generic `gh_api` rejects file-content and Git-blob endpoints. `*` broadens metadata access only and never grants remote source-text access. See [search retrieval and revision rules](docs/review-policy-authoring.md#search-results-and-retrieval).
 - For local models, reduce `tool_planning_max_context_bytes` and `tool_planning_max_tokens`, and increase `tool_planning_timeout_sec` as needed.
 - Set `tool_failure_enforcement=true` to fail closed when tool harness planning fails or when every tool request fails.
 - Use `tool_min_successful_requests` (for example `1`) to enforce a minimum successful tool-evidence threshold when the planner attempted tool requests.

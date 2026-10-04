@@ -918,6 +918,47 @@ def test_merge_cannot_launder_missing_evidence():
     assert review.verification_requests[0].candidate.candidate_id == merged.candidate_id
 
 
+@pytest.mark.parametrize("cross_batch", [False, True])
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_critic_can_merge_independent_proofs_at_confirmed_changed_line(cross_batch, confirmed):
+    from pr_reviewer.specialist_runtime.adjudication import merge_accepted_findings
+
+    store, first = _store()
+    second = store.add_tool_result(
+        session_id="session-2", tool="read_file",
+        arguments={"path": "src/store.py", "start_line": 40},
+        result={"status": "ok", "content": "retry repeats write_with_retry()"},
+        category="implementation",
+    ).id
+    if confirmed:
+        store.add_tool_result(
+            session_id="session-1", tool="read_pr_diff",
+            arguments={"path": "src/store.py"},
+            result={"status": "ok", "content": (
+                "diff --git a/src/store.py b/src/store.py\n"
+                "--- a/src/store.py\n+++ b/src/store.py\n"
+                "@@ -41 +41 @@\n-old()\n+write_with_retry()\n"
+            )}, category="implementation",
+        )
+    candidates = (
+        replace(_candidate("C1", evidence_ids=(first,)), root_cause_fingerprint="root-a"),
+        replace(_candidate("C2", evidence_ids=(second,),
+                           claim="An ambiguous response causes repeated persistence",
+                           causal_chain="A retry repeats a write after the response is lost."),
+                root_cause_fingerprint="root-b"),
+    )
+    keep = {"candidate_id": "C1", "action": "keep"}
+    merge = {"candidate_id": "C2", "action": "merge", "target_id": "C1"}
+    review = _adjudicate(candidates, (keep, {"candidate_id": "C2", "action": "keep"}
+                                     if cross_batch else merge), store)
+    if cross_batch:
+        assert len(review.accepted) == 2  # Same changed line alone is not deduplication.
+        review = merge_accepted_findings(review, (merge,), store)
+    assert len(review.accepted) == (1 if confirmed else 2)
+    if confirmed:
+        assert set(review.accepted[0].contributor_candidate_ids) == {"C1", "C2"}
+
+
 def test_handoff_is_sparse_and_uses_only_genuine_structured_theme():
     store, evidence_id = _store()
     findings = (

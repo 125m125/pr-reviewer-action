@@ -13,9 +13,10 @@ from typing import Any, Mapping
 from .types import BudgetLimits, PhaseShares
 
 
-_V2_TOP_LEVEL_KEYS = frozenset({
+_V3_TOP_LEVEL_KEYS = frozenset({
     "version", "components", "recipes", "coverage_rules", "sources",
     "generated_artifacts", "verdict_policy", "publishing", "exclude",
+    "ownership_precedence", "boundaries",
 })
 _V1_TOP_LEVEL_KEYS = frozenset({
     "version", "components", "recipes", "generated_artifacts", "exclude",
@@ -23,7 +24,7 @@ _V1_TOP_LEVEL_KEYS = frozenset({
 _MATCH_KEYS = frozenset({
     "paths_any", "component_ids_any", "risk_flags_any", "file_roles_any",
 })
-_EXECUTION_MODES = frozenset({"coverage", "dedicated", "independent"})
+_EXECUTION_MODES = frozenset({"integrated", "independent"})
 _COMPONENT_KEYS = frozenset({
     "id", "paths", "responsibilities", "related_components", "contracts",
     "invariants",
@@ -32,6 +33,10 @@ _RECIPE_KEYS = frozenset({
     "id", "title", "objective", "execution", "match", "lenses",
     "seed_paths", "related_paths", "invariants", "expected_evidence",
     "evidence_requirements", "priority", "source",
+})
+_BOUNDARY_KEYS = frozenset({
+    "id", "contract_paths", "participants", "contract_change_owner",
+    "endpoint_paths", "objective",
 })
 _EVIDENCE_REQUIREMENT_KEYS = frozenset({
     "id", "category", "when", "seed_paths", "related_paths", "mode",
@@ -168,7 +173,7 @@ class RecipePolicy:
     id: str
     title: str
     objective: str
-    execution: str = "coverage"
+    execution: str = "integrated"
     match: Mapping[str, tuple[str, ...]] = field(default_factory=lambda: MappingProxyType({}))
     lenses: tuple[str, ...] = ()
     seed_paths: tuple[str, ...] = ()
@@ -180,9 +185,21 @@ class RecipePolicy:
 
 
 @dataclass(frozen=True)
+class BoundaryPolicy:
+    id: str
+    contract_paths: tuple[str, ...]
+    participants: tuple[str, ...]
+    contract_change_owner: str
+    endpoint_paths: Mapping[str, tuple[str, ...]]
+    objective: str
+
+
+@dataclass(frozen=True)
 class ReviewPolicy:
-    version: int = 2
+    version: int = 3
     components: tuple[Mapping[str, Any], ...] = ()
+    ownership_precedence: tuple[str, ...] = ()
+    boundaries: tuple[BoundaryPolicy, ...] = ()
     recipes: tuple[RecipePolicy, ...] = ()
     coverage_rules: tuple[Mapping[str, Any], ...] = ()
     sources: tuple[SourceRule, ...] = ()
@@ -198,7 +215,7 @@ class ReviewPolicy:
         return cls(recipes=recipes)
 
     def legacy_projection(self) -> dict[str, Any]:
-        """Return the v1 dictionary consumed by unreplaced specialist helpers."""
+        """Return plain policy data consumed by unreplaced specialist helpers."""
         recipes = []
         for recipe in self.recipes:
             recipes.append({
@@ -206,6 +223,7 @@ class ReviewPolicy:
                 "match": {key: list(value) for key, value in recipe.match.items()},
                 "title": recipe.title,
                 "objective": recipe.objective,
+                "execution": recipe.execution,
                 "lenses": list(recipe.lenses),
                 "seed_paths": list(recipe.seed_paths),
                 "related_paths": list(recipe.related_paths),
@@ -226,8 +244,23 @@ class ReviewPolicy:
                 "source": "recipe",
             })
         return {
-            "version": 1,
+            "version": self.version,
             "components": [_thaw(item) for item in self.components],
+            "ownership_precedence": list(self.ownership_precedence),
+            "boundaries": [
+                {
+                    "id": item.id,
+                    "contract_paths": list(item.contract_paths),
+                    "participants": list(item.participants),
+                    "contract_change_owner": item.contract_change_owner,
+                    "endpoint_paths": {
+                        owner: list(paths)
+                        for owner, paths in item.endpoint_paths.items()
+                    },
+                    "objective": item.objective,
+                }
+                for item in self.boundaries
+            ],
             "recipes": recipes,
             "coverage_rules": [_thaw(item) for item in self.coverage_rules],
             "generated_artifacts": [_thaw(item) for item in self.generated_artifacts],
@@ -441,9 +474,12 @@ def _recipe_policy(raw: Mapping[str, Any]) -> RecipePolicy:
             elif key == "component_ids_any":
                 values = tuple(_slug(item) for item in values)
             normalized_match[key] = values
-    execution = str(raw.get("execution", "coverage")).strip().lower()
+    execution = str(raw.get("execution", "integrated")).strip().lower()
     if execution not in _EXECUTION_MODES:
-        raise ValueError("recipe execution must be coverage, dedicated, or independent")
+        raise ValueError(
+            "recipe execution must be integrated or independent; migrate old "
+            "coverage/dedicated recipes explicitly"
+        )
     priority = str(raw.get("priority", "normal")).strip().lower()
     if priority not in {"critical", "high", "normal", "low"}:
         priority = "normal"
@@ -470,6 +506,61 @@ def _recipe_policy(raw: Mapping[str, Any]) -> RecipePolicy:
         expected_evidence=_strings(raw.get("expected_evidence", []), field_name="recipe expected_evidence"),
         evidence_requirements=evidence_requirements,
         priority=priority,
+    )
+
+
+def _boundary_policy(
+    raw: Mapping[str, Any], *, component_ids: frozenset[str],
+) -> BoundaryPolicy:
+    unknown = set(raw) - _BOUNDARY_KEYS
+    if unknown:
+        raise ValueError(
+            "boundary contains unknown keys: " + ", ".join(sorted(unknown))
+        )
+    if not raw.get("id"):
+        raise ValueError("every boundary requires an id")
+    raw_participants = raw.get("participants")
+    participants = tuple(
+        _slug(item)
+        for item in _strings(raw_participants, field_name="boundary participants")
+    )
+    if len(set(participants)) != len(participants) or (
+        isinstance(raw_participants, list)
+        and len(participants) != len(raw_participants)
+    ):
+        raise ValueError("boundary participants must be unique")
+    unknown_participants = set(participants) - component_ids
+    if unknown_participants:
+        raise ValueError(
+            "boundary participants reference unknown components: "
+            + ", ".join(sorted(unknown_participants))
+        )
+    owner = _slug(raw.get("contract_change_owner"), fallback="")
+    if not owner or owner not in participants:
+        raise ValueError("boundary contract_change_owner must be a participant")
+    endpoint_data = _mapping(raw.get("endpoint_paths"), field_name="boundary endpoint_paths")
+    endpoint_paths: dict[str, tuple[str, ...]] = {}
+    for participant, paths in endpoint_data.items():
+        participant_id = _slug(participant)
+        if participant_id not in participants:
+            raise ValueError("boundary endpoint_paths keys must be participants")
+        if participant_id in endpoint_paths:
+            raise ValueError("boundary endpoint_paths keys must be unique")
+        endpoint_paths[participant_id] = _repository_paths(
+            paths, field_name=f"boundary endpoint_paths {participant_id}",
+        )
+    objective = str(raw.get("objective") or "").strip()
+    if not objective:
+        raise ValueError("boundary objective must be a non-empty string")
+    return BoundaryPolicy(
+        id=_slug(raw["id"]),
+        contract_paths=_repository_paths(
+            raw.get("contract_paths"), field_name="boundary contract_paths",
+        ),
+        participants=participants,
+        contract_change_owner=owner,
+        endpoint_paths=MappingProxyType(endpoint_paths),
+        objective=objective[:1000],
     )
 
 
@@ -663,10 +754,14 @@ def _publishing(raw: Any) -> Mapping[str, Any]:
     })
 
 
-def _parse_v2_policy(data: Mapping[str, Any]) -> ReviewPolicy:
-    if data.get("version") != 2:
-        raise ValueError("review policy must be a JSON object with version 1 or 2")
-    unknown = set(data) - _V2_TOP_LEVEL_KEYS
+def _parse_v3_policy(data: Mapping[str, Any]) -> ReviewPolicy:
+    if data.get("version") != 3:
+        if data.get("version") in {1, 2}:
+            raise ValueError(
+                "review policy version 1 or 2 requires explicit migration to version 3"
+            )
+        raise ValueError("review policy must be a JSON object with version 3")
+    unknown = set(data) - _V3_TOP_LEVEL_KEYS
     if unknown:
         raise ValueError(f"policy contains unknown top-level keys: {', '.join(sorted(unknown))}")
     if not (set(data) - {"version"}):
@@ -675,6 +770,33 @@ def _parse_v2_policy(data: Mapping[str, Any]) -> ReviewPolicy:
         _component_policy(item)
         for item in _entries(data.get("components"), field_name="components")
     )
+    component_ids = tuple(str(item["id"]) for item in components)
+    if len(set(component_ids)) != len(component_ids):
+        raise ValueError("component ids must be unique")
+    raw_precedence = data.get("ownership_precedence")
+    precedence = tuple(
+        _slug(item)
+        for item in _strings(
+            raw_precedence, field_name="ownership_precedence",
+        )
+    )
+    if len(set(precedence)) != len(precedence) or (
+        isinstance(raw_precedence, list) and len(precedence) != len(raw_precedence)
+    ):
+        raise ValueError("ownership_precedence ids must be unique")
+    unknown_precedence = set(precedence) - set(component_ids)
+    if unknown_precedence:
+        raise ValueError(
+            "ownership_precedence references unknown component ids: "
+            + ", ".join(sorted(unknown_precedence))
+        )
+    boundaries = tuple(
+        _boundary_policy(item, component_ids=frozenset(component_ids))
+        for item in _entries(data.get("boundaries"), field_name="boundaries")
+    )
+    boundary_ids = tuple(item.id for item in boundaries)
+    if len(set(boundary_ids)) != len(boundary_ids):
+        raise ValueError("boundary ids must be unique")
     recipes = tuple(
         _recipe_policy(item)
         for item in _entries(data.get("recipes"), field_name="recipes")
@@ -684,6 +806,8 @@ def _parse_v2_policy(data: Mapping[str, Any]) -> ReviewPolicy:
         raise ValueError("recipe ids must be unique")
     return ReviewPolicy(
         components=components,
+        ownership_precedence=precedence,
+        boundaries=boundaries,
         recipes=recipes,
         coverage_rules=tuple(
             _coverage_rule(item, recipe_ids=recipe_ids)
@@ -704,6 +828,8 @@ def _parse_v2_policy(data: Mapping[str, Any]) -> ReviewPolicy:
 def _policy_sections(policy: ReviewPolicy) -> dict[str, object]:
     return {
         "components": policy.components,
+        "ownership_precedence": policy.ownership_precedence,
+        "boundaries": policy.boundaries,
         "recipes": policy.recipes,
         "coverage_rules": policy.coverage_rules,
         "sources": policy.sources,
@@ -781,6 +907,8 @@ def authorize_policy_change(
             # base component map prevents an automatic head-policy edit from
             # making a base recipe silently stop matching.
             components=base_policy.components,
+            ownership_precedence=base_policy.ownership_precedence,
+            boundaries=base_policy.boundaries,
             recipes=recipes,
             coverage_rules=_unique_structured(
                 (*base_policy.coverage_rules, *head_policy.coverage_rules)
@@ -818,12 +946,18 @@ def authorize_policy_change(
 
 
 def load_review_policy(path: str | Path, legacy_path: str | Path | None = None) -> ReviewPolicy:
-    """Load the current-branch policy, falling back to an optional legacy file."""
+    """Load the required current-branch version-3 policy."""
     candidate = Path(path)
-    if not candidate.is_file() and legacy_path is not None:
-        candidate = Path(legacy_path)
     if not candidate.is_file():
-        return ReviewPolicy.minimal()
+        if legacy_path is not None and Path(legacy_path).is_file():
+            raise ValueError(
+                f"legacy review policy found at {legacy_path}; explicit migration "
+                "to version 3 is required"
+            )
+        raise ValueError(
+            f"review policy file not found: {candidate}. See "
+            "docs/review-policy-authoring.md#quick-start"
+        )
     try:
         data = json.loads(candidate.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -835,6 +969,4 @@ def parse_review_policy(data: object) -> ReviewPolicy:
     """Parse an already-loaded policy value through the same strict schema."""
     if not isinstance(data, dict):
         raise ValueError("review policy must be a JSON object")
-    if data.get("version") == 1:
-        data = migrate_v1_policy(data)
-    return _parse_v2_policy(data)
+    return _parse_v3_policy(data)

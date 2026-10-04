@@ -1060,6 +1060,17 @@ def test_raw_repository_request_suggests_repository_not_web_permission():
     assert "```json" not in note.markdown
 
 
+def test_stale_repository_request_is_suppressed_only_by_explicit_repository_grant():
+    request = repository_access_request("repos/owner/project/contents/README.md",
+        "obligation-store", "Verify contract.", "Inspect source.", "Repo not allowed")
+    assert build_source_access_request_notes([request], obligations=_controller_obligations(),
+        allowed_github_repositories=("Owner/Project",)) == ()
+    for allowed in (("*",), ("owner/project-other",), ()):
+        notes = build_source_access_request_notes([request], obligations=_controller_obligations(),
+            allowed_github_repositories=allowed)
+        assert len(notes) == 1
+
+
 def test_repository_authorization_combines_endpoints_into_one_addition():
     requests = [repository_access_request(endpoint, "obligation-store", "Verify contract.", "Inspect source.", "Repo not allowed")
         for endpoint in ["repos/owner/project", "repos/owner/project/commits/" + "a" * 40]]

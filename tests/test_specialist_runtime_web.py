@@ -54,7 +54,7 @@ def test_search_returns_snippets_only_for_approved_sources():
         SearchCandidate("Blog", "https://blog.invalid/post", "unapproved content"),
     ])
 
-    result = discover("api behavior", provider, source_policy())
+    result = discover("api behavior", provider, source_policy(), result_registry=SearchResultRegistry())
 
     assert result.approved[0].snippet == "trusted snippet"
     assert result.approved[0].classification == "official"
@@ -76,9 +76,9 @@ def test_search_provider_cannot_invent_an_opaque_result_handle():
         result_registry=SearchResultRegistry(),
     ).as_dict()["approved"][0]
 
-    assert result["fetch_method"] == "url"
+    assert result["fetch_method"] == "result_id"
     assert result["url"] == "https://docs.example.com/api"
-    assert "result_id" not in result
+    assert result["result_id"] != "search-result-999"
 
 
 def test_unapproved_candidate_creates_request_without_fetching():
@@ -211,6 +211,7 @@ def test_discovery_scans_bounded_results_and_caps_approved_output():
     result = discover(
         "release support", provider, source_policy(),
         search_scan_limit=4, tool_max_search_results=2,
+        result_registry=SearchResultRegistry(),
     )
 
     assert provider.limits == [4]
@@ -243,6 +244,7 @@ def test_discovery_prioritizes_approved_results_over_denied_metadata():
     result = discover(
         "release support", provider, source_policy(),
         search_scan_limit=2, tool_max_search_results=1,
+        result_registry=SearchResultRegistry(),
     )
 
     assert [item.url for item in result.approved] == [
@@ -415,13 +417,13 @@ def test_allowlisted_opaque_search_result_uses_session_handle_without_exposing_u
 
     assert len(payload["approved"]) == 1
     candidate = payload["approved"][0]
-    assert candidate["result_id"] == "search-result-1"
+    assert candidate["result_id"].startswith("search-result-")
     assert candidate["fetch_method"] == "result_id"
     assert candidate["fetch_allowed"] is True
     assert candidate["snippet"] == "trusted snippet"
     assert "url" not in candidate
     assert token not in json.dumps(payload)
-    assert registry.resolve("search-result-1") == url
+    assert registry.resolve(candidate["result_id"]) == url
 
 
 @pytest.mark.parametrize("query", (
@@ -546,6 +548,77 @@ def test_secure_fetch_prefers_markdown_then_plain_text_then_html():
     assert result.content == "# API\n\nSupported."
 
 
+def test_selected_fetch_reaches_late_content_and_keeps_payload_bounded():
+    url = 'https://docs.example.com/manual'
+    body = ('<h1>Manual</h1><h2>Other</h2><p>' + 'filler ' * 20_000 +
+            '</p><h2 id="invoke">Invocation</h2><p>needle argument semantics</p>').encode()
+    transport = FakeHttpTransport({url: HttpResponse(200, {'Content-Type': 'text/html'}, body)})
+    fetcher = SecureFetcher(source_policy(), transport=transport, resolver=public_resolver, max_bytes=3000)
+    result = fetcher.fetch(url, search_terms=('needle',))
+    assert 'needle argument semantics' in result.content
+    assert 'filler filler' not in result.content
+    assert transport.requests[0].max_bytes == 8 * 1024 * 1024
+    assert len(result.to_tool_result().encode()) <= 3000
+    assert result.selection['download_truncated'] is False
+    assert result.truncated is True
+    assert result.selection['passages']
+
+
+@pytest.mark.parametrize('opaque_source', [False, True])
+def test_selected_html_masks_decoded_opaque_tokens_before_retention(opaque_source):
+    token = '0123456789abcdef' * 4
+    url = 'https://docs.example.com/' + (token if opaque_source else 'manual')
+    encoded = ''.join(f'&#{ord(c)};' for c in token)
+    body = f'<h2>Needle</h2><p>needle <a href="/{token}">{encoded}</a></p>'.encode()
+    transport = FakeHttpTransport({url: HttpResponse(200, {'Content-Type': 'text/html'}, body)})
+    store = EvidenceStore()
+    result = SecureFetcher(source_policy(), transport=transport, resolver=public_resolver,
+        evidence_store=store, max_bytes=5000).fetch(url, search_terms=('needle',),
+        allow_opaque_url=opaque_source, public_reference='opaque source' if opaque_source else None,
+        result_registry=SearchResultRegistry())
+    assert token not in result.to_tool_result()
+    assert token not in store.snapshot().records[0].content
+
+
+def test_high_entropy_fragment_is_denied_in_fetch_and_navigation():
+    token = '0123456789abcdef' * 4
+    url = 'https://docs.example.com/manual'
+    transport = FakeHttpTransport({url: HttpResponse(200, {'Content-Type': 'text/html'},
+        f'<h2>Needle</h2><p>needle <a href="#{token}">{token}</a></p>'.encode())})
+    fetcher = SecureFetcher(source_policy(), transport=transport, resolver=public_resolver, max_bytes=5000)
+    with pytest.raises(SourceDenied, match='anchor'):
+        fetcher.fetch(url + '#' + token)
+    assert not transport.requests
+    result = fetcher.fetch(url, search_terms=('needle',), result_registry=SearchResultRegistry())
+    assert token not in result.to_tool_result()
+    assert not any(link.get('fetch_allowed') for link in result.navigation)
+
+
+@pytest.mark.parametrize('terms', [[], [''], ['x'] * 9, ['x' * 129], 'needle', [42]])
+def test_bad_selector_rejected_before_transport(terms):
+    transport = FakeHttpTransport({})
+    with pytest.raises(ValueError, match='search_terms'):
+        SecureFetcher(source_policy(), transport=transport, resolver=public_resolver).fetch(
+            'https://docs.example.com/manual', search_terms=terms)
+    assert not transport.requests
+
+
+def test_navigation_uses_real_links_and_rechecks_permissions_without_fetching():
+    url = 'https://docs.example.com/start'
+    final = 'https://docs.example.com/guide/manual'
+    body = b'<h2 id="invoke">Invocation</h2><p>needle <a href="chapter#part">chapter</a> <a href="https://evil.example/no">secret denied label</a></p>'
+    transport = FakeHttpTransport({url: HttpResponse(302, {'Location': final}, b''),
+        final: HttpResponse(200, {'Content-Type': 'text/html'}, body)})
+    registry = SearchResultRegistry()
+    result = SecureFetcher(source_policy(), transport=transport, resolver=public_resolver, max_bytes=5000).fetch(
+        url + '#invoke', search_terms=('needle',), result_registry=registry)
+    assert len(transport.requests) == 2
+    allowed = next(link for link in result.navigation if link.get('fetch_allowed'))
+    assert registry.resolve(allowed['result_id']) == 'https://docs.example.com/guide/chapter#part'
+    assert 'secret denied label' not in json.dumps(result.navigation)
+    assert any(link.get('fetch_allowed') is False for link in result.navigation)
+
+
 def test_documentation_redirect_accepts_underscore_slug_without_relaxing_host_policy():
     start = "https://docs.github.com/en/actions/using-jobs/assigning-permissions-to-jobs"
     destination = (
@@ -642,6 +715,7 @@ def test_secure_fetch_normalizes_masks_truncates_and_records_evidence():
     record = store.snapshot().get(result.evidence_id)
     assert record is not None
     assert record.content_hash == result.content_hash
+    assert record.truncated is True
     assert record.mime_type == "text/html"
     assert record.provenance == result.provenance
 
@@ -681,9 +755,83 @@ def test_search_provider_uses_dns_pinned_transport_and_canonical_endpoint():
         resolver=public_resolver,
     )
 
-    assert provider.search("api support", limit=5) == ()
+    assert tuple(provider.search("api support", limit=5)) == ()
     assert transport.requests[0].url == expected
     assert transport.requests[0].resolved_ip == PUBLIC_IP
+
+
+@pytest.mark.parametrize("results, expected", [([], "inconclusive"), ([{
+    "title": "Docs", "url": "https://docs.example.com/api", "content": "API",
+}], "partial")])
+def test_search_surfaces_engine_failures_without_leaking_provider_messages(results, expected):
+    transport = FakeHttpTransport({
+        "https://search.example.com/search?q=api&format=json": HttpResponse(
+            200, {"content-type": "application/json"}, json.dumps({
+                "results": results,
+                "unresponsive_engines": [["duckduckgo", "CAPTCHA"],
+                    ["brave", "Suspended: too many requests"],
+                    ["duckduckgo", "CAPTCHA"],
+                    ["other", "internal URL with secret"], None],
+            }).encode(),
+        ),
+    })
+    payload = discover("api", SearxngSearchProvider(
+        "https://search.example.com/search", transport=transport, resolver=public_resolver,
+    ), source_policy(), result_registry=SearchResultRegistry()).as_dict()
+    assert payload["search_status"] == expected
+    assert payload["engine_warnings"] == [
+        {"engine": "duckduckgo", "reason": "captcha"},
+        {"engine": "brave", "reason": "rate_limited"},
+        {"engine": "other", "reason": "unavailable"},
+    ]
+    assert payload["suppressed_result_count"] == 0
+    assert "internal URL" not in json.dumps(payload)
+    assert "absence" in payload["search_limitation"]
+    if expected == "inconclusive":
+        assert "avoid repeated similar searches" in payload["search_limitation"]
+    else:
+        assert "Use relevant results" in payload["search_limitation"]
+
+
+def test_filled_search_quota_preserves_diagnostics_without_partial_warning():
+    provider = FakeSearchProvider(web.SearchResponse((
+        SearchCandidate("Docs", "https://docs.example.com/api", "API"),
+        SearchCandidate("Other", "https://other.example.com/api", "Other"),
+    ), (("brave", "rate_limited"),)))
+    payload = discover("api", provider, source_policy(), tool_max_search_results=2,
+                       result_registry=SearchResultRegistry()).as_dict()
+    assert payload["search_status"] == "ok"
+    assert len(payload["approved"]) == len(payload["unapproved"]) == 1
+    assert payload["engine_warnings"] == [{"engine": "brave", "reason": "rate_limited"}]
+    assert "search_limitation" not in payload
+
+
+def test_clean_empty_search_is_not_a_provider_failure():
+    assert discover("api", FakeSearchProvider([]), source_policy()).as_dict()["search_status"] == "empty"
+
+
+def test_search_engine_warnings_are_bounded_and_reject_unsafe_engine_labels():
+    warnings = web._engine_warnings([
+        ["<script>bad</script>", "timeout"],
+        *[[f"engine-{i}", "CAPTCHA"] for i in range(30)],
+    ])
+    assert len(warnings) == 10
+    assert warnings[0] == ("unknown", "timeout")
+    assert "<script>" not in str(warnings)
+
+
+def test_search_warning_summary_deduplicates_retained_searches_only():
+    store = EvidenceStore()
+    for tool, engine, query in [("web_search", "brave", "one"),
+                                ("web_search", "brave", "two"),
+                                ("read_file", "not-a-search", "three")]:
+        store.add_tool_result(session_id="s1", tool=tool, arguments={"query": query}, result={
+            "status": "ok", "result": {"kind": "search_discovery", "query": query,
+                "engine_warnings": [{"engine": engine, "reason": "rate_limited"}]},
+        })
+    assert web.search_warning_summary(store.snapshot().records) == [
+        {"engine": "brave", "reason": "rate_limited"},
+    ]
 
 
 def test_search_redirect_cannot_leak_query_to_another_host():
@@ -959,6 +1107,25 @@ def _transport_request(timeout: float) -> HttpRequest:
         timeout=timeout, deadline=time.monotonic() + timeout, max_bytes=1024,
         headers={},
     )
+
+
+def test_premature_http_eof_cannot_be_reported_as_complete():
+    import http.client
+    import io
+    class BodySocket:
+        def makefile(self, *args):
+            return io.BytesIO(b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n'
+                b'Content-Length: 1000\r\n\r\nneedle useful partial document')
+    response = http.client.HTTPResponse(BodySocket())
+    response.begin()
+    connection = _ImmediateConnection(response)
+    transport = StdlibHttpTransport(connection_factory=lambda *args: connection)
+    result = SecureFetcher(source_policy(), transport=transport, resolver=public_resolver).fetch(
+        'https://docs.example.com/manual', search_terms=('needle',))
+    assert 'needle useful partial document' in result.content
+    assert result.truncated is True
+    assert result.selection['download_truncated'] is True
+    assert any('incomplete' in text for text in result.selection['limitations'])
 
 
 def test_transport_slow_headers_obey_elapsed_hard_deadline_and_close_socket():

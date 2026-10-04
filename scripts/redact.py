@@ -37,10 +37,16 @@ _RE_KUBE_CRED = re.compile(
 )
 
 _RE_SOURCE_KV_SECRET = re.compile(
-    r"(?i)(?P<key>api[_-]?key|api[_-]?token|auth[_-]?token|access[_-]?key|"
+    # Only explicit shell commands disambiguate an empty assignment from config.
+    r"(?i)(?P<empty_shell>\b(?:export|env)[ \t]+[A-Za-z_][A-Za-z0-9_]*="
+    r"(?:[ \t]+[A-Za-z_][A-Za-z0-9_]*=)*"
+    r"(?=\s+[A-Za-z_][A-Za-z0-9_]*=))|"
+    r"(?P<key>api[_-]?key|api[_-]?token|auth[_-]?token|access[_-]?key|"
     r"token|password|secret)"
     r"(?P<separator>\s*[:=]\s*)"
-    r"(?P<quote>['\"]?)(?P<value>[^\s'\"]{8,})(?P=quote)"
+    r"(?P<quote>['\"])?"
+    r"(?P<value>(?(quote)(?:\\.|(?!(?P=quote))[^\\\r\n])*|[^\s'\"]{8,}))"
+    r"(?(quote)(?P=quote))"
 )
 _RE_DYNAMIC_REFERENCE = re.compile(
     r"^(?:\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|"
@@ -64,17 +70,19 @@ def mask_source_secrets(text: str | None) -> tuple[str, int]:
 
     def replace_key_value(match: re.Match[str]) -> str:
         nonlocal count
+        if match.group("empty_shell"):
+            return match.group(0)
         key = match.group("key")
         value = match.group("value")
         normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
-        if _RE_DYNAMIC_REFERENCE.fullmatch(value):
+        if len(value) < 8 or _RE_DYNAMIC_REFERENCE.fullmatch(value):
             return match.group(0)
         if not match.group("quote") and re.sub(
             r"[^a-z0-9]", "", value.lower()
         ) == normalized_key:
             return match.group(0)
         count += 1
-        quote = match.group("quote")
+        quote = match.group("quote") or ""
         return f"{key}{match.group('separator')}{quote}[REDACTED_VALUE]{quote}"
 
     redacted = _RE_SOURCE_KV_SECRET.sub(replace_key_value, text)
