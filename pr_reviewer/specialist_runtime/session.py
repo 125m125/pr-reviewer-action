@@ -1638,6 +1638,7 @@ class SpecialistSession:
         self._successful_collections: dict[str, str] = {}
         self._delegated_summary_cache: dict[str, dict[str, object]] = {}
         self._deferred_tool_results: dict[str, tuple[dict[str, Any], str]] = {}
+        self._pending_tool_requests: dict[str, dict[str, Any]] = {}
         self._tool_call_keys: dict[str, str] = {}
         self._delegation_hint_sources: set[tuple[str, str, str]] = set()
         self._tool_call_evidence_ids: dict[str, str] = {}
@@ -2810,7 +2811,9 @@ class SpecialistSession:
         self.lease.request_timeout(
             self.request_timeout_sec, now=self.clock(),
         )
-        resuming_checkpoint = self.state is SessionState.CHECKPOINT
+        resuming_checkpoint = self.state in {
+            SessionState.CHECKPOINT, SessionState.COVERAGE_EVALUATION,
+        }
         if resuming_checkpoint and self._checkpoint_spans:
             continuation_admission = self._estimate_admission(
                 tools_enabled=True,
@@ -2832,7 +2835,16 @@ class SpecialistSession:
                     or self._checkpoint_pressure_due()
                 )
                 if continuation_pressure:
-                    reconstructed = self._reconstruct_from_valid_checkpoint()
+                    # Stop-disposition and scheduler messages need not survive
+                    # as history: accepted state and current scope already do.
+                    # Keep actual post-checkpoint exploration in the emergency path.
+                    tail = self.conversation.events[self._checkpoint_spans[-1].response_end:]
+                    reconstructed = self._reconstruct_from_valid_checkpoint(
+                        preserve_recent_exchanges=any(
+                            event.get("kind") in {"assistant_tool_calls", "assistant_reasoning"}
+                            for event in tail
+                        ),
+                    )
                     continuation_admission = self._estimate_admission(
                         tools_enabled=True,
                         max_tokens=self.max_tokens,
@@ -4728,7 +4740,7 @@ class SpecialistSession:
         model_purpose: str = "",
     ) -> None:
         if (tool_name in {"web_fetch", "web_fetch_search_result"}
-                and result.get("effective_tool") in {"gh_api", "read_remote_file"}
+                and result.get("effective_tool") in {"gh_api", "read_remote_file", "web_fetch"}
                 and isinstance(result.get("effective_arguments"), Mapping)):
             tool_name = result["effective_tool"]
             arguments = result["effective_arguments"]
@@ -7122,9 +7134,22 @@ class SpecialistSession:
         self.conversation.events = projected.events
         self._checkpoint_spans = rebuilt_spans
         self._compacted_evidence = compacted_evidence
+        reconstructed = False
+        if (after.admission_tokens > self.max_context_tokens
+                or self._checkpoint_pressure_due(reserve_tool_result=bool(self._pending_tool_requests))):
+            # The checkpoint is already accepted. Re-serializing it through the
+            # model cannot make room for exploration; use one authoritative copy.
+            reconstructed = self._reconstruct_from_valid_checkpoint(
+                preserve_recent_exchanges=any(
+                    event.get("kind") in {"assistant_tool_calls", "assistant_reasoning"}
+                    for event in old_events[latest.response_end:]
+                ),
+            )
+            if reconstructed:
+                after = self._estimate_admission(tools_enabled=True, max_tokens=self.max_tokens)
         if latest.diagnostic is not None:
             latest.diagnostic.update({
-                "compaction_level": str(compaction_level)[:40],
+                "compaction_level": "checkpoint_reconstruction" if reconstructed else str(compaction_level)[:40],
                 "compaction_input_tokens_before": before.input_tokens,
                 "compaction_input_tokens_after": after.input_tokens,
                 "removed_reasoning_messages": (
@@ -7140,7 +7165,7 @@ class SpecialistSession:
         """Compatibility entry point; never compact without a valid boundary."""
         self._compact_validated_epoch()
 
-    def _reconstruct_from_valid_checkpoint(self) -> bool:
+    def _reconstruct_from_valid_checkpoint(self, *, preserve_recent_exchanges: bool = True) -> bool:
         """Emergency rebuild from controller-owned cumulative checkpoint state."""
         if (
             self._last_valid_checkpoint is None
@@ -7226,7 +7251,7 @@ class SpecialistSession:
             min(self.recovery_evidence_bytes, self.max_context_tokens * 2),
         )
         newest_groups: list[list[dict[str, Any]]] = []
-        for group in reversed(exchange_groups):
+        for group in reversed(exchange_groups) if preserve_recent_exchanges else ():
             group_bytes = len(
                 json.dumps(group, sort_keys=True).encode("utf-8")
             )
@@ -7241,20 +7266,14 @@ class SpecialistSession:
             record.id: record for record in self.evidence_store.snapshot().records
         }
         newly_omitted_evidence_ids: list[str] = []
-        for group in exchange_groups:
-            if any(id(event) in selected_event_ids for event in group):
+        for event in previous.events:
+            if id(event) in selected_event_ids or event.get("kind") != "tool_result":
                 continue
-            for event in group:
-                if event.get("kind") != "tool_result":
-                    continue
-                evidence_id = self._tool_call_evidence_ids.get(
-                    str(event.get("call_id") or ""),
-                    "",
-                )
-                record = retained_records.get(evidence_id)
-                if record is not None and record.is_usable_for_coverage:
-                    self._compacted_evidence[evidence_id] = record
-                    newly_omitted_evidence_ids.append(evidence_id)
+            evidence_id = self._tool_call_evidence_ids.get(str(event.get("call_id") or ""), "")
+            record = retained_records.get(evidence_id)
+            if record is not None and record.is_usable_for_coverage:
+                self._compacted_evidence[evidence_id] = record
+                newly_omitted_evidence_ids.append(evidence_id)
         checkpoint_request_start = len(rebuilt.events)
         rebuilt.add_user(
             "Emergency reconstruction from the latest validated cumulative "
@@ -7262,6 +7281,8 @@ class SpecialistSession:
         )
         snapshot = {
             "cumulative_checkpoint": self._bounded_reconstruction_checkpoint(),
+            "pending_tool_requests": list(self._pending_tool_requests.values()),
+            "delegation_receipts": self._delegation_receipts,
             "compacted_evidence": self._compacted_evidence_catalogue(
                 max_bytes=max(0, self.recovery_evidence_bytes // 2),
                 priority_evidence_ids=tuple(reversed(newly_omitted_evidence_ids)),
@@ -7280,7 +7301,10 @@ class SpecialistSession:
                 + (self._current_continuation_scope() or "Continue the same specialist assignment.")
                 + " Use proposed next actions only within the selected task. "
                 "Treat the cumulative checkpoint as continuation memory and use only "
-                "the bounded compacted-evidence catalogue for retrieval."
+                "the bounded compacted-evidence catalogue for retrieval. "
+                "Repeat pending_tool_requests within the selected task using ordinary tools; "
+                "these results were not delivered. Retained results replay without refetching "
+                "or duplicate penalties, subject to context limits."
             ),
             "epoch_continuation": True,
             "emergency_reconstruction": True,
@@ -7569,6 +7593,25 @@ class SpecialistSession:
             self._tool_calls_deferred_for_checkpoint = True
         name = self._tool_activity_call_names.get(call_id, "")
         if name:
+            if key:
+                # Bookkeeping only, never authorization. Match the retrieval
+                # identity even when the retry rewords its purpose/targets.
+                pending_name, _, encoded = key.partition(":")
+                pending_args = json.loads(encoded)
+                if pending_name not in _OBLIGATION_LOCAL_TOOL_NAMES and pending_name != COMPACTED_EVIDENCE_TOOL_NAME:
+                    pending_args.pop("targets", None)
+                    pending_args.pop("obligation_ids", None)
+                    if pending_name in {"gh_api", "read_remote_file", "web_fetch", "web_search", "web_fetch_search_result"}:
+                        pending_args.pop("purpose", None)
+                pending_key = native_tool_request_key(pending_name, pending_args)
+                if isinstance(result, Mapping) and result.get("status") == "deferred":
+                    self._pending_tool_requests[pending_key] = {
+                        "tool_name": pending_name, "arguments": pending_args,
+                        "result_retained": key in self._deferred_tool_results,
+                    }
+                else:
+                    # An error is still a delivered result, not pending work.
+                    self._pending_tool_requests.pop(pending_key, None)
             if isinstance(result, Mapping) and result.get("status") in {"rejected", "blocked"}:
                 outcome = "rejected"
             elif is_error:

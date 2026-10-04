@@ -95,6 +95,33 @@ def test_child_local_assessment_scope_does_not_claim_parent_paths():
     assert session.coverage.obligations()[0].scope == ("a.py", "b.py")
 
 
+def test_deferred_delegation_preserves_targets_and_replays_receipt_once():
+    session = owner_session()
+    requests = []
+
+    def delegate(request):
+        requests.append(request)
+        return {"status": "queued", "request_id": "delegation-1"}
+
+    session.bind_delegation_request_handler(delegate)
+    session._checkpoint_pressure_due = lambda **kw: not kw.get("reserve_tool_result", False)
+    arguments = {"question": "Check b", "reason": "Separate operation",
+                 "changed_paths": ["b.py"], "targets": ["O1"]}
+    session._execute_calls(({"id": "first", "name": "request_delegation",
+                             "arguments": json.dumps(arguments)},))
+    pending = next(iter(session._pending_tool_requests.values()))
+    assert pending["arguments"] == arguments
+    session._checkpoint_pressure_due = lambda **kw: False
+    session._tool_calls_deferred_for_checkpoint = False
+    session._execute_calls(({"id": "retry", "name": pending["tool_name"],
+                             "arguments": json.dumps(pending["arguments"])},))
+    assert len(requests) == 1
+    assert requests[0]["targets"] == ["OB-owner"]
+    assert json.loads(session.conversation.events[-1]["content"])["request_id"] == "delegation-1"
+    assert not session._pending_tool_requests
+    assert not session._deferred_tool_results
+
+
 @pytest.mark.parametrize("child", [False, True])
 def test_checkpoint_contract_only_advertises_current_owned_scope(child):
     session = owner_session(depth=1 if child else 0, paths=("b.py",) if child else ("a.py", "b.py"))
