@@ -2709,6 +2709,7 @@ class ReviewController:
             "in_flight": attempt.in_flight,
             "purpose": attempt.purpose,
             "finish_reason": attempt.finish_reason,
+            "stream_watchdog_reason": attempt.stream_watchdog_reason,
             "text_source": attempt.text_source,
             "tool_call_count": attempt.tool_call_count,
             "error": attempt.error,

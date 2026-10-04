@@ -481,7 +481,8 @@ COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
         "Read a bounded excerpt from an evidence result that the controller "
         "explicitly marked as compacted. Only evidence IDs listed in a recent "
         "compaction marker are valid; this tool never reads arbitrary evidence "
-        "or creates new evidence."
+        "or creates new evidence. For another page, use the returned next_offset; "
+        "ranges already retrieved since compaction are not returned again."
     ),
     "parameters": {
         "type": "object",
@@ -1646,7 +1647,9 @@ class SpecialistSession:
         self._tool_activity_outcomes: dict[str, str] = {}
         self._tool_activity_evidence: dict[str, set[str]] = {}
         self._compacted_evidence: dict[str, EvidenceRecord] = {}
-        self._compacted_evidence_read_keys: set[tuple[str, str, str, int]] = set()
+        self._compacted_evidence_read_ranges: dict[
+            tuple[str, str, str, int], list[tuple[int, int]]
+        ] = {}
         self._compacted_evidence_reads = 0
         self._compacted_evidence_generation = 0
         self._last_compact_progress_fingerprint = ""
@@ -2750,6 +2753,10 @@ class SpecialistSession:
                 finish_reason=result.finish_reason,
                 text_source=result.text_source,
                 tool_call_count=len(result.tool_calls),
+                stream_watchdog_reason=(
+                    result.stream_watchdog_reason or "repetition"
+                    if result.stream_watchdog_triggered else ""
+                ),
                 actual_prompt_tokens=actual_prompt_tokens,
                 actual_completion_tokens=actual_completion_tokens,
                 **request_performance(result.usage, result.response.get("timings")),
@@ -2935,6 +2942,13 @@ class SpecialistSession:
                 calls=turn.tool_calls,
             )
             if not turn.tool_calls:
+                if turn.stream_watchdog_triggered:
+                    # This is a detected repetition loop, not an output-limit
+                    # truncation. Save accepted state instead of prefilling the
+                    # same unfinished reasoning and repeating it again.
+                    return self.request_checkpoint(
+                        f"stream-watchdog-{turn.stream_watchdog_reason or 'repetition'}",
+                    )
                 textual_tool_reason = _textual_tool_call_reason(turn.content)
                 if textual_tool_reason is not None:
                     self.budget.record_tool_rejection(textual_tool_reason)
@@ -4286,6 +4300,7 @@ class SpecialistSession:
                 self._add_tool_result(
                     call_id, recovered,
                 )
+                progressed = bool(recovered.get("content")) or progressed
                 continue
             if name in _OBLIGATION_LOCAL_TOOL_NAMES:
                 if name == TEST_RESULTS_TOOL_NAME:
@@ -7403,8 +7418,11 @@ class SpecialistSession:
         key = (
             evidence_id, target, purpose, self._compacted_evidence_generation,
         )
-        if key in self._compacted_evidence_read_keys:
-            self.budget.record_no_progress()
+        content = record.content
+        excerpt = content[offset:offset + limit]
+        end = offset + len(excerpt)
+        ranges = self._compacted_evidence_read_ranges.get(key, [])
+        if excerpt and any(start <= offset and end <= stop for start, stop in ranges):
             return {
                 "status": "ok",
                 "evidence_id": evidence_id,
@@ -7412,15 +7430,44 @@ class SpecialistSession:
                 "target": target,
                 "purpose": purpose,
             }
+        if not excerpt:
+            return {
+                "status": "ok", "evidence_id": evidence_id, "target": target,
+                "purpose": purpose, "content": "", "offset": offset,
+                "limit": limit, "truncated": False, "next_offset": None,
+                "source_truncated": bool(record.truncated),
+            }
         if self._compacted_evidence_reads >= _MAX_COMPACTED_EVIDENCE_READS:
             return {
                 "status": "error",
                 "error": "compacted evidence read budget exhausted",
             }
-        self._compacted_evidence_read_keys.add(key)
+        # Return only the first unread contiguous part of the requested range.
+        # Never concatenate separated excerpts under a misleading single offset.
+        for start, stop in ranges:
+            if stop <= offset:
+                continue
+            if start <= offset:
+                offset = min(stop, end)
+            else:
+                end = min(end, start)
+                break
+        excerpt = content[offset:end]
+        # Merge delivered intervals so changing page boundaries cannot make
+        # already delivered content count as progress. At most four reads are
+        # allowed, so a sorted list is sufficient.
+        merged: list[tuple[int, int]] = []
+        for start, stop in sorted([*ranges, (offset, end)]):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(stop, merged[-1][1]))
+            else:
+                merged.append((start, stop))
+        self._compacted_evidence_read_ranges[key] = merged
         self._compacted_evidence_reads += 1
-        content = record.content
-        excerpt = content[offset:offset + limit]
+        next_offset = end
+        for start, stop in merged:
+            if start <= next_offset <= stop:
+                next_offset = stop
         return {
             "status": "ok",
             "evidence_id": evidence_id,
@@ -7431,6 +7478,7 @@ class SpecialistSession:
             "offset": offset,
             "limit": limit,
             "truncated": offset + len(excerpt) < len(content),
+            "next_offset": next_offset if next_offset < len(content) else None,
             "source_truncated": bool(record.truncated),
         }
 

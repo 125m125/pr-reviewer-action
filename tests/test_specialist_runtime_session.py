@@ -266,7 +266,7 @@ def test_compacted_evidence_reader_is_strict_and_deduplicated():
             "purpose": "obligation_resolution", "offset": 0, "limit": 100,
         }),
     }
-    assert session._execute_calls((first,)) is False
+    assert session._execute_calls((first,)) is True
     assert "retained source" in session.conversation.events[-1]["content"]
     assert session.budget.snapshot().tool_calls == 0
     assert session._tool_call_evidence_ids["read-1"] == record.id
@@ -279,8 +279,9 @@ def test_compacted_evidence_reader_is_strict_and_deduplicated():
             "purpose": "obligation_resolution", "offset": 5, "limit": 10,
         }),
     }
-    session._execute_calls((repeated,))
+    assert session._execute_calls((repeated,)) is False
     assert "replayed_compacted" in session.conversation.events[-1]["content"]
+    assert session.budget.snapshot().no_progress_streak == 0
 
     rejected = {
         "id": "read-3",
@@ -292,6 +293,110 @@ def test_compacted_evidence_reader_is_strict_and_deduplicated():
     }
     session._execute_calls((rejected,))
     assert "not marked as compacted" in session.conversation.events[-1]["content"]
+
+
+def test_compacted_evidence_pages_make_progress_without_replaying_delivered_ranges():
+    session = make_session(ScriptedGateway([]))
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "content": "a" * 8_000 + "tail"},
+    )
+    session._compacted_evidence[record.id] = record
+
+    def read(offset, limit=4_000):
+        progressed = session._execute_calls(({
+            "id": f"read-{offset}-{limit}", "name": COMPACTED_EVIDENCE_TOOL_NAME,
+            "arguments": json.dumps({
+                "evidence_id": record.id, "target": "OB-code",
+                "purpose": "obligation_resolution", "offset": offset, "limit": limit,
+            }),
+        },))
+        return progressed, json.loads(session.conversation.events[-1]["content"])
+
+    progressed, first = read(0)
+    assert progressed
+    assert first["content"] == record.content[:4_000]
+    assert first["next_offset"] == 4_000
+    progressed, second = read(first["next_offset"], 6_000)
+    assert progressed
+    assert second["content"] == record.content[4_000:8_000]
+    assert second["next_offset"] == 8_000
+    assert second["limit"] == 4_000
+    # A range spanning two delivered pages is still a duplicate.
+    progressed, duplicate = read(2_000)
+    assert not progressed
+    assert duplicate["replayed_compacted"]
+    assert session._compacted_evidence_reads == 2
+    progressed, last = read(8_000)
+    assert progressed
+    assert last["content"] == record.content[8_000:]
+    assert last["next_offset"] is None
+    assert not last["truncated"]
+    progressed, empty = read(len(record.content))
+    assert not progressed
+    assert empty["next_offset"] is None
+    assert session._compacted_evidence_reads == 3
+    assert session.budget.snapshot().tool_calls == 0
+    assert session.budget.snapshot().no_progress_streak == 0
+
+    # Compaction permits recovery again, but does not reset the read budget.
+    session._compacted_evidence_generation += 1
+    assert read(0)[0]
+    progressed, exhausted = read(4_000)
+    assert not progressed
+    assert exhausted["error"] == "compacted evidence read budget exhausted"
+
+
+@pytest.mark.parametrize(("first_offset", "expected_offset", "expected_end", "next_offset"), [
+    (0, 1_000, 4_000, 4_000),
+    (1_000, 0, 1_000, 2_000),
+])
+def test_compacted_evidence_partial_overlap_returns_only_unread_content(
+    first_offset, expected_offset, expected_end, next_offset,
+):
+    session = make_session(ScriptedGateway([]))
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "content": "a" * 5_000},
+    )
+    session._compacted_evidence[record.id] = record
+    arguments = {
+        "evidence_id": record.id, "target": "OB-code",
+        "purpose": "obligation_resolution",
+    }
+    session._read_compacted_evidence({**arguments, "offset": first_offset, "limit": 1_000})
+
+    page = session._read_compacted_evidence({**arguments, "offset": 0, "limit": 4_000})
+
+    assert page["offset"] == expected_offset
+    assert page["content"] == record.content[expected_offset:expected_end]
+    assert page["next_offset"] == next_offset
+    assert session._compacted_evidence_reads == 2
+
+
+def test_exploration_continues_through_fresh_compacted_pages_and_one_duplicate():
+    gateway = ScriptedGateway([])
+    session = make_session(gateway)
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "content": "a" * 5_000},
+    )
+    session._compacted_evidence[record.id] = record
+    gateway.responses = [
+        tool_call_response(COMPACTED_EVIDENCE_TOOL_NAME, {
+            "evidence_id": record.id, "target": "OB-code",
+            "purpose": "obligation_resolution", "offset": offset,
+        }, call_id=f"page-{index}")
+        for index, offset in enumerate((0, 4_000, 4_000))
+    ] + [checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])]
+    session.budget.record_no_progress()
+
+    result = session.explore()
+
+    assert not result.degraded
+    assert len(gateway.requests) == 4
+    assert all(request.tools_enabled for request in gateway.requests)
+    assert session._compacted_evidence_reads == 2
 
 
 def test_compacted_evidence_requires_authorized_target_and_purpose():
@@ -6389,6 +6494,34 @@ def test_interrupted_reasoning_continues_without_new_user_instruction(finish_rea
     assert [m for m in second if m["role"] == "user"] == [m for m in first if m["role"] == "user"]
     assert "Still tracing the caller." in gateway.requests[1].messages
     assert gateway.requests[1].tools_enabled
+
+
+@pytest.mark.parametrize("reason", ["repeated-block", "repeated-paragraph", "repeated-textual-tool-marker"])
+def test_repetition_watchdog_requests_checkpoint_instead_of_reasoning_continuation(reason):
+    gateway = ScriptedGateway([
+        replace(
+            reasoning_only_response("Repeated investigation deliberation."),
+            finish_reason="incomplete", stream_watchdog_triggered=True,
+            stream_watchdog_reason=reason,
+        ),
+        checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"]),
+    ])
+    session = make_session(gateway)
+    evidence = seed_successful_tool_exchange(
+        session, call_id="accepted", path="a.py", content="accepted source",
+    )
+    attempts = RequestAttemptJournal()
+    session.bind_request_attempt_journal(attempts, "assignment-1")
+
+    result = session.explore()
+
+    assert not result.degraded
+    assert result.state.value == "checkpoint"
+    assert len(gateway.requests) == 2
+    assert not gateway.requests[1].tools_enabled
+    assert f"stream-watchdog-{reason}" in gateway.requests[1].messages
+    assert session.evidence_store.snapshot().get(evidence.id) is not None
+    assert attempts.close_since(0)[0].stream_watchdog_reason == reason
 
 
 @pytest.mark.parametrize("repeat_error", [False, True])
