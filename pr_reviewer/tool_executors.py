@@ -1116,6 +1116,12 @@ def execute_tool_request(
                 output_max_bytes=max_response_bytes,
             )
             if res.get("error"):
+                if (not target.opaque and res["error"] ==
+                        "source denied: source is not allowlisted by current policy"):
+                    # Resolve access identity only on policy denials. Never
+                    # expose an approved opaque URL through routing metadata.
+                    tool_result["effective_tool"] = "web_fetch"
+                    tool_result["effective_arguments"] = {"url": url}
                 raise ValueError(res["error"])
             content_text, truncated = ((res.get('content', ''), False) if res.get('selection') is not None
                 else mask_and_truncate(res.get("content", ""), max_response_bytes))

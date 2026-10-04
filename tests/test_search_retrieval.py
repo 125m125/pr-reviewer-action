@@ -18,6 +18,102 @@ class Provider:
         return [SearchCandidate("Official", self.url, "Details", result_id="forged")]
 
 
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("allowed", [False, True])
+def test_release_listing_routes_before_repository_authorization(monkeypatch, tmp_path, direct, allowed):
+    registry = SearchResultRegistry()
+    url = "https://github.com/qdrant/qdrant/releases"
+    repos = ("qdrant/qdrant",) if allowed else ()
+    calls = []
+    def api(endpoint, *args):
+        calls.append(endpoint)
+        return {"data": [{"tag_name": "v1.18.1"}]}
+    monkeypatch.setattr("pr_reviewer.platform.gh_api", api)
+    discovery = discover("release", Provider(url), SourcePolicy(()),
+        result_registry=registry, allowed_repos=repos, current_repo="own/repo").as_dict()
+    hit = discovery["approved" if allowed else "unapproved"][0]
+    if direct:
+        tool, arguments = "web_fetch", {"url": url}
+    else:
+        assert hit["result_id"] != "forged"
+        tool, arguments = "web_fetch_search_result", {"result_id": hit["result_id"]}
+    result = execute_tool_request(tool, arguments, str(tmp_path), repos, "own/repo", (),
+        12000, 10, search_result_registry=registry)
+    assert result["effective_tool"] == "gh_api"
+    assert result["effective_arguments"] == {"endpoint": "repos/qdrant/qdrant/releases"}
+    if allowed:
+        assert result["status"] == "ok"
+        assert calls == ["repos/qdrant/qdrant/releases"]
+    else:
+        assert calls == []
+        assert result["result"]["error"] == "Repo not allowed: qdrant/qdrant"
+
+
+def test_unapproved_website_id_denies_without_network_and_keeps_access_identity(tmp_path):
+    from pr_reviewer.specialist_runtime.web_evidence import SecureFetcher
+    registry = SearchResultRegistry()
+    url = "https://docs.example.com/guide"
+    hit = discover("contract", Provider(url), SourcePolicy(()),
+        result_registry=registry).as_dict()["unapproved"][0]
+    assert hit["fetch_allowed"] is False
+    assert hit["fetch_method"] == "result_id"
+    assert hit["result_id"] != "forged"
+    assert "snippet" not in hit
+    def no_dns(*args):
+        pytest.fail("Denied discovery must not perform network I/O")
+    result = execute_tool_request("web_fetch_search_result", {"result_id": hit["result_id"]},
+        str(tmp_path), (), "own/repo", (), 12000, 10,
+        search_result_registry=registry, secure_fetcher=SecureFetcher(SourcePolicy(()), resolver=no_dns))
+    assert result["result"]["error"] == "source denied: source is not allowlisted by current policy"
+    assert result["effective_tool"] == "web_fetch"
+    assert result["effective_arguments"] == {"url": url}
+
+    # Exercise the session consumer too: the URL is controller-resolved, not
+    # supplied by the model, and repeated denials produce one access request.
+    from tests.test_specialist_runtime_session import make_session, ScriptedGateway
+    session = make_session(ScriptedGateway([]))
+    for _ in range(2):
+        session._record_source_access_requests("web_fetch_search_result",
+            {"result_id": hit["result_id"]}, result, ("OB-code",), model_purpose="Verify this contract")
+    assert len(session.source_access_requests) == 1
+    assert session.source_access_requests[0].candidate_url == url
+
+
+def test_website_allowlist_does_not_override_repository_denial():
+    registry = SearchResultRegistry()
+    result = discover("release", Provider("https://github.com/qdrant/qdrant/releases"),
+        SourcePolicy.from_hosts(["github.com"]), result_registry=registry,
+        current_repo="own/repo").as_dict()
+    assert result["approved"] == []
+    assert result["unapproved"][0]["denial_reason"] == "Repo not allowed: qdrant/qdrant"
+    assert registry.resolve_target(result["unapproved"][0]["result_id"]).route == "github_metadata"
+
+
+@pytest.mark.parametrize("url,route", [
+    ("https://api.github.com/repos/other/repo/contents/README.md?ref=main", "github_file"),
+    ("https://github.com/other/repo/issues/12#issuecomment-234", "github_metadata"),
+    ("https://docs.example.com/guide?page=2#install", "web"),
+])
+def test_denied_ids_preserve_safe_query_and_anchor_identity(url, route):
+    registry = SearchResultRegistry()
+    hit = discover("contract", Provider(url), SourcePolicy(()),
+        result_registry=registry, current_repo="own/repo").as_dict()["unapproved"][0]
+    target = registry.resolve_target(hit["result_id"])
+    assert target.url == url
+    assert target.route == route
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/other/repo/tree/main", "http://docs.example.com/guide",
+    "https://docs.example.com/guide?token=secret",
+    "https://github.com/own/repo/blob/" + "a" * 40 + "/file.py",
+])
+def test_unsafe_or_unsupported_discovery_does_not_offer_access_request_id(url):
+    hit = discover("contract", Provider(url), SourcePolicy(()),
+        result_registry=SearchResultRegistry(), current_repo="own/repo").as_dict()["unapproved"][0]
+    assert "result_id" not in hit
+
+
 @pytest.mark.parametrize("url,route", [
     ("https://docs.example.com/guide", "web"),
     ("https://github.com/other/repo/issues/12", "github_metadata"),
@@ -350,6 +446,8 @@ def test_search_routes_never_reinterpret_host_spellings_or_nested_escapes(url, m
     ("https://api.github.com/repos/other/repo/pulls/12", "pulls/12"),
     ("https://github.com/other/repo/releases/tag/v1", "releases/tags/v1"),
     ("https://api.github.com/repos/other/repo/releases/tags/v1", "releases/tags/v1"),
+    ("https://github.com/other/repo/releases", "releases"),
+    ("https://api.github.com/repos/other/repo/releases", "releases"),
 ])
 def test_supported_web_and_api_routes_keep_exact_resource(url, endpoint):
     registry = SearchResultRegistry()

@@ -146,12 +146,15 @@ def test_web_policy_replay_keeps_discovery_non_evidentiary_and_denies_redirect_e
     assert result["source_denials"] == 2
     assert result["unsafe_fetch_attempts"] == 0
     assert result["source_access_requests"] == 1
-    assert result["unapproved"][0] == {
+    denied = result["unapproved"][0]
+    assert denied["result_id"].startswith("search-result-")
+    assert {key: value for key, value in denied.items() if key != "result_id"} == {
         "url": "https://evil.example.net/leaked",
         "host": "evil.example.net",
         "path": "/leaked",
         "denial_reason": "source is not allowlisted by current policy",
         "fetch_allowed": False,
+        "fetch_method": "result_id",
     }
     assert "UNAPPROVED-SNIPPET-MUST-STAY-HIDDEN" not in serialized
     assert "REDIRECT-ESCAPE-BODY-MUST-STAY-HIDDEN" not in serialized

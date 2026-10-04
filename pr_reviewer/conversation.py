@@ -248,11 +248,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "release/compare page (HTML often 404s or is JS-rendered): for "
             "github.com metadata use gh_api; for a Gitea/Forgejo host fetch its "
             "/api/v1/... JSON (e.g. .../releases/tags/TAG or "
-            ".../compare/BASE...HEAD), not the web page. Do not probe URLs "
-            "marked fetch_allowed=false by web_search. If external access is "
-            "materially necessary, select at most one clearly authoritative "
-            "unapproved result; that denied fetch records a human access "
-            "request instead of retrieving content."
+            ".../compare/BASE...HEAD), not the web page. For search results use "
+            "web_fetch_search_result with the returned ID, including an unapproved "
+            "result when one authoritative source is materially necessary and "
+            "you need to record a human access request. Do not probe alternatives "
+            "or retry a denial; results marked fetch_method=unavailable cannot be retrieved."
         ),
         "parameters": {
             "type": "object",
@@ -385,9 +385,11 @@ WEB_SEARCH_SCHEMA: dict[str, Any] = {
         "Discover URLs through the action's fixed search provider. Search is "
         "not evidence: approved-source results may include bounded snippets, "
         "while unapproved results contain metadata only. Every result states "
-        "fetch_allowed and its fetch_method. Use web_fetch_search_result with "
-        "the returned result_id, regardless of URL visibility, before relying on "
-        "it. Never probe unavailable alternatives; request access only for at "
+        "fetch_allowed and its fetch_method. Safe targets have a result_id, even "
+        "when authorization is missing; unsafe or unsupported targets are unavailable. "
+        "Use web_fetch_search_result with the returned ID. Authorized results "
+        "are fetched; unapproved IDs only record an access request without fetching. "
+        "Never probe unavailable alternatives; request access only for at "
         "most one result that appears to be an authoritative primary source "
         "and is materially necessary."
     ),
@@ -416,7 +418,10 @@ WEB_SEARCH_SCHEMA: dict[str, Any] = {
 WEB_FETCH_SEARCH_RESULT_SCHEMA: dict[str, Any] = {
     "name": "web_fetch_search_result",
     "description": (
-        "Retrieve one approved search or page-navigation result by its result_id. "
+        "Retrieve one search or page-navigation result by its result_id. An ID does "
+        "not grant permission: an unapproved result records an access request without "
+        "fetching content. Use that only for one materially necessary authoritative "
+        "source, explain why in purpose, and do not repeat denied requests. "
         "Optional search_terms filter website passages (not repository results), using literal "
         "case-insensitive OR matches and bounded context. Excerpts are incomplete evidence. The controller "
         "selects website or repository retrieval and rechecks permission. Visible "

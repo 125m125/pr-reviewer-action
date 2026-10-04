@@ -151,10 +151,14 @@ An accepted checkpoint also pauses when all assigned work has a closed dispositi
 and no selected follow-up, lead, or correction remains unfinished. Private TODOs
 and active findings alone do not keep exploration running; finalization still runs.
 
-Compaction keeps one historical snapshot from the preceding valid checkpoint,
+Normal compaction keeps one historical snapshot from the preceding valid checkpoint,
 the investigation since that boundary, and the complete latest checkpoint exchange.
 Older checkpoint requests and repairs are retired only after a new valid checkpoint.
 Accepted assessments and candidate status survive; historical private TODOs do not.
+If this leaves too little continuation space, the controller reconstructs from the
+assignment and one accepted cumulative checkpoint instead of requesting another
+model checkpoint. Deferred requests remain listed for retry: already-fetched
+results replay without refetching or duplicate penalties, subject to context limits.
 Working summaries replace earlier memory rather than accumulating a diary. Update
 arrays are deltas: an empty array changes nothing, and each obligation has at most
 one update per checkpoint. Valid unfinished updates can also be listed as unresolved;
