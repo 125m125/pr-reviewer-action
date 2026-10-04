@@ -1286,6 +1286,108 @@ def test_deferred_remote_read_replays_content_after_purpose_and_target_change():
     assert not session._deferred_tool_results
 
 
+@pytest.mark.parametrize("fetched", [False, True])
+def test_checkpoint_only_reconstruction_retains_pending_requests_and_replay(fetched):
+    gateway = ScriptedGateway([checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"])])
+    session = make_session(gateway, max_context_tokens=100_000)
+    arguments = {"repository": "owner/other", "ref": "a" * 40, "path": "a.py",
+                 "purpose": "original question", "targets": ["O1"]}
+    session._checkpoint_pressure_due = lambda **kw: fetched != kw.get("reserve_tool_result", False)
+    call = {"id": "pending-read", "name": "read_remote_file", "arguments": json.dumps(arguments)}
+    session.conversation.add_assistant_turn(calls=[call])
+    session._execute_calls((call,))
+    session._checkpoint_pressure_due = lambda **kw: False
+    session.request_checkpoint("controller-request", disposition="pause")
+    session.apply_coverage_feedback(["OB-code"])
+    before = session.budget.snapshot()
+
+    assert session._reconstruct_from_valid_checkpoint(preserve_recent_exchanges=False)
+    snapshot = next(json.loads(e["content"]) for e in session.conversation.events
+                    if e["kind"] == "assistant_text")
+    pending = snapshot["pending_tool_requests"]
+    assert len(pending) == 1
+    assert pending[0]["tool_name"] == "read_remote_file"
+    assert pending[0]["arguments"]["path"] == "a.py"
+    assert pending[0]["result_retained"] is fetched
+    assert not any(e["kind"] in {"assistant_tool_calls", "tool_result"}
+                   for e in session.conversation.events)
+    assert "Coverage feedback." not in json.dumps(session.conversation.events)
+    assert 'controller-selected gaps: ["O1"]' in session.conversation.events[-1]["content"]
+
+    retry = {"id": "retry", "name": "read_remote_file", "arguments": json.dumps({
+        **arguments, "purpose": "worded differently", "targets": ["O2"],
+    })}
+    session.conversation.add_assistant_turn(calls=[retry])
+    session._tool_calls_deferred_for_checkpoint = False
+    session._execute_calls((retry,))
+    assert json.loads(session.conversation.events[-1]["content"])["content"] == "contents:a.py"
+    assert session.budget.snapshot().tool_calls == before.tool_calls + (0 if fetched else 1)
+    assert session.budget.snapshot().tool_rejections == before.tool_rejections
+    assert not session._deferred_tool_results
+    assert session._reconstruct_from_valid_checkpoint(preserve_recent_exchanges=False)
+    snapshot = next(json.loads(e["content"]) for e in session.conversation.events
+                    if e["kind"] == "assistant_text")
+    assert snapshot["pending_tool_requests"] == []
+
+
+def test_followup_reconstructs_accepted_checkpoint_before_asking_for_another():
+    gateway = ScriptedGateway([
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+        checkpoint_response(inspected=[], unresolved=["OB-code", "OB-tests"]),
+    ])
+    session = make_session(gateway, max_context_tokens=100_000)
+    session.request_checkpoint("controller-request", disposition="pause")
+    session.conversation.add_user("obsolete continuation " + "stale " * 15_000)
+    session.apply_coverage_feedback(["OB-tests"])
+    session.max_context_tokens = 16_000
+    session.explore()
+    assert gateway.requests[1].tools_enabled is True
+    assert "obsolete continuation" not in gateway.requests[1].messages
+    assert "cumulative_checkpoint" in gateway.requests[1].messages
+
+
+def test_large_compaction_projection_reconstructs_without_another_model_turn():
+    gateway = ScriptedGateway([checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])])
+    session = make_session(gateway, max_context_tokens=100_000)
+    record = seed_successful_tool_exchange(session, call_id="source", path="a.py",
+        content="retained implementation " + "line\n" * 12_000)
+    session.conversation.add_user("Previous checkpoint contract: " + "owned/path.py " * 6_000)
+    session.request_checkpoint("controller-request", disposition="pause")
+    before_checkpoint = session.latest_checkpoint
+    before_budget = session.budget.snapshot()
+    session.max_context_tokens = 16_000
+
+    session._compact_validated_epoch()
+
+    assert len(gateway.requests) == 1
+    assert session.budget.snapshot() == before_budget
+    assert session.latest_checkpoint.working_summary == before_checkpoint.working_summary
+    assert record.id in session._compacted_evidence
+    assert not session._checkpoint_pressure_due()
+    assert not any(e["kind"] == "tool_result" for e in session.conversation.events)
+    diagnostic = session._finalization_diagnostics[-1]
+    assert diagnostic["compaction_level"] == "checkpoint_reconstruction"
+    assert diagnostic["compaction_input_tokens_after"] < diagnostic["compaction_input_tokens_before"]
+
+
+@pytest.mark.parametrize("fetched", [False, True])
+def test_delivered_deferred_error_is_no_longer_pending(fetched):
+    session = make_session(ScriptedGateway([]), execute_tool=lambda *args: {
+        "status": "error", "result": {"error": "remote request timed out"},
+    })
+    session._checkpoint_pressure_due = lambda **kw: fetched != kw.get("reserve_tool_result", False)
+    args = {"repository": "owner/other", "path": "a.py", "ref": "a" * 40}
+    session._execute_calls(({"id": "first", "name": "read_remote_file", "arguments": json.dumps(args)},))
+    assert session._pending_tool_requests
+    session._checkpoint_pressure_due = lambda **kw: False
+    session._tool_calls_deferred_for_checkpoint = False
+    session._execute_calls(({"id": "retry", "name": "read_remote_file", "arguments": json.dumps(args)},))
+    assert "timed out" in session.conversation.events[-1]["content"]
+    assert session.budget.snapshot().tool_calls == 1
+    assert not session._deferred_tool_results
+    assert not session._pending_tool_requests
+
+
 def test_truncated_deferred_result_preserves_metadata_through_repeated_deferral():
     session = make_session(
         ScriptedGateway([]), max_tool_result_bytes=1000,
@@ -5729,7 +5831,7 @@ def test_context_pressure_checkpoint_compacts_and_resumes_same_specialist():
         model_turns=8, tool_calls=8,
     )
     pressure_checks = iter((True, False, False))
-    session._checkpoint_pressure_due = lambda: next(pressure_checks, False)
+    session._checkpoint_pressure_due = lambda **kwargs: next(pressure_checks, False)
 
     result = session.explore()
 

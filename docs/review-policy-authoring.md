@@ -415,6 +415,10 @@ review.
 ### Search results and retrieval
 
 Every approved search result advertises `web_fetch_search_result(result_id)`.
+Safe results missing authorization also receive an ID, with `fetch_allowed=false`.
+Selecting one materially necessary authoritative result records an access request
+without fetching its content. IDs never grant access; unsafe or unsupported
+resources instead report `fetch_method=unavailable` and have no retrieval ID.
 Safe URLs, repository names, resource identifiers and file revisions remain
 visible for orientation, not as alternative retrieval instructions. Opaque URLs
 remain hidden. Search snippets are discovery metadata, not proof.
@@ -428,7 +432,7 @@ attempted; it does not establish that a resource exists or that the token can
 access it. A 404 is not an allowlist denial.
 
 Repository routing supports public GitHub repository roots, issue/PR details,
-full-SHA commits, release tags, supported issue/review-comment anchors, and source
+full-SHA commits, release listings and tags, supported issue/review-comment anchors, and source
 files. API equivalents and immutable raw-file links are supported. File line
 anchors select the requested range (at most 400 lines); unknown anchors and
 query semantics are rejected rather than silently ignored. Nested URL path

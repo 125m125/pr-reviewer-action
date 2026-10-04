@@ -129,6 +129,8 @@ def github_search_target(url: str) -> SearchRetrievalTarget | None:
         endpoint += f"/commits/{rest[1]}"
     elif len(rest) == 3 and rest[:2] == ["releases", "tags" if api else "tag"]:
         endpoint += "/releases/tags/" + rest[2]
+    elif rest == ["releases"]:
+        endpoint += "/releases"
     elif api and len(rest) == 3 and rest[:2] in (["issues", "comments"], ["pulls", "comments"]) and rest[2].isdigit():
         endpoint += "/" + "/".join(rest)
     else:
@@ -513,6 +515,8 @@ class SearchDiscovery:
                 "path": candidate.path,
                 "denial_reason": candidate.denial_reason,
                 "fetch_allowed": False,
+                "fetch_method": "result_id" if candidate.result_id else "unavailable",
+                **({"result_id": candidate.result_id} if candidate.result_id else {}),
             }
 
         count = len(self.approved) + len(self.unapproved)
@@ -970,10 +974,12 @@ def _route_candidates(candidates, source_policy, *, result_registry, allowed_rep
             resource, fragment = candidate.url, None
         decision = source_policy.classify(resource)
         target = None
+        request_target = None
         route_error = None
         try:
             target = github_search_target(candidate.url)
             if target is not None:
+                request_target = target
                 authorize_search_target(target, allowed_repos, current_repo)
         except (ValueError, SourceDenied) as exc:
             route_error = str(exc)
@@ -982,8 +988,8 @@ def _route_candidates(candidates, source_policy, *, result_registry, allowed_rep
             parsed = urlsplit(candidate.url)
             decision = SourceDecision(True, parsed.hostname or "", parsed.path,
                 classification="authorized-github-repository", canonical_url=candidate.url)
-        elif route_error and not decision.approved:
-            decision = replace(decision, reason=route_error)
+        elif route_error:
+            decision = replace(decision, approved=False, reason=route_error)
         if decision.approved:
             if result_registry is None:
                 raise SourceDenied("search result registry is required for approved discovery")
@@ -1042,6 +1048,23 @@ def _route_candidates(candidates, source_policy, *, result_registry, allowed_rep
                 continue
             # Never retain provider-controlled content for unapproved sources.
             safe_url, safe_host, safe_path = _safe_discovery_url(candidate.url)
+            result_id = None
+            if result_registry is not None:
+                if request_target is not None and (route_error or "").startswith("Repo not allowed: "):
+                    # Permission is the only missing prerequisite. Invalid paths,
+                    # refs and platform restrictions must not become access requests.
+                    repo = route_error.removeprefix("Repo not allowed: ")
+                    try:
+                        authorize_search_target(request_target, (repo,), current_repo)
+                    except (ValueError, SourceDenied):
+                        pass
+                    else:
+                        result_id = result_registry.register(candidate.url, request_target)
+                elif route_error is None and decision.reason == "source is not allowlisted by current policy":
+                    # Display URLs omit navigation queries/anchors. Validate the
+                    # original resource independently without granting access.
+                    if SourcePolicy.from_hosts((decision.host,)).classify(resource).approved:
+                        result_id = result_registry.register(candidate.url)
             unapproved.append(SearchCandidate(
                 title=None,
                 url=safe_url,
@@ -1049,6 +1072,7 @@ def _route_candidates(candidates, source_policy, *, result_registry, allowed_rep
                 host=safe_host,
                 path=safe_path,
                 denial_reason=decision.reason,
+                result_id=result_id,
             ))
     approved = approved[:tool_max_search_results]
     remaining = tool_max_search_results - len(approved)
