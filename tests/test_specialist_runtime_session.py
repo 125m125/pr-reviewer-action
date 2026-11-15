@@ -460,6 +460,126 @@ def test_test_results_tool_is_not_advertised_without_seeded_cases():
     }
 
 
+@pytest.mark.parametrize("suffix", ["x" * 150, '字\\"\n' * 60])
+def test_test_result_byte_pagination_delivers_complete_records_without_skipping(suffix):
+    tests = tuple({
+        "name": f"test_{i}_{suffix}", "status": "failed" if i == 23 else "passed",
+        "report": "module/" * 35 + "pytest.xml", "message": "",
+    } for i in range(24))
+    session = make_session(ScriptedGateway([]), test_results=tests, max_tool_result_bytes=2_000)
+    offset, received = 0, []
+    for page_number in range(24):
+        session._execute_calls(({
+            "id": f"tests-{page_number}", "name": TEST_RESULTS_TOOL_NAME,
+            "arguments": json.dumps({"name_contains": "test_", "max_results": 50, "offset": offset}),
+        },))
+        event = session.conversation.events[-1]
+        page = json.loads(event["content"])
+        assert len(event["content"].encode("utf-8")) <= 2_000
+        assert page["count"] == len(page["tests"]) > 0
+        assert page["total_matches"] == 24
+        received.extend(page["tests"])
+        assert len(session.evidence_store.snapshot().records) == len(received)
+        if page["next_offset"] is None:
+            assert page["truncated"] is False
+            break
+        assert page["truncated"] is True
+        assert page["next_offset"] == offset + page["count"]
+        offset = page["next_offset"]
+    assert [item["name"] for item in received] == [item["name"] for item in tests]
+    assert received[-1]["status"] == "failed"
+    assert len({item["evidence_id"] for item in received}) == 24
+
+
+def test_oversized_test_result_is_explicitly_shortened_without_blocking_next_page():
+    message = 'Failure "details" 字\n' * 300
+    tests = ({"name": "test_large", "status": "failed", "message": message},
+             {"name": "test_small", "status": "passed"})
+    session = make_session(ScriptedGateway([]), test_results=tests, max_tool_result_bytes=1_000)
+    session._execute_calls(({
+        "id": "large-test", "name": TEST_RESULTS_TOOL_NAME,
+        "arguments": json.dumps({"name_contains": "test_", "max_results": 50}),
+    },))
+    page = json.loads(session.conversation.events[-1]["content"])
+    assert page["count"] == 1
+    assert page["total_matches"] == 2
+    assert page["next_offset"] == 1
+    first = page["tests"][0]
+    assert first["name"] == "test_large"
+    assert first["status"] == "failed"
+    assert first["truncated_fields"] == ["message"]
+    assert message.startswith(first["message"])
+    assert session.test_results[0]["message"] == message
+    evidence = session.evidence_store.snapshot().get(first["evidence_id"])
+    assert json.loads(evidence.content)["test"]["message"] == message
+    next_page = session._read_test_results({"name_contains": "test_", "offset": 1})
+    assert next_page["tests"][0]["name"] == "test_small"
+    assert next_page["next_offset"] is None
+
+
+def test_oversized_test_result_omits_paths_instead_of_presenting_partial_paths():
+    test = {"name": "test_large_paths", "status": "passed",
+            "file": "nested/" * 200 + "test.py", "report": "reports/" * 200 + "junit.xml"}
+    session = make_session(ScriptedGateway([]), test_results=(test,), max_tool_result_bytes=500)
+    session._execute_calls(({
+        "id": "large-paths", "name": TEST_RESULTS_TOOL_NAME,
+        "arguments": json.dumps({"name_contains": "test_"}),
+    },))
+    content = session.conversation.events[-1]["content"]
+    page = json.loads(content)
+    assert len(content.encode("utf-8")) <= 500
+    assert page["count"] == page["total_matches"] == 1
+    assert page["next_offset"] is None
+    item = page["tests"][0]
+    assert item["file"] == item["report"] == ""
+    assert set(item["truncated_fields"]) == {"file", "report"}
+    retained = json.loads(session.evidence_store.snapshot().get(item["evidence_id"]).content)
+    assert retained["test"] == test
+
+
+def test_test_result_page_reports_an_impossibly_small_budget_without_retaining_cases():
+    session = make_session(ScriptedGateway([]),
+                           test_results=({"name": "test_large", "status": "failed"},),
+                           max_tool_result_bytes=200)
+    session._execute_calls(({
+        "id": "tiny-budget", "name": TEST_RESULTS_TOOL_NAME,
+        "arguments": json.dumps({"name_contains": "test_"}),
+    },))
+    page = json.loads(session.conversation.events[-1]["content"])
+    assert page["status"] == "error"
+    assert "byte limit too small" in page["error"]
+    assert session.evidence_store.snapshot().records == ()
+
+
+@pytest.mark.parametrize("query", [
+    {"name_contains": "absent"}, {"name_contains": "test_", "offset": 20},
+])
+def test_empty_test_result_page_does_not_offer_a_nonadvancing_offset(query):
+    session = make_session(ScriptedGateway([]),
+                           test_results=({"name": "test_one", "status": "passed"},),
+                           max_tool_result_bytes=200)
+    page = session._read_test_results(query)
+    assert page["tests"] == []
+    assert page["count"] == 0
+    assert page["truncated"] is False
+    assert page["next_offset"] is None
+
+
+def test_empty_test_result_page_reports_a_budget_too_small_for_its_envelope():
+    session = make_session(ScriptedGateway([]),
+                           test_results=({"name": "test_one", "status": "passed"},),
+                           max_tool_result_bytes=100)
+    session._execute_calls(({
+        "id": "tiny-empty-page", "name": TEST_RESULTS_TOOL_NAME,
+        "arguments": json.dumps({"name_contains": "absent"}),
+    },))
+    content = session.conversation.events[-1]["content"]
+    assert len(content.encode("utf-8")) <= 100
+    page = json.loads(content)
+    assert page["status"] == "error"
+    assert "byte limit too small" in page["error"]
+
+
 def test_context_pressure_defers_tool_calls_without_charging_or_deduplicating():
     session = make_session(ScriptedGateway([]), tool_calls=4)
     session._checkpoint_pressure_due = lambda *args, **kwargs: True

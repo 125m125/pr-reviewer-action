@@ -432,8 +432,10 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "name_contains or name_regex; matching test cases include their "
             "status, failure details, source path/line when available, and "
             "the evidence ID to cite. This tool never executes tests or fetches "
-            "arbitrary artifacts. Optionally filter by exact report name; use offset "
-            "to page through matching cases."
+            "arbitrary artifacts. Optionally filter by exact report name; pass the "
+            "returned next_offset as offset for the next page. Pages may contain "
+            "fewer than max_results to fit the byte limit; truncated_fields marks "
+            "shortened details in an oversized individual case."
         ),
         "parameters": {"type": "object", "properties": {
             "name_contains": {"type": "string", "maxLength": 300},
@@ -7507,7 +7509,7 @@ class SpecialistSession:
             offset = max(0, int(arguments.get("offset", 0)))
         except (TypeError, ValueError):
             return {"status": "error", "error": "offset must be a nonnegative integer"}
-        matches: list[dict[str, Any]] = []
+        originals: list[tuple[int, Mapping[str, Any]]] = []
         total = 0
         for index, test in enumerate(self.test_results, start=1):
             if report and str(test.get("report") or "") != report:
@@ -7523,25 +7525,54 @@ class SpecialistSession:
             total += 1
             if total <= offset:
                 continue
-            if len(matches) < limit:
-                item = dict(test)
-                item["evidence_id"] = retain_test_result(
-                    self.evidence_store,
-                    test,
-                    repository=self.test_results_repository,
-                    head_sha=self.test_results_head_sha,
-                    index=index,
-                    session_id=self.session_id,
-                )
-                matches.append(item)
-        return {
-            "status": "ok",
-            "count": len(matches),
-            "total_matches": total,
-            "truncated": total > offset + len(matches),
-            "next_offset": offset + len(matches) if total > offset + len(matches) else None,
-            "tests": matches,
-        }
+            if len(originals) < limit:
+                originals.append((index, test))
+        # Reserve the exact size of the store's evidence:<SHA256> IDs before
+        # retaining anything. Only delivered records should become evidence.
+        matches = [dict(test, evidence_id="evidence:" + "0" * 64) for _, test in originals]
+
+        def page() -> dict[str, Any]:
+            more = total > offset + len(matches)
+            return {
+                "status": "ok", "count": len(matches), "total_matches": total,
+                "truncated": more,
+                "next_offset": offset + len(matches) if more else None,
+                "tests": matches,
+            }
+
+        def fits() -> bool:
+            # Match Conversation's wire serialization, including escaping and
+            # pagination metadata; generic byte truncation would break JSON.
+            body = json.dumps(page(), ensure_ascii=False, sort_keys=True)
+            return len(body.encode("utf-8")) <= self.max_tool_result_bytes
+
+        while len(matches) > 1 and not fits():
+            matches.pop()
+        if matches:
+            item = matches[0]
+            while not fits():
+                fields = [
+                    key for key, value in item.items()
+                    if isinstance(value, str) and value and key not in {"status", "evidence_id"}
+                ]
+                if not fields:
+                    return {"status": "error", "error": "test result byte limit too small"}
+                key = max(fields, key=lambda key: len(item[key].encode("utf-8")))
+                shortened = item.setdefault("truncated_fields", [])
+                if key not in shortened:
+                    shortened.append(key)
+                # Never present a clipped source path as an actual file/report.
+                item[key] = "" if key in {"file", "report"} else item[key][:len(item[key]) // 2]
+        if not fits():
+            return {"status": "error", "error": "test result byte limit too small"}
+        for item, (index, test) in zip(matches, originals):
+            item["evidence_id"] = retain_test_result(
+                self.evidence_store, test,
+                repository=self.test_results_repository,
+                head_sha=self.test_results_head_sha,
+                index=index, session_id=self.session_id,
+            )
+        return page()
 
     def _snapshot(
         self,
