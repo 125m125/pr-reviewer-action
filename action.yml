@@ -1154,7 +1154,6 @@ runs:
           exit 1
         fi
         CLEANUP_NATIVE_REVIEWS="$(resolve_cleanup_flag "${CLEANUP_PREVIOUS_NATIVE_REVIEWS:-auto}" "$EFFECTIVE_PUBLISH_MODE")"
-        cleanup_native_reviews "$CLEANUP_NATIVE_REVIEWS"
         python3 "${GITHUB_ACTION_PATH}/scripts/publish_specialist_review.py" \
           --mode "$EFFECTIVE_PUBLISH_MODE" \
           --handoff review-handoff.json \
@@ -1165,6 +1164,8 @@ runs:
           --changed-files-count "$CHANGED_FILE_COUNT" \
           --diff-complete false \
           --policy-result specialist-policy-result.json \
+          --review-artifact specialist-review-artifact.json \
+          --cleanup-previous-reviews "$CLEANUP_NATIVE_REVIEWS" \
           --repo "$REPO" \
           --pr-number "$PR_NUMBER" \
           --head-sha "$HEAD_SHA" \

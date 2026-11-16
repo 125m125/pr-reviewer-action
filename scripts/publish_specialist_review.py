@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -30,6 +32,7 @@ from pr_reviewer.specialist_runtime.types import (  # noqa: E402
     ReviewNote,
     ReviewNoteKind,
 )
+from pr_reviewer.specialist_runtime.policy import parse_review_policy  # noqa: E402
 
 
 def _json(path: str) -> Any:
@@ -167,6 +170,59 @@ def _fork_state(value: str) -> bool | None:
     return normalized == "true"
 
 
+def _access_configuration(value: object, *, repo: str, head_sha: str, pr_number: int):
+    if value is None:
+        return None, ()
+    if (
+        not isinstance(value, Mapping)
+        or value.get("repository") != repo
+        or value.get("head_sha") != head_sha
+        or value.get("pr_number") != pr_number
+    ):
+        raise ValueError("review artifact identity does not match repository, PR, and head")
+    configuration = value.get("configuration", {})
+    external = value.get("external_access", {})
+    if not isinstance(configuration, Mapping) or not isinstance(external, Mapping):
+        raise ValueError("review artifact authorization configuration must be an object")
+    adapter = configuration.get("adapter", {})
+    if not isinstance(adapter, Mapping):
+        raise ValueError("review artifact adapter configuration must be an object")
+    repositories = adapter.get("allowed_github_repositories", [])
+    if not isinstance(repositories, list) or any(not isinstance(item, str) for item in repositories):
+        raise ValueError("allowed_github_repositories must be an array of strings")
+    # The artifact's policy field is metadata; these are the effective policy's rules.
+    sources = external.get("allowed_sources")
+    policy = parse_review_policy({"version": 3, "sources": sources}) if sources is not None else None
+    return policy, tuple(repositories)
+
+
+def _run_url(explicit: str | None, repo: str) -> str:
+    candidate = explicit
+    if candidate is None:
+        run_id = os.environ.get("GITHUB_RUN_ID", "")
+        if not re.fullmatch(r"[0-9]+", run_id) or os.environ.get("GITHUB_REPOSITORY") != repo:
+            return ""
+        candidate = os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/") + f"/{repo}/actions/runs/{run_id}"
+        attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
+        if re.fullmatch(r"[1-9][0-9]*", attempt) and int(attempt) > 1:
+            candidate += f"/attempts/{attempt}"
+    try:
+        parsed = urlsplit(candidate)
+        valid = (
+            re.fullmatch(r"https://[^\s<>\[\]()]+", candidate)
+            and parsed.hostname and parsed.username is None and parsed.password is None
+            and parsed.port in (None, 443) and not parsed.query and not parsed.fragment
+            and re.fullmatch("/" + re.escape(repo) + r"/actions/runs/[0-9]+(?:/attempts/[1-9][0-9]*)?", parsed.path)
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        if explicit is not None:
+            raise ValueError("run URL must identify this repository's HTTPS GitHub Actions run")
+        return ""
+    return candidate
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True, choices=("comment", "review_comment", "review_verdict"))
@@ -179,6 +235,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--diff-complete", type=_bool, default=False)
     parser.add_argument("--policy-result", required=True)
     parser.add_argument("--artifacts")
+    parser.add_argument("--review-artifact")
+    parser.add_argument("--run-url")
+    parser.add_argument("--cleanup-previous-reviews", type=_bool, default=True)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--pr-number", required=True, type=int)
     parser.add_argument("--head-sha", required=True)
@@ -204,6 +263,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     policy = _policy(_json(args.policy_result))
     artifacts = _artifacts(_json(args.artifacts) if args.artifacts else None)
+    access_policy, allowed_repositories = _access_configuration(
+        _json(args.review_artifact) if args.review_artifact else None,
+        repo=args.repo, head_sha=args.head_sha, pr_number=args.pr_number,
+    )
+    run_url = _run_url(args.run_url, args.repo)
     client = GhReviewClient(action_root=args.action_root)
     publisher = GitHubReviewPublisher(
         client, state_path=args.state, max_attempts=args.max_attempts
@@ -221,6 +285,10 @@ def main(argv: list[str] | None = None) -> int:
         pr_number=args.pr_number,
         head_sha=args.head_sha,
         artifact_links=artifacts,
+        access_policy=access_policy,
+        allowed_github_repositories=allowed_repositories,
+        run_url=run_url,
+        cleanup_previous_reviews=args.cleanup_previous_reviews,
         approval_policy=PublisherApprovalPolicy(
             allow_approve=args.allow_approve,
             approve_forks=args.approve_forks,

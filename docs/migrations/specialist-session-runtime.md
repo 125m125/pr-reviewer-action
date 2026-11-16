@@ -89,9 +89,14 @@ validation paths.
   policy produces a constrained/degraded result rather than broader access.
 - The published handoff is deliberately sparse: it gives a human the verdict,
   a behavioral change overview, what the AI reviewed, and useful human focus.
-  Detailed evidence, access requests, and findings
-  remain in resolvable notes instead of duplicating every finding in the sticky
-  summary.
+  In native publishing modes this handoff is the review body, with findings in
+  attached review threads and access requests in separate managed comments.
+  A successful full replacement minimizes older owned reviews and legacy sticky
+  handoffs as outdated without erasing their text or resolving open findings.
+  Incremental reviews preserve the previous full review. Explicit `comment`
+  mode still uses a sticky handoff. Later policy grants prepend an access-granted
+  note to the original access request and minimize it as resolved; the historical
+  pending wording is preserved, and no successful retrieval is implied.
 - Direct budgets bound the whole run, per-session turns, read-only tool calls,
   recovery, concurrency, and the absolute deadline. The artifact records the
   budget and event accounting, policy result, head SHA, and publication state.
