@@ -1051,11 +1051,28 @@ When `publish_mode` is set to `review_comment` or `review_verdict`, the action c
 
 By default, the action automatically cleans up previous managed native reviews for `review_comment` and `review_verdict` modes. The `cleanup_previous_native_reviews` input controls this behavior:
 
+For **specialist reviews**, the native review body contains the complete human
+handoff, reviewed head, scope, and run link; findings remain attached as inline
+review comments. There is no additional sticky handoff in native modes. A full
+review minimizes earlier owned specialist reviews and legacy sticky handoffs as
+outdated **only after the replacement review is confirmed submitted**. Their
+original text and finding threads remain intact. Incremental reviews retain the
+previous full review instead of implying that a partial review supersedes it.
+Retries of the same publication reuse the existing review.
+
+When a later run confirms that an old access request is now authorized by its
+effective repository/source policy, it prepends an **access granted** note with
+the confirming run and head, then minimizes that comment as resolved. The entire
+original request remains unchanged, including its historical pending-access
+wording. This confirms authorization only—not successful retrieval or resolution
+of the underlying review question. Unrecognized or still-denied requests remain
+untouched; absence from a later run's request list is not an authorization grant.
+
 - `auto` (default): enables cleanup for `review_comment` and `review_verdict` modes, disabled for `comment` mode (which already edits one sticky comment in place).
 - `true`: always enable cleanup regardless of publish mode.
 - `false`: disable cleanup entirely.
 
-The cleanup process:
+For single-model reviews, the existing cleanup process is:
 
 1. Identifies previous managed AI reviews from the current authenticated actor that carry the `<!-- ai-pr-reviewer -->` marker.
 2. Dismisses old approval or request-changes verdict reviews when permissions allow, so stale verdicts stop counting toward branch protection.
@@ -1107,7 +1124,7 @@ With `verdict_policy: findings_severity_gated`, the verdict is derived determini
 With `inline_findings: "true"` and a native publish mode, findings that carry a `file` + `line` anchoring to the PR diff are attached as **line-anchored review comments**:
 
 - `publish_mode: review_verdict` — the approve/request_changes review itself carries the inline comments (`comments[]` on the reviews API). If GitHub rejects the payload (e.g. an anchor raced a new push), the action falls back to the plain review, so publishing never fails because of inline findings.
-- `publish_mode: review_comment` — the sticky summary comment is published as usual, plus a separate native `COMMENT` review carrying the inline comments. That review includes the managed marker, so the next run's cleanup marks it superseded.
+- `publish_mode: review_comment` — specialist reviews put the handoff and inline comments in one native `COMMENT` review; single-model reviews retain the existing sticky-summary plus native-inline-review behavior. Managed reviews can be marked superseded by subsequent runs.
 - `publish_mode: comment` — ignored.
 
 Anchors are validated against the diff before submission (GitHub only accepts comments on lines present in the diff); findings without a valid anchor stay in the review body. Comment bodies are secret-masked and @-mention-neutralized like all published output, and capped by `inline_findings_max` (default 20).
