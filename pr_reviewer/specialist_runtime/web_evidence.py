@@ -558,8 +558,9 @@ class SourceAccessRequest:
     purpose: str
     authority_reason: str = ""
     model_purpose: str = ""
+    authorized_alternatives: tuple[Mapping[str, object], ...] = ()
 
-    def as_dict(self) -> dict[str, str]:
+    def as_dict(self) -> dict[str, object]:
         return {
             "kind": "source_access_request",
             "host": self.host,
@@ -568,6 +569,8 @@ class SourceAccessRequest:
             "purpose": self.purpose,
             "authority_reason": self.authority_reason,
             "model_purpose": self.model_purpose,
+            **({"authorized_alternatives": list(self.authorized_alternatives)}
+               if self.authorized_alternatives else {}),
         }
 
 
@@ -646,6 +649,28 @@ class SourcePolicy:
     @property
     def has_approved_sources(self) -> bool:
         return bool(self.rules)
+
+    def authorized_alternatives(self, url: str) -> list[dict[str, object]]:
+        from .source_alternatives import rank_host
+
+        decision = self.classify(url)
+        if decision.reason != 'source is not allowlisted by current policy':
+            return []
+        ranked = []
+        for rule in self.rules:
+            rank = rank_host(decision.host, rule.host)
+            if rank is None:
+                continue
+            priority, similarity, reason = rank
+            item = {
+                'host': rule.host, 'include_subdomains': rule.include_subdomains,
+                'path_prefixes': list(rule.path_prefixes), 'schemes': list(rule.schemes),
+                'match_reason': reason, 'content_verified': False,
+            }
+            if rule.classification:
+                item['classification'] = rule.classification
+            ranked.append((priority, -similarity, rule.host, json.dumps(item, sort_keys=True), item))
+        return [item[-1] for item in sorted(ranked, key=lambda x: x[:4])[:3]]
 
     def classify(self, url: str, *, allow_opaque: bool = False) -> SourceDecision:
         try:
@@ -1094,6 +1119,7 @@ def source_access_request(
     purpose: str,
     authority_reason: str = "",
     model_purpose: str = "",
+    authorized_alternatives: Sequence[Mapping[str, object]] = (),
 ) -> SourceAccessRequest:
     safe_url, safe_host, _ = _safe_discovery_url(candidate.url)
     if not safe_host:
@@ -1107,6 +1133,7 @@ def source_access_request(
         purpose=mask_secrets(str(purpose).strip())[:1000],
         authority_reason=mask_secrets(str(authority_reason).strip())[:1000],
         model_purpose=_bounded_request_text(model_purpose, 300),
+        authorized_alternatives=tuple(authorized_alternatives[:3]),
     )
 
 

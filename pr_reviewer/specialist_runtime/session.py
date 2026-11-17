@@ -4829,6 +4829,7 @@ class SpecialistSession:
                     "assigned review obligation.",
                     candidate.denial_reason,
                     model_purpose,
+                    authorized_alternatives=payload.get('authorized_alternatives', ()),
                 )
             except ValueError:
                 continue
