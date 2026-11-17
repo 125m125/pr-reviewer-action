@@ -4,6 +4,28 @@ import hashlib
 import json
 
 
+def source_budget_result(payload, max_bytes, *, web=False, remote=False):
+    """Report a budget failure only when existing source content was omitted entirely."""
+    if payload.get('content', '').strip():
+        return payload
+    page = payload.get('range', {})
+    selection = payload.get('selection', {})
+    if not (page.get('omitted_lines') or selection.get('omitted_matches', 0) > 0):
+        return payload
+    result = dict(payload, error='No readable content fit within the source budget.',
+                  error_code='source_budget_exceeded', source_budget_bytes=max_bytes)
+    if page:
+        result['range'] = dict(page)
+        if page.get('total_lines') is not None and (page.get('next_offset') or 0) > page['total_lines']:
+            result['range']['next_offset'] = None
+    result['hint'] = (
+        'You might want to use more focused search_terms or a smaller documentation page.' if web else
+        'You might want to choose a smaller remote source or use repository search if available.' if remote else
+        'If you need specific information, you might want to use git_grep to retrieve match-centered excerpts.'
+    ) + ' Excerpts do not establish exhaustive claims about omitted content.'
+    return result
+
+
 def line_window(text, offset, max_bytes, *, has_more=False):
     lines = text.splitlines(keepends=True)
     kept = []

@@ -18,7 +18,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol, Sequence
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
-
 from pr_reviewer.access_request_reconciliation import reconcile_access_request_comment
 from pr_reviewer.enforcement import RuntimeVerdictPolicyResult
 from pr_reviewer.platform import gh_argv
@@ -27,6 +26,14 @@ from pr_reviewer.specialist_runtime.types import ReviewHandoff, ReviewNote, Revi
 from scripts.redact import mask_secrets
 from scripts.sanitize_review_markdown import sanitize_markdown
 from scripts.strip_metadata_markers import strip_reserved_markers
+
+
+def _same_github_login(left: object, right: object) -> bool:
+    """REST/app bot identities can carry a suffix absent from GraphQL authors."""
+    def normalized(value):
+        return value.casefold().removesuffix('[bot]') if isinstance(value, str) else ''
+    first, second = normalized(left), normalized(right)
+    return bool(first and second and first == second)
 
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -2073,34 +2080,55 @@ class GitHubReviewPublisher:
             if not prior.get("is_minimized"):
                 self._minimize(state, prior.get("node_id"), "RESOLVED")
 
+        diagnostics = state['previous_review_cleanup'] = {
+            'enabled': cleanup,
+            'ownership': managed.get('review_ownership_diagnostics', {}),
+            'owned_reviews': len(managed.get('reviews', ())),
+            'eligible_reviews': 0, 'minimized_reviews': 0, 'failed_minimizations': 0,
+            'minimized_handoff_comments': 0,
+            'skipped_current_review': 0, 'skipped_pending': 0,
+            'skipped_unmanaged': 0, 'skipped_already_minimized': 0,
+        }
         if not cleanup:
+            diagnostics['skip_reason'] = 'cleanup disabled or review scope is not full'
             return
         for review in managed.get("reviews", ()):
-            if (review.get("id") == state["review"]["id"]
-                    or review.get("state") == "PENDING"
-                    or not str(review.get("body", "")).startswith((
-                        "<!-- ai-pr-reviewer-specialist:", "<!-- ai-pr-reviewer -->",
-                    ))):
+            if review.get('id') == state['review']['id']:
+                diagnostics['skipped_current_review'] += 1
                 continue
+            if review.get('state') == 'PENDING':
+                diagnostics['skipped_pending'] += 1
+                continue
+            if not str(review.get('body', '')).startswith((
+                '<!-- ai-pr-reviewer-specialist:', '<!-- ai-pr-reviewer -->',
+            )):
+                diagnostics['skipped_unmanaged'] += 1
+                continue
+            diagnostics['eligible_reviews'] += 1
             if review.get("state") in {"APPROVED", "CHANGES_REQUESTED"}:
                 dismissed = self._call("dismiss_previous_review", self.client.dismiss_review, review["id"])
                 if not isinstance(dismissed, Mapping) or dismissed.get("state") != "DISMISSED" or dismissed.get("id") != review["id"]:
                     self._errors.append({"operation": "dismiss_previous_review", "error": "review dismissal was not confirmed"})
             if not review.get("isMinimized"):
-                self._minimize(state, review.get("id"), "OUTDATED")
+                success = self._minimize(state, review.get("id"), "OUTDATED")
+                diagnostics['minimized_reviews' if success else 'failed_minimizations'] += 1
+            else:
+                diagnostics['skipped_already_minimized'] += 1
         for prior in managed.get("handoff_comments", ()):
             if not prior.get("is_minimized"):
-                self._minimize(state, prior.get("node_id"), "OUTDATED")
+                success = self._minimize(state, prior.get("node_id"), "OUTDATED")
+                diagnostics['minimized_handoff_comments' if success else 'failed_minimizations'] += 1
 
-    def _minimize(self, state: dict[str, Any], node_id: object, classifier: str) -> None:
+    def _minimize(self, state: dict[str, Any], node_id: object, classifier: str) -> bool:
         if not isinstance(node_id, str) or not node_id:
             self._errors.append({"operation": "minimize_comment", "error": "owned comment node ID is missing"})
-            return
+            return False
         result = self._call("minimize_comment", self.client.minimize_comment, node_id, classifier)
         if not isinstance(result, Mapping) or result.get("isMinimized") is not True:
             self._errors.append({"operation": "minimize_comment", "error": "comment minimization was not confirmed"})
-            return
+            return False
         self._checkpoint(state, "minimize_comment", {"node_id": node_id, "classifier": classifier})
+        return True
 
 
 _MANAGED_IDENTITY_QUERY = """
@@ -2409,7 +2437,7 @@ class GhReviewClient:
             trusted_author = (
                 (
                     node.get("viewerDidAuthor") is True
-                    and author_login == viewer_login
+                    and _same_github_login(author_login, viewer_login)
                 )
                 or author_login in _TRUSTED_WORKFLOW_COMMENT_AUTHORS
             )
@@ -2479,7 +2507,7 @@ class GhReviewClient:
                 node.get("body") == expected_body
                 and node.get("viewerDidAuthor") is True
                 and isinstance(author, Mapping)
-                and author.get("login") == viewer_login
+                and _same_github_login(author.get("login"), viewer_login)
             ):
                 matches.append(
                     self._validated_issue_comment(node, label="managed issue comment")
@@ -2653,7 +2681,7 @@ class GhReviewClient:
             if marker is None or first.get("viewerDidAuthor") is not True:
                 continue
             author = first.get("author")
-            if not isinstance(author, Mapping) or author.get("login") != viewer_login:
+            if not isinstance(author, Mapping) or not _same_github_login(author.get("login"), viewer_login):
                 continue
             comment_id = first.get("databaseId")
             url = first.get("url")
@@ -2679,7 +2707,7 @@ class GhReviewClient:
                     isinstance(item.get("body"), str)
                     and item.get("viewerDidAuthor") is True
                     and isinstance(author, Mapping)
-                    and author.get("login") == viewer_login
+                    and _same_github_login(author.get("login"), viewer_login)
                 ):
                     continue
                 owned_comments.append({
@@ -2740,7 +2768,7 @@ class GhReviewClient:
             owned = (
                 node.get("viewerDidAuthor") is True
                 and isinstance(author, Mapping)
-                and author.get("login") == viewer_login
+                and _same_github_login(author.get("login"), viewer_login)
             )
             if owned and isinstance(body, str) and body.startswith(_SPECIALIST_HANDOFF_MARKER):
                 handoff_comments.append({
@@ -2788,11 +2816,19 @@ class GhReviewClient:
             label="pull request reviews",
         )
         owned_reviews = []
+        ownership_diagnostics = {
+            'viewer_login': viewer_login, 'found': len(reviews), 'owned': 0,
+            'skipped_viewer_did_not_author': 0, 'skipped_author_mismatch': 0,
+            'author_logins': sorted({str(node['author'].get('login', ''))[:100]
+                                     for node in reviews if isinstance(node.get('author'), Mapping)})[:10],
+        }
         for node in reviews:
             if node.get("viewerDidAuthor") is not True:
+                ownership_diagnostics['skipped_viewer_did_not_author'] += 1
                 continue
             author = node.get("author")
-            if not isinstance(author, Mapping) or author.get("login") != viewer_login:
+            if not isinstance(author, Mapping) or not _same_github_login(author.get("login"), viewer_login):
+                ownership_diagnostics['skipped_author_mismatch'] += 1
                 continue
             review_id, url, body, state = (
                 node.get("id"), node.get("url"), node.get("body"), node.get("state")
@@ -2804,6 +2840,7 @@ class GhReviewClient:
             }:
                 raise RuntimeError("managed review result URL or state is invalid")
             owned_reviews.append(dict(node))
+            ownership_diagnostics['owned'] += 1
 
         changed_files = tuple(self.list_changed_files(repo, pr_number))
         if len(changed_files) != changed_files_count:
@@ -2835,6 +2872,7 @@ class GhReviewClient:
             "general_answered_fingerprints": tuple(sorted(general_answered)),
             "general_answered_identities": tuple(sorted(general_answered_identities)),
             "reviews": owned_reviews,
+            "review_ownership_diagnostics": ownership_diagnostics,
             "changed_files": changed_files,
             "changed_files_complete": True,
             "changed_files_count": changed_files_count,

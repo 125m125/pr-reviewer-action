@@ -29,7 +29,7 @@ from redact import mask_and_truncate, mask_secrets, mask_source_secrets  # noqa:
 # source of truth); _resolve_workspace_path reuses GH_DENY_SUBSTRINGS to block
 # the same sensitive segments in filesystem paths.
 from pr_reviewer.platform import GH_DENY_SUBSTRINGS  # noqa: E402
-from pr_reviewer.line_windows import line_window, bound_line_payload
+from pr_reviewer.line_windows import line_window, bound_line_payload, source_budget_result
 from pr_reviewer.specialist_runtime.web_evidence import (  # noqa: E402
     SearchProvider,
     SearchResultRegistry,
@@ -198,7 +198,7 @@ def read_file(path, workspace_root, offset=None, limit=None, include_line_number
     )
     window, _ = mask_source_secrets(window)
     window, page = line_window(window, start + 1, max_response_bytes, has_more=end < len(lines))
-    return {"content": window, "range": dict(page, total_lines=len(lines))}
+    return source_budget_result({"content": window, "range": dict(page, total_lines=len(lines))}, max_response_bytes)
 
 
 _DIFF_HUNK_COORDINATES_RE = re.compile(
@@ -594,7 +594,7 @@ def read_remote_file(
     masked_text, _redaction_count = mask_source_secrets(selected_text)
     selected_text, page = line_window(masked_text, line_start + 1, max_response_bytes,
                                       has_more=line_end < len(lines))
-    return {
+    return source_budget_result({
         "content": selected_text,
         "range": dict(page, total_lines=len(lines)),
         "repository": str(repository).strip().strip("/"),
@@ -602,7 +602,7 @@ def read_remote_file(
         "ref": revision,
         "requested_ref": requested_ref,
         "resolved_sha": revision,
-    }
+    }, max_response_bytes, remote=True)
 
 def web_fetch(
     url,
@@ -631,7 +631,7 @@ def web_fetch(
         fetcher = secure_fetcher or SecureFetcher(
             policy, timeout=request_timeout, evidence_store=evidence_store,
         )
-        return fetcher.fetch(
+        result = fetcher.fetch(
             url,
             session_id=session_id,
             model_identity=model_identity,
@@ -646,6 +646,7 @@ def web_fetch(
             current_repo=current_repo,
             output_max_bytes=output_max_bytes,
         ).as_dict()
+        return source_budget_result(result, output_max_bytes or getattr(fetcher, 'max_bytes', 12000), web=True)
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -786,6 +787,7 @@ def execute_tool_request(
     of validation, execution, truncation, and error-handling logic.
     """
     tool_result = {"tool": tool_name, "status": "error", "result": {}}
+    res = None
 
     def retrieve_repository_target(target):
         if 'search_terms' in args:
@@ -1214,6 +1216,10 @@ def execute_tool_request(
         tool_result["result"] = {"error": str(exc)}
         if str(exc).startswith(("Repo not allowed:", "source denied:")):
             tool_result["status"] = "rejected"
+        if (tool_name in {'read_file', 'read_remote_file', 'web_fetch', 'web_fetch_search_result'}
+                and isinstance(res, dict)
+                and res.get('error_code') == 'source_budget_exceeded'):
+            tool_result['result'] = res
         if (str(exc) == 'source denied: source is not allowlisted by current policy'
                 and tool_name in {'web_fetch', 'web_fetch_search_result'}):
             policy = source_policy or SourcePolicy(())

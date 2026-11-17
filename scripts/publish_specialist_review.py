@@ -297,6 +297,9 @@ def main(argv: list[str] | None = None) -> int:
             baseline_clean=args.baseline_clean,
         ),
     )
+    if state.get('previous_review_cleanup') is not None:
+        print('[review-publisher] previous review cleanup: '
+              + json.dumps(state['previous_review_cleanup'], sort_keys=True), file=sys.stderr)
     if (
         state.get("review_completed") is not True
         or bool(state.get("publication_errors"))
