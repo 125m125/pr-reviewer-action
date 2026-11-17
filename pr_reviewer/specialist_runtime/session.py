@@ -3954,6 +3954,7 @@ class SpecialistSession:
         self._associate_collection(collection.id, record, requested_obligation_ids)
         if not record.is_usable_for_coverage:
             return {
+                **result,
                 "error": record.content or "delegated source tool failed",
                 "source_evidence_id": record.id,
             }, record, collection
@@ -4007,10 +4008,24 @@ class SpecialistSession:
                     "source_identity": mask_runtime_text(record.source_identity, limit=300) if record else "",
                     "source_evidence_id": record.id if record else None,
                     "error": mask_runtime_text(str(result.get("error") or "source unavailable"), limit=300),
+                    **{key: result['result'][key] for key in (
+                        'error_code', 'source_budget_bytes', 'range', 'hint'
+                    ) if isinstance(result.get('result'), Mapping) and key in result['result']},
                 })
                 continue
             sources.append((record, collection, result))
+        empty_sources = [item for item in sources if not item[0].content.strip()]
+        sources = [item for item in sources if item[0].content.strip()]
+        for empty_record, _, _ in empty_sources:
+            source_failures.append({
+                'source_evidence_id': empty_record.id,
+                'tool': empty_record.tool,
+                'source_path': mask_runtime_text(empty_record.source_path or '', limit=300),
+                'error': 'The source contains no readable content to summarize.',
+            })
         if not sources:
+            if empty_sources:
+                record, collection, _ = empty_sources[0]
             return {"error": "No requested sources could be retrieved",
                     "source_failures": source_failures}, record, collection
         source_limit = self._delegated_source_byte_limit(target, question)

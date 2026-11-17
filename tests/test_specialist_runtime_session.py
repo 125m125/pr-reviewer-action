@@ -1772,6 +1772,43 @@ def delegated_summary_response(
     )
 
 
+def test_empty_delegated_read_skips_model_and_preserves_omission():
+    from pr_reviewer.line_windows import source_budget_result
+    gateway = ScriptedGateway([])
+    session = make_session(gateway, execute_tool=lambda name, args, **kw: {
+        'status': 'error', 'result': source_budget_result({'content': '', 'range': {
+            'offset': 1, 'lines': 0, 'total_lines': 1, 'next_offset': 2,
+            'has_more': True, 'truncated': True, 'omitted_lines': [1],
+            'omission_reason': 'line exceeds output byte limit',
+        }}, 12000)}, tool_schemas=[{'name': 'read_file', 'parameters': {'type': 'object'}}])
+    session._execute_calls(({'id': 'empty-source', 'name': DELEGATE_TOOL_SUMMARY_NAME,
+        'arguments': json.dumps({'target': 'source', 'question': 'Find relevant information',
+            'tool_requests': [{'tool_name': 'read_file', 'arguments': {'path': 'a.py'}}]})},))
+    payload = json.loads(session.conversation.events[-1]['content'])
+    assert gateway.requests == []
+    assert payload['error'] == 'No requested sources could be retrieved'
+    assert payload['source_failures'][0]['range']['omitted_lines'] == [1]
+    assert payload['source_failures'][0]['range']['next_offset'] is None
+    assert 'git_grep' in payload['source_failures'][0]['hint']
+    assert not session._delegated_summary_cache
+
+
+def test_delegated_summary_keeps_readable_source_when_another_is_empty():
+    gateway = ScriptedGateway([delegated_summary_response(start_line=1, end_line=1)])
+    session = make_session(gateway, execute_tool=lambda name, args, **kw: {
+        'status': 'ok', 'result': {'content': '' if args['path'] == 'empty.py' else 'feature=true'}},
+        tool_schemas=[{'name': 'read_file', 'parameters': {'type': 'object'}}])
+    session._execute_calls(({'id': 'partial', 'name': DELEGATE_TOOL_SUMMARY_NAME,
+        'arguments': json.dumps({'target': 'feature', 'question': 'Is it enabled?',
+            'tool_requests': [{'tool_name': 'read_file', 'arguments': {'path': path}}
+                              for path in ['empty.py', 'a.py']]})},))
+    payload = json.loads(session.conversation.events[-1]['content'])
+    assert len(gateway.requests) == 1
+    assert payload['status'] == 'ok'
+    assert payload['source_incomplete'] is True
+    assert payload['source_metadata']['source_failures'][0]['source_path'] == 'empty.py'
+
+
 def test_delegated_comparison_combines_retained_evidence_and_multiple_reads():
     gateway = ScriptedGateway([invalid_response(json.dumps({
         "summary": "Inputs agree.", "relevant_excerpts": [],

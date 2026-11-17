@@ -286,6 +286,9 @@ def test_old_reviews_retired_only_after_replacement_and_threads_left_open(tmp_pa
     assert operations.index("submit") < operations.index("dismiss") < operations.index("minimize")
     assert ("minimize", "old-review", "OUTDATED") in client.calls
     assert ("minimize", "old-handoff", "OUTDATED") in client.calls
+    assert result['previous_review_cleanup']['eligible_reviews'] == 1
+    assert result['previous_review_cleanup']['minimized_reviews'] == 1
+    assert result['previous_review_cleanup']['minimized_handoff_comments'] == 1
     assert "resolve" not in operations
 
 
@@ -2741,6 +2744,41 @@ def _connection(nodes=(), *, has_next=False, cursor=None):
         "nodes": list(nodes),
         "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
     }
+
+
+@pytest.mark.parametrize('viewer,author,expected', [
+    ('github-actions[bot]', 'github-actions', True),
+    ('github-actions', 'github-actions[bot]', True),
+    ('GitHub-Actions[bot]', 'github-actions', True),
+    ('github-actions[bot]', 'other-bot', False),
+    ('', '', False),
+])
+def test_bot_login_normalization(viewer, author, expected):
+    from pr_reviewer.github_review_notes import _same_github_login
+    assert _same_github_login(viewer, author) is expected
+
+
+def test_review_ownership_diagnostics_keep_viewer_author_requirement(monkeypatch, tmp_path):
+    client = GhReviewClient(action_root=tmp_path)
+    def graphql(query, variables):
+        if 'ManagedReviewIdentity' in query:
+            return {'data': {'viewer': {'login': 'github-actions[bot]'}, 'repository': {
+                'pullRequest': {'id': 'PR', 'changedFiles': 0, 'headRefOid': 'a' * 40}}}}
+        key = 'reviews' if 'ManagedReviews' in query else 'comments' if 'ManagedIssueComments' in query else 'reviewThreads'
+        nodes = [] if key != 'reviews' else [
+            {'id': 'old-review', 'url': 'https://github.com/owner/repo/pull/17#pullrequestreview-1',
+             'body': '<!-- ai-pr-reviewer-specialist:old -->', 'state': 'COMMENTED',
+             'viewerDidAuthor': authored, 'author': {'login': login}}
+            for authored, login in [(True, 'github-actions'), (False, 'github-actions'), (True, 'another')]]
+        return {'data': {'node': {key: _connection(nodes)}}}
+    monkeypatch.setattr(client, '_graphql', graphql)
+    monkeypatch.setattr(client, 'list_changed_files', lambda *args: ())
+    state = client.query_managed_state('owner/repo', 17)
+    assert len(state['reviews']) == 1
+    assert state['review_ownership_diagnostics'] == {
+        'viewer_login': 'github-actions[bot]', 'found': 3, 'owned': 1,
+        'skipped_viewer_did_not_author': 1, 'skipped_author_mismatch': 1,
+        'author_logins': ['another', 'github-actions']}
 
 
 def test_managed_state_paginates_threads_comments_and_thread_comments(monkeypatch, tmp_path):
