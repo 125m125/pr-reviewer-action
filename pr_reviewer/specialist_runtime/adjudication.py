@@ -2337,7 +2337,7 @@ def _source_request(
         )
     allowed = {
         "kind", "host", "candidate_url", "obligation_id", "purpose",
-        "authority_reason", "model_purpose",
+        "authority_reason", "model_purpose", "authorized_alternatives",
     }
     if set(value) - allowed or kind != "source_access_request":
         return None
@@ -2350,7 +2350,22 @@ def _source_request(
     }
     if not all(fields[key] for key in ("host", "candidate_url", "obligation_id", "purpose")):
         return None
-    return SourceAccessRequest(**fields)
+    alternatives = value.get('authorized_alternatives', ())
+    if not isinstance(alternatives, (list, tuple)) or any(
+        not isinstance(item, Mapping) for item in alternatives
+    ):
+        return None
+    for item in alternatives[:3]:
+        if (not isinstance(item.get('host'), str) or len(item['host']) > 253
+                or not isinstance(item.get('classification', ''), str)
+                or len(item.get('classification', '')) > 300):
+            return None
+        for key in ('path_prefixes', 'schemes'):
+            values = item.get(key, ())
+            if (not isinstance(values, (list, tuple)) or len(values) > 100
+                    or any(not isinstance(v, str) or len(v) > 1000 for v in values)):
+                return None
+    return SourceAccessRequest(**fields, authorized_alternatives=tuple(alternatives[:3]))
 
 
 def _canonical_request_url(value: str) -> tuple[str, str] | None:
@@ -2441,6 +2456,18 @@ def _source_note(
         + "\n\n**Why human input is needed:** " + _quoted(reason)
         + "\n\nDiscovery metadata is not review evidence; retrieval remains pending approval."
     )
+    if request.authorized_alternatives:
+        markdown += '\n\n**Possibly relevant authorized alternatives (repository-configured):**\n'
+        for alternative in request.authorized_alternatives[:3]:
+            markdown += (
+                '\n- Host: ' + _quoted(str(alternative.get('host', '')), limit=253)
+                + '; allowed paths: ' + _quoted(', '.join(map(str, alternative.get('path_prefixes', ()))) or 'all paths')
+                + '; schemes: ' + _quoted(', '.join(map(str, alternative.get('schemes', ()))))
+                + ('; classification: ' + _quoted(str(alternative['classification']))
+                   if alternative.get('classification') else '')
+            )
+        markdown += ('\n\nThese are navigation hints, not verified replacements. Check whether '
+                     'they contain the required information before granting additional access.')
     return ReviewNote(
         kind=ReviewNoteKind.SOURCE_ACCESS_REQUEST,
         fingerprint=_request_fingerprint(

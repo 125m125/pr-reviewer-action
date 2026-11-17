@@ -289,6 +289,53 @@ def git_grep(pattern, workspace_root, request_timeout=15):
         if result.returncode not in (0, 1):
             return {"error": f"git grep failed: {result.stderr.strip()}"}
         lines = result.stdout.strip().splitlines()[:60]
+        oversized = [line for line in lines if len(line.encode('utf-8')) > 2048]
+        if oversized:
+            # Let Git interpret its regex; Python only locates the literal matches.
+            hits = subprocess.run(
+                ['git', 'grep', '-z', '-n', '-o', '--', pattern, '.'],
+                cwd=workspace_root, capture_output=True, text=True,
+                timeout=request_timeout,
+            )
+            if hits.returncode not in (0, 1):
+                return {'error': f'git grep failed: {hits.stderr.strip()}'}
+            by_line = {}
+            for hit in hits.stdout.splitlines():
+                parts = hit.split('\0', 2)
+                if len(parts) == 3:
+                    by_line.setdefault((parts[0], parts[1]), []).append(parts[2])
+            bounded = []
+            for line in lines:
+                if line not in oversized:
+                    bounded.append(line)
+                    continue
+                parsed = re.match(r'^(.*?):(\d+):(.*)$', line)
+                if not parsed:
+                    continue
+                path, number, content = parsed.groups()
+                # Redact before slicing: a window must not split a secret value.
+                content, _ = mask_source_secrets(content)
+                windows = []
+                cursor = 0
+                for match in by_line.get((path, number), []):
+                    start = content.find(match, cursor) if match else -1
+                    if start < 0:
+                        continue
+                    cursor = start + len(match)
+                    left, right = max(0, start - 160), min(len(content), start + min(len(match), 512) + 160)
+                    if (windows and left <= windows[-1][1]
+                            and right - windows[-1][0] <= 1024):
+                        windows[-1] = (windows[-1][0], max(right, windows[-1][1]))
+                    else:
+                        windows.append((left, right))
+                    if len(windows) >= 8:
+                        break
+                for left, right in windows:
+                    bounded.append(f'{path}:{number}:[excerpt; surrounding text omitted] '
+                                   + content[left:right])
+                if not windows:
+                    bounded.append(f'{path}:{number}:[match omitted by redaction]')
+            lines = bounded
         return {"matches": lines}
     except subprocess.TimeoutExpired:
         return {"error": f"git grep timed out after {request_timeout}s"}
@@ -1167,6 +1214,19 @@ def execute_tool_request(
         tool_result["result"] = {"error": str(exc)}
         if str(exc).startswith(("Repo not allowed:", "source denied:")):
             tool_result["status"] = "rejected"
+        if (str(exc) == 'source denied: source is not allowlisted by current policy'
+                and tool_name in {'web_fetch', 'web_fetch_search_result'}):
+            policy = source_policy or SourcePolicy(())
+            alternatives = policy.authorized_alternatives(url)
+            tool_result['result']['authorized_alternatives'] = alternatives
+            if alternatives:
+                hint = ('These repository-configured sources may be relevant. Their relationship '
+                        'to the requested site and the requested content have not been verified. '
+                        'The original URL remains denied.')
+                if search_url:
+                    hint += (' If the URL came from memory, you might want to use web_search '
+                             'to verify the current documentation URL.')
+                tool_result['result']['hint'] = hint
 
     return tool_result
 
