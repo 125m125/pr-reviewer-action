@@ -2833,7 +2833,8 @@ class GhReviewClient:
             review_id, url, body, state = (
                 node.get("id"), node.get("url"), node.get("body"), node.get("state")
             )
-            if not all(isinstance(value, str) and value for value in (review_id, url, body, state)):
+            if (not all(isinstance(value, str) and value for value in (review_id, url, state))
+                    or not isinstance(body, str)):
                 raise RuntimeError("managed review object is invalid")
             if not _valid_github_result_url(url) or state not in {
                 "PENDING", "COMMENTED", "APPROVED", "CHANGES_REQUESTED", "DISMISSED",
