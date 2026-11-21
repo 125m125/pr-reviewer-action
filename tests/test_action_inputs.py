@@ -252,10 +252,11 @@ def test_specialist_structured_outputs_and_publisher_are_wired():
     specialist_block = content.split(
         "- name: Publish specialist review", 1,
     )[1].split("- name:", 1)[0]
-    assert 'cleanup_native_reviews "$CLEANUP_NATIVE_REVIEWS"' in specialist_block
+    assert '--cleanup-previous-reviews "$CLEANUP_NATIVE_REVIEWS"' in specialist_block
+    assert '--review-artifact specialist-review-artifact.json' in specialist_block
     assert "LIVE_HEAD_SHA=" in specialist_block
     assert specialist_block.index("LIVE_HEAD_SHA=") < specialist_block.index(
-        'cleanup_native_reviews "$CLEANUP_NATIVE_REVIEWS"'
+        'python3 "${GITHUB_ACTION_PATH}/scripts/publish_specialist_review.py"'
     )
     assert "--changed-files-complete true" in content
     assert 'if: inputs.review_strategy == \'single\'' in content

@@ -43,6 +43,7 @@ class ObligationBrief:
     scope: tuple[str, ...]
     recipe_objective: str = ""
     recipe_invariants: tuple[str, ...] = ()
+    evidence_hints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,10 @@ class Assignment:
     model_turn_limit: int = 0
     tool_call_limit: int = 0
     investigation_leads: tuple[InvestigationLead, ...] = ()
+    owner_component_id: str = ""
+    owned_changed_paths: tuple[str, ...] = ()
+    parent_assignment_id: str | None = None
+    delegation_depth: int = 0
 
     @property
     def assignment_id(self) -> str:
@@ -112,7 +117,7 @@ class PlannerTransformationResult:
 
 def _assignable_obligations(obligations: Iterable[CoverageObligation]) -> tuple[CoverageObligation, ...]:
     """Exclude Task 3's non-mandatory, evidence-free lifecycle bookkeeping."""
-    return tuple(item for item in obligations if item.mandatory and item.required_evidence_categories)
+    return tuple(item for item in obligations if item.mandatory and item.required_evidence_categories and not item.evaluator_owned)
 
 
 def _validated_assignable_obligations(
@@ -815,6 +820,7 @@ def _obligation_briefs(
                 _bounded_text(value, 240)
                 for value in item.recipe_invariants[:12]
             ),
+            evidence_hints=tuple(_bounded_text(value, 120) for value in item.evidence_hints[:16]),
         )
         for item in obligations
     )
@@ -1054,6 +1060,59 @@ def _fallback_assignment(
     )
     return _with_semantic_brief(
         assignment, {item.id: item for item in obligations}, topology,
+    )
+
+
+def component_assignment_plan(
+    obligations: Iterable[CoverageObligation], topology: Mapping[str, Any], config: RuntimeConfig,
+) -> AssignmentPlan:
+    """One owner investigation, plus explicit independent checks; overflow is visible."""
+    groups: dict[tuple[str, str], list[CoverageObligation]] = defaultdict(list)
+    for obligation in _validated_assignable_obligations(obligations):
+        if obligation.requires_independent_verification:
+            key = ("independent", obligation.recipe_id or obligation.subject)
+        else:
+            key = ("component", obligation.owner_component_id or "repository-remainder")
+        groups[key].append(obligation)
+    ordered = sorted(groups.items(), key=lambda item: (_PRIORITY_RANK[_priority(item[1])], item[0]))
+    cap = min(config.max_sessions, config.max_total_model_turns, config.max_total_tool_calls)
+    assignments: list[Assignment] = []
+    changed = set(topology.get("changed_files", ()))
+    for (kind, owner), items in ordered[:cap]:
+        items = sorted(items, key=lambda item: item.id)
+        scope = tuple(sorted({path for item in items for path in item.scope}))
+        seed_paths = tuple(sorted({path for item in items for path in item.seed_hints}))
+        independent = kind == "independent"
+        assignment = Assignment(
+            id=f"{kind}-{owner}",
+            title=f"Independent {owner} review" if independent else f"Review {owner} changed behavior",
+            objective=(
+                f"{'Independently assess' if independent else 'Assess'} changed behavior "
+                f"for {owner} and trace affected dependencies as needed. "
+                "Use the obligation briefs for explicit requirements and relevant recipe guidance; "
+                "unchanged supporting files are not a separate whole-component audit."
+            ),
+            obligation_ids=tuple(item.id for item in items),
+            recipe_ids=tuple(sorted({recipe_id for item in items for recipe_id in (
+                *item.integrated_recipe_ids, *((item.recipe_id,) if item.recipe_id else ()),
+            )})),
+            lenses=("independent-verification",) if independent else ("component-owned-review",),
+            seed_paths=seed_paths, boundary_paths=scope,
+            expected_evidence=tuple(sorted({category for item in items for category in item.required_evidence_categories})),
+            estimated_turns=len(items), priority=_priority(items),
+            overlap_justification="Explicit policy independent verification" if independent else "",
+            owner_component_id="" if independent else owner,
+            owned_changed_paths=tuple(sorted({
+                path for item in items if independent or item.origin == "component"
+                for path in item.scope if path in changed
+            })),
+        )
+        assignments.append(_with_semantic_brief(assignment, {item.id: item for item in items}, topology))
+    unassigned = tuple(sorted(item.id for _, items in ordered[cap:] for item in items))
+    return AssignmentPlan(
+        assignments=_with_primary_ownership(_with_scheduling_weights(tuple(assignments), config)),
+        unassigned_obligation_ids=unassigned,
+        unassigned_obligation_reasons=tuple((item, "owner queued: hard session or global request capacity exhausted") for item in unassigned),
     )
 
 

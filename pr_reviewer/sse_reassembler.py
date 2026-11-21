@@ -272,8 +272,6 @@ def _reassemble_openai(
 ) -> dict:
     finish_reason: str | None = None
     model: str | None = None
-    usage_prompt_tokens = 0
-    usage_completion_tokens = 0
     usage_details: dict[str, Any] = {}
     timings: dict[str, Any] = {}
     id_val = ""
@@ -373,9 +371,9 @@ def _reassemble_openai(
         if isinstance(usage, dict):
             # OpenAI usage chunks are cumulative snapshots, not token deltas.
             # Keep provider extensions (notably prompt_tokens_details) too.
+            # Missing counters stay absent: interrupted/unsupported usage is
+            # unavailable, not a provider-reported zero-token request.
             usage_details.update(usage)
-            usage_prompt_tokens = usage.get("prompt_tokens", usage_prompt_tokens)
-            usage_completion_tokens = usage.get("completion_tokens", usage_completion_tokens)
         if isinstance(chunk.get("timings"), dict):
             timings.update(chunk["timings"])
 
@@ -398,12 +396,7 @@ def _reassemble_openai(
                 "finish_reason": finish_reason or "incomplete",
             }
         ],
-        "usage": {
-            **usage_details,
-            "prompt_tokens": usage_prompt_tokens,
-            "completion_tokens": usage_completion_tokens,
-            "total_tokens": usage_prompt_tokens + usage_completion_tokens,
-        },
+        "usage": usage_details,
     }
     if timings:
         result["timings"] = timings

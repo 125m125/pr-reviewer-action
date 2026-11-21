@@ -96,7 +96,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "files (.env, .pem, credentials, id_rsa, …) are blocked. Output "
             "is truncated to ~12 KB. For a large file, pass offset/limit to "
             "read a line window (also the way to expand context around a "
-            "diff hunk) instead of blowing the cap."
+            "diff hunk) instead of blowing the cap. Continue at range.next_offset, "
+            "not the requested offset plus limit. Only complete lines are returned; "
+            "omitted_lines explicitly identifies oversized lines that could not fit."
         ),
         "parameters": {
             "type": "object",
@@ -128,12 +130,14 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "name": "read_remote_file",
         "description": (
             "Read a UTF-8 text file from an explicitly allowlisted remote "
-            "repository at an immutable commit SHA. This tool is only for "
+            "repository at a branch, tag or commit SHA. Symbolic refs resolve once "
+            "per session; use returned resolved_sha for subsequent reads. This tool is only for "
             "repositories other than the one under review; it rejects the "
-            "current repository, branches/tags, binary files, and unallowlisted "
+            "current repository, binary files, and unallowlisted "
             "repositories. Files over 8 MiB are rejected before content download; "
             "offset/limit cannot bypass this transfer cap. Use offset/limit for a bounded line window and "
             "include_line_numbers when exact remote line references matter. "
+            "Continue at range.next_offset; oversized omitted_lines are not evidence. "
             "Do not use gh_api to read repository contents."
         ),
         "parameters": {
@@ -149,8 +153,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 },
                 "ref": {
                     "type": "string",
-                    "pattern": "^[0-9a-fA-F]{40,64}$",
-                    "description": "Immutable 40–64 character commit object ID.",
+                    "description": "Branch, tag or immutable commit SHA; use resolved_sha from prior reads for the same version.",
                 },
                 "offset": {
                     "type": "integer",
@@ -232,26 +235,36 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "web_fetch",
         "description": (
-            "Fetch an HTTPS URL approved by the current source policy. The "
+            "Fetch an HTTPS URL approved by the current source policy. Unambiguous GitHub URLs "
+            "automatically use repository tools under repository permissions; ambiguous file refs "
+            "require read_remote_file with separate repository, ref and path fields. Optional search_terms "
+            "select literal case-insensitive matches with bounded section context, even on small pages. "
+            "Excerpts and no-match results do not prove absence. HTML anchors select a real section; "
+            "navigation result IDs can retrieve linked chapters. The "
             "executor rechecks host/path policy and public DNS addresses on "
             "every redirect, normalizes and masks content, and returns typed "
             "external evidence with provenance. Prefer a structured API "
             "endpoint over an HTML "
             "release/compare page (HTML often 404s or is JS-rendered): for "
-            "github.com use gh_api; for a Gitea/Forgejo host fetch its "
+            "github.com metadata use gh_api; for a Gitea/Forgejo host fetch its "
             "/api/v1/... JSON (e.g. .../releases/tags/TAG or "
-            ".../compare/BASE...HEAD), not the web page. Do not probe URLs "
-            "marked fetch_allowed=false by web_search. If external access is "
-            "materially necessary, select at most one clearly authoritative "
-            "unapproved result; that denied fetch records a human access "
-            "request instead of retrieving content."
+            ".../compare/BASE...HEAD), not the web page. For search results use "
+            "web_fetch_search_result with the returned ID, including an unapproved "
+            "result when one authoritative source is materially necessary and "
+            "you need to record a human access request. Do not probe alternatives "
+            "or retry a denial; results marked fetch_method=unavailable cannot be retrieved."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "Absolute https URL on an allowlisted host.",
+                    "description": "Absolute HTTPS URL allowed by website policy, or a supported GitHub URL authorized by repository policy.",
+                },
+                "search_terms": {
+                    "type": "array", "minItems": 1, "maxItems": 8,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "description": "Optional literal OR search terms; retains existing output limit, not full-page coverage.",
                 },
                 "purpose": {
                     "type": "string",
@@ -316,7 +329,9 @@ SPECIALIST_PR_DIFF_SCHEMA: dict[str, Any] = {
         "specialist's assignment. Prefer batching related production and test paths. "
         "The controller compares the immutable pull-request base merge-base "
         "to the immutable head (base...head); revisions cannot be supplied by "
-        "the model. Paths outside the assignment boundaries are rejected."
+        "the model. Paths outside the assignment boundaries are rejected. "
+        "Continue at range.next_offset (a patch-line offset, not a RIGHT file line). "
+        "Only complete lines are returned; omitted_lines identifies oversized lines."
     ),
     "parameters": {
         "type": "object",
@@ -363,17 +378,18 @@ SPECIALIST_PR_DIFF_SCHEMA: dict[str, Any] = {
 
 # Opt-in tool: advertised only when a search endpoint is configured (see
 # run_native_loop). web_search lets a weaker model discover the right source;
-# it then uses web_fetch for a visible URL or web_fetch_search_result when the
-# controller hid an opaque URL payload.
+# it then retrieves the controller-authorized target by result ID.
 WEB_SEARCH_SCHEMA: dict[str, Any] = {
     "name": "web_search",
     "description": (
         "Discover URLs through the action's fixed search provider. Search is "
         "not evidence: approved-source results may include bounded snippets, "
         "while unapproved results contain metadata only. Every result states "
-        "fetch_allowed and its fetch_method. Use web_fetch for a visible URL "
-        "or web_fetch_search_result for an opaque result ID before relying on "
-        "it. Never probe unavailable alternatives; request access only for at "
+        "fetch_allowed and its fetch_method. Safe targets have a result_id, even "
+        "when authorization is missing; unsafe or unsupported targets are unavailable. "
+        "Use web_fetch_search_result with the returned ID. Authorized results "
+        "are fetched; unapproved IDs only record an access request without fetching. "
+        "Never probe unavailable alternatives; request access only for at "
         "most one result that appears to be an authoritative primary source "
         "and is materially necessary."
     ),
@@ -402,18 +418,27 @@ WEB_SEARCH_SCHEMA: dict[str, Any] = {
 WEB_FETCH_SEARCH_RESULT_SCHEMA: dict[str, Any] = {
     "name": "web_fetch_search_result",
     "description": (
-        "Fetch one approved web_search result whose URL was hidden because it "
-        "contained an opaque path or query value. Pass only the result_id "
-        "returned by web_search. The controller resolves the session-scoped "
-        "URL, preserves safe navigation parameters, revalidates every redirect, "
-        "and keeps the hidden URL out of model context and artifacts."
+        "Retrieve one search or page-navigation result by its result_id. An ID does "
+        "not grant permission: an unapproved result records an access request without "
+        "fetching content. Use that only for one materially necessary authoritative "
+        "source, explain why in purpose, and do not repeat denied requests. "
+        "Optional search_terms filter website passages (not repository results), using literal "
+        "case-insensitive OR matches and bounded context. Excerpts are incomplete evidence. The controller "
+        "selects website or repository retrieval and rechecks permission. Visible "
+        "URLs are descriptive, not alternate retrieval instructions. For another "
+        "version/resource use a new search or the appropriate direct tool; permission "
+        "does not transfer. Hidden URLs stay hidden. No target overrides are accepted."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "result_id": {
                 "type": "string",
-                "description": "Opaque session-scoped ID returned by web_search.",
+                "description": "Opaque session-scoped ID returned by search or page navigation.",
+            },
+            "search_terms": {
+                "type": "array", "minItems": 1, "maxItems": 8,
+                "items": {"type": "string", "minLength": 1, "maxLength": 128},
             },
             "purpose": {
                 "type": "string",
@@ -434,6 +459,7 @@ def web_tool_schemas(
     search_url: str,
     source_policy: Any,
     allow_private_search_url: bool = False,
+    allowed_repos: Iterable[str] = (),
 ) -> list[dict[str, Any]]:
     """Build the catalogue, advertising discovery only when it can be safe."""
     from pr_reviewer.specialist_runtime.web_evidence import SearxngSearchProvider
@@ -445,11 +471,16 @@ def web_tool_schemas(
     schemas = [schema for schema in TOOL_SCHEMAS if schema["name"] != "web_fetch"]
     if has_sources:
         schemas.append(next(schema for schema in TOOL_SCHEMAS if schema["name"] == "web_fetch"))
-    if has_sources and SearxngSearchProvider.is_valid_endpoint(
+        schemas.append(WEB_FETCH_SEARCH_RESULT_SCHEMA)
+    from pr_reviewer.platform import resolve_platform
+    has_repository_route = bool(tuple(allowed_repos)) and resolve_platform() == "github"
+    if (has_sources or has_repository_route) and SearxngSearchProvider.is_valid_endpoint(
         str(search_url or "").strip(),
         allow_private_search_url=allow_private_search_url,
     ):
-        schemas.extend((WEB_SEARCH_SCHEMA, WEB_FETCH_SEARCH_RESULT_SCHEMA))
+        schemas.append(WEB_SEARCH_SCHEMA)
+        if not has_sources:
+            schemas.append(WEB_FETCH_SEARCH_RESULT_SCHEMA)
     return schemas
 
 # Per-tool result cap applied when re-adding tool output to the conversation
@@ -478,6 +509,23 @@ VERDICT_USER_INSTRUCTION = (
 # ---------------------------------------------------------------------------
 # Message normalisation
 # ---------------------------------------------------------------------------
+
+
+def _model_tool_result(result: Any) -> Any:
+    """Hide nonactionable search warnings on the wire, not in retained evidence."""
+    if isinstance(result, str):
+        if '"engine_warnings"' not in result or '"search_discovery"' not in result:
+            return result
+        try:
+            return json.dumps(_model_tool_result(json.loads(result)), ensure_ascii=False)
+        except ValueError:
+            return result
+    if not isinstance(result, dict):
+        return result
+    if result.get("kind") == "search_discovery" and result.get("search_status") == "ok":
+        return {key: value for key, value in result.items() if key != "engine_warnings"}
+    return {key: _model_tool_result(value) if key in {"result", "content"} else value
+            for key, value in result.items()}
 
 
 def _stringify_tool_result(result: Any) -> str:
@@ -704,11 +752,10 @@ class Conversation:
         """Append an assistant turn carrying tool-call requests.
 
         Each ``call`` is normalised to ``{"id", "name", "arguments"}``. Per
-        the #233 contract, ``arguments`` is treated as an opaque JSON string
-        end-to-end: a string is preserved verbatim (so malformed fragments
-        round-trip and the round-trip property holds for strict OpenAI
-        servers), and a dict/list is serialised **once at this boundary**
-        so the rest of the pipeline never has to think about it.
+        the #233 contract, ``arguments`` is stored as an opaque JSON string:
+        malformed fragments remain available for diagnostics and executor
+        rejection. Only the wire rendering substitutes rejected arguments
+        so strict servers can parse subsequent requests.
         """
         normalised: list[dict[str, Any]] = []
         for call in calls:
@@ -753,6 +800,9 @@ class Conversation:
     ) -> None:
         if not isinstance(call_id, str) or not call_id:
             return
+        from pr_reviewer.line_windows import bound_line_payload
+        result = _model_tool_result(result)
+        result = bound_line_payload(result, max_bytes)
         body = _stringify_tool_result(result)
         body, truncated = truncate_text(body, max_bytes)
         metadata: dict[str, str] = {}
@@ -1203,6 +1253,44 @@ class Conversation:
 
     # ---- wire emission ---------------------------------------------------
 
+    def _wire_events(self) -> Iterable[dict[str, Any]]:
+        """Keep rejected calls paired without replaying unparseable arguments.
+
+        Invalid arguments use a history-only placeholder, never execution input.
+        Empty arguments mean an empty object to the executor and are encoded so.
+        Raw arguments and results remain unchanged in neutral event storage.
+        """
+        invalid_ids: set[str] = set()
+        for event in self.events:
+            if event["kind"] == "assistant_tool_calls":
+                calls = []
+                for call in event["calls"]:
+                    if call["arguments"] == "":
+                        call = {**call, "arguments": "{}"}
+                    try:
+                        args = json.loads(call["arguments"])
+                        valid = isinstance(args, dict)
+                    except (ValueError, TypeError):
+                        valid = False
+                    if not valid:
+                        invalid_ids.add(call["id"])
+                        call = {**call, "arguments": "{}"}
+                    calls.append(call)
+                yield {**event, "calls": calls}
+            elif event["kind"] == "tool_result" and event["call_id"] in invalid_ids:
+                yield {
+                    **event,
+                    "is_error": True,
+                    "content": (
+                        "This call was not executed: its arguments were not a complete "
+                        "JSON object. The empty object in history is only a placeholder, "
+                        "not repaired arguments. Submit a fresh complete tool call.\n"
+                        + event["content"]
+                    ),
+                }
+            else:
+                yield event
+
     def _render_openai_messages(self) -> list[dict[str, Any]]:
         """Render neutral events as an OpenAI-format messages list.
 
@@ -1214,7 +1302,7 @@ class Conversation:
         """
         messages: list[dict[str, Any]] = []
         assistant_turn_open = False
-        for e in self.events:
+        for e in self._wire_events():
             kind = e["kind"]
             if kind == "user":
                 messages.append({"role": "user", "content": e["content"]})
@@ -1317,7 +1405,7 @@ class Conversation:
                 messages.append({"role": "user", "content": pending_tool_results})
                 pending_tool_results = []
 
-        for e in self.events:
+        for e in self._wire_events():
             kind = e["kind"]
             if kind == "user":
                 _flush_tool_results()
@@ -1380,16 +1468,7 @@ class Conversation:
                 # current catalogue doesn't do interleaved text+tool_use, so
                 # we emit a tool_use-only turn here.
                 for c in e["calls"]:
-                    try:
-                        input_value = (
-                            json.loads(c["arguments"]) if c["arguments"] else {}
-                        )
-                    except (json.JSONDecodeError, ValueError):
-                        # Some local models return fragmentary JSON in
-                        # arguments; surface it as a string rather than
-                        # dropping the call — the model can still see what
-                        # it asked for.
-                        input_value = {"_raw": c["arguments"]}
+                    input_value = json.loads(c["arguments"] or "{}")
                     blocks.append(
                         {
                             "type": "tool_use",

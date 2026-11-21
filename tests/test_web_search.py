@@ -26,6 +26,33 @@ SEARCH = "https://search.example.com/search"
 POLICY = SourcePolicy.from_hosts(["a.example", "b.example", "u.example"])
 
 
+def test_navigation_reader_available_without_search_engine():
+    names = {schema['name'] for schema in web_tool_schemas('', POLICY)}
+    assert 'web_fetch_search_result' in names
+    assert 'web_search' not in names
+
+
+def test_direct_and_registered_selector_have_same_source_ranges(tmp_path):
+    class Transport:
+        def request(self, request):
+            return HttpResponse(200, {'content-type': 'text/markdown'},
+                b'# Root\n## Target\nneedle\n## Other\nunrelated')
+    registry = SearchResultRegistry()
+    result_id = registry.register('https://a.example/doc')
+    fetcher = SecureFetcher(POLICY, transport=Transport(), resolver=lambda *_: ['93.184.216.34'], max_bytes=3000)
+    results = []
+    for name, args in [('web_fetch', {'url': 'https://a.example/doc'}),
+                       ('web_fetch_search_result', {'result_id': result_id})]:
+        result = rth.execute_tool_request(name, {**args, 'search_terms': ['needle']},
+            tmp_path, (), 'org/current', (), 3000, 10,
+            source_policy=POLICY, secure_fetcher=fetcher, search_result_registry=registry)
+        assert result['status'] == 'ok', result
+        assert len(json.dumps(result, ensure_ascii=False).encode()) <= 3000
+        results.append(result['result'])
+    assert results[0]['content'] == results[1]['content']
+    assert results[0]['selection'] == results[1]['selection']
+
+
 class _SearchTransport:
     def __init__(self, payload=None, error=None):
         self.payload = payload or {"results": []}
@@ -61,6 +88,7 @@ def test_returns_capped_policy_filtered_discovery():
     res = rth.web_search(
         "talos support matrix", SEARCH, max_results=2, source_policy=POLICY,
         provider=provider,
+        search_result_registry=SearchResultRegistry(),
     )
     assert "error" not in res
     assert res["kind"] == "search_discovery"
@@ -101,6 +129,7 @@ def test_execute_tool_request_dispatches_web_search():
         ".", set(), "o/r", ["u.example"], 12000, 20, SEARCH, 5,
         source_policy=SourcePolicy.from_hosts(["u.example"]),
         search_provider=provider,
+        search_result_registry=SearchResultRegistry(),
     )
     assert tr["status"] == "ok"
     assert tr["result"]["kind"] == "search_discovery"
@@ -260,7 +289,7 @@ def test_current_head_policy_wiring_is_empty_when_file_missing(tmp_path):
 def test_current_head_policy_wiring_preserves_path_restrictions(tmp_path):
     path = tmp_path / "policy.json"
     path.write_text(json.dumps({
-        "version": 2,
+        "version": 3,
         "sources": [{
             "host": "docs.example.com",
             "path_prefixes": ["/api"],
@@ -275,7 +304,7 @@ def test_current_head_policy_wiring_preserves_path_restrictions(tmp_path):
 
 
 def test_current_head_policy_wiring_fails_closed_when_invalid(tmp_path):
-    (tmp_path / "policy.json").write_text('{"version": 2, "sources": [{"host": "*"}]}')
+    (tmp_path / "policy.json").write_text('{"version": 3, "sources": [{"host": "*"}]}')
 
     policy = rth.load_current_source_policy(tmp_path, "policy.json")
 

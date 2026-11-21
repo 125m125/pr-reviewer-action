@@ -4,96 +4,464 @@
   "scenarios": {
     "multilingual": {
       "request_order": [
-        "planner-initial",
-        "specialist-tools",
-        "specialist-checkpoint",
+        "java-tools",
+        "java-checkpoint",
+        "contract-tools",
+        "contract-checkpoint",
+        "python-tools",
+        "python-checkpoint",
+        "typescript-tools",
+        "typescript-checkpoint",
+        "deployment-tools",
+        "deployment-checkpoint",
+        "store-tools",
+        "store-checkpoint",
+        "boundary-order-event",
+        "boundary-order-storage",
+        "boundary-worker-deployment",
         "critic",
+        "critic-retry",
         "finalizer"
       ],
       "responses": {
-        "planner-initial": {
+        "java-tools": {
           "expect": {
-            "role": "planner",
-            "tools_enabled": false,
-            "response_schema_name": "specialist_planner"
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
           },
           "response": {
-            "id": "chatcmpl-planner-initial",
+            "id": "java-tools",
+            "object": "chat.completion",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": null,
+                  "tool_calls": [
+                    {
+                      "id": "java-src",
+                      "type": "function",
+                      "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/main/java/example/api/OrderController.java\",\"targets\":[\"O1\",\"O2\"]}"
+                      }
+                    },
+                    {
+                      "id": "java-test",
+                      "type": "function",
+                      "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"tests/java/OrderControllerTest.java\",\"targets\":[\"O2\"]}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": "tool_calls"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        "java-checkpoint": {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "java-checkpoint",
+            "object": "chat.completion",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "{\"candidate_updates\":[],\"completed_steps\":[\"Inspected the owned implementation and relevant boundary context.\"],\"hypotheses\":[],\"inspected\":[\"src/main/java/example/api/OrderController.java\",\"tests/java/OrderControllerTest.java\"],\"invariants_evaluated\":[],\"new_candidates\":[],\"obligation_updates\":[{\"assessed_paths\":[\"contracts/order-event.schema.json\",\"src/main/java/example/api/OrderController.java\"],\"disposition\":\"covered\",\"evidence_ids\":[\"evidence:f55750b07717107d6b00ce8807869bb34d71eb10619094703fce548bf472596b\"],\"next_actions\":[],\"omitted_paths\":[],\"reason\":\"The Java producer publishes the changed order status through the event boundary.\",\"target\":\"O1\"},{\"assessed_paths\":[\"src/main/java/example/api/OrderController.java\",\"tests/java/OrderControllerTest.java\"],\"disposition\":\"covered\",\"evidence_ids\":[\"evidence:f55750b07717107d6b00ce8807869bb34d71eb10619094703fce548bf472596b\",\"evidence:75e7aab293a1ff2aa58dc9b7f6e17c118eae54e3dad40e3644c884f58b266e1d\"],\"next_actions\":[],\"omitted_paths\":[],\"reason\":\"The Java API implementation and focused test exercise the changed status behavior.\",\"target\":\"O2\"}],\"proposed_next_actions\":[],\"unknowns\":[],\"unresolved\":[],\"working_summary\":\"The owned group was assessed against retained repository evidence.\"}"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        "contract-tools": {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "contract-tools",
+            "object": "chat.completion",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": null,
+                  "tool_calls": [
+                    {
+                      "id": "contract",
+                      "type": "function",
+                      "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"contracts/order-event.schema.json\",\"targets\":[\"O1\",\"O2\"]}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": "tool_calls"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        "contract-checkpoint": {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "contract-checkpoint",
+            "object": "chat.completion",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "{\"candidate_updates\":[],\"completed_steps\":[\"Inspected the owned implementation and relevant boundary context.\"],\"hypotheses\":[],\"inspected\":[\"contracts/order-event.schema.json\"],\"invariants_evaluated\":[],\"new_candidates\":[],\"obligation_updates\":[{\"assessed_paths\":[\"contracts/order-event.schema.json\"],\"disposition\":\"covered\",\"evidence_ids\":[\"evidence:b7c393e556052aed7b8161bbb7b11ab70096ad5c05d19c297e0ea925471adcf0\"],\"next_actions\":[],\"omitted_paths\":[],\"reason\":\"The retained schema defines the shared order-event status contract.\",\"target\":\"O1\"},{\"assessed_paths\":[\"contracts/order-event.schema.json\"],\"disposition\":\"covered\",\"evidence_ids\":[\"evidence:b7c393e556052aed7b8161bbb7b11ab70096ad5c05d19c297e0ea925471adcf0\"],\"next_actions\":[],\"omitted_paths\":[],\"reason\":\"The changed contract remains explicit and reviewable as the component source of truth.\",\"target\":\"O2\"}],\"proposed_next_actions\":[],\"unknowns\":[],\"unresolved\":[],\"working_summary\":\"The owned group was assessed against retained repository evidence.\"}"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        "python-tools": {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "python-tools",
+            "object": "chat.completion",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": null,
+                  "tool_calls": [
+                    {
+                      "id": "python-src",
+                      "type": "function",
+                      "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"workers/messaging/order_worker.py\",\"targets\":[\"O1\",\"O2\",\"O3\",\"O4\"]}"
+                      }
+                    },
+                    {
+                      "id": "python-test",
+                      "type": "function",
+                      "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"tests/python/test_order_worker.py\",\"targets\":[\"O4\"]}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": "tool_calls"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        "python-checkpoint": {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "python-checkpoint",
+            "object": "chat.completion",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "{\"candidate_updates\":[],\"completed_steps\":[\"Inspected the owned implementation and relevant boundary context.\"],\"hypotheses\":[],\"inspected\":[\"workers/messaging/order_worker.py\",\"tests/python/test_order_worker.py\"],\"invariants_evaluated\":[],\"new_candidates\":[],\"obligation_updates\":[{\"assessed_paths\":[\"contracts/order-event.schema.json\",\"workers/messaging/order_worker.py\"],\"disposition\":\"covered\",\"evidence_ids\":[\"evidence:0461737e1b3a86ce069595da9d902d3dca6fe303359b1a36bb75beadcbc28476\"],\"next_actions\":[],\"omitted_paths\":[],\"reason\":\"The worker consumes the changed order status at the event boundary.\",\"target\":\"O1\"},{\"assessed_paths\":[\"db/migrations/V42__order_status.sql\",\"workers/messaging/order_worker.py\"],\"disposition\":\"covered\",\"evidence_ids\":[\"evidence:0461737e1b3a86ce069595da9d902d3dca6fe303359b1a36bb75beadcbc28476\"],\"next_actions\":[],\"omitted_paths\":[],\"reason\":\"The worker maps consumed status values into the persistence boundary.\",\"target\":\"O2\"},{\"assessed_paths\":[\"deploy/k8s/order-worker.yaml\",\"workers/messaging/order_worker.py\"],\"disposition\":\"covered\",\"evidence_ids\":[\"evidence:0461737e1b3a86ce069595da9d902d3dca6fe303359b1a36bb75beadcbc28476\"],\"next_actions\":[],\"omitted_paths\":[],\"reason\":\"The worker behavior is aligned with the deployment boundary configuration.\",\"target\":\"O3\"},{\"assessed_paths\":[\"tests/python/test_order_worker.py\",\"workers/messaging/order_worker.py\"],\"disposition\":\"covered\",\"evidence_ids\":[\"evidence:0461737e1b3a86ce069595da9d902d3dca6fe303359b1a36bb75beadcbc28476\",\"evidence:f4c1e046ba212198bd320cfbc7a0bd7367bd899cde3b4b961be19486e80f7258\"],\"next_actions\":[],\"omitted_paths\":[],\"reason\":\"The worker and its focused test retain cancellation behavior across delivery and persistence.\",\"target\":\"O4\"}],\"proposed_next_actions\":[],\"unknowns\":[],\"unresolved\":[],\"working_summary\":\"The owned group was assessed against retained repository evidence.\"}"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        "typescript-tools": {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "typescript-tools",
+            "object": "chat.completion",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": null,
+                  "tool_calls": [
+                    {
+                      "id": "ts-src",
+                      "type": "function",
+                      "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"web/src/order-client.ts\",\"targets\":[\"O1\",\"O2\"]}"
+                      }
+                    },
+                    {
+                      "id": "ts-test",
+                      "type": "function",
+                      "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"web/tests/order-client.spec.ts\",\"targets\":[\"O2\"]}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": "tool_calls"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        "typescript-checkpoint": {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "typescript-checkpoint",
+            "object": "chat.completion",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "{\"candidate_updates\":[],\"completed_steps\":[\"Inspected the owned implementation and relevant boundary context.\"],\"hypotheses\":[],\"inspected\":[\"web/src/order-client.ts\",\"web/tests/order-client.spec.ts\"],\"invariants_evaluated\":[],\"new_candidates\":[{\"affected_location\":\"web/src/order-client.ts:7\",\"candidate_id\":\"candidate-schema-enum\",\"category\":\"correctness\",\"causal_chain\":\"The schema and Java producer add CANCELLED while the TypeScript exhaustive switch retains only CREATED and SHIPPED.\",\"claim\":\"The TypeScript consumer does not handle the new CANCELLED status.\",\"consequence_support\":{\"condition\":\"switch retains only CREATED and SHIPPED\",\"input\":\"CANCELLED\",\"kind\":\"reachable_input_path\",\"outcome\":\"Cancelled orders render as an unknown state\"},\"manual_validation\":\"Run the TypeScript consumer test with a CANCELLED event.\",\"related_obligation_ids\":[\"obligation:component:typescript-consumer:changed-behavior:0c193c264f6e\"],\"root_cause_fingerprint\":\"root:candidate-schema-enum\",\"severity\":\"major\",\"supporting_evidence_ids\":[\"evidence:04267c3e8146fa3ac4c608661b26fca82afd85210aab7a417d67577f5a1bda16\"],\"user_visible_consequence\":\"Cancelled orders render as an unknown state.\"}],\"obligation_updates\":[{\"assessed_paths\":[\"contracts/order-event.schema.json\",\"web/src/order-client.ts\"],\"disposition\":\"covered\",\"evidence_ids\":[\"evidence:04267c3e8146fa3ac4c608661b26fca82afd85210aab7a417d67577f5a1bda16\"],\"next_actions\":[],\"omitted_paths\":[],\"reason\":\"The consumer switch was checked against the changed event status boundary.\",\"target\":\"O1\"},{\"assessed_paths\":[\"web/src/order-client.ts\",\"web/tests/order-client.spec.ts\"],\"disposition\":\"covered\",\"evidence_ids\":[\"evidence:04267c3e8146fa3ac4c608661b26fca82afd85210aab7a417d67577f5a1bda16\",\"evidence:f43aff203c775763bbcf5e05c86b8183f824c719977709d4ee30284f4415f6cc\"],\"next_actions\":[],\"omitted_paths\":[],\"reason\":\"The web implementation and focused test expose the missing CANCELLED handling.\",\"target\":\"O2\"}],\"proposed_next_actions\":[],\"unknowns\":[],\"unresolved\":[],\"working_summary\":\"The owned group was assessed against retained repository evidence.\"}"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        "deployment-tools": {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "deployment-tools",
+            "object": "chat.completion",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": null,
+                  "tool_calls": [
+                    {
+                      "id": "deploy",
+                      "type": "function",
+                      "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"deploy/k8s/order-worker.yaml\",\"targets\":[\"O1\",\"O2\"]}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": "tool_calls"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        "deployment-checkpoint": {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "deployment-checkpoint",
+            "object": "chat.completion",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "{\"candidate_updates\":[],\"completed_steps\":[\"Inspected the owned implementation and relevant boundary context.\"],\"hypotheses\":[],\"inspected\":[\"deploy/k8s/order-worker.yaml\"],\"invariants_evaluated\":[],\"new_candidates\":[],\"obligation_updates\":[{\"assessed_paths\":[\"deploy/k8s/order-worker.yaml\"],\"disposition\":\"covered\",\"evidence_ids\":[\"evidence:22fa8c287ceb20e0f34a0644c5d8852ce5b9b43a7e4e3fdce00483e8c44a18c3\"],\"next_actions\":[],\"omitted_paths\":[],\"reason\":\"The deployment manifest records the worker revision used at the rollout boundary.\",\"target\":\"O1\"},{\"assessed_paths\":[\"deploy/k8s/order-worker.yaml\"],\"disposition\":\"covered\",\"evidence_ids\":[\"evidence:22fa8c287ceb20e0f34a0644c5d8852ce5b9b43a7e4e3fdce00483e8c44a18c3\"],\"next_actions\":[],\"omitted_paths\":[],\"reason\":\"The changed rollout manifest is the retained deployment source of truth.\",\"target\":\"O2\"}],\"proposed_next_actions\":[],\"unknowns\":[],\"unresolved\":[],\"working_summary\":\"The owned group was assessed against retained repository evidence.\"}"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        "store-tools": {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "store-tools",
+            "object": "chat.completion",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": null,
+                  "tool_calls": [
+                    {
+                      "id": "store",
+                      "type": "function",
+                      "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"db/migrations/V42__order_status.sql\",\"targets\":[\"O1\",\"O2\"]}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": "tool_calls"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        "store-checkpoint": {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "store-checkpoint",
+            "object": "chat.completion",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "{\"candidate_updates\":[],\"completed_steps\":[\"Inspected the owned implementation and relevant boundary context.\"],\"hypotheses\":[],\"inspected\":[\"db/migrations/V42__order_status.sql\"],\"invariants_evaluated\":[],\"new_candidates\":[],\"obligation_updates\":[{\"assessed_paths\":[\"db/migrations/V42__order_status.sql\"],\"disposition\":\"covered\",\"evidence_ids\":[\"evidence:b62b740fa6e8ad98ace3b0106647690651ab455f57b2ebd815381920cc36e5ef\"],\"next_actions\":[],\"omitted_paths\":[],\"reason\":\"The migration admits the status persisted by the worker boundary.\",\"target\":\"O1\"},{\"assessed_paths\":[\"db/migrations/V42__order_status.sql\"],\"disposition\":\"covered\",\"evidence_ids\":[\"evidence:b62b740fa6e8ad98ace3b0106647690651ab455f57b2ebd815381920cc36e5ef\"],\"next_actions\":[],\"omitted_paths\":[],\"reason\":\"The changed migration preserves explicit persisted order status values.\",\"target\":\"O2\"}],\"proposed_next_actions\":[],\"unknowns\":[],\"unresolved\":[],\"working_summary\":\"The owned group was assessed against retained repository evidence.\"}"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        "boundary-order-event": {
+          "expect": {
+            "role": "boundary_evaluator",
+            "tools_enabled": false,
+            "response_schema_name": "specialist_boundary_evaluator"
+          },
+          "response": {
+            "id": "boundary-order-event",
             "object": "chat.completion",
             "choices": [{
               "index": 0,
               "message": {
                 "role": "assistant",
-                "content": "{\"transformations\":[{\"kind\":\"merge\",\"target_assignment_id\":\"fallback-combined-1\",\"source_assignment_ids\":[\"fallback-combined-2\"]},{\"kind\":\"improve\",\"assignment_id\":\"fallback-combined-1\",\"objective\":\"Trace the changed API and event contract through every producer, consumer, migration, deployment artifact, and test.\",\"lenses\":[\"contract\",\"delivery\",\"migration\"]}]}"
+                "content": "{\"question\":\"Compare the changed event schema with every producer and consumer, including status and failure semantics.\",\"outcome\":\"supported\",\"reason\":\"The retained schema, producer, and both consumers expose compatible order status behavior.\",\"evidence_ids\":[\"evidence:b7c393e556052aed7b8161bbb7b11ab70096ad5c05d19c297e0ea925471adcf0\",\"evidence:f55750b07717107d6b00ce8807869bb34d71eb10619094703fce548bf472596b\",\"evidence:04267c3e8146fa3ac4c608661b26fca82afd85210aab7a417d67577f5a1bda16\",\"evidence:0461737e1b3a86ce069595da9d902d3dca6fe303359b1a36bb75beadcbc28476\"]}"
               },
               "finish_reason": "stop"
             }],
             "usage": {"prompt_tokens": 3, "completion_tokens": 2}
           }
         },
-        "specialist-tools": {
+        "boundary-order-storage": {
           "expect": {
-            "role": "specialist",
-            "tools_enabled": true,
-            "response_schema_name": null
+            "role": "boundary_evaluator",
+            "tools_enabled": false,
+            "response_schema_name": "specialist_boundary_evaluator"
           },
           "response": {
-            "id": "chatcmpl-specialist-tools",
+            "id": "boundary-order-storage",
             "object": "chat.completion",
             "choices": [{
               "index": 0,
               "message": {
                 "role": "assistant",
-                "content": null,
-                "tool_calls": [
-                  {"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"interaction\",\"obligation_id\":\"obligation:recipe:cross-language-contract:interaction:edec5ab1904a\",\"path\":\"contracts/order-event.schema.json\"}"}},
-                  {"id":"call-2","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"deployment-artifact\",\"obligation_id\":\"obligation:recipe:deployment-rollout:deployment-artifact:7bb554316399\",\"path\":\"deploy/k8s/order-worker.yaml\"}"}},
-                  {"id":"call-3","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"risk-assessment\",\"obligation_id\":\"obligation:risk-rule:schema-changes:risk-assessment:4aa7fd38013b\",\"path\":\"contracts/order-event.schema.json\"}"}},
-                  {"id":"call-4","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"consumer\",\"obligation_id\":\"obligation:topology:contracts-order-event-schema-json:consumer:53c8f5e2d566\",\"path\":\"contracts/order-event.schema.json\"}"}},
-                  {"id":"call-5","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:contracts-order-event-schema-json:implementation:b57372513732\",\"path\":\"contracts/order-event.schema.json\"}"}},
-                  {"id":"call-6","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"producer\",\"obligation_id\":\"obligation:topology:contracts-order-event-schema-json:producer:42ca4db59e94\",\"path\":\"contracts/order-event.schema.json\"}"}},
-                  {"id":"call-7","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:db-migrations-v42-order-status-sql:implementation:e3d595e0465a\",\"path\":\"db/migrations/V42__order_status.sql\"}"}},
-                  {"id":"call-8","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:deploy-k8s-order-worker-yaml:implementation:7e0204a9458c\",\"path\":\"deploy/k8s/order-worker.yaml\"}"}},
-                  {"id":"call-9","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"interaction\",\"obligation_id\":\"obligation:topology:java-api-to-order-contract:interaction:7da5b698b788\",\"path\":\"contracts/order-event.schema.json\"}"}},
-                  {"id":"call-10","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"interaction\",\"obligation_id\":\"obligation:topology:order-contract-to-python-messaging:interaction:a35939cab811\",\"path\":\"contracts/order-event.schema.json\"}"}},
-                  {"id":"call-11","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"interaction\",\"obligation_id\":\"obligation:topology:order-contract-to-typescript-consumer:interaction:048d17c9fff3\",\"path\":\"contracts/order-event.schema.json\"}"}},
-                  {"id":"call-12","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"deployment-artifact\",\"obligation_id\":\"obligation:topology:order-deployment:deployment-artifact:4fd33e41198c\",\"path\":\"deploy/k8s/order-worker.yaml\"}"}},
-                  {"id":"call-13","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"interaction\",\"obligation_id\":\"obligation:topology:order-store-to-order-deployment:interaction:c4942a5fb641\",\"path\":\"contracts/order-event.schema.json\"}"}},
-                  {"id":"call-14","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"migration\",\"obligation_id\":\"obligation:topology:order-store:migration:80066a2fbb3a\",\"path\":\"db/migrations/V42__order_status.sql\"}"}},
-                  {"id":"call-15","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"persistence\",\"obligation_id\":\"obligation:topology:order-store:persistence:f6c6d8fba857\",\"path\":\"db/migrations/V42__order_status.sql\"}"}},
-                  {"id":"call-16","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"deployment-artifact\",\"obligation_id\":\"obligation:topology:order-worker-deployment:deployment-artifact:4128fc6ad77b\",\"path\":\"deploy/k8s/order-worker.yaml\"}"}},
-                  {"id":"call-17","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"interaction\",\"obligation_id\":\"obligation:topology:python-messaging-to-order-store:interaction:3e26931b6dcb\",\"path\":\"contracts/order-event.schema.json\"}"}},
-                  {"id":"call-18","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"consumer\",\"obligation_id\":\"obligation:topology:python-messaging:consumer:ec89c6c37935\",\"path\":\"tests/python/test_order_worker.py\"}"}},
-                  {"id":"call-19","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"delivery\",\"obligation_id\":\"obligation:topology:python-messaging:delivery:fb5b398a39da\",\"path\":\"tests/python/test_order_worker.py\"}"}},
-                  {"id":"call-20","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"producer\",\"obligation_id\":\"obligation:topology:python-messaging:producer:bca10ac5d93f\",\"path\":\"tests/python/test_order_worker.py\"}"}},
-                  {"id":"call-21","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"tests\",\"obligation_id\":\"obligation:topology:relevant-tests:tests:6c17d8d1bc72\",\"path\":\"tests/java/OrderControllerTest.java\"}"}},
-                  {"id":"call-22","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:src-main-java-example-api-ordercontroller-java:implementation:d577a16b2edb\",\"path\":\"src/main/java/example/api/OrderController.java\"}"}},
-                  {"id":"call-23","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:tests-java-ordercontrollertest-java:implementation:38c9abf890dd\",\"path\":\"tests/java/OrderControllerTest.java\"}"}},
-                  {"id":"call-24","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:tests-python-test-order-worker-py:implementation:da089070551e\",\"path\":\"tests/python/test_order_worker.py\"}"}},
-                  {"id":"call-25","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:web-src-order-client-ts:implementation:90781ad84511\",\"path\":\"web/src/order-client.ts\"}"}},
-                  {"id":"call-26","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:web-tests-order-client-spec-ts:implementation:2d10e0a0cbe6\",\"path\":\"web/tests/order-client.spec.ts\"}"}},
-                  {"id":"call-27","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:workers-messaging-order-worker-py:implementation:e1e64f7eccf7\",\"path\":\"workers/messaging/order_worker.py\"}"}}
-                ]
+                "content": "{\"question\":\"Verify the worker and database agree on persisted order status values.\",\"outcome\":\"supported\",\"reason\":\"The worker persistence behavior and migration admit the same order status values.\",\"evidence_ids\":[\"evidence:b62b740fa6e8ad98ace3b0106647690651ab455f57b2ebd815381920cc36e5ef\",\"evidence:0461737e1b3a86ce069595da9d902d3dca6fe303359b1a36bb75beadcbc28476\"]}"
               },
-              "finish_reason": "tool_calls"
+              "finish_reason": "stop"
             }],
             "usage": {"prompt_tokens": 3, "completion_tokens": 2}
           }
         },
-        "specialist-checkpoint": {
+        "boundary-worker-deployment": {
           "expect": {
-            "role": "specialist",
-            "tools_enabled": true,
-            "response_schema_name": null
+            "role": "boundary_evaluator",
+            "tools_enabled": false,
+            "response_schema_name": "specialist_boundary_evaluator"
           },
           "response": {
-            "id": "chatcmpl-specialist-checkpoint",
+            "id": "boundary-worker-deployment",
             "object": "chat.completion",
             "choices": [{
               "index": 0,
               "message": {
                 "role": "assistant",
-                "content": "{\"new_candidates\":[{\"candidate_id\":\"candidate-schema-enum\",\"root_cause_fingerprint\":\"root:candidate-schema-enum\",\"claim\":\"The TypeScript consumer does not handle the new CANCELLED status.\",\"affected_location\":\"web/src/order-client.ts:7\",\"causal_chain\":\"The schema and Java producer add CANCELLED while the TypeScript exhaustive switch retains only CREATED and SHIPPED.\",\"severity\":\"major\",\"category\":\"correctness\",\"supporting_evidence_ids\":[\"evidence:133db09e11ae509b27521770cf3232718d7e7808b6059c5a0b43ec2d1bc1a74f\"],\"related_obligation_ids\":[\"obligation:topology:web-src-order-client-ts:implementation:90781ad84511\"],\"consequence_support\":{\"kind\":\"reachable_input_path\",\"input\":\"CANCELLED\",\"condition\":\"switch retains only CREATED and SHIPPED\",\"outcome\":\"Cancelled orders render as an unknown state\"},\"user_visible_consequence\":\"Cancelled orders render as an unknown state.\",\"manual_validation\":\"Run the TypeScript consumer test with a CANCELLED event.\"}],\"evidence_ids\":[],\"inspected\":[\"contracts/order-event.schema.json\",\"db/migrations/V42__order_status.sql\",\"deploy/k8s/order-worker.yaml\",\"src/main/java/example/api/OrderController.java\",\"tests/java/OrderControllerTest.java\",\"tests/python/test_order_worker.py\",\"web/src/order-client.ts\",\"web/tests/order-client.spec.ts\",\"workers/messaging/order_worker.py\"],\"unresolved\":[],\"hypotheses\":[],\"invariants_evaluated\":[],\"unknowns\":[],\"proposed_next_actions\":[]}"
+                "content": "{\"question\":\"Verify deployment settings, worker behavior, and rollback assumptions remain aligned.\",\"outcome\":\"supported\",\"reason\":\"The deployment manifest and worker implementation retain compatible rollout behavior.\",\"evidence_ids\":[\"evidence:22fa8c287ceb20e0f34a0644c5d8852ce5b9b43a7e4e3fdce00483e8c44a18c3\",\"evidence:0461737e1b3a86ce069595da9d902d3dca6fe303359b1a36bb75beadcbc28476\"]}"
               },
               "finish_reason": "stop"
             }],
@@ -113,6 +481,19 @@
             }
           }
         },
+        "critic-retry": {
+          "expect": {
+            "role": "critic",
+            "tools_enabled": false,
+            "response_schema_name": "specialist_critic"
+          },
+          "response": {
+            "error": {
+              "message": "recorded critic retry failure",
+              "type": "recorded_transport_error"
+            }
+          }
+        },
         "finalizer": {
           "expect": {
             "role": "finalizer",
@@ -120,44 +501,312 @@
             "response_schema_name": "specialist_finalizer"
           },
           "response": {
-            "id": "chatcmpl-finalizer",
+            "id": "finalizer",
             "object": "chat.completion",
-            "choices": [{
-              "index": 0,
-              "message": {
-                "role": "assistant",
-                "content": "{\"component_ids\":[\"java-api\",\"order-contract\",\"order-deployment\",\"order-store\",\"python-messaging\",\"typescript-consumer\"],\"recipe_ids\":[\"cross-language-contract\",\"deployment-rollout\"]}"
-              },
-              "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 3, "completion_tokens": 2}
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "{\"component_ids\":[\"java-api\",\"order-contract\",\"order-deployment\",\"order-store\",\"python-messaging\",\"typescript-consumer\"],\"recipe_ids\":[\"cross-language-contract\",\"deployment-rollout\"]}"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
           }
         }
       }
     },
     "no_progress_resume": {
       "responses": [
-        {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"no-progress-tool","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-a","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/a.py\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}},
-        {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"no-progress-duplicate-1","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-a-duplicate-1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/a.py\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}},
-        {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"no-progress-duplicate-2","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-a-duplicate-2","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/a.py\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}},
-        {"expect":{"role":"specialist","tools_enabled":false,"response_schema_name":"specialist_checkpoint"},"response":{"id":"no-progress-checkpoint","choices":[{"index":0,"message":{"role":"assistant","content":"{\"inspected\":[\"src/a.py\"],\"unresolved\":[\"OB-tests\"],\"working_summary\":\"The implementation path was inspected; focused test coverage remains unresolved.\",\"completed_steps\":[\"Read src/a.py and retained its implementation evidence.\"],\"hypotheses\":[],\"candidate_updates\":[],\"invariants_evaluated\":[],\"unknowns\":[\"OB-tests\"],\"proposed_next_actions\":[\"Inspect the focused behavioral test for src/a.py.\"]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}},
-        {"expect":{"role":"specialist","tools_enabled":false,"response_schema_name":null},"response":{"id":"no-progress-dispositions","choices":[{"index":0,"message":{"role":"assistant","content":"{\"obligation_updates\":[{\"target\":\"O2\",\"disposition\":\"unresolved\",\"reason\":\"The focused test has not been inspected.\",\"evidence_ids\":[],\"next_actions\":[\"Read tests/test_a.py to verify changed behavior.\"]}]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}},
-        {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"no-progress-resume-tool","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-tests","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"tests/test_a.py\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}},
-        {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"no-progress-resume-checkpoint","choices":[{"index":0,"message":{"role":"assistant","content":"{\"inspected\":[\"src/a.py\",\"tests/test_a.py\"],\"unresolved\":[],\"hypotheses\":[],\"candidate_updates\":[],\"invariants_evaluated\":[],\"unknowns\":[],\"proposed_next_actions\":[]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}}
+        {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "no-progress-tool",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": null,
+                  "tool_calls": [
+                    {
+                      "id": "call-a",
+                      "type": "function",
+                      "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/a.py\"}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": "tool_calls"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "no-progress-duplicate-1",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": null,
+                  "tool_calls": [
+                    {
+                      "id": "call-a-duplicate-1",
+                      "type": "function",
+                      "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/a.py\"}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": "tool_calls"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "no-progress-duplicate-2",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": null,
+                  "tool_calls": [
+                    {
+                      "id": "call-a-duplicate-2",
+                      "type": "function",
+                      "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/a.py\"}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": "tool_calls"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": false,
+            "response_schema_name": "specialist_checkpoint"
+          },
+          "response": {
+            "id": "no-progress-checkpoint",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "{\"inspected\":[\"src/a.py\"],\"unresolved\":[\"OB-tests\"],\"working_summary\":\"The implementation path was inspected; focused test coverage remains unresolved.\",\"completed_steps\":[\"Read src/a.py and retained its implementation evidence.\"],\"hypotheses\":[],\"candidate_updates\":[],\"invariants_evaluated\":[],\"unknowns\":[\"OB-tests\"],\"proposed_next_actions\":[\"Inspect the focused behavioral test for src/a.py.\"]}"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": false,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "no-progress-dispositions",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "{\"obligation_updates\":[{\"target\":\"O2\",\"disposition\":\"unresolved\",\"reason\":\"The focused test has not been inspected.\",\"evidence_ids\":[],\"next_actions\":[\"Read tests/test_a.py to verify changed behavior.\"]}]}"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "no-progress-resume-tool",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": null,
+                  "tool_calls": [
+                    {
+                      "id": "call-tests",
+                      "type": "function",
+                      "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"tests/test_a.py\"}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": "tool_calls"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "no-progress-resume-checkpoint",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "{\"inspected\":[\"src/a.py\",\"tests/test_a.py\"],\"unresolved\":[],\"hypotheses\":[],\"candidate_updates\":[],\"invariants_evaluated\":[],\"unknowns\":[],\"proposed_next_actions\":[]}"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        }
       ]
     },
     "reconstruction": {
       "responses": [
-        {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"reconstruct-tool","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-reconstruct","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"src/a.py\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}},
-        {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"reconstruct-checkpoint","choices":[{"index":0,"message":{"role":"assistant","content":"{\"inspected\":[\"src/a.py\"],\"unresolved\":[\"OB-tests\"],\"hypotheses\":[],\"candidate_updates\":[],\"invariants_evaluated\":[],\"unknowns\":[\"OB-tests\"],\"proposed_next_actions\":[\"Inspect the focused behavioral test for src/a.py.\"]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}}
+        {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "reconstruct-tool",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": null,
+                  "tool_calls": [
+                    {
+                      "id": "call-reconstruct",
+                      "type": "function",
+                      "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/a.py\"}"
+                      }
+                    }
+                  ]
+                },
+                "finish_reason": "tool_calls"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        },
+        {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "reconstruct-checkpoint",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "{\"inspected\":[\"src/a.py\"],\"unresolved\":[\"OB-tests\"],\"hypotheses\":[],\"candidate_updates\":[],\"invariants_evaluated\":[],\"unknowns\":[\"OB-tests\"],\"proposed_next_actions\":[\"Inspect the focused behavioral test for src/a.py.\"]}"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        }
       ],
       "recovery_reason": "repetitive-transcript"
     },
     "planner_repair": {
-      "expected": {"repair_requests": 0, "source": "deterministic_base_transformed"}
+      "expected": {
+        "repair_requests": 0,
+        "source": "deterministic_base_transformed"
+      }
     },
     "failed_critic": {
-      "expected": {"terminal": true, "fallback": "conservative"}
+      "expected": {
+        "terminal": true,
+        "fallback": "conservative"
+      }
     },
     "deadline_cutoff": {
       "deadline_sec": 20,
@@ -168,11 +817,43 @@
         "finalization": 10
       },
       "responses": [
-        {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"deadline-checkpoint","choices":[{"index":0,"message":{"role":"assistant","content":"{\"inspected\":[],\"unresolved\":[\"obligation:topology:src-a-py:implementation:a24afd9558cf\"],\"hypotheses\":[],\"candidate_updates\":[],\"invariants_evaluated\":[],\"unknowns\":[\"obligation:topology:src-a-py:implementation:a24afd9558cf\"],\"proposed_next_actions\":[\"Inspect the changed implementation in src/a.py.\"]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}}
+        {
+          "expect": {
+            "role": "specialist",
+            "tools_enabled": true,
+            "response_schema_name": null
+          },
+          "response": {
+            "id": "deadline-checkpoint",
+            "choices": [
+              {
+                "index": 0,
+                "message": {
+                  "role": "assistant",
+                  "content": "{\"inspected\":[],\"unresolved\":[\"obligation:topology:src-a-py:implementation:a24afd9558cf\"],\"hypotheses\":[],\"candidate_updates\":[],\"invariants_evaluated\":[],\"unknowns\":[\"obligation:topology:src-a-py:implementation:a24afd9558cf\"],\"proposed_next_actions\":[\"Inspect the changed implementation in src/a.py.\"]}"
+                },
+                "finish_reason": "stop"
+              }
+            ],
+            "usage": {
+              "prompt_tokens": 3,
+              "completion_tokens": 2
+            }
+          }
+        }
       ]
     },
     "completion_inversion": {
-      "orders": [["assignment-b", "assignment-a"], ["assignment-a", "assignment-b"]],
+      "orders": [
+        [
+          "assignment-b",
+          "assignment-a"
+        ],
+        [
+          "assignment-a",
+          "assignment-b"
+        ]
+      ],
       "planner_response": {
         "expect": {
           "role": "planner",
@@ -181,15 +862,20 @@
         },
         "response": {
           "id": "completion-planner",
-          "choices": [{
-            "index": 0,
-            "message": {
-              "role": "assistant",
-              "content": "{\"assignments\":[{\"id\":\"assignment-a\",\"title\":\"Inspect A\",\"objective\":\"Inspect component A and the cross-component interaction.\",\"obligation_ids\":[\"obligation:topology:a-to-b:interaction:0a65f4aa488f\",\"obligation:topology:src-a-py:implementation:a24afd9558cf\"],\"lenses\":[\"interaction\"],\"seed_paths\":[\"src/a.py\"],\"boundary_paths\":[\"src/b.py\"],\"expected_evidence\":[\"implementation\",\"interaction\"],\"estimated_turns\":2,\"priority\":\"normal\",\"overlap_justification\":\"\"},{\"id\":\"assignment-b\",\"title\":\"Inspect B\",\"objective\":\"Inspect component B.\",\"obligation_ids\":[\"obligation:topology:src-b-py:implementation:acdc539c18ab\"],\"lenses\":[\"implementation\"],\"seed_paths\":[\"src/b.py\"],\"boundary_paths\":[],\"expected_evidence\":[\"implementation\"],\"estimated_turns\":2,\"priority\":\"normal\",\"overlap_justification\":\"\"}]}"
-            },
-            "finish_reason": "stop"
-          }],
-          "usage": {"prompt_tokens": 3, "completion_tokens": 2}
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "{\"assignments\":[{\"id\":\"assignment-a\",\"title\":\"Inspect A\",\"objective\":\"Inspect component A and the cross-component interaction.\",\"obligation_ids\":[\"obligation:topology:a-to-b:interaction:0a65f4aa488f\",\"obligation:topology:src-a-py:implementation:a24afd9558cf\"],\"lenses\":[\"interaction\"],\"seed_paths\":[\"src/a.py\"],\"boundary_paths\":[\"src/b.py\"],\"expected_evidence\":[\"implementation\",\"interaction\"],\"estimated_turns\":2,\"priority\":\"normal\",\"overlap_justification\":\"\"},{\"id\":\"assignment-b\",\"title\":\"Inspect B\",\"objective\":\"Inspect component B.\",\"obligation_ids\":[\"obligation:topology:src-b-py:implementation:acdc539c18ab\"],\"lenses\":[\"implementation\"],\"seed_paths\":[\"src/b.py\"],\"boundary_paths\":[],\"expected_evidence\":[\"implementation\"],\"estimated_turns\":2,\"priority\":\"normal\",\"overlap_justification\":\"\"}]}"
+              },
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 3,
+            "completion_tokens": 2
+          }
         }
       },
       "assignments": [
@@ -201,10 +887,19 @@
             "obligation:topology:a-to-b:interaction:0a65f4aa488f",
             "obligation:topology:src-a-py:implementation:a24afd9558cf"
           ],
-          "lenses": ["interaction"],
-          "seed_paths": ["src/a.py"],
-          "boundary_paths": ["src/b.py"],
-          "expected_evidence": ["implementation", "interaction"],
+          "lenses": [
+            "interaction"
+          ],
+          "seed_paths": [
+            "src/a.py"
+          ],
+          "boundary_paths": [
+            "src/b.py"
+          ],
+          "expected_evidence": [
+            "implementation",
+            "interaction"
+          ],
           "estimated_turns": 2,
           "priority": "normal",
           "overlap_justification": ""
@@ -216,10 +911,16 @@
           "obligation_ids": [
             "obligation:topology:src-b-py:implementation:acdc539c18ab"
           ],
-          "lenses": ["implementation"],
-          "seed_paths": ["src/b.py"],
+          "lenses": [
+            "implementation"
+          ],
+          "seed_paths": [
+            "src/b.py"
+          ],
           "boundary_paths": [],
-          "expected_evidence": ["implementation"],
+          "expected_evidence": [
+            "implementation"
+          ],
           "estimated_turns": 2,
           "priority": "normal",
           "overlap_justification": ""
@@ -227,17 +928,146 @@
       ],
       "session_responses": {
         "assignment-a": [
-          {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"assignment-a-tools","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"a-interaction","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"interaction\",\"obligation_id\":\"obligation:topology:a-to-b:interaction:0a65f4aa488f\",\"path\":\"src/a.py\"}"}},{"id":"a-implementation","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:src-a-py:implementation:a24afd9558cf\",\"path\":\"src/a.py\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}},
-          {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"assignment-a-checkpoint","choices":[{"index":0,"message":{"role":"assistant","content":"{\"inspected\":[\"src/a.py\"],\"unresolved\":[],\"hypotheses\":[],\"candidate_updates\":[],\"invariants_evaluated\":[],\"unknowns\":[],\"proposed_next_actions\":[]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}}
+          {
+            "expect": {
+              "role": "specialist",
+              "tools_enabled": true,
+              "response_schema_name": null
+            },
+            "response": {
+              "id": "assignment-a-tools",
+              "choices": [
+                {
+                  "index": 0,
+                  "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                      {
+                        "id": "a-interaction",
+                        "type": "function",
+                        "function": {
+                          "name": "read_file",
+                          "arguments": "{\"evidence_category\":\"interaction\",\"obligation_id\":\"obligation:topology:a-to-b:interaction:0a65f4aa488f\",\"path\":\"src/a.py\"}"
+                        }
+                      },
+                      {
+                        "id": "a-implementation",
+                        "type": "function",
+                        "function": {
+                          "name": "read_file",
+                          "arguments": "{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:src-a-py:implementation:a24afd9558cf\",\"path\":\"src/a.py\"}"
+                        }
+                      }
+                    ]
+                  },
+                  "finish_reason": "tool_calls"
+                }
+              ],
+              "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 2
+              }
+            }
+          },
+          {
+            "expect": {
+              "role": "specialist",
+              "tools_enabled": true,
+              "response_schema_name": null
+            },
+            "response": {
+              "id": "assignment-a-checkpoint",
+              "choices": [
+                {
+                  "index": 0,
+                  "message": {
+                    "role": "assistant",
+                    "content": "{\"inspected\":[\"src/a.py\"],\"unresolved\":[],\"hypotheses\":[],\"candidate_updates\":[],\"invariants_evaluated\":[],\"unknowns\":[],\"proposed_next_actions\":[]}"
+                  },
+                  "finish_reason": "stop"
+                }
+              ],
+              "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 2
+              }
+            }
+          }
         ],
         "assignment-b": [
-          {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"assignment-b-tools","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"b-implementation","type":"function","function":{"name":"read_file","arguments":"{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:src-b-py:implementation:acdc539c18ab\",\"path\":\"src/b.py\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}},
-          {"expect":{"role":"specialist","tools_enabled":true,"response_schema_name":null},"response":{"id":"assignment-b-checkpoint","choices":[{"index":0,"message":{"role":"assistant","content":"{\"inspected\":[\"src/b.py\"],\"unresolved\":[],\"hypotheses\":[],\"candidate_updates\":[],\"invariants_evaluated\":[],\"unknowns\":[],\"proposed_next_actions\":[]}"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}}
+          {
+            "expect": {
+              "role": "specialist",
+              "tools_enabled": true,
+              "response_schema_name": null
+            },
+            "response": {
+              "id": "assignment-b-tools",
+              "choices": [
+                {
+                  "index": 0,
+                  "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                      {
+                        "id": "b-implementation",
+                        "type": "function",
+                        "function": {
+                          "name": "read_file",
+                          "arguments": "{\"evidence_category\":\"implementation\",\"obligation_id\":\"obligation:topology:src-b-py:implementation:acdc539c18ab\",\"path\":\"src/b.py\"}"
+                        }
+                      }
+                    ]
+                  },
+                  "finish_reason": "tool_calls"
+                }
+              ],
+              "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 2
+              }
+            }
+          },
+          {
+            "expect": {
+              "role": "specialist",
+              "tools_enabled": true,
+              "response_schema_name": null
+            },
+            "response": {
+              "id": "assignment-b-checkpoint",
+              "choices": [
+                {
+                  "index": 0,
+                  "message": {
+                    "role": "assistant",
+                    "content": "{\"inspected\":[\"src/b.py\"],\"unresolved\":[],\"hypotheses\":[],\"candidate_updates\":[],\"invariants_evaluated\":[],\"unknowns\":[],\"proposed_next_actions\":[]}"
+                  },
+                  "finish_reason": "stop"
+                }
+              ],
+              "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 2
+              }
+            }
+          }
         ]
       }
     },
     "note_anchor_race": {
-      "orders": [["file-candidate", "line-candidate"], ["line-candidate", "file-candidate"]]
+      "orders": [
+        [
+          "file-candidate",
+          "line-candidate"
+        ],
+        [
+          "line-candidate",
+          "file-candidate"
+        ]
+      ]
     }
   }
 }

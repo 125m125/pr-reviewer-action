@@ -233,8 +233,16 @@ class _FakeClient:
         self.calls.append(("general_reply", repo, pr_number, prior, body))
         return {"id": 903, "url": _issue_url(903)}
 
+    def minimize_comment(self, node_id, classifier):
+        self.calls.append(("minimize", node_id, classifier))
+        return {"isMinimized": True, "minimizedReason": classifier.lower()}
 
-def _publish(tmp_path, client, *, mode="review_comment", notes=(), verdict="approve", approval=None):
+    def dismiss_review(self, review_id):
+        self.calls.append(("dismiss", review_id))
+        return {"id": review_id, "state": "DISMISSED"}
+
+
+def _publish(tmp_path, client, *, mode="review_comment", notes=(), verdict="approve", approval=None, **kwargs):
     state_path = tmp_path / "publication-state.json"
     publisher = GitHubReviewPublisher(client, state_path=state_path, max_attempts=1)
     result = publisher.publish(
@@ -251,8 +259,62 @@ def _publish(tmp_path, client, *, mode="review_comment", notes=(), verdict="appr
         approval_policy=approval or PublisherApprovalPolicy(),
         changed_files_complete=True,
         diff_complete=False,
+        **kwargs,
     )
     return result, json.loads(state_path.read_text(encoding="utf-8"))
+
+
+def test_native_review_contains_handoff_without_sticky_comment(tmp_path):
+    client = _FakeClient()
+    result, _ = _publish(tmp_path, client)
+    assert result["review_completed"]
+    assert not any(call[0] == "sticky" for call in client.calls)
+    body = next(call[3] for call in client.calls if call[0] == "submit")
+    assert "Sparse handoff" in body
+    assert "https://example/artifact" in body
+    assert "Reviewed head: `" + "a" * 40 + "`" in body
+
+
+def test_empty_unmanaged_review_is_left_untouched(tmp_path):
+    client = _FakeClient({'reviews': [{'id': 'empty-review', 'body': '', 'state': 'COMMENTED'}]})
+    result, _ = _publish(tmp_path, client)
+    assert result['review_completed']
+    assert result['previous_review_cleanup']['skipped_unmanaged'] == 1
+    assert not any(call[0] in {'dismiss', 'minimize'} for call in client.calls)
+
+
+def test_old_reviews_retired_only_after_replacement_and_threads_left_open(tmp_path):
+    client = _FakeClient({
+        "reviews": [{"id": "old-review", "body": "<!-- ai-pr-reviewer-specialist:old -->", "state": "CHANGES_REQUESTED"}],
+        "handoff_comments": [{"node_id": "old-handoff"}],
+    })
+    result, _ = _publish(tmp_path, client)
+    operations = [call[0] for call in client.calls]
+    assert result["review_completed"]
+    assert operations.index("submit") < operations.index("dismiss") < operations.index("minimize")
+    assert ("minimize", "old-review", "OUTDATED") in client.calls
+    assert ("minimize", "old-handoff", "OUTDATED") in client.calls
+    assert result['previous_review_cleanup']['eligible_reviews'] == 1
+    assert result['previous_review_cleanup']['minimized_reviews'] == 1
+    assert result['previous_review_cleanup']['minimized_handoff_comments'] == 1
+    assert "resolve" not in operations
+
+
+def test_failed_publication_keeps_previous_review_visible(tmp_path):
+    class FailureClient(_FakeClient):
+        def submit_review(self, *args):
+            raise RuntimeError("offline")
+    client = FailureClient({"reviews": [{"id": "old-review", "body": "<!-- ai-pr-reviewer-specialist:old -->", "state": "COMMENTED"}]})
+    result, _ = _publish(tmp_path, client)
+    assert not result["review_completed"]
+    assert not any(call[0] in {"minimize", "dismiss"} for call in client.calls)
+
+
+def test_incremental_review_preserves_previous_full_review(tmp_path):
+    client = _FakeClient({"reviews": [{"id": "old-review", "body": "<!-- ai-pr-reviewer-specialist:old -->", "state": "COMMENTED"}]})
+    _publish(tmp_path, client, approval=PublisherApprovalPolicy(effective_scope="incremental"))
+    assert not any(call[0] in {"minimize", "dismiss"} for call in client.calls)
+    assert "incremental" in next(call[3] for call in client.calls if call[0] == "submit")
 
 
 def test_comment_mode_only_updates_sparse_handoff_and_artifacts(tmp_path):
@@ -415,7 +477,6 @@ def test_review_comment_lifecycle_order_and_state(tmp_path):
 
     assert [call[0] for call in client.calls] == [
         "query",
-        "sticky",
         "reply",
         "reply",
         "resolve",
@@ -424,11 +485,12 @@ def test_review_comment_lifecycle_order_and_state(tmp_path):
         "add",
         "query",
         "submit",
-        "sticky",
     ]
     submit = next(call for call in client.calls if call[0] == "submit")
     assert submit[2] == "COMMENT"
-    assert "Automated specialist review notes. Detailed findings are in managed threads." in submit[3]
+    assert "Sparse handoff" in submit[3]
+    assert "https://example/artifact" in submit[3]
+    assert "Current evidence" not in submit[3]
     by_fp = {entry["fingerprint"]: entry for entry in state["notes"]}
     assert by_fp["fp-fixed"]["resolution"] == "resolved"
     assert by_fp["fp-line"]["anchor_type"] == "LINE"
@@ -923,10 +985,10 @@ def test_unanchored_requests_use_explicitly_non_resolvable_general_comment(tmp_p
     result, state = _publish(tmp_path, client, notes=(request,))
 
     assert [call[0] for call in client.calls] == [
-        "query", "sticky", "general", "pending", "query", "submit", "sticky"
+        "query", "general", "pending", "query", "submit"
     ]
     assert any(item["operation"] == "upsert_general_comment" for item in result["journal"])
-    assert "cannot be resolved" in client.calls[2][-1].lower()
+    assert "cannot be resolved" in next(call[-1] for call in client.calls if call[0] == "general").lower()
     assert state["notes"][0]["non_resolvable"] is True
     assert state["notes"][0]["anchor_type"] == "GENERAL"
 
@@ -1125,7 +1187,8 @@ def test_completed_owned_review_marker_makes_rerun_idempotent(tmp_path):
 
     assert not any(call[0] in {"pending", "add", "submit"} for call in client.calls)
     assert result["review"]["id"] == completed["id"]
-    assert result["sticky"]["url"] == _issue_url(100)
+    assert result["sticky"] == {}
+    assert not any(call[0] == "sticky" for call in client.calls)
 
 
 def test_completed_review_reuse_is_blocked_by_failed_existing_status_reply(tmp_path):
@@ -1156,7 +1219,7 @@ def test_completed_review_reuse_is_blocked_by_failed_existing_status_reply(tmp_p
 
     assert result["review_completed"] is False
     assert state["review"]["status"] == "pending_incomplete"
-    assert len([call for call in second.calls if call[0] == "sticky"]) == 1
+    assert not any(call[0] == "sticky" for call in second.calls)
 
 
 def test_completed_review_reuse_is_blocked_by_failed_resolution(tmp_path):
@@ -1186,7 +1249,7 @@ def test_completed_review_reuse_is_blocked_by_failed_resolution(tmp_path):
 
     assert result["review_completed"] is False
     assert state["review"]["status"] == "pending_incomplete"
-    assert len([call for call in second.calls if call[0] == "sticky"]) == 1
+    assert not any(call[0] == "sticky" for call in second.calls)
 
 
 def test_completed_review_reuse_is_blocked_by_failed_general_answer(tmp_path):
@@ -1213,7 +1276,7 @@ def test_completed_review_reuse_is_blocked_by_failed_general_answer(tmp_path):
 
     assert result["review_completed"] is False
     assert state["review"]["status"] == "pending_incomplete"
-    assert len([call for call in second.calls if call[0] == "sticky"]) == 1
+    assert not any(call[0] == "sticky" for call in second.calls)
 
 
 def test_completed_review_reuse_revalidates_head_after_reconciliation(tmp_path):
@@ -1253,7 +1316,7 @@ def test_completed_review_reuse_revalidates_head_after_reconciliation(tmp_path):
         error["operation"] == "pre_submit_head_ref_oid"
         for error in state["publication_errors"]
     )
-    assert len([call for call in second.calls if call[0] == "sticky"]) == 1
+    assert not any(call[0] == "sticky" for call in second.calls)
 
 
 def _completed_review_from_submit(client, state):
@@ -2173,22 +2236,22 @@ def test_production_review_mutations_require_expected_confirmed_state(monkeypatc
         client.submit_review("R", "REQUEST_CHANGES", "marker")
 
 
-def test_final_sticky_refresh_has_one_aggregate_review_link_and_no_note_detail(tmp_path):
+def test_native_review_has_handoff_artifacts_and_no_inline_note_detail(tmp_path):
     client = _FakeClient()
     _publish(
         tmp_path,
         client,
         notes=(_note("fp-secret", markdown="PRIVATE NOTE DETAIL"),),
     )
-    sticky_calls = [call for call in client.calls if call[0] == "sticky"]
+    body = next(call[3] for call in client.calls if call[0] == "submit")
+    assert not any(call[0] == "sticky" for call in client.calls)
+    assert "Sparse handoff" in body
+    assert body.count("https://example/artifact") == 1
+    assert "PRIVATE NOTE DETAIL" not in body
+    assert "PRIVATE NOTE DETAIL" in next(call[1]["body"] for call in client.calls if call[0] == "add")
 
-    assert len(sticky_calls) == 2
-    assert "PRIVATE NOTE DETAIL" not in sticky_calls[-1][3]
-    assert sticky_calls[-1][3].count(_review_url(151)) == 1
-    assert "Detailed managed review" in sticky_calls[-1][3]
 
-
-def test_final_sticky_refresh_uses_initial_comment_id_when_list_is_stale(tmp_path):
+def test_native_publication_never_updates_sticky_when_comment_listing_is_stale(tmp_path):
     class StaleListClient(_FakeClient):
         def update_sticky(self, repo, pr_number, body, known_comment_id=None):
             self.calls.append(("sticky", repo, pr_number, body, known_comment_id))
@@ -2198,7 +2261,8 @@ def test_final_sticky_refresh_uses_initial_comment_id_when_list_is_stale(tmp_pat
     _publish(tmp_path, client, notes=())
     sticky_calls = [call for call in client.calls if call[0] == "sticky"]
 
-    assert [call[4] for call in sticky_calls] == [None, 100]
+    assert sticky_calls == []
+    assert len([call for call in client.calls if call[0] == "submit"]) == 1
 
 
 @pytest.mark.parametrize(
@@ -2238,37 +2302,35 @@ def test_submitted_specialist_review_body_uses_cleanup_compatible_marker(
     assert 'startswith("<!-- ai-pr-reviewer")' in helper
 
 
-def test_invalid_sticky_success_object_fails_closed_before_query(tmp_path):
+def test_invalid_comment_mode_sticky_success_object_fails_closed(tmp_path):
     class InvalidStickyClient(_FakeClient):
         def update_sticky(self, repo, pr_number, body):
             self.calls.append(("sticky", repo, pr_number, body))
             return {}
 
     client = InvalidStickyClient()
-    result, _state = _publish(tmp_path, client, notes=(_note(),))
+    result, _state = _publish(tmp_path, client, mode="comment", notes=(_note(),))
 
-    assert [call[0] for call in client.calls] == ["query", "sticky"]
+    assert [call[0] for call in client.calls] == ["sticky"]
+    assert result["review_completed"] is False
     assert result["publication_errors"][0]["operation"] == "update_sticky"
 
 
-def test_invalid_final_sticky_refresh_is_not_checkpointed_as_success(tmp_path):
-    class InvalidRefreshClient(_FakeClient):
-        def __init__(self):
-            super().__init__()
-            self.sticky_count = 0
-
-        def update_sticky(self, repo, pr_number, body):
-            self.calls.append(("sticky", repo, pr_number, body))
-            self.sticky_count += 1
-            if self.sticky_count == 1:
-                return {"id": 100, "url": _issue_url(100)}
+def test_invalid_cleanup_confirmation_is_not_checkpointed_as_success(tmp_path):
+    class InvalidCleanupClient(_FakeClient):
+        def minimize_comment(self, node_id, classifier):
+            self.calls.append(("minimize", node_id, classifier))
             return {}
 
-    result, _state = _publish(tmp_path, InvalidRefreshClient(), notes=())
+    client = InvalidCleanupClient({"handoff_comments": [{"node_id": "old-handoff"}]})
+    result, _state = _publish(tmp_path, client, notes=())
 
-    assert result["sticky"] == {"id": 100, "url": _issue_url(100)}
-    assert not any(item["operation"] == "refresh_sticky" for item in result["journal"])
-    assert any(error["operation"] == "refresh_sticky" for error in result["publication_errors"])
+    assert result["sticky"] == {}
+    assert result["review"]["url"] == _review_url(151)
+    assert not any(item["operation"] == "minimize_comment" for item in result["journal"])
+    assert any(error["operation"] == "minimize_comment" for error in result["publication_errors"])
+    operations = [call[0] for call in client.calls]
+    assert operations.index("submit") < operations.index("minimize")
 
 
 def test_failed_submit_records_no_desired_event_url_or_final_success_link(tmp_path):
@@ -2284,7 +2346,7 @@ def test_failed_submit_records_no_desired_event_url_or_final_success_link(tmp_pa
     assert result["review_completed"] is False
     assert result["review"].get("event") is None
     assert result["review"].get("url") is None
-    assert [call[0] for call in client.calls].count("sticky") == 1
+    assert not any(call[0] == "sticky" for call in client.calls)
     assert not any(item["operation"] == "refresh_sticky" for item in result["journal"])
 
 
@@ -2690,6 +2752,42 @@ def _connection(nodes=(), *, has_next=False, cursor=None):
         "nodes": list(nodes),
         "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
     }
+
+
+@pytest.mark.parametrize('viewer,author,expected', [
+    ('github-actions[bot]', 'github-actions', True),
+    ('github-actions', 'github-actions[bot]', True),
+    ('GitHub-Actions[bot]', 'github-actions', True),
+    ('github-actions[bot]', 'other-bot', False),
+    ('', '', False),
+])
+def test_bot_login_normalization(viewer, author, expected):
+    from pr_reviewer.github_review_notes import _same_github_login
+    assert _same_github_login(viewer, author) is expected
+
+
+@pytest.mark.parametrize('body', ['<!-- ai-pr-reviewer-specialist:old -->', ''])
+def test_review_ownership_diagnostics_keep_viewer_author_requirement(monkeypatch, tmp_path, body):
+    client = GhReviewClient(action_root=tmp_path)
+    def graphql(query, variables):
+        if 'ManagedReviewIdentity' in query:
+            return {'data': {'viewer': {'login': 'github-actions[bot]'}, 'repository': {
+                'pullRequest': {'id': 'PR', 'changedFiles': 0, 'headRefOid': 'a' * 40}}}}
+        key = 'reviews' if 'ManagedReviews' in query else 'comments' if 'ManagedIssueComments' in query else 'reviewThreads'
+        nodes = [] if key != 'reviews' else [
+            {'id': 'old-review', 'url': 'https://github.com/owner/repo/pull/17#pullrequestreview-1',
+             'body': body, 'state': 'COMMENTED',
+             'viewerDidAuthor': authored, 'author': {'login': login}}
+            for authored, login in [(True, 'github-actions'), (False, 'github-actions'), (True, 'another')]]
+        return {'data': {'node': {key: _connection(nodes)}}}
+    monkeypatch.setattr(client, '_graphql', graphql)
+    monkeypatch.setattr(client, 'list_changed_files', lambda *args: ())
+    state = client.query_managed_state('owner/repo', 17)
+    assert len(state['reviews']) == 1
+    assert state['review_ownership_diagnostics'] == {
+        'viewer_login': 'github-actions[bot]', 'found': 3, 'owned': 1,
+        'skipped_viewer_did_not_author': 1, 'skipped_author_mismatch': 1,
+        'author_logins': ['another', 'github-actions']}
 
 
 def test_managed_state_paginates_threads_comments_and_thread_comments(monkeypatch, tmp_path):
@@ -3144,7 +3242,7 @@ def test_push_during_detail_mutations_keeps_review_pending(
 
     assert any(call[0] == "add" for call in client.calls)
     assert not any(call[0] == "submit" for call in client.calls)
-    assert [call[0] for call in client.calls].count("sticky") == 1
+    assert not any(call[0] == "sticky" for call in client.calls)
     assert result["review_completed"] is False
     assert state["review"]["status"] == "pending_incomplete"
     assert any(

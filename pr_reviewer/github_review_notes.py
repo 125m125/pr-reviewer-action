@@ -18,13 +18,22 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol, Sequence
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
-
+from pr_reviewer.access_request_reconciliation import reconcile_access_request_comment
 from pr_reviewer.enforcement import RuntimeVerdictPolicyResult
 from pr_reviewer.platform import gh_argv
+from pr_reviewer.specialist_runtime.policy import ReviewPolicy
 from pr_reviewer.specialist_runtime.types import ReviewHandoff, ReviewNote, ReviewNoteKind
 from scripts.redact import mask_secrets
 from scripts.sanitize_review_markdown import sanitize_markdown
 from scripts.strip_metadata_markers import strip_reserved_markers
+
+
+def _same_github_login(left: object, right: object) -> bool:
+    """REST/app bot identities can carry a suffix absent from GraphQL authors."""
+    def normalized(value):
+        return value.casefold().removesuffix('[bot]') if isinstance(value, str) else ''
+    first, second = normalized(left), normalized(right)
+    return bool(first and second and first == second)
 
 
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -118,6 +127,9 @@ class ReviewPublishClient(Protocol):
     ) -> Mapping[str, Any]: ...
     def add_review_thread(self, variables: Mapping[str, Any]) -> Mapping[str, Any]: ...
     def submit_review(self, review_id: str, event: str, body: str) -> Mapping[str, Any]: ...
+    def minimize_comment(self, node_id: str, classifier: str) -> Mapping[str, Any]: ...
+    def dismiss_review(self, review_id: str) -> Mapping[str, Any]: ...
+    def annotate_access_request(self, repo: str, pr_number: int, prior: Mapping[str, Any], body: str) -> Mapping[str, Any]: ...
     def upsert_general_comment(
         self, repo: str, pr_number: int, prior: Mapping[str, Any] | None, body: str
     ) -> Mapping[str, Any]: ...
@@ -675,6 +687,7 @@ def _publication_id(
     policy_result: RuntimeVerdictPolicyResult,
     notes: Sequence[ReviewNote],
     handoff: ReviewHandoff,
+    run_url: str = "",
 ) -> str:
     note_identities = []
     for note in notes:
@@ -695,6 +708,8 @@ def _publication_id(
             }, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest(),
         })
     identity = {
+        "body_format": "native-handoff-v1",
+        "run_url": run_url,
         "repo": repo.lower(),
         "pr_number": pr_number,
         "head_sha": head_sha,
@@ -861,6 +876,10 @@ class GitHubReviewPublisher:
         approval_policy: PublisherApprovalPolicy = PublisherApprovalPolicy(),
         changed_files_complete: bool = False,
         diff_complete: bool = False,
+        cleanup_previous_reviews: bool = True,
+        access_policy: Mapping[str, Any] | ReviewPolicy | None = None,
+        allowed_github_repositories: Iterable[str] = (),
+        run_url: str = "",
     ) -> dict[str, Any]:
         if mode not in {"comment", "review_comment", "review_verdict"}:
             raise ValueError("unsupported publish mode")
@@ -885,6 +904,9 @@ class GitHubReviewPublisher:
             raise ValueError("head_sha must be a canonical 40- or 64-character hex digest")
         if type(changed_files_complete) is not bool or type(diff_complete) is not bool:
             raise TypeError("snapshot completeness flags must be boolean")
+        if type(cleanup_previous_reviews) is not bool:
+            raise TypeError("cleanup_previous_reviews must be boolean")
+        allowed_github_repositories = tuple(allowed_github_repositories)
         if not isinstance(handoff, ReviewHandoff):
             raise TypeError("handoff must be a ReviewHandoff")
         if not isinstance(diff_text, str):
@@ -913,6 +935,7 @@ class GitHubReviewPublisher:
             policy_result=policy_result,
             notes=notes_snapshot,
             handoff=handoff,
+            run_url=run_url,
         )
         expected_review_state = _EXPECTED_REVIEW_STATE[desired_event]
         loaded_state: object = None
@@ -928,7 +951,11 @@ class GitHubReviewPublisher:
             publication_id=publication_id,
         )
         self._errors = (
-            [dict(item) for item in prior_state.get("publication_errors", ())]
+            [dict(item) for item in prior_state.get("publication_errors", ())
+             if item.get("operation") not in {
+                 "annotate_access_request", "minimize_comment", "dismiss_previous_review",
+                 "access_request_state",
+             }]
             if prior_state is not None
             else []
         )
@@ -1105,22 +1132,35 @@ class GitHubReviewPublisher:
             files_snapshot = live_files
             state["changed_files_complete"] = True
 
-        sticky_body = _handoff_body(handoff, artifact_links)
-        sticky = self._call(
-            "update_sticky", self.client.update_sticky, repo, pr_number, sticky_body
-        )
-        if not _valid_comment_result(sticky):
-            self._errors.append({
-                "operation": "update_sticky",
-                "error": "sticky publication did not return a valid id and URL",
-            })
-            state["publication_errors"] = self._errors
-            self._write_state(state)
-            return state
-        state["sticky"] = dict(sticky)
-        self._checkpoint(state, "update_sticky", sticky)
         if mode == "comment":
+            sticky = self._call(
+                "update_sticky", self.client.update_sticky, repo, pr_number,
+                _handoff_body(handoff, artifact_links),
+            )
+            if not _valid_comment_result(sticky):
+                self._errors.append({
+                    "operation": "update_sticky",
+                    "error": "sticky publication did not return a valid id and URL",
+                })
+                state["publication_errors"] = self._errors
+                self._write_state(state)
+                return state
+            state["sticky"] = dict(sticky)
+            self._checkpoint(state, "update_sticky", sticky)
             state["review_completed"] = True
+            if run_url and (access_policy is not None or allowed_github_repositories):
+                access_state = self._call(
+                    "access_request_state", self.client.query_managed_state,
+                    repo, pr_number, retry_safe=True,
+                )
+                if isinstance(access_state, Mapping) and access_state.get("head_ref_oid") == head_sha:
+                    self._after_publication(
+                        state, access_state, repo, pr_number, head_sha, access_policy,
+                        allowed_github_repositories, run_url, False,
+                    )
+                elif access_state is not None:
+                    self._errors.append({"operation": "access_request_state", "error": "current head not confirmed for access reconciliation"})
+            state["publication_errors"] = self._errors
             self._write_state(state)
             return state
 
@@ -1390,10 +1430,23 @@ class GitHubReviewPublisher:
                 continue
             if note.anchor is None:
                 prior_comment = prior_general.get(fingerprint)
+                access_request = fingerprint.startswith("source_access_request:")
+                if access_request and prior_comment and (
+                    prior_comment.get("is_minimized")
+                    or str(prior_comment.get("body", "")).startswith("<!-- ai-pr-review-access-granted:")
+                ):
+                    # A later revocation starts a new visible request. Preserve
+                    # the previous request and its historical grant verbatim.
+                    prior_comment = None
                 body = (
                     note.markdown
-                    + "\n\n> This managed general PR comment cannot be resolved in GitHub. "
-                    "Reply or re-review is required to record completion.\n\n"
+                    + (
+                        "\n\n> A later review will annotate and minimize this request "
+                        "when the effective configuration authorizes the requested access.\n\n"
+                        if access_request else
+                        "\n\n> This managed general PR comment cannot be resolved in GitHub. "
+                        "Reply or re-review is required to record completion.\n\n"
+                    )
                     + _general_marker(note)
                 )
                 published = self._call(
@@ -1570,6 +1623,10 @@ class GitHubReviewPublisher:
             })
 
         for fingerprint, prior in prior_general.items():
+            # Absence from a later review is not proof that access was granted.
+            # Reconcile these against effective authorization after publication.
+            if fingerprint.startswith("source_access_request:"):
+                continue
             current_note = current.get(fingerprint)
             if current_note is not None and current_note.anchor is None:
                 continue
@@ -1669,6 +1726,13 @@ class GitHubReviewPublisher:
 
         pull_request_id = str(managed.get("pull_request_id") or "")
         review_marker = _publication_marker(publication_id, desired_event)
+        review_body = (
+            review_marker + "\n" + _handoff_body(handoff, artifact_links)
+            + f"\n\nReviewed head: `{head_sha}` · Scope: {approval_policy.effective_scope}."
+        )
+        safe_run_url = _canonical_artifact_url(run_url)
+        if safe_run_url:
+            review_body += f" [Review run](<{safe_run_url}>)"
         completed_review = next((
             item
             for item in managed.get("reviews", ())
@@ -1733,22 +1797,11 @@ class GitHubReviewPublisher:
                 "safety_reason": "owned specialist review already submitted for this head",
             }
             self._checkpoint(state, "resume_submitted_review", completed_review)
-            refreshed = self._call(
-                "refresh_sticky",
-                self.client.update_sticky,
-                repo,
-                pr_number,
-                _handoff_body(handoff, artifact_links, completed_review["url"]),
-                sticky["id"],
+            self._after_publication(
+                state, managed, repo, pr_number, head_sha, access_policy,
+                allowed_github_repositories, run_url,
+                cleanup_previous_reviews and approval_policy.effective_scope == "full",
             )
-            if _valid_comment_result(refreshed):
-                state["sticky"] = dict(refreshed)
-                self._checkpoint(state, "refresh_sticky", refreshed)
-            elif refreshed is not None:
-                self._errors.append({
-                    "operation": "refresh_sticky",
-                    "error": "sticky refresh did not return a valid id and URL",
-                })
             state["publication_errors"] = self._errors
             state["notes"].sort(key=lambda item: str(item.get("fingerprint", "")))
             self._write_state(state)
@@ -1934,13 +1987,7 @@ class GitHubReviewPublisher:
                 self.client.submit_review,
                 review_id,
                 event,
-                review_marker
-                + (
-                    "\nAutomated specialist review notes. "
-                    "Detailed findings are in managed threads."
-                    if new_thread_notes
-                    else ""
-                ),
+                review_body,
             )
             if submitted is not None and not _valid_submitted_review(
                 submitted, review_marker, expected_review_state
@@ -1994,28 +2041,94 @@ class GitHubReviewPublisher:
                     "expected_event": event,
                     "safety_reason": "review submission was not confirmed",
                 }
-            review_url = (submitted or {}).get("url")
-            if isinstance(review_url, str) and _valid_github_result_url(review_url):
-                refreshed = self._call(
-                    "refresh_sticky",
-                    self.client.update_sticky,
-                    repo,
-                    pr_number,
-                    _handoff_body(handoff, artifact_links, review_url),
-                    sticky["id"],
+            if state["review_completed"]:
+                self._after_publication(
+                    state, managed, repo, pr_number, head_sha, access_policy,
+                    allowed_github_repositories, run_url,
+                    cleanup_previous_reviews and approval_policy.effective_scope == "full",
                 )
-                if _valid_comment_result(refreshed):
-                    state["sticky"] = dict(refreshed)
-                    self._checkpoint(state, "refresh_sticky", refreshed)
-                elif refreshed is not None:
-                    self._errors.append({
-                        "operation": "refresh_sticky",
-                        "error": "sticky refresh did not return a valid id and URL",
-                    })
         state["publication_errors"] = self._errors
         state["notes"].sort(key=lambda item: str(item.get("fingerprint", "")))
         self._write_state(state)
         return state
+
+    def _after_publication(
+        self, state: dict[str, Any], managed: Mapping[str, Any], repo: str,
+        pr_number: int, head_sha: str, access_policy: Mapping[str, Any] | ReviewPolicy | None,
+        allowed_repositories: Iterable[str], run_url: str, cleanup: bool,
+    ) -> None:
+        """Update owned historical objects only after the replacement is confirmed."""
+        for prior in managed.get("general_comments", ()):
+            if not str(prior.get("fingerprint", "")).startswith("source_access_request:"):
+                continue
+            body = reconcile_access_request_comment(
+                str(prior.get("body") or ""), policy=access_policy,
+                allowed_github_repositories=allowed_repositories,
+                current_repository=repo, run_url=run_url, head_sha=head_sha,
+            )
+            if body is None:
+                continue
+            if body != prior.get("body"):
+                updated = self._call(
+                    "annotate_access_request", self.client.annotate_access_request,
+                    repo, pr_number, prior, body,
+                )
+                if not _valid_comment_result(updated) or updated.get("id") != prior.get("id"):
+                    self._errors.append({"operation": "annotate_access_request", "error": "original comment update was not confirmed"})
+                    continue
+                self._checkpoint(state, "annotate_access_request", updated)
+            if not prior.get("is_minimized"):
+                self._minimize(state, prior.get("node_id"), "RESOLVED")
+
+        diagnostics = state['previous_review_cleanup'] = {
+            'enabled': cleanup,
+            'ownership': managed.get('review_ownership_diagnostics', {}),
+            'owned_reviews': len(managed.get('reviews', ())),
+            'eligible_reviews': 0, 'minimized_reviews': 0, 'failed_minimizations': 0,
+            'minimized_handoff_comments': 0,
+            'skipped_current_review': 0, 'skipped_pending': 0,
+            'skipped_unmanaged': 0, 'skipped_already_minimized': 0,
+        }
+        if not cleanup:
+            diagnostics['skip_reason'] = 'cleanup disabled or review scope is not full'
+            return
+        for review in managed.get("reviews", ()):
+            if review.get('id') == state['review']['id']:
+                diagnostics['skipped_current_review'] += 1
+                continue
+            if review.get('state') == 'PENDING':
+                diagnostics['skipped_pending'] += 1
+                continue
+            if not str(review.get('body', '')).startswith((
+                '<!-- ai-pr-reviewer-specialist:', '<!-- ai-pr-reviewer -->',
+            )):
+                diagnostics['skipped_unmanaged'] += 1
+                continue
+            diagnostics['eligible_reviews'] += 1
+            if review.get("state") in {"APPROVED", "CHANGES_REQUESTED"}:
+                dismissed = self._call("dismiss_previous_review", self.client.dismiss_review, review["id"])
+                if not isinstance(dismissed, Mapping) or dismissed.get("state") != "DISMISSED" or dismissed.get("id") != review["id"]:
+                    self._errors.append({"operation": "dismiss_previous_review", "error": "review dismissal was not confirmed"})
+            if not review.get("isMinimized"):
+                success = self._minimize(state, review.get("id"), "OUTDATED")
+                diagnostics['minimized_reviews' if success else 'failed_minimizations'] += 1
+            else:
+                diagnostics['skipped_already_minimized'] += 1
+        for prior in managed.get("handoff_comments", ()):
+            if not prior.get("is_minimized"):
+                success = self._minimize(state, prior.get("node_id"), "OUTDATED")
+                diagnostics['minimized_handoff_comments' if success else 'failed_minimizations'] += 1
+
+    def _minimize(self, state: dict[str, Any], node_id: object, classifier: str) -> bool:
+        if not isinstance(node_id, str) or not node_id:
+            self._errors.append({"operation": "minimize_comment", "error": "owned comment node ID is missing"})
+            return False
+        result = self._call("minimize_comment", self.client.minimize_comment, node_id, classifier)
+        if not isinstance(result, Mapping) or result.get("isMinimized") is not True:
+            self._errors.append({"operation": "minimize_comment", "error": "comment minimization was not confirmed"})
+            return False
+        self._checkpoint(state, "minimize_comment", {"node_id": node_id, "classifier": classifier})
+        return True
 
 
 _MANAGED_IDENTITY_QUERY = """
@@ -2061,7 +2174,7 @@ _MANAGED_ISSUE_COMMENTS_QUERY = """
 query ManagedIssueComments($pullRequestId: ID!, $cursor: String) {
   node(id: $pullRequestId) { ... on PullRequest {
     comments(first: 100, after: $cursor) {
-      nodes { databaseId url body viewerDidAuthor author { login } }
+      nodes { id databaseId url body isMinimized viewerDidAuthor author { login } }
       pageInfo { hasNextPage endCursor }
     }
   } }
@@ -2072,7 +2185,7 @@ _MANAGED_REVIEWS_QUERY = """
 query ManagedReviews($pullRequestId: ID!, $cursor: String) {
   node(id: $pullRequestId) { ... on PullRequest {
     reviews(first: 100, after: $cursor) {
-      nodes { id url body state viewerDidAuthor author { login } }
+      nodes { id url body state isMinimized viewerDidAuthor author { login } }
       pageInfo { hasNextPage endCursor }
     }
   } }
@@ -2324,7 +2437,7 @@ class GhReviewClient:
             trusted_author = (
                 (
                     node.get("viewerDidAuthor") is True
-                    and author_login == viewer_login
+                    and _same_github_login(author_login, viewer_login)
                 )
                 or author_login in _TRUSTED_WORKFLOW_COMMENT_AUTHORS
             )
@@ -2394,7 +2507,7 @@ class GhReviewClient:
                 node.get("body") == expected_body
                 and node.get("viewerDidAuthor") is True
                 and isinstance(author, Mapping)
-                and author.get("login") == viewer_login
+                and _same_github_login(author.get("login"), viewer_login)
             ):
                 matches.append(
                     self._validated_issue_comment(node, label="managed issue comment")
@@ -2568,7 +2681,7 @@ class GhReviewClient:
             if marker is None or first.get("viewerDidAuthor") is not True:
                 continue
             author = first.get("author")
-            if not isinstance(author, Mapping) or author.get("login") != viewer_login:
+            if not isinstance(author, Mapping) or not _same_github_login(author.get("login"), viewer_login):
                 continue
             comment_id = first.get("databaseId")
             url = first.get("url")
@@ -2594,7 +2707,7 @@ class GhReviewClient:
                     isinstance(item.get("body"), str)
                     and item.get("viewerDidAuthor") is True
                     and isinstance(author, Mapping)
-                    and author.get("login") == viewer_login
+                    and _same_github_login(author.get("login"), viewer_login)
                 ):
                     continue
                 owned_comments.append({
@@ -2645,6 +2758,7 @@ class GhReviewClient:
             label="pull request comments",
         )
         general = []
+        handoff_comments = []
         general_answered: set[str] = set()
         general_answered_identities: set[str] = set()
         for node in comment_nodes:
@@ -2654,8 +2768,13 @@ class GhReviewClient:
             owned = (
                 node.get("viewerDidAuthor") is True
                 and isinstance(author, Mapping)
-                and author.get("login") == viewer_login
+                and _same_github_login(author.get("login"), viewer_login)
             )
+            if owned and isinstance(body, str) and body.startswith(_SPECIALIST_HANDOFF_MARKER):
+                handoff_comments.append({
+                    "node_id": node.get("id"),
+                    "is_minimized": node.get("isMinimized") is True,
+                })
             if answer is not None and owned:
                 if all(answer.group(index) is not None for index in (2, 3, 4)):
                     general_answered_identities.add(_general_identity(
@@ -2681,6 +2800,8 @@ class GhReviewClient:
             general.append({
                 "fingerprint": marker.group(1),
                 "id": comment_id,
+                "node_id": node.get("id"),
+                "is_minimized": node.get("isMinimized") is True,
                 "url": url,
                 "body": body,
                 "generation": int(marker.group(2)) if marker.group(2) else 1,
@@ -2695,22 +2816,32 @@ class GhReviewClient:
             label="pull request reviews",
         )
         owned_reviews = []
+        ownership_diagnostics = {
+            'viewer_login': viewer_login, 'found': len(reviews), 'owned': 0,
+            'skipped_viewer_did_not_author': 0, 'skipped_author_mismatch': 0,
+            'author_logins': sorted({str(node['author'].get('login', ''))[:100]
+                                     for node in reviews if isinstance(node.get('author'), Mapping)})[:10],
+        }
         for node in reviews:
             if node.get("viewerDidAuthor") is not True:
+                ownership_diagnostics['skipped_viewer_did_not_author'] += 1
                 continue
             author = node.get("author")
-            if not isinstance(author, Mapping) or author.get("login") != viewer_login:
+            if not isinstance(author, Mapping) or not _same_github_login(author.get("login"), viewer_login):
+                ownership_diagnostics['skipped_author_mismatch'] += 1
                 continue
             review_id, url, body, state = (
                 node.get("id"), node.get("url"), node.get("body"), node.get("state")
             )
-            if not all(isinstance(value, str) and value for value in (review_id, url, body, state)):
+            if (not all(isinstance(value, str) and value for value in (review_id, url, state))
+                    or not isinstance(body, str)):
                 raise RuntimeError("managed review object is invalid")
             if not _valid_github_result_url(url) or state not in {
                 "PENDING", "COMMENTED", "APPROVED", "CHANGES_REQUESTED", "DISMISSED",
             }:
                 raise RuntimeError("managed review result URL or state is invalid")
             owned_reviews.append(dict(node))
+            ownership_diagnostics['owned'] += 1
 
         changed_files = tuple(self.list_changed_files(repo, pr_number))
         if len(changed_files) != changed_files_count:
@@ -2738,9 +2869,11 @@ class GhReviewClient:
             "viewer_login": viewer_login,
             "threads": threads,
             "general_comments": general,
+            "handoff_comments": handoff_comments,
             "general_answered_fingerprints": tuple(sorted(general_answered)),
             "general_answered_identities": tuple(sorted(general_answered_identities)),
             "reviews": owned_reviews,
+            "review_ownership_diagnostics": ownership_diagnostics,
             "changed_files": changed_files,
             "changed_files_complete": True,
             "changed_files_count": changed_files_count,
@@ -2839,6 +2972,54 @@ class GhReviewClient:
             if reconciled is not None:
                 return reconciled
             raise
+
+    def annotate_access_request(
+        self, repo: str, pr_number: int, prior: Mapping[str, Any], body: str,
+    ) -> Mapping[str, Any]:
+        self._split_repo(repo)
+        comment_id = prior.get("id")
+        if type(comment_id) is not int or comment_id <= 0:
+            raise ValueError("access request requires its original comment id")
+        try:
+            result = self._input_call(
+                ["api", f"repos/{repo}/issues/comments/{comment_id}", "--method", "PATCH"],
+                {"body": body},
+            )
+            confirmed = {"id": result.get("id"), "url": result.get("html_url")}
+            if result.get("body") != body or confirmed["id"] != comment_id or not _valid_comment_result(confirmed):
+                raise RuntimeError("access request annotation was not confirmed")
+            return confirmed
+        except Exception:
+            confirmed = self._find_owned_issue_comment_exact(repo, pr_number, body)
+            if confirmed is not None and confirmed.get("id") == comment_id:
+                return confirmed
+            raise
+
+    def minimize_comment(self, node_id: str, classifier: str) -> Mapping[str, Any]:
+        if classifier not in {"RESOLVED", "OUTDATED"}:
+            raise ValueError("unsupported comment minimization reason")
+        result = self._graphql(
+            "mutation MinimizeManagedComment($id: ID!, $reason: ReportedContentClassifiers!) { "
+            "minimizeComment(input: {subjectId: $id, classifier: $reason}) { "
+            "minimizedComment { isMinimized minimizedReason } } }",
+            {"id": node_id, "reason": classifier},
+        )
+        minimized = ((result.get("data") or {}).get("minimizeComment") or {}).get("minimizedComment") or {}
+        if minimized.get("isMinimized") is not True or minimized.get("minimizedReason") != classifier.lower():
+            raise RuntimeError("comment minimization was not confirmed")
+        return minimized
+
+    def dismiss_review(self, review_id: str) -> Mapping[str, Any]:
+        result = self._graphql(
+            "mutation DismissManagedReview($id: ID!) { dismissPullRequestReview(input: {"
+            "pullRequestReviewId: $id, message: \"Superseded by a newer completed AI review.\"}) {"
+            "pullRequestReview { id state } } }",
+            {"id": review_id},
+        )
+        review = ((result.get("data") or {}).get("dismissPullRequestReview") or {}).get("pullRequestReview") or {}
+        if review.get("id") != review_id or review.get("state") != "DISMISSED":
+            raise RuntimeError("review dismissal was not confirmed")
+        return review
 
     def reply_general_comment(
         self, repo: str, pr_number: int, prior: Mapping[str, Any], body: str

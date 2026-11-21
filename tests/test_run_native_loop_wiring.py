@@ -134,6 +134,32 @@ def test_native_loop_two_hops_writes_outputs(monkeypatch, tmp_path):
     assert harness["evidence_digest"] == "Talos v1.13.4 with k8s v1.36.2."
 
 
+def test_native_repository_only_search_wiring(monkeypatch, tmp_path):
+    from pr_reviewer import conversation
+    from pr_reviewer.specialist_runtime.web_evidence import SearchCandidate, SearxngSearchProvider
+    advertised = []
+    original = conversation.web_tool_schemas
+    def schemas(*args, **kwargs):
+        result = original(*args, **kwargs)
+        advertised.extend(item["name"] for item in result)
+        return result
+    monkeypatch.setattr(conversation, "web_tool_schemas", schemas)
+    monkeypatch.setenv("SEARCH_URL", "https://search.example.com/search")
+    monkeypatch.setattr(SearxngSearchProvider, "search", lambda *args, **kwargs: [
+        SearchCandidate("Issue", "https://github.com/owner/repo/issues/3", "details"),
+    ])
+    handled, result = _run(monkeypatch, tmp_path, [
+        _openai_call("search", "web_search", '{"query":"contract"}'),
+        _openai_text("Search metadata alone is not evidence."),
+    ])
+    assert handled
+    assert {"web_search", "web_fetch_search_result"} <= set(advertised)
+    assert "web_fetch" not in advertised
+    payload = result["tool_results"][0]["result"]
+    assert payload["approved"][0]["fetch_method"] == "result_id"
+    assert payload["approved"][0]["repository"] == "owner/repo"
+
+
 def test_reasoning_only_closing_analysis_is_internal_not_published(monkeypatch, tmp_path):
     (tmp_path / "a.txt").write_text("evidence")
     reasoning_only = {
@@ -662,7 +688,7 @@ def test_forty_call_review_is_compacted_within_model_context(monkeypatch, tmp_pa
     calls = []
     for i in range(40):
         name = f"evidence-{i}.txt"
-        (tmp_path / name).write_text(f"material-{i}\n" + "x" * 11900)
+        (tmp_path / name).write_text(f"material-{i}\n" + ("x" * 118 + "\n") * 100)
         calls.append({
             "id": f"c{i}", "type": "function",
             "function": {"name": "read_file", "arguments": json.dumps({"path": name})},

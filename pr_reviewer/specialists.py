@@ -586,12 +586,34 @@ def build_topology(
     configured = config.get("components", [])
     components: dict[str, dict[str, Any]] = {}
     path_component: dict[str, str] = {}
+    ownership_precedence = config.get("ownership_precedence", [])
+    component_owned = config.get("version") == 3
+    boundaries = config.get("boundaries", [])
+
+    def review_owner(path: str) -> dict[str, Any] | None:
+        matches = [item for item in configured if _match(path, item.get("paths", []))]
+        if len(matches) > 1:
+            ordered = [item for owner in ownership_precedence for item in matches if item["id"] == owner]
+            if len(ordered) != len(matches):
+                raise ValueError(f"ambiguous ownership for {path}; list overlapping components in ownership_precedence")
+            return ordered[0]
+        if matches:
+            return matches[0]
+        contract_owners = {item["contract_change_owner"] for item in boundaries if _match(path, item["contract_paths"])}
+        if len(contract_owners) > 1:
+            ordered = [owner for owner in ownership_precedence if owner in contract_owners]
+            if len(ordered) != len(contract_owners):
+                raise ValueError(f"ambiguous contract ownership for {path}; configure ownership_precedence")
+            contract_owners = {ordered[0]}
+        return next((item for item in configured if item["id"] in contract_owners), None)
 
     for path in changed:
-        configured_component = _configured_component_for(path, configured)
+        configured_component = review_owner(path) if component_owned else _configured_component_for(path, configured)
         root = _component_for(path, roots)
         component_id = (
-            configured_component["id"] if configured_component else _slug(root or "repository", "repository")
+            configured_component["id"] if configured_component else (
+                "repository-remainder" if component_owned else _slug(root or "repository", "repository")
+            )
         )
         path_component[path] = component_id
         entry = components.setdefault(component_id, {
@@ -780,6 +802,7 @@ def build_topology(
         "changed_files": changed,
         "components": list(components.values()),
         "path_components": path_component,
+        "unmatched_changed_paths": [path for path, owner in path_component.items() if owner == "repository-remainder"],
         "file_roles": all_roles,
         "languages": all_languages,
         "relationships": relationships,
