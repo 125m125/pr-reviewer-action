@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import urlsplit
@@ -33,6 +34,33 @@ from pr_reviewer.specialist_runtime.types import (  # noqa: E402
     ReviewNoteKind,
 )
 from pr_reviewer.specialist_runtime.policy import parse_review_policy  # noqa: E402
+from scripts.redact import mask_secrets  # noqa: E402
+
+
+def _report_publication(state: Mapping[str, Any], artifact_path: str | None) -> None:
+    for error in state.get('publication_errors', ()):
+        print('[review-publisher] publication error: ' + mask_secrets(json.dumps({
+            'operation': str(error.get('operation', 'unknown'))[:100],
+            'error': str(error.get('error', 'unknown'))[:2000],
+        })), file=sys.stderr)
+    if artifact_path:
+        path = Path(artifact_path)
+        artifact = json.loads(path.read_text(encoding='utf-8'))
+        publishing = artifact.setdefault('publishing', {})
+        publishing['status'] = ('published' if state.get('review_completed') is True
+                                and not state.get('publication_errors') else 'failed')
+        # Consumers already upload this artifact on failure; keep the actual publisher state with it.
+        publishing['publication_state'] = state
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                             suffix='.publication.tmp', delete=False) as stream:
+                temporary = Path(stream.name)
+                json.dump(artifact, stream, ensure_ascii=False)
+            os.replace(temporary, path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
 
 def _json(path: str) -> Any:
@@ -300,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
     if state.get('previous_review_cleanup') is not None:
         print('[review-publisher] previous review cleanup: '
               + json.dumps(state['previous_review_cleanup'], sort_keys=True), file=sys.stderr)
+    _report_publication(state, args.review_artifact)
     if (
         state.get("review_completed") is not True
         or bool(state.get("publication_errors"))
