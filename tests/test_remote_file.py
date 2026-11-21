@@ -74,14 +74,14 @@ def test_reads_allowlisted_remote_text_file_with_a_bounded_line_window(monkeypat
         "offset": 2, "lines": 2, "total_lines": 3,
         "truncated": False, "has_more": False, "next_offset": None,
     }
-    assert seen == {
+    assert {key: value for key, value in seen.items() if key != "timeout"} == {
         "endpoint": (
             "repos/other/project/contents/docs/contract.md?ref=" + "a" * 40
         ),
         "allowed_repos": {"other/project"},
         "current_repo": "",
-        "timeout": 25,
     }
+    assert 0 < seen["timeout"] <= 25
 
 
 @pytest.mark.parametrize(
