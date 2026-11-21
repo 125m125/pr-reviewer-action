@@ -27,6 +27,62 @@ from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from pr_reviewer.conversation import Conversation
+
+
+def _critic_anchor_excerpt(record, location: str, max_bytes: int = 1200) -> str | None:
+    """Prefer the retained RIGHT-side anchor over an arbitrary source prefix."""
+    match = re.fullmatch(r'(.+):(\d+)', location)
+    if not match or match[1] != record.source_path:
+        return None
+    target = int(match[2])
+    rows = record.content.splitlines(keepends=True)
+    current = (record.source_range or {}).get('offset') if record.tool == 'read_file' else None
+    anchor = None
+    for index, row in enumerate(rows):
+        if record.tool == 'read_pr_diff':
+            if row.startswith(('diff --git ', '--- ', '+++ ')):
+                current = None
+                continue
+            hunk = re.match(r'^@@ -\d+(?:,\d+)? \+(\d+)', row)
+            if hunk:
+                current = int(hunk[1])
+                continue
+            numbered = re.match(r'^[ +-] \[LEFT (?:\d+|-) \| RIGHT (\d+|-)\]', row)
+            if numbered:
+                number = int(numbered[1]) if numbered[1] != '-' else None
+            elif current is not None and row.startswith((' ', '+')):
+                number = current
+                current += 1
+            else:
+                continue
+        else:
+            numbered = re.match(r'^(?:RIGHT|LINE) (\d+) \|', row)
+            number = int(numbered[1]) if numbered else current
+            if current is not None:
+                current += 1
+        if number == target:
+            anchor = index
+            break
+    if anchor is None:
+        return None
+    left, right = anchor, anchor + 1
+    used = len(rows[anchor].encode('utf-8'))
+    for distance in range(1, 11):
+        for index in (anchor - distance, anchor + distance):
+            if not 0 <= index < len(rows):
+                continue
+            size = len(rows[index].encode('utf-8'))
+            if used + size > max_bytes:
+                continue
+            # Keep one contiguous source window, not disjoint invented context.
+            if index == left - 1:
+                left = index
+            elif index == right:
+                right = index + 1
+            else:
+                continue
+            used += size
+    return ''.join(rows[left:right]).encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore')
 from pr_reviewer.specialists import classify_file_roles
 from .adjudication import (
     merge_accepted_findings,
@@ -4808,7 +4864,8 @@ class ReviewController:
                             if item.get("source_evidence_id") == evidence_id
                             and isinstance(item.get("text"), str) and item["text"].strip()
                             and item["text"] in record.content), None)
-                        excerpt = (selected["text"] if selected else record.content).encode("utf-8")[:1200].decode(
+                        anchored = _critic_anchor_excerpt(record, candidate.affected_location)
+                        excerpt = (anchored if anchored is not None else selected["text"] if selected else record.content).encode("utf-8")[:1200].decode(
                             "utf-8", errors="ignore")
                         excerpts.append({
                             "evidence_id": record.id,
@@ -4821,8 +4878,8 @@ class ReviewController:
                             "truncated": record.truncated,
                             "excerpt_truncated": len(excerpt.encode("utf-8")) < len(record.content.encode("utf-8")),
                             "retained_bytes": len(record.content.encode("utf-8")),
-                            "excerpt_selection": "validated delegated excerpt" if selected else "source prefix",
-                            "excerpt_locator": selected.get("locator") if selected else None,
+                            "excerpt_selection": "finding anchor" if anchored is not None else "validated delegated excerpt" if selected else "source prefix",
+                            "excerpt_locator": candidate.affected_location if anchored is not None else selected.get("locator") if selected else None,
                             "redacted": record.redacted,
                             "contradicts": record.contradicts,
                         })

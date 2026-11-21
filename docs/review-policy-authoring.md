@@ -46,6 +46,14 @@ spawn a session: the primary investigation owner can inspect them. A relevant
 successful lookup and brief reason can support "not affected"; exhaustive
 negative proof is not required.
 
+If a schema-owning component is also a boundary participant, explicitly map its
+authoritative schema and generator files in `endpoint_paths`. For example,
+`"database": ["movieHRdb-database/src/main/resources/db/changelog/**", "movieHRdb-database/pom.xml"]`
+can overlap that boundary's `contract_paths`. Without an endpoint mapping,
+participant proof defaults to implementation outside the contract paths; naming
+the component as `contract_change_owner` does not override that rule. Do not
+substitute another participant's implementation just to satisfy this check.
+
 Local boundary scope contains only changed contracts and that participant's
 endpoint matches. Other component behavior remains separate. A fresh bounded,
 tools-disabled evaluator compares retained local assessments and actual source

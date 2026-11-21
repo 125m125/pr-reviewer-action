@@ -527,6 +527,11 @@ class ObligationAssessmentLedger:
                 "inspect and cite " + (", ".join(obligation.boundary_endpoint_paths)
                 or "participant implementation outside the boundary contract")
                 + " with immutable current-head head_sha provenance"
+                + (". No endpoint_paths mapping is configured for this participant; "
+                   "the default excludes contract_paths. Use in-scope participant implementation "
+                   "evidence, or record the policy/evidence gap if the participant's implementation "
+                   "is the contract itself. Do not substitute another participant's implementation."
+                   if not obligation.boundary_endpoint_paths else "")
             )
         elif (
             proposed is ObligationDisposition.PARTIALLY_COVERED

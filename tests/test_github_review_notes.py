@@ -275,6 +275,14 @@ def test_native_review_contains_handoff_without_sticky_comment(tmp_path):
     assert "Reviewed head: `" + "a" * 40 + "`" in body
 
 
+def test_empty_unmanaged_review_is_left_untouched(tmp_path):
+    client = _FakeClient({'reviews': [{'id': 'empty-review', 'body': '', 'state': 'COMMENTED'}]})
+    result, _ = _publish(tmp_path, client)
+    assert result['review_completed']
+    assert result['previous_review_cleanup']['skipped_unmanaged'] == 1
+    assert not any(call[0] in {'dismiss', 'minimize'} for call in client.calls)
+
+
 def test_old_reviews_retired_only_after_replacement_and_threads_left_open(tmp_path):
     client = _FakeClient({
         "reviews": [{"id": "old-review", "body": "<!-- ai-pr-reviewer-specialist:old -->", "state": "CHANGES_REQUESTED"}],
@@ -2758,7 +2766,8 @@ def test_bot_login_normalization(viewer, author, expected):
     assert _same_github_login(viewer, author) is expected
 
 
-def test_review_ownership_diagnostics_keep_viewer_author_requirement(monkeypatch, tmp_path):
+@pytest.mark.parametrize('body', ['<!-- ai-pr-reviewer-specialist:old -->', ''])
+def test_review_ownership_diagnostics_keep_viewer_author_requirement(monkeypatch, tmp_path, body):
     client = GhReviewClient(action_root=tmp_path)
     def graphql(query, variables):
         if 'ManagedReviewIdentity' in query:
@@ -2767,7 +2776,7 @@ def test_review_ownership_diagnostics_keep_viewer_author_requirement(monkeypatch
         key = 'reviews' if 'ManagedReviews' in query else 'comments' if 'ManagedIssueComments' in query else 'reviewThreads'
         nodes = [] if key != 'reviews' else [
             {'id': 'old-review', 'url': 'https://github.com/owner/repo/pull/17#pullrequestreview-1',
-             'body': '<!-- ai-pr-reviewer-specialist:old -->', 'state': 'COMMENTED',
+             'body': body, 'state': 'COMMENTED',
              'viewerDidAuthor': authored, 'author': {'login': login}}
             for authored, login in [(True, 'github-actions'), (False, 'github-actions'), (True, 'another')]]
         return {'data': {'node': {key: _connection(nodes)}}}
