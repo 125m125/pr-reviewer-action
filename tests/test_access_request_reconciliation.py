@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import html
+import sys
+from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pr_reviewer.access_request_reconciliation import reconcile_access_request_comment
 from pr_reviewer.specialist_runtime.policy import ReviewPolicy, SourceRule
