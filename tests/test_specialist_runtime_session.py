@@ -1433,6 +1433,49 @@ def test_tool_admitted_thread_assessment_survives_failed_checkpoint():
     assert session._snapshot().review_thread_assessments[0]["assessment"] == "fixed"
 
 
+def test_related_thread_assessments_finish_without_a_model_checkpoint():
+    from pr_reviewer.specialist_runtime.callbacks import freeze_callback_value
+
+    first, last = [
+        tool_call_response("assess_review_thread", {
+            "target": target, "assessment": "unverified", "reason": "No decisive evidence",
+            "evidence_ids": [],
+        }, call_id=target)
+        for target in ("H1", "H2")
+    ]
+    trailing = tool_call_response("read_file", {"path": "a.py"}, call_id="trailing-read")
+    gateway = ScriptedGateway([first, replace(last, tool_calls=last.tool_calls + trailing.tool_calls)])
+    executed = []
+    session = make_session(gateway, execute_tool=lambda *args, **kwargs: executed.append(args))
+    session.apply_review_thread_feedback(freeze_callback_value(tuple({
+        "target": target, "path": "a.py", "line": 1,
+        "comments": [{"body": f"Discussion {target}"}],
+    } for target in ("H1", "H2"))))
+    result = session.explore()
+    assert [row["target"] for row in result.review_thread_assessments] == ["H1", "H2"]
+    assert len(gateway.requests) == 2
+    assert "Discussion H2" in gateway.requests[1].messages
+    session.settle_for_scheduling()
+    session.finalize()
+    assert len(gateway.requests) == 2
+    assert len(session._accepted_work[0].review_thread_assessments) == 2
+    assert not executed
+    assert "review_thread_batch_complete" in str(session.conversation.events)
+
+
+def test_historical_assessment_can_still_be_submitted_in_checkpoint_fallback():
+    checkpoint = checkpoint_response(inspected=[], unresolved=[], review_thread_assessments=[{
+        "target": "H1", "assessment": "unverified", "reason": "Need more evidence",
+        "evidence_ids": [],
+    }])
+    gateway = ScriptedGateway([replace(checkpoint, text="I could not verify the claim."), checkpoint])
+    session = make_session(gateway, obligations=())
+    session.apply_review_thread_feedback(({"target": "H1", "path": "a.py"},))
+    result = session.explore()
+    assert [item["assessment"] for item in result.review_thread_assessments] == ["unverified"]
+    assert len(gateway.requests) == 2
+
+
 def make_session(
     gateway, *, tool_calls=4, model_turns=8, recoveries=1,
     execute_tool=None, lease=None, assignment=None, obligations=None,

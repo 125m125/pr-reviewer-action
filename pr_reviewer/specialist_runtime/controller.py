@@ -3356,13 +3356,17 @@ class ReviewController:
             session, "apply_investigation_lead_feedback", None,
         )):
             for index, lead in enumerate(assignment.investigation_leads, start=1):
-                if lead.kind == "delegation":
+                if lead.kind in {"delegation", "review_thread"}:
                     continue
                 prior_work, sources = self._followup_prior_work(state, assignment, lead)
                 handle.apply_investigation_lead_feedback(
                     f"L{index}", lead, prior_work, sources,
                 )
-                self._disclose_review_thread(state, handle, lead)
+            threads = tuple(lead for lead in assignment.investigation_leads if lead.kind == "review_thread")
+            if threads:
+                args = self._review_thread_feedback(state, threads)
+                if args is not None:
+                    handle.apply_review_thread_feedback(*args)
         budget_binder = getattr(
             session, "bind_global_budget_admission_handler", None,
         )
@@ -3880,12 +3884,28 @@ class ReviewController:
             state.boundary_evaluations[boundary.id] = outcome
             supported = outcome.outcome == "supported"
             state.coverage.record_boundary_result(combined.id, outcome.evidence_ids, supported=supported)
+            state.journal.emit("boundary_evaluation", {"boundary_id": boundary.id, "outcome": outcome.outcome, "reason": outcome.reason, "input_fingerprint": outcome.input_fingerprint})
             lead_id = f"boundary:{boundary.id}"
             old_lead = state.investigation_leads.get(lead_id)
             if supported:
                 if old_lead is not None:
                     state.investigation_leads[lead_id] = replace(old_lead, status=InvestigationLeadStatus.RESOLVED_NO_ISSUE, resolution_reason=outcome.reason)
             else:
+                next_action = outcome.suggested_investigation or f"Investigate {outcome.missing_fact}"
+                # A different assessment fingerprint can reflect incidental edits to
+                # a participant's write-up, not a new question for a specialist.
+                unchanged_closed_question = (
+                    old_lead is not None and previous is not None
+                    and old_lead.status not in {InvestigationLeadStatus.OPEN, InvestigationLeadStatus.SCHEDULED}
+                    and " ".join(old_lead.next_action.casefold().split()) == " ".join(next_action.casefold().split())
+                    and " ".join(previous.missing_fact.casefold().split()) == " ".join(outcome.missing_fact.casefold().split())
+                )
+                if unchanged_closed_question:
+                    state.journal.emit("boundary_lead_not_reopened", {
+                        "boundary_id": boundary.id, "lead_id": lead_id,
+                        "reason": "same closed evidence question",
+                    })
+                    continue
                 state.investigation_leads[lead_id] = InvestigationLead(
                     lead_id=lead_id,
                     summary=(
@@ -3897,13 +3917,12 @@ class ReviewController:
                         *(old_lead.evidence_ids if old_lead else ()),
                         *outcome.evidence_ids,
                     ))),
-                    next_action=outcome.suggested_investigation or f"Investigate {outcome.missing_fact}",
+                    next_action=next_action,
                     required_capability="repository", origin_session_id="boundary-evaluator",
                     attempt_count=old_lead.attempt_count if old_lead else 0,
                     last_evidence_delta=old_lead.last_evidence_delta if old_lead else 0,
                     last_outcome=old_lead.last_outcome if old_lead else "",
                 )
-            state.journal.emit("boundary_evaluation", {"boundary_id": boundary.id, "outcome": outcome.outcome, "reason": outcome.reason, "input_fingerprint": outcome.input_fingerprint})
 
     def _refresh_boundary_coverage(
         self, state: _RunState, reconciliation: CoverageReconciliation,
@@ -4213,19 +4232,32 @@ class ReviewController:
             state.journal.emit("review_thread_queued", {"target": target, "path": path,
                                                        "owner_session_id": session_id})
 
-    def _disclose_review_thread(self, state, session, lead):
-        if lead.kind != "review_thread":
-            return
-        target = lead.lead_id.removeprefix("review-thread:")
-        snapshot = next((item for item in state.inputs.review_threads if item.get("target") == target), None)
-        if snapshot is None:
-            return
+    def _review_thread_batch(self, state, lead):
+        peers = (
+            other for other in state.investigation_leads.values()
+            if other.kind == "review_thread" and other.lead_id != lead.lead_id
+            and other.status is InvestigationLeadStatus.OPEN
+            and not other.attempt_count
+            and other.origin_session_id == lead.origin_session_id
+            and other.affected_paths == lead.affected_paths
+        )
+        return (lead, *tuple(peers)[:2])
+
+    def _review_thread_feedback(self, state, leads):
+        by_target = {item["target"]: item for item in state.inputs.review_threads}
+        snapshots = tuple(
+            by_target[target] for lead in leads
+            if (target := lead.lead_id.removeprefix("review-thread:")) in by_target
+        )
+        if not snapshots:
+            return None
+        path = snapshots[0]["path"]
         candidates = []
         evidence_ids = set()
         active = {session_id: set(result.checkpoint.candidate_finding_ids)
                   for (_, session_id), result in state.session_results.items() if result.checkpoint}
         for candidate in (*state.candidate_occurrences.values(), *state.inputs.candidate_findings):
-            if candidate.affected_location.rsplit(":", 1)[0] != snapshot["path"] and candidate.affected_location != snapshot["path"]:
+            if candidate.affected_location.rsplit(":", 1)[0] != path and candidate.affected_location != path:
                 continue
             if candidate.collector_session_id in active and candidate.candidate_id not in active[candidate.collector_session_id]:
                 continue
@@ -4238,9 +4270,7 @@ class ReviewController:
                 break
         evidence = EvidenceSnapshot(tuple(record for record in state.evidence.snapshot().records
                                            if record.id in evidence_ids))
-        callback = getattr(session, "apply_review_thread_feedback", None)
-        if callable(callback):
-            callback((snapshot,), tuple(candidates), evidence)
+        return snapshots, tuple(candidates), evidence
 
     def _followup_prior_work(
         self, state: _RunState, assignment: Assignment, lead: InvestigationLead,
@@ -4404,18 +4434,26 @@ class ReviewController:
                     lead_id = action.lead_ids[0]
                     lead = state.investigation_leads.get(lead_id)
                     lead_target = self._investigation_lead_target(state, lead_id)
-                    prior_work, sources = self._followup_prior_work(
-                        state, assignment, lead,
-                    ) if lead is not None else (None, None)
-                    succeeded, _ = self._session_hook(
-                        state, action.session_id,
-                        "apply_investigation_lead_feedback",
-                        RunPhase.FOLLOWUP, lead_target, lead, prior_work, sources,
-                    ) if lead is not None else (False, None)
-                    if succeeded and lead is not None:
-                        self._disclose_review_thread(state, session, lead)
-                        state.investigation_leads[lead_id] = replace(
-                            lead,
+                    if lead is None:
+                        succeeded = False
+                        batch = ()
+                    elif lead.kind == "review_thread":
+                        batch = self._review_thread_batch(state, lead)
+                        args = self._review_thread_feedback(state, batch)
+                        succeeded, _ = self._session_hook(
+                            state, action.session_id, "apply_review_thread_feedback",
+                            RunPhase.FOLLOWUP, *args,
+                        ) if args is not None else (False, None)
+                    else:
+                        batch = (lead,)
+                        prior_work, sources = self._followup_prior_work(state, assignment, lead)
+                        succeeded, _ = self._session_hook(
+                            state, action.session_id, "apply_investigation_lead_feedback",
+                            RunPhase.FOLLOWUP, lead_target, lead, prior_work, sources,
+                        )
+                    for item in batch if succeeded else ():
+                        state.investigation_leads[item.lead_id] = replace(
+                            item,
                             status=InvestigationLeadStatus.SCHEDULED,
                             assigned_session_id=action.session_id,
                         )
@@ -4436,7 +4474,7 @@ class ReviewController:
                     "kind": action.kind,
                     "session_id": action.session_id,
                     "obligation_ids": action.obligation_ids,
-                    "lead_ids": action.lead_ids,
+                    "lead_ids": tuple(item.lead_id for item in batch) if action.lead_ids and succeeded else action.lead_ids,
                     "outcome": outcome,
                 })
                 continue
@@ -4574,20 +4612,22 @@ class ReviewController:
                 state.assignments[assignment.id] = assignment
                 expected_session_id = self._session_identity(state, assignment)
                 state.assignment_sessions[assignment.id] = expected_session_id
-                scheduled = replace(
-                    lead,
-                    status=InvestigationLeadStatus.SCHEDULED,
-                    assigned_session_id=expected_session_id,
+                batch = self._review_thread_batch(state, lead) if lead.kind == "review_thread" else (lead,)
+                scheduled = tuple(
+                    replace(item, status=InvestigationLeadStatus.SCHEDULED,
+                            assigned_session_id=expected_session_id)
+                    for item in batch
                 )
                 assignment = replace(
-                    assignment, investigation_leads=(scheduled,),
+                    assignment, investigation_leads=scheduled,
                 )
                 state.assignments[assignment.id] = assignment
-                state.investigation_leads[lead_id] = scheduled
+                for item in scheduled:
+                    state.investigation_leads[item.lead_id] = item
                 result.append(assignment)
                 state.journal.emit("negotiation_action_applied", {
                     "kind": action.kind,
-                    "lead_ids": action.lead_ids,
+                    "lead_ids": tuple(item.lead_id for item in scheduled),
                     "assignment_id": assignment.id,
                     "outcome": "scheduled",
                 })
@@ -7374,35 +7414,58 @@ class ReviewController:
                     state, followup, followup_snapshot,
                 )
                 next_reconciliation = self._refresh_boundary_coverage(state, next_reconciliation)
+                completed_sessions = {
+                    item.session_result.session_id for item in followup.results
+                }
+                attempted_lead_ids = dict.fromkeys(lead_id for action in actions for lead_id in action.lead_ids)
+                for lead_id, lead in tuple(state.investigation_leads.items()):
+                    if (lead.kind != "review_thread" or lead_id not in open_lead_ids
+                            or lead.assigned_session_id not in completed_sessions):
+                        continue
+                    selected_directly = lead_id in attempted_lead_ids
+                    attempted_lead_ids[lead_id] = None
+                    if lead.status is InvestigationLeadStatus.SCHEDULED:
+                        state.investigation_leads[lead_id] = replace(
+                            lead,
+                            # Unreached peers can still be selected on their own,
+                            # but the attempt count keeps them out of another batch.
+                            status=(InvestigationLeadStatus.BLOCKED if selected_directly
+                                    else InvestigationLeadStatus.OPEN),
+                            assigned_session_id=lead.assigned_session_id if selected_directly else None,
+                            resolution_reason="historical follow-up ended without an accepted assessment",
+                        )
                 new_records = tuple(
                     record for record in state.evidence.snapshot().records
                     if record.id not in before_evidence
                     and record.is_usable_for_coverage
                 )
-                for action in actions:
-                    for lead_id in action.lead_ids:
-                        lead = state.investigation_leads.get(lead_id)
-                        if lead is None or not followups:
-                            continue
-                        conclusions = tuple(
-                            item.session_result.checkpoint.working_summary
-                            for item in followup.results
-                            if item.session_result.checkpoint and item.session_result.checkpoint.working_summary
-                        )
-                        evidence_ids = tuple(record.id for record in new_records)
-                        state.investigation_leads[lead_id] = replace(
-                            lead, attempt_count=lead.attempt_count + 1,
-                            last_evidence_delta=len(evidence_ids),
-                            last_outcome=(" ".join(conclusions)[:1200] or
-                                          "Follow-up returned no recorded conclusion."),
-                            evidence_ids=tuple(dict.fromkeys((*lead.evidence_ids, *evidence_ids))),
-                        )
-                        journal.emit("investigation_lead_followup_completed", {
-                            "lead_id": lead_id,
-                            "attempt_count": lead.attempt_count + 1,
-                            "evidence_delta": len(evidence_ids),
-                            "outcome": state.investigation_leads[lead_id].last_outcome,
-                        })
+                for lead_id in attempted_lead_ids:
+                    lead = state.investigation_leads.get(lead_id)
+                    if lead is None or not followups:
+                        continue
+                    conclusions = tuple(
+                        item.session_result.checkpoint.working_summary
+                        for item in followup.results
+                        if item.session_result.checkpoint and item.session_result.checkpoint.working_summary
+                    )
+                    assessment = (state.review_thread_assessments.get(lead_id.removeprefix("review-thread:"), {})
+                                  if lead.kind == "review_thread" else None)
+                    supporting = None if assessment is None else set(assessment.get("evidence_ids", ()))
+                    evidence_ids = tuple(record.id for record in new_records
+                                         if supporting is None or record.id in supporting)
+                    conclusion = (" ".join(conclusions)[:1200] or "Follow-up returned no recorded conclusion.")
+                    state.investigation_leads[lead_id] = replace(
+                        lead, attempt_count=lead.attempt_count + 1,
+                        last_evidence_delta=len(evidence_ids),
+                        last_outcome=(lead.resolution_reason or conclusion) if lead.kind == "review_thread" else conclusion,
+                        evidence_ids=tuple(dict.fromkeys((*lead.evidence_ids, *evidence_ids))),
+                    )
+                    journal.emit("investigation_lead_followup_completed", {
+                        "lead_id": lead_id,
+                        "attempt_count": lead.attempt_count + 1,
+                        "evidence_delta": len(evidence_ids),
+                        "outcome": state.investigation_leads[lead_id].last_outcome,
+                    })
                 # Evidence collection counts as progress even before it satisfies
                 # an obligation. A scheduled exploration that adds neither evidence
                 # nor coverage retires only its target so another gap can be tried;

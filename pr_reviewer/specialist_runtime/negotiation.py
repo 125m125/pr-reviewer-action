@@ -436,9 +436,40 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             if actions:
                 admissible.append({**target, "allowed_actions": actions})
         targets = admissible
+    open_paths = {
+        path for item in obligations for path in item.scope
+    } | {
+        path for lead in _negotiable_leads(state) for path in lead.affected_paths
+    }
+    covered_ids = {
+        key for key, status in state.coverage.obligation_statuses
+        if status is ObligationStatus.COVERED
+    }
+    admitted_evidence = dict(state.coverage.evidence_by_obligation)
+    related_completed = []
+    for item in state.obligations:
+        assessment = assessments.get(item.id)
+        if (item.id not in covered_ids or assessment is None
+                or assessment.disposition is not ObligationDisposition.COVERED):
+            continue
+        assessed = assessment.assessed_paths or (item.scope if len(item.scope) == 1 else ())
+        paths = tuple(path for path in assessed if path in open_paths and path in item.scope)
+        evidence_ids = tuple(key for key in assessment.evidence_ids
+                             if key in admitted_evidence.get(item.id, ()))
+        if not paths or not evidence_ids:
+            continue
+        related_completed.append({
+            "subject": item.subject[:200],
+            "paths": paths[:3],
+            "conclusion": assessment.reason[:450],
+            "retained_evidence_ids": evidence_ids[:3],
+        })
+        if len(related_completed) == 6:
+            break
     return {
         "protocol": "choose exactly one action for one target handle",
         "targets": tuple(targets),
+        **({"related_completed_checks": tuple(related_completed)} if related_completed else {}),
     }
 
 

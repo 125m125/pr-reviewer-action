@@ -76,6 +76,13 @@ def test_state_exposes_only_one_full_thread_and_compact_queue():
     assert state["current_thread"]["target"] == "H1"
     assert len(state["pending"]) == 2
     assert "comments" not in state["pending"][1]
+    store = EvidenceStore()
+    decision = dict(target="H1", assessment="unverified", reason="No decisive evidence", evidence_ids=[])
+    assert ledger.assess(decision, store)["status"] == "accepted"
+    repeat = ledger.assess({**decision, "reason": "Overwritten conclusion"}, store)
+    assert repeat["status"] == "rejected"
+    assert repeat["thread_state"]["current_thread"]["target"] == "H2"
+    assert ledger.assessments[0]["reason"] == "No decisive evidence"
 
 
 def test_empty_source_window_cannot_prove_a_fix():

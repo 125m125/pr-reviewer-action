@@ -112,6 +112,14 @@ class ReviewThreadLedger:
     def assessments(self):
         return tuple(deepcopy(tuple(self._assessments.values())))
 
+    def set_queue(self, threads):
+        self.threads = {item["target"]: deepcopy(dict(item)) for item in threads}
+        self._last_rejection = None
+
+    @property
+    def has_pending(self):
+        return any(key not in self._assessments for key in self.threads)
+
     def state(self):
         pending = [item for key, item in self.threads.items() if key not in self._assessments]
         return {"current_thread": deepcopy(pending[0]) if pending else None,
@@ -136,8 +144,10 @@ class ReviewThreadLedger:
         snapshot = self.threads.get(target) if isinstance(target, str) else None
         if snapshot is None:
             return reject("Unknown or unassigned review thread target.")
+        if target in self._assessments:
+            return reject("This thread already has an accepted assessment. Assess current_thread instead.")
         current = self.state()["current_thread"]
-        if current is not None and target != current["target"] and target not in self._assessments:
+        if current is not None and target != current["target"]:
             return reject("Assess the supplied current_thread before advancing to another discussion.")
         assessment = raw.get("assessment")
         if not isinstance(assessment, str) or assessment not in {"still_present", "fixed", "disproven", "unverified"}:
