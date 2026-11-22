@@ -4071,6 +4071,13 @@ class ReviewController:
         negotiation_state = self._negotiation_state(
             state, reconciliation, followup_started, excluded_obligation_ids,
         )
+        compact_context = compact_negotiation_context(negotiation_state)
+        if not compact_context["targets"]:
+            state.journal.emit("negotiation_adjustment", {
+                "component": "negotiator", "action": "stop",
+                "reason": "no eligible follow-up targets remain",
+            })
+            return ()
         if not state.deadline.exploration_allowed(now=self.clock()):
             self._degrade(state, "deadline", "exploration cutoff reached before follow-up")
             try:
@@ -4089,7 +4096,6 @@ class ReviewController:
             return ()
         if self.negotiator is not None:
             try:
-                compact_context = compact_negotiation_context(negotiation_state)
                 role_context: dict[str, object] = {
                     "negotiation_state": compact_context,
                     "negotiation_targets": compact_context["targets"],
@@ -4192,6 +4198,7 @@ class ReviewController:
                 continue
             owners = [assignment for assignment in state.plan.assignments
                       if path in assignment.owned_changed_paths]
+            owners = [assignment for assignment in owners if assignment.owner_component_id] or owners
             owner = owners[0] if len(owners) == 1 else None
             session_id = state.assignment_sessions.get(owner.id, "") if owner else ""
             state.investigation_leads[lead_id] = InvestigationLead(
@@ -4200,7 +4207,7 @@ class ReviewController:
                 next_action=(f"Independently verify discussion {target} against current code; "
                              "reuse current candidate evidence where relevant. Use assess_review_thread, "
                              "not a new candidate merely repeating the historical claim."),
-                required_capability="read_file", origin_session_id=session_id,
+                required_capability="repository", origin_session_id=session_id,
                 kind="review_thread",
             )
             state.journal.emit("review_thread_queued", {"target": target, "path": path,
@@ -4831,16 +4838,17 @@ class ReviewController:
         output_tokens = min(getattr(self.critic, "max_tokens", 4096),
                             state.inputs.config.session_limits.output_tokens or 4096)
 
-        def fits(items):
+        def fits(items, batch_context):
             # Budget decision output too: many tiny candidates can fit the
             # input window while their ID/action rows exceed completion space.
             decision_bytes = sum(len(c.candidate_id.encode("utf-8")) * 2 + 160 for c in items)
-            return (self._critic_context_bytes(self._critic_context_slice(context, items)) <= limit
+            return (self._critic_context_bytes(batch_context) <= limit
                     and decision_bytes <= max(1, output_tokens - 256) * 3)
 
         batches, current = [], []
         for candidate in context["candidates"]:
-            if current and not fits((*current, candidate)):
+            proposed = (*current, candidate)
+            if current and not fits(proposed, self._critic_context_slice(context, proposed)):
                 batches.append(tuple(current))
                 current = []
             current.append(candidate)
@@ -4849,13 +4857,17 @@ class ReviewController:
         rows, fallback_ids = [], set()
         for index, candidates in enumerate(batches, 1):
             batch_context = self._critic_context_slice(context, candidates)
+            # History is optional. Drop whole discussions before letting them
+            # crowd out an otherwise reviewable candidate and its proof.
+            while batch_context["review_threads"] and self._critic_context_bytes(batch_context) > limit:
+                batch_context["review_threads"] = batch_context["review_threads"][:-1]
             request_id = "critic:1" if len(batches) == 1 else f"critic:batch:{index}"
             state.journal.emit("critic_batch_started", {
                 "request_id": request_id, "batch": index, "batch_count": len(batches),
                 "candidate_ids": tuple(c.candidate_id for c in candidates),
                 "context_bytes": self._critic_context_bytes(batch_context), "limit_bytes": limit,
             })
-            if fits(candidates):
+            if fits(candidates, batch_context):
                 batch_rows, failed = self._critic_batch_result(state, batch_context, request_id)
             else:
                 self._degrade(state, "critic", f"{request_id}: single candidate exceeds critic batch budget; request not sent")
@@ -5004,11 +5016,9 @@ class ReviewController:
                     "candidate_assessments": candidate_assessments,
                     "review_threads": tuple({
                         "target": item["target"], "path": item["path"], "line": item.get("line"),
-                        "origin": item["origin"], "discussion_complete": (item.get("discussion_complete", False)
-                            and len(item.get("comments", ())) <= 4
-                            and all(len(str(comment.get("body", ""))) <= 1200 for comment in item.get("comments", ()))),
-                        "comments": [{"author": comment.get("author"), "body": str(comment.get("body", ""))[:1200]}
-                                     for comment in item.get("comments", ())[:4]],
+                        "origin": item["origin"], "discussion_complete": item.get("discussion_complete", False),
+                        "comments": [{"author": comment.get("author"), "body": comment.get("body", "")}
+                                     for comment in item.get("comments", ())],
                         "assessment": state.review_thread_assessments.get(item["target"], {}).get("assessment", "unverified"),
                     } for item in state.inputs.review_threads
                         if any(candidate.affected_location.split(":", 1)[0] == item["path"] for candidate in candidates)),
@@ -5189,8 +5199,6 @@ class ReviewController:
             update = association.get("update", "")
             if (snapshot is None or finding is None or finding.affected_file != snapshot["path"]
                     or not snapshot.get("discussion_complete")
-                    or len(snapshot.get("comments", ())) > 4
-                    or any(len(str(comment.get("body", ""))) > 1200 for comment in snapshot.get("comments", ()))
                     or not isinstance(update, str) or len(update) > 3000
                     or (association["kind"] == "update" and not update.strip())):
                 state.journal.emit("review_thread_association_rejected", {"candidate_id": row.get("candidate_id"),
@@ -5446,6 +5454,7 @@ class ReviewController:
             + "."
             for lead in state.investigation_leads.values()
             if lead.status is InvestigationLeadStatus.BLOCKED
+            and lead.kind != "review_thread"
             and lead.summary.strip()
         )[:2]
         human_focus = tuple(dict.fromkeys((
