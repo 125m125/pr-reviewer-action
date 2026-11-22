@@ -208,6 +208,34 @@ def state_for(
     )
 
 
+def test_scheduler_sees_completed_checks_on_shared_paths_as_context_not_targets():
+    state = state_for(covered=("OB2",), checkpoints=(SessionCheckpoint(
+        session_id="S2", state=SessionState.CHECKPOINT,
+        obligation_assessments=(ObligationAssessment(
+            "O1", "OB2", ObligationDisposition.COVERED,
+            "Confirmed the native review event at the publishing call site.", ("E-OB2",),
+        ),),
+    ),))
+    assert "related_completed_checks" not in compact_negotiation_context(state)
+    shared = replace(state.obligations[0], scope=("src/a.py",))
+    context = compact_negotiation_context(replace(state, obligations=(shared, state.obligations[1])))
+    check, = context["related_completed_checks"]
+    assert check["retained_evidence_ids"] == ("E-OB2",)
+    assert check["paths"] == ("src/a.py",)
+    target, = context["targets"]
+    assert target["handle"] == "U1"
+    # Aggregate coverage by multiple owners does not make one owner's
+    # conclusion about b.py applicable to a.py.
+    grouped = replace(state.obligations[1], scope=("src/a.py", "src/b.py"))
+    checkpoint, = state.checkpoints
+    assessment, = checkpoint.obligation_assessments
+    assert "related_completed_checks" not in compact_negotiation_context(replace(
+        state, obligations=(shared, grouped), checkpoints=(replace(
+            checkpoint, obligation_assessments=(replace(assessment, assessed_paths=("src/b.py",)),),
+        ),),
+    ))
+
+
 def test_followup_keeps_checkpoint_repair_and_accounting_capacity():
     state = state_for(max_sessions=2)
     state = replace(state, session_resources=tuple(

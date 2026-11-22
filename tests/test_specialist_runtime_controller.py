@@ -130,6 +130,36 @@ def test_historical_threads_are_optional_post_initial_leads(tmp_path):
     assert initial < queued
 
 
+def test_historical_batch_is_bounded_to_open_discussions_on_the_same_path(tmp_path):
+    inputs = replace(_inputs(tmp_path), review_threads=tuple(
+        {"target": f"H{index}", "path": "a.py" if index < 6 else "b.py"}
+        for index in range(1, 7)
+    ))
+    state = _RunState(inputs, EventJournal(), RunDeadline(0, 100, PhaseShares()), EvidenceStore())
+    controller = _controller(tmp_path)
+    state.plan = controller_module.AssignmentPlan(())
+    controller._queue_review_threads(state)
+    leads = state.investigation_leads
+    leads["review-thread:H2"] = replace(
+        leads["review-thread:H2"], status=controller_module.InvestigationLeadStatus.SCHEDULED,
+    )
+    batch = controller._review_thread_batch(state, leads["review-thread:H4"])
+    assert [lead.lead_id for lead in batch] == ["review-thread:H4", "review-thread:H1", "review-thread:H3"]
+    from pr_reviewer.specialist_runtime.negotiation import NegotiationAction
+
+    action = NegotiationAction(
+        kind="new_session", obligation_ids=(), lead_ids=("review-thread:H4",),
+        expected_evidence=("repository",), estimated_turns=3,
+        reason="Check related unresolved discussions.", expected_coverage_gain=1,
+    )
+    assignment, = controller._followup_assignments(state, (action,))
+    assigned_session = state.assignment_sessions[assignment.id]
+    assert [item.lead_id for item in assignment.investigation_leads] == [item.lead_id for item in batch]
+    assert all(leads[item.lead_id].assigned_session_id == assigned_session for item in batch)
+    snapshots, _, _ = controller._review_thread_feedback(state, assignment.investigation_leads)
+    assert [item["target"] for item in snapshots] == ["H4", "H1", "H3"]
+
+
 def test_historical_thread_can_resume_component_owner_despite_independent_overlap(tmp_path):
     from pr_reviewer.specialist_runtime.negotiation import (
         NegotiationState, SessionResources, compact_negotiation_context,

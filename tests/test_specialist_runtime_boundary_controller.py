@@ -90,7 +90,7 @@ def test_negotiation_projects_session_scope_not_mutable_assignment_scope(tmp_pat
     assert negotiation.changed_files == inputs.changed_files
 
 
-def test_boundary_evaluator_uses_sources_and_does_not_repeat_unchanged_inputs(tmp_path):
+def test_boundary_evaluator_uses_sources_and_does_not_repeat_unchanged_inputs(tmp_path, monkeypatch):
     policy = parse_review_policy({
         "version": 3,
         "components": [{"id": "a", "paths": ["a/**"]}, {"id": "b", "paths": ["b/**"]}],
@@ -130,3 +130,28 @@ def test_boundary_evaluator_uses_sources_and_does_not_repeat_unchanged_inputs(tm
     failure = state.boundary_evaluations["api"]
     assert "missing usable source evidence for participant" not in failure.reason
     assert "assessment remains incomplete" in failure.reason
+
+    from pr_reviewer.specialist_runtime import controller as controller_module
+    from pr_reviewer.specialist_runtime.types import InvestigationLeadStatus
+
+    lead_id = "boundary:api"
+    state.investigation_leads[lead_id] = replace(
+        state.investigation_leads[lead_id], status=InvestigationLeadStatus.BLOCKED,
+    )
+    build_context = controller_module.build_boundary_context
+
+    def changed_input(*args, **kwargs):
+        return {**build_context(*args, **kwargs), "input_fingerprint": "different-input"}
+
+    monkeypatch.setattr(controller_module, "build_boundary_context", changed_input)
+    controller._evaluate_boundaries(state)
+    assert state.investigation_leads[lead_id].status is InvestigationLeadStatus.BLOCKED
+    assert state.coverage.obligation_statuses()[combined.id] is ObligationStatus.UNRESOLVED
+
+    def distinct_question(*args, **kwargs):
+        return {**changed_input(*args, **kwargs), "input_fingerprint": "new-question",
+                "suggested_investigation": "Check encoding of numeric request identifiers."}
+
+    monkeypatch.setattr(controller_module, "build_boundary_context", distinct_question)
+    controller._evaluate_boundaries(state)
+    assert state.investigation_leads[lead_id].status is InvestigationLeadStatus.OPEN

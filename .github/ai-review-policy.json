@@ -670,7 +670,7 @@
           "pr_reviewer/github_review_notes.py"
         ]
       },
-      "objective": "Compare retained review outcomes and note fields with their publication consumers, including incomplete states and finding locations."
+      "objective": "Compare retained review outcomes and note fields with their publication consumers, including incomplete states and finding locations. For verdict routing, start at the specialist publish entry point and _native_event in github_review_notes.py: review_comment and review_verdict use different native event policies. Check the matching review body/event test before tracing unrelated publishing paths."
     }
   ]
 }
