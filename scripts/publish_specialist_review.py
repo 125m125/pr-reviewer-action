@@ -38,6 +38,8 @@ from scripts.redact import mask_secrets  # noqa: E402
 
 
 def _report_publication(state: Mapping[str, Any], artifact_path: str | None) -> None:
+    for warning in state.get("publication_warnings", ()):
+        print("[review-publisher] warning: " + mask_secrets(json.dumps(warning)), file=sys.stderr)
     for error in state.get('publication_errors', ()):
         print('[review-publisher] publication error: ' + mask_secrets(json.dumps({
             'operation': str(error.get('operation', 'unknown'))[:100],
@@ -205,7 +207,7 @@ def _access_configuration(value: object, *, repo: str, head_sha: str, pr_number:
         not isinstance(value, Mapping)
         or value.get("repository") != repo
         or value.get("head_sha") != head_sha
-        or value.get("pr_number") != pr_number
+        or type(value.get("pr_number")) is not int or value.get("pr_number") != pr_number
     ):
         raise ValueError("review artifact identity does not match repository, PR, and head")
     configuration = value.get("configuration", {})
@@ -291,10 +293,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     policy = _policy(_json(args.policy_result))
     artifacts = _artifacts(_json(args.artifacts) if args.artifacts else None)
+    artifact = _json(args.review_artifact) if args.review_artifact else None
     access_policy, allowed_repositories = _access_configuration(
-        _json(args.review_artifact) if args.review_artifact else None,
+        artifact,
         repo=args.repo, head_sha=args.head_sha, pr_number=args.pr_number,
     )
+    threads = artifact.get("review_threads", {}) if artifact else {}
+    if not isinstance(threads, Mapping) or any(
+        not isinstance(threads.get(key, []), list) or not all(isinstance(item, Mapping) for item in threads[key])
+        for key in ("snapshots", "assessments", "associations") if key in threads
+    ):
+        raise ValueError("review_threads must contain arrays of controller records")
+    for snapshot in threads.get("snapshots", []):
+        if (snapshot.get("repository") != args.repo or snapshot.get("head_sha") != args.head_sha
+                or type(snapshot.get("pr_number")) is not int or snapshot["pr_number"] != args.pr_number):
+            raise ValueError("review-thread snapshot identity mismatch")
     run_url = _run_url(args.run_url, args.repo)
     client = GhReviewClient(action_root=args.action_root)
     publisher = GitHubReviewPublisher(
@@ -314,6 +327,9 @@ def main(argv: list[str] | None = None) -> int:
         head_sha=args.head_sha,
         artifact_links=artifacts,
         access_policy=access_policy,
+        review_thread_snapshots=threads.get("snapshots", ()),
+        review_thread_assessments=threads.get("assessments", ()),
+        review_thread_associations=threads.get("associations", ()),
         allowed_github_repositories=allowed_repositories,
         run_url=run_url,
         cleanup_previous_reviews=args.cleanup_previous_reviews,

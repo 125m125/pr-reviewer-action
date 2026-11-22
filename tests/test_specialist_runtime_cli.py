@@ -26,6 +26,19 @@ from pr_reviewer.specialist_runtime.types import (
 )
 
 
+def test_historical_collection_uses_action_root_and_immutable_identity(monkeypatch, tmp_path):
+    from pr_reviewer.github_review_notes import GhReviewClient
+    observed = {}
+    def query(self, repo, pr, head):
+        observed.update(action_root=self.action_root, repo=repo, pr=pr, head=head)
+        return ()
+    monkeypatch.setattr(GhReviewClient, "query_review_threads", query)
+    config = SimpleNamespace(environment={"GITHUB_ACTION_PATH": str(tmp_path)})
+    inputs = SimpleNamespace(repository="o/r", pr_number=7, head_sha="a" * 40)
+    assert cli._collect_review_threads(config, inputs) == ()
+    assert observed == dict(action_root=tmp_path.resolve(), repo="o/r", pr=7, head="a" * 40)
+
+
 def test_critic_batch_and_dedup_logs_report_sizes_and_outcomes():
     from pr_reviewer.specialist_runtime.events import RunEvent
     batch = cli._runtime_event_line(RunEvent(1, "critic_batch_started", {

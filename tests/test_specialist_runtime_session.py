@@ -1401,6 +1401,38 @@ def reasoning_only_response(value):
     )
 
 
+def test_review_threads_are_hidden_until_explicitly_assigned():
+    session = make_session([])
+    assert "assess_review_thread" not in {item["name"] for item in session.conversation.tool_schemas}
+    session.apply_review_thread_feedback(({
+        "target": "H1", "path": "a.py", "line": 1, "thread_id": "T1",
+        "head_sha": "a" * 40, "comments": [{"body": "A historical claim"}],
+        "discussion_complete": True,
+    },), ())
+    assert "assess_review_thread" in {item["name"] for item in session.conversation.tool_schemas}
+    assert "A historical claim" in str(session.conversation.events)
+    assert "review_thread_state" in session._cumulative_checkpoint_payload()["latest_checkpoint"]
+
+
+def test_tool_admitted_thread_assessment_survives_failed_checkpoint():
+    from pr_reviewer.specialist_runtime.evidence import EvidenceProvenance
+    session = make_session([], repository_head_sha="a" * 40)
+    session.apply_review_thread_feedback(({
+        "target": "H1", "path": "a.py", "line": 1, "thread_id": "T1",
+        "head_sha": "a" * 40, "comments": [{"body": "Possible bug"}],
+        "discussion_complete": True,
+    },), ())
+    record = session.evidence_store.add_tool_result(session_id=session.session_id,
+        tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "result": {"content": "fixed()"}},
+        provenance=EvidenceProvenance(head_sha="a" * 40))
+    result = tool_call_response("assess_review_thread", {"target": "H1", "assessment": "fixed",
+        "reason": "Verified corrected current source", "evidence_ids": [record.id]})
+    assert session._execute_calls(result.tool_calls)
+    assert session._checkpoint_from_text("not json") is None
+    assert session._snapshot().review_thread_assessments[0]["assessment"] == "fixed"
+
+
 def make_session(
     gateway, *, tool_calls=4, model_turns=8, recoveries=1,
     execute_tool=None, lease=None, assignment=None, obligations=None,
@@ -3194,13 +3226,23 @@ def test_final_synthesis_repairs_rejected_candidates_independently():
     assert diagnostic["repair_attempts"][1]["status"] == "output_limit"
 
 
-def test_candidate_tools_report_and_withdraw_with_short_session_handles():
-    session = make_session(ScriptedGateway([]))
+def test_candidate_tools_report_and_withdraw_with_short_session_handles(tmp_path):
+    from pr_reviewer.tool_executors import read_file
+
+    (tmp_path / "a.py").write_text(
+        "def changed(state):\n    if state:\n        state = 'wrong'\n    return state\n# tail\n",
+        encoding="utf-8",
+    )
+    session = make_session(ScriptedGateway([]), execute_tool=lambda name, arguments, **kwargs: {
+        "tool": name, "status": "ok", "result": read_file(
+            arguments["path"], tmp_path, offset=arguments["offset"], limit=arguments["limit"],
+        ),
+    })
     tool_names = {item["name"] for item in session.conversation.tool_schemas}
     before = session.budget.snapshot().tool_calls
     session._execute_calls(({
         "id": "read-candidate", "name": "read_file",
-        "arguments": json.dumps({"path": "a.py", "targets": ["O1"]}),
+        "arguments": json.dumps({"path": "a.py", "offset": 1, "limit": 4, "targets": ["O1"]}),
     },))
     evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
 

@@ -141,15 +141,11 @@ def _result_truncated(result: Mapping[str, Any]) -> bool:
     nested = result.get("result")
     if result.get("truncated") is True:
         return True
-    if not isinstance(nested, Mapping):
-        return False
-    if nested.get("truncated") is True:
+    payload = nested if isinstance(nested, Mapping) else result
+    if payload.get("truncated") is True:
         return True
-    value = nested.get("range")
-    return bool(
-        isinstance(value, Mapping)
-        and (value.get("truncated") is True or value.get("has_more") is True)
-    )
+    value = payload.get("range")
+    return isinstance(value, Mapping) and value.get("truncated") is True
 
 
 def _retained_selection(tool: str, result: Mapping[str, Any], content: str) -> dict | None:
@@ -170,7 +166,7 @@ def _retained_selection(tool: str, result: Mapping[str, Any], content: str) -> d
 
 
 def _retained_file_range(
-    tool: str, result: Mapping[str, Any], content: str, *, truncated: bool,
+    tool: str, result: Mapping[str, Any], *, truncated: bool,
 ) -> dict | None:
     """Keep executor coordinates, never derive file positions from source prose."""
     if tool not in {"read_file", "read_remote_file"}:
@@ -181,7 +177,7 @@ def _retained_file_range(
         return None
     # Redaction/retention can change line structure. Do not advertise a mapping
     # unless each retained line still corresponds to the executor's file slice.
-    if truncated or len(content.splitlines()) != len(_result_content(result).splitlines()):
+    if truncated or raw.get("coordinates_unavailable"):
         return None
     return {key: value for key, value in raw.items()
             if key in {"offset", "lines", "total_lines", "next_offset", "has_more", "truncated"}
@@ -232,9 +228,10 @@ def _bounded_tool_content(
         raise ValueError("max_content_bytes must be positive")
     masked, count = mask_source_secrets(content)
     raw = masked.encode("utf-8", errors="replace")
-    truncated = len(raw) > max_content_bytes
-    if truncated:
+    clipped = len(raw) > max_content_bytes
+    if clipped:
         masked = raw[:max_content_bytes].decode("utf-8", errors="replace") + "\n[truncated]"
+    truncated = clipped or (bool(count) and len(masked.splitlines()) != len(content.splitlines()))
     return masked, bool(count), truncated, (("controller-source-value",) if count else ())
 
 
@@ -312,7 +309,7 @@ def canonical_evidence_key(
     max_content_bytes: int = 64 * 1024,
 ) -> str:
     """Return a deterministic identity for a bounded, safely stored result."""
-    content, _, _, _ = _bounded_tool_content(
+    content, _, truncated, _ = _bounded_tool_content(
         str(tool).strip(), _result_content(result), max_content_bytes,
     )
     sanitized_provenance, _ = _sanitize_provenance(provenance)
@@ -325,6 +322,8 @@ def canonical_evidence_key(
         "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         "provenance": _provenance_identity(sanitized_provenance),
     }
+    if truncated or _result_truncated(result):
+        identity["truncated"] = True
     selection = _retained_selection(tool, result, content)
     if selection is not None:
         identity['selection'] = selection
@@ -740,7 +739,7 @@ class EvidenceStore:
             supersedes=canonical_supersedes,
             contradicts=canonical_contradicts,
             selection=_retained_selection(tool, result, content),
-            source_range=_retained_file_range(tool, result, content, truncated=truncated),
+            source_range=_retained_file_range(tool, result, truncated=truncated),
         )
         self._records[record.id] = record
         if record.is_usable_for_coverage:

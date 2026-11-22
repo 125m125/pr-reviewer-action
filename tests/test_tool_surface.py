@@ -50,6 +50,7 @@ def test_file_pagination_counts_only_complete_utf8_lines(tmp_path):
     first = _exec("read_file", {"path": "f.txt", "offset": 1, "limit": 4}, tmp_path)["result"]
     assert first["content"] == ("é" * 2000 + "\n") * 2
     assert first["range"]["lines"] == 2
+    assert first["range"]["truncated"] is True
     assert first["range"]["next_offset"] == 3
     second = _exec("read_file", {"path": "f.txt", "offset": 3}, tmp_path)["result"]
     assert first["content"] + second["content"] == (tmp_path / "f.txt").read_text(encoding="utf-8")
@@ -60,6 +61,7 @@ def test_oversized_file_line_is_explicitly_omitted(tmp_path):
     result = _exec("read_file", {"path": "f.txt"}, tmp_path)["result"]
     assert result["content"] == ""
     assert result["range"]["lines"] == 0
+    assert result["range"]["truncated"] is True
     assert result["range"]["omitted_lines"] == [1]
     assert result["range"]["next_offset"] == 2
 
@@ -69,7 +71,15 @@ def test_read_file_offset_limit_returns_window(tmp_path):
     assert res["status"] == "ok"
     assert res["result"]["content"] == "row10\nrow11\nrow12\n"
     assert res["result"]["range"] == {"offset": 10, "lines": 3, "total_lines": 100,
-                                      "has_more": True, "truncated": True, "next_offset": 13}
+                                      "has_more": True, "truncated": False, "next_offset": 13}
+
+
+def test_read_file_retains_complete_final_line_without_newline(tmp_path):
+    (tmp_path / "f.txt").write_text("first\nlast", encoding="utf-8")
+    result = _exec("read_file", {"path": "f.txt", "offset": 2}, tmp_path)["result"]
+    assert result["content"] == "last"
+    assert result["range"] == {"offset": 2, "lines": 1, "total_lines": 2,
+                               "has_more": False, "truncated": False, "next_offset": None}
 
 
 def test_read_file_no_range_reads_whole_file(tmp_path):

@@ -275,6 +275,77 @@ def test_native_review_contains_handoff_without_sticky_comment(tmp_path):
     assert "Reviewed head: `" + "a" * 40 + "`" in body
 
 
+@pytest.mark.parametrize("origin,stale,human_reply,expected", [
+    ("managed", False, False, ["reply", "resolve"]), ("human", False, False, []),
+    ("managed", True, False, []), ("managed", False, True, []),
+])
+def test_explicit_reassessment_needs_live_owned_uncontested_thread(tmp_path, origin, stale, human_reply, expected):
+    client = _FakeClient()
+    snapshot = dict(target="H1", origin=origin, repository="owner/repo", pr_number=17, head_sha="a"*40,
+                    thread_id="T", comment_id=10, last_comment_id=10, path="a.py", line=6, side="RIGHT",
+                    fingerprint="fp-old" if origin == "managed" else None, review_id="R", discussion_complete=True,
+                    human_reply=human_reply, is_resolved=False, comments=[{"id":10,"author":"starter","body":"concern"}])
+    def live(*_args):
+        if any(c[0] == "reply" for c in client.calls):
+            return ({**snapshot, "last_comment_id":901, "comments":[*snapshot["comments"],
+                    {"id":901,"author":"bot","body":client.calls[-1][2]}]},)
+        return ({**snapshot, "last_comment_id":11 if stale else 10},)
+    client.query_review_threads = live
+    result, _ = _publish(tmp_path, client, review_thread_snapshots=[snapshot], review_thread_assessments=[
+        dict(target="H1", assessment="fixed", reason="The parser now rejects empty tokens on line 6.",
+             evidence_ids=["E1"], update="", snapshot=snapshot)])
+    assert result["review_completed"] and not result["publication_errors"]
+    assert [c[0] for c in client.calls if c[0] in {"reply","resolve"}] == expected
+
+
+@pytest.mark.parametrize("kind,stale,expected", [("duplicate",False,[]), ("duplicate",True,["add"]), ("update",False,["reply"])])
+def test_critic_association_suppresses_only_confirmed_existing_thread(tmp_path, kind, stale, expected):
+    client = _FakeClient()
+    snapshot = dict(target="H1", origin="human", repository="owner/repo", pr_number=17, head_sha="a"*40,
+                    thread_id="T", comment_id=10, last_comment_id=10, path="a.py", line=6, side="RIGHT",
+                    review_id="R", discussion_complete=True, human_reply=False, is_resolved=False,
+                    comments=[{"id":10,"author":"starter","body":"concern"}])
+    client.query_review_threads = lambda *_: ({**snapshot, "last_comment_id":11 if stale else 10},)
+    result, _ = _publish(tmp_path, client, notes=[_note("fp")], review_thread_snapshots=[snapshot],
+                         review_thread_associations=[dict(target="H1",kind=kind,candidate_id="C1", fingerprint="fp",
+                         update="The same condition also breaks empty token inputs.", snapshot=snapshot)])
+    assert result["review_completed"]
+    assert [c[0] for c in client.calls if c[0] in {"reply","add"}] == expected
+
+
+def test_current_duplicate_overrules_earlier_fixed_assessment(tmp_path):
+    client = _FakeClient()
+    snapshot = dict(target="H1", origin="managed", repository="owner/repo", pr_number=17, head_sha="a"*40,
+                    thread_id="T", comment_id=10, last_comment_id=10, path="a.py", line=6, side="RIGHT",
+                    fingerprint="prior", review_id="R", discussion_complete=True, human_reply=False, is_resolved=False,
+                    comments=[{"id":10,"author":"bot","body":"concern"}])
+    client.query_review_threads = lambda *_: (snapshot,)
+    result, _ = _publish(tmp_path, client, notes=[_note("new-fp")], review_thread_snapshots=[snapshot],
+        review_thread_associations=[dict(target="H1",kind="duplicate",candidate_id="C1", fingerprint="new-fp",snapshot=snapshot)],
+        review_thread_assessments=[dict(target="H1",assessment="fixed",evidence_ids=["E1"],
+            reason="This would incorrectly announce a fix.",snapshot=snapshot)])
+    assert result["review_completed"]
+    assert not any(c[0] in {"reply", "resolve", "add"} for c in client.calls)
+
+
+@pytest.mark.parametrize("owned,expected", [(True, []), (False, ["add"])])
+def test_retry_associated_update_recognizes_only_its_own_exact_intervening_reply(tmp_path, owned, expected):
+    client = _FakeClient()
+    snapshot = dict(target="H1", origin="human", repository="owner/repo", pr_number=17, head_sha="a"*40,
+                    thread_id="T", comment_id=10, last_comment_id=10, path="a.py", line=6, side="RIGHT",
+                    review_id="R", discussion_complete=True, human_reply=False, is_resolved=False,
+                    comments=[{"id":10,"author":"starter","body":"concern"}])
+    update = "This code also fails when the token is empty."
+    client.query_review_threads = lambda *_: ({**snapshot, "last_comment_id": 12,
+        "comments": [*snapshot["comments"], {"id": 12, "author": "bot" if owned else "user",
+                                            "viewer_owned": owned, "body": update}]},)
+    result, _ = _publish(tmp_path, client, notes=[_note("fp")], review_thread_snapshots=[snapshot],
+        review_thread_associations=[dict(target="H1",kind="update",candidate_id="C1", fingerprint="fp",
+                                        update=update,snapshot=snapshot)])
+    assert result["review_completed"]
+    assert [c[0] for c in client.calls if c[0] in {"reply", "add"}] == expected
+
+
 def test_empty_unmanaged_review_is_left_untouched(tmp_path):
     client = _FakeClient({'reviews': [{'id': 'empty-review', 'body': '', 'state': 'COMMENTED'}]})
     result, _ = _publish(tmp_path, client)
@@ -291,13 +362,43 @@ def test_old_reviews_retired_only_after_replacement_and_threads_left_open(tmp_pa
     result, _ = _publish(tmp_path, client)
     operations = [call[0] for call in client.calls]
     assert result["review_completed"]
-    assert operations.index("submit") < operations.index("dismiss") < operations.index("minimize")
+    assert "dismiss" not in operations
+    assert operations.index("submit") < operations.index("minimize")
     assert ("minimize", "old-review", "OUTDATED") in client.calls
     assert ("minimize", "old-handoff", "OUTDATED") in client.calls
     assert result['previous_review_cleanup']['eligible_reviews'] == 1
     assert result['previous_review_cleanup']['minimized_reviews'] == 1
     assert result['previous_review_cleanup']['minimized_handoff_comments'] == 1
     assert "resolve" not in operations
+
+
+@pytest.mark.parametrize("disposition,extra_general,expected", [("fixed",False,True),("unverified",False,False),("fixed",True,False)])
+def test_old_block_dismissal_requires_complete_verified_inventory(tmp_path, disposition, extra_general, expected):
+    first = _FakeClient()
+    _, first_state = _publish(tmp_path, first, mode="review_verdict", verdict="request_changes", notes=[_note("prior")])
+    old = {**_completed_review_from_submit(first, first_state), "id":"old"}
+    snapshot = dict(target="H1", origin="managed", repository="owner/repo", pr_number=17, head_sha="a"*40,
+                    thread_id="thread-prior", comment_id=904, last_comment_id=904, path="a.py", line=6, side="RIGHT",
+                    fingerprint="prior", review_id="old", discussion_complete=True, human_reply=False, is_resolved=False,
+                    comments=[{"id":904,"author":"bot","body":"concern"}])
+    client = _FakeClient({"reviews":[old], "threads":[{**snapshot, "publication_id":first_state["publication_id"]}],
+        "general_comments":[{"fingerprint":"extra", "publication_id":first_state["publication_id"]}] if extra_general else []})
+    def live(*_args):
+        reply = next((c for c in client.calls if c[0] == "reply"), None)
+        if reply:
+            return ({**snapshot,"last_comment_id":901,"comments":[*snapshot["comments"],{"id":901,"body":reply[2]}]},)
+        return (snapshot,)
+    client.query_review_threads = live
+    def resolve(tid):
+        client.managed_state["threads"][0]["is_resolved"] = True
+        client.managed_state["threads"][0].update(live()[0])
+        client.managed_state["threads"][0]["is_resolved"] = True
+        return {"id":tid,"is_resolved":True}
+    client.resolve_thread = resolve
+    result, _ = _publish(tmp_path, client, review_thread_snapshots=[snapshot], review_thread_assessments=[
+        dict(target="H1", assessment=disposition, reason="The parser rejects all empty tokens before use.",
+             evidence_ids=["E1"], update="",snapshot=snapshot)])
+    assert result["review_completed"] and (("dismiss","old") in client.calls) is expected
 
 
 def test_failed_publication_keeps_previous_review_visible(tmp_path):
@@ -477,9 +578,6 @@ def test_review_comment_lifecycle_order_and_state(tmp_path):
 
     assert [call[0] for call in client.calls] == [
         "query",
-        "reply",
-        "reply",
-        "resolve",
         "pending",
         "add",
         "add",
@@ -492,7 +590,7 @@ def test_review_comment_lifecycle_order_and_state(tmp_path):
     assert "https://example/artifact" in submit[3]
     assert "Current evidence" not in submit[3]
     by_fp = {entry["fingerprint"]: entry for entry in state["notes"]}
-    assert by_fp["fp-fixed"]["resolution"] == "resolved"
+    assert "fp-fixed" not in by_fp
     assert by_fp["fp-line"]["anchor_type"] == "LINE"
     assert by_fp["fp-file"]["anchor_type"] == "FILE"
     assert state["publication_errors"] == []
@@ -554,40 +652,11 @@ def test_human_resolved_thread_is_not_reopened(tmp_path):
     _result, state = _publish(tmp_path, client, notes=(_note(),))
 
     assert not any(call[0] in {"resolve", "add"} for call in client.calls)
-    assert [call[0] for call in client.calls].count("reply") == 1
-    assert "human-resolved" in [call for call in client.calls if call[0] == "reply"][0][2]
+    assert not any(call[0] == "reply" for call in client.calls)
     assert state["notes"][0]["human_resolved"] is True
     assert state["notes"][0]["resolution"] == "human_resolved_not_reopened"
 
 
-def test_human_resolved_status_reply_is_deduplicated_for_head(tmp_path):
-    thread = {
-        "fingerprint": "fp-1",
-        "generation": 1,
-        "thread_id": "thread-human",
-        "comment_id": 12,
-        "url": _discussion_url(12),
-        "is_resolved": True,
-        "resolved_by_publisher": False,
-        "owned_comment_bodies": (),
-    }
-    first = _FakeClient({
-        "pull_request_id": "PR-node",
-        "threads": [thread],
-        "general_comments": [],
-        "reviews": [],
-    })
-    _publish(tmp_path, first, notes=(_note(),))
-    reply_body = next(call[2] for call in first.calls if call[0] == "reply")
-    client = _FakeClient({
-        "pull_request_id": "PR-node",
-        "threads": [{**thread, "owned_comment_bodies": (reply_body,)}],
-        "general_comments": [],
-        "reviews": [],
-    })
-    _publish(tmp_path, client, notes=(_note(),))
-
-    assert not any(call[0] in {"reply", "resolve", "add"} for call in client.calls)
 
 
 def test_publisher_resolved_recurrence_creates_new_generation(tmp_path):
@@ -650,118 +719,11 @@ def test_publisher_resolved_recurrence_without_anchor_degrades_to_managed_genera
     assert result["review"]["event"] == "COMMENT"
 
 
-def test_same_open_status_reply_is_deduplicated_for_head(tmp_path):
-    thread = {
-        "fingerprint": "fp-1",
-        "generation": 1,
-        "thread_id": "thread-open",
-        "comment_id": 12,
-        "url": _discussion_url(12),
-        "is_resolved": False,
-        "resolved_by_publisher": False,
-        "owned_comment_bodies": (),
-    }
-    first = _FakeClient({
-        "pull_request_id": "PR-node",
-        "threads": [thread],
-        "general_comments": [],
-        "reviews": [],
-    })
-    _publish(tmp_path, first, notes=(_note(),))
-    reply_body = next(call[2] for call in first.calls if call[0] == "reply")
-    client = _FakeClient({
-        "pull_request_id": "PR-node",
-        "threads": [{**thread, "owned_comment_bodies": (reply_body,)}],
-        "general_comments": [],
-        "reviews": [],
-    })
-    _publish(tmp_path, client, notes=(_note(),))
-
-    assert not any(call[0] == "reply" for call in client.calls)
-
-
-def test_same_head_changed_note_content_gets_one_new_status_reply(tmp_path):
-    base_thread = {
-        "fingerprint": "fp-status-content",
-        "generation": 1,
-        "thread_id": "thread-open",
-        "comment_id": 45,
-        "url": _discussion_url(45),
-        "is_resolved": False,
-        "owned_comment_bodies": (),
-    }
-    first = _FakeClient({
-        "pull_request_id": "PR-node",
-        "threads": [base_thread],
-        "general_comments": [],
-        "reviews": [],
-    })
-    _publish(
-        tmp_path, first, notes=(_note("fp-status-content", markdown="old evidence"),)
-    )
-    old_reply = next(call[2] for call in first.calls if call[0] == "reply")
-    second = _FakeClient({
-        "pull_request_id": "PR-node",
-        "threads": [{**base_thread, "owned_comment_bodies": (old_reply,)}],
-        "general_comments": [],
-        "reviews": [],
-    })
-    _publish(
-        tmp_path,
-        second,
-        notes=(_note("fp-status-content", markdown="changed evidence"),),
-    )
-    changed_reply = next(call[2] for call in second.calls if call[0] == "reply")
-    third = _FakeClient({
-        "pull_request_id": "PR-node",
-        "threads": [{
-            **base_thread,
-            "owned_comment_bodies": (old_reply, changed_reply),
-        }],
-        "general_comments": [],
-        "reviews": [],
-    })
-
-    _publish(
-        tmp_path,
-        third,
-        notes=(_note("fp-status-content", markdown="changed evidence"),),
-    )
-
-    assert old_reply != changed_reply
-    assert not any(call[0] == "reply" for call in third.calls)
-
-
-@pytest.mark.parametrize("human_resolved", [False, True])
-def test_unconfirmed_existing_status_reply_keeps_review_pending(tmp_path, human_resolved):
-    class ReplyFailureClient(_FakeClient):
-        def reply_thread(self, comment_id, body):
-            self.calls.append(("reply", comment_id, body))
-            return {}
-
-    client = ReplyFailureClient({
-        "threads": [{
-            "fingerprint": "fp-status-failed",
-            "generation": 1,
-            "thread_id": "thread-status-failed",
-            "comment_id": 71,
-            "url": _discussion_url(71),
-            "is_resolved": human_resolved,
-            "resolved_by_publisher": False,
-            "owned_comment_bodies": (),
-        }],
-    })
-
-    result, state = _publish(
-        tmp_path, client, notes=(_note("fp-status-failed"),)
-    )
-    note = next(item for item in state["notes"] if item["fingerprint"] == "fp-status-failed")
-
-    assert note["resolution"] == "publication_failed"
-    assert note["confirmed"] is False
-    assert note["publication_errors"]
-    assert result["review"]["status"] == "pending_incomplete"
-    assert not any(call[0] == "submit" for call in client.calls)
+def test_same_open_fingerprint_preserved_without_noisy_reply(tmp_path):
+    client = _FakeClient({"threads": [{"fingerprint": "fp-1", "thread_id": "T", "is_resolved": False}]})
+    result, _ = _publish(tmp_path, client, notes=[_note()])
+    assert result["review_completed"] and result["notes"][0]["resolution"] == "open"
+    assert not any(c[0] in {"reply", "resolve", "add"} for c in client.calls)
 
 
 def test_general_answer_followup_is_deduplicated(tmp_path):
@@ -812,165 +774,13 @@ def test_failed_general_update_never_reports_stale_comment_as_open(tmp_path):
     assert result["review_completed"] is False
 
 
-def test_failed_general_answer_remains_unanswered_and_failed(tmp_path):
-    class AnswerFailureClient(_FakeClient):
-        def reply_general_comment(self, repo, pr_number, prior, body):
-            self.calls.append(("general_reply", repo, pr_number, prior, body))
-            return {}
-
-    client = AnswerFailureClient({
-        "pull_request_id": "PR-node",
-        "threads": [],
-        "general_comments": [{
-            "fingerprint": "fp-answer-fail",
-            "id": 51,
-            "url": _issue_url(51),
-            "body": "open",
-        }],
-        "reviews": [],
-    })
-
-    result, state = _publish(tmp_path, client, notes=())
-    note = next(item for item in state["notes"] if item["fingerprint"] == "fp-answer-fail")
-
-    assert note["resolution"] == "publication_failed"
-    assert note["answered"] is False
-    assert note["confirmed"] is False
-    assert result["review"]["status"] == "pending_incomplete"
-    assert not any(call[0] == "submit" for call in client.calls)
-
-
-def test_failed_superseded_general_answer_keeps_anchored_note_pending(tmp_path):
-    class AnswerFailureClient(_FakeClient):
-        def reply_general_comment(self, repo, pr_number, prior, body):
-            self.calls.append(("general_reply", repo, pr_number, prior, body))
-            return {}
-
-    client = AnswerFailureClient({
-        "general_comments": [{
-            "fingerprint": "fp-now-anchored-fail",
-            "id": 53,
-            "url": _issue_url(53),
-            "body": "old fallback",
-            "publication_id": "b" * 32,
-            "generation": 1,
-            "content_digest": "c" * 16,
-        }],
-    })
-
-    result, state = _publish(
-        tmp_path, client, notes=(_note("fp-now-anchored-fail"),)
-    )
-    note = next(
-        item for item in state["notes"]
-        if item["fingerprint"] == "fp-now-anchored-fail"
-    )
-
-    assert note["resolution"] == "publication_failed"
-    assert note["confirmed"] is False
-    assert "reply_general_comment" in note["publication_errors"]
-    assert result["review"]["status"] == "pending_incomplete"
-    assert not any(call[0] == "submit" for call in client.calls)
-
-
-def test_anchored_note_answers_superseded_general_fallback_once(tmp_path):
-    general = {
-        "fingerprint": "fp-now-anchored",
-        "id": 52,
-        "url": _issue_url(52),
-        "body": "old fallback",
-    }
-    first = _FakeClient({
-        "pull_request_id": "PR-node",
-        "threads": [],
-        "general_comments": [general],
-        "reviews": [],
-    })
-    _publish(tmp_path, first, notes=(_note("fp-now-anchored"),))
-    answer = next(call[-1] for call in first.calls if call[0] == "general_reply")
-    second = _FakeClient({
-        "pull_request_id": "PR-node",
-        "threads": [],
-        "general_comments": [general],
-        "general_answered_fingerprints": ("fp-now-anchored",),
-        "reviews": [],
-    })
-
-    _publish(tmp_path, second, notes=(_note("fp-now-anchored"),))
-
-    assert "fixed or answered" in answer
-    assert not any(call[0] == "general_reply" for call in second.calls)
-
-
-def test_general_request_and_answer_identity_include_publication_generation_and_content(
-    tmp_path,
-):
-    first = _FakeClient()
-    result, _state = _publish(
-        tmp_path,
-        first,
-        notes=(_note("fp-general-identity", file=None, line=None),),
-    )
-    request_body = next(call[-1] for call in first.calls if call[0] == "general")
-    marker = request_body.split("<!-- ai-pr-review-general:", 1)[1].split(" -->", 1)[0]
-    assert f"publication={result['publication_id']}" in marker
-    assert "generation=1" in marker
-    content_digest = marker.split("content=", 1)[1]
-
-    second = _FakeClient({
-        "general_comments": [{
-            "fingerprint": "fp-general-identity",
-            "id": 54,
-            "url": _issue_url(54),
-            "body": request_body,
-            "publication_id": result["publication_id"],
-            "generation": 1,
-            "content_digest": content_digest,
-        }],
-        # A prior same-head publication answered this fingerprint, but not this
-        # publication/generation/content identity.
-        "general_answered_fingerprints": ("fp-general-identity",),
-        "general_answered_identities": (
-            f"fp-general-identity:{'d' * 32}:1:{content_digest}",
-        ),
-    })
-
-    _publish(tmp_path, second, notes=())
-    answer_body = next(call[-1] for call in second.calls if call[0] == "general_reply")
-
-    assert f"publication={result['publication_id']}" in answer_body
-    assert "generation=1" in answer_body
-    assert f"content={content_digest}" in answer_body
-
-
-def test_unbound_general_answer_migrates_to_exact_identity_once(tmp_path):
-    general = {
-        "fingerprint": "fp-general-migration",
-        "id": 55,
-        "url": _issue_url(55),
-        "body": "legacy unbound request",
-    }
-    first = _FakeClient({"general_comments": [general]})
-    first_result, first_state = _publish(tmp_path, first, notes=())
-    answer_body = next(
-        call[-1] for call in first.calls if call[0] == "general_reply"
-    )
-    answer_marker = answer_body.split(
-        "<!-- ai-pr-review-general-answer:", 1
-    )[1].split(" -->", 1)[0]
-    content_digest = answer_marker.split("content=", 1)[1]
-    completed = _completed_review_from_submit(first, first_state)
-    second = _FakeClient({
-        "general_comments": [general],
-        "general_answered_identities": (
-            f"fp-general-migration:{first_result['publication_id']}:1:{content_digest}",
-        ),
-        "reviews": [completed],
-    })
-
-    _publish(tmp_path, second, notes=())
-
-    assert not any(call[0] == "general_reply" for call in second.calls)
+@pytest.mark.parametrize("current", [(), (_note("fp-old"),)])
+def test_prior_general_finding_not_answered_by_absence_or_new_anchor(tmp_path, current):
+    client = _FakeClient({"general_comments": [{"fingerprint": "fp-old", "id": 15, "url": _issue_url(15)}]})
+    result, _ = _publish(tmp_path, client, notes=current)
+    assert result["review_completed"]
+    assert not any(c[0] == "general_reply" for c in client.calls)
+    assert bool(current) == any(c[0] == "add" for c in client.calls)
 
 
 def test_unanchored_requests_use_explicitly_non_resolvable_general_comment(tmp_path):
@@ -1191,92 +1001,6 @@ def test_completed_owned_review_marker_makes_rerun_idempotent(tmp_path):
     assert not any(call[0] == "sticky" for call in client.calls)
 
 
-def test_completed_review_reuse_is_blocked_by_failed_existing_status_reply(tmp_path):
-    note = _note("fp-completed-status")
-    first = _FakeClient()
-    _first_result, first_state = _publish(tmp_path, first, notes=(note,))
-    completed = _completed_review_from_submit(first, first_state)
-
-    class StatusFailureClient(_FakeClient):
-        def reply_thread(self, comment_id, body):
-            self.calls.append(("reply", comment_id, body))
-            return {}
-
-    second = StatusFailureClient({
-        "threads": [{
-            "fingerprint": note.fingerprint,
-            "generation": 1,
-            "thread_id": "thread-completed-status",
-            "comment_id": 56,
-            "url": _discussion_url(56),
-            "is_resolved": False,
-            "owned_comment_bodies": (),
-        }],
-        "reviews": [completed],
-    })
-
-    result, state = _publish(tmp_path, second, notes=(note,))
-
-    assert result["review_completed"] is False
-    assert state["review"]["status"] == "pending_incomplete"
-    assert not any(call[0] == "sticky" for call in second.calls)
-
-
-def test_completed_review_reuse_is_blocked_by_failed_resolution(tmp_path):
-    first = _FakeClient()
-    _first_result, first_state = _publish(tmp_path, first, notes=())
-    completed = _completed_review_from_submit(first, first_state)
-
-    class ResolutionFailureClient(_FakeClient):
-        def resolve_thread(self, thread_id):
-            self.calls.append(("resolve", thread_id))
-            return {}
-
-    second = ResolutionFailureClient({
-        "threads": [{
-            "fingerprint": "fp-completed-fixed",
-            "generation": 1,
-            "thread_id": "thread-completed-fixed",
-            "comment_id": 57,
-            "url": _discussion_url(57),
-            "is_resolved": False,
-            "owned_comment_bodies": (),
-        }],
-        "reviews": [completed],
-    })
-
-    result, state = _publish(tmp_path, second, notes=())
-
-    assert result["review_completed"] is False
-    assert state["review"]["status"] == "pending_incomplete"
-    assert not any(call[0] == "sticky" for call in second.calls)
-
-
-def test_completed_review_reuse_is_blocked_by_failed_general_answer(tmp_path):
-    first = _FakeClient()
-    _first_result, first_state = _publish(tmp_path, first, notes=())
-    completed = _completed_review_from_submit(first, first_state)
-
-    class GeneralAnswerFailureClient(_FakeClient):
-        def reply_general_comment(self, repo, pr_number, prior, body):
-            self.calls.append(("general_reply", repo, pr_number, prior, body))
-            return {}
-
-    second = GeneralAnswerFailureClient({
-        "general_comments": [{
-            "fingerprint": "fp-completed-general",
-            "id": 58,
-            "url": _issue_url(58),
-            "body": "unanswered general request",
-        }],
-        "reviews": [completed],
-    })
-
-    result, state = _publish(tmp_path, second, notes=())
-
-    assert result["review_completed"] is False
-    assert state["review"]["status"] == "pending_incomplete"
-    assert not any(call[0] == "sticky" for call in second.calls)
 
 
 def test_completed_review_reuse_revalidates_head_after_reconciliation(tmp_path):
@@ -1404,98 +1128,6 @@ def test_dismissed_owned_review_never_satisfies_current_publication(tmp_path):
     assert any(call[0] == "submit" for call in second.calls)
 
 
-def test_timeout_after_resolve_reconciles_confirmed_owned_resolution_marker(tmp_path):
-    class ResolveTimeoutClient(_FakeClient):
-        def __init__(self):
-            super().__init__({
-                "pull_request_id": "PR-node",
-                "threads": [{
-                    "fingerprint": "fp-fixed",
-                    "generation": 1,
-                    "thread_id": "thread-fixed",
-                    "comment_id": 44,
-                    "url": _discussion_url(44),
-                    "is_resolved": False,
-                    "owned_comment_bodies": (),
-                }],
-                "general_comments": [],
-                "reviews": [],
-            })
-            self.query_count = 0
-            self.attempted_body = ""
-
-        def query_managed_state(self, repo, pr_number):
-            self.calls.append(("query", repo, pr_number))
-            self.query_count += 1
-            if self.query_count == 1:
-                return self.managed_state
-            marker = (
-                f"<!-- ai-pr-review-resolution:fp-fixed:g1:{'a' * 40}:publisher -->"
-            )
-            state = dict(self.managed_state)
-            state["threads"] = [{
-                **self.managed_state["threads"][0],
-                "is_resolved": True,
-                "resolved_by_publisher": True,
-                "owned_comment_bodies": (marker,),
-            }]
-            return state
-
-        def resolve_thread(self, thread_id):
-            self.calls.append(("resolve", thread_id))
-            raise TimeoutError("server committed before timeout")
-
-    result, state = _publish(tmp_path, ResolveTimeoutClient(), notes=())
-    fixed = next(item for item in state["notes"] if item["fingerprint"] == "fp-fixed")
-
-    assert fixed["resolution"] == "resolved"
-    assert any(item["operation"] == "reconcile_resolve_thread" for item in result["journal"])
-
-
-def test_timeout_after_status_reply_reconciles_by_exact_owned_marker(tmp_path):
-    class ReplyTimeoutClient(_FakeClient):
-        def __init__(self):
-            super().__init__({
-                "pull_request_id": "PR-node",
-                "threads": [{
-                    "fingerprint": "fp-open",
-                    "generation": 1,
-                    "thread_id": "thread-open",
-                    "comment_id": 45,
-                    "url": _discussion_url(45),
-                    "is_resolved": False,
-                    "owned_comment_bodies": (),
-                }],
-                "general_comments": [],
-                "reviews": [],
-            })
-            self.query_count = 0
-
-        def query_managed_state(self, repo, pr_number):
-            self.calls.append(("query", repo, pr_number))
-            self.query_count += 1
-            if self.query_count == 1:
-                return self.managed_state
-            state = dict(self.managed_state)
-            state["threads"] = [{
-                **self.managed_state["threads"][0],
-                "owned_comment_bodies": (self.attempted_body,),
-            }]
-            return state
-
-        def reply_thread(self, comment_id, body):
-            self.calls.append(("reply", comment_id, body))
-            self.attempted_body = body
-            raise TimeoutError("server committed before timeout")
-
-    result, state = _publish(
-        tmp_path, ReplyTimeoutClient(), notes=(_note("fp-open"),)
-    )
-
-    assert next(item for item in state["notes"] if item["fingerprint"] == "fp-open")[
-        "resolution"
-    ] == "open"
-    assert any(item["operation"] == "reconcile_reply_open_thread" for item in result["journal"])
 
 
 def test_publication_checkpoints_survive_interruption_after_thread_create(tmp_path):
@@ -2328,7 +1960,8 @@ def test_invalid_cleanup_confirmation_is_not_checkpointed_as_success(tmp_path):
     assert result["sticky"] == {}
     assert result["review"]["url"] == _review_url(151)
     assert not any(item["operation"] == "minimize_comment" for item in result["journal"])
-    assert any(error["operation"] == "minimize_comment" for error in result["publication_errors"])
+    assert not result["publication_errors"]
+    assert any(error["operation"] == "minimize_comment" for error in result["publication_warnings"])
     operations = [call[0] for call in client.calls]
     assert operations.index("submit") < operations.index("minimize")
 
@@ -2367,68 +2000,6 @@ def test_publisher_rejects_valid_shape_submit_with_wrong_terminal_state(tmp_path
     assert result["review_completed"] is False
 
 
-def test_resolve_requires_confirmed_resolved_thread(tmp_path):
-    class FalseResolveClient(_FakeClient):
-        def resolve_thread(self, thread_id):
-            self.calls.append(("resolve", thread_id))
-            return {"id": thread_id, "is_resolved": False}
-
-    client = FalseResolveClient({
-        "pull_request_id": "PR-node",
-        "threads": [{
-            "fingerprint": "fp-fixed",
-            "generation": 1,
-            "thread_id": "thread-fixed",
-            "comment_id": 44,
-            "url": _discussion_url(44),
-            "is_resolved": False,
-        }],
-        "general_comments": [],
-        "reviews": [],
-    })
-    result, state = _publish(tmp_path, client, notes=())
-    fixed = [item for item in state["notes"] if item["fingerprint"] == "fp-fixed"][0]
-
-    assert fixed["resolution"] == "publication_failed"
-    assert fixed["confirmed"] is False
-    assert result["review"]["status"] == "pending_incomplete"
-    assert not any(call[0] == "submit" for call in client.calls)
-    assert any(error["operation"] == "resolve_thread" for error in state["publication_errors"])
-
-
-def test_resolution_is_not_attempted_when_owned_resolution_reply_is_unconfirmed(tmp_path):
-    class ReplyFailureClient(_FakeClient):
-        def reply_thread(self, comment_id, body):
-            self.calls.append(("reply", comment_id, body))
-            raise TimeoutError("unconfirmed")
-
-    client = ReplyFailureClient({
-        "pull_request_id": "PR-node",
-        "threads": [{
-            "fingerprint": "fp-unconfirmed-resolution",
-            "generation": 1,
-            "thread_id": "thread-fixed",
-            "comment_id": 44,
-            "url": _discussion_url(44),
-            "is_resolved": False,
-            "owned_comment_bodies": (),
-        }],
-        "general_comments": [],
-        "reviews": [],
-    })
-
-    result, state = _publish(tmp_path, client, notes=())
-
-    assert not any(call[0] == "resolve" for call in client.calls)
-    note = next(
-        item
-        for item in state["notes"]
-        if item["fingerprint"] == "fp-unconfirmed-resolution"
-    )
-    assert note["resolution"] == "publication_failed"
-    assert note["confirmed"] is False
-    assert result["review"]["status"] == "pending_incomplete"
-    assert not any(call[0] == "submit" for call in client.calls)
 
 
 def test_invalid_pending_review_object_stops_thread_and_submit_mutations(tmp_path):
@@ -2577,6 +2148,8 @@ def test_specialist_publish_cli_loads_only_typed_final_artifacts(tmp_path, monke
         "files.json": [{"filename": "a.py"}],
         "policy.json": {"verdict": "request_changes", "source": "supported-findings"},
         "artifacts.json": [{"label": "Artifact", "url": "https://example/artifact"}],
+        "review.json": {"repository": "owner/repo", "pr_number": 17, "head_sha": "abc123",
+                        "review_threads": {"snapshots": [], "assessments": [], "associations": []}},
     }
     for name, value in inputs.items():
         (tmp_path / name).write_text(json.dumps(value), encoding="utf-8")
@@ -2610,6 +2183,7 @@ def test_specialist_publish_cli_loads_only_typed_final_artifacts(tmp_path, monke
         "--diff-complete", "false",
         "--policy-result", str(tmp_path / "policy.json"),
         "--artifacts", str(tmp_path / "artifacts.json"),
+        "--review-artifact", str(tmp_path / "review.json"),
         "--repo", "owner/repo",
         "--pr-number", "17",
         "--head-sha", "abc123",
@@ -2632,6 +2206,7 @@ def test_specialist_publish_cli_loads_only_typed_final_artifacts(tmp_path, monke
     assert captured["publish"]["diff_complete"] is False
     assert "transcript" not in captured["publish"]
     assert "evidence_store" not in captured["publish"]
+    assert tuple(captured["publish"]["review_thread_snapshots"]) == ()
 
 
 def test_specialist_publish_cli_exits_nonzero_on_partial_publication(
@@ -2764,6 +2339,35 @@ def _connection(nodes=(), *, has_next=False, cursor=None):
 def test_bot_login_normalization(viewer, author, expected):
     from pr_reviewer.github_review_notes import _same_github_login
     assert _same_github_login(viewer, author) is expected
+
+
+@pytest.mark.parametrize("human_login,human_owned", [("human", False), ("bot", True)])
+def test_thread_snapshot_authenticates_roots_and_keeps_latest_comment_after_clipping(tmp_path, monkeypatch, human_login, human_owned):
+    client = GhReviewClient(action_root=tmp_path)
+    roots = [("human", "User", False, "Concern"), ("bot", "Bot", True, "<!-- ai-pr-review-note:owned -->"),
+             ("stranger", "User", False, "<!-- ai-pr-review-note:spoof -->"), ("other", "Bot", False, "Concern")]
+    def graphql(query, variables):
+        if "ManagedReviewIdentity" in query:
+            return {"data": {"viewer": {"login": "bot"}, "repository": {"nameWithOwner": "o/r",
+                    "pullRequest": {"id": "P", "headRefOid": "a"*40, "baseRepository": {"nameWithOwner": "o/r"}}}}}
+        if "ManagedReviewThreads" in query:
+            return {"data": {"node": {"reviewThreads": _connection([
+                {"id": str(i), "isResolved": False, "subjectType": "LINE", "path": "a.py", "originalLine": 4,
+                 "diffSide": "RIGHT"} for i in range(4)])}}}
+        if "ManagedReviews" in query:
+            return {"data": {"node": {"reviews": _connection([])}}}
+        login, typ, own, body = roots[int(variables["threadId"])]
+        comments = [{"databaseId": 10, "author": {"login": login, "__typename": typ}, "viewerDidAuthor": own,
+                     "body": body, "pullRequestReview": {"id": "R"}}]
+        if own:
+            comments.extend({"databaseId": 11+i, "author": {"login": human_login, "__typename": "User"},
+                             "body": "continued", "viewerDidAuthor": human_owned} for i in range(100))
+        return {"data": {"node": {"comments": _connection(comments)}}}
+    monkeypatch.setattr(client, "_graphql", graphql)
+    snapshots = client.query_review_threads("o/r", 17, "a"*40)
+    assert [(s["target"], s["origin"]) for s in snapshots] == [("H1", "human"), ("H2", "managed")]
+    assert snapshots[1]["last_comment_id"] == 110 and snapshots[1]["human_reply"]
+    assert not snapshots[1]["discussion_complete"] and snapshots[0]["discussion_complete"]
 
 
 @pytest.mark.parametrize('body', ['<!-- ai-pr-reviewer-specialist:old -->', ''])

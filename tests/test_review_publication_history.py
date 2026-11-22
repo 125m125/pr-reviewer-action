@@ -4,6 +4,7 @@ import pytest
 from test_github_review_notes import _FakeClient, _publish, _note, ReviewNoteKind
 from test_access_request_reconciliation import REPO_BODY
 from pr_reviewer.github_review_notes import GhReviewClient
+from pr_reviewer.github_review_notes import PublisherApprovalPolicy
 
 
 RUN = "https://github.com/owner/repo/actions/runs/123"
@@ -108,27 +109,39 @@ def test_separate_runs_get_distinct_review_identity(tmp_path):
     assert ("minimize", "old-review-id", "OUTDATED") in client.calls
 
 
-def test_switching_from_single_review_retires_old_owned_blocking_verdict(tmp_path):
+def test_switching_from_single_review_preserves_unassessed_blocking_verdict(tmp_path):
     client = _FakeClient({"reviews": [
         {"id": "old-single", "state": "CHANGES_REQUESTED", "body": "<!-- ai-pr-reviewer -->\nOld review"},
         {"id": "unmanaged", "state": "CHANGES_REQUESTED", "body": "My own unrelated review"},
     ]})
     result, _ = _publish(tmp_path, client)
     assert result["review_completed"]
-    assert ("dismiss", "old-single") in client.calls
+    assert ("dismiss", "old-single") not in client.calls
     assert ("minimize", "old-single", "OUTDATED") in client.calls
     assert not any(call[0] in {"dismiss", "minimize"} and call[1] == "unmanaged" for call in client.calls)
+
+
+def test_new_approval_cannot_supersede_uncleared_owned_request_changes(tmp_path):
+    client = _FakeClient({"reviews": [{"id": "old", "state": "CHANGES_REQUESTED",
+        "body": "<!-- ai-pr-reviewer-specialist:old -->"}]})
+    result, _ = _publish(tmp_path, client, mode="review_verdict", verdict="approve",
+        approval=PublisherApprovalPolicy(allow_approve=True, is_fork=False,
+            effective_scope="full", baseline_clean=True))
+    assert result["review_completed"]
+    assert next(call[2] for call in client.calls if call[0] == "submit") == "COMMENT"
+    assert not any(call[0] == "dismiss" for call in client.calls)
 
 
 def test_dismissal_failure_does_not_prevent_visual_retirement(tmp_path):
     class DismissalDenied(_FakeClient):
         def dismiss_review(self, review_id):
             raise RuntimeError("dismissal is restricted")
-    client = DismissalDenied({"reviews": [{"id": "old-review", "state": "CHANGES_REQUESTED", "body": "<!-- ai-pr-reviewer-specialist:old -->"}]})
+    client = DismissalDenied({"reviews": [{"id": "old-review", "state": "APPROVED", "body": "<!-- ai-pr-reviewer-specialist:old -->"}]})
     result, _ = _publish(tmp_path, client)
     assert result["review_completed"]
     assert ("minimize", "old-review", "OUTDATED") in client.calls
-    assert any(error["operation"] == "dismiss_previous_review" for error in result["publication_errors"])
+    assert not result["publication_errors"]
+    assert any(error["operation"] == "dismiss_previous_review" for error in result["publication_warnings"])
 
 
 def test_revoked_permission_creates_visible_request_without_overwriting_archive(tmp_path):
