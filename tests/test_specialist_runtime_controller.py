@@ -130,13 +130,42 @@ def test_historical_threads_are_optional_post_initial_leads(tmp_path):
     assert initial < queued
 
 
+def test_historical_thread_can_resume_component_owner_despite_independent_overlap(tmp_path):
+    from pr_reviewer.specialist_runtime.negotiation import (
+        NegotiationState, SessionResources, compact_negotiation_context,
+    )
+
+    inputs = replace(_inputs(tmp_path), review_threads=({"target": "H1", "path": "src/worker.py"},))
+    state = _RunState(inputs, EventJournal(), RunDeadline(0, 100, PhaseShares()), EvidenceStore())
+    owner = controller_module.Assignment(
+        "owner", "Worker", "Review worker", (), (), (), (), (), (), 2, "normal",
+        owner_component_id="worker", owned_changed_paths=("src/worker.py",),
+    )
+    independent = replace(owner, id="independent", owner_component_id="")
+    state.plan = controller_module.AssignmentPlan((independent, owner))
+    state.assignment_sessions = {"owner": "S1", "independent": "S2"}
+    _controller(tmp_path)._queue_review_threads(state)
+    target, = compact_negotiation_context(NegotiationState(
+        obligations=(), coverage=CoverageLedger(()).snapshot(), assignments=state.plan.assignments,
+        checkpoints=(), session_ownership=(controller_module.SessionOwnership("S1", "owner"),),
+        session_resources=(SessionResources("S1", 8, 100, 8, advertised_tools=("read_file",),
+                                            allowed_diff_paths=("src/worker.py",)),),
+        remaining_deadline_sec=100, seconds_per_turn=1, current_session_count=2, max_sessions=4,
+        followup_sessions_started=0, max_followup_sessions=1, new_session_turns_remaining=8,
+        new_session_turn_cap=8, new_session_lease_remaining_sec=100, new_session_tool_call_cap=8,
+        investigation_leads=tuple(state.investigation_leads.values()), changed_files=inputs.changed_files,
+    ))["targets"]
+    assert "resume" in target["allowed_actions"]
+
+
 @pytest.mark.parametrize("kind,update", [("duplicate", ""), ("update", "New reproduction information")])
 def test_critic_thread_association_preserves_authorized_finding(tmp_path, kind, update):
     inputs = _inputs(tmp_path)
+    root_comment = "Delivery bug. " + "Supporting explanation. " * 90 + "End of discussion."
     snapshot = {"target": "H1", "thread_id": "T1", "comment_id": 1, "last_comment_id": 1,
                 "path": "src/worker.py", "line": 7, "side": "RIGHT", "origin": "human",
                 "repository": inputs.repository, "pr_number": inputs.pr_number, "head_sha": inputs.head_sha,
-                "comments": [{"id": 1, "body": "Delivery bug"}], "discussion_complete": True}
+                "comments": [{"id": 1, "body": root_comment}], "discussion_complete": True}
     observed = {}
     def critic(request):
         observed.update(request.context)
@@ -145,6 +174,8 @@ def test_critic_thread_association_preserves_authorized_finding(tmp_path, kind, 
             for item in request.context["candidates"]]}
     result = _controller(tmp_path, critic=critic).run(replace(inputs, review_threads=(snapshot,)))
     assert observed["review_threads"][0]["target"] == "H1"
+    assert observed["review_threads"][0]["discussion_complete"]
+    assert observed["review_threads"][0]["comments"][0]["body"] == root_comment
     association = result.artifact["review_threads"]["associations"][0]
     assert association["kind"] == kind
     assert association["fingerprint"]
@@ -302,6 +333,8 @@ def test_handoff_focus_includes_only_blocked_investigation_leads(tmp_path):
         coverage=CoverageLedger(obligations),
         investigation_leads={
             blocked.lead_id: blocked, resolved.lead_id: resolved,
+            "review-thread:H1": replace(blocked, lead_id="review-thread:H1",
+                                       kind="review_thread", summary="Reassess unresolved discussion H1"),
         },
     )
 
@@ -312,6 +345,7 @@ def test_handoff_focus_includes_only_blocked_investigation_leads(tmp_path):
         for item in handoff.human_focus
     )
     assert all("worker drops retries" not in item for item in handoff.human_focus)
+    assert all("discussion H1" not in item for item in handoff.human_focus)
 
 
 def test_unreachable_model_endpoint_stops_before_specialist_sessions(tmp_path):
@@ -2479,7 +2513,8 @@ def test_controller_local_store_preserves_large_delegated_reference(tmp_path):
     assert "END_OF_REFERENCE" in json.dumps(received)
 
 
-def test_negotiator_stops_cleanly_when_no_model_turn_fits_deadline(tmp_path):
+@pytest.mark.parametrize("clock,exclude_target", [(89.5, False), (0.0, True)])
+def test_negotiator_stops_cleanly_without_an_executable_request(tmp_path, clock, exclude_target):
     called = False
 
     def negotiator(_request):
@@ -2516,10 +2551,12 @@ def test_negotiator_stops_cleanly_when_no_model_turn_fits_deadline(tmp_path):
         never_covered_obligation_ids=(target,),
     )
     controller = _controller(
-        tmp_path, negotiator=negotiator, clock=lambda: 89.5,
+        tmp_path, negotiator=negotiator, clock=lambda: clock,
     )
 
-    actions = controller._negotiate(state, reconciliation)
+    actions = controller._negotiate(
+        state, reconciliation, excluded_obligation_ids=(target,) if exclude_target else (),
+    )
 
     assert actions == ()
     assert called is False
@@ -2711,7 +2748,7 @@ def test_lead_followup_reports_actual_attempt_and_new_evidence(tmp_path):
     assert any(event.kind == "investigation_lead_followup_completed" for event in result.events)
 
 
-def test_gateway_negotiator_receives_compact_targets_and_re_evaluates_each_wave(tmp_path):
+def test_gateway_negotiator_receives_compact_targets_and_skips_empty_second_wave(tmp_path):
     requests = []
 
     class Gateway:
@@ -2763,10 +2800,9 @@ def test_gateway_negotiator_receives_compact_targets_and_re_evaluates_each_wave(
         artifact_output_root=tmp_path,
     ).run(inputs)
 
-    # The first follow-up adds implementation evidence but the obligation still
-    # lacks tests evidence.  It is therefore a real progress step and must get a
-    # second negotiation decision even though the unresolved ID is unchanged.
-    assert len(requests) == 2
+    # Progress triggers a second scheduling round, but it has no eligible target.
+    # An unresolved obligation alone is not a reason to call the model again.
+    assert len(requests) == 1
     assert all("obligation_id" not in target for target in requests[0]["negotiation_state"]["targets"])
     assert result.artifact["evidence"]
     assert [event.payload["round"] for event in result.events if event.kind == "negotiation_round"] == [1, 2]
@@ -3366,16 +3402,21 @@ def test_critic_size_batches_keep_candidate_context_and_isolate_failures(tmp_pat
 
 
 def test_critic_oversized_single_candidate_does_not_block_other_batches(tmp_path):
-    candidates = tuple(CandidateFinding(candidate_id=f"C{i}", root_cause_fingerprint="r", claim="claim")
+    candidates = tuple(CandidateFinding(candidate_id=f"C{i}", root_cause_fingerprint="r", claim="claim",
+                                       affected_location="src/worker.py:7")
                        for i in range(2))
     seen = []
     def critic(request):
         seen.extend(c.candidate_id for c in request.context["candidates"])
+        assert not request.context["review_threads"]
         return {"actions": [{"candidate_id": c.candidate_id, "action": "keep"}
                             for c in request.context["candidates"]]}
     critic.max_context_bytes = 2000
     context = {"candidates": candidates, "candidate_evidence": {"C0": "x" * 10000, "C1": "small"},
-               "candidate_assessments": {}, "obligations": {}}
+               "candidate_assessments": {}, "obligations": {}, "review_threads": ({
+                   "target": "H1", "path": "src/worker.py", "discussion_complete": True,
+                   "comments": [{"body": "Long historical discussion. " * 120}],
+               },)}
     state = _RunState(inputs=_inputs(tmp_path), journal=EventJournal(),
                       deadline=RunDeadline(0.0, 90.0, PhaseShares()), evidence=EvidenceStore())
     result, fallback_ids, _count = _controller(tmp_path, critic=critic)._run_critic_batches(state, context)
