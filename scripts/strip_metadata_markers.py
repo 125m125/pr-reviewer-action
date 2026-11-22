@@ -22,6 +22,7 @@ from pathlib import Path
 
 # Reserved internal metadata patterns — must stay in sync with action.yml.
 RESERVED_PATTERNS = [
+    re.compile(r'<!--\s*ai-pr-review-(?:thread-assessments|thread-resolutions|block-inventory)\s*:\s*[^>]*-->', re.IGNORECASE),
     re.compile(r'<!--\s*ai-pr-review-fingerprint\s*:\s*[^>]*-->', re.IGNORECASE),
     re.compile(r'<!--\s*ai-pr-review-sha\s*:\s*[^>]*-->', re.IGNORECASE),
 ]

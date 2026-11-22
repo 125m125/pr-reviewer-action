@@ -137,6 +137,27 @@ def test_remote_text_reports_byte_truncation(monkeypatch):
     assert result["range"]["next_offset"] == 17
 
 
+def test_remote_text_retains_complete_requested_page(monkeypatch):
+    raw = b"first\nsecond\nthird\n"
+    monkeypatch.setattr("pr_reviewer.platform.gh_api", lambda *a: {
+        "data": {"type": "file", "size": len(raw)},
+    })
+    monkeypatch.setattr("pr_reviewer.platform.gh_raw_file", lambda *a: {"content": raw})
+    result = _call(offset=2, limit=1)
+    record = EvidenceStore().add_tool_result(
+        session_id="S1", tool="read_remote_file",
+        arguments={"repository": "other/project", "path": "docs/contract.md",
+                   "ref": "a" * 40, "offset": 2, "limit": 1},
+        result={"status": "ok", "result": result},
+    )
+    assert record.content == "second\n"
+    assert record.truncated is False
+    assert record.source_range == {
+        "offset": 2, "lines": 1, "total_lines": 3,
+        "truncated": False, "has_more": True, "next_offset": 3,
+    }
+
+
 @pytest.mark.parametrize("length,body", ((None, b"x" * 100), ("999", b"x" * 100), ("5", b"hello")))
 def test_raw_transfer_enforces_limit_even_with_missing_length(monkeypatch, length, body):
     from pr_reviewer.platform import gh_raw_file

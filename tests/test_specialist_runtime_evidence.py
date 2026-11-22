@@ -9,6 +9,71 @@ from pr_reviewer.specialist_runtime.evidence import (
     EvidenceStore,
     canonical_evidence_key,
 )
+from pr_reviewer.line_windows import bound_line_payload
+from pr_reviewer.tool_executors import read_file
+
+
+def test_explicit_file_window_retains_complete_evidence_and_coordinates(tmp_path):
+    path = "source.py"
+    lines = [f"line {number}\n" for number in range(1, 460)]
+    (tmp_path / path).write_text("".join(lines), encoding="utf-8")
+    page = read_file(path, tmp_path, offset=100, limit=110)
+    record = EvidenceStore().add_tool_result(
+        session_id="S1", tool="read_file",
+        arguments={"path": path, "offset": 100, "limit": 110},
+        result={"status": "ok", "result": page},
+    )
+    assert record.content == "".join(lines[99:209])
+    assert record.truncated is False
+    assert record.source_range == {
+        "offset": 100, "lines": 110, "total_lines": 459,
+        "has_more": True, "next_offset": 210, "truncated": False,
+    }
+
+
+def test_serialized_clipping_is_not_reused_as_complete_evidence(tmp_path):
+    (tmp_path / "source.py").write_text("first\n" + "$" * 200 + "\n", encoding="utf-8")
+    clipped = bound_line_payload(read_file("source.py", tmp_path), 180)
+    complete = read_file("source.py", tmp_path, limit=1)
+    assert clipped["content"] == complete["content"] == "first\n"
+    assert clipped["range"]["truncated"] is True
+    store = EvidenceStore()
+    retained = [
+        store.add_tool_result(
+            session_id="S1", tool="read_file", arguments={"path": "source.py"},
+            result={"status": "ok", "result": payload},
+        )
+        for payload in (complete, clipped)
+    ]
+    assert [record.truncated for record in retained] == [False, True]
+    assert retained[0].id != retained[1].id
+
+
+def test_serialized_budget_does_not_keep_a_fragment_of_a_physical_line():
+    payload = {
+        "content": "first\nshort\u2028" + "x" * 200 + "\n",
+        "range": {"offset": 1, "lines": 2, "truncated": False},
+    }
+    result = bound_line_payload(payload, 140)
+    assert result["content"] == "first\n"
+    assert result["range"]["next_offset"] == 2
+    assert result["range"]["truncated"] is True
+
+
+@pytest.mark.parametrize("executor_redacted", [False, True])
+def test_redaction_that_collapses_source_lines_is_not_complete_evidence(tmp_path, executor_redacted):
+    source = "first\nBearer\nabcdefghijklmnopqrstuv\nlast\n"
+    payload = {"content": source, "range": {"offset": 1, "lines": 4}}
+    if executor_redacted:
+        (tmp_path / "source.py").write_text(source, encoding="utf-8")
+        payload = read_file("source.py", tmp_path)
+    record = EvidenceStore().add_tool_result(
+        session_id="S1", tool="read_file", arguments={"path": "source.py"},
+        result={"status": "ok", "result": payload},
+    )
+    assert "abcdefghijklmnopqrstuv" not in record.content
+    assert record.truncated is True
+    assert record.source_range is None
 
 
 def test_retention_truncation_does_not_advertise_original_file_coordinates():
@@ -110,7 +175,6 @@ def test_evidence_retains_redaction_and_truncation_state():
 
 @pytest.mark.parametrize("metadata", (
     {"range": {"truncated": True}},
-    {"range": {"has_more": True}},
     {"truncated": True},
 ))
 def test_diff_evidence_retains_executor_range_truncation(metadata):

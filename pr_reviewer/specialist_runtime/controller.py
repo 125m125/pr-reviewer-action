@@ -27,6 +27,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from pr_reviewer.conversation import Conversation
+from .review_threads import ReviewThreadLedger
 
 
 def _critic_anchor_excerpt(record, location: str, max_bytes: int = 1200) -> str | None:
@@ -756,7 +757,7 @@ def _critic_response_diagnostics(value: object) -> dict[str, object]:
                 action_count += 1
                 extra_fields.update(
                     str(key) for key in row
-                    if key not in {"candidate_id", "action", "target_id"}
+                    if key not in {"candidate_id", "action", "target_id", "review_thread"}
                 )
     return {
         "response_digest": _digest(value),
@@ -802,6 +803,7 @@ def _partial_critic_result(
             "candidate_id": candidate_id,
             "action": action,
             "target_id": target_id,
+            **({"review_thread": dict(row["review_thread"])} if isinstance(row.get("review_thread"), Mapping) else {}),
         })
     return tuple(rows), tuple(sorted(allowed - seen))
 
@@ -994,6 +996,7 @@ def _validated_critic_result(
             "candidate_id": candidate_id,
             "action": action,
             "target_id": target_id,
+            **({"review_thread": dict(row["review_thread"])} if isinstance(row.get("review_thread"), Mapping) else {}),
         })
     if seen != allowed_ids:
         raise ValueError("critic omitted candidate decisions")
@@ -1310,6 +1313,7 @@ class ReviewInputs:
     ] = ()
     verification_requests: tuple[Mapping[str, Any], ...] = ()
     test_results: tuple[Mapping[str, Any], ...] = ()
+    review_threads: tuple[Mapping[str, Any], ...] = ()
     pr_metadata: Mapping[str, Any] = field(default_factory=dict)
     configuration_warnings: tuple[str, ...] = ()
     adapter_configuration: Mapping[str, Any] = field(default_factory=dict)
@@ -1746,6 +1750,8 @@ class _RunState:
         SourceAccessRequest | RepositoryAccessRequest
     ] = field(default_factory=list)
     investigation_leads: dict[str, InvestigationLead] = field(default_factory=dict)
+    review_thread_assessments: dict[str, Mapping[str, object]] = field(default_factory=dict)
+    review_thread_associations: list[Mapping[str, object]] = field(default_factory=list)
     boundary_evaluations: dict[str, object] = field(default_factory=dict)
     boundary_model_turns: int = 0
     admission_lock: object = field(default_factory=RLock)
@@ -1854,6 +1860,11 @@ class _IsolatedSessionHandle:
         if not callable(callback):
             raise TypeError("resumed session must support apply_coverage_feedback")
         callback(tuple(gaps))
+
+    def apply_review_thread_feedback(self, threads, candidates, evidence) -> None:
+        self.evidence.merge_completed_snapshot(evidence)
+        self.baseline_evidence_ids |= frozenset(evidence.evidence_ids)
+        self.session.apply_review_thread_feedback(threads, candidates)
 
     def apply_investigation_lead_feedback(
         self, target: str, lead: InvestigationLead,
@@ -2544,10 +2555,18 @@ class ReviewController:
         )
 
     @staticmethod
+    def _unverified_historical_blocker(state: _RunState) -> bool:
+        return any(item.get("origin") == "managed" and item.get("review_state") == "CHANGES_REQUESTED"
+                   and state.review_thread_assessments.get(item["target"], {}).get("assessment") not in {"fixed", "disproven"}
+                   for item in state.inputs.review_threads)
+
+    @staticmethod
     def _review_status(state: _RunState) -> str:
         if state.degradations:
             return "degraded"
         if state.blocking_obligation_ids:
+            return "incomplete"
+        if ReviewController._unverified_historical_blocker(state):
             return "incomplete"
         return "complete"
 
@@ -3343,6 +3362,7 @@ class ReviewController:
                 handle.apply_investigation_lead_feedback(
                     f"L{index}", lead, prior_work, sources,
                 )
+                self._disclose_review_thread(state, handle, lead)
         budget_binder = getattr(
             session, "bind_global_budget_admission_handler", None,
         )
@@ -3511,6 +3531,26 @@ class ReviewController:
         self, state: _RunState, session_result: object,
     ) -> None:
         """Merge detached lead reports and explicit resolutions into run state."""
+        for raw in getattr(session_result, "review_thread_assessments", ()):
+            target = raw.get("target") if isinstance(raw, Mapping) else None
+            snapshot = next((item for item in state.inputs.review_threads if item.get("target") == target), None)
+            lead = state.investigation_leads.get("review-thread:" + str(target))
+            if snapshot is None or lead is None or lead.assigned_session_id != session_result.session_id:
+                continue
+            ledger = ReviewThreadLedger((snapshot,), head_sha=state.inputs.head_sha)
+            decision = {key: value for key, value in raw.items() if key != "snapshot"}
+            outcome = ledger.assess(decision, state.evidence)
+            if outcome["status"] == "accepted":
+                state.review_thread_assessments[target] = ledger.assessments[0]
+                state.investigation_leads[lead.lead_id] = replace(
+                    lead, status=(InvestigationLeadStatus.BLOCKED if raw["assessment"] == "unverified"
+                                  else InvestigationLeadStatus.RESOLVED_NO_ISSUE),
+                    resolution_reason=str(raw["reason"]),
+                )
+            state.journal.emit("review_thread_assessment", {
+                "target": target, "status": outcome["status"],
+                "assessment": raw.get("assessment"), "reason": outcome.get("reason", ""),
+            })
         for lead in tuple(getattr(session_result, "investigation_leads", ())):
             if not isinstance(lead, InvestigationLead):
                 continue
@@ -4140,6 +4180,61 @@ class ReviewController:
             self._degrade(state, "negotiator", _bounded_error(exc))
             return ()
 
+    def _queue_review_threads(self, state: _RunState) -> None:
+        """Optional leads only after independent exploration, never hard obligations."""
+        for snapshot in state.inputs.review_threads:
+            if snapshot.get("prior_assessment") in {"still_present", "fixed", "disproven"}:
+                state.journal.emit("review_thread_reassessment_reused", {"target": snapshot["target"]})
+                continue
+            target, path = snapshot["target"], snapshot["path"]
+            lead_id = "review-thread:" + target
+            if lead_id in state.investigation_leads or len(state.investigation_leads) >= 32:
+                continue
+            owners = [assignment for assignment in state.plan.assignments
+                      if path in assignment.owned_changed_paths]
+            owner = owners[0] if len(owners) == 1 else None
+            session_id = state.assignment_sessions.get(owner.id, "") if owner else ""
+            state.investigation_leads[lead_id] = InvestigationLead(
+                lead_id=lead_id, summary=f"Reassess unresolved review discussion {target} on {path}",
+                affected_paths=(path,), evidence_ids=(),
+                next_action=(f"Independently verify discussion {target} against current code; "
+                             "reuse current candidate evidence where relevant. Use assess_review_thread, "
+                             "not a new candidate merely repeating the historical claim."),
+                required_capability="read_file", origin_session_id=session_id,
+                kind="review_thread",
+            )
+            state.journal.emit("review_thread_queued", {"target": target, "path": path,
+                                                       "owner_session_id": session_id})
+
+    def _disclose_review_thread(self, state, session, lead):
+        if lead.kind != "review_thread":
+            return
+        target = lead.lead_id.removeprefix("review-thread:")
+        snapshot = next((item for item in state.inputs.review_threads if item.get("target") == target), None)
+        if snapshot is None:
+            return
+        candidates = []
+        evidence_ids = set()
+        active = {session_id: set(result.checkpoint.candidate_finding_ids)
+                  for (_, session_id), result in state.session_results.items() if result.checkpoint}
+        for candidate in (*state.candidate_occurrences.values(), *state.inputs.candidate_findings):
+            if candidate.affected_location.rsplit(":", 1)[0] != snapshot["path"] and candidate.affected_location != snapshot["path"]:
+                continue
+            if candidate.collector_session_id in active and candidate.candidate_id not in active[candidate.collector_session_id]:
+                continue
+            ids = tuple(candidate.supporting_evidence_ids[:8])
+            evidence_ids.update(ids)
+            candidates.append({"candidate_id": candidate.candidate_id, "claim": candidate.claim[:600],
+                               "affected_location": candidate.affected_location,
+                               "status": "provisional", "evidence_ids": ids})
+            if len(candidates) == 6:
+                break
+        evidence = EvidenceSnapshot(tuple(record for record in state.evidence.snapshot().records
+                                           if record.id in evidence_ids))
+        callback = getattr(session, "apply_review_thread_feedback", None)
+        if callable(callback):
+            callback((snapshot,), tuple(candidates), evidence)
+
     def _followup_prior_work(
         self, state: _RunState, assignment: Assignment, lead: InvestigationLead,
     ) -> tuple[dict[str, object], EvidenceSnapshot]:
@@ -4311,6 +4406,7 @@ class ReviewController:
                         RunPhase.FOLLOWUP, lead_target, lead, prior_work, sources,
                     ) if lead is not None else (False, None)
                     if succeeded and lead is not None:
+                        self._disclose_review_thread(state, session, lead)
                         state.investigation_leads[lead_id] = replace(
                             lead,
                             status=InvestigationLeadStatus.SCHEDULED,
@@ -4646,6 +4742,8 @@ class ReviewController:
         obligation_ids = {oid for item in candidates for oid in item.related_obligation_ids}
         return {
             **context,
+            "review_threads": tuple(item for item in context.get("review_threads", ())
+                                    if any(candidate.affected_location.split(":", 1)[0] == item["path"] for candidate in candidates))[:8],
             "candidates": tuple(candidates),
             "candidate_evidence": {key: value for key, value in context["candidate_evidence"].items()
                                    if key in ids},
@@ -4660,6 +4758,21 @@ class ReviewController:
         return len(json.dumps(_json_value(context), ensure_ascii=False,
                               separators=(",", ":")).encode("utf-8"))
 
+    def _disclosed_thread_rows(self, state, rows, context):
+        disclosed = {item["target"] for item in context.get("review_threads", ())}
+        admitted = []
+        for row in rows:
+            row = dict(row)
+            association = row.get("review_thread")
+            if isinstance(association, Mapping) and (not isinstance(association.get("target"), str)
+                                                    or association["target"] not in disclosed):
+                row.pop("review_thread")
+                state.journal.emit("review_thread_association_rejected", {
+                    "candidate_id": row["candidate_id"], "reason": "thread was not disclosed in this critic request",
+                })
+            admitted.append(row)
+        return tuple(admitted)
+
     def _critic_batch_result(self, state, context, request_id):
         candidates = context["candidates"]
         try:
@@ -4672,11 +4785,12 @@ class ReviewController:
                 state.journal.emit("critic_response_normalized", diagnostics)
             try:
                 result = _validated_critic_result(result, candidates)
-                return tuple(result["actions"]), set()
+                return self._disclosed_thread_rows(state, result["actions"], context), set()
             except ValueError as exc:
                 if "omitted candidate decisions" not in str(exc):
                     raise
             partial_rows, missing_ids = _partial_critic_result(result, candidates)
+            partial_rows = self._disclosed_thread_rows(state, partial_rows, context)
             missing_candidates = tuple(c for c in candidates if c.candidate_id in missing_ids)
             state.journal.emit("critic_repair_requested", {
                 "request_id": request_id, "missing_candidate_ids": missing_ids,
@@ -4703,7 +4817,7 @@ class ReviewController:
                 state.journal.emit("critic_repair_completed", {
                     "request_id": request_id, "repaired_candidate_ids": missing_ids,
                 })
-                return tuple(validated["actions"]), set()
+                return self._disclosed_thread_rows(state, validated["actions"], context), set()
             except Exception as exc:
                 self._degrade(state, "critic", request_id + ": " + _bounded_error(exc))
                 fallback = self._conservative_critic(missing_candidates)
@@ -4888,6 +5002,16 @@ class ReviewController:
                     "candidates": candidates,
                     "candidate_evidence": candidate_evidence,
                     "candidate_assessments": candidate_assessments,
+                    "review_threads": tuple({
+                        "target": item["target"], "path": item["path"], "line": item.get("line"),
+                        "origin": item["origin"], "discussion_complete": (item.get("discussion_complete", False)
+                            and len(item.get("comments", ())) <= 4
+                            and all(len(str(comment.get("body", ""))) <= 1200 for comment in item.get("comments", ()))),
+                        "comments": [{"author": comment.get("author"), "body": str(comment.get("body", ""))[:1200]}
+                                     for comment in item.get("comments", ())[:4]],
+                        "assessment": state.review_thread_assessments.get(item["target"], {}).get("assessment", "unverified"),
+                    } for item in state.inputs.review_threads
+                        if any(candidate.affected_location.split(":", 1)[0] == item["path"] for candidate in candidates)),
                     # The critic evaluates candidates, not repository coverage.
                     # Expanded scope/seed paths describe exploration routing,
                     # not the invariant or evidence contract being adjudicated.
@@ -4991,6 +5115,7 @@ class ReviewController:
                     repaired_rows, _ignored_missing = _partial_critic_result(
                         repaired, candidates,
                     )
+                    repaired_rows = self._disclosed_thread_rows(state, repaired_rows, {})
                     repaired_by_id = {
                         item["candidate_id"]: item
                         for item in repaired_rows
@@ -5052,6 +5177,30 @@ class ReviewController:
             )
         if critic_batch_count > 1:
             self._deduplicate_critic_batches(state)
+        snapshots = {item["target"]: item for item in state.inputs.review_threads}
+        for row in _critic_rows(critic_result):
+            association = row.get("review_thread")
+            if (not isinstance(association, Mapping) or not isinstance(association.get("kind"), str)
+                    or association["kind"] not in {"duplicate", "update"}):
+                continue
+            snapshot = snapshots.get(str(association.get("target", "")))
+            finding = next((item for item in state.review.accepted
+                            if row.get("candidate_id") in {item.candidate_id, *item.contributor_candidate_ids}), None)
+            update = association.get("update", "")
+            if (snapshot is None or finding is None or finding.affected_file != snapshot["path"]
+                    or not snapshot.get("discussion_complete")
+                    or len(snapshot.get("comments", ())) > 4
+                    or any(len(str(comment.get("body", ""))) > 1200 for comment in snapshot.get("comments", ()))
+                    or not isinstance(update, str) or len(update) > 3000
+                    or (association["kind"] == "update" and not update.strip())):
+                state.journal.emit("review_thread_association_rejected", {"candidate_id": row.get("candidate_id"),
+                    "reason": "Association needs an authorized same-path finding, complete discussion and substantive update text."})
+                continue
+            state.review_thread_associations.append({
+                "candidate_id": finding.candidate_id, "fingerprint": finding.root_cause_fingerprint,
+                "target": snapshot["target"], "kind": association["kind"],
+                "update": mask_runtime_text(update, limit=3000), "snapshot": snapshot,
+            })
         for disposition in state.review.dispositions:
             state.journal.emit("candidate_disposition", _json_value(disposition))
     @staticmethod
@@ -5324,11 +5473,12 @@ class ReviewController:
         )
         return ReviewHandoffContext(
             recommendation=(
+                "human_review_required" if self._unverified_historical_blocker(state) else (
                 "no_blocking_findings"
                 if state.verdict_source == "approval-disabled"
                 and not state.blocking_finding_ids
                 and not state.blocking_obligation_ids
-                else state.verdict
+                else state.verdict)
             ),
             status=status,
             change_topics=change_topics,
@@ -5343,7 +5493,7 @@ class ReviewController:
             ),
             review_emphasis_topics=review_emphasis_topics,
             material_coverage_limited=bool(
-                state.degradations or state.blocking_obligation_ids
+                state.degradations or state.blocking_obligation_ids or self._unverified_historical_blocker(state)
             ),
             candidate_retention_limited=self._candidate_retention_limited(state),
             degraded_stages=tuple(
@@ -5867,6 +6017,9 @@ class ReviewController:
         )
         state.verdict = policy_result.verdict
         state.verdict_source = policy_result.source
+        if self._unverified_historical_blocker(state) and state.verdict != "request_changes":
+            state.verdict = "notice"
+            state.verdict_source = "unverified-historical-review"
         state.blocking_finding_ids = policy_result.blocking_finding_ids
         state.blocking_obligation_ids = policy_result.blocking_obligation_ids
         state.journal.emit("verdict_selected", {
@@ -6510,6 +6663,21 @@ class ReviewController:
             "evaluation_status": self._review_status(state),
             "boundary_evaluations": [_json_value(state.boundary_evaluations[key]) for key in sorted(state.boundary_evaluations)],
             "boundary_model_turns": state.boundary_model_turns,
+            "review_threads": {
+                "snapshots": _json_value(state.inputs.review_threads),
+                "assessments": _json_value(tuple(state.review_thread_assessments.values())),
+                "associations": _json_value(state.review_thread_associations),
+                "statistics": {
+                    "available": len(state.inputs.review_threads),
+                    "queued": sum(lead.kind == "review_thread" for lead in state.investigation_leads.values()),
+                    "assessed": len(state.review_thread_assessments),
+                    "reused": sum(bool(row.get("prior_assessment")) for row in state.inputs.review_threads),
+                    "unverified": len(state.inputs.review_threads) - sum(
+                        row["assessment"] != "unverified" for row in state.review_thread_assessments.values())
+                        - sum(bool(row.get("prior_assessment")) for row in state.inputs.review_threads),
+                    "new_updates": sum(bool(row.get("update")) for row in state.review_thread_assessments.values()),
+                },
+            },
             "investigation_leads": [
                 _json_value(state.investigation_leads[key])
                 for key in sorted(state.investigation_leads)
@@ -7133,6 +7301,7 @@ class ReviewController:
 
             self._complete_phase(state)
             self._transition(state, "followup")
+            self._queue_review_threads(state)
             reconciliation = self._refresh_boundary_coverage(state, reconciliation)
             followup_lease = state.deadline.lease_for(RunPhase.FOLLOWUP)
             for session_id in sorted(state.sessions):

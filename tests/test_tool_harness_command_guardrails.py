@@ -4,6 +4,8 @@ import subprocess
 import threading
 from pathlib import Path
 
+import pytest
+
 from pr_reviewer import tool_executors
 from scripts import run_tool_harness
 
@@ -406,8 +408,9 @@ def test_read_pr_diff_bounds_capture_before_large_single_line_is_materialized(
     assert result["result"]["range"]["truncated"] is True
 
 
+@pytest.mark.parametrize("embedded_separator", ["-", "\u2028"])
 def test_read_pr_diff_streams_to_later_offset_beyond_response_byte_cap(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, embedded_separator,
 ):
     base_sha = "1" * 40
     head_sha = "2" * 40
@@ -415,7 +418,7 @@ def test_read_pr_diff_streams_to_later_offset_beyond_response_byte_cap(
     (tmp_path / "src").mkdir()
     (tmp_path / path).write_text("head\n", encoding="utf-8")
     early_lines = [f"+early-{index:04d}-{'x' * 80}\n" for index in range(180)]
-    late_lines = ["@@ -900,2 +900,2 @@\n", "-late-old\n", "+late-new\n", "+after\n"]
+    late_lines = ["@@ -900,2 +900,2 @@\n", "-late-old\n", f"+late{embedded_separator}new\n", "+after\n"]
     patch_bytes = "".join((*early_lines, *late_lines)).encode("utf-8")
     assert len(patch_bytes) > 12000
 
@@ -454,7 +457,8 @@ def test_read_pr_diff_streams_to_later_offset_beyond_response_byte_cap(
         "next_offset": 184,
         "returned_lines": 3,
         "has_more": True,
-        "truncated": True,
+        "truncated": embedded_separator == "\u2028",
+        **({"coordinates_unavailable": True} if embedded_separator == "\u2028" else {}),
     }
     assert process.killed is True
 

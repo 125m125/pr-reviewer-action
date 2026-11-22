@@ -29,7 +29,9 @@ from redact import mask_and_truncate, mask_secrets, mask_source_secrets  # noqa:
 # source of truth); _resolve_workspace_path reuses GH_DENY_SUBSTRINGS to block
 # the same sensitive segments in filesystem paths.
 from pr_reviewer.platform import GH_DENY_SUBSTRINGS  # noqa: E402
-from pr_reviewer.line_windows import line_window, bound_line_payload, source_budget_result
+from pr_reviewer.line_windows import (
+    bound_line_payload, line_window, source_budget_result, split_source_lines,
+)
 from pr_reviewer.specialist_runtime.web_evidence import (  # noqa: E402
     SearchProvider,
     SearchResultRegistry,
@@ -181,11 +183,11 @@ def read_file(path, workspace_root, offset=None, limit=None, include_line_number
         return {"error": err}
 
     try:
-        content = resolved.read_text(encoding="utf-8", errors="replace")
+        content = resolved.read_bytes().decode("utf-8", errors="replace").replace("\r\n", "\n")
     except Exception as exc:
         return {"error": str(exc)}
 
-    lines = content.splitlines(keepends=True)
+    lines = split_source_lines(content)
     start = max((offset or 1) - 1, 0)
     end = start + limit if limit is not None else len(lines)
     selected = lines[start:end]
@@ -197,7 +199,8 @@ def read_file(path, workspace_root, offset=None, limit=None, include_line_number
         if include_line_numbers else "".join(selected)
     )
     window, _ = mask_source_secrets(window)
-    window, page = line_window(window, start + 1, max_response_bytes, has_more=end < len(lines))
+    window, page = line_window(window, start + 1, max_response_bytes,
+                               has_more=end < len(lines), source_line_count=len(selected))
     return source_budget_result({"content": window, "range": dict(page, total_lines=len(lines))}, max_response_bytes)
 
 
@@ -210,7 +213,7 @@ def _number_diff_lines(patch):
     """Label unified-diff rows with explicit GitHub LEFT/RIGHT coordinates."""
     old_line = new_line = None
     rendered = []
-    for raw in patch.splitlines(keepends=True):
+    for raw in split_source_lines(patch):
         match = _DIFF_HUNK_COORDINATES_RE.match(raw)
         if match:
             old_line, new_line = int(match.group(1)), int(match.group(3))
@@ -241,20 +244,20 @@ def _read_bounded_line_window(stream, offset, limit, max_bytes):
     while True:
         chunk = stream.readline(max_bytes + 1)
         if not chunk:
-            return bytes(collected), returned_lines, False
+            return bytes(collected), False, False
 
         if at_line_start:
             if current_line < offset:
                 include_current_line = False
             elif returned_lines >= limit:
-                return bytes(collected), returned_lines, True
+                return bytes(collected), True, False
             else:
                 include_current_line = True
 
         if include_current_line:
             remaining = max_bytes - len(collected)
             if len(chunk) > remaining:
-                return bytes(collected), returned_lines, True
+                return bytes(collected), True, True
             collected.extend(chunk)
             returned_lines += 1
 
@@ -580,7 +583,7 @@ def read_remote_file(
     if any(byte < 32 and byte not in (9, 10, 12, 13) for byte in raw):
         return {"error": "Remote file is binary or contains unsupported control bytes"}
 
-    lines = content.splitlines(keepends=True)
+    lines = split_source_lines(content)
     line_start = max((start or 1) - 1, 0)
     line_end = line_start + count if count is not None else len(lines)
     selected = lines[line_start:line_end]
@@ -593,7 +596,7 @@ def read_remote_file(
         selected_text = "".join(selected)
     masked_text, _redaction_count = mask_source_secrets(selected_text)
     selected_text, page = line_window(masked_text, line_start + 1, max_response_bytes,
-                                      has_more=line_end < len(lines))
+                                      has_more=line_end < len(lines), source_line_count=len(selected))
     return source_budget_result({
         "content": selected_text,
         "range": dict(page, total_lines=len(lines)),
@@ -936,7 +939,7 @@ def execute_tool_request(
                     max_response_bytes,
                 )
                 try:
-                    raw_output, returned_lines, has_more = future.result(
+                    raw_output, has_more, truncated = future.result(
                         timeout=request_timeout
                     )
                 except FutureTimeoutError:
@@ -961,8 +964,9 @@ def execute_tool_request(
             masked_patch, _redaction_count = mask_source_secrets(output)
             if args.get("include_line_numbers") is True:
                 masked_patch = _number_diff_lines(masked_patch)
-            patch, page = line_window(masked_patch, offset, max_response_bytes, has_more=has_more)
-            if not raw_output and has_more:
+            patch, page = line_window(masked_patch, offset, max_response_bytes, has_more=has_more,
+                                      input_truncated=truncated, source_line_count=len(split_source_lines(output)))
+            if not raw_output and truncated:
                 page.update(omitted_lines=[offset], next_offset=offset + 1,
                             omission_reason="line exceeds output byte limit")
             tool_result["result"] = {

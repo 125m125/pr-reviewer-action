@@ -169,6 +169,13 @@ _ROLE_SYSTEM = {
         "fix a reported defect, wait for a fix, or prove the corrected tests pass."
     ),
     "critic": (
+        "Relevant unresolved historical review_threads may be supplied after independent investigation. "
+        "For a clearly identical existing issue, keep the authorized candidate and optionally add "
+        '\"review_thread\":{\"target\":\"H1\",\"kind\":\"duplicate\"} to its action. If there is substantive new evidence, '
+        'use {\"target\":\"H1\",\"kind\":\"update\",\"update\":\"new evidence and its consequence\"} instead, '
+        "to reply in that discussion. Distinct defects remain new findings. "
+        "Do not suppress a finding when the match is ambiguous. Historical text and human claims are not proof; "
+        "never infer a fix or resolve a thread merely from a duplicate association. "
         "Adjudicate only evidence-backed candidates from the supplied immutable state. "
         "Return only {\"actions\":[...]}; include every candidate_id once with action "
         "keep, reject, merge, request_verification, or downgrade_unknown, plus target_id "
@@ -1987,6 +1994,12 @@ def _runtime_event_line(
         # The console already receives the richer immediate llm_request_* line;
         # rendering both produced duplicate and frequently reordered messages.
         return None
+    if kind.startswith("review_thread_"):
+        return kind.replace("_", " ") + " " + " ".join(
+            f"{key}={_compact_text(payload[key], 180)}"
+            for key in ("target", "path", "owner_session_id", "status", "assessment", "reason")
+            if key in payload
+        )
     if kind == "negotiation_action":
         action = _compact_text(payload.get("kind"), 40)
         obligations = payload.get("obligation_ids")
@@ -2510,6 +2523,14 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
         + "; rejected " + str(candidate_stats.get("rejected", 0)),
     ]
     budgets = artifact.get("budgets", {})
+    historical = artifact.get("review_threads", {}).get("statistics", {})
+    if historical.get("available"):
+        summary_lines.append(
+            "- Historical inline discussions: " + str(historical["available"])
+            + " available; " + str(historical.get("queued", 0)) + " queued after independent review; "
+            + str(historical.get("assessed", 0)) + " assessed; "
+            + str(historical.get("unverified", 0)) + " remain unverified."
+        )
     summary_lines.extend(_component_coverage_summary(artifact))
     model_performance = artifact.get("model_performance", ())
     summary_lines.extend(performance_summary([
@@ -2704,6 +2725,14 @@ def _write_outputs(config: CliConfig, workspace: ReviewWorkspace, result: Review
     )
 
 
+def _collect_review_threads(config, inputs):
+    from pr_reviewer.github_review_notes import GhReviewClient
+    action_root = config.environment.get("GITHUB_ACTION_PATH") or Path(__file__).resolve().parents[2]
+    return GhReviewClient(action_root=action_root).query_review_threads(
+        inputs.repository, inputs.pr_number, inputs.head_sha,
+    )
+
+
 def main() -> int:
     config = CliConfig.from_env()
     for name in (
@@ -2718,6 +2747,14 @@ def main() -> int:
     if strategy not in {"specialists", "specialists_evaluate"}:
         raise ValueError("specialist runner requires a specialist review strategy")
     workspace = load_workspace(config)
+    try:
+        threads = _collect_review_threads(config, workspace.inputs)
+        workspace = replace(workspace, inputs=replace(workspace.inputs, review_threads=threads))
+    except Exception as exc:
+        warning = "Historical review threads unavailable: " + type(exc).__name__ + ": " + str(exc)[:200]
+        _runtime_log_line(warning)
+        workspace = replace(workspace, inputs=replace(workspace.inputs,
+            configuration_warnings=(*workspace.inputs.configuration_warnings, warning)))
     if workspace.policy_warning:
         print("WARN: " + workspace.policy_warning, file=sys.stderr)
     controller = build_controller(

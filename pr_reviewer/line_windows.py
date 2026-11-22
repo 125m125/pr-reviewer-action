@@ -4,6 +4,12 @@ import hashlib
 import json
 
 
+def split_source_lines(text):
+    """Split on LF only, matching the streamed patch reader and Git line numbers."""
+    *terminated, tail = text.split("\n")
+    return [line + "\n" for line in terminated] + ([tail] if tail else [])
+
+
 def source_budget_result(payload, max_bytes, *, web=False, remote=False):
     """Report a budget failure only when existing source content was omitted entirely."""
     if payload.get('content', '').strip():
@@ -26,8 +32,9 @@ def source_budget_result(payload, max_bytes, *, web=False, remote=False):
     return result
 
 
-def line_window(text, offset, max_bytes, *, has_more=False):
-    lines = text.splitlines(keepends=True)
+def line_window(text, offset, max_bytes, *, has_more=False, input_truncated=False,
+                source_line_count=None):
+    lines = split_source_lines(text)
     kept = []
     used = 0
     for line in lines:
@@ -37,11 +44,19 @@ def line_window(text, offset, max_bytes, *, has_more=False):
         kept.append(line)
         used += size
     omitted = [offset] if lines and not kept else []
-    more = has_more or len(kept) < len(lines)
+    clipped = len(kept) < len(lines)
+    structure_changed = source_line_count is not None and source_line_count != len(lines)
+    # Coordinate consumers using splitlines() cannot safely anchor these excerpts.
+    coordinates_lost = structure_changed or len(text.splitlines()) != len(lines)
+    more = has_more or clipped or input_truncated
+    next_offset = offset + len(kept) + len(omitted) if more else None
+    if more and structure_changed:
+        next_offset = None if clipped else offset + source_line_count
     return "".join(kept), {
         "offset": offset, "lines": len(kept),
-        "has_more": more, "truncated": more,
-        "next_offset": offset + len(kept) + len(omitted) if more else None,
+        "has_more": more, "truncated": clipped or input_truncated or coordinates_lost,
+        "next_offset": next_offset,
+        **({"coordinates_unavailable": True} if coordinates_lost else {}),
         **({"omitted_lines": omitted, "omission_reason": "line exceeds output byte limit"} if omitted else {}),
     }
 
@@ -106,14 +121,15 @@ def bound_line_payload(payload, max_bytes):
     original_range = payload["range"]
     size = lambda: len(json.dumps(result, ensure_ascii=False).encode("utf-8"))
     while size() > max_bytes and result[key]:
-        lines = result[key].splitlines(keepends=True)
+        lines = split_source_lines(result[key])
         result[key] = "".join(lines[:-1])
         count = len(lines) - 1
+        coordinates_lost = original_range.get("coordinates_unavailable")
         result["range"] = dict(original_range, lines=count, truncated=True, has_more=True,
-                               next_offset=original_range["offset"] + count)
+                               next_offset=None if coordinates_lost else original_range["offset"] + count)
         if "returned_lines" in original_range:
             result["range"]["returned_lines"] = count
-        if not count:
+        if not count and not coordinates_lost:
             result["range"].update(omitted_lines=[original_range["offset"]],
                                    omission_reason="line exceeds serialized output byte limit",
                                    next_offset=original_range["offset"] + 1)

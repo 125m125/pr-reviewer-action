@@ -34,15 +34,24 @@ def _runtime_input_obligations():
     )
 
 
-def test_boundary_accepts_unchanged_inspected_runtime_sources_without_changed_coverage():
+def test_boundary_accepts_unchanged_inspected_runtime_sources_without_changed_coverage(tmp_path):
     from pr_reviewer.specialist_runtime.coverage import _assessment_evidence_satisfies
     from pr_reviewer.specialist_runtime.obligation_assessment import ObligationAssessmentLedger
+    from pr_reviewer.tool_executors import read_file
 
     boundary, obligations = _runtime_input_obligations()
     store = EvidenceStore()
     contract = _record(store, path="action.yml", content="specialist_allow_approve: false")
     config = _record(store, path="scripts/sections/config.sh", content="export SPECIALIST_ALLOW_APPROVE")
-    parser = _record(store, path="pr_reviewer/specialist_runtime/policy.py", content="_boolean(env, 'SPECIALIST_ALLOW_APPROVE', False)")
+    path = "pr_reviewer/specialist_runtime/policy.py"
+    (tmp_path / path).parent.mkdir(parents=True)
+    (tmp_path / path).write_text("_boolean(env, 'SPECIALIST_ALLOW_APPROVE', False)\n# tail\n", encoding="utf-8")
+    parser = store.add_tool_result(
+        session_id="session-1", tool="read_file",
+        arguments={"path": path, "offset": 1, "limit": 1},
+        result={"status": "ok", "result": read_file(path, tmp_path, limit=1)},
+        provenance=EvidenceProvenance(head_sha=HEAD_SHA),
+    )
     assessments = []
     for obligation in obligations:
         endpoint = parser if obligation.participant_id == "specialist-runtime" else config

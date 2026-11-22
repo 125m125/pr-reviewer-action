@@ -23,6 +23,10 @@ from pr_reviewer.enforcement import RuntimeVerdictPolicyResult
 from pr_reviewer.platform import gh_argv
 from pr_reviewer.specialist_runtime.policy import ReviewPolicy
 from pr_reviewer.specialist_runtime.types import ReviewHandoff, ReviewNote, ReviewNoteKind
+from pr_reviewer.specialist_runtime.review_threads import (
+    assessment_receipt, receipt_assessment, resolution_receipt, receipt_resolutions,
+    resolution_is_current, _discussion_digest,
+)
 from scripts.redact import mask_secrets
 from scripts.sanitize_review_markdown import sanitize_markdown
 from scripts.strip_metadata_markers import strip_reserved_markers
@@ -57,7 +61,7 @@ _PUBLISHER_RESOLUTION_RE = re.compile(
 )
 _OWN_MARKER_RE = re.compile(
     r"<!--\s*ai-pr-review(?:er)?-"
-    r"(?:note|general(?:-answer)?|resolution|status|specialist(?:-handoff)?|run)"
+    r"(?:note|general(?:-answer)?|resolution|status|specialist(?:-handoff)?|run|thread-assessments|thread-resolutions|block-inventory)"
     r"(?::[^>]*)?\s*-->",
     re.IGNORECASE,
 )
@@ -119,6 +123,7 @@ class ReviewPublishClient(Protocol):
         known_comment_id: int | None = None,
     ) -> Mapping[str, Any]: ...
     def query_pr_identity(self, repo: str, pr_number: int) -> Mapping[str, Any]: ...
+    def query_review_threads(self, repo: str, pr_number: int, head_sha: str) -> Sequence[Mapping[str, Any]]: ...
     def query_managed_state(self, repo: str, pr_number: int) -> Mapping[str, Any]: ...
     def reply_thread(self, comment_id: object, body: str) -> Mapping[str, Any]: ...
     def resolve_thread(self, thread_id: str) -> Mapping[str, Any]: ...
@@ -754,6 +759,11 @@ def _publication_marker(publication_id: str, event: str) -> str:
     return f"<!-- ai-pr-reviewer-specialist:{publication_id}:event={event} -->"
 
 
+def _concern_inventory(children: Iterable[tuple[str, str]]) -> str:
+    encoded = json.dumps(sorted(children), separators=(",", ":"), ensure_ascii=True)
+    return "<!-- ai-pr-review-block-inventory:" + hashlib.sha256(encoded.encode()).hexdigest() + " -->"
+
+
 _STATE_VERSION = 2
 
 
@@ -880,6 +890,9 @@ class GitHubReviewPublisher:
         access_policy: Mapping[str, Any] | ReviewPolicy | None = None,
         allowed_github_repositories: Iterable[str] = (),
         run_url: str = "",
+        review_thread_snapshots: Sequence[Mapping[str, Any]] = (),
+        review_thread_assessments: Sequence[Mapping[str, Any]] = (),
+        review_thread_associations: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
         if mode not in {"comment", "review_comment", "review_verdict"}:
             raise ValueError("unsupported publish mode")
@@ -912,6 +925,17 @@ class GitHubReviewPublisher:
         if not isinstance(diff_text, str):
             raise TypeError("diff_text must be a string")
         notes_snapshot = tuple(notes)
+        snapshots = {}
+        for item in review_thread_snapshots:
+            if (not isinstance(item, Mapping) or not re.fullmatch(r"H[1-9]\d*", str(item.get("target", "")))
+                    or item["target"] in snapshots or item.get("repository") != repo or item.get("head_sha") != head_sha
+                    or type(item.get("pr_number")) is not int or item["pr_number"] != pr_number):
+                raise ValueError("review-thread snapshot identity mismatch")
+            snapshots[item["target"]] = item
+        for record in (*review_thread_assessments, *review_thread_associations):
+            if (not isinstance(record, Mapping) or record.get("target") not in snapshots
+                    or record.get("snapshot") != snapshots[record["target"]]):
+                raise ValueError("review-thread decision does not match its snapshot")
         if not all(isinstance(note, ReviewNote) for note in notes_snapshot):
             raise TypeError("notes must contain only ReviewNote values")
         files_snapshot = tuple(changed_files)
@@ -926,6 +950,15 @@ class GitHubReviewPublisher:
             desired_event, event_reason = "COMMENT", "non-verdict specialist review"
         else:
             desired_event, event_reason = _native_event(policy_result, approval_policy)
+        if desired_event == "APPROVE":
+            try:
+                prior_reviews = self.client.query_managed_state(repo, pr_number)
+                blocked = any(item.get("state") == "CHANGES_REQUESTED"
+                              for item in prior_reviews.get("reviews", ()))
+            except Exception:
+                blocked = True
+            if blocked:
+                desired_event, event_reason = "COMMENT", "prior changes-requested review requires explicit clearance before approval"
         publication_id = _publication_id(
             repo=repo,
             pr_number=pr_number,
@@ -1192,69 +1225,34 @@ class GitHubReviewPublisher:
         current = {item.fingerprint: item for item in normalized}
         new_thread_notes: list[NormalizedReviewNote] = []
         resolution_sources: dict[tuple[str, int], str] = {}
-        legacy_answered_general = {
-            str(item) for item in managed.get("general_answered_fingerprints", ())
-        }
-        answered_general_identities = {
-            str(item) for item in managed.get("general_answered_identities", ())
-        }
-        detail_failures: dict[str, list[str]] = {}
         all_details_confirmed = True
+        failed_associations = set()
+        current_targets = set()
+        current_fingerprints = set(current)
+        for record in review_thread_associations:
+            fingerprint = record.get("fingerprint")
+            if fingerprint not in current or record.get("kind") not in {"duplicate", "update"}:
+                continue
+            current_targets.add(record["target"])
+            if self._historical_decision(state, record, repo, pr_number, head_sha, association=True):
+                del current[fingerprint]
+                state["notes"].append({"fingerprint": fingerprint, "id": record["snapshot"]["thread_id"],
+                                       "resolution": record["kind"], "confirmed": True, "publication_errors": []})
+            else:
+                failed_associations.add(fingerprint)
+        for record in review_thread_assessments:
+            if (record.get("assessment") in {"fixed", "disproven"}
+                    and (record["target"] in current_targets or record["snapshot"].get("fingerprint") in current_fingerprints)):
+                state.setdefault("publication_warnings", []).append({"operation": "historical_thread",
+                    "target": record["target"], "error": "current finding conflicts with historical resolution"})
+                continue
+            self._historical_decision(state, record, repo, pr_number, head_sha, association=False)
 
-        def reconcile_thread_reply(
-            fingerprint: str, generation: int, marker: str, prior: Mapping[str, Any]
-        ) -> Mapping[str, Any] | None:
-            refreshed = self._call(
-                "reconcile_reply_thread",
-                self.client.query_managed_state,
-                repo,
-                pr_number,
-                retry_safe=True,
-            )
-            if not isinstance(refreshed, Mapping):
-                return None
-            for item in refreshed.get("threads", ()):
-                if not isinstance(item, Mapping):
-                    continue
-                if (
-                    item.get("fingerprint") != fingerprint
-                    or int(item.get("generation", 1)) != generation
-                ):
-                    continue
-                for comment in item.get("owned_comments", ()):
-                    if (
-                        isinstance(comment, Mapping)
-                        and marker in str(comment.get("body") or "")
-                        and _valid_comment_result(comment)
-                    ):
-                        return comment
-                if any(
-                    marker in body
-                    for body in item.get("owned_comment_bodies", ())
-                    if isinstance(body, str)
-                ):
-                    comment_id = prior.get("comment_id")
-                    url = prior.get("url")
-                    if (
-                        isinstance(comment_id, int)
-                        and not isinstance(comment_id, bool)
-                        and comment_id > 0
-                        and isinstance(url, str)
-                        and _valid_github_result_url(url)
-                    ):
-                        return {"id": comment_id, "url": url}
-            return None
-
-        # Same fingerprints are updated in place; resolved human threads stay resolved.
+        # A stale critic association must not silently swallow a current finding.
         for fingerprint, note in current.items():
-            prior = prior_threads.get(fingerprint)
+            prior = None if fingerprint in failed_associations else prior_threads.get(fingerprint)
             if prior is not None:
                 generation = int(prior.get("generation", 1))
-                owned_bodies = tuple(
-                    item for item in prior.get("owned_comment_bodies", ())
-                    if isinstance(item, str)
-                )
-                content_digest = _note_reply_digest(note)
                 if prior.get("is_resolved"):
                     if prior.get("resolved_by_publisher"):
                         recurrent = _note_generation(note, generation + 1)
@@ -1315,117 +1313,13 @@ class GitHubReviewPublisher:
                         new_thread_notes.append(recurrent)
                         resolution_sources[(fingerprint, generation + 1)] = "publisher_recurrence"
                         continue
-                    status_marker = (
-                        f"<!-- ai-pr-review-status:{fingerprint}:g{generation}:"
-                        f"{head_sha}:content={content_digest}:human-resolved -->"
-                    )
-                    reply = None
-                    status_confirmed = any(
-                        status_marker in body for body in owned_bodies
-                    )
-                    if not status_confirmed:
-                        reply = self._call(
-                            "reply_thread",
-                            self.client.reply_thread,
-                            prior.get("comment_id"),
-                            "**Re-review status:** Current evidence still references this "
-                            "human-resolved thread; it remains resolved and was not reopened.\n\n"
-                            + status_marker,
-                        )
-                        reconciled_reply = False
-                        if not _valid_comment_result(reply):
-                            reply = reconcile_thread_reply(
-                                fingerprint, generation, status_marker, prior
-                            )
-                            reconciled_reply = _valid_comment_result(reply)
-                        if _valid_comment_result(reply):
-                            status_confirmed = True
-                            self._checkpoint(
-                                state,
-                                "reconcile_reply_human_resolved_thread"
-                                if reconciled_reply
-                                else "reply_human_resolved_thread",
-                                reply,
-                            )
-                    if not status_confirmed:
-                        all_details_confirmed = False
-                        self._errors.append({
-                            "operation": "reply_human_resolved_thread",
-                            "error": "human-resolved status reply was not confirmed",
-                        })
-                    state["notes"].append({
-                        "fingerprint": fingerprint,
-                        "generation": generation,
-                        "id": prior.get("thread_id"),
-                        "url": prior.get("url"),
-                        "reply_id": (reply or {}).get("id"),
-                        "anchor_type": prior.get("anchor_type") or (
-                            note.anchor.subject_type if note.anchor else None
-                        ),
-                        "resolution": (
-                            "human_resolved_not_reopened"
-                            if status_confirmed
-                            else "publication_failed"
-                        ),
-                        "resolution_source": "human",
-                        "human_resolved": True,
-                        "confirmed": status_confirmed,
-                        "publication_errors": (
-                            [] if status_confirmed else ["reply_human_resolved_thread"]
-                        ),
-                    })
-                    continue
-                status_marker = (
-                    f"<!-- ai-pr-review-status:{fingerprint}:g{generation}:{head_sha}:"
-                    f"content={content_digest}:open -->"
-                )
-                reply = None
-                status_confirmed = any(status_marker in body for body in owned_bodies)
-                if not status_confirmed:
-                    reply = self._call(
-                        "reply_thread",
-                        self.client.reply_thread,
-                        prior.get("comment_id"),
-                        "**Re-review status:** This note remains open with current evidence.\n\n"
-                        + note.markdown + "\n\n" + status_marker,
-                    )
-                    reconciled_reply = False
-                    if not _valid_comment_result(reply):
-                        reply = reconcile_thread_reply(
-                            fingerprint, generation, status_marker, prior
-                        )
-                        reconciled_reply = _valid_comment_result(reply)
-                    if _valid_comment_result(reply):
-                        status_confirmed = True
-                        self._checkpoint(
-                            state,
-                            "reconcile_reply_open_thread"
-                            if reconciled_reply
-                            else "reply_open_thread",
-                            reply,
-                        )
-                if not status_confirmed:
-                    all_details_confirmed = False
-                    self._errors.append({
-                        "operation": "reply_open_thread",
-                        "error": "open-thread status reply was not confirmed",
-                    })
                 state["notes"].append({
-                    "fingerprint": fingerprint,
-                    "generation": generation,
-                    "id": prior.get("thread_id"),
-                    "url": prior.get("url"),
-                    "reply_id": (reply or {}).get("id"),
-                    "anchor_type": prior.get("anchor_type") or (
-                        note.anchor.subject_type if note.anchor else None
-                    ),
-                    "resolution": "open" if status_confirmed else "publication_failed",
-                    "resolution_source": "existing_thread",
-                    "human_resolved": False,
-                    "confirmed": status_confirmed,
-                    "publication_errors": (
-                        [] if status_confirmed else ["reply_open_thread"]
-                    ),
+                    "fingerprint": fingerprint, "generation": generation, "id": prior.get("thread_id"),
+                    "url": prior.get("url"), "confirmed": True, "publication_errors": [],
+                    "anchor_type": prior.get("anchor_type") or (note.anchor.subject_type if note.anchor else None),
+                    "resolution": "human_resolved_not_reopened" if prior.get("is_resolved") else "open",
+                    "resolution_source": "human" if prior.get("is_resolved") else "existing_thread",
+                    "human_resolved": bool(prior.get("is_resolved")),
                 })
                 continue
             if note.anchor is None:
@@ -1491,238 +1385,6 @@ class GitHubReviewPublisher:
                 new_thread_notes.append(note)
                 resolution_sources[(fingerprint, note.generation)] = "new"
 
-        # Missing prior fingerprints were fixed/answered by the current policy result.
-        for fingerprint, prior in prior_threads.items():
-            if fingerprint in current or prior.get("is_resolved"):
-                continue
-            generation = int(prior.get("generation", 1))
-            resolution_marker = (
-                f"<!-- ai-pr-review-resolution:{fingerprint}:g{generation}:"
-                f"{head_sha}:publisher -->"
-            )
-            resolution_body = (
-                "**Re-review status:** Fixed or answered in the current review; resolving.\n\n"
-                + resolution_marker
-            )
-            owned_bodies = tuple(
-                item for item in prior.get("owned_comment_bodies", ())
-                if isinstance(item, str)
-            )
-            reply = None
-            resolution_reply_confirmed = any(
-                resolution_marker in body for body in owned_bodies
-            )
-            if not resolution_reply_confirmed:
-                reply = self._call(
-                    "reply_thread", self.client.reply_thread, prior.get("comment_id"), resolution_body
-                )
-                reconciled_reply = False
-                if not _valid_comment_result(reply):
-                    reply = reconcile_thread_reply(
-                        fingerprint, generation, resolution_marker, prior
-                    )
-                    reconciled_reply = _valid_comment_result(reply)
-                if _valid_comment_result(reply):
-                    resolution_reply_confirmed = True
-                    self._checkpoint(
-                        state,
-                        "reconcile_reply_resolved_thread"
-                        if reconciled_reply
-                        else "reply_resolved_thread",
-                        reply,
-                    )
-            if not resolution_reply_confirmed:
-                all_details_confirmed = False
-                self._errors.append({
-                    "operation": "reply_resolved_thread",
-                    "error": "owned resolution reply marker was not confirmed",
-                })
-                state["notes"].append({
-                    "fingerprint": fingerprint,
-                    "generation": generation,
-                    "id": prior.get("thread_id"),
-                    "url": prior.get("url"),
-                    "reply_id": None,
-                    "anchor_type": prior.get("anchor_type"),
-                    "resolution": "publication_failed",
-                    "human_resolved": False,
-                    "resolved_by_publisher": False,
-                    "resolution_source": "publisher_failed",
-                    "confirmed": False,
-                    "publication_errors": ["reply_resolved_thread"],
-                })
-                continue
-            resolved = self._call(
-                "resolve_thread", self.client.resolve_thread, str(prior.get("thread_id") or "")
-            )
-            reconciled_resolution = False
-            if not (
-                isinstance(resolved, Mapping)
-                and resolved.get("id") == prior.get("thread_id")
-                and resolved.get("is_resolved") is True
-            ):
-                refreshed = self._call(
-                    "reconcile_resolve_thread",
-                    self.client.query_managed_state,
-                    repo,
-                    pr_number,
-                    retry_safe=True,
-                )
-                if isinstance(refreshed, Mapping):
-                    match = next((
-                        item
-                        for item in refreshed.get("threads", ())
-                        if isinstance(item, Mapping)
-                        and item.get("fingerprint") == fingerprint
-                        and int(item.get("generation", 1)) == generation
-                        and item.get("thread_id") == prior.get("thread_id")
-                        and item.get("is_resolved") is True
-                        and item.get("resolved_by_publisher") is True
-                        and any(
-                            resolution_marker in body
-                            for body in item.get("owned_comment_bodies", ())
-                            if isinstance(body, str)
-                        )
-                    ), None)
-                    if match is not None:
-                        resolved = {
-                            "id": prior.get("thread_id"),
-                            "is_resolved": True,
-                        }
-                        reconciled_resolution = True
-            if not (
-                isinstance(resolved, Mapping)
-                and resolved.get("id") == prior.get("thread_id")
-                and resolved.get("is_resolved") is True
-            ):
-                self._errors.append({
-                    "operation": "resolve_thread",
-                    "error": "resolve mutation did not confirm the managed thread as resolved",
-                })
-                resolved = None
-                all_details_confirmed = False
-            else:
-                self._checkpoint(
-                    state,
-                    "reconcile_resolve_thread" if reconciled_resolution else "resolve_thread",
-                    resolved,
-                )
-            state["notes"].append({
-                "fingerprint": fingerprint,
-                "generation": generation,
-                "id": prior.get("thread_id"),
-                "url": prior.get("url"),
-                "reply_id": (reply or {}).get("id"),
-                "anchor_type": prior.get("anchor_type"),
-                "resolution": "resolved" if resolved is not None else "publication_failed",
-                "human_resolved": False,
-                "resolved_by_publisher": resolved is not None,
-                "resolution_source": "publisher" if resolved is not None else "publisher_failed",
-                "confirmed": resolved is not None,
-                "publication_errors": [] if resolved is not None else ["resolve_thread"],
-            })
-
-        for fingerprint, prior in prior_general.items():
-            # Absence from a later review is not proof that access was granted.
-            # Reconcile these against effective authorization after publication.
-            if fingerprint.startswith("source_access_request:"):
-                continue
-            current_note = current.get(fingerprint)
-            if current_note is not None and current_note.anchor is None:
-                continue
-            reply = None
-            prior_generation = prior.get("generation", 1)
-            if not isinstance(prior_generation, int) or isinstance(
-                prior_generation, bool
-            ) or prior_generation < 1:
-                prior_generation = 1
-            prior_publication = prior.get("publication_id")
-            has_bound_publication = isinstance(prior_publication, str) and bool(
-                re.fullmatch(r"[0-9a-f]{32}", prior_publication)
-            )
-            if not has_bound_publication:
-                prior_publication = publication_id
-            prior_content_digest = prior.get("content_digest")
-            has_bound_content = isinstance(prior_content_digest, str) and bool(
-                re.fullmatch(r"[0-9a-f]{16}", prior_content_digest)
-            )
-            if not has_bound_content:
-                prior_content_digest = hashlib.sha256(
-                    str(prior.get("body") or "").encode("utf-8")
-                ).hexdigest()[:16]
-            answer_identity = _general_identity(
-                fingerprint,
-                prior_publication,
-                prior_generation,
-                prior_content_digest,
-            )
-            answer_confirmed = answer_identity in answered_general_identities
-            if not answer_confirmed and (
-                not has_bound_publication or not has_bound_content
-            ):
-                answer_confirmed = fingerprint in legacy_answered_general
-            if not answer_confirmed:
-                answer_marker = (
-                    f"<!-- ai-pr-review-general-answer:{fingerprint} "
-                    f"generation={prior_generation} publication={prior_publication} "
-                    f"content={prior_content_digest} -->"
-                )
-                reply = self._call(
-                    "reply_general_comment",
-                    self.client.reply_general_comment,
-                    repo,
-                    pr_number,
-                    prior,
-                    "**Re-review status:** This request is fixed or answered. "
-                    "The original general PR comment is non-resolvable and remains as history.\n\n"
-                    + answer_marker,
-                )
-                if _valid_comment_result(reply):
-                    answer_confirmed = True
-                    self._checkpoint(state, "reply_general_comment", reply)
-                else:
-                    all_details_confirmed = False
-                    detail_failures.setdefault(fingerprint, []).append(
-                        "reply_general_comment"
-                    )
-                    self._errors.append({
-                        "operation": "reply_general_comment",
-                        "error": "general answer follow-up was not confirmed",
-                    })
-            if current_note is not None:
-                if not answer_confirmed:
-                    existing = next((
-                        item
-                        for item in reversed(state["notes"])
-                        if item.get("fingerprint") == fingerprint
-                    ), None)
-                    if existing is not None:
-                        existing["resolution"] = "publication_failed"
-                        existing["confirmed"] = False
-                        existing["publication_errors"] = sorted(set(
-                            list(existing.get("publication_errors", ()))
-                            + ["reply_general_comment"]
-                        ))
-                continue
-            state["notes"].append({
-                "fingerprint": fingerprint,
-                "id": prior.get("id"),
-                "url": prior.get("url"),
-                "reply_id": (reply or {}).get("id"),
-                "anchor_type": "GENERAL",
-                "resolution": (
-                    "answered_non_resolvable"
-                    if answer_confirmed
-                    else "publication_failed"
-                ),
-                "answered": answer_confirmed,
-                "confirmed": answer_confirmed,
-                "human_resolved": False,
-                "non_resolvable": True,
-                "publication_errors": (
-                    [] if answer_confirmed else ["reply_general_comment"]
-                ),
-            })
 
         pull_request_id = str(managed.get("pull_request_id") or "")
         review_marker = _publication_marker(publication_id, desired_event)
@@ -1730,6 +1392,12 @@ class GitHubReviewPublisher:
             review_marker + "\n" + _handoff_body(handoff, artifact_links)
             + f"\n\nReviewed head: `{head_sha}` · Scope: {approval_policy.effective_scope}."
         )
+        receipt = assessment_receipt(review_thread_assessments)
+        if receipt:
+            review_body += "\n\n" + receipt
+        resolution_record = resolution_receipt(state.get("confirmed_historical_resolutions", ()))
+        if resolution_record:
+            review_body += "\n\n" + resolution_record
         safe_run_url = _canonical_artifact_url(run_url)
         if safe_run_url:
             review_body += f" [Review run](<{safe_run_url}>)"
@@ -1895,10 +1563,8 @@ class GitHubReviewPublisher:
                             }
                             if not _valid_thread_result(created):
                                 created = None
-                note_errors = list(detail_failures.get(note.fingerprint, ()))
-                if created is None:
-                    note_errors.append("add_review_thread")
-                detail_confirmed = created is not None and not note_errors
+                note_errors = ["add_review_thread"] if created is None else []
+                detail_confirmed = created is not None
                 state["notes"].append({
                     "fingerprint": note.fingerprint,
                     "generation": note.generation,
@@ -1960,6 +1626,8 @@ class GitHubReviewPublisher:
             if (
                 not isinstance(pre_submit_state, Mapping)
                 or pre_submit_state.get("head_ref_oid") != head_sha
+                or (desired_event == "APPROVE" and any(item.get("state") == "CHANGES_REQUESTED"
+                    for item in pre_submit_state.get("reviews", ())))
             ):
                 self._errors.append({
                     "operation": "pre_submit_head_ref_oid",
@@ -1982,6 +1650,14 @@ class GitHubReviewPublisher:
                 self._write_state(state)
                 return state
             event, reason = desired_event, event_reason
+            # Only attest to a complete inventory when every note became a new,
+            # confirmed line thread in this very review (not a general or association).
+            if (event == "REQUEST_CHANGES" and notes_snapshot and len(notes_snapshot) == len(state["notes"])
+                    and all(item.kind == ReviewNoteKind.FINDING for item in notes_snapshot)
+                    and all(item.get("confirmed") and item.get("anchor_type") == "LINE"
+                            and item.get("resolution_source") == "new" for item in state["notes"])):
+                inventory = _concern_inventory((n["id"], n["fingerprint"]) for n in state["notes"])
+                review_body = review_body.replace(review_marker, review_marker + "\n" + inventory, 1)
             submitted = self._call(
                 "submit_review",
                 self.client.submit_review,
@@ -2052,6 +1728,63 @@ class GitHubReviewPublisher:
         self._write_state(state)
         return state
 
+    def _historical_decision(self, state, record, repo, pr_number, head_sha, *, association):
+        snapshot = record["snapshot"]
+        identity_keys = ("repository", "pr_number", "head_sha", "thread_id", "comment_id", "origin",
+                         "fingerprint", "review_id", "path", "line", "side", "author", "author_type")
+        def fresh():
+            return next((s for s in self.client.query_review_threads(repo, pr_number, head_sha)
+                         if all(s.get(k) == snapshot.get(k) for k in identity_keys)
+                         and s.get("is_resolved") is False and s.get("discussion_complete") is True), {})
+        try:
+            live = fresh()
+            # A retry may see exactly the update that the previous attempt posted.
+            if (live and association and record.get("kind") == "update"
+                    and snapshot.get("discussion_complete") is True
+                    and list(live["comments"][:-1]) == list(snapshot["comments"])
+                    and live["comments"][-1].get("viewer_owned") is True
+                    and live["comments"][-1]["id"] == live.get("last_comment_id")
+                    and live["comments"][-1]["body"] == _clean_markdown(record.get("update"))):
+                return True
+            if (not live or snapshot.get("discussion_complete") is not True
+                    or live.get("last_comment_id") != snapshot.get("last_comment_id")
+                    or list(live["comments"]) != list(snapshot["comments"])):
+                raise ValueError("thread changed, resolved, or discussion incomplete")
+            if association and record["kind"] == "duplicate":
+                return True
+            resolve = (not association and record.get("assessment") in {"fixed", "disproven"}
+                       and live.get("origin") == "managed" and live.get("human_reply") is False
+                       and bool(record.get("evidence_ids")))
+            text = _clean_markdown(record.get("update") or (record.get("reason") if resolve else ""))
+            if not text:
+                return False
+            if any(_clean_markdown(c["body"]) == text for c in live["comments"]):
+                return not resolve
+            if resolve:
+                text += f"\n\n<!-- ai-pr-review-resolution:{live['fingerprint']}:publisher -->"
+            reply = self.client.reply_thread(live["comment_id"], text)
+            if not _valid_comment_result(reply):
+                raise ValueError("thread reply was not confirmed")
+            self._checkpoint(state, "historical_thread_reply", reply)
+            if resolve:
+                after = fresh()
+                if (after.get("last_comment_id") != reply["id"] or after.get("human_reply") is not False
+                        or list(after["comments"][:-1]) != list(live["comments"]) or after["comments"][-1]["body"] != text):
+                    raise ValueError("thread changed after explanatory reply; left unresolved")
+                result = self.client.resolve_thread(live["thread_id"])
+                if not isinstance(result, Mapping) or result.get("id") != live["thread_id"] or result.get("is_resolved") is not True:
+                    raise ValueError("resolution was not confirmed")
+                self._checkpoint(state, "resolve_historical_thread", result)
+                state.setdefault("confirmed_historical_resolutions", []).append({
+                    "thread_id": live["thread_id"], "last_comment_id": after["last_comment_id"],
+                    "discussion_digest": _discussion_digest(after),
+                })
+            return True
+        except Exception as exc:
+            state.setdefault("publication_warnings", []).append({"operation": "historical_thread",
+                "target": record["target"], "error": mask_secrets(str(exc))[:500]})
+            return False
+
     def _after_publication(
         self, state: dict[str, Any], managed: Mapping[str, Any], repo: str,
         pr_number: int, head_sha: str, access_policy: Mapping[str, Any] | ReviewPolicy | None,
@@ -2092,6 +1825,7 @@ class GitHubReviewPublisher:
         if not cleanup:
             diagnostics['skip_reason'] = 'cleanup disabled or review scope is not full'
             return
+        cleanup_errors_start = len(self._errors)
         for review in managed.get("reviews", ()):
             if review.get('id') == state['review']['id']:
                 diagnostics['skipped_current_review'] += 1
@@ -2105,7 +1839,11 @@ class GitHubReviewPublisher:
                 diagnostics['skipped_unmanaged'] += 1
                 continue
             diagnostics['eligible_reviews'] += 1
-            if review.get("state") in {"APPROVED", "CHANGES_REQUESTED"}:
+            # The replacement verdict alone never retires an old block.
+            if review.get("state") == "APPROVED" or (
+                review.get("state") == "CHANGES_REQUESTED"
+                and self._block_explicitly_cleared(state, review, repo, pr_number, head_sha)
+            ):
                 dismissed = self._call("dismiss_previous_review", self.client.dismiss_review, review["id"])
                 if not isinstance(dismissed, Mapping) or dismissed.get("state") != "DISMISSED" or dismissed.get("id") != review["id"]:
                     self._errors.append({"operation": "dismiss_previous_review", "error": "review dismissal was not confirmed"})
@@ -2118,6 +1856,30 @@ class GitHubReviewPublisher:
             if not prior.get("is_minimized"):
                 success = self._minimize(state, prior.get("node_id"), "OUTDATED")
                 diagnostics['minimized_handoff_comments' if success else 'failed_minimizations'] += 1
+        if self._errors[cleanup_errors_start:]:
+            state.setdefault("publication_warnings", []).extend(self._errors[cleanup_errors_start:])
+            del self._errors[cleanup_errors_start:]
+
+    def _block_explicitly_cleared(self, state, review, repo, pr_number, head_sha):
+        confirmations = state.get("confirmed_historical_resolutions", ())
+        lines = review["body"].splitlines()
+        if len(lines) < 2:
+            return False
+        marker = re.fullmatch(r"<!-- ai-pr-reviewer-specialist:([0-9a-f]{32}):event=REQUEST_CHANGES -->", lines[0])
+        if not marker or not lines[1].startswith("<!-- ai-pr-review-block-inventory:"):
+            return False
+        live = self._call("refresh_blocking_review", self.client.query_managed_state, repo, pr_number, retry_safe=True)
+        if (not live or live.get("head_ref_oid") != head_sha or live.get("repository_full_name") != repo
+                or not any(r.get("id") == review["id"] and r.get("body") == review["body"]
+                           and r.get("state") == "CHANGES_REQUESTED" for r in live.get("reviews", ()))
+                or any(c.get("publication_id") in {None, marker[1]} for c in live.get("general_comments", ()))):
+            return False
+        children = [t for t in live.get("threads", ()) if t.get("review_id") == review["id"]]
+        fixed = {t["thread_id"] for t in children if t.get("confirmed_resolution") is True
+                 or any(resolution_is_current(record, t) for record in confirmations)}
+        return (bool(children) and all(t.get("thread_id") in fixed and t.get("is_resolved") is True
+                                       and t.get("publication_id") == marker[1] for t in children)
+                and lines[1] == _concern_inventory((t["thread_id"], t["fingerprint"]) for t in children))
 
     def _minimize(self, state: dict[str, Any], node_id: object, classifier: str) -> bool:
         if not isinstance(node_id, str) or not node_id:
@@ -2149,7 +1911,7 @@ _MANAGED_THREADS_QUERY = """
 query ManagedReviewThreads($pullRequestId: ID!, $cursor: String) {
   node(id: $pullRequestId) { ... on PullRequest {
     reviewThreads(first: 100, after: $cursor) {
-      nodes { id isResolved }
+      nodes { id isResolved subjectType path originalLine line diffSide }
       pageInfo { hasNextPage endCursor }
     }
   } }
@@ -2161,7 +1923,7 @@ query ManagedThreadComments($threadId: ID!, $cursor: String) {
   node(id: $threadId) { ... on PullRequestReviewThread {
     comments(first: 100, after: $cursor) {
       nodes {
-        databaseId url body viewerDidAuthor author { login }
+        databaseId url body viewerDidAuthor author { login __typename }
         pullRequestReview { id body state commit { oid } }
       }
       pageInfo { hasNextPage endCursor }
@@ -2611,6 +2373,87 @@ class GhReviewClient:
             raise RuntimeError("live pull request repository identity is invalid")
         return result
 
+    def query_review_threads(self, repo: str, pr_number: int, head_sha: str) -> tuple[dict, ...]:
+        owner, name = self._split_repo(repo)
+        def identity():
+            data = self._graphql(_MANAGED_IDENTITY_QUERY, {"owner": owner, "name": name, "number": pr_number})["data"]
+            repository = data["repository"]
+            pr = repository["pullRequest"]
+            if (repository["nameWithOwner"] != repo or pr["baseRepository"]["nameWithOwner"] != repo
+                    or pr["headRefOid"] != head_sha or not pr["id"] or not data["viewer"]["login"]):
+                raise RuntimeError("review-thread snapshot identity changed")
+            return pr["id"], data["viewer"]["login"]
+        pr_id, viewer = identity()
+        snapshots = []
+        for thread in self._paged_nodes(_MANAGED_THREADS_QUERY, {"pullRequestId": pr_id},
+                                        connection_name="reviewThreads", label="review threads"):
+            if thread["isResolved"] is not False or thread.get("subjectType") != "LINE":
+                continue
+            line = thread.get("originalLine") or thread.get("line")
+            if type(line) is not int or line < 1 or not _safe_repo_path(thread.get("path")) or thread.get("diffSide") not in {"LEFT", "RIGHT"}:
+                continue
+            comments = self._paged_nodes(_MANAGED_THREAD_COMMENTS_QUERY, {"threadId": thread["id"]},
+                                         connection_name="comments", label="review thread comments")
+            if not comments:
+                raise RuntimeError("review thread has no root")
+            root = comments[0]
+            author = root.get("author") or {}
+            marker = _NOTE_GENERATION_MARKER_RE.search(root["body"]) or _NOTE_MARKER_RE.search(root["body"])
+            owned = root.get("viewerDidAuthor") is True and _same_github_login(author.get("login"), viewer)
+            if marker and owned:
+                origin = "managed"
+            elif not marker and author.get("__typename") == "User" and author.get("login"):
+                origin = "human"
+            else:
+                continue
+            retained = []
+            remaining = 16384
+            complete = True
+            human_reply = False
+            for index, item in enumerate(comments):
+                if type(item.get("databaseId")) is not int or item["databaseId"] <= 0 or not isinstance(item.get("body"), str):
+                    raise RuntimeError("review thread comment is invalid")
+                actor = item.get("author") or {}
+                resolution = _PUBLISHER_RESOLUTION_RE.search(item["body"])
+                publisher_explanation = (resolution and marker and resolution.group(1) == marker.group(1)
+                    and item.get("viewerDidAuthor") is True and _same_github_login(actor.get("login"), viewer))
+                if index and actor.get("__typename") != "Bot" and not publisher_explanation:
+                    human_reply = True
+                encoded = mask_secrets(item["body"]).encode("utf-8")
+                if len(retained) >= 32 or not remaining:
+                    complete = False
+                    continue
+                body = encoded[:remaining].decode("utf-8", "ignore")
+                complete &= len(encoded) <= remaining
+                remaining -= min(remaining, len(encoded))
+                retained.append({"id": item["databaseId"], "author": actor.get("login") or "", "body": body,
+                                 "viewer_owned": item.get("viewerDidAuthor") is True and _same_github_login(actor.get("login"), viewer)})
+            review = root.get("pullRequestReview") or {}
+            snapshots.append(dict(target=f"H{len(snapshots)+1}", thread_id=thread["id"], comment_id=root["databaseId"],
+                                  last_comment_id=comments[-1]["databaseId"], path=thread["path"], line=line, side=thread["diffSide"],
+                                  review_id=review.get("id"), review_state=review.get("state"),
+                                  original_head_sha=(review.get("commit") or {}).get("oid"),
+                                  author=author["login"], author_type=author.get("__typename"), origin=origin,
+                                  fingerprint=marker.group(1) if marker else None, repository=repo, pr_number=pr_number,
+                                  head_sha=head_sha, discussion_complete=complete, human_reply=human_reply,
+                                  comments=retained, is_resolved=False))
+        if snapshots:
+            reviews = self._paged_nodes(_MANAGED_REVIEWS_QUERY, {"pullRequestId": pr_id},
+                                        connection_name="reviews", label="review assessment receipts")
+            for review in reviews:
+                if (review.get("viewerDidAuthor") is not True
+                        or not _same_github_login((review.get("author") or {}).get("login"), viewer)
+                        or review.get("state") in {"PENDING", "DISMISSED"}
+                        or not str(review.get("body", "")).startswith("<!-- ai-pr-reviewer-specialist:")):
+                    continue
+                for snapshot in snapshots:
+                    prior = receipt_assessment(str(review["body"]), snapshot)
+                    if prior:
+                        snapshot["prior_assessment"] = prior
+        if identity() != (pr_id, viewer):
+            raise RuntimeError("review-thread snapshot identity changed")
+        return tuple(snapshots)
+
     def query_managed_state(self, repo: str, pr_number: int) -> Mapping[str, Any]:
         owner, name = self._split_repo(repo)
         self._repo_context = (repo, pr_number)
@@ -2717,6 +2560,13 @@ class GhReviewClient:
             bodies = [item["body"] for item in owned_comments]
             threads.append({
                 "fingerprint": fingerprint,
+                "last_comment_id": comments[-1]["databaseId"],
+                "discussion_digest": _discussion_digest({"comments": [{
+                    "id": item["databaseId"], "author": (item.get("author") or {}).get("login") or "",
+                    "body": mask_secrets(item["body"]),
+                    "viewer_owned": item.get("viewerDidAuthor") is True
+                        and _same_github_login((item.get("author") or {}).get("login"), viewer_login),
+                } for item in comments]}),
                 "generation": generation,
                 "publication_id": publication_id,
                 "review_id": (
@@ -2843,6 +2693,13 @@ class GhReviewClient:
             owned_reviews.append(dict(node))
             ownership_diagnostics['owned'] += 1
 
+        confirmed = [record for review in owned_reviews
+                     if review.get("state") not in {"PENDING", "DISMISSED"}
+                     and str(review.get("body", "")).startswith("<!-- ai-pr-reviewer-specialist:")
+                     for record in receipt_resolutions(review["body"])]
+        for thread in threads:
+            thread["confirmed_resolution"] = thread.get("is_resolved") is True and any(
+                resolution_is_current(record, thread) for record in confirmed)
         changed_files = tuple(self.list_changed_files(repo, pr_number))
         if len(changed_files) != changed_files_count:
             raise RuntimeError(

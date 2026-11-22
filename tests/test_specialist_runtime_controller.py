@@ -114,6 +114,83 @@ def test_controller_public_api_is_importable():
     assert ReviewResult
 
 
+def test_historical_threads_are_optional_post_initial_leads(tmp_path):
+    snapshot = {"target": "H1", "thread_id": "T1", "comment_id": 1, "last_comment_id": 1,
+                "path": "a.py", "line": 1, "side": "RIGHT", "origin": "human",
+                "repository": "o/r", "pr_number": 1, "head_sha": "a" * 40,
+                "comments": [{"id": 1, "body": "A historical claim"}], "discussion_complete": True}
+    inputs = replace(_inputs(tmp_path), review_threads=(snapshot,))
+    result = _controller(tmp_path).run(inputs)
+    artifact = result.artifact
+    assert artifact["review_threads"]["snapshots"][0]["target"] == "H1"
+    assert artifact["review_threads"]["statistics"]["queued"] == 1
+    events = artifact["events"]
+    queued = next(i for i, row in enumerate(events) if row["kind"] == "review_thread_queued")
+    initial = next(i for i, row in enumerate(events) if row["kind"] == "phase_changed" and row["payload"].get("phase") == "initial")
+    assert initial < queued
+
+
+@pytest.mark.parametrize("kind,update", [("duplicate", ""), ("update", "New reproduction information")])
+def test_critic_thread_association_preserves_authorized_finding(tmp_path, kind, update):
+    inputs = _inputs(tmp_path)
+    snapshot = {"target": "H1", "thread_id": "T1", "comment_id": 1, "last_comment_id": 1,
+                "path": "src/worker.py", "line": 7, "side": "RIGHT", "origin": "human",
+                "repository": inputs.repository, "pr_number": inputs.pr_number, "head_sha": inputs.head_sha,
+                "comments": [{"id": 1, "body": "Delivery bug"}], "discussion_complete": True}
+    observed = {}
+    def critic(request):
+        observed.update(request.context)
+        return {"actions": [{"candidate_id": item.candidate_id, "action": "keep",
+            "review_thread": {"target": "H1", "kind": kind, "update": update}}
+            for item in request.context["candidates"]]}
+    result = _controller(tmp_path, critic=critic).run(replace(inputs, review_threads=(snapshot,)))
+    assert observed["review_threads"][0]["target"] == "H1"
+    association = result.artifact["review_threads"]["associations"][0]
+    assert association["kind"] == kind
+    assert association["fingerprint"]
+    assert any(note.kind == ReviewNoteKind.FINDING for note in result.notes)
+
+
+def test_unassessed_old_blocker_requires_human_review_without_new_blocker(tmp_path):
+    inputs = _inputs(tmp_path)
+    state = _RunState(inputs=replace(inputs, review_threads=({
+        "target": "H1", "origin": "managed", "review_state": "CHANGES_REQUESTED",
+    },)), journal=EventJournal(),
+        deadline=RunDeadline(0, inputs.config.review_deadline_sec, inputs.config.phase_shares),
+        evidence=EvidenceStore())
+    assert ReviewController._review_status(state) == "incomplete"
+    assert not state.blocking_finding_ids
+    state.review_thread_assessments["H1"] = {"assessment": "fixed"}
+    assert ReviewController._review_status(state) == "complete"
+
+
+def test_critic_cannot_associate_a_thread_not_disclosed_in_its_batch(tmp_path):
+    inputs = _inputs(tmp_path)
+    snapshots = tuple({"target": f"H{i}", "thread_id": f"T{i}", "comment_id": i, "last_comment_id": i,
+        "path": "src/worker.py", "line": 7, "side": "RIGHT", "origin": "human",
+        "repository": inputs.repository, "pr_number": inputs.pr_number, "head_sha": inputs.head_sha,
+        "comments": [{"id": i, "body": "Unrelated discussion"}], "discussion_complete": True}
+        for i in range(1, 10))
+    def critic(request):
+        assert "H9" not in {item["target"] for item in request.context["review_threads"]}
+        return {"actions": [{"candidate_id": item.candidate_id, "action": "keep",
+            "review_thread": {"target": "H9", "kind": "duplicate"}}
+            for item in request.context["candidates"]]}
+    result = _controller(tmp_path, critic=critic).run(replace(inputs, review_threads=snapshots))
+    assert not result.artifact["review_threads"]["associations"]
+    assert any(note.kind == ReviewNoteKind.FINDING for note in result.notes)
+
+
+def test_unchanged_conclusive_discussion_is_not_scheduled_again(tmp_path):
+    inputs = _inputs(tmp_path)
+    snapshot = {"target": "H1", "thread_id": "T1", "path": "src/worker.py",
+                "prior_assessment": "still_present", "origin": "human",
+                "comments": [], "discussion_complete": True}
+    result = _controller(tmp_path).run(replace(inputs, review_threads=(snapshot,)))
+    assert result.artifact["review_threads"]["statistics"]["queued"] == 0
+    assert result.artifact["review_threads"]["statistics"]["reused"] == 1
+
+
 def test_performance_snapshot_is_included_before_hardened_artifact_write(tmp_path):
     rows = ({"measured_prompt_tokens": 1234, "measured_completion_tokens": 56},) * 2001
     controller = _controller(tmp_path, performance_snapshot=lambda: rows)
