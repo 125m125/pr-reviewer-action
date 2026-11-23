@@ -122,6 +122,42 @@ def test_boundary_evaluator_uses_sources_and_does_not_repeat_unchanged_inputs(tm
     combined = next(item for item in obligations if item.evaluator_owned)
     assert state.coverage.obligation_statuses()[combined.id] is ObligationStatus.COVERED
     assert state.investigation_leads == {}
+
+    # The evidence can settle the comparison without settling the author's
+    # intent. A prior lead for this boundary must stop being schedulable.
+    from pr_reviewer.specialist_runtime.types import InvestigationLead, InvestigationLeadStatus
+
+    lead_id = "boundary:api"
+    state.investigation_leads[lead_id] = InvestigationLead(
+        lead_id=lead_id, summary="Check identifier routing.", affected_paths=("contract.json",),
+        evidence_ids=(), next_action="Check whether translation is intentional.",
+        required_capability="repository", origin_session_id="boundary-evaluator",
+    )
+    state.boundary_evaluations.clear()
+    def mismatch(request):
+        packet = request.context
+        return {"question": packet["question"], "outcome": "incompatible",
+                "reason": "The endpoints use different identifiers.",
+                "evidence_ids": list(packet["source_evidence_ids"]),
+                "missing_fact": "Whether the discrepancy was intended.",
+                "suggested_investigation": "", "followup_kind": "maintainer_decision"}
+    mismatch_controller = ReviewController(boundary_evaluator=mismatch, artifact_output_root=tmp_path)
+    mismatch_controller._evaluate_boundaries(state)
+    assert state.boundary_evaluations["api"].outcome == "incompatible"
+    assert state.investigation_leads[lead_id].status is InvestigationLeadStatus.BLOCKED
+    assert state.coverage.obligation_statuses()[combined.id] is ObligationStatus.UNRESOLVED
+
+    # A separate observable question should still be schedulable.
+    state.boundary_evaluations.clear()
+    def mismatch_with_gap(request):
+        return {**mismatch(request), "followup_kind": "repository_evidence",
+                "missing_fact": "Whether the legacy caller normalizes numeric identifiers.",
+                "suggested_investigation": "Read a/legacy.py for identifier normalization."}
+    ReviewController(boundary_evaluator=mismatch_with_gap, artifact_output_root=tmp_path)._evaluate_boundaries(state)
+    assert state.boundary_evaluations["api"].outcome == "incompatible"
+    assert state.investigation_leads[lead_id].status is InvestigationLeadStatus.OPEN
+    assert state.investigation_leads[lead_id].next_action == "Read a/legacy.py for identifier normalization."
+
     reopened = replace(assessments[0], disposition=ObligationDisposition.PARTIALLY_COVERED, next_actions=("Check cancellation behavior.",), assessment_version=2)
     state.session_results[("A", "S1")] = SimpleNamespace(checkpoint=SessionCheckpoint("S1", SessionState.CHECKPOINT, obligation_assessments=(reopened, *assessments[1:])))
     controller._evaluate_boundaries(state)
@@ -132,9 +168,6 @@ def test_boundary_evaluator_uses_sources_and_does_not_repeat_unchanged_inputs(tm
     assert "assessment remains incomplete" in failure.reason
 
     from pr_reviewer.specialist_runtime import controller as controller_module
-    from pr_reviewer.specialist_runtime.types import InvestigationLeadStatus
-
-    lead_id = "boundary:api"
     state.investigation_leads[lead_id] = replace(
         state.investigation_leads[lead_id], status=InvestigationLeadStatus.BLOCKED,
     )

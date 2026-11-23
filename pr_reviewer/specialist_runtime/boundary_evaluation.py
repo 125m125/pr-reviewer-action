@@ -22,11 +22,11 @@ _COMPLETE_DISPOSITIONS = frozenset({
     ObligationDisposition.NOT_APPLICABLE,
 })
 _OUTCOMES = frozenset({
-    "supported", "insufficient_evidence", "potential_contradiction",
+    "supported", "incompatible", "insufficient_evidence", "potential_contradiction",
 })
 _RESULT_KEYS = frozenset({
     "question", "outcome", "reason", "evidence_ids", "missing_fact",
-    "suggested_investigation",
+    "suggested_investigation", "followup_kind",
 })
 
 
@@ -49,6 +49,7 @@ class BoundaryEvaluation:
     evidence_ids: tuple[str, ...]
     missing_fact: str = ""
     suggested_investigation: str = ""
+    followup_kind: str = "none"
 
 
 def build_boundary_context(
@@ -299,7 +300,7 @@ def validate_boundary_evaluation(
     if outcome not in _OUTCOMES:
         raise ValueError(
             "boundary evaluation outcome must be supported, "
-            "insufficient_evidence, or potential_contradiction"
+            "incompatible, insufficient_evidence, or potential_contradiction"
         )
     reason = str(raw.get("reason") or "").strip()
     if not reason:
@@ -327,40 +328,46 @@ def validate_boundary_evaluation(
     source_ids = set(context.get("source_evidence_ids", ()))
     if set(evidence_ids) - source_ids:
         raise ValueError("boundary evaluation citations must name source evidence")
-    if outcome == "supported":
+    if outcome in {"supported", "incompatible"}:
         if context.get("incomplete"):
             diagnostic = "; ".join(str(item) for item in context.get("diagnostics", ()))
             raise ValueError(
-                "supported boundary evaluation requires a complete source evidence packet"
+                f"{outcome} boundary evaluation requires a complete source evidence packet"
                 + (f": {diagnostic}" if diagnostic else "")
             )
         if str(raw.get("question") or "").strip() != str(context.get("question") or ""):
-            raise ValueError("supported boundary evaluation must name the specific question")
+            raise ValueError(f"{outcome} boundary evaluation must name the specific question")
         if not evidence_ids:
-            raise ValueError("supported boundary evaluation requires source evidence citations")
+            raise ValueError(f"{outcome} boundary evaluation requires source evidence citations")
         cited = set(evidence_ids)
         participant_evidence = context.get("participant_evidence_ids", {})
         for participant in context.get("required_participants", ()):
             if not cited.intersection(participant_evidence.get(participant, ())):
                 raise ValueError(
-                    "supported boundary evaluation requires source evidence for "
+                    f"{outcome} boundary evaluation requires source evidence for "
                     f"participant {participant}"
                 )
         contract_ids = set(context.get("contract_evidence_ids", ()))
         if contract_ids and not cited.intersection(contract_ids):
             raise ValueError(
-                "supported boundary evaluation requires boundary contract source evidence"
+                f"{outcome} boundary evaluation requires boundary contract source evidence"
             )
+    missing_fact = str(raw.get("missing_fact") or "").strip()
+    suggested = str(raw.get("suggested_investigation") or "").strip()
+    followup_kind = raw.get("followup_kind", "none")
+    if not isinstance(followup_kind, str) or followup_kind not in {"none", "repository_evidence", "maintainer_decision"}:
+        raise ValueError("invalid boundary followup_kind")
+    if followup_kind == "repository_evidence" and (outcome == "supported" or not missing_fact or not suggested):
+        raise ValueError("repository follow-up requires a missing fact and a targeted investigation on an unresolved boundary")
     return BoundaryEvaluation(
         boundary_id=str(context.get("boundary_id") or ""),
         input_fingerprint=str(context.get("input_fingerprint") or ""),
         outcome=outcome,
         reason=reason,
         evidence_ids=evidence_ids,
-        missing_fact=str(raw.get("missing_fact") or "").strip(),
-        suggested_investigation=str(
-            raw.get("suggested_investigation") or ""
-        ).strip(),
+        missing_fact=missing_fact,
+        suggested_investigation=suggested,
+        followup_kind=followup_kind,
     )
 
 

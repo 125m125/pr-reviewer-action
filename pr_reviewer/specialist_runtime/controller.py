@@ -3880,6 +3880,7 @@ class ReviewController:
                     error or "boundary comparison did not complete", (),
                     missing_fact=error or "compatible participant behavior is not established",
                     suggested_investigation=context.get("suggested_investigation") or f"Investigate {error or boundary.objective}.",
+                    followup_kind="repository_evidence",
                 )
             state.boundary_evaluations[boundary.id] = outcome
             supported = outcome.outcome == "supported"
@@ -3890,6 +3891,16 @@ class ReviewController:
             if supported:
                 if old_lead is not None:
                     state.investigation_leads[lead_id] = replace(old_lead, status=InvestigationLeadStatus.RESOLVED_NO_ISSUE, resolution_reason=outcome.reason)
+            elif outcome.followup_kind != "repository_evidence":
+                if old_lead is not None:
+                    state.investigation_leads[lead_id] = replace(
+                        old_lead, status=InvestigationLeadStatus.BLOCKED,
+                        resolution_reason=outcome.missing_fact or outcome.reason,
+                    )
+                state.journal.emit("boundary_no_repository_followup", {
+                    "boundary_id": boundary.id, "outcome": outcome.outcome,
+                    "followup_kind": outcome.followup_kind,
+                })
             else:
                 next_action = outcome.suggested_investigation or f"Investigate {outcome.missing_fact}"
                 # A different assessment fingerprint can reflect incidental edits to
@@ -3909,6 +3920,8 @@ class ReviewController:
                 state.investigation_leads[lead_id] = InvestigationLead(
                     lead_id=lead_id,
                     summary=(
+                        "The boundary mismatch is established. Investigate only this separate gap: "
+                        f"{outcome.missing_fact}" if outcome.outcome == "incompatible" else
                         "Boundary compatibility could not be established for "
                         f"{boundary.objective}; complete the remaining boundary assessment."
                     ),
@@ -3982,6 +3995,12 @@ class ReviewController:
                     for record in session.evidence.snapshot().records
                 ),
                 allowed_diff_paths=tuple(getattr(session.session, "changed_files", ())),
+                historical_paths=tuple(dict.fromkeys(
+                    path
+                    for lead in state.assignments[ownership.assignment_id].investigation_leads
+                    if lead.kind == "review_thread"
+                    for path in lead.affected_paths
+                )),
                 advertised_tools=tuple(sorted(
                     str(item.get("name") or "").strip()
                     for item in getattr(
