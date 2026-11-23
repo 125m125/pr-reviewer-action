@@ -160,6 +160,30 @@ def test_historical_batch_is_bounded_to_open_discussions_on_the_same_path(tmp_pa
     assert [item["target"] for item in snapshots] == ["H4", "H1", "H3"]
 
 
+def test_fresh_historical_waves_do_not_share_an_assignment_or_session(tmp_path):
+    from pr_reviewer.specialist_runtime.negotiation import NegotiationAction
+
+    inputs = replace(_inputs(tmp_path), review_threads=(
+        {"target": "H1", "path": "a.py"}, {"target": "H2", "path": "b.py"},
+    ))
+    state = _RunState(inputs, EventJournal(), RunDeadline(0, 100, PhaseShares()), EvidenceStore())
+    controller = _controller(tmp_path)
+    state.plan = controller_module.AssignmentPlan(())
+    controller._queue_review_threads(state)
+    assignment_ids, session_ids = set(), set()
+    for target in ("H1", "H2"):
+        action = NegotiationAction(
+            kind="new_session", obligation_ids=(), lead_ids=(f"review-thread:{target}",),
+            expected_evidence=("repository",), estimated_turns=2,
+            reason="Independently reassess the discussion.", expected_coverage_gain=1,
+        )
+        assignment, = controller._followup_assignments(state, (action,))
+        assignment_ids.add(assignment.id)
+        session_ids.add(state.assignment_sessions[assignment.id])
+    assert len(assignment_ids) == len(session_ids) == 2
+    assert len(state.assignments) == 2
+
+
 def test_historical_thread_can_resume_component_owner_despite_independent_overlap(tmp_path):
     from pr_reviewer.specialist_runtime.negotiation import (
         NegotiationState, SessionResources, compact_negotiation_context,
