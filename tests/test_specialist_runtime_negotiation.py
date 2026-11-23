@@ -408,6 +408,27 @@ def test_lead_scope_distinguishes_unchanged_supporting_sources(changed_files, ex
         assert action.session_id == "S1"
 
 
+def test_historical_consult_skips_unrelated_history_when_repaired_path_leaves_diff():
+    lead = InvestigationLead(
+        lead_id="review-thread:H3", summary="Verify the repaired publisher.",
+        affected_paths=("publisher.py",), evidence_ids=(),
+        next_action="Check the native event on current head.",
+        required_capability="repository", origin_session_id="", kind="review_thread",
+    )
+    historical = SessionResources(
+        "S1", 8, 100, 8, advertised_tools=("read_file",),
+        allowed_diff_paths=("redact.py",), historical_paths=("redact.py",),
+    )
+    ordinary = replace(historical, session_id="S2", historical_paths=())
+    state = replace(state_for(
+        covered=("OB1", "OB2"), resources=(historical, ordinary),
+        max_sessions=2, investigation_leads=(lead,),
+    ), changed_files=("redact.py",))
+    action = fallback_next_action(state)
+    assert (action.kind, action.session_id) == ("consult", "S2")
+    assert fallback_next_action(replace(state, session_resources=(historical,))).kind == "record_unknown"
+
+
 def resume_raw(**updates):
     raw = {
         "kind": "resume",

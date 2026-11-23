@@ -107,6 +107,7 @@ class SessionResources:
     retained_evidence_count: int = 0
     advertised_tools: tuple[str, ...] = ()
     allowed_diff_paths: tuple[str, ...] = ()
+    historical_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -386,7 +387,7 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
                 allowed_actions.insert(0, "resume")
             if any(session_id != origin for session_id in capable_sessions):
                 allowed_actions.insert(0, "consult")
-            required_tools = _required_tools(lead.required_capability)
+            required_tools = _lead_required_tools(lead)
             # A fresh assignment can authorize the lead's paths even when no
             # existing session has that scope or any exploration turns left.
             capability_available = not required_tools or any(
@@ -601,10 +602,14 @@ def _required_tools(capability: str) -> frozenset[str]:
     }.get(capability, frozenset({"__unsupported__"}))
 
 
+def _lead_required_tools(lead: InvestigationLead) -> frozenset[str]:
+    return frozenset({"read_file"}) if lead.kind == "review_thread" else _required_tools(lead.required_capability)
+
+
 def _capable_lead_sessions(
     lead: InvestigationLead, state: NegotiationState,
 ) -> tuple[str, ...]:
-    required = _required_tools(lead.required_capability)
+    required = _lead_required_tools(lead)
     required_diff_paths = set(lead.affected_paths)
     if state.changed_files is not None:
         # Unchanged supporting sources use read_file, not the scoped PR diff.
@@ -618,6 +623,9 @@ def _capable_lead_sessions(
         if resource.lease_remaining_sec < state.seconds_per_turn:
             continue
         advertised = frozenset(resource.advertised_tools)
+        if (lead.kind == "review_thread" and resource.historical_paths
+                and not set(lead.affected_paths).issubset(resource.historical_paths)):
+            continue
         if required and not required.intersection(advertised):
             continue
         if not required_diff_paths.issubset(resource.allowed_diff_paths):
