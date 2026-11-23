@@ -1241,7 +1241,10 @@ class GitHubReviewPublisher:
             else:
                 failed_associations.add(fingerprint)
         for record in review_thread_assessments:
-            if (record.get("assessment") in {"fixed", "disproven"}
+            resolves = record.get("assessment") in {"fixed", "disproven"}
+            if not resolves and not _clean_markdown(record.get("update")):
+                continue
+            if (resolves
                     and (record["target"] in current_targets or record["snapshot"].get("fingerprint") in current_fingerprints)):
                 state.setdefault("publication_warnings", []).append({"operation": "historical_thread",
                     "target": record["target"], "error": "current finding conflicts with historical resolution"})

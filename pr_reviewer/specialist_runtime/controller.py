@@ -4376,7 +4376,16 @@ class ReviewController:
     ) -> tuple[Assignment, ...]:
         result: list[Assignment] = []
         obligation_by_id = {item.id: item for item in state.obligations}
-        for index, action in enumerate(actions, start=1):
+
+        def fresh_assignment_id(prefix: str) -> str:
+            # A scheduling invocation normally handles one action. Never reuse
+            # a previous wave's assignment (and thus its durable session).
+            serial = len(state.assignments) + 1
+            while f"{prefix}-{serial}" in state.assignments:
+                serial += 1
+            return f"{prefix}-{serial}"
+
+        for action in actions:
             state.journal.emit("negotiation_action", {
                 "kind": action.kind,
                 "session_id": action.session_id,
@@ -4547,7 +4556,7 @@ class ReviewController:
                         for item in selected
                     )
                     assignment = Assignment(
-                        id=f"boundary-{boundary_id}-followup-{index}",
+                        id=fresh_assignment_id(f"boundary-{boundary_id}-followup"),
                         title=f"Boundary {boundary_id} follow-up",
                         objective=lead.next_action,
                         obligation_ids=tuple(item.id for item in selected),
@@ -4589,8 +4598,8 @@ class ReviewController:
                     )
                 else:
                     assignment = Assignment(
-                        id=f"investigation-lead-followup-{index}",
-                        title=f"Investigation lead follow-up {index}",
+                        id=fresh_assignment_id("investigation-lead-followup"),
+                        title="Investigation lead follow-up",
                         objective=lead.next_action,
                         obligation_ids=(), recipe_ids=(),
                         lenses=("investigation-lead",),
@@ -4670,8 +4679,8 @@ class ReviewController:
                 continue
             assignment = replace(
                 plan.assignments[0],
-                id=f"{plan.assignments[0].id}-followup-{index}",
-                title=f"{plan.assignments[0].title} follow-up {index}",
+                id=fresh_assignment_id(f"{plan.assignments[0].id}-followup"),
+                title=f"{plan.assignments[0].title} follow-up",
                 estimated_turns=min(action.estimated_turns, plan.assignments[0].estimated_turns),
                 model_turn_limit=min(plan.assignments[0].model_turn_limit, remaining_turns),
                 tool_call_limit=min(plan.assignments[0].tool_call_limit, remaining_tools),

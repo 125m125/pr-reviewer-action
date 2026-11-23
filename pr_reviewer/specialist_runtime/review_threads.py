@@ -117,8 +117,12 @@ class ReviewThreadLedger:
         self._last_rejection = None
 
     @property
+    def current_target(self):
+        return next((key for key in self.threads if key not in self._assessments), None)
+
+    @property
     def has_pending(self):
-        return any(key not in self._assessments for key in self.threads)
+        return self.current_target is not None
 
     def state(self):
         pending = [item for key, item in self.threads.items() if key not in self._assessments]
@@ -146,8 +150,7 @@ class ReviewThreadLedger:
             return reject("Unknown or unassigned review thread target.")
         if target in self._assessments:
             return reject("This thread already has an accepted assessment. Assess current_thread instead.")
-        current = self.state()["current_thread"]
-        if current is not None and target != current["target"]:
+        if target != self.current_target:
             return reject("Assess the supplied current_thread before advancing to another discussion.")
         assessment = raw.get("assessment")
         if not isinstance(assessment, str) or assessment not in {"still_present", "fixed", "disproven", "unverified"}:

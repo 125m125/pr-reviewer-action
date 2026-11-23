@@ -1414,6 +1414,48 @@ def test_review_threads_are_hidden_until_explicitly_assigned():
     assert "review_thread_state" in session._cumulative_checkpoint_payload()["latest_checkpoint"]
 
 
+def test_historical_retrieval_only_opens_shared_evidence_for_current_thread():
+    from pr_reviewer.specialist_runtime.evidence import EvidenceProvenance
+
+    session = make_session([], repository_head_sha="a" * 40)
+    def retain(path, content):
+        return session.evidence_store.add_tool_result(
+            session_id=session.session_id, tool="read_file", arguments={"path": path},
+            result={"status": "ok", "result": {"content": content}},
+            provenance=EvidenceProvenance(head_sha="a" * 40),
+        )
+
+    shared = retain("a.py", "relevant current source")
+    unrelated = retain("secret.py", "unrelated history")
+    session._compacted_evidence[unrelated.id] = unrelated
+    session.apply_review_thread_feedback((
+        {"target": "H1", "path": "a.py"}, {"target": "H2", "path": "a.py"},
+    ), ({"candidate_id": "candidate:reference:C1", "evidence_ids": [shared.id]},))
+
+    def retrieve(target, evidence_id):
+        return session._read_compacted_evidence({
+            "target": target, "purpose": "contradiction_check", "evidence_id": evidence_id,
+        })
+
+    assert retrieve("H1", shared.id).get("content") == "relevant current source"
+    assert retrieve("H1", unrelated.id)["status"] == "error"
+    assert retrieve("H2", shared.id)["status"] == "error"
+    assert retrieve("candidate:reference:C1", shared.id)["status"] == "error"
+    args = {"target": "H1", "purpose": "contradiction_check", "evidence_id": shared.id}
+    from pr_reviewer.tool_loop import native_tool_request_key
+    key = native_tool_request_key("read_compacted_evidence", args)
+    session._deferred_tool_results[key] = ({
+        "content": json.dumps({"status": "ok", "content": "stale historical result"}),
+        "is_error": False,
+    }, shared.id)
+    session.apply_coverage_feedback(("other work",))
+    assert retrieve("H1", shared.id)["status"] == "error"
+    call = tool_call_response("read_compacted_evidence", args)
+    session.conversation.add_assistant_turn(calls=call.tool_calls)
+    assert not session._execute_calls(call.tool_calls)
+    assert "stale historical result" not in str(session.conversation.events)
+
+
 def test_tool_admitted_thread_assessment_survives_failed_checkpoint():
     from pr_reviewer.specialist_runtime.evidence import EvidenceProvenance
     session = make_session([], repository_head_sha="a" * 40)

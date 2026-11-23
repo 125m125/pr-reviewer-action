@@ -483,8 +483,8 @@ COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
     "name": COMPACTED_EVIDENCE_TOOL_NAME,
     "description": (
         "Read a bounded excerpt from an evidence result that the controller "
-        "explicitly marked as compacted. Only evidence IDs listed in a recent "
-        "compaction marker are valid; this tool never reads arbitrary evidence "
+        "explicitly marked as compacted or shared for the current historical discussion. "
+        "This tool never reads arbitrary evidence "
         "or creates new evidence. For another page, use the returned next_offset; "
         "ranges already retrieved since compaction are not returned again."
     ),
@@ -493,7 +493,7 @@ COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
         "properties": {
             "evidence_id": {
                 "type": "string",
-                "description": "Exact evidence ID from a compaction marker.",
+                "description": "Exact ID from the compaction marker or shared historical evidence.",
             },
             "offset": {
                 "type": "integer",
@@ -505,7 +505,7 @@ COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
             },
             "target": {
                 "type": "string",
-                "description": "Controller-owned obligation, family, or candidate handle.",
+                "description": "Controller-owned obligation, family, local candidate, or current historical H# handle.",
             },
             "purpose": {
                 "type": "string",
@@ -1688,6 +1688,7 @@ class SpecialistSession:
         self._checkpoint_state_degraded = False
         self._checkpoint_recovery_required = False
         self._review_thread_followup = False
+        self._historical_evidence_ids: set[str] = set()
         self._last_context_admission: dict[str, object] = {}
         self._admission_calibration = {
             "tools": _AdmissionCalibration(),
@@ -1871,11 +1872,13 @@ class SpecialistSession:
         self._followup_assessment_versions = {}
         self.state = SessionState.COVERAGE_EVALUATION
         self.budget.reset_no_progress_streak("historical review thread feedback")
+        self._historical_evidence_ids.clear()
         for candidate in current_candidates:
             for evidence_id in candidate.get("evidence_ids", ()):
                 record = self.evidence_store.lookup_canonical(evidence_id)
-                if record is not None:
+                if record is not None and record.provenance.head_sha == self.repository_head_sha:
                     self._compacted_evidence[record.id] = record
+                    self._historical_evidence_ids.add(record.id)
         if not any(item.get("name") == "assess_review_thread" for item in self.conversation.tool_schemas):
             self.conversation.tool_schemas.append(copy.deepcopy(ASSESS_REVIEW_THREAD_SCHEMA))
         self._continuation_scope = (
@@ -1893,8 +1896,9 @@ class SpecialistSession:
             "Use assess_review_thread to submit each result; no closing summary is needed. "
             "Reuse evidence for related discussions, but assess each independently. "
             "Publish no acknowledgment or unchanged 'still present' update. "
-            "Current candidate evidence can be recovered with read_compacted_evidence; "
-            "these candidate IDs are references, not local update/withdrawal targets. "
+            "To recover a listed evidence ID, call read_compacted_evidence with target "
+            "equal to current_thread.target (the H# handle) and purpose contradiction_check. "
+            "Candidate IDs here are references, not tool targets. "
             + json.dumps({"review_thread_state": self._review_threads.state(),
                           "current_candidates": current_candidates}, default=str)
         )
@@ -4362,7 +4366,11 @@ class SpecialistSession:
                     progressed = True
                 continue
             if name in _OBLIGATION_LOCAL_TOOL_NAMES or name == COMPACTED_EVIDENCE_TOOL_NAME:
-                if self._replay_deferred_result(call_id, self._tool_call_keys.get(call_id, "")):
+                key = self._tool_call_keys.get(call_id, "")
+                if (key in self._deferred_tool_results
+                        and (name != COMPACTED_EVIDENCE_TOOL_NAME
+                             or not self._compacted_evidence_target_error(arguments))
+                        and self._replay_deferred_result(call_id, key)):
                     progressed = True
                     continue
             if name == COMPACTED_EVIDENCE_TOOL_NAME:
@@ -6918,6 +6926,7 @@ class SpecialistSession:
         if not self._review_thread_followup:
             return
         self._review_thread_followup = False
+        self._historical_evidence_ids.clear()
         self._review_threads.set_queue(())
         self.conversation.tool_schemas[:] = [
             item for item in self.conversation.tool_schemas
@@ -7478,6 +7487,22 @@ class SpecialistSession:
             if event.get("kind") in {"assistant_text", "assistant_reasoning"}
         )
 
+    def _compacted_evidence_target_error(self, arguments: Mapping[str, Any]) -> str:
+        target = str(arguments.get("target") or "").strip()
+        if self._review_thread_followup and target == self._review_threads.current_target:
+            evidence_id = str(arguments.get("evidence_id") or "").strip()
+            return ("" if evidence_id in self._historical_evidence_ids
+                    else "evidence was not shared for the current historical discussion")
+        authorized_targets = set(self._assigned_obligation_ids())
+        authorized_targets.update(self.obligation_assessments.handles())
+        authorized_targets.update(self._candidate_statuses)
+        authorized_targets.update(self._investigation_lead_targets)
+        authorized_targets.update(
+            str(getattr(item, "family_id", ""))
+            for item in getattr(self.assignment, "families", ())
+        )
+        return "" if target in authorized_targets else "target is not controller-authorized"
+
     def _read_compacted_evidence(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         if set(arguments) - {"evidence_id", "target", "purpose", "offset", "limit"}:
             return {"status": "error", "error": "unexpected retrieval arguments"}
@@ -7493,16 +7518,8 @@ class SpecialistSession:
                 "status": "error",
                 "error": "authorized target and retrieval purpose are required",
             }
-        authorized_targets = set(self._assigned_obligation_ids())
-        authorized_targets.update(self.obligation_assessments.handles())
-        authorized_targets.update(self._candidate_statuses)
-        authorized_targets.update(self._investigation_lead_targets)
-        authorized_targets.update(
-            str(getattr(item, "family_id", ""))
-            for item in getattr(self.assignment, "families", ())
-        )
-        if target not in authorized_targets:
-            return {"status": "error", "error": "target is not controller-authorized"}
+        if error := self._compacted_evidence_target_error(arguments):
+            return {"status": "error", "error": error}
         record = self._compacted_evidence.get(evidence_id)
         if record is None:
             return {

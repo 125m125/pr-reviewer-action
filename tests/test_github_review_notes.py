@@ -298,6 +298,22 @@ def test_explicit_reassessment_needs_live_owned_uncontested_thread(tmp_path, ori
     assert [c[0] for c in client.calls if c[0] in {"reply","resolve"}] == expected
 
 
+def test_unchanged_historical_assessment_does_not_revalidate_for_publication(tmp_path):
+    client = _FakeClient()
+    snapshot = dict(target="H1", origin="managed", repository="owner/repo", pr_number=17,
+                    head_sha="a"*40, thread_id="T", comment_id=10, last_comment_id=10,
+                    path="a.py", line=6, side="RIGHT", fingerprint="fp-old", review_id="R",
+                    discussion_complete=True, human_reply=False, is_resolved=False,
+                    comments=[{"id":10,"author":"bot","body":"concern"}])
+    client.query_review_threads = lambda *_: ()
+    result, _ = _publish(tmp_path, client, review_thread_snapshots=[snapshot], review_thread_assessments=[
+        dict(target="H1", assessment="still_present", reason="Still fails on empty tokens.",
+             evidence_ids=["E1"], update="", snapshot=snapshot)])
+    assert result["review_completed"]
+    assert not result.get("publication_warnings")
+    assert not any(call[0] in {"reply", "resolve"} for call in client.calls)
+
+
 @pytest.mark.parametrize("kind,stale,expected", [("duplicate",False,[]), ("duplicate",True,["add"]), ("update",False,["reply"])])
 def test_critic_association_suppresses_only_confirmed_existing_thread(tmp_path, kind, stale, expected):
     client = _FakeClient()
