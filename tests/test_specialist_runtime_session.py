@@ -1505,6 +1505,41 @@ def test_related_thread_assessments_finish_without_a_model_checkpoint():
     assert "review_thread_batch_complete" in str(session.conversation.events)
 
 
+@pytest.mark.parametrize("limit", ["context", "tool_result"])
+def test_historical_assessment_commits_before_reserving_next_discussion(monkeypatch, limit):
+    checkpoint = checkpoint_response(inspected=[], unresolved=[])
+    second = tool_call_response("assess_review_thread", {
+        "target": "H2", "assessment": "unverified", "reason": "No decisive evidence", "evidence_ids": [],
+    }, call_id="H2")
+    gateway = ScriptedGateway([checkpoint, second])
+    session = make_session(gateway, obligations=(), max_context_tokens=100_000, max_tool_result_bytes=1024)
+    session.apply_review_thread_feedback((
+        {"target": "H1", "path": "a.py"}, {"target": "H2", "path": "a.py",
+                                          "comments": [{"body": "large next discussion\n" + "source context\n" * 100}]},
+    ))
+    turn = tool_call_response("assess_review_thread", {
+        "target": "H1", "assessment": "unverified", "reason": "No decisive evidence", "evidence_ids": [],
+    })
+    calls = turn.tool_calls
+    if limit == "context":
+        calls = tool_call_response("read_file", {"path": "a.py"}).tool_calls + calls
+    session.conversation.add_assistant_turn(calls=calls)
+    with monkeypatch.context() as pressure:
+        pressure.setattr(session, "_checkpoint_pressure_due", lambda **kwargs: limit == "context")
+        assert session._execute_calls(calls)
+    if limit == "context":
+        assert json.loads(session.conversation.events[-2]["content"])["status"] == "deferred"
+    assert session._snapshot().review_thread_assessments[0]["target"] == "H1"
+    result = session.conversation.events[-1]["content"]
+    assert '"status": "accepted"' in result and "large next discussion" not in result
+    assert session._tool_calls_deferred_for_checkpoint
+    assert not session._deferred_tool_results
+    session._tool_calls_deferred_for_checkpoint = False
+    resumed = session._checkpoint_and_resume("deferred-tool-result-growth")
+    assert [row["target"] for row in resumed.review_thread_assessments] == ["H1", "H2"]
+    assert "large next discussion" in gateway.requests[1].messages
+
+
 def test_historical_assessment_can_still_be_submitted_in_checkpoint_fallback():
     checkpoint = checkpoint_response(inspected=[], unresolved=[], review_thread_assessments=[{
         "target": "H1", "assessment": "unverified", "reason": "Need more evidence",
@@ -3311,7 +3346,8 @@ def test_final_synthesis_repairs_rejected_candidates_independently():
     assert diagnostic["repair_attempts"][1]["status"] == "output_limit"
 
 
-def test_candidate_tools_report_and_withdraw_with_short_session_handles(tmp_path):
+@pytest.mark.parametrize("pressure", [False, True])
+def test_candidate_tools_report_and_withdraw_with_short_session_handles(tmp_path, monkeypatch, pressure):
     from pr_reviewer.tool_executors import read_file
 
     (tmp_path / "a.py").write_text(
@@ -3331,7 +3367,7 @@ def test_candidate_tools_report_and_withdraw_with_short_session_handles(tmp_path
     },))
     evidence_id = json.loads(session.conversation.events[-1]["content"])["evidence_id"]
 
-    progressed = session._execute_calls(({
+    report_calls = ({
         "id": "report-1", "name": "report_candidate",
         "arguments": json.dumps({
             "claim": "The changed branch returns the wrong state.",
@@ -3346,7 +3382,11 @@ def test_candidate_tools_report_and_withdraw_with_short_session_handles(tmp_path
             "user_visible_consequence": "The operation returns the wrong state.",
             "manual_validation": "Run the changed state-transition test.",
         }),
-    },))
+    },)
+    with monkeypatch.context() as scoped:
+        if pressure:
+            scoped.setattr(session, "_checkpoint_pressure_due", lambda **kwargs: True)
+        progressed = session._execute_calls(report_calls)
 
     report = json.loads(session.conversation.events[-1]["content"])
     assert {"report_candidate", "withdraw_candidate"}.issubset(tool_names)
@@ -3356,6 +3396,10 @@ def test_candidate_tools_report_and_withdraw_with_short_session_handles(tmp_path
     candidate_id = session.candidate_findings[0].candidate_id
     assert candidate_id != "C1"
     assert session.budget.snapshot().tool_calls == before + 1
+    if pressure:
+        assert session._accepted_work[0].checkpoint.candidate_finding_ids == (candidate_id,)
+        assert not session._deferred_tool_results
+        session._tool_calls_deferred_for_checkpoint = False
 
     progressed = session._execute_calls(({
         "id": "withdraw-1", "name": "withdraw_candidate",
