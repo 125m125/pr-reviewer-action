@@ -1758,9 +1758,12 @@ class GitHubReviewPublisher:
             resolve = (not association and record.get("assessment") in {"fixed", "disproven"}
                        and live.get("origin") == "managed" and live.get("human_reply") is False
                        and bool(record.get("evidence_ids")))
+            can_resolve = live.get("viewer_can_resolve") is not False
             text = _clean_markdown(record.get("update") or (record.get("reason") if resolve else ""))
             if not text:
                 return False
+            if resolve and not can_resolve:
+                text += "\n\nThe review token cannot resolve this conversation. A maintainer can resolve it."
             if any(_clean_markdown(c["body"]) == text for c in live["comments"]):
                 return not resolve
             if resolve:
@@ -1769,11 +1772,13 @@ class GitHubReviewPublisher:
             if not _valid_comment_result(reply):
                 raise ValueError("thread reply was not confirmed")
             self._checkpoint(state, "historical_thread_reply", reply)
-            if resolve:
+            if resolve and can_resolve:
                 after = fresh()
                 if (after.get("last_comment_id") != reply["id"] or after.get("human_reply") is not False
                         or list(after["comments"][:-1]) != list(live["comments"]) or after["comments"][-1]["body"] != text):
                     raise ValueError("thread changed after explanatory reply; left unresolved")
+                if after.get("viewer_can_resolve") is False:
+                    raise ValueError("GitHub no longer permits this token to resolve the thread; left unresolved")
                 result = self.client.resolve_thread(live["thread_id"])
                 if not isinstance(result, Mapping) or result.get("id") != live["thread_id"] or result.get("is_resolved") is not True:
                     raise ValueError("resolution was not confirmed")
@@ -1914,7 +1919,7 @@ _MANAGED_THREADS_QUERY = """
 query ManagedReviewThreads($pullRequestId: ID!, $cursor: String) {
   node(id: $pullRequestId) { ... on PullRequest {
     reviewThreads(first: 100, after: $cursor) {
-      nodes { id isResolved subjectType path originalLine line diffSide }
+      nodes { id isResolved viewerCanResolve subjectType path originalLine line diffSide }
       pageInfo { hasNextPage endCursor }
     }
   } }
@@ -2439,7 +2444,7 @@ class GhReviewClient:
                                   author=author["login"], author_type=author.get("__typename"), origin=origin,
                                   fingerprint=marker.group(1) if marker else None, repository=repo, pr_number=pr_number,
                                   head_sha=head_sha, discussion_complete=complete, human_reply=human_reply,
-                                  comments=retained, is_resolved=False))
+                                  comments=retained, is_resolved=False, viewer_can_resolve=thread.get("viewerCanResolve")))
         if snapshots:
             reviews = self._paged_nodes(_MANAGED_REVIEWS_QUERY, {"pullRequestId": pr_id},
                                         connection_name="reviews", label="review assessment receipts")

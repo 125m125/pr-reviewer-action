@@ -1154,6 +1154,7 @@ class GatewayRoleAdapter:
                 ),
                 response_schema=None,
                 tools_enabled=False,
+                allow_fallbacks=request.role != "thread_matcher",
                 timeout_sec=request.timeout_sec,
                 deadline_at=request.lease.deadline_at,
                 stream=self.stream,
@@ -2334,6 +2335,7 @@ class ReviewController:
         negotiator: object | None = None,
         boundary_evaluator: object | None = None,
         critic: object | None = None,
+        thread_matcher: object | None = None,
         repairer: object | None = None,
         remediator: object | None = None,
         finalizer: object | None = None,
@@ -2365,6 +2367,7 @@ class ReviewController:
         self.negotiator = negotiator
         self.boundary_evaluator = boundary_evaluator
         self.critic = critic
+        self.thread_matcher = thread_matcher
         # Kept as a source-compatible constructor argument. Candidate proof
         # repair now happens at report/checkpoint admission, while the critic
         # remains the final adjudicator. The separate remediator can only add
@@ -2859,6 +2862,7 @@ class ReviewController:
         planner_request_budget: PlannerRequestBudget | None = None,
         attempt_admission: Callable[[], None] | None = None,
         max_attempts: int = 2,
+        timeout_cap: float | None = None,
     ) -> object:
         state.journal.emit("model_request_started", {
             "request_id": request_id,
@@ -2874,6 +2878,8 @@ class ReviewController:
             timeout = min(
                 float(state.inputs.config.model_request_timeout_sec), remaining(),
             )
+            if timeout_cap is not None:
+                timeout = min(timeout, timeout_cap)
             frozen_context = freeze_callback_value(context)
             if not isinstance(frozen_context, Mapping):
                 raise TypeError("role context must freeze to an object")
@@ -5279,6 +5285,105 @@ class ReviewController:
             })
         for disposition in state.review.dispositions:
             state.journal.emit("candidate_disposition", _json_value(disposition))
+
+    def _associate_unmatched_review_threads(self, state: _RunState) -> None:
+        """Link confirmed findings only; the publisher still rechecks the live thread."""
+        if self.thread_matcher is None or not state.inputs.review_threads:
+            return
+        matched = {row["fingerprint"] for row in state.review_thread_associations}
+        used = {row["target"] for row in state.review_thread_associations}
+
+        def assessment(item):
+            return state.review_thread_assessments.get(item["target"], {}).get("assessment", item.get("prior_assessment"))
+
+        snapshots = {
+            item["target"]: item for item in state.inputs.review_threads
+            if item.get("discussion_complete") is True and not item.get("is_resolved")
+            and item.get("head_sha") == state.inputs.head_sha
+            and item["target"] not in used
+            and assessment(item) not in {"fixed", "disproven"}
+        }
+        exact = {item.get("fingerprint") for item in snapshots.values()}
+        findings = []
+        options = {}
+        for finding in state.review.accepted:
+            if finding.root_cause_fingerprint in matched or finding.root_cause_fingerprint in exact:
+                continue
+            paths = {finding.affected_file}
+            for evidence_id in finding.supporting_evidence_ids:
+                record = state.evidence.lookup_canonical(evidence_id)
+                if (record is not None and record.source_path
+                        and record.provenance.head_sha == state.inputs.head_sha
+                        and record.is_usable_for_coverage and not record.truncated):
+                    paths.add(record.source_path)
+            relevant = [item for item in snapshots.values() if item["path"] in paths]
+            relevant.sort(key=lambda item: (
+                item["path"] != finding.affected_file,
+                item.get("line") != finding.line or item.get("side") != "RIGHT",
+                assessment(item) != "still_present",
+                abs(item["line"] - finding.line)
+                if isinstance(item.get("line"), int) and finding.line is not None else float("inf"),
+                item["target"],
+            ))
+            if not relevant:
+                continue
+            options[finding.candidate_id] = (finding, {item["target"] for item in relevant[:3]})
+            findings.append({
+                "candidate_id": finding.candidate_id,
+                "location": finding.affected_location,
+                "claim": mask_runtime_text(finding.claim, limit=600),
+                "causal_chain": mask_runtime_text(finding.causal_chain, limit=600),
+                "threads": [{
+                    "target": item["target"], "path": item["path"], "line": item.get("line"),
+                    "assessment": assessment(item),
+                    "comments": [
+                        mask_runtime_text(comment.get("body", ""), limit=600)
+                        for comment in tuple(item.get("comments", ()))[:1] + tuple(item.get("comments", ()))[-2:][1:]
+                    ],
+                } for item in relevant[:3]],
+            })
+            if len(findings) == 4:
+                break
+        if not findings:
+            return
+        try:
+            response = self._model_request(
+                state, role="thread_matcher", request_id="thread_matcher:1",
+                phase=RunPhase.FINALIZATION, component=self.thread_matcher, method="match",
+                context={"findings": findings}, max_attempts=1, timeout_cap=60,
+            )
+            rows = response.get("matches") if isinstance(response, Mapping) else None
+            if not isinstance(rows, (list, tuple)) or len(rows) > len(findings):
+                raise ValueError("expected at most one match per presented finding")
+            seen = set()
+            for row in rows:
+                if not isinstance(row, Mapping) or set(row) != {"candidate_id", "target"}:
+                    raise ValueError("malformed historical match")
+                candidate_id = row["candidate_id"]
+                if not isinstance(candidate_id, str) or candidate_id not in options or candidate_id in seen:
+                    raise ValueError("unknown or repeated candidate in historical match")
+                seen.add(candidate_id)
+            for row in rows:
+                finding, possible = options[row["candidate_id"]]
+                target = row["target"]
+                if target is None:
+                    continue
+                if not isinstance(target, str) or target not in possible or target in used:
+                    state.journal.emit("review_thread_association_rejected", {
+                        "candidate_id": finding.candidate_id, "reason": "fallback target unavailable or not disclosed for this finding",
+                    })
+                    continue
+                used.add(target)
+                state.review_thread_associations.append({
+                    "candidate_id": finding.candidate_id, "fingerprint": finding.root_cause_fingerprint,
+                    "target": target, "kind": "duplicate", "update": "", "snapshot": snapshots[target],
+                })
+                state.journal.emit("review_thread_association_matched", {
+                    "candidate_id": finding.candidate_id, "target": target, "source": "fallback",
+                })
+        except Exception as exc:
+            state.journal.emit("review_thread_association_fallback_failed", {"reason": _bounded_error(exc)})
+
     @staticmethod
     def _rejected_candidate_diagnostics(
         state: _RunState,
@@ -7756,6 +7861,7 @@ class ReviewController:
                     "obligation_id": request.obligation_id,
                 })
             self._finalize_products(state)
+            self._associate_unmatched_review_threads(state)
 
             self._complete_phase(state)
             state.required_note_count = self._required_note_count(state)

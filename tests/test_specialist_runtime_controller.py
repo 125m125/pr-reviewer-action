@@ -236,6 +236,81 @@ def test_critic_thread_association_preserves_authorized_finding(tmp_path, kind, 
     assert any(note.kind == ReviewNoteKind.FINDING for note in result.notes)
 
 
+@pytest.mark.parametrize("selected,expected", [("H1", 1), ("H99", 0), (None, 0)])
+def test_fallback_matches_only_disclosed_threads_without_changing_findings(tmp_path, selected, expected):
+    inputs = _inputs(tmp_path)
+    snapshot = {"target": "H1", "thread_id": "T1", "path": "src/worker.py", "line": 7,
+                "side": "RIGHT", "head_sha": inputs.head_sha, "discussion_complete": True,
+                "comments": [{"body": "The earlier worker failure."}], "origin": "managed"}
+    formerly_fixed = {**snapshot, "target": "H99", "thread_id": "T99", "prior_assessment": "fixed"}
+    def matcher(request):
+        finding, = request.context["findings"]
+        assert [row["target"] for row in finding["threads"]] == ["H1"]
+        return {"matches": [{"candidate_id": finding["candidate_id"], "target": selected}]}
+
+    result = _controller(tmp_path, thread_matcher=matcher).run(replace(inputs, review_threads=(snapshot, formerly_fixed)))
+    assert len(result.artifact["review_threads"]["associations"]) == expected
+    assert sum(note.kind == ReviewNoteKind.FINDING for note in result.notes) == 1
+
+
+def test_historical_matcher_does_not_retry_a_rejected_provider_request():
+    from pr_reviewer.specialist_runtime.model_gateway import OpenAIModelGateway
+
+    requests = []
+    def transport(_base_url, _api_format, payload, *_args, **_kwargs):
+        requests.append(payload)
+        raise ModelRequestError("response_format unsupported", status=400)
+
+    gateway = OpenAIModelGateway(
+        base_url="http://model.test/v1", api_key="test", default_model="model", transport=transport,
+    )
+    adapter = GatewayRoleAdapter(gateway, response_format_override="json_object")
+    with pytest.raises(ModelRequestError, match="response_format unsupported"):
+        adapter.complete(RoleRequest(
+            role="thread_matcher", request_id="thread_matcher:1", phase=RunPhase.FINALIZATION,
+            lease=controller_module.SessionLease(RunPhase.FINALIZATION, 10**20),
+            timeout_sec=30, max_tokens=512, context={"findings": []}, max_attempts=1,
+        ))
+    assert len(requests) == 1
+    assert "tools" not in requests[0]
+
+
+def test_historical_matcher_shortlists_cited_cross_file_source_not_unrelated_thread(tmp_path):
+    from pr_reviewer.specialist_runtime.adjudication import AcceptedFinding, AdjudicatedReview
+    from pr_reviewer.specialist_runtime.evidence import EvidenceProvenance
+
+    inputs = _inputs(tmp_path)
+    snapshots = tuple({
+        "target": target, "path": path, "head_sha": inputs.head_sha,
+        "discussion_complete": True, "comments": [{"body": "Old report about delivery."}],
+    } for target, path in (("H1", "src/caller.py"), ("H2", "src/unrelated.py")))
+    store = EvidenceStore()
+    evidence = store.add_tool_result(
+        session_id="S1", tool="read_file", arguments={"path": "src/caller.py"},
+        result={"status": "ok", "content": "retry(worker)"},
+        provenance=EvidenceProvenance(head_sha=inputs.head_sha),
+    )
+    finding = AcceptedFinding(
+        candidate_id="C1", root_cause_fingerprint="new-fingerprint", deduplication_key="delivery",
+        claim="The retry processes the delivery twice.", user_visible_consequence="Duplicate delivery.",
+        affected_file="src/worker.py", line=7, causal_chain="The caller retries after a committed result.",
+        severity="major", category="correctness", supporting_evidence_ids=(evidence.id,),
+        contradicting_evidence_ids=(), related_obligation_ids=(), supporting_citations=(),
+        contradicting_citations=(), manual_validation="", confidence_rationale="",
+    )
+    state = _RunState(replace(inputs, review_threads=snapshots), EventJournal(), RunDeadline(0, 100, PhaseShares()), store)
+    state.review = AdjudicatedReview(accepted=(finding,))
+    def matcher(request):
+        candidate, = request.context["findings"]
+        assert [item["target"] for item in candidate["threads"]] == ["H1"]
+        return {"matches": [{"candidate_id": "C1", "target": "H2"}]}
+
+    _controller(tmp_path, thread_matcher=matcher)._associate_unmatched_review_threads(state)
+    assert any(event.kind == "review_thread_association_rejected" for event in state.journal.snapshot())
+    assert not state.review_thread_associations
+    assert state.review.accepted == (finding,)
+
+
 def test_unassessed_old_blocker_requires_human_review_without_new_blocker(tmp_path):
     inputs = _inputs(tmp_path)
     state = _RunState(inputs=replace(inputs, review_threads=({

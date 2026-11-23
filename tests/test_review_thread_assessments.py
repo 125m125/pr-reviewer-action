@@ -53,6 +53,20 @@ def test_valid_assessment_is_durable_and_preserves_controller_identity():
     assert ledger.state()["pending"] == []
 
 
+def test_bad_citation_names_failure_and_offers_usable_source():
+    store = EvidenceStore()
+    matching = evidence(store)
+    bad = evidence(store, head="b" * 40)
+    ledger = ReviewThreadLedger([thread()], head_sha="a" * 40)
+    result = ledger.assess(dict(target="H1", assessment="fixed", reason="The fix is visible.",
+                               evidence_ids=[bad.id]), store)
+    assert result["status"] == "rejected"
+    assert result["failed_check"] == "review_thread.evidence_ids"
+    assert result["rejected_evidence"] == [{"evidence_id": bad.id, "reason": "wrong_head"}]
+    assert result["acceptable_evidence"][0]["evidence_id"] == matching.id
+    assert not ledger.assessments
+
+
 def test_incomplete_discussion_cannot_be_declared_fixed():
     store = EvidenceStore()
     record = evidence(store)
@@ -70,10 +84,11 @@ def test_model_cannot_grant_resolution_authority():
 
 
 def test_state_exposes_only_one_full_thread_and_compact_queue():
-    snapshots = [thread(), {**thread(), "target": "H2", "thread_id": "T2"}]
+    snapshots = [thread(viewer_can_resolve=False), {**thread(), "target": "H2", "thread_id": "T2"}]
     ledger = ReviewThreadLedger(snapshots, head_sha="a" * 40)
     state = ledger.state()
     assert state["current_thread"]["target"] == "H1"
+    assert "viewer_can_resolve" not in state["current_thread"]
     assert len(state["pending"]) == 2
     assert "comments" not in state["pending"][1]
     store = EvidenceStore()

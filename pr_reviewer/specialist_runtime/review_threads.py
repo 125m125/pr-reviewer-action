@@ -126,7 +126,10 @@ class ReviewThreadLedger:
 
     def state(self):
         pending = [item for key, item in self.threads.items() if key not in self._assessments]
-        return {"current_thread": deepcopy(pending[0]) if pending else None,
+        current = deepcopy(pending[0]) if pending else None
+        if current is not None:
+            current.pop("viewer_can_resolve", None)  # Publishing permission is not model authority.
+        return {"current_thread": current,
                 "last_rejection": deepcopy(self._last_rejection),
                 "pending": [{"target": item["target"], "path": item["path"], "line": item.get("line")}
                             for item in pending],
@@ -137,10 +140,10 @@ class ReviewThreadLedger:
                     for row in tuple(self._assessments.values())[-4:]]}
 
     def assess(self, raw, evidence_store):
-        def reject(reason):
+        def reject(reason, **diagnostics):
             self._last_rejection = {"target": str(raw.get("target", ""))[:80] if isinstance(raw, Mapping) else "",
-                                    "reason": reason}
-            return {"status": "rejected", "reason": reason, "thread_state": self.state()}
+                                    "reason": reason, **diagnostics}
+            return {"status": "rejected", "reason": reason, **diagnostics, "thread_state": self.state()}
 
         if not isinstance(raw, Mapping) or set(raw) - set(ASSESS_REVIEW_THREAD_SCHEMA["parameters"]["properties"]):
             return reject("Use only target, assessment, reason, evidence_ids and optional update; identity and permissions are controller-owned.")
@@ -162,17 +165,53 @@ class ReviewThreadLedger:
                 or not isinstance(ids, (list, tuple)) or len(ids) > 12
                 or not all(isinstance(value, str) for value in ids)):
             return reject("Supply a bounded reason, optional update, and at most 12 retained evidence IDs.")
+        def evidence_error(record):
+            if record is None:
+                return "not_retained"
+            if record.provenance.head_sha != self.head_sha:
+                return "wrong_head"
+            if record.truncated:
+                return "truncated"
+            if not record.is_usable_for_coverage:
+                return "not_usable"
+            return ""
+
+        def comment_source(record):
+            return (record.source_path == snapshot["path"] and record.content.strip()
+                    and record.tool in {"read_file", "read_pr_diff", "git_grep", "git_blame"}
+                    and (record.source_range is None or record.source_range.get("lines", 0) > 0))
+
+        def evidence_rejection(reason, rejected=()):
+            available = []
+            for record in evidence_store.snapshot().records:
+                if not evidence_error(record) and comment_source(record):
+                    available.append({"evidence_id": record.id, "source_path": record.source_path,
+                                      "tool": record.tool})
+                    if len(available) == 4:
+                        break
+            return reject(reason, failed_check="review_thread.evidence_ids",
+                          rejected_evidence=list(rejected), acceptable_evidence=available,
+                          repair_hints=[
+                              "Keep only usable citations that support your conclusion. "
+                              "A conclusive assessment needs current-head source for the commented path."
+                              if available else
+                              "Read the relevant lines of the commented path at the current head, "
+                              "or record unverified if you cannot establish the result."
+                          ])
+
         records = [evidence_store.lookup_canonical(value) for value in ids]
-        if any(record is None or not record.is_usable_for_coverage or record.truncated
-               or record.provenance.head_sha != self.head_sha for record in records):
-            return reject("Use successful, complete retained evidence from the current immutable head; pagination alone is allowed.")
+        invalid = [{"evidence_id": mask_secrets(value)[:160], "reason": error}
+                   for value, record in zip(ids, records) if (error := evidence_error(record))]
+        if invalid:
+            return evidence_rejection(
+                "Use successful, complete retained evidence from the current immutable head; pagination alone is allowed.",
+                invalid,
+            )
         if assessment != "unverified":
-            if (snapshot.get("head_sha") != self.head_sha or not snapshot.get("discussion_complete")
-                    or not any(record.source_path == snapshot["path"] and record.content.strip()
-                               and record.tool in {"read_file", "read_pr_diff", "git_grep", "git_blame"}
-                               and (record.source_range is None or record.source_range.get("lines", 0) > 0)
-                               for record in records)):
-                return reject("A conclusion requires the complete discussion and current-head source evidence for the commented path. Otherwise record unverified.")
+            if snapshot.get("head_sha") != self.head_sha or not snapshot.get("discussion_complete"):
+                return reject("A conclusion requires a complete discussion bound to the current head. Otherwise record unverified.")
+            if not any(comment_source(record) for record in records):
+                return evidence_rejection("A conclusion requires current-head source evidence for the commented path.")
         self._assessments[target] = {
             "target": target, "assessment": assessment, "reason": mask_secrets(reason.strip()),
             "evidence_ids": list(dict.fromkeys(ids)), "update": mask_secrets(update.strip()),

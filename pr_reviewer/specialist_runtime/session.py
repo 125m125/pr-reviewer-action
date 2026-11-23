@@ -3645,7 +3645,9 @@ class SpecialistSession:
             return True
 
         payload, accepted = self._admit_candidate(arguments)
-        self._add_tool_result(call_id, payload)
+        self._add_tool_result(call_id, payload, committed_receipt=payload if accepted else None)
+        if accepted:
+            self._snapshot()
         return accepted
 
     def _admit_candidate(
@@ -4337,26 +4339,23 @@ class SpecialistSession:
                     )
                 except (ValueError, TypeError):
                     pass
-        for index, call in enumerate(calls):
+        for call in calls:
             call_id = str(call.get("id") or "")
             name = str(call.get("name") or "")
             if self._review_thread_followup and not self._review_threads.has_pending:
                 self._add_tool_result(call_id, {"status": "rejected", "reason": "review_thread_batch_complete"})
                 continue
-            if self._tool_calls_deferred_for_checkpoint or self._checkpoint_pressure_due(
-                reserve_tool_result=True, reserve_response=False,
+            if name not in {"assess_review_thread", "report_candidate"} and (
+                self._tool_calls_deferred_for_checkpoint or self._checkpoint_pressure_due(
+                    reserve_tool_result=True, reserve_response=False,
+                )
             ):
-                for deferred in calls[index:]:
-                    self._add_tool_result(
-                        str(deferred.get("id") or ""),
-                        {
-                            "status": "deferred",
-                            "reason": "checkpoint_required",
-                            "retry_after_compaction": True,
-                        },
-                    )
+                self._add_tool_result(call_id, {
+                    "status": "deferred", "reason": "checkpoint_required",
+                    "retry_after_compaction": True,
+                })
                 self._tool_calls_deferred_for_checkpoint = True
-                break
+                continue
             try:
                 arguments = decode_native_tool_arguments(call.get("arguments"))
             except (json.JSONDecodeError, ValueError, TypeError) as exc:
@@ -4365,8 +4364,15 @@ class SpecialistSession:
                 continue
             if name == "assess_review_thread":
                 result = self._review_threads.assess(arguments, self.evidence_store)
-                self._add_tool_result(call_id, result, is_error=result["status"] == "rejected")
-                if result["status"] == "accepted":
+                accepted = result["status"] == "accepted"
+                receipt = {key: value for key, value in result.items() if key != "thread_state"}
+                self._add_tool_result(
+                    call_id, result if accepted and self._review_threads.has_pending else receipt,
+                    is_error=not accepted, committed_receipt={
+                        **receipt, "next_thread_after_compaction": True,
+                    } if accepted else None,
+                )
+                if accepted:
                     self._snapshot()
                     progressed = True
                 continue
@@ -5649,7 +5655,8 @@ class SpecialistSession:
                 (item.kind, item.target) not in accepted_corrections
                 for item in change_rejections
             ) or bool(self._last_checkpoint_rejections)
-            if (not unfinished_lead and not unfinished_corrections
+            unfinished_history = self._review_thread_followup and self._review_threads.has_pending
+            if (not unfinished_history and not unfinished_lead and not unfinished_corrections
                     and (self._followup_outcome_recorded() or assignment_complete)):
                 # Completing a selected follow-up does not close remaining component gaps.
                 # Return those to the scheduler instead of replaying the original task.
@@ -5683,6 +5690,9 @@ class SpecialistSession:
                 str(item) for item in self.obligation_assessments.assessments()
             ],
             "evidence_ids": sorted(checkpoint.evidence_ids),
+            "historical_assessments": [
+                (row["target"], row["assessment"]) for row in self._review_threads.assessments
+            ],
         }
         return hashlib.sha256(json.dumps(
             payload, sort_keys=True, separators=(",", ":"), default=str,
@@ -7775,6 +7785,7 @@ class SpecialistSession:
     def _add_tool_result(
         self, call_id: str, result: object, *, is_error: bool = False,
         max_bytes: int | None = None,
+        committed_receipt: Mapping[str, object] | None = None,
     ) -> None:
         """Persist privacy-safe tool outcome counters across transcript compaction."""
         if max_bytes is None:
@@ -7788,15 +7799,20 @@ class SpecialistSession:
             len(self.conversation.events) > event_count
             and key and not (isinstance(result, Mapping) and result.get("status") == "deferred")
             and not (self._review_thread_followup and not self._review_threads.has_pending)
-            and self._checkpoint_pressure_due()
+            and (self._checkpoint_pressure_due()
+                 or (committed_receipt is not None
+                     and self.conversation.events[-1]["metadata"].get("truncated") == "true"))
         ):
-            self._deferred_tool_results[key] = (
-                self.conversation.events[-1],
-                self._tool_call_evidence_ids.get(call_id, ""),
-            )
+            if committed_receipt is None:
+                self._deferred_tool_results[key] = (
+                    self.conversation.events[-1],
+                    self._tool_call_evidence_ids.get(call_id, ""),
+                )
             del self.conversation.events[event_count:]
-            result = {"status": "deferred", "reason": "checkpoint_required",
-                      "retry_after_compaction": True, "result_retained": True}
+            result = committed_receipt if committed_receipt is not None else {
+                "status": "deferred", "reason": "checkpoint_required",
+                "retry_after_compaction": True, "result_retained": True,
+            }
             is_error = False
             self.conversation.add_tool_result(call_id, result, max_bytes=max_bytes)
             self._tool_calls_deferred_for_checkpoint = True

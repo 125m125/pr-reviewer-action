@@ -275,11 +275,16 @@ def test_native_review_contains_handoff_without_sticky_comment(tmp_path):
     assert "Reviewed head: `" + "a" * 40 + "`" in body
 
 
-@pytest.mark.parametrize("origin,stale,human_reply,expected", [
-    ("managed", False, False, ["reply", "resolve"]), ("human", False, False, []),
-    ("managed", True, False, []), ("managed", False, True, []),
+@pytest.mark.parametrize("origin,stale,human_reply,permission,after_permission,expected", [
+    ("managed", False, False, True, True, ["reply", "resolve"]),
+    ("managed", False, False, False, False, ["reply"]),
+    ("managed", False, False, True, False, ["reply"]),
+    ("human", False, False, True, True, []),
+    ("managed", True, False, True, True, []), ("managed", False, True, True, True, []),
 ])
-def test_explicit_reassessment_needs_live_owned_uncontested_thread(tmp_path, origin, stale, human_reply, expected):
+def test_explicit_reassessment_needs_live_owned_uncontested_thread(
+    tmp_path, origin, stale, human_reply, permission, after_permission, expected,
+):
     client = _FakeClient()
     snapshot = dict(target="H1", origin=origin, repository="owner/repo", pr_number=17, head_sha="a"*40,
                     thread_id="T", comment_id=10, last_comment_id=10, path="a.py", line=6, side="RIGHT",
@@ -287,15 +292,21 @@ def test_explicit_reassessment_needs_live_owned_uncontested_thread(tmp_path, ori
                     human_reply=human_reply, is_resolved=False, comments=[{"id":10,"author":"starter","body":"concern"}])
     def live(*_args):
         if any(c[0] == "reply" for c in client.calls):
-            return ({**snapshot, "last_comment_id":901, "comments":[*snapshot["comments"],
+            return ({**snapshot, "last_comment_id":901, "viewer_can_resolve": after_permission,
+                     "comments":[*snapshot["comments"],
                     {"id":901,"author":"bot","body":client.calls[-1][2]}]},)
-        return ({**snapshot, "last_comment_id":11 if stale else 10},)
+        return ({**snapshot, "last_comment_id":11 if stale else 10, "viewer_can_resolve": permission},)
     client.query_review_threads = live
     result, _ = _publish(tmp_path, client, review_thread_snapshots=[snapshot], review_thread_assessments=[
         dict(target="H1", assessment="fixed", reason="The parser now rejects empty tokens on line 6.",
              evidence_ids=["E1"], update="", snapshot=snapshot)])
     assert result["review_completed"] and not result["publication_errors"]
     assert [c[0] for c in client.calls if c[0] in {"reply","resolve"}] == expected
+    if not permission:
+        reply = next(c[2] for c in client.calls if c[0] == "reply")
+        assert "The parser now rejects empty tokens" in reply
+        assert "maintainer" in reply
+        assert not result.get("confirmed_historical_resolutions")
 
 
 def test_unchanged_historical_assessment_does_not_revalidate_for_publication(tmp_path):
@@ -2367,9 +2378,10 @@ def test_thread_snapshot_authenticates_roots_and_keeps_latest_comment_after_clip
             return {"data": {"viewer": {"login": "bot"}, "repository": {"nameWithOwner": "o/r",
                     "pullRequest": {"id": "P", "headRefOid": "a"*40, "baseRepository": {"nameWithOwner": "o/r"}}}}}
         if "ManagedReviewThreads" in query:
+            assert "viewerCanResolve" in query
             return {"data": {"node": {"reviewThreads": _connection([
                 {"id": str(i), "isResolved": False, "subjectType": "LINE", "path": "a.py", "originalLine": 4,
-                 "diffSide": "RIGHT"} for i in range(4)])}}}
+                 "diffSide": "RIGHT", "viewerCanResolve": i == 1} for i in range(4)])}}}
         if "ManagedReviews" in query:
             return {"data": {"node": {"reviews": _connection([])}}}
         login, typ, own, body = roots[int(variables["threadId"])]
@@ -2382,6 +2394,7 @@ def test_thread_snapshot_authenticates_roots_and_keeps_latest_comment_after_clip
     monkeypatch.setattr(client, "_graphql", graphql)
     snapshots = client.query_review_threads("o/r", 17, "a"*40)
     assert [(s["target"], s["origin"]) for s in snapshots] == [("H1", "human"), ("H2", "managed")]
+    assert [s["viewer_can_resolve"] for s in snapshots] == [False, True]
     assert snapshots[1]["last_comment_id"] == 110 and snapshots[1]["human_reply"]
     assert not snapshots[1]["discussion_complete"] and snapshots[0]["discussion_complete"]
 
