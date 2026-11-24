@@ -1318,6 +1318,7 @@ class ReviewInputs:
     pr_metadata: Mapping[str, Any] = field(default_factory=dict)
     configuration_warnings: tuple[str, ...] = ()
     adapter_configuration: Mapping[str, Any] = field(default_factory=dict)
+    load_closed_thread_objections: Callable[[tuple[str, ...]], Sequence[Mapping[str, Any]]] | None = None
 
 
 def _change_components(
@@ -4082,10 +4083,7 @@ class ReviewController:
             ),
             excluded_obligation_ids=tuple(sorted(set(excluded_obligation_ids))),
             changed_files=state.inputs.changed_files,
-            investigation_leads=tuple(
-                state.investigation_leads[key]
-                for key in sorted(state.investigation_leads)
-            ),
+            investigation_leads=tuple(state.investigation_leads.values()),
         )
 
     def _negotiate(
@@ -4232,7 +4230,31 @@ class ReviewController:
 
     def _queue_review_threads(self, state: _RunState) -> None:
         """Optional leads only after independent exploration, never hard obligations."""
-        for snapshot in state.inputs.review_threads:
+        candidate_lines: dict[str, set[int]] = {}
+        evidence_paths = set()
+        for candidate in (*state.inputs.candidate_findings, *state.candidate_occurrences.values()):
+            path, _, line = candidate.affected_location.partition(":")
+            lines = candidate_lines.setdefault(path, set())
+            if line.isascii() and line.isdecimal():
+                lines.add(int(line))
+            for evidence_id in candidate.supporting_evidence_ids:
+                record = state.evidence.lookup_canonical(evidence_id)
+                if (record is not None and record.source_path and record.is_usable_for_coverage
+                        and not record.truncated and record.provenance.head_sha == state.inputs.head_sha):
+                    evidence_paths.add(record.source_path)
+
+        def signals(snapshot):
+            path, line = snapshot["path"], snapshot.get("line")
+            nearby = isinstance(line, int) and any(abs(line - other) <= 8 for other in candidate_lines.get(path, ()))
+            return (
+                (nearby, "near a current candidate"),
+                (snapshot.get("previously_reported_fixed"), "previously reported fixed; check for recurrence"),
+                (snapshot.get("has_human_objection"), "human disputed the earlier claim"),
+                (not nearby and path in candidate_lines, "same file as a current candidate"),
+                (path in evidence_paths, "current candidate cites evidence from this file"),
+            )
+
+        for snapshot in sorted(state.inputs.review_threads, key=lambda row: tuple(not applies for applies, _ in signals(row))):
             if snapshot.get("prior_assessment") in {"still_present", "fixed", "disproven"}:
                 state.journal.emit("review_thread_reassessment_reused", {"target": snapshot["target"]})
                 continue
@@ -4245,8 +4267,12 @@ class ReviewController:
             owners = [assignment for assignment in owners if assignment.owner_component_id] or owners
             owner = owners[0] if len(owners) == 1 else None
             session_id = state.assignment_sessions.get(owner.id, "") if owner else ""
+            reasons = [reason for applies, reason in signals(snapshot) if applies]
+            summary = f"Reassess unresolved review discussion {target} on {path}"
+            if reasons:
+                summary += " (" + "; ".join(reasons) + ")"
             state.investigation_leads[lead_id] = InvestigationLead(
-                lead_id=lead_id, summary=f"Reassess unresolved review discussion {target} on {path}",
+                lead_id=lead_id, summary=summary,
                 affected_paths=(path,), evidence_ids=(),
                 next_action=(f"Independently verify discussion {target} against current code; "
                              "reuse current candidate evidence where relevant. Use assess_review_thread, "
@@ -4821,10 +4847,19 @@ class ReviewController:
     def _critic_context_slice(context, candidates):
         ids = {item.candidate_id for item in candidates}
         obligation_ids = {oid for item in candidates for oid in item.related_obligation_ids}
+        def near_objection(candidate, objection):
+            path, _, line = candidate.affected_location.partition(":")
+            return path == objection["path"] and (
+                not line.isdigit() or abs(int(line) - objection["line"]) <= 8
+            )
         return {
             **context,
             "review_threads": tuple(item for item in context.get("review_threads", ())
                                     if any(candidate.affected_location.split(":", 1)[0] == item["path"] for candidate in candidates))[:8],
+            "closed_thread_objections": tuple(
+                item for item in context.get("closed_thread_objections", ())
+                if any(near_objection(candidate, item) for candidate in candidates)
+            )[:4],
             "candidates": tuple(candidates),
             "candidate_evidence": {key: value for key, value in context["candidate_evidence"].items()
                                    if key in ids},
@@ -4920,9 +4955,11 @@ class ReviewController:
                     and decision_bytes <= max(1, output_tokens - 256) * 3)
 
         batches, current = [], []
+        # Optional objections must not split an otherwise valid batch.
+        sizing_context = {**context, "closed_thread_objections": ()}
         for candidate in context["candidates"]:
             proposed = (*current, candidate)
-            if current and not fits(proposed, self._critic_context_slice(context, proposed)):
+            if current and not fits(proposed, self._critic_context_slice(sizing_context, proposed)):
                 batches.append(tuple(current))
                 current = []
             current.append(candidate)
@@ -4933,6 +4970,8 @@ class ReviewController:
             batch_context = self._critic_context_slice(context, candidates)
             # History is optional. Drop whole discussions before letting them
             # crowd out an otherwise reviewable candidate and its proof.
+            while batch_context["closed_thread_objections"] and self._critic_context_bytes(batch_context) > limit:
+                batch_context["closed_thread_objections"] = batch_context["closed_thread_objections"][:-1]
             while batch_context["review_threads"] and self._critic_context_bytes(batch_context) > limit:
                 batch_context["review_threads"] = batch_context["review_threads"][:-1]
             request_id = "critic:1" if len(batches) == 1 else f"critic:batch:{index}"
@@ -5025,6 +5064,13 @@ class ReviewController:
             fallback_candidate_ids.update(item.candidate_id for item in candidates)
         else:
             try:
+                closed_objections = ()
+                if state.inputs.load_closed_thread_objections is not None:
+                    try:
+                        locations = tuple(dict.fromkeys(candidate.affected_location for candidate in candidates))
+                        closed_objections = state.inputs.load_closed_thread_objections(locations)
+                    except Exception as exc:
+                        state.journal.emit("review_thread_objections_unavailable", {"reason": _bounded_error(exc)})
                 retained = {
                     record.id: record
                     for record in state.evidence.snapshot().records
@@ -5088,6 +5134,9 @@ class ReviewController:
                     "candidates": candidates,
                     "candidate_evidence": candidate_evidence,
                     "candidate_assessments": candidate_assessments,
+                    "closed_thread_objections": tuple({
+                        field: item[field] for field in ("path", "line", "prior_finding", "human_objection")
+                    } for item in closed_objections),
                     "review_threads": tuple({
                         "target": item["target"], "path": item["path"], "line": item.get("line"),
                         "origin": item["origin"], "discussion_complete": item.get("discussion_complete", False),

@@ -236,6 +236,52 @@ def test_critic_thread_association_preserves_authorized_finding(tmp_path, kind, 
     assert any(note.kind == ReviewNoteKind.FINDING for note in result.notes)
 
 
+def test_closed_thread_objections_are_advisory_critic_context(tmp_path):
+    inputs = _inputs(tmp_path)
+    objection = {"path": "src/worker.py", "line": 7, "prior_finding": "Old delivery finding",
+                 "human_objection": "False positive: only internal callers can reach this."}
+    requests = []
+
+    def critic(request):
+        requests.append(request.context)
+        return {"actions": [{"candidate_id": item.candidate_id, "action": "keep"}
+                            for item in request.context["candidates"]]}
+
+    def load_objections(locations):
+        assert locations == ("src/worker.py:7",)
+        assert not requests
+        return (objection, {**objection, "path": "src/other.py"}, {**objection, "line": 70})
+
+    result = _controller(tmp_path, critic=critic).run(replace(inputs, load_closed_thread_objections=load_objections))
+    context, = requests
+    assert context["closed_thread_objections"] == (objection,)
+    assert context["review_threads"] == ()
+    assert not result.artifact["review_threads"]["associations"]
+    assert any(note.kind == ReviewNoteKind.FINDING for note in result.notes)
+
+
+def test_historical_queue_prioritizes_candidate_overlap_and_prior_fix(tmp_path):
+    history = tuple({"target": f"H{i}", "path": "unrelated.py", "line": i}
+                    for i in range(1, 34))
+    matching = {"target": "H34", "path": "src/worker.py", "line": 7}
+    regression = {"target": "H35", "path": "src/other.py", "line": 2, "previously_reported_fixed": True}
+    disputed = {"target": "H36", "path": "src/x.py", "line": 3, "has_human_objection": True}
+    inputs = replace(_inputs(tmp_path), review_threads=(*history, matching, regression, disputed))
+    summaries = []
+
+    def negotiator(request):
+        summaries.append([row["summary"] for row in request.context["negotiation_targets"] if row["handle"].startswith("L")])
+        raise RuntimeError("use deterministic fallback after capturing scheduling context")
+
+    result = _controller(tmp_path, negotiator=negotiator).run(inputs)
+    queued = [row["payload"] for row in result.artifact["events"] if row["kind"] == "review_thread_queued"]
+    assert [row["target"] for row in queued[:3]] == ["H34", "H35", "H36"]
+    assert len(queued) == 32
+    assert "near a current candidate" in summaries[0][0]
+    assert "check for recurrence" in summaries[0][1]
+    assert "human disputed the earlier claim" in summaries[0][2]
+
+
 @pytest.mark.parametrize("selected,expected", [("H1", 1), ("H99", 0), (None, 0)])
 def test_fallback_matches_only_disclosed_threads_without_changing_findings(tmp_path, selected, expected):
     inputs = _inputs(tmp_path)

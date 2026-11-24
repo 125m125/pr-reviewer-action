@@ -572,7 +572,8 @@ def _negotiable_leads(state: NegotiationState) -> tuple[InvestigationLead, ...]:
                 InvestigationLeadStatus.SCHEDULED,
             }
         ),
-        key=lambda item: item.lead_id,
+        # Historical leads are queued in relevance order by the controller.
+        key=lambda item: (item.kind == "review_thread", "" if item.kind == "review_thread" else item.lead_id),
     ))
 
 
