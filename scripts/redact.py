@@ -42,7 +42,7 @@ _RE_SOURCE_KV_SECRET = re.compile(
     r"(?:[ \t]+[A-Za-z_][A-Za-z0-9_]*=)*"
     r"(?=\s+[A-Za-z_][A-Za-z0-9_]*=))|"
     r"(?P<key>api[_-]?key|api[_-]?token|auth[_-]?token|access[_-]?key|"
-    r"token|password|secret)"
+    r"token|secret)"
     r"(?P<separator>\s*[:=]\s*)"
     r"(?P<quote>['\"])?"
     r"(?P<value>(?(quote)(?:\\.|(?!(?P=quote))[^\\\r\n])*|[^\s'\"]{8,}))"
