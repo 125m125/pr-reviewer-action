@@ -5341,6 +5341,44 @@ def test_checkpoint_partially_accepts_obligations_and_repairs_only_rejections():
     assert "O2" in receipt and "blocked" in receipt
 
 
+def test_boundary_checkpoint_repairs_only_citations_without_reinvestigation():
+    from pr_reviewer.specialist_runtime.evidence import EvidenceProvenance
+
+    gateway = ScriptedGateway([])
+    head = "a" * 40
+    obligation = CoverageObligation("OB-api", "boundary-participant", "consumer",
+        required_evidence_categories=("tool-result",), boundary_id="api",
+        participant_id="consumer", boundary_endpoint_paths=("a.py",), seed_hints=("a.py",))
+    session = make_session(gateway, repository_head_sha=head, obligations=(obligation,),
+        assignment=SpecialistAssignment("api", "Check consumer behavior", primary_obligation_ids=(obligation.id,)))
+    good = session.evidence_store.add_tool_result(session_id="S1", tool="read_file",
+        arguments={"path": "a.py"}, result={"status": "ok", "content": "accept(request.id)"},
+        provenance=EvidenceProvenance(head_sha=head))
+    bad = session.evidence_store.add_tool_result(session_id="S1", tool="read_file",
+        arguments={"path": "a.py", "limit": 100}, result={"status": "ok", "content": "partial", "truncated": True},
+        provenance=EvidenceProvenance(head_sha=head))
+    reason = "The consumer still accepts the request identity."
+    gateway.responses = [
+        checkpoint_response(inspected=[], unresolved=[], obligation_updates=[{
+            "target": "O1", "disposition": "covered", "reason": reason, "evidence_ids": [bad.id],
+            "next_actions": [],
+        }]),
+        invalid_response(json.dumps({
+            "unresolved": [], "candidate_updates": [], "new_candidates": [],
+            "obligation_updates": [{"target": "O1", "evidence_ids": [good.id]}],
+        })),
+    ]
+
+    result = session.request_checkpoint("controller-request")
+
+    assert len(gateway.requests) == 2
+    prompt = json.loads(gateway.requests[1].messages)[-1]["content"]
+    assert bad.id in prompt and good.id in prompt
+    assessment, = result.checkpoint.obligation_assessments
+    assert assessment.disposition.value == "covered"
+    assert assessment.reason == reason and assessment.evidence_ids == (good.id,)
+
+
 def test_focused_unresolved_correction_preserves_existing_coverage_and_scope():
     session = make_session(ScriptedGateway([]))
     session._execute_calls(({

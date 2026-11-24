@@ -11,6 +11,7 @@ from typing import Iterable, Mapping
 from .evidence import EvidenceRecord, EvidenceSnapshot
 from .obligation_assessment import (
     ObligationAssessment, ObligationDisposition,
+    boundary_citation_repair,
     boundary_participant_source,
     boundary_source_diagnostic as _source_diagnostic,
 )
@@ -60,6 +61,7 @@ def build_boundary_context(
     max_bytes: int,
     obligations: Mapping[str, str] | None = None,
     expected_head_sha: str | None = None,
+    change_scope: str = "",
 ) -> dict:
     if not isinstance(boundary, BoundaryPolicy):
         raise TypeError("boundary must be a BoundaryPolicy")
@@ -101,7 +103,8 @@ def build_boundary_context(
         )
     )
     if contract_records and not any(
-        record.id in cited_ids for record in contract_records
+        record.id in cited_ids and _source_diagnostic(record, expected_head_sha) is None
+        for record in contract_records
     ):
         usable_fallbacks = sorted(
             (
@@ -186,7 +189,20 @@ def build_boundary_context(
             missing.append(participant)
             if not participant_evidence[participant]:
                 diagnostics.append(f"missing usable source evidence for participant {participant}")
-                followups.append(f"Inspect and cite usable source evidence for participant {participant}.")
+                cited = tuple(dict.fromkeys(
+                    item for assessment in participant_assessments for item in assessment.evidence_ids
+                ))
+                if cited:
+                    followups.append(f"Repair {participant}'s boundary citations. " + boundary_citation_repair(
+                        records_by_id, cited, expected_head_sha,
+                        lambda record: any(_participant_source(record, participant, item, boundary)
+                                           for item in participant_assessments),
+                        boundary.endpoint_paths.get(participant, ()),
+                    ))
+                else:
+                    paths = ", ".join(boundary.endpoint_paths.get(participant, ())[:3])
+                    followups.append(f"Inspect and cite usable source evidence for participant {participant}"
+                                     + (f" at {paths}; focus on the changed interaction." if paths else "."))
             else:
                 diagnostics.append(f"participant {participant} assessment remains incomplete or contradicted")
                 actions = list(dict.fromkeys(
@@ -210,7 +226,7 @@ def build_boundary_context(
     )
     if boundary.contract_paths and not contract_evidence_ids:
         diagnostics.append("missing usable source evidence for boundary contract")
-        followups.append("Inspect and cite the boundary contract source.")
+        followups.append("Read only the relevant contract slice in " + ", ".join(boundary.contract_paths[:3]) + ".")
 
     invalid_evidence = sorted(
         record.id for record in selected if record.id not in source_records
@@ -235,6 +251,7 @@ def build_boundary_context(
         },
         "assessments": assessment_packets,
         "evidence": [_record_semantics(record) for record in selected],
+        "change_scope": change_scope,
     }
     fingerprint = "boundary:" + hashlib.sha256(
         _canonical_json(semantic).encode("utf-8")
@@ -243,6 +260,7 @@ def build_boundary_context(
         "boundary_id": boundary.id,
         "boundary": semantic["boundary"],
         "question": boundary.objective,
+        "change_scope": change_scope,
         "required_participants": list(participants),
         "assessments": assessment_packets,
         "evidence": evidence_packets,
@@ -404,6 +422,7 @@ def _record_packet(record: EvidenceRecord) -> dict[str, object]:
         "arguments": _arguments(record),
         "source_identity": record.source_identity,
         "source_path": record.source_path,
+        "source_range": record.source_range,
         "provenance": _provenance(record),
         "status": record.status,
         "content": record.content,

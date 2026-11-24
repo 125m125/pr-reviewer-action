@@ -14,6 +14,7 @@ from pr_reviewer.specialists import classify_file_roles
 
 from .assignments import Assignment
 from .boundary_evaluation import _source_diagnostic
+from .callbacks import mask_runtime_text
 from .evidence import EvidenceRecord, EvidenceSnapshot
 from .obligation_assessment import ObligationAssessment, ObligationAssessmentLedger, ObligationDisposition
 from .policy import RecipePolicy, ReviewPolicy
@@ -417,6 +418,30 @@ def derive_obligations(
         ))
         if not contract_changes and not endpoint_changes:
             continue
+        raw_facts = topology.get("change_facts") or {}
+        facts = raw_facts.get("facts", raw_facts) if isinstance(raw_facts, Mapping) else {}
+        groups = [("Contract", contract_changes)]
+        groups.extend(
+            (f"Endpoint {participant}", tuple(path for path in endpoint_changes if any(
+                fnmatch.fnmatchcase(path, pattern)
+                for pattern in boundary.endpoint_paths.get(participant, ())
+            )))
+            for participant in boundary.participants
+        )
+        scope_rows = []
+        for label, paths in groups:
+            shown = ", ".join(paths[:2]) or "no matching changed path"
+            scope_rows.append(f"{label}: {shown}" + (f" (+{len(paths)-2} more)" if len(paths) > 2 else ""))
+        for path in tuple(dict.fromkeys((*endpoint_changes, *contract_changes)))[:3]:
+            fact = facts.get(path) if isinstance(facts, Mapping) else None
+            if not isinstance(fact, Mapping):
+                continue
+            details = (*_strings(fact.get("hunk_summaries"))[:1], *_strings(fact.get("change_excerpts"))[:2])
+            if details:
+                scope_rows.append(f"{path}: " + " | ".join(details))
+        change_scope = mask_runtime_text(
+            "Boundary diff triggers (sample, not proof of no impact): " + "; ".join(scope_rows), limit=1500,
+        )
         affected_owners = [owner for owner in boundary.participants if owner in owner_paths]
         fallback_owner = boundary.contract_change_owner if contract_changes else (
             affected_owners[0] if affected_owners else boundary.contract_change_owner
@@ -444,8 +469,12 @@ def derive_obligations(
                     *boundary.endpoint_paths.get(participant, ()),
                     *component_by_id[participant].get("paths", ()),
                 ))),
-                explanation=f"Check {participant}'s side of {boundary.id}: {boundary.objective}",
+                explanation=(
+                    f"Check {participant}'s side of the changed interaction in {boundary.id}. "
+                    "Use boundary_change_scope to identify the relevant behavior; trace unchanged code only as needed."
+                ),
                 recipe_objective=boundary.objective,
+                boundary_change_scope=change_scope,
             ))
         obligations.append(CoverageObligation(
             obligation_id=_obligation_id("boundary", boundary.id, "compatibility"),
@@ -454,6 +483,7 @@ def derive_obligations(
             satisfaction_predicates=("recorded_evidence",),
             scope=tuple(dict.fromkeys((*contract_changes, *endpoint_changes))),
             seed_hints=boundary.contract_paths, explanation=boundary.objective,
+            boundary_change_scope=change_scope,
         ))
     return tuple(sorted(obligations, key=lambda item: item.id))
 

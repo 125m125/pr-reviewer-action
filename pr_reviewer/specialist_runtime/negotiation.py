@@ -353,6 +353,7 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             "handle": f"U{index}",
             "risk_tier": item.risk_tier,
             "subject": item.subject,
+            **({"boundary_change_scope": item.boundary_change_scope} if item.boundary_change_scope else {}),
             "summary": (
                 assessment.reason if assessment is not None and assessment.reason else
                 checkpoint_summary or
@@ -369,6 +370,10 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
                 if request.obligation_id == item.id
             ),
         })
+    boundary_scopes = {
+        f"boundary:{item.boundary_id}": item.boundary_change_scope
+        for item in state.obligations if item.evaluator_owned and item.boundary_change_scope
+    }
     reserved_delegations = _reserved_delegation_lead_ids(state)
     for index, lead in enumerate(_negotiable_leads(state), start=1):
         allowed_actions = ["record_unknown"]
@@ -408,6 +413,7 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             "risk_tier": "normal",
             "subject": lead.affected_paths[0] if lead.affected_paths else "investigation lead",
             "summary": lead.summary,
+            **({"boundary_change_scope": boundary_scopes[lead.lead_id]} if lead.lead_id in boundary_scopes else {}),
             "allowed_actions": tuple(dict.fromkeys(allowed_actions)),
             "last_conclusion": lead.resolution_reason or lead.last_outcome,
             "attempt_count": lead.attempt_count,

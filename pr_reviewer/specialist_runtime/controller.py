@@ -3825,6 +3825,7 @@ class ReviewController:
                 boundary, assessments, state.evidence.snapshot(),
                 max_bytes=getattr(self.boundary_evaluator, "max_context_bytes", None) or 60_000,
                 obligations=locals_by_id, expected_head_sha=state.inputs.head_sha,
+                change_scope=combined.boundary_change_scope,
             )
             previous = state.boundary_evaluations.get(boundary.id)
             if previous is not None and previous.input_fingerprint == context["input_fingerprint"]:

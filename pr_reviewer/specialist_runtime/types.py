@@ -147,6 +147,7 @@ class CoverageObligation:
     integrated_recipe_ids: tuple[str, ...] = ()
     boundary_endpoint_paths: tuple[str, ...] = ()
     boundary_contract_paths: tuple[str, ...] = ()
+    boundary_change_scope: str = ""
 
     @property
     def id(self) -> str:
