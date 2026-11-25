@@ -2106,6 +2106,7 @@ def test_handoff_summarizer_prompt_limits_prose_to_controller_facts(
     assert "human_focus_facts" in prompt
     assert "controller-authorized orientation" in prompt_lower
     assert "do not invent work absent from the supplied state" in prompt_lower
+    assert "600 characters maximum per field" in prompt_lower
     assert '"human_focus":string' in prompt
     assert "do not list files, findings, severities" in prompt
     assert "do not claim complete coverage" in prompt_lower

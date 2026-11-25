@@ -8271,6 +8271,34 @@ def test_actual_token_overflow_remains_charged_without_retry():
     assert len(gateway.requests) == 1
 
 
+@pytest.mark.parametrize(("tools", "expected"), [
+    (("web_search", "web_fetch", "read_remote_file"), ("web_search", "web_fetch", "read_remote_file", DELEGATE_TOOL_SUMMARY_NAME)),
+    (("read_remote_file",), ("read_remote_file", DELEGATE_TOOL_SUMMARY_NAME)),
+    (("read_file",), ()),
+])
+def test_followup_source_reminder_only_suggests_available_external_tools(tools, expected):
+    session = make_session(
+        ScriptedGateway([]),
+        tool_schemas=[{"name": name, "parameters": {"type": "object", "properties": {}}}
+                      for name in tools],
+    )
+    assert session.obligation_assessments.propose(
+        target="O2", disposition="unresolved", reason="Need the documented input behavior.",
+        assessed_paths=(), omitted_paths=(), evidence_ids=(),
+        next_actions=("Check the upstream input contract.",),
+        evidence=session.evidence_store.snapshot(), eligible=lambda *_: True,
+    ).accepted
+    assignment = json.loads(session.conversation.events[0]["content"].split("\n", 1)[1])
+    session.apply_coverage_feedback(["OB-tests"])
+
+    feedback = session.conversation.events[-1]["content"]
+    scope = session._current_continuation_scope()
+    for prompt in (assignment.get("followup_source_reminder", ""), feedback, scope):
+        assert ("prefer a focused lookup" in prompt) == bool(expected)
+        for name in ("web_search", "web_fetch", "read_remote_file", DELEGATE_TOOL_SUMMARY_NAME):
+            assert (name in prompt) == (name in expected)
+
+
 def test_coverage_feedback_resumes_same_conversation_and_budget():
     gateway = ScriptedGateway([
         tool_call_response("read_file", {"path": "a.py"}),

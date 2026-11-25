@@ -1718,9 +1718,14 @@ class SpecialistSession:
             assignment, "assignment_id", getattr(assignment, "id", ""),
         ))
         self._request_turn = 0
-        if not self.conversation.events:
-            self.conversation.add_user(self._assignment_prompt())
         self._advertise_obligation_associations()
+        if not self.conversation.events:
+            self.conversation.add_user(self._assignment_prompt(
+                include_followup_reminder=(
+                    self.lease.phase is RunPhase.FOLLOWUP
+                    and not getattr(self.assignment, "investigation_leads", ())
+                ),
+            ))
 
     def _advertise_obligation_associations(self) -> None:
         """Add controller-owned association metadata only to specialist schemas."""
@@ -1837,7 +1842,7 @@ class SpecialistSession:
             ))
         self.conversation.tool_schemas = schemas
 
-    def _assignment_prompt(self) -> str:
+    def _assignment_prompt(self, *, include_followup_reminder: bool = False) -> str:
         prompt = specialist_assignment_prompt(
             self.assignment,
             change_overview=self.change_overview,
@@ -1847,6 +1852,8 @@ class SpecialistSession:
         )
         payload = json.loads(prompt.split("\n", 1)[1])
         payload["delegation_receipts"] = self._delegation_receipts
+        if include_followup_reminder and (reminder := self._external_source_reminder()):
+            payload["followup_source_reminder"] = reminder.strip()
         payload["ownership_instruction"] = (
             "Only current owned_changed_paths and assigned targets are your responsibility. "
             "Transferred work remains queued/incomplete until the controller reports otherwise. "
@@ -2066,6 +2073,29 @@ class SpecialistSession:
                 "actions or reopen remaining gaps; end exploration for controller checkpointing."
             )
         return self._continuation_scope
+
+    def _external_source_reminder(self) -> str:
+        advertised = {item.get("name") for item in self.conversation.tool_schemas}
+        routes = [
+            hint for name, hint in (
+                ("web_search", "use web_search to locate official documentation"),
+                ("web_fetch", "use web_fetch for a focused page"),
+                ("web_fetch_search_result", "use web_fetch_search_result for an official search result"),
+                ("read_remote_file", "use read_remote_file for a specific upstream file"),
+            )
+            if name in advertised
+        ]
+        if not routes:
+            return ""
+        if (DELEGATE_TOOL_SUMMARY_NAME in advertised
+                and advertised.intersection({"web_fetch", "web_fetch_search_result", "read_remote_file"})):
+            routes.append("prefer delegate_tool_summary for a narrow question about a large page or file")
+        return (
+            " If you are reconsidering the same external behavior without new evidence, "
+            "prefer a focused lookup in an authorized source: " + "; ".join(routes) + ". "
+            "Use retained evidence if it already answers the question. If you cannot verify it, "
+            "record the specific uncertainty and move on."
+        )
 
     def _checkpoint_obligation_contract(self) -> str:
         pending: list[dict[str, object]] = []
@@ -6871,6 +6901,7 @@ class SpecialistSession:
                 if not self.obligation_assessments.assessment(target).next_actions_consumed
                 for action in self.obligation_assessments.assessment(target).next_actions
             )
+            source_reminder = self._external_source_reminder() if next_actions else ""
             self._continuation_scope = (
                 " Continue only the latest controller-selected gaps: "
                 + json.dumps([target for value in normalized
@@ -6882,6 +6913,7 @@ class SpecialistSession:
                 "known, use retained evidence without rereading completed work. Then stop issuing tools; the controller will "
                 "request a checkpoint. Do not reopen other gaps, repeat completed checks, "
                 "or resubmit active candidates. Resuming after compaction does not expand this task."
+                + source_reminder
             )
             self.conversation.add_user(
                 "Coverage feedback. The previous checkpoint proposed_next_actions "
@@ -6903,6 +6935,7 @@ class SpecialistSession:
                 "via tool, include the outcome in that checkpoint's obligation_updates. Other obligations remain "
                 "controller-owned: do not reopen or resolve them during this follow-up. "
                 "An active finding does not prevent completion of the selected investigation."
+                + source_reminder
             )
             self.obligation_assessments.consume_next_actions(normalized)
             self.budget.reset_no_progress_streak("material controller feedback")
@@ -6947,12 +6980,14 @@ class SpecialistSession:
                 json.loads(json.dumps(schema))
             )
         self.state = SessionState.COVERAGE_EVALUATION
+        source_reminder = self._external_source_reminder()
         self._continuation_scope = (
             " Continue only the controller-selected lead " + normalized_target
             + ": " + lead.summary + ". Next action: " + lead.next_action
             + ". Once the lead is resolved, stop without tool calls; the controller will "
             "request a checkpoint. Do not reopen other gaps, repeat completed checks, "
             "or resubmit active candidates. Resuming after compaction does not expand this task."
+            + source_reminder
         )
         self.conversation.add_user(
             "Controller-selected investigation lead. Tools are available again. "
@@ -6977,6 +7012,7 @@ class SpecialistSession:
                 "repeating completed investigation."
                 if prior_work else ""
             )
+            + source_reminder
         )
         self.budget.reset_no_progress_streak("material investigation lead feedback")
 
