@@ -96,8 +96,22 @@ def test_boundary_evaluator_uses_sources_and_does_not_repeat_unchanged_inputs(tm
         "components": [{"id": "a", "paths": ["a/**"]}, {"id": "b", "paths": ["b/**"]}],
         "boundaries": [{"id": "api", "contract_paths": ["contract.json"], "participants": ["a", "b"], "contract_change_owner": "a", "objective": "Request IDs agree", "endpoint_paths": {"a": ["a/**"], "b": ["b/**"]}}],
     })
-    inputs = replace(_inputs(tmp_path), policy=policy, topology={"changed_files": ["contract.json"], "components": [{"id": "a", "changed_files": []}, {"id": "b", "changed_files": []}]}, changed_files=("contract.json",))
+    inputs = replace(_inputs(tmp_path), policy=policy, topology={
+        "changed_files": ["contract.json", "a/endpoint.py"],
+        "components": [{"id": "a", "changed_files": ["a/endpoint.py"]}, {"id": "b", "changed_files": []}],
+        "change_facts": {"facts": {
+            "contract.json": {"change_excerpts": ['+ "id": "string"']},
+            "a/endpoint.py": {"hunk_summaries": ["changed hunk at new-file line 4"],
+                              "change_excerpts": ["+ request_id = payload.id"]},
+        }},
+    }, changed_files=("contract.json", "a/endpoint.py"))
     obligations = derive_obligations(inputs.topology, {}, policy)
+    for item in obligations:
+        if item.boundary_id == "api":
+            assert "Contract: contract.json" in item.boundary_change_scope
+            assert "Endpoint a: a/endpoint.py" in item.boundary_change_scope
+            assert "+ request_id = payload.id" in item.boundary_change_scope
+            assert "Endpoint b: no matching changed path" in item.boundary_change_scope
     store = EvidenceStore()
     contract = store.add_tool_result(session_id="S1", tool="read_file", arguments={"path": "contract.json"}, result={"status": "ok", "content": '{"id":"string"}'}, provenance=EvidenceProvenance(head_sha=inputs.head_sha))
     assessments = []
@@ -112,6 +126,7 @@ def test_boundary_evaluator_uses_sources_and_does_not_repeat_unchanged_inputs(tm
     def evaluate(request):
         requests.append(request)
         packet = request.context
+        assert "+ request_id = payload.id" in packet["change_scope"]
         assert any("request_id" in source["content"] for source in packet["evidence"])
         return {"question": packet["question"], "outcome": "supported", "reason": "Both endpoints preserve the contract identity.", "evidence_ids": list(packet["source_evidence_ids"]), "missing_fact": "", "suggested_investigation": ""}
     controller = ReviewController(boundary_evaluator=evaluate, artifact_output_root=tmp_path)
@@ -157,6 +172,14 @@ def test_boundary_evaluator_uses_sources_and_does_not_repeat_unchanged_inputs(tm
     assert state.boundary_evaluations["api"].outcome == "incompatible"
     assert state.investigation_leads[lead_id].status is InvestigationLeadStatus.OPEN
     assert state.investigation_leads[lead_id].next_action == "Read a/legacy.py for identifier normalization."
+    from pr_reviewer.specialist_runtime.negotiation import compact_negotiation_context
+
+    negotiation = controller._negotiation_state(
+        replace(state, session_results={}), SimpleNamespace(snapshot=state.coverage.snapshot()), 0,
+    )
+    lead_targets = [row for row in compact_negotiation_context(negotiation)["targets"]
+                    if row["handle"].startswith("L")]
+    assert "+ request_id = payload.id" in lead_targets[0]["boundary_change_scope"]
 
     reopened = replace(assessments[0], disposition=ObligationDisposition.PARTIALLY_COVERED, next_actions=("Check cancellation behavior.",), assessment_version=2)
     state.session_results[("A", "S1")] = SimpleNamespace(checkpoint=SessionCheckpoint("S1", SessionState.CHECKPOINT, obligation_assessments=(reopened, *assessments[1:])))

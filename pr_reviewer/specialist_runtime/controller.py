@@ -87,6 +87,10 @@ def _critic_anchor_excerpt(record, location: str, max_bytes: int = 1200) -> str 
 from pr_reviewer.specialists import classify_file_roles
 from .adjudication import (
     merge_accepted_findings,
+    merge_evidence_options,
+    merge_rejection,
+    normalize_merge_basis,
+    _added_diff_lines_by_path,
     AcceptedFinding,
     AdjudicatedReview,
     ReviewHandoffContext,
@@ -141,6 +145,8 @@ from .negotiation import (
     SessionResources,
     compact_negotiation_context,
     fallback_next_action,
+    revalidate_deferred_followup,
+    select_compact_followup_wave,
     validate_compact_negotiation,
     validate_negotiation,
 )
@@ -780,11 +786,11 @@ def _critic_rows(value: object) -> tuple[Mapping[str, object], ...]:
 def _partial_critic_result(
     value: object,
     candidates: Iterable[CandidateFinding],
-) -> tuple[tuple[Mapping[str, str], ...], tuple[str, ...]]:
+) -> tuple[tuple[Mapping[str, object], ...], tuple[str, ...]]:
     """Keep valid rows and identify candidate IDs needing a bounded repair."""
     allowed = {item.candidate_id for item in candidates}
     seen: set[str] = set()
-    rows: list[Mapping[str, str]] = []
+    rows: list[Mapping[str, object]] = []
     for row in _critic_rows(value):
         candidate_id = str(row.get("candidate_id") or "").strip()
         action = str(row.get("action") or "").strip().lower()
@@ -799,10 +805,12 @@ def _partial_critic_result(
         elif target_id:
             continue
         seen.add(candidate_id)
+        basis = normalize_merge_basis(row.get("merge_basis")) if action == "merge" else {}
         rows.append({
             "candidate_id": candidate_id,
             "action": action,
             "target_id": target_id,
+            **({"merge_basis": basis} if basis else {}),
             **({"review_thread": dict(row["review_thread"])} if isinstance(row.get("review_thread"), Mapping) else {}),
         })
     return tuple(rows), tuple(sorted(allowed - seen))
@@ -989,13 +997,12 @@ def _validated_critic_result(
         elif target_id:
             raise ValueError("critic target_id is only valid for merge")
         seen.add(candidate_id)
-        # Models commonly add rationale/evidence fields despite the compact
-        # decision schema.  Those fields cannot change adjudication and are
-        # intentionally ignored; only the validated decision is admitted.
+        basis = normalize_merge_basis(row.get("merge_basis")) if action == "merge" else {}
         admitted.append({
             "candidate_id": candidate_id,
             "action": action,
             "target_id": target_id,
+            **({"merge_basis": basis} if basis else {}),
             **({"review_thread": dict(row["review_thread"])} if isinstance(row.get("review_thread"), Mapping) else {}),
         })
     if seen != allowed_ids:
@@ -1318,6 +1325,7 @@ class ReviewInputs:
     pr_metadata: Mapping[str, Any] = field(default_factory=dict)
     configuration_warnings: tuple[str, ...] = ()
     adapter_configuration: Mapping[str, Any] = field(default_factory=dict)
+    load_closed_thread_objections: Callable[[tuple[str, ...]], Sequence[Mapping[str, Any]]] | None = None
 
 
 def _change_components(
@@ -1956,6 +1964,7 @@ def _json_value(value: object) -> object:
         return {
             item.name: _json_value(getattr(value, item.name))
             for item in fields(value)
+            if not (item.metadata.get("omit_none") and getattr(value, item.name) is None)
         }
     return str(value)
 
@@ -3399,34 +3408,61 @@ class ReviewController:
         state: _RunState,
         assignments: Iterable[Assignment],
         phase: RunPhase,
+        *,
+        refill=None,
     ) -> tuple[WaveResult, WaveSnapshot]:
         assert state.coverage is not None
         assignment_items = tuple(assignments)
         wave_snapshot = WaveSnapshot(state.evidence.snapshot(), state.coverage.snapshot())
-        expected_ids = {
-            assignment.id: self._session_identity(state, assignment)
-            for assignment in assignment_items
-        }
-        existing_handles = {
-            assignment.id: state.sessions.get(expected_ids[assignment.id])
-            for assignment in assignment_items
-        }
-        for assignment in assignment_items:
-            state.journal.emit("specialist_initializing", {
-                "assignment_id": assignment.id,
-                "session_id": expected_ids[assignment.id],
-                "phase": phase.value,
-                "resumed": isinstance(
-                    existing_handles[assignment.id], _IsolatedSessionHandle,
-                ),
-            })
+        expected_ids = {}
+        existing_handles = {}
+        snapshots = {}
+        all_assignments: dict[str, Assignment] = {}
+
+        def prepare(items, snapshot):
+            ids = {item.id: self._session_identity(state, item) for item in items}
+            if len(set(ids.values())) != len(items):
+                raise ValueError("a wave cannot run the same assignment or durable session twice")
+            for assignment in items:
+                session_id = ids[assignment.id]
+                expected_ids[assignment.id] = session_id
+                existing_handles[assignment.id] = state.sessions.get(session_id)
+                snapshots[assignment.id] = snapshot
+                all_assignments[assignment.id] = assignment
+                state.journal.emit("specialist_initializing", {
+                    "assignment_id": assignment.id, "session_id": session_id, "phase": phase.value,
+                    "resumed": isinstance(existing_handles[assignment.id], _IsolatedSessionHandle),
+                })
+
+        prepare(assignment_items, wave_snapshot)
+        admitted: set[int] = set()
+
+        def refill_wave(finished, reserved):
+            if finished:
+                with state.admission_lock:
+                    snapshot = WaveSnapshot(state.evidence.snapshot(), state.coverage.snapshot())
+                    partial = WaveResult(
+                        phase=phase, results=finished, failures=(), not_started=(),
+                        cancelled_assignment_ids=(), in_flight_assignment_ids=(),
+                        evidence_ids=(), coverage_projection=(),
+                    )
+                    self._admit_wave_results(state, partial, snapshot, expected_ids, existing_handles, ())
+                    admitted.update(id(item.session_result) for item in finished)
+                    reconciled = self._reconcile(state, partial, snapshot)
+            else:
+                reconciled = None
+            additions = tuple(refill(finished, reserved, reconciled))
+            if additions:
+                prepare(additions, WaveSnapshot(state.evidence.snapshot(), state.coverage.snapshot()))
+            return additions
+
         scheduler = self.scheduler_type(
             deadline=state.deadline,
             session_factory=lambda assignment, lease, snapshot: self._create_isolated_session(
                 state,
                 assignment,
                 lease,
-                snapshot,
+                snapshots[assignment.id],
                 expected_ids[assignment.id],
                 existing_handles[assignment.id]
                 if isinstance(existing_handles[assignment.id], _IsolatedSessionHandle)
@@ -3438,7 +3474,24 @@ class ReviewController:
             request_attempt_journal=state.request_attempt_journal,
             clock=self.clock,
         )
-        result = scheduler.run_wave(assignment_items, phase)
+        result = scheduler.run_wave(assignment_items, phase, **({"refill": refill_wave} if refill else {}))
+        if admitted:
+            snapshot = WaveSnapshot(state.evidence.snapshot(), state.coverage.snapshot())
+            unadmitted = replace(result, results=tuple(
+                item for item in result.results if id(item.session_result) not in admitted
+            ))
+        else:
+            snapshot, unadmitted = wave_snapshot, result
+        self._admit_wave_results(state, unadmitted, snapshot, expected_ids, existing_handles,
+                                 all_assignments.values(), retained_assignment_ids={
+                                     item.assignment_id for item in result.results
+                                 })
+        return result, wave_snapshot
+
+    def _admit_wave_results(
+        self, state, result, wave_snapshot, expected_ids, existing_handles,
+        assignment_items, *, retained_assignment_ids=(),
+    ) -> None:
         self._admit_wave_request_attempts(state, result.request_attempts)
         assignment_by_id = state.assignments
         for item in result.results:
@@ -3514,10 +3567,7 @@ class ReviewController:
                 "session_id": session_id or "",
                 "reason": "in_flight_after_wave_cutoff; retained_for_checkpoint_recovery",
             })
-        retained_assignments = {
-            item.assignment_id
-            for item in result.results
-        } | set(result.in_flight_assignment_ids)
+        retained_assignments = set(retained_assignment_ids) | set(result.in_flight_assignment_ids)
         for assignment in assignment_items:
             if assignment.id in retained_assignments or existing_handles[assignment.id] is not None:
                 continue
@@ -3535,7 +3585,6 @@ class ReviewController:
                     "content_hash": record.content_hash,
                     "status": record.status,
                 })
-        return result, wave_snapshot
 
     def _admit_investigation_lead_state(
         self, state: _RunState, session_result: object,
@@ -3824,6 +3873,17 @@ class ReviewController:
                 boundary, assessments, state.evidence.snapshot(),
                 max_bytes=getattr(self.boundary_evaluator, "max_context_bytes", None) or 60_000,
                 obligations=locals_by_id, expected_head_sha=state.inputs.head_sha,
+                change_scope=combined.boundary_change_scope,
+                unaffected_diff_paths={
+                    item.participant_id: item.boundary_unaffected_diff_paths
+                    for item in state.obligations if item.id in locals_by_id
+                },
+                contract_unchanged=not any(
+                    fnmatch.fnmatchcase(path, pattern)
+                    for path in (*state.inputs.changed_files,
+                                 *state.inputs.topology.get("changed_original_paths", ()))
+                    for pattern in boundary.contract_paths
+                ),
             )
             previous = state.boundary_evaluations.get(boundary.id)
             if previous is not None and previous.input_fingerprint == context["input_fingerprint"]:
@@ -3885,8 +3945,11 @@ class ReviewController:
                     boundary.id, context["input_fingerprint"], "insufficient_evidence",
                     error or "boundary comparison did not complete", (),
                     missing_fact=error or "compatible participant behavior is not established",
-                    suggested_investigation=context.get("suggested_investigation") or f"Investigate {error or boundary.objective}.",
-                    followup_kind="repository_evidence",
+                    suggested_investigation=(
+                        "" if context["configuration_only_gap"] else
+                        context.get("suggested_investigation") or f"Investigate {error or boundary.objective}."
+                    ),
+                    followup_kind="maintainer_decision" if context["configuration_only_gap"] else "repository_evidence",
                 )
             state.boundary_evaluations[boundary.id] = outcome
             supported = outcome.outcome == "supported"
@@ -4082,15 +4145,13 @@ class ReviewController:
             ),
             excluded_obligation_ids=tuple(sorted(set(excluded_obligation_ids))),
             changed_files=state.inputs.changed_files,
-            investigation_leads=tuple(
-                state.investigation_leads[key]
-                for key in sorted(state.investigation_leads)
-            ),
+            investigation_leads=tuple(state.investigation_leads.values()),
         )
 
     def _negotiate(
         self, state: _RunState, reconciliation: CoverageReconciliation,
         *, attempt: int = 1, excluded_obligation_ids: Iterable[str] = (),
+        deferred: list[NegotiationAction] | None = None,
     ) -> tuple[NegotiationAction, ...]:
         remaining_turns, remaining_tools = self._remaining_global_budget(state)
         if remaining_turns <= 0 or remaining_tools <= 0:
@@ -4138,6 +4199,9 @@ class ReviewController:
                 "reason": "no model turn fits the remaining exploration deadline",
             })
             return ()
+        wave_limit = min(state.inputs.config.concurrency, remaining_turns, remaining_tools)
+        if wave_limit > 1:
+            compact_context["protocol"] = "propose a ranked wave of independent follow-up actions"
         if self.negotiator is not None:
             try:
                 role_context: dict[str, object] = {
@@ -4148,6 +4212,7 @@ class ReviewController:
                     "change_overview": change_overview_orientation(
                         state.change_overview,
                     ),
+                    **({"followup_wave_limit": wave_limit} if wave_limit > 1 else {}),
                 }
                 # Keep the typed state available to in-process integrations for
                 # backwards compatibility.  Gateway-backed model roles receive
@@ -4175,7 +4240,25 @@ class ReviewController:
                         "from": raw_kind,
                         "to": {"record-unknown": "record_unknown", "new-session": "new_session"}[raw_kind],
                     })
-                if isinstance(self.negotiator, GatewayRoleAdapter):
+                if wave_limit > 1 and "actions" in raw and (
+                    isinstance(self.negotiator, GatewayRoleAdapter)
+                    or isinstance(raw["actions"], list) and any(
+                        isinstance(row, Mapping) and "target" in row for row in raw["actions"]
+                    )
+                ):
+                    proposal = select_compact_followup_wave(
+                        raw, negotiation_state, limit=wave_limit,
+                        conflicts=lambda action: self._followup_conflict_keys(state, action),
+                    )
+                    state.journal.emit("negotiation_wave_admitted", {
+                        "limit": wave_limit,
+                        "proposed": len(raw["actions"]),
+                        "admitted": len(proposal.actions),
+                        "deferred": len(proposal.deferred),
+                    })
+                    if deferred is not None:
+                        deferred.extend(proposal.deferred)
+                elif isinstance(self.negotiator, GatewayRoleAdapter):
                     proposal = validate_compact_negotiation(raw, negotiation_state)
                 else:
                     # Trusted in-process adapters may still return the legacy
@@ -4230,9 +4313,180 @@ class ReviewController:
             self._degrade(state, "negotiator", _bounded_error(exc))
             return ()
 
+    def _followup_conflict_keys(self, state: _RunState, action: NegotiationAction) -> set[tuple[str, str]]:
+        keys: set[tuple[str, str]] = set()
+        owner = state.ownership.get(action.session_id) if action.session_id else None
+        if owner is not None:
+            keys.add(("assignment", owner.assignment_id))
+        obligation_ids = set(action.obligation_ids)
+        for lead_id in action.lead_ids:
+            lead = state.investigation_leads[lead_id]
+            batch = self._review_thread_batch(state, lead) if lead.kind == "review_thread" else (lead,)
+            keys.update(("target", item.lead_id) for item in batch)
+            keys.update(("path", path) for item in batch for path in item.affected_paths)
+            obligation_ids.update(lead.delegated_obligation_ids)
+            if lead.child_assignment_id:
+                keys.add(("assignment", lead.child_assignment_id))
+            if lead_id.startswith("boundary:"):
+                keys.add(("boundary", lead_id.removeprefix("boundary:")))
+        for item in state.obligations:
+            if item.id in obligation_ids:
+                keys.add(("target", item.id))
+                keys.update(("path", path) for path in item.scope)
+                if item.boundary_id:
+                    keys.add(("boundary", item.boundary_id))
+        return keys
+
+    def _drain_followup_queue(self, state, actions, deferred, excluded_obligation_ids, round_number):
+        """Refill from the current proposal only; the outer loop owns fresh proposals."""
+        assignments = []
+        reservations = {}
+        finished_work = []
+        settled = None
+        check_index = 0
+
+        def schedule(action):
+            keys = self._followup_conflict_keys(state, action)
+            items = self._followup_assignments(state, (action,))
+            for item in items:
+                reservations[item.id] = keys | {("assignment", item.id)}
+            assignments.extend(items)
+            return items
+
+        for action in actions:
+            schedule(action)
+
+        def revalidate(action, reconciled, occupied):
+            with state.admission_lock:
+                if min(self._remaining_global_budget(state)) <= occupied:
+                    return None
+                followup_started = len(set(state.assignments) - {item.id for item in state.plan.assignments})
+                current_state = self._negotiation_state(state, reconciled, followup_started, excluded_obligation_ids)
+                return revalidate_deferred_followup(action, current_state)
+
+        def refill(finished, active, reconciliation):
+            nonlocal settled, check_index
+            if reconciliation is not None:
+                settled = reconciliation
+            for item in finished:
+                checkpoint = item.session_result.checkpoint
+                keys = set(reservations.pop(item.assignment_id, ()))
+                keys.update(
+                    ("path", record.source_path)
+                    for evidence_id in checkpoint.evidence_ids
+                    if (record := state.evidence.lookup_canonical(evidence_id)) is not None
+                    and record.is_usable_for_coverage and record.source_path
+                )
+                finished_work.append((keys, _mask_runtime_text(checkpoint.working_summary)[:650]))
+            if not deferred or settled is None:
+                return ()
+            busy = set().union(*(reservations.get(key, set()) for key in active))
+            open_slots = max(0, state.inputs.config.concurrency - len(active))
+            additions = []
+            waiting = []
+            for action in deferred:
+                if not state.deadline.exploration_allowed(now=self.clock()):
+                    break
+                keys = self._followup_conflict_keys(state, action)
+                if len(additions) >= open_slots or keys.intersection(busy):
+                    waiting.append(action)
+                    continue
+                occupied = len(active) + len(additions)
+                try:
+                    current = revalidate(action, settled, occupied)
+                except NegotiationError as exc:
+                    state.journal.emit("negotiation_deferred_dropped", {
+                        "targets": (*action.obligation_ids, *action.lead_ids), "reason": _bounded_error(exc),
+                    })
+                    continue
+                if current is None:
+                    waiting.append(action)
+                    continue
+                changed = tuple(summary for touched, summary in finished_work
+                                if any(key[0] in {"path", "target", "boundary"} for key in keys.intersection(touched)))
+                if changed:
+                    check_index += 1
+                    if self.negotiator is None:
+                        continue
+                    try:
+                        decision = self._model_request(
+                            state, role="negotiator", phase=RunPhase.FOLLOWUP,
+                            request_id=f"negotiator:recheck:{round_number}:{check_index}",
+                            component=self.negotiator, method="propose", max_attempts=1,
+                            context={"revalidate_followup": {
+                                "kind": current.kind, "original_question": _mask_runtime_text(current.reason)[:500],
+                                "paths": tuple(sorted(value for kind, value in keys if kind == "path"))[:8],
+                                "completed_conclusions": changed[-3:],
+                            }},
+                        )
+                    except Exception as exc:
+                        state.journal.emit("negotiation_deferred_dropped", {"reason": _bounded_error(exc)})
+                        continue
+                    run = isinstance(decision, Mapping) and set(decision) == {"decision"} and decision["decision"] == "run"
+                    state.journal.emit("negotiation_deferred_rechecked", {
+                        "targets": (*current.obligation_ids, *current.lead_ids),
+                        "decision": "run" if run else "defer",
+                    })
+                    if not run:
+                        continue
+                if not state.deadline.exploration_allowed(now=self.clock()):
+                    break
+                # Another live session can consume budget or reserve a
+                # delegation while the focused decision is in flight.
+                try:
+                    with state.admission_lock:
+                        current = revalidate(action, settled, occupied)
+                        items = schedule(current) if current and current.kind == "new_session" else ()
+                except NegotiationError as exc:
+                    state.journal.emit("negotiation_deferred_dropped", {
+                        "targets": (*action.obligation_ids, *action.lead_ids), "reason": _bounded_error(exc),
+                    })
+                    continue
+                if current is None:
+                    waiting.append(action)
+                    continue
+                if current.kind != "new_session":
+                    items = schedule(current)
+                if items:
+                    actions.append(current)
+                    additions.extend(items)
+                    busy.update(keys)
+                    state.journal.emit("negotiation_deferred_admitted", {
+                        "targets": (*current.obligation_ids, *current.lead_ids),
+                    })
+            deferred[:] = waiting
+            return additions
+
+        result, snapshot = self._run_wave(state, assignments, RunPhase.FOLLOWUP, refill=refill)
+        return result, snapshot, assignments
+
     def _queue_review_threads(self, state: _RunState) -> None:
         """Optional leads only after independent exploration, never hard obligations."""
-        for snapshot in state.inputs.review_threads:
+        candidate_lines: dict[str, set[int]] = {}
+        evidence_paths = set()
+        for candidate in (*state.inputs.candidate_findings, *state.candidate_occurrences.values()):
+            path, _, line = candidate.affected_location.partition(":")
+            lines = candidate_lines.setdefault(path, set())
+            if line.isascii() and line.isdecimal():
+                lines.add(int(line))
+            for evidence_id in candidate.supporting_evidence_ids:
+                record = state.evidence.lookup_canonical(evidence_id)
+                if (record is not None and record.source_path and record.is_usable_for_coverage
+                        and not record.truncated and record.provenance.head_sha == state.inputs.head_sha):
+                    evidence_paths.add(record.source_path)
+
+        def signals(snapshot):
+            path, line = snapshot["path"], snapshot.get("line")
+            nearby = isinstance(line, int) and any(abs(line - other) <= 8 for other in candidate_lines.get(path, ()))
+            return (
+                (nearby, "near a current candidate"),
+                (snapshot.get("previously_reported_fixed"), "previously reported fixed; check for recurrence"),
+                (snapshot.get("has_human_objection"), "human disputed the earlier claim"),
+                (not nearby and path in candidate_lines, "same file as a current candidate"),
+                (path in evidence_paths, "current candidate cites evidence from this file"),
+            )
+
+        for snapshot in sorted(state.inputs.review_threads, key=lambda row: tuple(not applies for applies, _ in signals(row))):
             if snapshot.get("prior_assessment") in {"still_present", "fixed", "disproven"}:
                 state.journal.emit("review_thread_reassessment_reused", {"target": snapshot["target"]})
                 continue
@@ -4245,8 +4499,12 @@ class ReviewController:
             owners = [assignment for assignment in owners if assignment.owner_component_id] or owners
             owner = owners[0] if len(owners) == 1 else None
             session_id = state.assignment_sessions.get(owner.id, "") if owner else ""
+            reasons = [reason for applies, reason in signals(snapshot) if applies]
+            summary = f"Reassess unresolved review discussion {target} on {path}"
+            if reasons:
+                summary += " (" + "; ".join(reasons) + ")"
             state.investigation_leads[lead_id] = InvestigationLead(
-                lead_id=lead_id, summary=f"Reassess unresolved review discussion {target} on {path}",
+                lead_id=lead_id, summary=summary,
                 affected_paths=(path,), evidence_ids=(),
                 next_action=(f"Independently verify discussion {target} against current code; "
                              "reuse current candidate evidence where relevant. Use assess_review_thread, "
@@ -4821,10 +5079,19 @@ class ReviewController:
     def _critic_context_slice(context, candidates):
         ids = {item.candidate_id for item in candidates}
         obligation_ids = {oid for item in candidates for oid in item.related_obligation_ids}
+        def near_objection(candidate, objection):
+            path, _, line = candidate.affected_location.partition(":")
+            return path == objection["path"] and (
+                not line.isdigit() or abs(int(line) - objection["line"]) <= 8
+            )
         return {
             **context,
             "review_threads": tuple(item for item in context.get("review_threads", ())
                                     if any(candidate.affected_location.split(":", 1)[0] == item["path"] for candidate in candidates))[:8],
+            "closed_thread_objections": tuple(
+                item for item in context.get("closed_thread_objections", ())
+                if any(near_objection(candidate, item) for candidate in candidates)
+            )[:4],
             "candidates": tuple(candidates),
             "candidate_evidence": {key: value for key, value in context["candidate_evidence"].items()
                                    if key in ids},
@@ -4920,9 +5187,11 @@ class ReviewController:
                     and decision_bytes <= max(1, output_tokens - 256) * 3)
 
         batches, current = [], []
+        # Optional objections must not split an otherwise valid batch.
+        sizing_context = {**context, "closed_thread_objections": ()}
         for candidate in context["candidates"]:
             proposed = (*current, candidate)
-            if current and not fits(proposed, self._critic_context_slice(context, proposed)):
+            if current and not fits(proposed, self._critic_context_slice(sizing_context, proposed)):
                 batches.append(tuple(current))
                 current = []
             current.append(candidate)
@@ -4933,6 +5202,8 @@ class ReviewController:
             batch_context = self._critic_context_slice(context, candidates)
             # History is optional. Drop whole discussions before letting them
             # crowd out an otherwise reviewable candidate and its proof.
+            while batch_context["closed_thread_objections"] and self._critic_context_bytes(batch_context) > limit:
+                batch_context["closed_thread_objections"] = batch_context["closed_thread_objections"][:-1]
             while batch_context["review_threads"] and self._critic_context_bytes(batch_context) > limit:
                 batch_context["review_threads"] = batch_context["review_threads"][:-1]
             request_id = "critic:1" if len(batches) == 1 else f"critic:batch:{index}"
@@ -4955,15 +5226,15 @@ class ReviewController:
             })
         return {"actions": rows}, fallback_ids, len(batches)
 
-    def _deduplicate_critic_batches(self, state):
+    def _deduplicate_critic_batches(self, state, critic_context):
         if len(state.review.accepted) < 2:
             return
         context = {
             "critic_deduplication": {
                 "instruction": (
                     "These findings already passed substantive review and deterministic validation. "
-                    "Only identify duplicates with the same defect and consequence. Return "
-                    "{\"actions\":[{\"candidate_id\":\"source\",\"action\":\"merge\",\"target_id\":\"survivor\"}]}. "
+                    "Only identify duplicates addressed by one concrete fix. Return merge actions with candidate_id and target_id. "
+                    "For cross-file merges also return merge_basis with same_fix, source_evidence_id, and target_evidence_id. "
                     "Return an empty actions array if none are duplicates. Do not reject, downgrade, "
                     "promote, rewrite, or re-evaluate findings. Omit unchanged findings. "
                     "When uncertain, leave both findings unchanged."
@@ -4977,6 +5248,14 @@ class ReviewController:
                 "user_visible_consequence": item.user_visible_consequence,
             } for item in state.review.accepted),
         }
+        if len({item.affected_file for item in state.review.accepted}) > 1:
+            context["candidate_evidence"] = {
+                item.candidate_id: tuple({
+                    **{key: excerpt[key] for key in ("evidence_id", "path", "tool", "truncated")},
+                    "content_excerpt": excerpt["content_excerpt"][:400],
+                } for excerpt in critic_context["candidate_evidence"].get(item.candidate_id, ())[:4])
+                for item in state.review.accepted
+            }
         size = self._critic_context_bytes(context)
         limit = getattr(self.critic, "max_context_bytes", None) or 160_000
         # ponytail: one compact dedup pass; leave duplicates rather than launch
@@ -5025,6 +5304,13 @@ class ReviewController:
             fallback_candidate_ids.update(item.candidate_id for item in candidates)
         else:
             try:
+                closed_objections = ()
+                if state.inputs.load_closed_thread_objections is not None:
+                    try:
+                        locations = tuple(dict.fromkeys(candidate.affected_location for candidate in candidates))
+                        closed_objections = state.inputs.load_closed_thread_objections(locations)
+                    except Exception as exc:
+                        state.journal.emit("review_thread_objections_unavailable", {"reason": _bounded_error(exc)})
                 retained = {
                     record.id: record
                     for record in state.evidence.snapshot().records
@@ -5088,6 +5374,9 @@ class ReviewController:
                     "candidates": candidates,
                     "candidate_evidence": candidate_evidence,
                     "candidate_assessments": candidate_assessments,
+                    "closed_thread_objections": tuple({
+                        field: item[field] for field in ("path", "line", "prior_finding", "human_objection")
+                    } for item in closed_objections),
                     "review_threads": tuple({
                         "target": item["target"], "path": item["path"], "line": item.get("line"),
                         "origin": item["origin"], "discussion_complete": item.get("discussion_complete", False),
@@ -5128,30 +5417,56 @@ class ReviewController:
                 candidates, critic_result, state.evidence,
                 obligations=obligation_map, changed_files=state.inputs.changed_files,
             )
-            invalid_merge_ids = tuple(
-                item.candidate_id
+            rejected_by_id = {
+                item.candidate_id: item
                 for item in state.review.dispositions
                 if item.reason == "invalid-merge-target-kept"
-            )
+            }
+            eligible_targets = {}
             if (
-                invalid_merge_ids
+                rejected_by_id
                 and self.critic is not None
                 and critic_context is not None
             ):
-                invalid_id_set = set(invalid_merge_ids)
                 original_rows, _missing = _partial_critic_result(
                     critic_result, candidates,
                 )
                 original_by_id = {
                     item["candidate_id"]: item for item in original_rows
                 }
+                records = {item.id: item for item in state.evidence.snapshot().records}
+                added_lines = _added_diff_lines_by_path(records.values())
+                accepted = {item.candidate_id: item for item in state.review.accepted}
+                for candidate_id, rejected in rejected_by_id.items():
+                    source = accepted[candidate_id]
+                    targets = tuple(
+                        target.candidate_id for target in accepted.values()
+                        if original_by_id[target.candidate_id]["action"] == "keep"
+                        and (
+                            merge_rejection(source, target, added_lines, records, {}) is None
+                            or (target.candidate_id == rejected.target_id
+                                and source.affected_file != target.affected_file
+                                and merge_evidence_options(source, records)
+                                and merge_evidence_options(target, records))
+                        )
+                    )
+                    if targets:
+                        eligible_targets[candidate_id] = targets
+                if not eligible_targets:
+                    state.journal.emit("critic_merge_repair_skipped", {
+                        "reason": "no feasible independently kept merge target",
+                        "rejected_merges": tuple(_json_value(item) for item in rejected_by_id.values()),
+                    })
+            if eligible_targets:
+                invalid_merge_ids = tuple(eligible_targets)
+                invalid_id_set = set(invalid_merge_ids)
+                target_ids = {target for values in eligible_targets.values() for target in values}
+                rejected_merges = tuple({
+                    **original_by_id[item], "reason": rejected_by_id[item].merge_rejection,
+                } for item in invalid_merge_ids)
                 state.journal.emit("critic_merge_repair_requested", {
                     "invalid_candidate_ids": invalid_merge_ids,
-                    "rejected_merges": tuple(
-                        original_by_id[item]
-                        for item in invalid_merge_ids
-                        if item in original_by_id
-                    ),
+                    "rejected_merges": rejected_merges,
                 })
                 try:
                     repaired = self._model_request(
@@ -5170,28 +5485,25 @@ class ReviewController:
                                 candidate_id: critic_context[
                                     "candidate_evidence"
                                 ][candidate_id]
-                                for candidate_id in invalid_merge_ids
+                                for candidate_id in sorted(invalid_id_set | target_ids)
                             },
                             "candidate_assessments": {
                                 item: critic_context["candidate_assessments"][item]
                                 for item in invalid_merge_ids
                             },
-                            "eligible_merge_targets": tuple(
+                            "merge_target_findings": tuple(
                                 item for item in candidates
-                                if item.candidate_id not in invalid_id_set
+                                if item.candidate_id in target_ids
                             ),
+                            "eligible_merge_targets": eligible_targets,
                             "critic_merge_repair": {
                                 "invalid_candidate_ids": invalid_merge_ids,
-                                "rejected_merges": tuple(
-                                    original_by_id[item]
-                                    for item in invalid_merge_ids
-                                    if item in original_by_id
-                                ),
+                                "rejected_merges": rejected_merges,
                                 "instruction": (
                                     "The requested merges were not deterministically "
-                                    "compatible. Return one corrected action for each listed "
-                                    "candidate ID. Keep the candidate unless another listed "
-                                    "action is justified; merge only into an eligible target."
+                                    "compatible. For each listed source, return keep or merge "
+                                    "into a target listed for that source. For a cross-file "
+                                    "merge use merge_basis to connect the two findings."
                                 ),
                             },
                         },
@@ -5203,7 +5515,10 @@ class ReviewController:
                     repaired_by_id = {
                         item["candidate_id"]: item
                         for item in repaired_rows
-                        if item["candidate_id"] in invalid_id_set
+                        if item["candidate_id"] in invalid_id_set and (
+                            item["action"] == "keep" or (item["action"] == "merge" and
+                            item["target_id"] in eligible_targets[item["candidate_id"]])
+                        )
                     }
                     still_missing = tuple(
                         item for item in invalid_merge_ids
@@ -5229,7 +5544,14 @@ class ReviewController:
                         changed_files=state.inputs.changed_files,
                     )
                     state.journal.emit("critic_merge_repair_completed", {
-                        "repaired_candidate_ids": invalid_merge_ids,
+                        "merged_candidate_ids": tuple(
+                            item.candidate_id for item in state.review.dispositions
+                            if item.candidate_id in invalid_id_set and item.action == "merge"
+                        ),
+                        "retained_candidate_ids": tuple(
+                            item.candidate_id for item in state.review.dispositions
+                            if item.candidate_id in invalid_id_set and item.action == "keep"
+                        ),
                     })
                 except Exception as repair_exc:
                     state.journal.emit("critic_merge_repair_failed", {
@@ -5260,7 +5582,7 @@ class ReviewController:
                 ) for item in state.review.dispositions),
             )
         if critic_batch_count > 1:
-            self._deduplicate_critic_batches(state)
+            self._deduplicate_critic_batches(state, critic_context)
         snapshots = {item["target"]: item for item in state.inputs.review_threads}
         for row in _critic_rows(critic_result):
             association = row.get("review_thread")
@@ -7491,9 +7813,8 @@ class ReviewController:
                     state, session_id, "update_lease", RunPhase.FOLLOWUP,
                     followup_lease,
                 )
-            # Negotiation is deliberately one-action-at-a-time.  Recompute the
-            # authoritative state after each bounded wave so the next proposal
-            # cannot rely on stale obligations, leases, or coverage gains.
+            # Reconcile each whole wave before asking for more work. A result
+            # from one lane may settle another target or change session reuse.
             unproductive_obligation_ids: set[str] = set()
             round_index = -1
             while state.deadline.exploration_allowed(now=self.clock()):
@@ -7531,18 +7852,25 @@ class ReviewController:
                     "uncovered_count": len(before_uncovered),
                     "open_lead_count": len(open_lead_ids),
                 })
-                actions = self._negotiate(
+                deferred: list[NegotiationAction] = []
+                actions = list(self._negotiate(
                     state,
                     reconciliation,
                     attempt=round_index + 1,
                     excluded_obligation_ids=unproductive_obligation_ids,
-                )
+                    deferred=deferred,
+                ))
                 if not actions:
                     break
-                followups = self._followup_assignments(state, actions)
-                followup, followup_snapshot = self._run_wave(
-                    state, followups, RunPhase.FOLLOWUP,
-                )
+                if deferred:
+                    followup, followup_snapshot, followups = self._drain_followup_queue(
+                        state, actions, deferred, unproductive_obligation_ids, round_index + 1,
+                    )
+                else:
+                    followups = self._followup_assignments(state, actions)
+                    followup, followup_snapshot = self._run_wave(
+                        state, followups, RunPhase.FOLLOWUP,
+                    )
                 next_reconciliation = self._reconcile(
                     state, followup, followup_snapshot,
                 )

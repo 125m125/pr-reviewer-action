@@ -29,14 +29,16 @@ from pr_reviewer.specialist_runtime.types import (
 def test_historical_collection_uses_action_root_and_immutable_identity(monkeypatch, tmp_path):
     from pr_reviewer.github_review_notes import GhReviewClient
     observed = {}
-    def query(self, repo, pr, head):
-        observed.update(action_root=self.action_root, repo=repo, pr=pr, head=head)
+    def query(self, repo, pr, head, *, objection_locations=()):
+        observed.update(action_root=self.action_root, repo=repo, pr=pr, head=head, objection_locations=objection_locations)
         return ()
     monkeypatch.setattr(GhReviewClient, "query_review_threads", query)
     config = SimpleNamespace(environment={"GITHUB_ACTION_PATH": str(tmp_path)})
-    inputs = SimpleNamespace(repository="o/r", pr_number=7, head_sha="a" * 40)
+    inputs = SimpleNamespace(repository="o/r", pr_number=7, head_sha="a" * 40, changed_files=("a.py",))
     assert cli._collect_review_threads(config, inputs) == ()
-    assert observed == dict(action_root=tmp_path.resolve(), repo="o/r", pr=7, head="a" * 40)
+    assert observed == dict(action_root=tmp_path.resolve(), repo="o/r", pr=7, head="a" * 40, objection_locations=())
+    cli._collect_review_threads(config, inputs, objection_locations=("a.py:5",))
+    assert observed["objection_locations"] == ("a.py:5",)
 
 
 def test_critic_batch_and_dedup_logs_report_sizes_and_outcomes():

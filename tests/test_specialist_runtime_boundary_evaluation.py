@@ -18,6 +18,52 @@ from pr_reviewer.specialist_runtime.policy import BoundaryPolicy
 HEAD_SHA = "a" * 40
 
 
+@pytest.mark.parametrize("path,truncated,expected", [
+    ("runtime/cli.py", False, True),
+    ("runtime/cli.py", True, False),
+    ("unrelated.py", False, False),
+])
+def test_unchanged_endpoint_can_use_intact_changed_side_diff(path, truncated, expected):
+    from pr_reviewer.specialist_runtime.coverage import derive_obligations, _assessment_evidence_satisfies
+    from pr_reviewer.specialist_runtime.obligation_assessment import ObligationAssessmentLedger
+    from pr_reviewer.specialist_runtime.policy import parse_review_policy
+
+    policy = parse_review_policy({
+        "version": 3,
+        "components": [{"id": "runtime", "paths": ["runtime/**"]}, {"id": "shell", "paths": ["shell/**"]}],
+        "boundaries": [{"id": "inputs", "contract_paths": ["action.yml"],
+            "participants": ["runtime", "shell"], "contract_change_owner": "shell",
+            "objective": "Input values keep their meaning",
+            "endpoint_paths": {"runtime": ["runtime/cli.py"], "shell": ["shell/config.sh"]}}],
+    })
+    rows = derive_obligations({"changed_files": ["runtime/cli.py", "unrelated.py"],
+        "components": [{"id": "runtime", "changed_files": ["runtime/cli.py"]}]}, {}, policy)
+    shell = next(row for row in rows if row.participant_id == "shell")
+    runtime = next(row for row in rows if row.participant_id == "runtime")
+    store = EvidenceStore()
+    record = store.add_tool_result(session_id="s", tool="read_pr_diff", arguments={"path": path},
+        result={"status": "ok", "truncated": truncated,
+                "content": "@@ -4 +4 @@\n-old_prompt\n+new_prompt"},
+        provenance=EvidenceProvenance(head_sha=HEAD_SHA))
+    ledger = ObligationAssessmentLedger(session_id="s", obligations=(shell,),
+        obligation_ids=(shell.id,), expected_head_sha=HEAD_SHA)
+    result = ledger.propose(target="O1", disposition="not_applicable",
+        reason="Only the model prompt changes; no shell inputs or defaults are affected.",
+        evidence_ids=(record.id,), next_actions=(), evidence=store.snapshot(), eligible=_assessment_evidence_satisfies)
+    assert result.accepted is expected
+    if expected:
+        assert ledger.assessment("O1").assessed_paths == ()
+        context = build_boundary_context(policy.boundaries[0], (
+            ledger.assessment("O1"),
+            _assessment(runtime.id, record.id, disposition=ObligationDisposition.NOT_APPLICABLE),
+        ), store.snapshot(), max_bytes=30_000, expected_head_sha=HEAD_SHA,
+            obligations={shell.id: "shell", runtime.id: "runtime"},
+            unaffected_diff_paths={"shell": shell.boundary_unaffected_diff_paths}, contract_unchanged=True)
+        assert context["missing_participants"] == []
+        assert context["incomplete"] is False
+        assert context["participant_evidence_ids"]["shell"] == [record.id]
+
+
 def _runtime_input_obligations():
     from pathlib import Path
     from pr_reviewer.specialist_runtime.coverage import derive_obligations
@@ -32,6 +78,24 @@ def _runtime_input_obligations():
         next(item for item in policy.boundaries if item.id == "action-runtime-inputs"),
         tuple(item for item in obligations if item.boundary_id == "action-runtime-inputs" and not item.evaluator_owned),
     )
+
+
+def test_contract_only_blocked_participant_gets_policy_diagnostic():
+    boundary = _boundary()
+    store = EvidenceStore()
+    contract = _record(store, path="contracts/message.json", content="showId: UUID")
+    producer = _record(store, path="backend/send.py", content="send(event)")
+    assessments = (
+        _assessment("backend", producer.id),
+        _assessment("worker", contract.id, disposition=ObligationDisposition.BLOCKED),
+    )
+    # An eligible source from another participant cannot fill the policy gap.
+    context = build_boundary_context(boundary, assessments, store.snapshot(), max_bytes=30_000,
+        expected_head_sha=HEAD_SHA)
+    assert "Contract evidence is present for worker" in " ".join(context["diagnostics"])
+    assert context["configuration_only_gap"] is True
+    assert context["suggested_investigation"] == ""
+    assert context["incomplete"] is True
 
 
 def test_boundary_accepts_unchanged_inspected_runtime_sources_without_changed_coverage(tmp_path):

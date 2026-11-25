@@ -383,6 +383,39 @@ def test_boundary_participant_without_changed_paths_can_record_supported_inspect
     assert ledger.assessment("O1").disposition.value == "covered"
 
 
+def test_boundary_citation_rejection_offers_only_eligible_retained_alternatives():
+    from pr_reviewer.specialist_runtime.evidence import EvidenceProvenance
+    from pr_reviewer.specialist_runtime.obligation_assessment import ObligationAssessmentLedger
+
+    obligation = CoverageObligation("boundary", "boundary-participant", "Consumer",
+        boundary_id="api", participant_id="consumer", boundary_endpoint_paths=("consumer.py",))
+    head = "a" * 40
+    ledger = ObligationAssessmentLedger(session_id="S1", obligations=(obligation,),
+        obligation_ids=(obligation.id,), expected_head_sha=head)
+    store = EvidenceStore()
+
+    def source(path, offset, *, truncated=False, sha=head):
+        return store.add_tool_result(session_id="S1", tool="read_file",
+            arguments={"path": path, "offset": offset, "limit": 5},
+            result={"status": "ok", "content": "accept(request.id)", "truncated": truncated},
+            provenance=EvidenceProvenance(head_sha=sha))
+
+    bad = source("consumer.py", 10, truncated=True)
+    valid = source("consumer.py", 11)
+    wrong_endpoint = source("producer.py", 11)
+    stale = source("consumer.py", 20, sha="b" * 40)
+    proposal = dict(target="O1", disposition="covered",
+        reason="The consumer still accepts the request identity.", next_actions=(),
+        evidence=store.snapshot(), eligible=lambda *_: True)
+    rejected = ledger.propose(**proposal, evidence_ids=(bad.id,))
+    assert not rejected.accepted
+    assert bad.id in rejected.reason and "truncated source read" in rejected.reason
+    assert valid.id in rejected.reason and "consumer.py" in rejected.reason and "11" in rejected.reason
+    assert wrong_endpoint.id not in rejected.reason and stale.id not in rejected.reason
+    assert ledger.assessment("O1").disposition.value == "pending"
+    assert ledger.propose(**proposal, evidence_ids=(valid.id,)).accepted
+
+
 def test_component_group_accepts_eligible_owner_evidence_and_ignores_supplemental_evidence():
     paths = ("backend/a.py", "backend/b.py")
     ledger = _ledger(scope=paths, owner_component_id="backend")

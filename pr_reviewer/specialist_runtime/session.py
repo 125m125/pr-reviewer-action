@@ -737,6 +737,7 @@ class _CheckpointChangeRejection:
     reason: str
     payload: Mapping[str, Any]
     diagnostic: Mapping[str, Any] | None = None
+    citation_repair: bool = False
 
 
 _CHECKPOINT_LIFECYCLE_INSTRUCTIONS = {
@@ -1262,6 +1263,7 @@ def specialist_assignment_prompt(
             "recipe_objective": item.recipe_objective,
             "recipe_invariants": list(item.recipe_invariants),
             "evidence_hints": list(item.evidence_hints),
+            **({"boundary_change_scope": item.boundary_change_scope} if item.boundary_change_scope else {}),
         } for item in component_obligations)
     boundary_hints = tuple(dict.fromkeys((*getattr(
         assignment,
@@ -1371,7 +1373,8 @@ def specialist_assignment_prompt(
     payload.pop("obligation_ids", None)
     payload["independent_targets"] = [handles[item] for item in payload.pop("independent_obligation_ids") if item in handles]
     payload["obligation_briefs"] = [
-        {**{key: value for key, value in item.items() if key != "obligation_id"},
+        {**{key: value for key, value in item.items()
+            if key != "obligation_id" and (key != "boundary_change_scope" or value)},
          "target": handles[item["obligation_id"]]}
         for item in payload.get("obligation_briefs", ()) if item.get("obligation_id") in handles
     ]
@@ -1510,6 +1513,7 @@ class SpecialistSession:
         delegated_summary_max_tokens: int | None = None,
         delegated_summary_max_source_bytes: int | None = None,
         changed_files: tuple[str, ...] = (),
+        pr_changed_files: tuple[str, ...] | None = None,
         change_overview: Mapping[str, object] | None = None,
         test_results: tuple[Mapping[str, object], ...] = (),
         test_results_repository: str = "",
@@ -1584,6 +1588,8 @@ class SpecialistSession:
         self.test_results_repository = str(test_results_repository).strip()
         self.test_results_head_sha = str(test_results_head_sha).strip()
         self.repository_head_sha = str(repository_head_sha).strip()
+        self._pr_changed_files = (frozenset(_normalized_path(path) for path in pr_changed_files)
+                                  if pr_changed_files is not None else None)
         self.changed_files = tuple(dict.fromkeys(
             str(path).replace("\\", "/").strip("/")
             for path in (
@@ -2153,6 +2159,12 @@ class SpecialistSession:
         obligation_targets = sorted({
             item.target for item in rejections if item.kind == "obligation"
         })
+        if rejections and all(item.citation_repair for item in rejections):
+            keys = ("target", "evidence_ids")
+            obligation_item["properties"] = {
+                key: obligation_item["properties"][key] for key in keys
+            }
+            obligation_item["required"] = list(keys)
         if obligation_targets:
             obligation_item["properties"]["target"]["enum"] = obligation_targets
         unresolved_items: dict[str, Any] = {"type": "string"}
@@ -2192,6 +2204,12 @@ class SpecialistSession:
                     json.dumps(item.diagnostic, sort_keys=True)
                     if item.diagnostic is not None else item.reason
                 )
+            )
+        if rejections and all(item.citation_repair for item in rejections):
+            lines.append(
+                "For each supported citation repair, return only target and replacement evidence_ids "
+                "in obligation_updates. The controller retains the original conclusion and paths. "
+                "Use unresolved when no eligible retained excerpt proves the conclusion."
             )
         lines.extend((
             "Return only corrections for these rejected changes. For each "
@@ -4601,13 +4619,7 @@ class SpecialistSession:
                     {
                         "evidence_id": prior.id,
                         "replayed_duplicate": True,
-                        "changed": bool(
-                            prior.source_path
-                            and any(
-                                prior.source_path in obligation.scope
-                                for obligation in self.coverage.obligations()
-                            )
-                        ),
+                        "changed": self._source_changed(prior),
                         "eligible_targets": list(requested_targets),
                         "coverage_effect": "neutral_evidence_retained",
                     },
@@ -4756,13 +4768,7 @@ class SpecialistSession:
                     **({"range": dict(payload["range"])}
                        if isinstance(payload, Mapping) and isinstance(payload.get("range"), Mapping)
                        else {}),
-                    "changed": bool(
-                        record.source_path
-                        and any(
-                            record.source_path in obligation.scope
-                            for obligation in self.coverage.obligations()
-                        )
-                    ),
+                    "changed": self._source_changed(record),
                     "eligible_targets": list(requested_targets),
                     "coverage_effect": "neutral_evidence_retained",
                     **self._remote_delegation_hint(name, record, payload),
@@ -4981,6 +4987,12 @@ class SpecialistSession:
                 obligation_id=obligation_id,
                 categories=obligation.required_evidence_categories,
             )
+
+    def _source_changed(self, record: EvidenceRecord) -> bool | None:
+        if (self._pr_changed_files is None or not record.source_path
+                or record.tool not in {"read_file", "read_pr_diff", "git_grep", "git_blame"}):
+            return None
+        return _normalized_path(record.source_path) in self._pr_changed_files
 
     def _associate_proposed_evidence(
         self, target: str, evidence_ids: tuple[str, ...],
@@ -5481,8 +5493,26 @@ class SpecialistSession:
                             item.target: item.assessment_version
                             for item in self.obligation_assessments.assessments()
                         }
+                        correction_text = correction.content
+                        if (isinstance(correction_raw, Mapping)
+                                and all(item.citation_repair for item in correction_group)):
+                            originals = {item.target: item.payload for item in correction_group}
+                            updates = correction_raw.get("obligation_updates")
+                            if isinstance(updates, list) and all(
+                                isinstance(row, Mapping) and set(row) == {"target", "evidence_ids"}
+                                and isinstance(row["target"], str) and row["target"] in originals
+                                for row in updates
+                            ):
+                                correction_text = json.dumps({
+                                    **correction_raw,
+                                    "obligation_updates": [
+                                        {**originals[row["target"]], **row} for row in updates
+                                    ],
+                                })
+                            else:
+                                correction_text = ""
                         corrected = self._checkpoint_from_text(
-                            correction.content,
+                            correction_text,
                             require_complete_pending=False,
                             allowed_obligation_targets={
                                 item.target for item in correction_group
@@ -6099,6 +6129,7 @@ class SpecialistSession:
                 ) or str(update.get("target") or "<missing>")
                 rejections.append(_CheckpointChangeRejection(
                     "obligation", target, proposal.reason, dict(update),
+                    citation_repair=proposal.citation_repair,
                 ))
                 continue
             if proposal.ignored_supplemental_evidence_ids:

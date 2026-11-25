@@ -44,6 +44,7 @@ class ObligationBrief:
     recipe_objective: str = ""
     recipe_invariants: tuple[str, ...] = ()
     evidence_hints: tuple[str, ...] = ()
+    boundary_change_scope: str = ""
 
 
 @dataclass(frozen=True)
@@ -821,6 +822,7 @@ def _obligation_briefs(
                 for value in item.recipe_invariants[:12]
             ),
             evidence_hints=tuple(_bounded_text(value, 120) for value in item.evidence_hints[:16]),
+            boundary_change_scope=item.boundary_change_scope,
         )
         for item in obligations
     )
