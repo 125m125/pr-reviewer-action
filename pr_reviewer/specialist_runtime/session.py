@@ -485,7 +485,7 @@ TEST_RESULTS_TOOL_NAME = "read_test_results"
 COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
     "name": COMPACTED_EVIDENCE_TOOL_NAME,
     "description": (
-        "Read a bounded excerpt from an evidence result that the controller "
+        "Recover retained text from an evidence result that the controller "
         "explicitly marked as compacted or shared for the current historical discussion. "
         "This tool never reads arbitrary evidence "
         "or creates new evidence. For another page, use the returned next_offset; "
@@ -504,7 +504,7 @@ COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
             },
             "limit": {
                 "type": "integer",
-                "description": "Optional excerpt size, capped by the controller.",
+                "description": "Optional maximum characters. By default, return as much as fits the normal tool-result budget.",
             },
             "target": {
                 "type": "string",
@@ -522,7 +522,6 @@ COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
     },
 }
 _MAX_COMPACTED_EVIDENCE_READS = 4
-_MAX_COMPACTED_EVIDENCE_READ_CHARS = 4_000
 _CONTEXT_LIMIT_SIGNALS = (
     "context_length_exceeded",
     "context size",
@@ -7586,26 +7585,25 @@ class SpecialistSession:
                 "error": "evidence ID is not marked as compacted",
             }
         raw_offset = arguments.get("offset", 0)
-        raw_limit = arguments.get("limit", _MAX_COMPACTED_EVIDENCE_READ_CHARS)
+        content = record.content
+        raw_limit = arguments.get("limit")
         if (
             isinstance(raw_offset, bool)
             or not isinstance(raw_offset, int)
             or raw_offset < 0
-            or isinstance(raw_limit, bool)
-            or not isinstance(raw_limit, int)
-            or raw_limit <= 0
+            or ("limit" in arguments and (
+                isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or raw_limit <= 0
+            ))
         ):
             return {"status": "error", "error": "offset and limit are invalid"}
         offset = raw_offset
-        limit = min(raw_limit, _MAX_COMPACTED_EVIDENCE_READ_CHARS)
+        limit = raw_limit if raw_limit is not None else max(0, len(content) - offset)
         key = (
             evidence_id, target, purpose, self._compacted_evidence_generation,
         )
-        content = record.content
-        excerpt = content[offset:offset + limit]
-        end = offset + len(excerpt)
+        end = min(len(content), offset + limit)
         ranges = self._compacted_evidence_read_ranges.get(key, [])
-        if excerpt and any(start <= offset and end <= stop for start, stop in ranges):
+        if end > offset and any(start <= offset and end <= stop for start, stop in ranges):
             return {
                 "status": "ok",
                 "evidence_id": evidence_id,
@@ -7613,7 +7611,7 @@ class SpecialistSession:
                 "target": target,
                 "purpose": purpose,
             }
-        if not excerpt:
+        if end <= offset:
             return {
                 "status": "ok", "evidence_id": evidence_id, "target": target,
                 "purpose": purpose, "content": "", "offset": offset,
@@ -7635,7 +7633,37 @@ class SpecialistSession:
             else:
                 end = min(end, start)
                 break
-        excerpt = content[offset:end]
+        def page(stop: int) -> dict[str, Any]:
+            next_offset = stop
+            for start, previous_end in ranges:
+                if start <= next_offset <= previous_end:
+                    next_offset = previous_end
+            return {
+                "status": "ok", "evidence_id": evidence_id, "target": target,
+                "purpose": purpose, "tool": record.tool,
+                "content": content[offset:stop], "offset": offset, "limit": limit,
+                "truncated": stop < len(content),
+                "next_offset": next_offset if next_offset < len(content) else None,
+                "source_truncated": bool(record.truncated),
+            }
+
+        def fits(result: dict[str, Any]) -> bool:
+            return len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= self.max_tool_result_bytes
+
+        # Budget the serialized response before marking any characters as delivered.
+        result = page(end)
+        if not fits(result):
+            low, high = offset, end
+            while low + 1 < high:
+                middle = (low + high) // 2
+                if fits(page(middle)):
+                    low = middle
+                else:
+                    high = middle
+            if low == offset:
+                return {"status": "error", "error": "tool result budget too small for compacted evidence"}
+            end = low
+            result = page(end)
         # Merge delivered intervals so changing page boundaries cannot make
         # already delivered content count as progress. At most four reads are
         # allowed, so a sorted list is sufficient.
@@ -7647,23 +7675,7 @@ class SpecialistSession:
                 merged.append((start, stop))
         self._compacted_evidence_read_ranges[key] = merged
         self._compacted_evidence_reads += 1
-        next_offset = end
-        for start, stop in merged:
-            if start <= next_offset <= stop:
-                next_offset = stop
-        return {
-            "status": "ok",
-            "evidence_id": evidence_id,
-            "target": target,
-            "purpose": purpose,
-            "tool": record.tool,
-            "content": excerpt,
-            "offset": offset,
-            "limit": limit,
-            "truncated": offset + len(excerpt) < len(content),
-            "next_offset": next_offset if next_offset < len(content) else None,
-            "source_truncated": bool(record.truncated),
-        }
+        return result
 
     def _read_test_results(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         """Return bounded controller-seeded test cases matching a model query."""

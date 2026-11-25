@@ -163,7 +163,7 @@ def build_boundary_context(
             "assessed_paths": list(assessment.assessed_paths),
             "omitted_paths": list(assessment.omitted_paths),
             "assessment_version": assessment.assessment_version,
-            "next_actions": list(assessment.next_actions),
+            "next_actions": [] if assessment.next_actions_consumed else list(assessment.next_actions),
         }
         for participant, assessment in relevant
     ]
@@ -238,10 +238,17 @@ def build_boundary_context(
                                      + (f" at {paths}; focus on the changed interaction." if paths else "."))
             else:
                 diagnostics.append(f"participant {participant} assessment remains incomplete or contradicted")
+                omitted_paths = tuple(dict.fromkeys(
+                    path for assessment in participant_assessments
+                    for path in assessment.omitted_paths
+                ))
                 actions = list(dict.fromkeys(
                     action for assessment in participant_assessments
+                    if not assessment.next_actions_consumed
                     for action in assessment.next_actions
                 ))
+                if omitted_paths:
+                    actions.insert(0, "Inspect unassessed changed paths: " + ", ".join(omitted_paths[:20]) + ".")
                 followups.append(
                     f"Complete participant {participant}'s assessment using its retained source evidence. "
                     + (" ".join(actions) if actions else

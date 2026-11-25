@@ -295,6 +295,38 @@ def test_compacted_evidence_reader_is_strict_and_deduplicated():
     assert "not marked as compacted" in session.conversation.events[-1]["content"]
 
 
+@pytest.mark.parametrize("budget,single_page", [(12_000, True), (3_000, False)])
+def test_compacted_evidence_uses_normal_result_budget(budget, single_page):
+    session = make_session(ScriptedGateway([]), max_tool_result_bytes=budget)
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "content": ('é"\\' * 1_040) + ("tail" * 260)},
+    )
+    session._compacted_evidence[record.id] = record
+    offset = 0
+    recovered = ""
+    for index in range(4):
+        call = {
+            "id": f"page-{index}", "name": COMPACTED_EVIDENCE_TOOL_NAME,
+            "arguments": json.dumps({
+                "evidence_id": record.id, "target": "OB-code",
+                "purpose": "obligation_resolution", "offset": offset,
+            }),
+        }
+        assert session._execute_calls((call,))
+        body = session.conversation.events[-1]["content"]
+        assert len(body.encode("utf-8")) <= budget
+        page = json.loads(body)
+        assert page["offset"] == offset
+        recovered += page["content"]
+        offset = page["next_offset"]
+        if offset is None:
+            break
+        assert offset == len(recovered)
+    assert recovered == record.content
+    assert (index == 0) == single_page
+
+
 def test_compacted_evidence_pages_make_progress_without_replaying_delivered_ranges():
     session = make_session(ScriptedGateway([]))
     record = session.evidence_store.add_tool_result(
@@ -317,7 +349,7 @@ def test_compacted_evidence_pages_make_progress_without_replaying_delivered_rang
     assert progressed
     assert first["content"] == record.content[:4_000]
     assert first["next_offset"] == 4_000
-    progressed, second = read(first["next_offset"], 6_000)
+    progressed, second = read(first["next_offset"])
     assert progressed
     assert second["content"] == record.content[4_000:8_000]
     assert second["next_offset"] == 8_000
@@ -385,7 +417,7 @@ def test_exploration_continues_through_fresh_compacted_pages_and_one_duplicate()
     gateway.responses = [
         tool_call_response(COMPACTED_EVIDENCE_TOOL_NAME, {
             "evidence_id": record.id, "target": "OB-code",
-            "purpose": "obligation_resolution", "offset": offset,
+            "purpose": "obligation_resolution", "offset": offset, "limit": 4_000,
         }, call_id=f"page-{index}")
         for index, offset in enumerate((0, 4_000, 4_000))
     ] + [checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])]

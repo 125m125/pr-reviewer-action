@@ -97,14 +97,14 @@ def test_boundary_evaluator_uses_sources_and_does_not_repeat_unchanged_inputs(tm
         "boundaries": [{"id": "api", "contract_paths": ["contract.json"], "participants": ["a", "b"], "contract_change_owner": "a", "objective": "Request IDs agree", "endpoint_paths": {"a": ["a/**"], "b": ["b/**"]}}],
     })
     inputs = replace(_inputs(tmp_path), policy=policy, topology={
-        "changed_files": ["contract.json", "a/endpoint.py"],
-        "components": [{"id": "a", "changed_files": ["a/endpoint.py"]}, {"id": "b", "changed_files": []}],
+        "changed_files": ["contract.json", "a/endpoint.py", "a/types.py"],
+        "components": [{"id": "a", "changed_files": ["a/endpoint.py", "a/types.py"]}, {"id": "b", "changed_files": []}],
         "change_facts": {"facts": {
             "contract.json": {"change_excerpts": ['+ "id": "string"']},
             "a/endpoint.py": {"hunk_summaries": ["changed hunk at new-file line 4"],
                               "change_excerpts": ["+ request_id = payload.id"]},
         }},
-    }, changed_files=("contract.json", "a/endpoint.py"))
+    }, changed_files=("contract.json", "a/endpoint.py", "a/types.py"))
     obligations = derive_obligations(inputs.topology, {}, policy)
     for item in obligations:
         if item.boundary_id == "api":
@@ -201,7 +201,17 @@ def test_boundary_evaluator_uses_sources_and_does_not_repeat_unchanged_inputs(tm
                     if row["handle"].startswith("L")]
     assert "+ request_id = payload.id" in lead_targets[0]["boundary_change_scope"]
 
-    reopened = replace(assessments[0], disposition=ObligationDisposition.PARTIALLY_COVERED, next_actions=("Check cancellation behavior.",), assessment_version=2)
+    state.investigation_leads[lead_id] = replace(
+        state.investigation_leads[lead_id],
+        status=InvestigationLeadStatus.RESOLVED_NO_ISSUE,
+        resolution_reason="The legacy caller never receives the unnormalized ID.",
+    )
+    reopened = replace(
+        assessments[0], disposition=ObligationDisposition.PARTIALLY_COVERED,
+        assessed_paths=("a/endpoint.py", "contract.json"), omitted_paths=("a/types.py",),
+        next_actions=("Check legacy caller normalization again.",),
+        next_actions_consumed=True, assessment_version=2,
+    )
     state.session_results[("A", "S1")] = SimpleNamespace(checkpoint=SessionCheckpoint("S1", SessionState.CHECKPOINT, obligation_assessments=(reopened, *assessments[1:])))
     controller._evaluate_boundaries(state)
     assert len(requests) == 1
@@ -209,6 +219,25 @@ def test_boundary_evaluator_uses_sources_and_does_not_repeat_unchanged_inputs(tm
     failure = state.boundary_evaluations["api"]
     assert "missing usable source evidence for participant" not in failure.reason
     assert "assessment remains incomplete" in failure.reason
+    lead = state.investigation_leads[lead_id]
+    assert lead.status is InvestigationLeadStatus.OPEN
+    negotiation = controller._negotiation_state(
+        replace(state, session_results={}), SimpleNamespace(snapshot=state.coverage.snapshot()), 1,
+    )
+    target = next(row for row in compact_negotiation_context(negotiation)["targets"]
+                  if row["handle"].startswith("L"))
+    assert "legacy caller never receives" in target["last_conclusion"]
+    assert "a/types.py" in target["next_actions"][0]
+    assert "normalization again" not in target["next_actions"][0]
+
+    assignment = controller._plan(state).assignments[0]
+    prior, _ = controller._followup_prior_work(state, assignment, lead)
+    assert prior["missing_question"] == target["next_actions"][0]
+    assert prior["prior_hypothesis_resolution"] == target["last_conclusion"]
+    partial = next(item for item in prior["assessments"] if item["obligation_id"] == reopened.obligation_id)
+    assert partial["disposition"] == "partially_covered"
+    assert partial["omitted_paths"] == ["a/types.py"]
+    assert not partial["next_actions"]
 
     from pr_reviewer.specialist_runtime import controller as controller_module
     state.investigation_leads[lead_id] = replace(

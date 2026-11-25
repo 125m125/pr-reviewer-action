@@ -3966,6 +3966,12 @@ class ReviewController:
                         "reason": "same closed evidence question",
                     })
                     continue
+                prior_outcome = old_lead.last_outcome if old_lead else ""
+                if (old_lead is not None and old_lead.status is InvestigationLeadStatus.RESOLVED_NO_ISSUE
+                        and old_lead.resolution_reason):
+                    prior_outcome = mask_runtime_text(
+                        "Prior hypothesis ruled out: " + old_lead.resolution_reason, limit=1_000,
+                    )
                 state.investigation_leads[lead_id] = InvestigationLead(
                     lead_id=lead_id,
                     summary=(
@@ -3983,7 +3989,7 @@ class ReviewController:
                     required_capability="repository", origin_session_id="boundary-evaluator",
                     attempt_count=old_lead.attempt_count if old_lead else 0,
                     last_evidence_delta=old_lead.last_evidence_delta if old_lead else 0,
-                    last_outcome=old_lead.last_outcome if old_lead else "",
+                    last_outcome=prior_outcome,
                 )
 
     def _refresh_boundary_coverage(
@@ -4418,10 +4424,16 @@ class ReviewController:
             evidence_ids.extend(candidates[-1]["evidence_ids"])
             if len(candidates) == 6:
                 break
-        latest = {}
-        for _revision, _owner, assessment in self._accepted_checkpoint_assessments(state):
-            if assessment.obligation_id in obligation_ids:
-                latest[assessment.obligation_id] = assessment
+        boundary_id = lead.lead_id.removeprefix("boundary:") if lead.lead_id.startswith("boundary:") else ""
+        assessment_ids = ({
+            item.id for item in state.obligations
+            if item.boundary_id == boundary_id and item.participant_id
+        } if boundary_id else obligation_ids)
+        latest = {
+            assessment.obligation_id: assessment
+            for _revision, _owner, assessment in self._accepted_checkpoint_assessments(state)
+            if assessment.obligation_id in assessment_ids
+        }
         assessments = []
         for assessment in tuple(latest.values())[:8]:
             assessments.append({
@@ -4429,7 +4441,14 @@ class ReviewController:
                 "disposition": assessment.disposition.value,
                 "reason": mask_runtime_text(assessment.reason, limit=600),
                 "evidence_ids": list(assessment.evidence_ids[:8]),
-                "next_actions": [mask_runtime_text(item, limit=300) for item in assessment.next_actions[:3]],
+                "next_actions": [
+                    mask_runtime_text(item, limit=300) for item in assessment.next_actions[:3]
+                    if not assessment.next_actions_consumed
+                ],
+                **({
+                    "assessed_paths": list(assessment.assessed_paths[:20]),
+                    "omitted_paths": list(assessment.omitted_paths[:20]),
+                } if boundary_id else {}),
             })
             evidence_ids.extend(assessment.evidence_ids[:8])
         sources = []
@@ -4445,16 +4464,18 @@ class ReviewController:
         retained_ids = {record.id for record in sources}
         for item in (*candidates, *assessments):
             item["evidence_ids"] = [value for value in item["evidence_ids"] if value in retained_ids]
-        evaluation = state.boundary_evaluations.get(lead.lead_id.removeprefix("boundary:"))
         return {
-            "missing_question": mask_runtime_text(
-                getattr(evaluation, "missing_fact", "") or lead.next_action, limit=1000,
-            ),
+            "missing_question": mask_runtime_text(lead.next_action, limit=1000),
+            **({"prior_hypothesis_resolution": lead.last_outcome}
+               if boundary_id and lead.last_outcome else {}),
             "semantics": (
-                "Prior candidates and assessments are unverified claims, not facts or coverage proof. "
+                "Prior candidates and assessment explanations are unverified claims, not facts or coverage proof. "
                 "You may contradict them. Answer only the missing question; do not restart the whole "
                 "investigation. Prior observations are not local candidate update or withdrawal targets. "
                 "Use retained source evidence to verify claims and avoid restating an existing defect."
+                + (" The dispositions and omitted paths reflect accepted coverage state. A prior hypothesis "
+                   "resolution does not close this coverage gap; do not recheck it without contradictory evidence."
+                   if boundary_id else "")
             ),
             "candidates": candidates,
             "assessments": assessments,
@@ -7722,7 +7743,11 @@ class ReviewController:
                     state.investigation_leads[lead_id] = replace(
                         lead, attempt_count=lead.attempt_count + 1,
                         last_evidence_delta=len(evidence_ids),
-                        last_outcome=(lead.resolution_reason or conclusion) if lead.kind == "review_thread" else conclusion,
+                        last_outcome=(
+                            (lead.resolution_reason or conclusion) if lead.kind == "review_thread"
+                            else lead.last_outcome if lead_id.startswith("boundary:")
+                            else conclusion
+                        ),
                         evidence_ids=tuple(dict.fromkeys((*lead.evidence_ids, *evidence_ids))),
                     )
                     journal.emit("investigation_lead_followup_completed", {
