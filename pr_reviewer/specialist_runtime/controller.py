@@ -87,6 +87,10 @@ def _critic_anchor_excerpt(record, location: str, max_bytes: int = 1200) -> str 
 from pr_reviewer.specialists import classify_file_roles
 from .adjudication import (
     merge_accepted_findings,
+    merge_evidence_options,
+    merge_rejection,
+    normalize_merge_basis,
+    _added_diff_lines_by_path,
     AcceptedFinding,
     AdjudicatedReview,
     ReviewHandoffContext,
@@ -780,11 +784,11 @@ def _critic_rows(value: object) -> tuple[Mapping[str, object], ...]:
 def _partial_critic_result(
     value: object,
     candidates: Iterable[CandidateFinding],
-) -> tuple[tuple[Mapping[str, str], ...], tuple[str, ...]]:
+) -> tuple[tuple[Mapping[str, object], ...], tuple[str, ...]]:
     """Keep valid rows and identify candidate IDs needing a bounded repair."""
     allowed = {item.candidate_id for item in candidates}
     seen: set[str] = set()
-    rows: list[Mapping[str, str]] = []
+    rows: list[Mapping[str, object]] = []
     for row in _critic_rows(value):
         candidate_id = str(row.get("candidate_id") or "").strip()
         action = str(row.get("action") or "").strip().lower()
@@ -799,10 +803,12 @@ def _partial_critic_result(
         elif target_id:
             continue
         seen.add(candidate_id)
+        basis = normalize_merge_basis(row.get("merge_basis")) if action == "merge" else {}
         rows.append({
             "candidate_id": candidate_id,
             "action": action,
             "target_id": target_id,
+            **({"merge_basis": basis} if basis else {}),
             **({"review_thread": dict(row["review_thread"])} if isinstance(row.get("review_thread"), Mapping) else {}),
         })
     return tuple(rows), tuple(sorted(allowed - seen))
@@ -989,13 +995,12 @@ def _validated_critic_result(
         elif target_id:
             raise ValueError("critic target_id is only valid for merge")
         seen.add(candidate_id)
-        # Models commonly add rationale/evidence fields despite the compact
-        # decision schema.  Those fields cannot change adjudication and are
-        # intentionally ignored; only the validated decision is admitted.
+        basis = normalize_merge_basis(row.get("merge_basis")) if action == "merge" else {}
         admitted.append({
             "candidate_id": candidate_id,
             "action": action,
             "target_id": target_id,
+            **({"merge_basis": basis} if basis else {}),
             **({"review_thread": dict(row["review_thread"])} if isinstance(row.get("review_thread"), Mapping) else {}),
         })
     if seen != allowed_ids:
@@ -1957,6 +1962,7 @@ def _json_value(value: object) -> object:
         return {
             item.name: _json_value(getattr(value, item.name))
             for item in fields(value)
+            if not (item.metadata.get("omit_none") and getattr(value, item.name) is None)
         }
     return str(value)
 
@@ -5008,15 +5014,15 @@ class ReviewController:
             })
         return {"actions": rows}, fallback_ids, len(batches)
 
-    def _deduplicate_critic_batches(self, state):
+    def _deduplicate_critic_batches(self, state, critic_context):
         if len(state.review.accepted) < 2:
             return
         context = {
             "critic_deduplication": {
                 "instruction": (
                     "These findings already passed substantive review and deterministic validation. "
-                    "Only identify duplicates with the same defect and consequence. Return "
-                    "{\"actions\":[{\"candidate_id\":\"source\",\"action\":\"merge\",\"target_id\":\"survivor\"}]}. "
+                    "Only identify duplicates addressed by one concrete fix. Return merge actions with candidate_id and target_id. "
+                    "For cross-file merges also return merge_basis with same_fix, source_evidence_id, and target_evidence_id. "
                     "Return an empty actions array if none are duplicates. Do not reject, downgrade, "
                     "promote, rewrite, or re-evaluate findings. Omit unchanged findings. "
                     "When uncertain, leave both findings unchanged."
@@ -5030,6 +5036,14 @@ class ReviewController:
                 "user_visible_consequence": item.user_visible_consequence,
             } for item in state.review.accepted),
         }
+        if len({item.affected_file for item in state.review.accepted}) > 1:
+            context["candidate_evidence"] = {
+                item.candidate_id: tuple({
+                    **{key: excerpt[key] for key in ("evidence_id", "path", "tool", "truncated")},
+                    "content_excerpt": excerpt["content_excerpt"][:400],
+                } for excerpt in critic_context["candidate_evidence"].get(item.candidate_id, ())[:4])
+                for item in state.review.accepted
+            }
         size = self._critic_context_bytes(context)
         limit = getattr(self.critic, "max_context_bytes", None) or 160_000
         # ponytail: one compact dedup pass; leave duplicates rather than launch
@@ -5191,30 +5205,56 @@ class ReviewController:
                 candidates, critic_result, state.evidence,
                 obligations=obligation_map, changed_files=state.inputs.changed_files,
             )
-            invalid_merge_ids = tuple(
-                item.candidate_id
+            rejected_by_id = {
+                item.candidate_id: item
                 for item in state.review.dispositions
                 if item.reason == "invalid-merge-target-kept"
-            )
+            }
+            eligible_targets = {}
             if (
-                invalid_merge_ids
+                rejected_by_id
                 and self.critic is not None
                 and critic_context is not None
             ):
-                invalid_id_set = set(invalid_merge_ids)
                 original_rows, _missing = _partial_critic_result(
                     critic_result, candidates,
                 )
                 original_by_id = {
                     item["candidate_id"]: item for item in original_rows
                 }
+                records = {item.id: item for item in state.evidence.snapshot().records}
+                added_lines = _added_diff_lines_by_path(records.values())
+                accepted = {item.candidate_id: item for item in state.review.accepted}
+                for candidate_id, rejected in rejected_by_id.items():
+                    source = accepted[candidate_id]
+                    targets = tuple(
+                        target.candidate_id for target in accepted.values()
+                        if original_by_id[target.candidate_id]["action"] == "keep"
+                        and (
+                            merge_rejection(source, target, added_lines, records, {}) is None
+                            or (target.candidate_id == rejected.target_id
+                                and source.affected_file != target.affected_file
+                                and merge_evidence_options(source, records)
+                                and merge_evidence_options(target, records))
+                        )
+                    )
+                    if targets:
+                        eligible_targets[candidate_id] = targets
+                if not eligible_targets:
+                    state.journal.emit("critic_merge_repair_skipped", {
+                        "reason": "no feasible independently kept merge target",
+                        "rejected_merges": tuple(_json_value(item) for item in rejected_by_id.values()),
+                    })
+            if eligible_targets:
+                invalid_merge_ids = tuple(eligible_targets)
+                invalid_id_set = set(invalid_merge_ids)
+                target_ids = {target for values in eligible_targets.values() for target in values}
+                rejected_merges = tuple({
+                    **original_by_id[item], "reason": rejected_by_id[item].merge_rejection,
+                } for item in invalid_merge_ids)
                 state.journal.emit("critic_merge_repair_requested", {
                     "invalid_candidate_ids": invalid_merge_ids,
-                    "rejected_merges": tuple(
-                        original_by_id[item]
-                        for item in invalid_merge_ids
-                        if item in original_by_id
-                    ),
+                    "rejected_merges": rejected_merges,
                 })
                 try:
                     repaired = self._model_request(
@@ -5233,28 +5273,25 @@ class ReviewController:
                                 candidate_id: critic_context[
                                     "candidate_evidence"
                                 ][candidate_id]
-                                for candidate_id in invalid_merge_ids
+                                for candidate_id in sorted(invalid_id_set | target_ids)
                             },
                             "candidate_assessments": {
                                 item: critic_context["candidate_assessments"][item]
                                 for item in invalid_merge_ids
                             },
-                            "eligible_merge_targets": tuple(
+                            "merge_target_findings": tuple(
                                 item for item in candidates
-                                if item.candidate_id not in invalid_id_set
+                                if item.candidate_id in target_ids
                             ),
+                            "eligible_merge_targets": eligible_targets,
                             "critic_merge_repair": {
                                 "invalid_candidate_ids": invalid_merge_ids,
-                                "rejected_merges": tuple(
-                                    original_by_id[item]
-                                    for item in invalid_merge_ids
-                                    if item in original_by_id
-                                ),
+                                "rejected_merges": rejected_merges,
                                 "instruction": (
                                     "The requested merges were not deterministically "
-                                    "compatible. Return one corrected action for each listed "
-                                    "candidate ID. Keep the candidate unless another listed "
-                                    "action is justified; merge only into an eligible target."
+                                    "compatible. For each listed source, return keep or merge "
+                                    "into a target listed for that source. For a cross-file "
+                                    "merge use merge_basis to connect the two findings."
                                 ),
                             },
                         },
@@ -5266,7 +5303,10 @@ class ReviewController:
                     repaired_by_id = {
                         item["candidate_id"]: item
                         for item in repaired_rows
-                        if item["candidate_id"] in invalid_id_set
+                        if item["candidate_id"] in invalid_id_set and (
+                            item["action"] == "keep" or (item["action"] == "merge" and
+                            item["target_id"] in eligible_targets[item["candidate_id"]])
+                        )
                     }
                     still_missing = tuple(
                         item for item in invalid_merge_ids
@@ -5292,7 +5332,14 @@ class ReviewController:
                         changed_files=state.inputs.changed_files,
                     )
                     state.journal.emit("critic_merge_repair_completed", {
-                        "repaired_candidate_ids": invalid_merge_ids,
+                        "merged_candidate_ids": tuple(
+                            item.candidate_id for item in state.review.dispositions
+                            if item.candidate_id in invalid_id_set and item.action == "merge"
+                        ),
+                        "retained_candidate_ids": tuple(
+                            item.candidate_id for item in state.review.dispositions
+                            if item.candidate_id in invalid_id_set and item.action == "keep"
+                        ),
                     })
                 except Exception as repair_exc:
                     state.journal.emit("critic_merge_repair_failed", {
@@ -5323,7 +5370,7 @@ class ReviewController:
                 ) for item in state.review.dispositions),
             )
         if critic_batch_count > 1:
-            self._deduplicate_critic_batches(state)
+            self._deduplicate_critic_batches(state, critic_context)
         snapshots = {item["target"]: item for item in state.inputs.review_threads}
         for row in _critic_rows(critic_result):
             association = row.get("review_thread")

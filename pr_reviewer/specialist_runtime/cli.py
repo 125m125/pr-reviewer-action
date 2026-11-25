@@ -237,6 +237,12 @@ _ROLE_SYSTEM = {
         "the retained source; excerpt_truncated describes what you can actually see. "
         "Missing text in a shortened excerpt proves "
         "neither presence nor absence of the claimed contract."
+        " Different file anchors do not rule out a duplicate. For a cross-file merge include "
+        'merge_basis: {"same_fix":"why one concrete fix resolves both claims",'
+        '"source_evidence_id":"support cited by the source",'
+        '"target_evidence_id":"support cited by the target"}. '
+        "IDs may differ; a shared file, term, or evidence ID alone does not establish a duplicate. "
+        "The target must be kept, not merged onward. If one fix would not resolve both, keep both."
         " If the controller supplies a critic repair request, return decisions only for "
         "the listed missing_candidate_ids; accepted decisions are already retained and "
         "must not be repeated."
@@ -2223,6 +2229,8 @@ def _runtime_event_line(
         details = f"action={action} reason={reason}"
         if target:
             details += f" target={target}"
+        if payload.get("merge_rejection"):
+            details += f" merge_rejection={_compact_text(payload['merge_rejection'], 140)}"
         return f"candidate {candidate_id} disposition: {details}"
     if kind == "specialist_initializing":
         return (

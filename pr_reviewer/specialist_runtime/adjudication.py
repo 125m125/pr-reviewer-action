@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import (
     dataclass,
+    field,
     fields as dataclass_fields,
     is_dataclass,
     replace,
@@ -20,6 +21,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from pr_reviewer.enforcement import RuntimeVerdictPolicyResult, derive_runtime_verdict
 
+from .callbacks import mask_runtime_text
 from .coverage import evidence_satisfies_obligation
 from .evidence import EvidenceRecord, EvidenceSnapshot, EvidenceStore
 from .types import (
@@ -55,6 +57,8 @@ class CandidateDisposition:
     action: str
     reason: str
     target_id: str | None = None
+    merge_rejection: str | None = field(default=None, metadata={"omit_none": True})
+    merge_basis: Mapping[str, str] | None = field(default=None, metadata={"omit_none": True})
 
 
 @dataclass(frozen=True)
@@ -870,6 +874,42 @@ def _merge_compatible(
     )
 
 
+def normalize_merge_basis(value: object) -> dict[str, str]:
+    keys = ("same_fix", "source_evidence_id", "target_evidence_id")
+    if not isinstance(value, Mapping) or any(
+        not isinstance(value.get(key), str) or not value[key].strip() for key in keys
+    ):
+        return {}
+    return {key: (mask_runtime_text(value[key], limit=600) if key == "same_fix"
+                  else value[key].strip()[:80]) for key in keys}
+
+
+def merge_evidence_options(finding: AcceptedFinding, records: Mapping[str, EvidenceRecord]) -> tuple[str, ...]:
+    return tuple(item for item in finding.supporting_evidence_ids
+                 if item not in finding.contradicting_evidence_ids
+                 and (record := records.get(item)) is not None
+                 and record.is_usable_for_coverage and not record.truncated and record.content.strip())
+
+
+def merge_rejection(
+    source: AcceptedFinding, target: AcceptedFinding | None,
+    added_lines: Mapping[str, frozenset[int]], records: Mapping[str, EvidenceRecord],
+    basis: Mapping[str, str],
+) -> str | None:
+    if target is None or source.candidate_id == target.candidate_id:
+        return "target-not-independently-kept"
+    if source.affected_file == target.affected_file:
+        return None if _merge_compatible(_candidate_from_accepted(source), _candidate_from_accepted(target), added_lines) else (
+            "same-file-lacks-shared-root-evidence-or-confirmed-line"
+        )
+    if not basis:
+        return "cross-file-same-fix-and-two-citations-required"
+    if (basis["source_evidence_id"] not in merge_evidence_options(source, records)
+            or basis["target_evidence_id"] not in merge_evidence_options(target, records)):
+        return "cross-file-citation-not-eligible-for-its-finding"
+    return None
+
+
 def _snapshot(evidence: EvidenceStore | EvidenceSnapshot) -> EvidenceSnapshot:
     if isinstance(evidence, EvidenceStore):
         return evidence.snapshot()
@@ -1341,7 +1381,7 @@ def _merge_findings(
         if added_diff_lines is not None else None
     )
     line = _best_confirmed_line(
-        (item.line for item in values),
+        (item.line for item in values if item.affected_file == representative.affected_file),
         confirmed=confirmed,
         preferred=representative.line,
     )
@@ -1383,15 +1423,26 @@ def merge_accepted_findings(
     """A dedup-only pass cannot reject, promote, or rewrite a finding."""
     accepted = {item.candidate_id: item for item in review.accepted}
     dispositions = {item.candidate_id: item for item in review.dispositions}
-    added_lines = _added_diff_lines_by_path(_snapshot(evidence).records)
-    for row in _decision_rows(proposals):
+    records = {record.id: record for record in _snapshot(evidence).records}
+    added_lines = _added_diff_lines_by_path(records.values())
+    rows = _decision_rows(proposals)
+    merge_sources = {str(row.get("candidate_id", "")) for row in rows if row.get("action") == "merge"}
+    original = dict(accepted)
+    for row in rows:
         if row.get("action") != "merge":
             continue
         source_id, target_id = str(row.get("candidate_id", "")), str(row.get("target_id", ""))
         source, target = accepted.get(source_id), accepted.get(target_id)
         if source is None or target is None or source_id == target_id:
             continue
-        if not _merge_compatible(_candidate_from_accepted(source), _candidate_from_accepted(target), added_lines):
+        basis = normalize_merge_basis(row.get("merge_basis"))
+        cross_file = source.affected_file != target.affected_file
+        reason = ("cross-file-target-also-merging" if cross_file and target_id in merge_sources else
+                  merge_rejection(original[source_id], original[target_id], added_lines, records, basis))
+        if reason:
+            dispositions[source_id] = CandidateDisposition(
+                source_id, "keep", "invalid-merge-target-kept", target_id, merge_rejection=reason,
+            )
             continue
         accepted[target_id] = _merge_findings((source, target), target_id, added_diff_lines=added_lines)
         del accepted[source_id]
@@ -1400,6 +1451,7 @@ def merge_accepted_findings(
             if candidate_id == source_id or (disposition.action == "merge" and disposition.target_id == source_id):
                 dispositions[candidate_id] = CandidateDisposition(
                     candidate_id, "merge", "cross-batch-duplicate", target_id,
+                    merge_basis=(basis if cross_file and candidate_id == source_id else disposition.merge_basis),
                 )
     return replace(review, accepted=tuple(accepted[key] for key in sorted(accepted)),
                    dispositions=tuple(dispositions[key] for key in sorted(dispositions)))
@@ -1442,7 +1494,7 @@ def adjudicate_candidates(
     verification: dict[str, CandidateVerificationRequest] = {}
     unknowns: dict[str, CandidateFinding] = {}
     dispositions: dict[str, CandidateDisposition] = {}
-    merge_sources: dict[str, list[AcceptedFinding]] = {}
+    merge_sources: dict[str, list[tuple[AcceptedFinding, dict[str, str]]]] = {}
 
     for candidate_id in sorted(candidate_by_id):
         candidate = candidate_by_id[candidate_id]
@@ -1505,39 +1557,35 @@ def adjudicate_candidates(
             )
             continue
         if action == "merge":
-            target = candidate_by_id.get(target_id)
-            if target is None or not _merge_compatible(candidate, target, added_diff_lines):
-                disposition = CandidateDisposition(
-                    candidate_id, "keep", "invalid-merge-target-kept", target_id or None
-                )
-                accepted[candidate_id] = authorized
-                dispositions[candidate_id] = disposition
-                continue
-            merge_sources.setdefault(target_id, []).append(authorized)
+            merge_sources.setdefault(target_id, []).append((authorized, normalize_merge_basis(decision.get("merge_basis"))))
             continue
         accepted[candidate_id] = authorized
         dispositions[candidate_id] = CandidateDisposition(candidate_id, "keep", "accepted")
 
+    kept_targets = dict(accepted)
     for target_id in sorted(merge_sources):
-        sources = merge_sources[target_id]
-        target = accepted.get(target_id)
-        if target is None:
-            for source in sources:
+        target = kept_targets.get(target_id)
+        valid_sources = []
+        for source, basis in merge_sources[target_id]:
+            reason = merge_rejection(source, target, added_diff_lines, records, basis)
+            if reason:
                 accepted[source.candidate_id] = source
                 dispositions[source.candidate_id] = CandidateDisposition(
                     source.candidate_id,
                     "keep",
                     "invalid-merge-target-kept",
-                    target_id,
+                    target_id or None,
+                    merge_rejection=reason,
                 )
-            continue
-        accepted[target_id] = _merge_findings(
-            (target, *sources), target_id,
-            added_diff_lines=added_diff_lines,
-        )
-        for source in sources:
+                continue
+            valid_sources.append(source)
             dispositions[source.candidate_id] = CandidateDisposition(
-                source.candidate_id, "merge", "merged", target_id
+                source.candidate_id, "merge", "merged", target_id,
+                merge_basis=basis if source.affected_file != target.affected_file else None,
+            )
+        if valid_sources:
+            accepted[target_id] = _merge_findings(
+                (target, *valid_sources), target_id, added_diff_lines=added_diff_lines,
             )
 
     by_fingerprint: dict[str, list[AcceptedFinding]] = {}

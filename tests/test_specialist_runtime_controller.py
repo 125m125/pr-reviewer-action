@@ -3991,7 +3991,9 @@ def test_malformed_critic_result_uses_evidence_gated_conservative_fallback(
     assert "private" not in critic_degradations[0]["reason"]
 
 
-def test_critic_gets_one_focused_correction_for_invalid_merge(tmp_path):
+@pytest.mark.parametrize("cross_file", [False, True])
+def test_critic_only_repairs_a_merge_when_it_has_a_feasible_target(tmp_path, cross_file):
+    source_path = "src/audit.py" if cross_file else "src/worker.py"
     store = EvidenceStore()
     first = store.add_tool_result(
         session_id="seed-a",
@@ -4003,7 +4005,7 @@ def test_critic_gets_one_focused_correction_for_invalid_merge(tmp_path):
     second = store.add_tool_result(
         session_id="seed-b",
         tool="read_file",
-        arguments={"path": "src/worker.py"},
+        arguments={"path": source_path},
         result={"status": "ok", "content": "audit_after_retry()"},
         category="implementation",
     )
@@ -4039,7 +4041,7 @@ def test_critic_gets_one_focused_correction_for_invalid_merge(tmp_path):
         candidate_id="duplicate-audit",
         root_cause_fingerprint="root-audit",
         claim="The audit callback may emit two records for one action",
-        affected_location="src/worker.py:9",
+        affected_location=f"{source_path}:9",
         causal_chain=(
             "An ambiguous response reaches the audit callback and the audit callback "
             "observes the repeated write."
@@ -4094,8 +4096,12 @@ def test_critic_gets_one_focused_correction_for_invalid_merge(tmp_path):
             ]}
         repair = request.context["critic_merge_repair"]
         assert repair["invalid_candidate_ids"] == (source.candidate_id,)
+        assert repair["rejected_merges"][0]["reason"] == "cross-file-same-fix-and-two-citations-required"
+        assert request.context["eligible_merge_targets"][source.candidate_id] == (target.candidate_id,)
         return {"actions": [
-            {"candidate_id": source.candidate_id, "action": "keep"},
+            {"candidate_id": source.candidate_id, "action": "merge", "target_id": target.candidate_id,
+             "merge_basis": {"same_fix": "Make the repeated write idempotent so the audit callback never sees a duplicate.",
+                             "source_evidence_id": second.id, "target_evidence_id": first.id}},
         ]}
 
     result = _controller(
@@ -4110,16 +4116,18 @@ def test_critic_gets_one_focused_correction_for_invalid_merge(tmp_path):
         obligation_deriver=lambda *_args, **_kwargs: (obligation,),
     ).run(replace(
         _inputs(tmp_path), candidate_findings=(target, source),
+        changed_files=tuple(dict.fromkeys(("src/worker.py", source_path))),
     ))
 
-    assert len(critic_requests) == 2
-    assert {item["candidate_id"] for item in result.artifact["accepted_candidates"]} >= {
-        target.candidate_id, source.candidate_id,
-    }
-    assert any(
-        item["kind"] == "critic_merge_repair_completed"
-        for item in result.artifact["events"]
-    )
+    assert len(critic_requests) == (2 if cross_file else 1)
+    accepted = {item["candidate_id"] for item in result.artifact["accepted_candidates"]}
+    if cross_file:
+        assert accepted == {target.candidate_id}
+        completed, = [item["payload"] for item in result.artifact["events"] if item["kind"] == "critic_merge_repair_completed"]
+        assert completed["merged_candidate_ids"] == (source.candidate_id,)
+    else:
+        assert accepted == {target.candidate_id, source.candidate_id}
+        assert any(item["kind"] == "critic_merge_repair_skipped" for item in result.artifact["events"])
 
 
 def test_critic_degradation_emits_one_verification_request_per_controller_root(
