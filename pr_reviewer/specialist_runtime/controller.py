@@ -145,6 +145,7 @@ from .negotiation import (
     SessionResources,
     compact_negotiation_context,
     fallback_next_action,
+    select_compact_followup_wave,
     validate_compact_negotiation,
     validate_negotiation,
 )
@@ -3414,6 +3415,8 @@ class ReviewController:
             assignment.id: self._session_identity(state, assignment)
             for assignment in assignment_items
         }
+        if len(set(expected_ids.values())) != len(assignment_items):
+            raise ValueError("a wave cannot run the same assignment or durable session twice")
         existing_handles = {
             assignment.id: state.sessions.get(expected_ids[assignment.id])
             for assignment in assignment_items
@@ -4156,6 +4159,9 @@ class ReviewController:
                 "reason": "no model turn fits the remaining exploration deadline",
             })
             return ()
+        wave_limit = min(state.inputs.config.concurrency, remaining_turns, remaining_tools)
+        if wave_limit > 1:
+            compact_context["protocol"] = "propose a ranked wave of independent follow-up actions"
         if self.negotiator is not None:
             try:
                 role_context: dict[str, object] = {
@@ -4166,6 +4172,7 @@ class ReviewController:
                     "change_overview": change_overview_orientation(
                         state.change_overview,
                     ),
+                    **({"followup_wave_limit": wave_limit} if wave_limit > 1 else {}),
                 }
                 # Keep the typed state available to in-process integrations for
                 # backwards compatibility.  Gateway-backed model roles receive
@@ -4193,7 +4200,22 @@ class ReviewController:
                         "from": raw_kind,
                         "to": {"record-unknown": "record_unknown", "new-session": "new_session"}[raw_kind],
                     })
-                if isinstance(self.negotiator, GatewayRoleAdapter):
+                if wave_limit > 1 and "actions" in raw and (
+                    isinstance(self.negotiator, GatewayRoleAdapter)
+                    or isinstance(raw["actions"], list) and any(
+                        isinstance(row, Mapping) and "target" in row for row in raw["actions"]
+                    )
+                ):
+                    proposal = select_compact_followup_wave(
+                        raw, negotiation_state, limit=wave_limit,
+                        conflicts=lambda action: self._followup_conflict_keys(state, action),
+                    )
+                    state.journal.emit("negotiation_wave_admitted", {
+                        "limit": wave_limit,
+                        "proposed": len(raw["actions"]),
+                        "admitted": len(proposal.actions),
+                    })
+                elif isinstance(self.negotiator, GatewayRoleAdapter):
                     proposal = validate_compact_negotiation(raw, negotiation_state)
                 else:
                     # Trusted in-process adapters may still return the legacy
@@ -4247,6 +4269,30 @@ class ReviewController:
         except NegotiationError as exc:
             self._degrade(state, "negotiator", _bounded_error(exc))
             return ()
+
+    def _followup_conflict_keys(self, state: _RunState, action: NegotiationAction) -> set[tuple[str, str]]:
+        keys: set[tuple[str, str]] = set()
+        owner = state.ownership.get(action.session_id) if action.session_id else None
+        if owner is not None:
+            keys.add(("assignment", owner.assignment_id))
+        obligation_ids = set(action.obligation_ids)
+        for lead_id in action.lead_ids:
+            lead = state.investigation_leads[lead_id]
+            batch = self._review_thread_batch(state, lead) if lead.kind == "review_thread" else (lead,)
+            keys.update(("target", item.lead_id) for item in batch)
+            keys.update(("path", path) for item in batch for path in item.affected_paths)
+            obligation_ids.update(lead.delegated_obligation_ids)
+            if lead.child_assignment_id:
+                keys.add(("assignment", lead.child_assignment_id))
+            if lead_id.startswith("boundary:"):
+                keys.add(("boundary", lead_id.removeprefix("boundary:")))
+        for item in state.obligations:
+            if item.id in obligation_ids:
+                keys.add(("target", item.id))
+                keys.update(("path", path) for path in item.scope)
+                if item.boundary_id:
+                    keys.add(("boundary", item.boundary_id))
+        return keys
 
     def _queue_review_threads(self, state: _RunState) -> None:
         """Optional leads only after independent exploration, never hard obligations."""
@@ -7601,9 +7647,8 @@ class ReviewController:
                     state, session_id, "update_lease", RunPhase.FOLLOWUP,
                     followup_lease,
                 )
-            # Negotiation is deliberately one-action-at-a-time.  Recompute the
-            # authoritative state after each bounded wave so the next proposal
-            # cannot rely on stale obligations, leases, or coverage gains.
+            # Reconcile each whole wave before asking for more work. A result
+            # from one lane may settle another target or change session reuse.
             unproductive_obligation_ids: set[str] = set()
             round_index = -1
             while state.deadline.exploration_allowed(now=self.clock()):

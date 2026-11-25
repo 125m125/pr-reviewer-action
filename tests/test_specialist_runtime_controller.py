@@ -2983,6 +2983,66 @@ def test_gateway_negotiator_receives_compact_targets_and_skips_empty_second_wave
     assert [event.payload["round"] for event in result.events if event.kind == "negotiation_round"] == [1, 2]
 
 
+def test_parallel_followups_reuse_distinct_sessions_and_wait_for_wave(tmp_path):
+    from threading import Barrier
+
+    from pr_reviewer.specialist_runtime.policy import parse_review_policy
+
+    both_running = Barrier(2, timeout=3)
+    resumed = []
+    rounds = []
+
+    class Session(_ResumeSession):
+        def explore(self):
+            if self.calls:
+                both_running.wait()
+                resumed.append(self.session_id)
+            self.calls += 1
+            return SessionResult(self.session_id, SessionState.CHECKPOINT,
+                checkpoint=SessionCheckpoint(self.session_id, SessionState.CHECKPOINT),
+                budget=BudgetUsage(model_turns=self.calls))
+
+        def finalize(self):
+            return SessionResult(self.session_id, SessionState.COMPLETE,
+                checkpoint=SessionCheckpoint(self.session_id, SessionState.CHECKPOINT),
+                budget=BudgetUsage(model_turns=self.calls), report={"summary": "done"})
+
+    def factory(assignment, lease, snapshot, evidence_store, coverage, obligations, expected_session_id):
+        return Session(assignment, evidence_store, obligations, expected_session_id)
+
+    def negotiate(request):
+        rounds.append(tuple(resumed))
+        if len(rounds) > 1:
+            remaining, = request.context["negotiation_targets"]
+            return {"kind": "record_unknown", "target": remaining["handle"], "reason": "Leave the last check open."}
+        targets = [row["handle"] for row in request.context["negotiation_targets"]
+                   if "resume" in row["allowed_actions"]]
+        assert request.context["followup_wave_limit"] == 2
+        assert len(targets) == 3
+        return {"actions": [
+            {"kind": "resume", "target": handle, "reason": "Check the independent changed behavior."}
+            for handle in (targets[0], targets[0], targets[1])
+        ]}
+
+    paths = ("a/main.py", "b/main.py", "c/main.py")
+    inputs = _inputs(tmp_path)
+    inputs = replace(inputs, changed_files=paths,
+        config=replace(inputs.config, concurrency=2),
+        policy=parse_review_policy({"version": 3, "components": [
+            {"id": component, "paths": [f"{component}/**"]} for component in ("a", "b", "c")
+        ]}),
+        topology={"changed_files": list(paths), "components": [
+            {"id": component, "changed_files": [path]} for component, path in zip(("a", "b", "c"), paths)
+        ]})
+    result = _controller(tmp_path, session_factory=factory, negotiator=negotiate).run(inputs)
+
+    initial = {event.payload["session_id"] for event in result.events
+               if event.kind == "specialist_initializing" and event.payload["phase"] == "initial"}
+    assert len(initial) == 3 and len(resumed) == 2 and set(resumed) < initial
+    assert len(set(resumed)) == 2
+    assert rounds == [(), tuple(resumed)]
+
+
 @pytest.mark.parametrize("failed_evidence", [False, True])
 def test_unproductive_followup_retires_target_and_tries_a_different_one(tmp_path, failed_evidence):
     request_count = 0

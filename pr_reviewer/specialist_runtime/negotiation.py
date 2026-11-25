@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from math import isfinite
 import re
@@ -1137,6 +1137,46 @@ def validate_compact_negotiation(
             "compact proposal must contain kind, target, and reason, not actions"
         )
     return validate_negotiation(_compact_raw_to_legacy(raw, state), state)
+
+
+def select_compact_followup_wave(
+    raw: Mapping[str, Any],
+    state: NegotiationState,
+    *,
+    limit: int,
+    conflicts: Callable[[NegotiationAction], set[tuple[str, str]]],
+) -> NegotiationProposal:
+    """Admit independent, feasible actions in model preference order."""
+    rows = raw.get("actions")
+    if set(raw) != {"actions"} or not isinstance(rows, list) or not rows:
+        raise NegotiationError("parallel proposal must contain a non-empty actions array")
+    accepted: list[NegotiationAction] = []
+    reserved: set[tuple[str, str]] = set()
+    # The model may offer alternatives, but validation work is bounded too.
+    for row in rows[:2 * limit]:
+        if len(accepted) >= limit:
+            break
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            action, = validate_compact_negotiation(row, state).actions
+        except NegotiationError:
+            continue
+        if action.kind == "record_unknown":
+            if not accepted:
+                return NegotiationProposal(actions=(action,))
+            continue
+        keys = conflicts(action)
+        if action.session_id:
+            keys.add(("session", action.session_id))
+        keys.update(("target", target) for target in (*action.obligation_ids, *action.lead_ids))
+        if reserved.intersection(keys) or _validate_feasibility((*accepted, action), state):
+            continue
+        reserved.update(keys)
+        accepted.append(action)
+    if not accepted:
+        raise NegotiationError("parallel proposal contained no feasible actions")
+    return NegotiationProposal(actions=tuple(accepted))
 
 
 def fallback_next_action(state: NegotiationState) -> NegotiationAction:
