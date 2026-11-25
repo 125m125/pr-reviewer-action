@@ -81,7 +81,7 @@ jobs:
       - name: Review pull request
         # Component-owned specialist reviews with policy v3 and bounded
         # cross-component evaluation; pin the clean implementation, not canaries.
-        uses: 125m125/pr-reviewer-action@0327bc5f542b9f6e21d31b4766e3ed14ee9acd36
+        uses: 125m125/pr-reviewer-action@3283ae72e27e498ae0e1a718e6a2e0e8eb0ea0d1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
