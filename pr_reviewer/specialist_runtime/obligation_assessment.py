@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import re
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, Iterable, Mapping
@@ -181,14 +182,26 @@ def is_retained_empty_repository_search(record: EvidenceRecord) -> bool:
 def boundary_participant_source(
     record: EvidenceRecord, endpoint_paths: tuple[str, ...],
     contract_paths: tuple[str, ...], *, not_applicable: bool = False,
+    unaffected_diff_paths: tuple[str, ...] = (),
 ) -> bool:
     if not_applicable and is_retained_empty_repository_search(record):
         return True
     if not record.source_path:
         return False
+    if not_applicable and boundary_changed_side_diff(record, unaffected_diff_paths):
+        return True
     if endpoint_paths:
         return any(fnmatch.fnmatchcase(record.source_path, pattern) for pattern in endpoint_paths)
     return not any(fnmatch.fnmatchcase(record.source_path, pattern) for pattern in contract_paths)
+
+
+def boundary_changed_side_diff(record: EvidenceRecord, paths: tuple[str, ...]) -> bool:
+    if record.tool != "read_pr_diff" or record.source_path not in paths or record.truncated:
+        return False
+    hunk = re.search(r"(?m)^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@[^\n]*\n", record.content)
+    return hunk is not None and any(
+        line.startswith(("+", "-")) for line in record.content[hunk.end():].splitlines()
+    )
 
 
 def boundary_source_diagnostic(
@@ -576,6 +589,7 @@ class ObligationAssessmentLedger:
                     records[item], obligation.boundary_endpoint_paths,
                     obligation.boundary_contract_paths,
                     not_applicable=effective is ObligationDisposition.NOT_APPLICABLE,
+                    unaffected_diff_paths=obligation.boundary_unaffected_diff_paths,
                 )
                 for item in eligible_ids
             )
@@ -591,6 +605,9 @@ class ObligationAssessmentLedger:
                    "is the contract itself. Do not substitute another participant's implementation."
                    if not obligation.boundary_endpoint_paths else "")
             )
+            if effective is ObligationDisposition.NOT_APPLICABLE and obligation.boundary_unaffected_diff_paths:
+                error += (". The mapped endpoint is unchanged; no reread is needed to establish that. "
+                          "Cite an intact triggering diff and explain why the changed interaction cannot affect it.")
             citation_repair = True
         elif (
             proposed is ObligationDisposition.PARTIALLY_COVERED
@@ -605,7 +622,8 @@ class ObligationAssessmentLedger:
             proposed is ObligationDisposition.NOT_APPLICABLE
             and obligation.boundary_id
             and not any(
-                is_retained_empty_repository_search(records[item]) or (
+                is_retained_empty_repository_search(records[item]) or
+                boundary_changed_side_diff(records[item], obligation.boundary_unaffected_diff_paths) or (
                 records[item].is_usable_for_coverage
                 and not records[item].truncated
                 and eligible(records[item], obligation)
@@ -677,6 +695,7 @@ class ObligationAssessmentLedger:
                 lambda record: boundary_participant_source(
                     record, obligation.boundary_endpoint_paths, obligation.boundary_contract_paths,
                     not_applicable=effective is ObligationDisposition.NOT_APPLICABLE,
+                    unaffected_diff_paths=obligation.boundary_unaffected_diff_paths,
                 ) and eligible(record, obligation),
                 obligation.boundary_endpoint_paths,
             )

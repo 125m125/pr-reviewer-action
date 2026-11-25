@@ -148,6 +148,7 @@ class CoverageObligation:
     boundary_endpoint_paths: tuple[str, ...] = ()
     boundary_contract_paths: tuple[str, ...] = ()
     boundary_change_scope: str = ""
+    boundary_unaffected_diff_paths: tuple[str, ...] = ()
 
     @property
     def id(self) -> str:

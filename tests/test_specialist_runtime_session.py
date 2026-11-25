@@ -1561,7 +1561,7 @@ def make_session(
     recovery_max_tokens=None, clock=time.monotonic, test_results=(),
     tool_schemas=None, delegated_summary_max_tokens=None,
     delegated_summary_max_source_bytes=None, max_tool_result_bytes=12_000,
-    repository_head_sha="",
+    repository_head_sha="", pr_changed_files=None,
 ):
     obligations = obligations or (
         CoverageObligation(
@@ -1609,8 +1609,21 @@ def make_session(
         test_results_repository="owner/repository",
         test_results_head_sha="b" * 40,
         repository_head_sha=repository_head_sha,
+        pr_changed_files=pr_changed_files,
         clock=clock,
     )
+
+
+@pytest.mark.parametrize("inventory,expected", [(("other.py",), True), ((), False), (None, None)])
+def test_read_change_status_uses_full_pr_inventory(inventory, expected):
+    session = make_session(
+        ScriptedGateway([]), pr_changed_files=inventory,
+        execute_tool=lambda *_: {"status": "ok", "result": {"content": "partial line",
+            "range": {"offset": 1, "lines": 1, "truncated": True}}},
+    )
+    session._execute_calls(({"id": "call", "name": "read_file", "arguments": '{"path":"other.py"}'},))
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["changed"] is expected
 
 
 def make_component_group_session(gateway):

@@ -98,6 +98,8 @@ _ROLE_SYSTEM = {
         "Use change_scope to isolate the changed interaction that could affect another participant. "
         "Unchanged code can be needed to trace the impact, but don't re-audit unrelated defaults or routing. "
         "An omitted diff excerpt is not proof that a behavior is unaffected. "
+        "For changed_side_evidence_ids, decide whether the cited triggering changes can affect "
+        "the unchanged participant. If the excerpt doesn't settle that, report the concrete missing fact. "
         "Return JSON with question (copy the supplied question), outcome (supported, "
         "incompatible, insufficient_evidence, or potential_contradiction), reason, evidence_ids, "
         "followup_kind (none, repository_evidence, or maintainer_decision), missing_fact, and "
@@ -1010,6 +1012,10 @@ def load_workspace(config: CliConfig) -> ReviewWorkspace:
         policy.legacy_projection(),
         change_facts=change_facts,
     )
+    topology["changed_original_paths"] = tuple(dict.fromkeys(
+        value.replace("\\", "/") for item in complete_pr_files
+        if isinstance((value := item.get("previous_filename")), str) and value.strip()
+    ))
     publish_mode = config.environment.get("PUBLISH_MODE", "review_comment").strip().lower()
     if publish_mode not in {"comment", "review_comment", "review_verdict"}:
         raise ValueError("publish_mode must be comment, review_comment, or review_verdict")
@@ -1364,6 +1370,7 @@ def build_controller(
             ),
             max_tool_result_bytes=config.tool_response_bytes,
             changed_files=allowed_diff_paths,
+            pr_changed_files=getattr(session_factory, "pr_changed_files", None),
             repository_head_sha=immutable_diff_range[1] if immutable_diff_range else "",
             change_overview=change_overview,
             test_results=tuple(test_results),
@@ -2807,6 +2814,8 @@ def main() -> int:
     session_factory = getattr(controller, "_cli_session_factory", None)
     if session_factory is not None:
         session_factory.source_policy = SourcePolicy.from_review_policy(workspace.inputs.policy)
+        session_factory.pr_changed_files = (*workspace.inputs.changed_files,
+                                            *workspace.inputs.topology.get("changed_original_paths", ()))
     result = controller.run(workspace.inputs)
     _write_outputs(config, workspace, result)
     return 0

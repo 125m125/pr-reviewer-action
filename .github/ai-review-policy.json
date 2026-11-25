@@ -652,7 +652,7 @@
           "pr_reviewer/specialist_runtime/policy.py"
         ]
       },
-      "objective": "Compare changed action input defaults and environment values with runtime parsing and validation."
+      "objective": "Compare changes to action input defaults, environment wiring, or runtime parsing that could affect input behavior. If the triggering runtime edits do not change input handling, cite the relevant diff and explain the lack of impact; do not re-audit unrelated defaults."
     },
     {
       "id": "runtime-publication",
@@ -665,12 +665,17 @@
       ],
       "contract_change_owner": "specialist-runtime",
       "endpoint_paths": {
+        "specialist-runtime": [
+          "pr_reviewer/specialist_runtime/types.py",
+          "pr_reviewer/specialist_runtime/controller.py",
+          "pr_reviewer/specialist_runtime/review_threads.py"
+        ],
         "publishing": [
           "scripts/publish_specialist_review.py",
           "pr_reviewer/github_review_notes.py"
         ]
       },
-      "objective": "Compare retained review outcomes and note fields with their publication consumers, including incomplete states and finding locations. For verdict routing, start at the specialist publish entry point and _native_event in github_review_notes.py: review_comment and review_verdict use different native event policies. Check the matching review body/event test before tracing unrelated publishing paths."
+      "objective": "Trace changed review outcomes, historical thread decisions, or note fields to their publication consumers. Check incomplete states and finding anchors when affected. Inspect _native_event and the review body/event tests only if the changes can affect native verdict routing."
     }
   ]
 }

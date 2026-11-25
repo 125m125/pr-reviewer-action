@@ -3826,6 +3826,16 @@ class ReviewController:
                 max_bytes=getattr(self.boundary_evaluator, "max_context_bytes", None) or 60_000,
                 obligations=locals_by_id, expected_head_sha=state.inputs.head_sha,
                 change_scope=combined.boundary_change_scope,
+                unaffected_diff_paths={
+                    item.participant_id: item.boundary_unaffected_diff_paths
+                    for item in state.obligations if item.id in locals_by_id
+                },
+                contract_unchanged=not any(
+                    fnmatch.fnmatchcase(path, pattern)
+                    for path in (*state.inputs.changed_files,
+                                 *state.inputs.topology.get("changed_original_paths", ()))
+                    for pattern in boundary.contract_paths
+                ),
             )
             previous = state.boundary_evaluations.get(boundary.id)
             if previous is not None and previous.input_fingerprint == context["input_fingerprint"]:
@@ -3887,8 +3897,11 @@ class ReviewController:
                     boundary.id, context["input_fingerprint"], "insufficient_evidence",
                     error or "boundary comparison did not complete", (),
                     missing_fact=error or "compatible participant behavior is not established",
-                    suggested_investigation=context.get("suggested_investigation") or f"Investigate {error or boundary.objective}.",
-                    followup_kind="repository_evidence",
+                    suggested_investigation=(
+                        "" if context["configuration_only_gap"] else
+                        context.get("suggested_investigation") or f"Investigate {error or boundary.objective}."
+                    ),
+                    followup_kind="maintainer_decision" if context["configuration_only_gap"] else "repository_evidence",
                 )
             state.boundary_evaluations[boundary.id] = outcome
             supported = outcome.outcome == "supported"

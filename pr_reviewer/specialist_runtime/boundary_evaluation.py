@@ -11,6 +11,7 @@ from typing import Iterable, Mapping
 from .evidence import EvidenceRecord, EvidenceSnapshot
 from .obligation_assessment import (
     ObligationAssessment, ObligationDisposition,
+    boundary_changed_side_diff,
     boundary_citation_repair,
     boundary_participant_source,
     boundary_source_diagnostic as _source_diagnostic,
@@ -34,10 +35,12 @@ _RESULT_KEYS = frozenset({
 def _participant_source(
     record: EvidenceRecord, participant: str,
     assessment: ObligationAssessment, boundary: BoundaryPolicy,
+    unaffected_diff_paths: tuple[str, ...] = (),
 ) -> bool:
     return boundary_participant_source(
         record, boundary.endpoint_paths.get(participant, ()), boundary.contract_paths,
         not_applicable=assessment.disposition is ObligationDisposition.NOT_APPLICABLE,
+        unaffected_diff_paths=unaffected_diff_paths,
     )
 
 
@@ -62,6 +65,8 @@ def build_boundary_context(
     obligations: Mapping[str, str] | None = None,
     expected_head_sha: str | None = None,
     change_scope: str = "",
+    unaffected_diff_paths: Mapping[str, tuple[str, ...]] | None = None,
+    contract_unchanged: bool = False,
 ) -> dict:
     if not isinstance(boundary, BoundaryPolicy):
         raise TypeError("boundary must be a BoundaryPolicy")
@@ -70,6 +75,7 @@ def build_boundary_context(
     if not isinstance(max_bytes, int) or max_bytes <= 0:
         raise ValueError("max_bytes must be positive")
     owner_by_obligation = dict(obligations or {})
+    changed_side_paths = dict(unaffected_diff_paths or {})
     participants = tuple(boundary.participants)
     relevant: list[tuple[str, ObligationAssessment]] = []
     for assessment in assessments:
@@ -158,7 +164,8 @@ def build_boundary_context(
             if owner == participant
             for evidence_id in assessment.evidence_ids
             if evidence_id in source_records
-            and _participant_source(source_records[evidence_id], participant, assessment, boundary)
+            and _participant_source(source_records[evidence_id], participant, assessment, boundary,
+                                    changed_side_paths.get(participant, ()))
         })
         for participant in participants
     }
@@ -167,9 +174,16 @@ def build_boundary_context(
         for record in source_records.values()
         for contradicted_id in record.contradicts
     }
+    changed_side_evidence = {
+        participant: [item for item in participant_evidence[participant]
+                      if boundary_changed_side_diff(source_records[item], changed_side_paths.get(participant, ()))]
+        for participant in participants
+    }
     missing = []
     diagnostics = []
     followups = []
+    mapping_gaps = []
+    contract_evidence_ids = sorted(record.id for record in contract_records if record.id in source_records)
     if mixed_revisions:
         diagnostics.append("source evidence contains mixed head_sha revisions")
     for participant in participants:
@@ -192,10 +206,19 @@ def build_boundary_context(
                 cited = tuple(dict.fromkeys(
                     item for assessment in participant_assessments for item in assessment.evidence_ids
                 ))
+                if not boundary.endpoint_paths.get(participant) and set(cited).intersection(contract_evidence_ids):
+                    message = (f"Contract evidence is present for {participant}, but it does not count as "
+                               "participant evidence without an explicit endpoint_paths mapping. "
+                               "Cite the actual producer or consumer, or map the contract explicitly if it serves both roles.")
+                    diagnostics.append(message)
+                    if all(item.disposition is ObligationDisposition.BLOCKED for item in participant_assessments):
+                        mapping_gaps.append(participant)
+                        continue
                 if cited:
                     followups.append(f"Repair {participant}'s boundary citations. " + boundary_citation_repair(
                         records_by_id, cited, expected_head_sha,
-                        lambda record: any(_participant_source(record, participant, item, boundary)
+                        lambda record: any(_participant_source(record, participant, item, boundary,
+                                                               changed_side_paths.get(participant, ()))
                                            for item in participant_assessments),
                         boundary.endpoint_paths.get(participant, ()),
                     ))
@@ -215,18 +238,15 @@ def build_boundary_context(
                        "Record the remaining assessment gap; do not reread sources merely because the assessment is incomplete.")
                 )
 
-    contract_evidence_ids = sorted(
-        record.id for record in selected
-        if record.id in source_records
-        and record.source_path
-        and any(
-            fnmatch.fnmatchcase(record.source_path, pattern)
-            for pattern in boundary.contract_paths
-        )
-    )
-    if boundary.contract_paths and not contract_evidence_ids:
+    # A changed-side non-impact review asks whether the unchanged contract is
+    # reached at all, not whether new producer and consumer values agree.
+    changed_side_only = (contract_unchanged and not missing and any(changed_side_evidence.values())
+                         and all(item.disposition is ObligationDisposition.NOT_APPLICABLE for _, item in relevant))
+    contract_missing = bool(boundary.contract_paths and not contract_evidence_ids and not changed_side_only)
+    if contract_missing:
         diagnostics.append("missing usable source evidence for boundary contract")
         followups.append("Read only the relevant contract slice in " + ", ".join(boundary.contract_paths[:3]) + ".")
+    configuration_only_gap = bool(mapping_gaps and not followups and not mixed_revisions)
 
     invalid_evidence = sorted(
         record.id for record in selected if record.id not in source_records
@@ -252,6 +272,9 @@ def build_boundary_context(
         "assessments": assessment_packets,
         "evidence": [_record_semantics(record) for record in selected],
         "change_scope": change_scope,
+        "changed_side_only": changed_side_only,
+        "changed_side_evidence_ids": changed_side_evidence,
+        "configuration_only_gap": configuration_only_gap,
     }
     fingerprint = "boundary:" + hashlib.sha256(
         _canonical_json(semantic).encode("utf-8")
@@ -261,6 +284,9 @@ def build_boundary_context(
         "boundary": semantic["boundary"],
         "question": boundary.objective,
         "change_scope": change_scope,
+        "changed_side_evidence_ids": changed_side_evidence,
+        "changed_side_only": changed_side_only,
+        "configuration_only_gap": configuration_only_gap,
         "required_participants": list(participants),
         "assessments": assessment_packets,
         "evidence": evidence_packets,
@@ -268,9 +294,7 @@ def build_boundary_context(
         "contract_evidence_ids": contract_evidence_ids,
         "source_evidence_ids": sorted(source_records),
         "missing_participants": missing,
-        "incomplete": bool(missing or mixed_revisions or (
-            boundary.contract_paths and not contract_evidence_ids
-        )),
+        "incomplete": bool(missing or mixed_revisions or contract_missing),
         "diagnostics": diagnostics,
         "suggested_investigation": " ".join(followups),
         "input_fingerprint": fingerprint,
@@ -291,6 +315,7 @@ def build_boundary_context(
         }
         context["missing_participants"] = list(participants)
         context["incomplete"] = True
+        context["configuration_only_gap"] = False
         context["diagnostics"].append(
             f"required boundary evidence exceeds max_bytes ({packet_bytes} > {max_bytes})"
         )
@@ -366,6 +391,8 @@ def validate_boundary_evaluation(
                     f"participant {participant}"
                 )
         contract_ids = set(context.get("contract_evidence_ids", ()))
+        if outcome == "incompatible" and context.get("changed_side_only") and not contract_ids:
+            raise ValueError("an incompatible contract requires direct contract source evidence")
         if contract_ids and not cited.intersection(contract_ids):
             raise ValueError(
                 f"{outcome} boundary evaluation requires boundary contract source evidence"
