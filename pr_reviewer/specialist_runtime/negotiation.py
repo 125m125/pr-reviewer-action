@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from math import isfinite
 import re
@@ -262,6 +262,7 @@ class NegotiationProposal:
     """Stable immutable collection of validated follow-up actions."""
 
     actions: tuple[NegotiationAction, ...]
+    deferred: tuple[NegotiationAction, ...] = ()
 
 
 def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
@@ -353,6 +354,7 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             "handle": f"U{index}",
             "risk_tier": item.risk_tier,
             "subject": item.subject,
+            **({"boundary_change_scope": item.boundary_change_scope} if item.boundary_change_scope else {}),
             "summary": (
                 assessment.reason if assessment is not None and assessment.reason else
                 checkpoint_summary or
@@ -369,6 +371,10 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
                 if request.obligation_id == item.id
             ),
         })
+    boundary_scopes = {
+        f"boundary:{item.boundary_id}": item.boundary_change_scope
+        for item in state.obligations if item.evaluator_owned and item.boundary_change_scope
+    }
     reserved_delegations = _reserved_delegation_lead_ids(state)
     for index, lead in enumerate(_negotiable_leads(state), start=1):
         allowed_actions = ["record_unknown"]
@@ -408,6 +414,7 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             "risk_tier": "normal",
             "subject": lead.affected_paths[0] if lead.affected_paths else "investigation lead",
             "summary": lead.summary,
+            **({"boundary_change_scope": boundary_scopes[lead.lead_id]} if lead.lead_id in boundary_scopes else {}),
             "allowed_actions": tuple(dict.fromkeys(allowed_actions)),
             "last_conclusion": lead.resolution_reason or lead.last_outcome,
             "attempt_count": lead.attempt_count,
@@ -572,7 +579,8 @@ def _negotiable_leads(state: NegotiationState) -> tuple[InvestigationLead, ...]:
                 InvestigationLeadStatus.SCHEDULED,
             }
         ),
-        key=lambda item: item.lead_id,
+        # Historical leads are queued in relevance order by the controller.
+        key=lambda item: (item.kind == "review_thread", "" if item.kind == "review_thread" else item.lead_id),
     ))
 
 
@@ -1130,6 +1138,72 @@ def validate_compact_negotiation(
             "compact proposal must contain kind, target, and reason, not actions"
         )
     return validate_negotiation(_compact_raw_to_legacy(raw, state), state)
+
+
+def select_compact_followup_wave(
+    raw: Mapping[str, Any],
+    state: NegotiationState,
+    *,
+    limit: int,
+    conflicts: Callable[[NegotiationAction], set[tuple[str, str]]],
+) -> NegotiationProposal:
+    """Admit independent, feasible actions in model preference order."""
+    rows = raw.get("actions")
+    if set(raw) != {"actions"} or not isinstance(rows, list) or not rows:
+        raise NegotiationError("parallel proposal must contain a non-empty actions array")
+    accepted: list[NegotiationAction] = []
+    deferred: list[NegotiationAction] = []
+    proposed_targets: set[str] = set()
+    reserved: set[tuple[str, str]] = set()
+    # The model may offer alternatives, but validation work is bounded too.
+    for row in rows[:2 * limit]:
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            action, = validate_compact_negotiation(row, state).actions
+        except NegotiationError:
+            continue
+        if action.kind == "record_unknown":
+            if not accepted:
+                return NegotiationProposal(actions=(action,))
+            continue
+        targets = set((*action.lead_ids, *action.obligation_ids))
+        if proposed_targets.intersection(targets):
+            continue
+        proposed_targets.update(targets)
+        keys = conflicts(action)
+        if action.session_id:
+            keys.add(("session", action.session_id))
+        keys.update(("target", target) for target in (*action.obligation_ids, *action.lead_ids))
+        if (len(accepted) >= limit or reserved.intersection(keys)
+                or _validate_feasibility((*accepted, action), state)):
+            deferred.append(action)
+            continue
+        reserved.update(keys)
+        accepted.append(action)
+    if not accepted:
+        raise NegotiationError("parallel proposal contained no feasible actions")
+    return NegotiationProposal(actions=tuple(accepted), deferred=tuple(deferred))
+
+
+def revalidate_deferred_followup(
+    action: NegotiationAction, state: NegotiationState,
+) -> NegotiationAction:
+    """Translate stable IDs through the current target handles without silently rerouting."""
+    if action.lead_ids:
+        handles = _compact_target_leads(state)
+        target = next((key for key, item in handles.items() if (item.lead_id,) == action.lead_ids), None)
+    else:
+        handles = _compact_target_obligations(state)
+        target = next((key for key, item in handles.items() if (item.id,) == action.obligation_ids), None)
+    if target is None:
+        raise NegotiationError("target is no longer open")
+    current, = validate_compact_negotiation({
+        "kind": action.kind, "target": target, "reason": action.reason,
+    }, state).actions
+    if current.session_id != action.session_id:
+        raise NegotiationError("eligible session changed; reconsider in the next negotiation")
+    return current
 
 
 def fallback_next_action(state: NegotiationState) -> NegotiationAction:

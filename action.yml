@@ -1481,9 +1481,8 @@ runs:
         esac
 
     - name: Clear re-review label
-      # When a label add triggered this review, remove it so re-adding the
-      # label re-triggers. Best-effort; never fails the run.
-      if: ${{ github.event.action == 'labeled' && github.event.label.name == inputs.rereview_label && steps.precheck.outputs.should_review == 'true' }}
+      # Allow a fresh attempt even after failure, but leave cancelled requests alone.
+      if: ${{ !cancelled() && github.event.action == 'labeled' && github.event.label.name == inputs.rereview_label && steps.precheck.outputs.should_review == 'true' }}
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
@@ -1493,4 +1492,7 @@ runs:
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
         LABEL: ${{ inputs.rereview_label }}
-      run: gh api -X DELETE "repos/${REPO}/issues/${PR_NUMBER}/labels/${LABEL}" --silent 2>/dev/null || true
+      run: |
+        if ! gh api -X DELETE "repos/${REPO}/issues/${PR_NUMBER}/labels/${LABEL}" --silent 2>/dev/null; then
+          echo "::warning::Could not clear the re-review label. If it is still present, remove it before re-adding it to retry."
+        fi

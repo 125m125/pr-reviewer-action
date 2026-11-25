@@ -170,6 +170,40 @@ def _adjudicate(
     )
 
 
+@pytest.mark.parametrize("cross_batch", [False, True])
+@pytest.mark.parametrize("basis_kind,expected", [("valid", 1), ("missing", 2), ("swapped", 2)])
+def test_cross_file_merge_requires_a_same_fix_and_retained_evidence_on_both_sides(
+    cross_batch, basis_kind, expected,
+):
+    from pr_reviewer.specialist_runtime.adjudication import merge_accepted_findings
+
+    store, target_id = _store()
+    source_id = store.add_tool_result(session_id="session-2", tool="read_pr_diff",
+        arguments={"path": "src/consumer.py"}, category="implementation",
+        result={"status": "ok", "content": "@@ -41 +41 @@\n-old\n+write_with_retry()"}).id
+    target = _candidate("target", location="src/store.py", evidence_ids=(target_id,))
+    source = _candidate("source", location="src/consumer.py:41", evidence_ids=(source_id,))
+    merge = {"candidate_id": "source", "action": "merge", "target_id": "target"}
+    if basis_kind != "missing":
+        merge["merge_basis"] = {
+            "same_fix": "Make the retry idempotent in the writer so the consumer cannot persist an action twice.",
+            "source_evidence_id": source_id if basis_kind == "valid" else target_id,
+            "target_evidence_id": target_id if basis_kind == "valid" else source_id,
+        }
+    keep = {"candidate_id": "target", "action": "keep"}
+    before = adjudicate_candidates((source, target), {"actions": [
+        keep, {"candidate_id": "source", "action": "keep"} if cross_batch else merge,
+    ]}, store, obligations=_obligations(), changed_files=("src/store.py", "src/consumer.py"))
+    after = merge_accepted_findings(before, {"actions": [merge]}, store) if cross_batch else before
+    assert len(after.accepted) == expected
+    if expected == 1:
+        assert after.accepted[0].affected_file == "src/store.py"
+        assert after.accepted[0].line is None  # Never borrow a line from the other file.
+        assert set(after.accepted[0].supporting_evidence_ids) == {source_id, target_id}
+        disposition = next(item for item in after.dispositions if item.candidate_id == "source")
+        assert disposition.merge_basis == merge["merge_basis"]
+
+
 @pytest.mark.parametrize(
     ("path", "anchor_field", "anchor", "category", "first_claim", "second_claim"),
     (

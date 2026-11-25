@@ -644,7 +644,7 @@ or publishing authority.
 | `forgejo_token` | Optional Forgejo API token. Defaults to `github_token` when blank; set it when the token used for GitHub-compatible operations is not valid for the Forgejo REST API. | No | `""` |
 | `skip_if_diff_unchanged` | Skip the LLM review when the current PR patch matches the last managed review fingerprint | No | `true` |
 | `force_review` | Bypass the diff-unchanged guard and review even when the fingerprint matches. Set automatically by the `rereview_label`; also drivable from `workflow_dispatch`/`repository_dispatch`. When the last managed review was not clean, a forced re-review runs at **full** scope to re-establish a clean baseline (recovers a PR wedged in *Request changes*) | No | `false` |
-| `rereview_label` | Label that, when added to a PR, forces a fresh review (add `labeled` to the workflow's `pull_request` types to enable). Self-authorizing — only write/triage can label. The label is removed after, so re-adding re-triggers | No | `ai-review` |
+| `rereview_label` | Label that, when added to a PR, forces a fresh review (add `labeled` to the workflow's `pull_request` types to enable). Self-authorizing — only write/triage can label. The action clears the label after an accepted attempt, even if it fails, but not on cancellation | No | `ai-review` |
 | `ci_status_check` | Wait for all CI checks to reach a terminal state before starting the AI review. Default false — immediate review. | No | `false` |
 | `ci_timeout_sec` | Maximum seconds to wait for CI checks to complete when ci_status_check=true. | No | `300` |
 | `ci_interval_sec` | Seconds between CI status polls when ci_status_check=true. | No | `15` |
@@ -783,7 +783,7 @@ on:
 >   cancel-in-progress: true
 > ```
 
-Nothing else changes. The action detects the label event itself: if the added label is the `rereview_label` (default `ai-review`) it forces a fresh review and then **removes the label** so adding it again re-triggers; any other label is ignored. There's no second workflow, no command parsing, and no checkout/authorization dance — labels are inherently maintainer-only (only users with write/triage permission can apply them), and the trigger rides `pull_request`, so there's no privileged-checkout exposure.
+Nothing else changes. The action detects the label event itself: if the added label is the `rereview_label` (default `ai-review`) it forces a fresh review; any other label is ignored. After precheck accepts the request, the action **removes the label** at the end of the attempt even if analysis or publishing fails, so re-adding it triggers a retry. Cancelled runs leave the label alone. There's no second workflow, no command parsing, and no checkout/authorization dance — labels are inherently maintainer-only (only users with write/triage permission can apply them), and the trigger rides `pull_request`, so there's no privileged-checkout exposure.
 
 Rename the trigger label with the `rereview_label` input if `ai-review` collides with an existing label. This repository's own [`ai-pr-review.yaml`](.github/workflows/ai-pr-review.yaml) uses exactly this wiring.
 

@@ -22,6 +22,8 @@ from pr_reviewer.specialist_runtime.negotiation import (
     SessionResources,
     compact_negotiation_context,
     fallback_next_action,
+    revalidate_deferred_followup,
+    select_compact_followup_wave,
     validate_compact_negotiation,
     validate_negotiation,
 )
@@ -124,6 +126,38 @@ def test_retained_source_read_does_not_reopen_network_access(action, expected):
         authority_reason="Source is not allowlisted",
     ),))
     assert fallback_next_action(state).kind == expected
+
+
+def test_parallel_selection_keeps_model_order_and_defers_same_session():
+    lead = InvestigationLead("other", "Inspect an edge case.", (), (), "Read its source.",
+                             "repository", "S2")
+    state = state_for(investigation_leads=(lead,), resources=(
+        SessionResources("S1", remaining_model_turns=5, remaining_tool_calls=3,
+                         lease_remaining_sec=100.0, advertised_tools=("read_file",)),
+        SessionResources("S2", remaining_model_turns=5, remaining_tool_calls=3,
+                         lease_remaining_sec=100.0, advertised_tools=("read_file",)),
+    ))
+    proposal = select_compact_followup_wave({"actions": [
+        {"kind": "resume", "target": target, "reason": "Inspect the assigned evidence."}
+        for target in ("L1", "U1", "U2")
+    ]}, state, limit=2, conflicts=lambda _: set())
+    assert [(action.lead_ids, action.obligation_ids, action.session_id) for action in proposal.actions] == [
+        (("other",), (), "S2"), ((), ("OB1",), "S1"),
+    ]
+
+
+def test_parallel_selection_respects_aggregate_new_session_capacity():
+    state = state_for()
+    proposal = select_compact_followup_wave({"actions": [
+        {"kind": "new_session", "target": target, "reason": "Inspect the assigned evidence."}
+        for target in ("U1", "U2")
+    ]}, state, limit=2, conflicts=lambda _: set())
+    action, = proposal.actions
+    assert action.obligation_ids == ("OB2",)
+    deferred, = proposal.deferred
+    assert deferred.obligation_ids == ("OB1",)
+    with pytest.raises(NegotiationError, match="target is no longer open"):
+        revalidate_deferred_followup(deferred, state_for(covered=("OB1",)))
 
 
 def assignment(

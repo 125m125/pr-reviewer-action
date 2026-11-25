@@ -3,9 +3,37 @@
 from __future__ import annotations
 
 import re
+import subprocess
+import textwrap
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _rereview_cleanup_step():
+    action = (_REPO_ROOT / "action.yml").read_text(encoding="utf-8")
+    return action.split("\n    - name: Clear re-review label\n", 1)[1].split("\n    - ", 1)[0]
+
+
+def test_rereview_label_cleanup_runs_after_failure_but_not_cancellation():
+    condition = re.search(r"(?m)^      if: (.+)$", _rereview_cleanup_step())[1]
+    # An explicit status function overrides GitHub's implicit success() gate.
+    assert "!cancelled()" in condition
+    assert "success()" not in condition
+    assert "github.event.action == 'labeled'" in condition
+    assert "github.event.label.name == inputs.rereview_label" in condition
+    assert "steps.precheck.outputs.should_review == 'true'" in condition
+
+
+def test_rereview_label_cleanup_warns_without_masking_original_result():
+    run = _rereview_cleanup_step().split("\n      run: ", 1)[1]
+    script = textwrap.dedent(run.partition("\n")[2]) if run.startswith("|") else run
+    result = subprocess.run(
+        ["bash", "-ec", 'gh() { return 1; };\n' + script],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "::warning::" in result.stdout + result.stderr
 
 
 def parse_action_inputs():

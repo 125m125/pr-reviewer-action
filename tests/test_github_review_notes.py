@@ -309,6 +309,34 @@ def test_explicit_reassessment_needs_live_owned_uncontested_thread(
         assert not result.get("confirmed_historical_resolutions")
 
 
+@pytest.mark.parametrize("permission,owned,update,expected", [
+    (False, True, "", []),
+    (True, True, "", ["resolve"]),
+    (False, False, "", ["reply"]),
+    (False, True, "The regression test now covers the empty token case.", ["reply"]),
+])
+def test_reassessment_reuses_only_owned_verified_fix_reply(tmp_path, permission, owned, update, expected):
+    client = _FakeClient()
+    snapshot = dict(target="H1", origin="managed", repository="owner/repo", pr_number=17,
+                    head_sha="a"*40, thread_id="T", comment_id=10, last_comment_id=11,
+                    path="a.py", line=6, side="RIGHT", fingerprint="fp-old", review_id="R",
+                    discussion_complete=True, human_reply=False, is_resolved=False,
+                    viewer_can_resolve=permission, comments=[
+                        {"id":10,"author":"bot","body":"Concern."},
+                        {"id":11,"author":"bot","viewer_owned":owned,
+                         "body":"Previous explanation.\n\n<!-- ai-pr-review-resolution:fp-old:publisher -->"},
+                    ])
+    client.query_review_threads = lambda *_: (snapshot,)
+    result, _ = _publish(tmp_path, client, review_thread_snapshots=[snapshot], review_thread_assessments=[
+        dict(target="H1", assessment="fixed", reason="Same fix, with different wording.",
+             evidence_ids=["E1"], update=update, snapshot=snapshot)])
+    assert result["review_completed"]
+    assert [c[0] for c in client.calls if c[0] in {"reply", "resolve"}] == expected
+    if expected == ["resolve"]:
+        confirmation, = result["confirmed_historical_resolutions"]
+        assert confirmation["last_comment_id"] == 11
+
+
 def test_unchanged_historical_assessment_does_not_revalidate_for_publication(tmp_path):
     client = _FakeClient()
     snapshot = dict(target="H1", origin="managed", repository="owner/repo", pr_number=17,
@@ -371,6 +399,49 @@ def test_retry_associated_update_recognizes_only_its_own_exact_intervening_reply
                                         update=update,snapshot=snapshot)])
     assert result["review_completed"]
     assert [c[0] for c in client.calls if c[0] in {"reply", "add"}] == expected
+
+
+@pytest.mark.parametrize("association,assessment,owned,posted,expected", [
+    (False, "still_present", True, False, ["reply"]),
+    (True, "still_present", True, False, ["reply"]),
+    (True, "still_present", True, True, []),
+    (True, "unverified", True, False, []),
+    (True, "still_present", False, False, []),
+])
+def test_verified_recurrence_updates_the_existing_open_thread(
+    tmp_path, association, assessment, owned, posted, expected,
+):
+    snapshot = dict(target="H1", origin="managed", repository="owner/repo", pr_number=17,
+                    head_sha="a"*40, thread_id="T", comment_id=10, last_comment_id=11,
+                    path="a.py", line=6, side="RIGHT", fingerprint="fp-old", review_id="R",
+                    discussion_complete=True, human_reply=False, is_resolved=False, comments=[
+                        {"id": 10, "body": "Original report."},
+                        {"id": 11, "viewer_owned": owned, "body":
+                         "The fix is verified.\n\n<!-- ai-pr-review-resolution:fp-old:publisher -->"},
+                    ])
+    client = _FakeClient({"threads": [snapshot]})
+    live = snapshot
+    if posted:
+        live = {**snapshot, "last_comment_id": 12, "comments": [*snapshot["comments"], {
+            "id": 12, "viewer_owned": True,
+            "body": f"This issue was previously verified fixed, but it is present again at `{'a'*12}`.\n\n"
+                    "The retry again applies the change twice.",
+        }]}
+    client.query_review_threads = lambda *_: (live,)
+    fingerprint = "fp-new" if association else "fp-old"
+    result, _ = _publish(
+        tmp_path, client, notes=[_note(fingerprint)], review_thread_snapshots=[snapshot],
+        review_thread_associations=[dict(target="H1", kind="duplicate", candidate_id="C1",
+                                         fingerprint=fingerprint, snapshot=snapshot)] if association else (),
+        review_thread_assessments=[dict(target="H1", assessment=assessment, evidence_ids=["E1"],
+                                        reason="The retry again applies the change twice.", snapshot=snapshot)],
+    )
+    assert result["review_completed"]
+    assert [c[0] for c in client.calls if c[0] in {"reply", "add", "resolve"}] == expected
+    if expected:
+        reply = next(c for c in client.calls if c[0] == "reply")
+        assert reply[1] == 10
+        assert "present again" in reply[2] and "retry again applies the change twice" in reply[2]
 
 
 def test_empty_unmanaged_review_is_left_untouched(tmp_path):
@@ -2397,6 +2468,46 @@ def test_thread_snapshot_authenticates_roots_and_keeps_latest_comment_after_clip
     assert [s["viewer_can_resolve"] for s in snapshots] == [False, True]
     assert snapshots[1]["last_comment_id"] == 110 and snapshots[1]["human_reply"]
     assert not snapshots[1]["discussion_complete"] and snapshots[0]["discussion_complete"]
+
+
+def test_closed_thread_objections_are_opt_in_human_replies(monkeypatch, tmp_path):
+    client = GhReviewClient(action_root=tmp_path)
+    replies = {
+        "1": [("User", "False positive: this fallback is intentional.")],
+        "2": [("Bot", "False positive.")],
+        "3": [("User", "This is not a false positive."), ("User", "> Not an issue")],
+        "4": [("User", "Not an issue.")],
+        "5": [("User", "False positive."), ("User", "Correction: this isn't a false positive.")],
+        "6": [("User", "Not an issue with this check, but please fix the caller.")],
+        **{str(i): [("User", "Not an issue elsewhere in this file.")] for i in range(7, 16)},
+    }
+    loaded = []
+    def graphql(query, variables):
+        if "ManagedReviewIdentity" in query:
+            return {"data": {"viewer": {"login": "bot"}, "repository": {"nameWithOwner": "o/r",
+                    "pullRequest": {"id": "P", "headRefOid": "a"*40, "baseRepository": {"nameWithOwner": "o/r"}}}}}
+        if "ManagedReviewThreads" in query:
+            return {"data": {"node": {"reviewThreads": _connection([
+                {"id": i, "isResolved": True, "subjectType": "LINE", "path": "other.py" if i == "4" else "a.py",
+                 "line": 6 if int(i) < 7 else 100, "originalLine": 4, "diffSide": "RIGHT"} for i in replies
+            ])}}}
+        tid = variables["threadId"]
+        loaded.append(tid)
+        comments = [{"body": "Earlier finding", "author": {"__typename": "Bot", "login": "bot"}}]
+        comments += [{"body": body, "author": {"__typename": kind, "login": "reviewer"}}
+                     for kind, body in replies[tid]]
+        return {"data": {"node": {"comments": _connection(comments)}}}
+    monkeypatch.setattr(client, "_graphql", graphql)
+
+    assert client.query_review_threads("o/r", 17, "a"*40) == ()
+    assert loaded == []
+    objections = client.query_review_threads("o/r", 17, "a"*40, objection_locations=("a.py:6",))
+    assert "4" not in loaded
+    assert set(loaded) == {"1", "2", "3", "5", "6"}
+    assert [(item["line"], item["prior_finding"], item["human_objection"]) for item in objections] == [
+        (6, "Earlier finding", replies[i][0][1]) for i in ("6", "1")
+    ]
+    assert all(item["is_resolved"] and "target" not in item for item in objections)
 
 
 @pytest.mark.parametrize('body', ['<!-- ai-pr-reviewer-specialist:old -->', ''])

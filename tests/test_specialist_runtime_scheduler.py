@@ -104,6 +104,37 @@ def empty_snapshot() -> WaveSnapshot:
     )
 
 
+def test_followup_refill_can_reuse_a_finished_assignment_before_the_other_lane_finishes():
+    refilled = Event()
+    slow_started = Event()
+    starts = []
+
+    def factory(item, lease, snapshot):
+        starts.append(item.id)
+        def work():
+            if item.id == "slow":
+                slow_started.set()
+                assert refilled.wait(2), "free slot was never refilled"
+            elif starts.count("fast") == 2:
+                refilled.set()
+            else:
+                assert slow_started.wait(2)
+        return FakeSession(session_result(item.id, evidence_ids=(), statuses=()), before_result=work)
+
+    def refill(finished, running):
+        if len(starts) == 2 and [item.assignment_id for item in finished] == ["fast"]:
+            assert running == ("slow",)
+            return (assignment("fast"),)
+        return ()
+
+    scheduler = SessionScheduler(deadline=deadline(), session_factory=factory,
+                                 wave_snapshot=empty_snapshot(), concurrency=2, clock=FakeClock(0))
+    result = scheduler.run_wave((assignment("fast"), assignment("slow")), RunPhase.FOLLOWUP,
+                                refill=refill)
+    assert not result.failures
+    assert [item.assignment_id for item in result.results] == ["fast", "slow", "fast"]
+
+
 def scheduler_with_completion_order(order: tuple[str, ...]) -> SessionScheduler:
     completion = OrderedCompletion(order)
     results = {

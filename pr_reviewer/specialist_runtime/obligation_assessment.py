@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import re
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, Iterable, Mapping
@@ -68,6 +69,7 @@ class AssessmentProposalResult:
     reason: str
     eligible_evidence_ids: tuple[str, ...] = ()
     ignored_supplemental_evidence_ids: tuple[str, ...] = ()
+    citation_repair: bool = False
 
 
 def _bounded(value: object, limit: int) -> str:
@@ -180,14 +182,26 @@ def is_retained_empty_repository_search(record: EvidenceRecord) -> bool:
 def boundary_participant_source(
     record: EvidenceRecord, endpoint_paths: tuple[str, ...],
     contract_paths: tuple[str, ...], *, not_applicable: bool = False,
+    unaffected_diff_paths: tuple[str, ...] = (),
 ) -> bool:
     if not_applicable and is_retained_empty_repository_search(record):
         return True
     if not record.source_path:
         return False
+    if not_applicable and boundary_changed_side_diff(record, unaffected_diff_paths):
+        return True
     if endpoint_paths:
         return any(fnmatch.fnmatchcase(record.source_path, pattern) for pattern in endpoint_paths)
     return not any(fnmatch.fnmatchcase(record.source_path, pattern) for pattern in contract_paths)
+
+
+def boundary_changed_side_diff(record: EvidenceRecord, paths: tuple[str, ...]) -> bool:
+    if record.tool != "read_pr_diff" or record.source_path not in paths or record.truncated:
+        return False
+    hunk = re.search(r"(?m)^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@[^\n]*\n", record.content)
+    return hunk is not None and any(
+        line.startswith(("+", "-")) for line in record.content[hunk.end():].splitlines()
+    )
 
 
 def boundary_source_diagnostic(
@@ -210,6 +224,62 @@ def boundary_source_diagnostic(
     if expected_head_sha and revision != expected_head_sha:
         return "head_sha provenance mismatch"
     return None
+
+
+def boundary_citation_repair(
+    records: Mapping[str, EvidenceRecord],
+    cited_ids: Iterable[str],
+    expected_head_sha: str | None,
+    matches: Callable[[EvidenceRecord], bool],
+    paths: tuple[str, ...],
+) -> str:
+    """Offer current, in-scope sources without asserting that they prove the claim."""
+    def location(record: EvidenceRecord) -> str:
+        path = record.source_path or "repository search"
+        span = record.source_range or {}
+        offset, lines = span.get("offset"), span.get("lines")
+        if type(offset) is int and type(lines) is int and lines > 0:
+            return f"{path}:{offset}-{offset + lines - 1}"
+        try:
+            args = json.loads(record.arguments)
+        except (TypeError, ValueError):
+            return path
+        if (isinstance(args, Mapping) and type(args.get("offset")) is int
+                and type(args.get("limit")) is int):
+            return f"{path} (requested offset {args['offset']}, limit {args['limit']})"
+        return path
+
+    invalid = []
+    cited_sources = set()
+    cited_paths = set()
+    for item in cited_ids:
+        record = records.get(item)
+        if record is None:
+            invalid.append(f"{item}: not retained")
+            continue
+        if matches(record) and record.source_path:
+            cited_sources.add(location(record))
+            cited_paths.add(record.source_path)
+        diagnostic = boundary_source_diagnostic(record, expected_head_sha)
+        if diagnostic or not matches(record):
+            invalid.append(f"{item}: {diagnostic or 'not eligible for this participant or contract'}")
+    options = sorted(
+        (record for record in records.values() if boundary_source_diagnostic(record, expected_head_sha) is None
+         and matches(record)),
+        key=lambda record: (record.source_path not in cited_paths, record.id),
+    )[:4]
+    detail = ("Rejected citations: " + "; ".join(invalid[:4]) + ". ") if invalid else ""
+    if options:
+        detail += "Eligible retained options (use only if they support the conclusion): " + "; ".join(
+            f"{record.id} at {location(record)}" for record in options
+        ) + ". "
+    else:
+        detail += "No eligible replacement is retained. "
+    sources = ", ".join(sorted(cited_sources)[:3] or paths[:3]) or "the participant implementation"
+    return detail + (
+        "Replace only the evidence_ids if the retained sources support the claim; otherwise leave it unresolved. "
+        f"If tools are available and proof is missing, read only the relevant source slice in {sources}."
+    )
 
 
 class ObligationAssessmentLedger:
@@ -473,6 +543,7 @@ class ObligationAssessmentLedger:
             )
         )
         error = ""
+        citation_repair = False
         if not conclusion:
             error = "a concise reason is required"
         elif component_scoped and contains_glob:
@@ -518,6 +589,7 @@ class ObligationAssessmentLedger:
                     records[item], obligation.boundary_endpoint_paths,
                     obligation.boundary_contract_paths,
                     not_applicable=effective is ObligationDisposition.NOT_APPLICABLE,
+                    unaffected_diff_paths=obligation.boundary_unaffected_diff_paths,
                 )
                 for item in eligible_ids
             )
@@ -533,6 +605,10 @@ class ObligationAssessmentLedger:
                    "is the contract itself. Do not substitute another participant's implementation."
                    if not obligation.boundary_endpoint_paths else "")
             )
+            if effective is ObligationDisposition.NOT_APPLICABLE and obligation.boundary_unaffected_diff_paths:
+                error += (". The mapped endpoint is unchanged; no reread is needed to establish that. "
+                          "Cite an intact triggering diff and explain why the changed interaction cannot affect it.")
+            citation_repair = True
         elif (
             proposed is ObligationDisposition.PARTIALLY_COVERED
             and not resolved_omitted
@@ -546,7 +622,8 @@ class ObligationAssessmentLedger:
             proposed is ObligationDisposition.NOT_APPLICABLE
             and obligation.boundary_id
             and not any(
-                is_retained_empty_repository_search(records[item]) or (
+                is_retained_empty_repository_search(records[item]) or
+                boundary_changed_side_diff(records[item], obligation.boundary_unaffected_diff_paths) or (
                 records[item].is_usable_for_coverage
                 and not records[item].truncated
                 and eligible(records[item], obligation)
@@ -606,6 +683,22 @@ class ObligationAssessmentLedger:
             if len(owned_paths) > 20:
                 error += f" (first 20 of {len(owned_paths)}; see assigned scope for the rest)"
             error += ". Supporting reads outside this inventory are evidence, not changed-path coverage."
+        if (obligation.participant_id and effective in {
+                ObligationDisposition.COVERED, ObligationDisposition.NOT_APPLICABLE,
+            } and (citation_repair or error.startswith((
+                "proposal references unknown retained evidence:", "supported work requires retained evidence",
+                "supported work requires eligible retained evidence",
+            )))):
+            citation_repair = True
+            error += ". " + boundary_citation_repair(
+                records, retained_ids, self.expected_head_sha,
+                lambda record: boundary_participant_source(
+                    record, obligation.boundary_endpoint_paths, obligation.boundary_contract_paths,
+                    not_applicable=effective is ObligationDisposition.NOT_APPLICABLE,
+                    unaffected_diff_paths=obligation.boundary_unaffected_diff_paths,
+                ) and eligible(record, obligation),
+                obligation.boundary_endpoint_paths,
+            )
         attempt = ObligationAttempt(
             target=target, disposition=effective, reason=conclusion,
             evidence_ids=retained_ids, next_actions=actions,
@@ -627,7 +720,7 @@ class ObligationAssessmentLedger:
             )
             return AssessmentProposalResult(
                 False, target, proposed, error,
-                eligible_ids, ignored_ids,
+                eligible_ids, ignored_ids, citation_repair,
             )
         self._assessments[target] = ObligationAssessment(
             target=target, obligation_id=assessment.obligation_id,

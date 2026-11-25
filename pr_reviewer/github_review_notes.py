@@ -338,6 +338,17 @@ def _clean_markdown(value: object) -> str:
     return sanitize_markdown(mask_secrets(text)).strip()
 
 
+def _latest_owned_fix_reply(snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
+    comments = snapshot.get("comments", ())
+    last = comments[-1] if len(comments) > 1 else {}
+    marker = _PUBLISHER_RESOLUTION_RE.search(str(last.get("body", "")))
+    if (last.get("viewer_owned") is True and last.get("id") == snapshot.get("last_comment_id")
+            and marker is not None and marker.group(1) == snapshot.get("fingerprint")
+            and _clean_markdown(last.get("body"))):
+        return last
+    return {}
+
+
 def _note_marker(
     fingerprint: str, generation: int = 1, publication_id: str | None = None
 ) -> str:
@@ -1229,18 +1240,48 @@ class GitHubReviewPublisher:
         failed_associations = set()
         current_targets = set()
         current_fingerprints = set(current)
-        for record in review_thread_associations:
+        recurrence_updates = {}
+        for assessment in review_thread_assessments:
+            snapshot = assessment["snapshot"]
+            if (assessment.get("assessment") == "still_present" and assessment.get("evidence_ids")
+                    and snapshot.get("discussion_complete") is True and snapshot.get("is_resolved") is False
+                    and _latest_owned_fix_reply(snapshot)):
+                reason = _clean_markdown(assessment.get("update")) or _clean_markdown(assessment.get("reason"))
+                if reason:
+                    recurrence_updates[assessment["target"]] = (
+                        f"This issue was previously verified fixed, but it is present again at `{head_sha[:12]}`.\n\n{reason}"
+                    )
+        associations = list(review_thread_associations)
+        associated_fingerprints = {record.get("fingerprint") for record in associations}
+        for target, snapshot in snapshots.items():
+            fingerprint = snapshot.get("fingerprint")
+            if (target in recurrence_updates and fingerprint in current
+                    and current[fingerprint].kind == ReviewNoteKind.FINDING
+                    and fingerprint not in associated_fingerprints):
+                associations.append({"target": target, "kind": "duplicate",
+                                     "fingerprint": fingerprint, "snapshot": snapshot})
+                associated_fingerprints.add(fingerprint)
+        replied_to_recurrences = set()
+        for record in associations:
             fingerprint = record.get("fingerprint")
             if fingerprint not in current or record.get("kind") not in {"duplicate", "update"}:
                 continue
             current_targets.add(record["target"])
+            recurrence = (record["target"] in recurrence_updates
+                          and current[fingerprint].kind == ReviewNoteKind.FINDING)
+            if recurrence and record.get("kind") == "duplicate":
+                record = {**record, "kind": "update", "update": recurrence_updates[record["target"]]}
             if self._historical_decision(state, record, repo, pr_number, head_sha, association=True):
                 del current[fingerprint]
+                if recurrence:
+                    replied_to_recurrences.add(record["target"])
                 state["notes"].append({"fingerprint": fingerprint, "id": record["snapshot"]["thread_id"],
                                        "resolution": record["kind"], "confirmed": True, "publication_errors": []})
             else:
                 failed_associations.add(fingerprint)
         for record in review_thread_assessments:
+            if record["target"] in replied_to_recurrences and record.get("assessment") == "still_present":
+                continue
             resolves = record.get("assessment") in {"fixed", "disproven"}
             if not resolves and not _clean_markdown(record.get("update")):
                 continue
@@ -1759,24 +1800,33 @@ class GitHubReviewPublisher:
                        and live.get("origin") == "managed" and live.get("human_reply") is False
                        and bool(record.get("evidence_ids")))
             can_resolve = live.get("viewer_can_resolve") is not False
-            text = _clean_markdown(record.get("update") or (record.get("reason") if resolve else ""))
+            update = _clean_markdown(record.get("update"))
+            text = update or (_clean_markdown(record.get("reason")) if resolve else "")
             if not text:
                 return False
-            if resolve and not can_resolve:
-                text += "\n\nThe review token cannot resolve this conversation. A maintainer can resolve it."
-            if any(_clean_markdown(c["body"]) == text for c in live["comments"]):
-                return not resolve
-            if resolve:
-                text += f"\n\n<!-- ai-pr-review-resolution:{live['fingerprint']}:publisher -->"
-            reply = self.client.reply_thread(live["comment_id"], text)
-            if not _valid_comment_result(reply):
-                raise ValueError("thread reply was not confirmed")
-            self._checkpoint(state, "historical_thread_reply", reply)
+            manual_note = "\n\nThe review token cannot resolve this conversation. A maintainer can resolve it."
+            comments = live["comments"]
+            last = _latest_owned_fix_reply(live) if resolve else {}
+            previous_text = _clean_markdown(last.get("body")).removesuffix(manual_note).strip()
+            reuse_reply = bool(previous_text) and (not update or update == previous_text)
+            after = live
+            if not reuse_reply:
+                if resolve and not can_resolve:
+                    text += manual_note
+                if any(_clean_markdown(c["body"]) == text for c in comments):
+                    return not resolve
+                if resolve:
+                    text += f"\n\n<!-- ai-pr-review-resolution:{live['fingerprint']}:publisher -->"
+                reply = self.client.reply_thread(live["comment_id"], text)
+                if not _valid_comment_result(reply):
+                    raise ValueError("thread reply was not confirmed")
+                self._checkpoint(state, "historical_thread_reply", reply)
+                if resolve and can_resolve:
+                    after = fresh()
+                    if (after.get("last_comment_id") != reply["id"] or after.get("human_reply") is not False
+                            or list(after["comments"][:-1]) != list(comments) or after["comments"][-1]["body"] != text):
+                        raise ValueError("thread changed after explanatory reply; left unresolved")
             if resolve and can_resolve:
-                after = fresh()
-                if (after.get("last_comment_id") != reply["id"] or after.get("human_reply") is not False
-                        or list(after["comments"][:-1]) != list(live["comments"]) or after["comments"][-1]["body"] != text):
-                    raise ValueError("thread changed after explanatory reply; left unresolved")
                 if after.get("viewer_can_resolve") is False:
                     raise ValueError("GitHub no longer permits this token to resolve the thread; left unresolved")
                 result = self.client.resolve_thread(live["thread_id"])
@@ -1939,6 +1989,35 @@ query ManagedThreadComments($threadId: ID!, $cursor: String) {
   } }
 }
 """.strip()
+
+_FALSE_POSITIVE_REPLY = re.compile(r"\b(?:false[ -]+positive|not\s+(?:an?\s+)?(?:issue|bug))\b", re.I)
+_FALSE_POSITIVE_RETRACTION = re.compile(
+    r"\b(?:not|never|[a-z]+n['’]t)\s+(?:actually\s+)?(?:an?\s+)?false[ -]+positive\b",
+    re.I,
+)
+
+
+def _human_thread_objection(comments: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    for item in reversed(comments[1:]):
+        actor = item.get("author") or {}
+        login = actor.get("login")
+        body = item.get("body")
+        if (actor.get("__typename") != "User" or not login or login.lower().endswith("[bot]")
+                or not isinstance(body, str)):
+            continue
+        prose = re.sub(r"(?ms)^\s*(?:```|~~~)[^\n]*\n.*?(?:^\s*(?:```|~~~)[^\n]*$|\Z)", "", body)
+        prose = re.sub(r"(?m)^\s*>[^\n]*", "", prose)
+        if _FALSE_POSITIVE_RETRACTION.search(prose):
+            return None
+        if match := _FALSE_POSITIVE_REPLY.search(prose):
+            # Keep the objection itself even when it follows a long preamble.
+            start = max(0, match.start() - 150)
+            return {
+                "prior_finding": mask_secrets(str(comments[0].get("body") or ""))[:700],
+                "human_objection": mask_secrets(prose[start:])[:700].strip(),
+            }
+    return None
+
 
 _MANAGED_ISSUE_COMMENTS_QUERY = """
 query ManagedIssueComments($pullRequestId: ID!, $cursor: String) {
@@ -2381,7 +2460,8 @@ class GhReviewClient:
             raise RuntimeError("live pull request repository identity is invalid")
         return result
 
-    def query_review_threads(self, repo: str, pr_number: int, head_sha: str) -> tuple[dict, ...]:
+    def query_review_threads(self, repo: str, pr_number: int, head_sha: str, *,
+                             objection_locations: Sequence[str] = ()) -> tuple[dict, ...]:
         owner, name = self._split_repo(repo)
         def identity():
             data = self._graphql(_MANAGED_IDENTITY_QUERY, {"owner": owner, "name": name, "number": pr_number})["data"]
@@ -2393,8 +2473,9 @@ class GhReviewClient:
             return pr["id"], data["viewer"]["login"]
         pr_id, viewer = identity()
         snapshots = []
-        for thread in self._paged_nodes(_MANAGED_THREADS_QUERY, {"pullRequestId": pr_id},
-                                        connection_name="reviewThreads", label="review threads"):
+        threads = self._paged_nodes(_MANAGED_THREADS_QUERY, {"pullRequestId": pr_id},
+                                    connection_name="reviewThreads", label="review threads")
+        for thread in (() if objection_locations else threads):
             if thread["isResolved"] is not False or thread.get("subjectType") != "LINE":
                 continue
             line = thread.get("originalLine") or thread.get("line")
@@ -2445,6 +2526,11 @@ class GhReviewClient:
                                   fingerprint=marker.group(1) if marker else None, repository=repo, pr_number=pr_number,
                                   head_sha=head_sha, discussion_complete=complete, human_reply=human_reply,
                                   comments=retained, is_resolved=False, viewer_can_resolve=thread.get("viewerCanResolve")))
+            snapshot = snapshots[-1]
+            if _latest_owned_fix_reply(snapshot):
+                snapshot["previously_reported_fixed"] = True
+            if complete and _human_thread_objection(comments):
+                snapshot["has_human_objection"] = True
         if snapshots:
             reviews = self._paged_nodes(_MANAGED_REVIEWS_QUERY, {"pullRequestId": pr_id},
                                         connection_name="reviews", label="review assessment receipts")
@@ -2458,6 +2544,36 @@ class GhReviewClient:
                     prior = receipt_assessment(str(review["body"]), snapshot)
                     if prior:
                         snapshot["prior_assessment"] = prior
+        # Rank cheap anchors before paying for comment bodies. Closed threads
+        # are never part of the open H# inventory.
+        by_path: dict[str, list[int | None]] = {}
+        for location in objection_locations:
+            path, _, line = location.partition(":")
+            by_path.setdefault(path, []).append(int(line) if line.isascii() and line.isdecimal() else None)
+        ranked = []
+        if by_path:
+            for index, thread in enumerate(threads):
+                lines = by_path.get(thread.get("path"))
+                line = thread.get("line") or thread.get("originalLine")
+                if (thread["isResolved"] is not True or thread.get("subjectType") != "LINE"
+                        or thread.get("diffSide") not in {"LEFT", "RIGHT"} or not lines
+                        or type(line) is not int or line < 1):
+                    continue
+                distance = min(9 if target is None else abs(target - line) for target in lines)
+                if distance <= 8 or None in lines:
+                    ranked.append((distance, -index, line, thread))
+        for _, _, line, thread in sorted(ranked)[:8]:
+            try:
+                response = self._graphql(_MANAGED_THREAD_COMMENTS_QUERY, {"threadId": thread["id"], "cursor": None})
+                comments, has_next, _ = self._connection(
+                    response["data"]["node"]["comments"], label="closed thread comments")
+            except subprocess.TimeoutExpired:
+                break
+            except (KeyError, TypeError, RuntimeError, subprocess.SubprocessError, ValueError):
+                continue
+            # Avoid treating an old objection as current when later replies are unseen.
+            if not has_next and (objection := _human_thread_objection(comments)):
+                snapshots.append(dict(path=thread["path"], line=line, is_resolved=True, **objection))
         if identity() != (pr_id, viewer):
             raise RuntimeError("review-thread snapshot identity changed")
         return tuple(snapshots)
