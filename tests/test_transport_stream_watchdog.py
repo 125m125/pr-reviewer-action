@@ -9,6 +9,26 @@ import pytest
 from pr_reviewer import transport
 
 
+@pytest.mark.parametrize("flag,expected", [(None, False), ("false", False), ("unexpected", False), (" TRUE ", True)])
+def test_model_transport_only_skips_tls_with_explicit_opt_in(monkeypatch, flag, expected):
+    key = "PR_REVIEWER_ALLOW_INSECURE_TLS"
+    if flag is None:
+        monkeypatch.delenv(key, raising=False)
+    else:
+        monkeypatch.setenv(key, flag)
+    commands = []
+
+    def fake_run(args, _timeout):
+        commands.append(args)
+        return subprocess.CompletedProcess(args, 0, '{}\n200', '')
+
+    monkeypatch.setattr(transport, "safe_run", fake_run)
+    transport.run_chat_request("https://model.local/v1", "openai", {}, "", 1)
+    command, = commands
+    assert ("--insecure" in command) is expected
+    assert command[1] == "-q"
+
+
 @pytest.mark.parametrize("code,is_timeout", [(28, True), (7, False)])
 def test_curl_timeout_is_distinguished_from_endpoint_failure(monkeypatch, code, is_timeout):
     monkeypatch.setattr(transport, "safe_run", lambda *a, **kw:

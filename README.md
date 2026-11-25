@@ -297,6 +297,7 @@ Only three inputs are required: `github_token`, `ai_base_url`, and `ai_model`. E
 | `ai_api_format` | Primary API request/response format: `openai` or `anthropic` | No | `openai` |
 | `ai_model` | Model name for the primary analysis pass | Yes | - |
 | `ai_api_key` | Optional API key for the primary AI endpoint. OpenAI format sends `Authorization: Bearer`; Anthropic format sends `x-api-key` | No | `""` |
+| `ai_allow_insecure_tls` | Skip certificate verification for AI model requests, including fallback and routed calls. Only opt in for intentionally trusted self-signed endpoints; prefer adding the certificate or CA to the runner trust store | No | `false` |
 | `ai_max_tokens` | Maximum completion tokens for primary and fallback final review calls. Required by Anthropic-compatible APIs. **Reasoning models** (those that emit a thinking channel, e.g. Gemma) need this headroom — too low a cap is spent on reasoning, leaving empty content (`finish_reason=length`) so the verdict JSON fails to parse and the review needlessly escalates; raise to `16000`+ for verbose reasoners | No | `8192` |
 | `ai_temperature` | Sampling temperature for the review model. Empty string omits the field (some newer cloud models reject non-default temperature) | No | `0.1` |
 | `ai_response_format` | Structured-output mode for OpenAI-compatible endpoints (incl. LiteLLM): `off`, `json_object`, or `json_schema` (enforces the verdict/review_markdown schema). Ignored for `anthropic`. Improves reliability with smaller local models | No | `off` |

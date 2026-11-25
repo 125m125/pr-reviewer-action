@@ -81,6 +81,16 @@ rc=0; run_curl_model ok "$OUT" || rc=$?
 check "rc is 0 on success" "$rc" "0"
 check "body written on success" "$([ -s "$OUT" ] && echo yes || echo no)" "yes"
 
+echo "=== Test: TLS certificate verification is opt-out only ==="
+OUT="$TMPDIR/tls.json"
+for flag in false ' TRUE ' unexpected; do
+  MOCK_ARGV_LOG="$TMPDIR/tls-argv" PR_REVIEWER_ALLOW_INSECURE_TLS="$flag" run_curl_model ok "$OUT"
+  want=no
+  [[ "$flag" != ' TRUE ' ]] || want=yes
+  check "TLS opt-out with flag [$flag]" \
+    "$(grep -Fxq -- '--insecure' "$TMPDIR/tls-argv" && echo yes || echo no)" "$want"
+done
+
 echo ""
 echo "=== Test: HTTP 400 → rc 22, error body preserved ==="
 OUT="$TMPDIR/err.json"
