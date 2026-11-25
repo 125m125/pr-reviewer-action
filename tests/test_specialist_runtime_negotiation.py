@@ -22,6 +22,7 @@ from pr_reviewer.specialist_runtime.negotiation import (
     SessionResources,
     compact_negotiation_context,
     fallback_next_action,
+    revalidate_deferred_followup,
     select_compact_followup_wave,
     validate_compact_negotiation,
     validate_negotiation,
@@ -153,6 +154,10 @@ def test_parallel_selection_respects_aggregate_new_session_capacity():
     ]}, state, limit=2, conflicts=lambda _: set())
     action, = proposal.actions
     assert action.obligation_ids == ("OB2",)
+    deferred, = proposal.deferred
+    assert deferred.obligation_ids == ("OB1",)
+    with pytest.raises(NegotiationError, match="target is no longer open"):
+        revalidate_deferred_followup(deferred, state_for(covered=("OB1",)))
 
 
 def assignment(

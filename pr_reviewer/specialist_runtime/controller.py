@@ -145,6 +145,7 @@ from .negotiation import (
     SessionResources,
     compact_negotiation_context,
     fallback_next_action,
+    revalidate_deferred_followup,
     select_compact_followup_wave,
     validate_compact_negotiation,
     validate_negotiation,
@@ -3407,36 +3408,61 @@ class ReviewController:
         state: _RunState,
         assignments: Iterable[Assignment],
         phase: RunPhase,
+        *,
+        refill=None,
     ) -> tuple[WaveResult, WaveSnapshot]:
         assert state.coverage is not None
         assignment_items = tuple(assignments)
         wave_snapshot = WaveSnapshot(state.evidence.snapshot(), state.coverage.snapshot())
-        expected_ids = {
-            assignment.id: self._session_identity(state, assignment)
-            for assignment in assignment_items
-        }
-        if len(set(expected_ids.values())) != len(assignment_items):
-            raise ValueError("a wave cannot run the same assignment or durable session twice")
-        existing_handles = {
-            assignment.id: state.sessions.get(expected_ids[assignment.id])
-            for assignment in assignment_items
-        }
-        for assignment in assignment_items:
-            state.journal.emit("specialist_initializing", {
-                "assignment_id": assignment.id,
-                "session_id": expected_ids[assignment.id],
-                "phase": phase.value,
-                "resumed": isinstance(
-                    existing_handles[assignment.id], _IsolatedSessionHandle,
-                ),
-            })
+        expected_ids = {}
+        existing_handles = {}
+        snapshots = {}
+        all_assignments: dict[str, Assignment] = {}
+
+        def prepare(items, snapshot):
+            ids = {item.id: self._session_identity(state, item) for item in items}
+            if len(set(ids.values())) != len(items):
+                raise ValueError("a wave cannot run the same assignment or durable session twice")
+            for assignment in items:
+                session_id = ids[assignment.id]
+                expected_ids[assignment.id] = session_id
+                existing_handles[assignment.id] = state.sessions.get(session_id)
+                snapshots[assignment.id] = snapshot
+                all_assignments[assignment.id] = assignment
+                state.journal.emit("specialist_initializing", {
+                    "assignment_id": assignment.id, "session_id": session_id, "phase": phase.value,
+                    "resumed": isinstance(existing_handles[assignment.id], _IsolatedSessionHandle),
+                })
+
+        prepare(assignment_items, wave_snapshot)
+        admitted: set[int] = set()
+
+        def refill_wave(finished, reserved):
+            if finished:
+                with state.admission_lock:
+                    snapshot = WaveSnapshot(state.evidence.snapshot(), state.coverage.snapshot())
+                    partial = WaveResult(
+                        phase=phase, results=finished, failures=(), not_started=(),
+                        cancelled_assignment_ids=(), in_flight_assignment_ids=(),
+                        evidence_ids=(), coverage_projection=(),
+                    )
+                    self._admit_wave_results(state, partial, snapshot, expected_ids, existing_handles, ())
+                    admitted.update(id(item.session_result) for item in finished)
+                    reconciled = self._reconcile(state, partial, snapshot)
+            else:
+                reconciled = None
+            additions = tuple(refill(finished, reserved, reconciled))
+            if additions:
+                prepare(additions, WaveSnapshot(state.evidence.snapshot(), state.coverage.snapshot()))
+            return additions
+
         scheduler = self.scheduler_type(
             deadline=state.deadline,
             session_factory=lambda assignment, lease, snapshot: self._create_isolated_session(
                 state,
                 assignment,
                 lease,
-                snapshot,
+                snapshots[assignment.id],
                 expected_ids[assignment.id],
                 existing_handles[assignment.id]
                 if isinstance(existing_handles[assignment.id], _IsolatedSessionHandle)
@@ -3448,7 +3474,24 @@ class ReviewController:
             request_attempt_journal=state.request_attempt_journal,
             clock=self.clock,
         )
-        result = scheduler.run_wave(assignment_items, phase)
+        result = scheduler.run_wave(assignment_items, phase, **({"refill": refill_wave} if refill else {}))
+        if admitted:
+            snapshot = WaveSnapshot(state.evidence.snapshot(), state.coverage.snapshot())
+            unadmitted = replace(result, results=tuple(
+                item for item in result.results if id(item.session_result) not in admitted
+            ))
+        else:
+            snapshot, unadmitted = wave_snapshot, result
+        self._admit_wave_results(state, unadmitted, snapshot, expected_ids, existing_handles,
+                                 all_assignments.values(), retained_assignment_ids={
+                                     item.assignment_id for item in result.results
+                                 })
+        return result, wave_snapshot
+
+    def _admit_wave_results(
+        self, state, result, wave_snapshot, expected_ids, existing_handles,
+        assignment_items, *, retained_assignment_ids=(),
+    ) -> None:
         self._admit_wave_request_attempts(state, result.request_attempts)
         assignment_by_id = state.assignments
         for item in result.results:
@@ -3524,10 +3567,7 @@ class ReviewController:
                 "session_id": session_id or "",
                 "reason": "in_flight_after_wave_cutoff; retained_for_checkpoint_recovery",
             })
-        retained_assignments = {
-            item.assignment_id
-            for item in result.results
-        } | set(result.in_flight_assignment_ids)
+        retained_assignments = set(retained_assignment_ids) | set(result.in_flight_assignment_ids)
         for assignment in assignment_items:
             if assignment.id in retained_assignments or existing_handles[assignment.id] is not None:
                 continue
@@ -3545,7 +3585,6 @@ class ReviewController:
                     "content_hash": record.content_hash,
                     "status": record.status,
                 })
-        return result, wave_snapshot
 
     def _admit_investigation_lead_state(
         self, state: _RunState, session_result: object,
@@ -4112,6 +4151,7 @@ class ReviewController:
     def _negotiate(
         self, state: _RunState, reconciliation: CoverageReconciliation,
         *, attempt: int = 1, excluded_obligation_ids: Iterable[str] = (),
+        deferred: list[NegotiationAction] | None = None,
     ) -> tuple[NegotiationAction, ...]:
         remaining_turns, remaining_tools = self._remaining_global_budget(state)
         if remaining_turns <= 0 or remaining_tools <= 0:
@@ -4214,7 +4254,10 @@ class ReviewController:
                         "limit": wave_limit,
                         "proposed": len(raw["actions"]),
                         "admitted": len(proposal.actions),
+                        "deferred": len(proposal.deferred),
                     })
+                    if deferred is not None:
+                        deferred.extend(proposal.deferred)
                 elif isinstance(self.negotiator, GatewayRoleAdapter):
                     proposal = validate_compact_negotiation(raw, negotiation_state)
                 else:
@@ -4293,6 +4336,129 @@ class ReviewController:
                 if item.boundary_id:
                     keys.add(("boundary", item.boundary_id))
         return keys
+
+    def _drain_followup_queue(self, state, actions, deferred, excluded_obligation_ids, round_number):
+        """Refill from the current proposal only; the outer loop owns fresh proposals."""
+        assignments = []
+        reservations = {}
+        finished_work = []
+        settled = None
+        check_index = 0
+
+        def schedule(action):
+            keys = self._followup_conflict_keys(state, action)
+            items = self._followup_assignments(state, (action,))
+            for item in items:
+                reservations[item.id] = keys | {("assignment", item.id)}
+            assignments.extend(items)
+            return items
+
+        for action in actions:
+            schedule(action)
+
+        def revalidate(action, reconciled, occupied):
+            with state.admission_lock:
+                if min(self._remaining_global_budget(state)) <= occupied:
+                    return None
+                followup_started = len(set(state.assignments) - {item.id for item in state.plan.assignments})
+                current_state = self._negotiation_state(state, reconciled, followup_started, excluded_obligation_ids)
+                return revalidate_deferred_followup(action, current_state)
+
+        def refill(finished, active, reconciliation):
+            nonlocal settled, check_index
+            if reconciliation is not None:
+                settled = reconciliation
+            for item in finished:
+                checkpoint = item.session_result.checkpoint
+                keys = set(reservations.pop(item.assignment_id, ()))
+                keys.update(
+                    ("path", record.source_path)
+                    for evidence_id in checkpoint.evidence_ids
+                    if (record := state.evidence.lookup_canonical(evidence_id)) is not None
+                    and record.is_usable_for_coverage and record.source_path
+                )
+                finished_work.append((keys, _mask_runtime_text(checkpoint.working_summary)[:650]))
+            if not deferred or settled is None:
+                return ()
+            busy = set().union(*(reservations.get(key, set()) for key in active))
+            open_slots = max(0, state.inputs.config.concurrency - len(active))
+            additions = []
+            waiting = []
+            for action in deferred:
+                if not state.deadline.exploration_allowed(now=self.clock()):
+                    break
+                keys = self._followup_conflict_keys(state, action)
+                if len(additions) >= open_slots or keys.intersection(busy):
+                    waiting.append(action)
+                    continue
+                occupied = len(active) + len(additions)
+                try:
+                    current = revalidate(action, settled, occupied)
+                except NegotiationError as exc:
+                    state.journal.emit("negotiation_deferred_dropped", {
+                        "targets": (*action.obligation_ids, *action.lead_ids), "reason": _bounded_error(exc),
+                    })
+                    continue
+                if current is None:
+                    waiting.append(action)
+                    continue
+                changed = tuple(summary for touched, summary in finished_work
+                                if any(key[0] in {"path", "target", "boundary"} for key in keys.intersection(touched)))
+                if changed:
+                    check_index += 1
+                    if self.negotiator is None:
+                        continue
+                    try:
+                        decision = self._model_request(
+                            state, role="negotiator", phase=RunPhase.FOLLOWUP,
+                            request_id=f"negotiator:recheck:{round_number}:{check_index}",
+                            component=self.negotiator, method="propose", max_attempts=1,
+                            context={"revalidate_followup": {
+                                "kind": current.kind, "original_question": _mask_runtime_text(current.reason)[:500],
+                                "paths": tuple(sorted(value for kind, value in keys if kind == "path"))[:8],
+                                "completed_conclusions": changed[-3:],
+                            }},
+                        )
+                    except Exception as exc:
+                        state.journal.emit("negotiation_deferred_dropped", {"reason": _bounded_error(exc)})
+                        continue
+                    run = isinstance(decision, Mapping) and set(decision) == {"decision"} and decision["decision"] == "run"
+                    state.journal.emit("negotiation_deferred_rechecked", {
+                        "targets": (*current.obligation_ids, *current.lead_ids),
+                        "decision": "run" if run else "defer",
+                    })
+                    if not run:
+                        continue
+                if not state.deadline.exploration_allowed(now=self.clock()):
+                    break
+                # Another live session can consume budget or reserve a
+                # delegation while the focused decision is in flight.
+                try:
+                    with state.admission_lock:
+                        current = revalidate(action, settled, occupied)
+                        items = schedule(current) if current and current.kind == "new_session" else ()
+                except NegotiationError as exc:
+                    state.journal.emit("negotiation_deferred_dropped", {
+                        "targets": (*action.obligation_ids, *action.lead_ids), "reason": _bounded_error(exc),
+                    })
+                    continue
+                if current is None:
+                    waiting.append(action)
+                    continue
+                if current.kind != "new_session":
+                    items = schedule(current)
+                if items:
+                    actions.append(current)
+                    additions.extend(items)
+                    busy.update(keys)
+                    state.journal.emit("negotiation_deferred_admitted", {
+                        "targets": (*current.obligation_ids, *current.lead_ids),
+                    })
+            deferred[:] = waiting
+            return additions
+
+        result, snapshot = self._run_wave(state, assignments, RunPhase.FOLLOWUP, refill=refill)
+        return result, snapshot, assignments
 
     def _queue_review_threads(self, state: _RunState) -> None:
         """Optional leads only after independent exploration, never hard obligations."""
@@ -7686,18 +7852,25 @@ class ReviewController:
                     "uncovered_count": len(before_uncovered),
                     "open_lead_count": len(open_lead_ids),
                 })
-                actions = self._negotiate(
+                deferred: list[NegotiationAction] = []
+                actions = list(self._negotiate(
                     state,
                     reconciliation,
                     attempt=round_index + 1,
                     excluded_obligation_ids=unproductive_obligation_ids,
-                )
+                    deferred=deferred,
+                ))
                 if not actions:
                     break
-                followups = self._followup_assignments(state, actions)
-                followup, followup_snapshot = self._run_wave(
-                    state, followups, RunPhase.FOLLOWUP,
-                )
+                if deferred:
+                    followup, followup_snapshot, followups = self._drain_followup_queue(
+                        state, actions, deferred, unproductive_obligation_ids, round_index + 1,
+                    )
+                else:
+                    followups = self._followup_assignments(state, actions)
+                    followup, followup_snapshot = self._run_wave(
+                        state, followups, RunPhase.FOLLOWUP,
+                    )
                 next_reconciliation = self._reconcile(
                     state, followup, followup_snapshot,
                 )

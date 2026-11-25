@@ -2983,23 +2983,41 @@ def test_gateway_negotiator_receives_compact_targets_and_skips_empty_second_wave
     assert [event.payload["round"] for event in result.events if event.kind == "negotiation_round"] == [1, 2]
 
 
-def test_parallel_followups_reuse_distinct_sessions_and_wait_for_wave(tmp_path):
-    from threading import Barrier
+@pytest.mark.parametrize("queue_mode", ("none", "independent", "affected", "declined"))
+def test_parallel_followups_reuse_distinct_sessions_and_drain_before_renegotiating(tmp_path, queue_mode):
+    from threading import Barrier, Event
 
     from pr_reviewer.specialist_runtime.policy import parse_review_policy
 
     both_running = Barrier(2, timeout=3)
     resumed = []
     rounds = []
+    focus = []
+    release_slow = Event()
 
     class Session(_ResumeSession):
         def explore(self):
+            evidence_ids = ()
             if self.calls:
-                both_running.wait()
+                component = self.assignment.owner_component_id
+                if queue_mode == "none" or component in {"a", "b"}:
+                    both_running.wait()
+                if queue_mode != "none" and component == "b":
+                    assert release_slow.wait(3), "The deferred action was not reconsidered mid-wave"
+                if queue_mode != "none" and component == "c":
+                    release_slow.set()
+                if queue_mode in {"affected", "declined"} and component == "a":
+                    evidence = self.evidence_store.add_tool_result(
+                        session_id=self.session_id, tool="read_file", arguments={"path": "c/main.py"},
+                        result={"status": "ok", "content": "A related check inspected component C."},
+                        category="implementation",
+                    )
+                    evidence_ids = (evidence.id,)
                 resumed.append(self.session_id)
             self.calls += 1
             return SessionResult(self.session_id, SessionState.CHECKPOINT,
-                checkpoint=SessionCheckpoint(self.session_id, SessionState.CHECKPOINT),
+                checkpoint=SessionCheckpoint(self.session_id, SessionState.CHECKPOINT, evidence_ids=evidence_ids,
+                                             working_summary="Retained a related source check."),
                 budget=BudgetUsage(model_turns=self.calls))
 
         def finalize(self):
@@ -3011,17 +3029,25 @@ def test_parallel_followups_reuse_distinct_sessions_and_wait_for_wave(tmp_path):
         return Session(assignment, evidence_store, obligations, expected_session_id)
 
     def negotiate(request):
+        if "revalidate_followup" in request.context:
+            focus.append(request.context["revalidate_followup"])
+            assert not release_slow.is_set()
+            if queue_mode == "declined":
+                release_slow.set()
+                return {"decision": "defer"}
+            return {"decision": "run"}
         rounds.append(tuple(resumed))
         if len(rounds) > 1:
-            remaining, = request.context["negotiation_targets"]
+            remaining = request.context["negotiation_targets"][0]
             return {"kind": "record_unknown", "target": remaining["handle"], "reason": "Leave the last check open."}
         targets = [row["handle"] for row in request.context["negotiation_targets"]
                    if "resume" in row["allowed_actions"]]
         assert request.context["followup_wave_limit"] == 2
         assert len(targets) == 3
+        ordered = (targets[0], targets[0], targets[1]) if queue_mode == "none" else (*targets,)
         return {"actions": [
             {"kind": "resume", "target": handle, "reason": "Check the independent changed behavior."}
-            for handle in (targets[0], targets[0], targets[1])
+            for handle in ordered
         ]}
 
     paths = ("a/main.py", "b/main.py", "c/main.py")
@@ -3038,9 +3064,13 @@ def test_parallel_followups_reuse_distinct_sessions_and_wait_for_wave(tmp_path):
 
     initial = {event.payload["session_id"] for event in result.events
                if event.kind == "specialist_initializing" and event.payload["phase"] == "initial"}
-    assert len(initial) == 3 and len(resumed) == 2 and set(resumed) < initial
-    assert len(set(resumed)) == 2
-    assert rounds == [(), tuple(resumed)]
+    assert len(initial) == 3
+    expect_refill = queue_mode in {"independent", "affected"}
+    assert len(resumed) == len(set(resumed)) == (3 if expect_refill else 2)
+    assert set(resumed).issubset(initial)
+    assert rounds[0] == () and all(snapshot == tuple(resumed) for snapshot in rounds[1:])
+    assert any(event.kind == "negotiation_deferred_admitted" for event in result.events) == expect_refill
+    assert len(focus) == (1 if queue_mode in {"affected", "declined"} else 0)
 
 
 @pytest.mark.parametrize("failed_evidence", [False, True])

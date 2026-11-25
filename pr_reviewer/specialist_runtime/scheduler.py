@@ -274,14 +274,18 @@ class SessionScheduler:
         self,
         assignments: Iterable[object],
         phase: RunPhase = RunPhase.INITIAL,
+        *,
+        refill: Callable[[tuple[AssignmentResult, ...], tuple[str, ...]], Iterable[object]] | None = None,
     ) -> WaveResult:
         normalized_phase = RunPhase(phase)
         if normalized_phase not in _EXPLORATION_PHASES:
             raise ValueError("scheduler waves require initial or followup phase")
         ordered = tuple(sorted(tuple(assignments), key=_assignment_order))
-        ordered_ids = tuple(_assignment_id(item) for item in ordered)
+        ordered_ids = [_assignment_id(item) for item in ordered]
         if len(set(ordered_ids)) != len(ordered_ids):
             raise ValueError("assignment IDs must be unique within a wave")
+        if refill is not None and normalized_phase is not RunPhase.FOLLOWUP:
+            raise ValueError("only follow-up waves can refill")
         lease = self.deadline.lease_for(normalized_phase)
         attempt_cursor = (
             self.request_attempt_journal.cursor()
@@ -289,45 +293,47 @@ class SessionScheduler:
         )
         self._emit("wave_started", {
             "phase": normalized_phase.value,
-            "assignment_ids": ordered_ids,
+            "assignment_ids": tuple(ordered_ids),
             "concurrency": self.concurrency,
         })
 
-        remaining = deque(ordered)
+        remaining = deque(enumerate(ordered))
         active: dict[
-            Future[_CompletedSession | _FailedSession | _WorkerDeclined], object
+            Future[_CompletedSession | _FailedSession | _WorkerDeclined], int
         ] = {}
-        completed: dict[str, _CompletedSession] = {}
-        failed: dict[str, str] = {}
-        failed_sessions: dict[str, ScheduledSession] = {}
-        declined: set[str] = set()
-        cancelled: set[str] = set()
-        in_flight: set[str] = set()
+        completed: dict[int, _CompletedSession] = {}
+        failed: dict[int, str] = {}
+        failed_sessions: dict[int, ScheduledSession] = {}
+        declined: set[int] = set()
+        cancelled: set[int] = set()
+        in_flight: set[int] = set()
 
         def collect(
             future: Future[_CompletedSession | _FailedSession | _WorkerDeclined],
-        ) -> None:
-            assignment = active.pop(future)
-            assignment_id = _assignment_id(assignment)
+        ) -> AssignmentResult | None:
+            ticket = active.pop(future)
             if future.cancelled():
-                cancelled.add(assignment_id)
+                cancelled.add(ticket)
                 return
             try:
                 outcome = future.result()
             except BaseException as exc:  # isolate every specialist failure
-                failed[assignment_id] = format_callback_error(exc)
+                failed[ticket] = format_callback_error(exc)
                 return
             if isinstance(outcome, _WorkerDeclined):
-                declined.add(assignment_id)
+                declined.add(ticket)
             elif isinstance(outcome, _FailedSession):
-                failed[assignment_id] = outcome.error
-                failed_sessions[assignment_id] = outcome.session
+                failed[ticket] = outcome.error
+                failed_sessions[ticket] = outcome.session
             else:
-                completed[assignment_id] = outcome
+                completed[ticket] = outcome
+                return AssignmentResult(ordered_ids[ticket], outcome.result, outcome.session)
+            return None
 
         executor = _DaemonExecutor(self.concurrency)
         cutoff_reached = False
-        try:
+        def submit_remaining() -> None:
+            nonlocal cutoff_reached
             # Admission is stable and may queue more work than the executor can
             # immediately run. Every queued worker independently rechecks cutoff
             # before constructing mutable session state.
@@ -335,7 +341,7 @@ class SessionScheduler:
                 if not self._can_launch(lease):
                     cutoff_reached = True
                     break
-                assignment = remaining[0]
+                ticket, assignment = remaining[0]
                 assignment_id = _assignment_id(assignment)
                 self._emit("session_admitted", {"assignment_id": assignment_id})
                 # Event sinks are synchronous admission work and may consume the
@@ -344,13 +350,15 @@ class SessionScheduler:
                     cutoff_reached = True
                     break
                 future = executor.submit(self._run_assignment, assignment, lease)
-                active[future] = assignment
+                active[future] = ticket
                 remaining.popleft()
                 self._emit("session_queued", {"assignment_id": assignment_id})
                 if not self._can_launch(lease):
                     cutoff_reached = True
                     break
 
+        try:
+            submit_remaining()
             while active and not cutoff_reached:
                 if not self._can_launch(lease):
                     cutoff_reached = True
@@ -363,10 +371,21 @@ class SessionScheduler:
                 if not done:
                     cutoff_reached = True
                     break
-                for future in done:
-                    collect(future)
+                finished = tuple(item for future in sorted(done, key=active.__getitem__)
+                                 if (item := collect(future)) is not None)
                 if not self._can_launch(lease):
                     cutoff_reached = True
+                elif refill is not None and len(active) < self.concurrency:
+                    reserved = tuple(dict.fromkeys(ordered_ids[key] for key in (*active.values(), *failed)))
+                    additions = tuple(refill(finished, reserved))
+                    added_ids = tuple(_assignment_id(item) for item in additions)
+                    if (len(additions) > self.concurrency - len(active)
+                            or len(set(added_ids)) != len(added_ids)
+                            or set(added_ids).intersection(reserved)):
+                        raise ValueError("refill exceeds idle capacity or reuses a reserved assignment")
+                    remaining.extend(enumerate(additions, start=len(ordered_ids)))
+                    ordered_ids.extend(added_ids)
+                    submit_remaining()
 
             if cutoff_reached:
                 # Capture already-completed futures first, cancel only futures
@@ -382,7 +401,10 @@ class SessionScheduler:
                     if future.done():
                         collect(future)
                     else:
-                        in_flight.add(_assignment_id(active.pop(future)))
+                        in_flight.add(active.pop(future))
+        except BaseException:
+            cutoff_reached = True
+            raise
         finally:
             executor.shutdown(wait=not cutoff_reached, cancel_futures=cutoff_reached)
 
@@ -394,26 +416,26 @@ class SessionScheduler:
         stable_results = tuple(
             AssignmentResult(
                 assignment_id,
-                completed[assignment_id].result,
-                completed[assignment_id].session,
+                completed[ticket].result,
+                completed[ticket].session,
             )
-            for assignment_id in ordered_ids
-            if assignment_id in completed
+            for ticket, assignment_id in enumerate(ordered_ids)
+            if ticket in completed
         )
         stable_failures = tuple(
             WaveFailure(
                 assignment_id,
-                failed[assignment_id],
-                failed_sessions.get(assignment_id),
+                failed[ticket],
+                failed_sessions.get(ticket),
             )
-            for assignment_id in ordered_ids
-            if assignment_id in failed
+            for ticket, assignment_id in enumerate(ordered_ids)
+            if ticket in failed
         )
-        never_submitted = {_assignment_id(item) for item in remaining}
+        never_submitted = {ticket for ticket, _ in remaining}
         not_started_set = never_submitted | declined
-        not_started = tuple(item for item in ordered_ids if item in not_started_set)
-        cancelled_assignment_ids = tuple(item for item in ordered_ids if item in cancelled)
-        in_flight_assignment_ids = tuple(item for item in ordered_ids if item in in_flight)
+        not_started = tuple(ordered_ids[ticket] for ticket in sorted(not_started_set))
+        cancelled_assignment_ids = tuple(ordered_ids[ticket] for ticket in sorted(cancelled))
+        in_flight_assignment_ids = tuple(ordered_ids[ticket] for ticket in sorted(in_flight))
 
         evidence_ids = set(self.wave_snapshot.evidence.evidence_ids)
         coverage = dict(self.wave_snapshot.coverage.obligation_statuses)
@@ -425,21 +447,19 @@ class SessionScheduler:
                     coverage.get(obligation_id), ObligationStatus(status)
                 )
 
-        result_by_id = {item.assignment_id: item for item in stable_results}
-        failure_by_id = {item.assignment_id: item for item in stable_failures}
-        for assignment_id in ordered_ids:
-            if assignment_id in result_by_id:
+        for ticket, assignment_id in enumerate(ordered_ids):
+            if ticket in completed:
                 self._emit("session_completed", {"assignment_id": assignment_id})
-            elif assignment_id in failure_by_id:
+            elif ticket in failed:
                 self._emit("session_failed", {
                     "assignment_id": assignment_id,
-                    "error": failure_by_id[assignment_id].error,
+                    "error": failed[ticket],
                 })
-            elif assignment_id in not_started_set:
+            elif ticket in not_started_set:
                 self._emit("session_not_started", {"assignment_id": assignment_id})
-            elif assignment_id in cancelled:
+            elif ticket in cancelled:
                 self._emit("session_cancelled", {"assignment_id": assignment_id})
-            elif assignment_id in in_flight:
+            elif ticket in in_flight:
                 self._emit("session_in_flight", {"assignment_id": assignment_id})
         self._emit("wave_completed", {
             "phase": normalized_phase.value,

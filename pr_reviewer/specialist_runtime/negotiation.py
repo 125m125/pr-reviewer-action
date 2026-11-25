@@ -262,6 +262,7 @@ class NegotiationProposal:
     """Stable immutable collection of validated follow-up actions."""
 
     actions: tuple[NegotiationAction, ...]
+    deferred: tuple[NegotiationAction, ...] = ()
 
 
 def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
@@ -1151,11 +1152,11 @@ def select_compact_followup_wave(
     if set(raw) != {"actions"} or not isinstance(rows, list) or not rows:
         raise NegotiationError("parallel proposal must contain a non-empty actions array")
     accepted: list[NegotiationAction] = []
+    deferred: list[NegotiationAction] = []
+    proposed_targets: set[str] = set()
     reserved: set[tuple[str, str]] = set()
     # The model may offer alternatives, but validation work is bounded too.
     for row in rows[:2 * limit]:
-        if len(accepted) >= limit:
-            break
         if not isinstance(row, Mapping):
             continue
         try:
@@ -1166,17 +1167,43 @@ def select_compact_followup_wave(
             if not accepted:
                 return NegotiationProposal(actions=(action,))
             continue
+        targets = set((*action.lead_ids, *action.obligation_ids))
+        if proposed_targets.intersection(targets):
+            continue
+        proposed_targets.update(targets)
         keys = conflicts(action)
         if action.session_id:
             keys.add(("session", action.session_id))
         keys.update(("target", target) for target in (*action.obligation_ids, *action.lead_ids))
-        if reserved.intersection(keys) or _validate_feasibility((*accepted, action), state):
+        if (len(accepted) >= limit or reserved.intersection(keys)
+                or _validate_feasibility((*accepted, action), state)):
+            deferred.append(action)
             continue
         reserved.update(keys)
         accepted.append(action)
     if not accepted:
         raise NegotiationError("parallel proposal contained no feasible actions")
-    return NegotiationProposal(actions=tuple(accepted))
+    return NegotiationProposal(actions=tuple(accepted), deferred=tuple(deferred))
+
+
+def revalidate_deferred_followup(
+    action: NegotiationAction, state: NegotiationState,
+) -> NegotiationAction:
+    """Translate stable IDs through the current target handles without silently rerouting."""
+    if action.lead_ids:
+        handles = _compact_target_leads(state)
+        target = next((key for key, item in handles.items() if (item.lead_id,) == action.lead_ids), None)
+    else:
+        handles = _compact_target_obligations(state)
+        target = next((key for key, item in handles.items() if (item.id,) == action.obligation_ids), None)
+    if target is None:
+        raise NegotiationError("target is no longer open")
+    current, = validate_compact_negotiation({
+        "kind": action.kind, "target": target, "reason": action.reason,
+    }, state).actions
+    if current.session_id != action.session_id:
+        raise NegotiationError("eligible session changed; reconsider in the next negotiation")
+    return current
 
 
 def fallback_next_action(state: NegotiationState) -> NegotiationAction:

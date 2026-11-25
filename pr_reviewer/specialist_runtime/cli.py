@@ -165,6 +165,11 @@ _ROLE_SYSTEM = {
         "small ordinary assignments when permitted to free capacity under the hard session cap."
     ),
     "negotiator": (
+        "If given revalidate_followup, assess only the supplied deferred question using the "
+        "completed conclusions. Return only {\"decision\":\"run\"} if the original question is "
+        "still concrete and unanswered, or {\"decision\":\"defer\"} if it is answered, no longer "
+        "worth pursuing, or needs a different investigation. Do not propose new targets. "
+        "Otherwise, "
         "Without followup_wave_limit, return exactly one bounded action as "
         "{\"kind\":string,\"target\":string,\"reason\":string}. "
         "With followup_wave_limit, return {\"actions\":[...]} in priority order, up to that limit. "
