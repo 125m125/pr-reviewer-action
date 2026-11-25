@@ -56,6 +56,16 @@ class BoundaryEvaluation:
     followup_kind: str = "none"
 
 
+class BoundaryCitationError(ValueError):
+    """The existing packet can be re-cited without a repository read."""
+
+    def __init__(self, reason: str, groups: Mapping[str, tuple[str, ...]], cited: Iterable[str] = ()):
+        super().__init__(reason)
+        supplied = set(cited)
+        self.missing_groups = tuple(group for group, ids in groups.items() if not supplied.intersection(ids))
+        self.allowed_handles = {group: groups[group] for group in (self.missing_groups or tuple(groups))}
+
+
 def build_boundary_context(
     boundary: BoundaryPolicy,
     assessments: Iterable[ObligationAssessment],
@@ -349,14 +359,21 @@ def validate_boundary_evaluation(
     if not reason:
         raise ValueError("boundary evaluation reason must be non-empty")
     raw_evidence_ids = raw.get("evidence_ids", [])
+    groups = {}
+    if outcome in {"supported", "incompatible"}:
+        participant_evidence = context.get("participant_evidence_ids", {})
+        groups = {f"participant:{item}": tuple(participant_evidence.get(item, ()))
+                  for item in context.get("required_participants", ())}
+        if contract_ids := tuple(context.get("contract_evidence_ids", ())):
+            groups["contract"] = contract_ids
     if not isinstance(raw_evidence_ids, list) or any(
         not isinstance(item, str) or not item.strip()
         for item in raw_evidence_ids
     ):
-        raise ValueError("boundary evaluation evidence_ids must be an array of strings")
+        raise BoundaryCitationError("boundary evaluation evidence_ids must be an array of strings", groups)
     evidence_ids = tuple(item.strip() for item in raw_evidence_ids)
     if len(set(evidence_ids)) != len(evidence_ids):
-        raise ValueError("boundary evaluation evidence_ids must be unique")
+        raise BoundaryCitationError("boundary evaluation evidence_ids must be unique", groups, evidence_ids)
     supplied_ids = {
         str(item.get("id"))
         for item in context.get("evidence", [])
@@ -364,13 +381,13 @@ def validate_boundary_evaluation(
     }
     unknown_ids = set(evidence_ids) - supplied_ids
     if unknown_ids:
-        raise ValueError(
+        raise BoundaryCitationError(
             "boundary evaluation cites evidence outside the supplied packet: "
-            + ", ".join(sorted(unknown_ids))
+            + ", ".join(sorted(unknown_ids)), groups, evidence_ids,
         )
     source_ids = set(context.get("source_evidence_ids", ()))
     if set(evidence_ids) - source_ids:
-        raise ValueError("boundary evaluation citations must name source evidence")
+        raise BoundaryCitationError("boundary evaluation citations must name source evidence", groups, evidence_ids)
     if outcome in {"supported", "incompatible"}:
         if context.get("incomplete"):
             diagnostic = "; ".join(str(item) for item in context.get("diagnostics", ()))
@@ -381,21 +398,21 @@ def validate_boundary_evaluation(
         if str(raw.get("question") or "").strip() != str(context.get("question") or ""):
             raise ValueError(f"{outcome} boundary evaluation must name the specific question")
         if not evidence_ids:
-            raise ValueError(f"{outcome} boundary evaluation requires source evidence citations")
+            raise BoundaryCitationError(f"{outcome} boundary evaluation requires source evidence citations", groups)
         cited = set(evidence_ids)
         participant_evidence = context.get("participant_evidence_ids", {})
         for participant in context.get("required_participants", ()):
             if not cited.intersection(participant_evidence.get(participant, ())):
-                raise ValueError(
+                raise BoundaryCitationError(
                     f"{outcome} boundary evaluation requires source evidence for "
-                    f"participant {participant}"
+                    f"participant {participant}", groups, evidence_ids,
                 )
         contract_ids = set(context.get("contract_evidence_ids", ()))
         if outcome == "incompatible" and context.get("changed_side_only") and not contract_ids:
             raise ValueError("an incompatible contract requires direct contract source evidence")
         if contract_ids and not cited.intersection(contract_ids):
-            raise ValueError(
-                f"{outcome} boundary evaluation requires boundary contract source evidence"
+            raise BoundaryCitationError(
+                f"{outcome} boundary evaluation requires boundary contract source evidence", groups, evidence_ids,
             )
     missing_fact = str(raw.get("missing_fact") or "").strip()
     suggested = str(raw.get("suggested_investigation") or "").strip()

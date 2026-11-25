@@ -306,9 +306,12 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "are admitted independently even if this resolution is rejected. "
             "For covered, cite at least one direct in-scope evidence ID. Tests "
             "and consumers may be cited as supplemental evidence; the controller "
-            "retains only the eligible subset for coverage. Covered means the "
-            "investigation is complete, not that the code is correct: report "
-            "supported defects and mark covered when no investigation remains. "
+            "retains only the eligible subset for coverage. Use covered when "
+            "the change affects this interaction and you finished checking it, "
+            "even if you found a defect. Use not_applicable when cited evidence "
+            "shows the triggering changes do not affect this interaction. "
+            "An unchanged participant alone is not enough. If unsure, use unresolved "
+            "and name the one missing fact. "
             "Do not keep coverage partial pending a code fix or passing tests."
         ),
         "parameters": {"type": "object", "properties": {
@@ -763,11 +766,19 @@ _CHECKPOINT_CONTROLLER_STATE_INSTRUCTION = (
     "evidence_metadata, obligation_statuses, recipe_statuses, or "
     "candidate_statuses. The controller preserves and derives those fields."
 )
+_OBLIGATION_DISPOSITION_RULE = (
+    "Covered: the change affects this interaction and you finished checking it; "
+    "report any supported defect separately. Not_applicable: cite the triggering "
+    "change and explain why it cannot affect this interaction. An unchanged file "
+    "alone does not prove no impact. Unresolved: name the one missing fact that "
+    "prevents you from deciding applicability or behavior. Once the conclusion is "
+    "settled, submit it; do not revisit the choice without new evidence. "
+)
 _OBLIGATION_PROTOCOL_INSTRUCTION = (
     " Coverage is not a request to find supporting evidence at all costs. "
-    "Covered means investigation complete, not defect-free code. A reported "
-    "candidate does not keep coverage open: use covered with result=candidates "
-    "when the assigned investigation is complete. Partially covered means a "
+    + _OBLIGATION_DISPOSITION_RULE
+    + "A reported candidate does not keep coverage open: use covered with result=candidates "
+    "when the affected investigation is complete. Partially covered means a "
     "specific investigation remains, not that a developer must fix the defect "
     "or make failing tests pass. "
     "Actively attempt to falsify the changed behavior before resolving an obligation; "
@@ -846,7 +857,7 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
     "consequence/manual_validation under 300 characters. Use the structured "
     "consequence_support object advertised by the schema. "
     "Use only exact "
-    "retained evidence IDs (evidence:<hash>) from successful tool results in "
+    "short retained evidence handles exactly as shown in successful tool results in "
     "evidence_ids and supporting_evidence_ids; repository paths are not evidence IDs."
 )
 _CHECKPOINT_REPAIR_INSTRUCTION = (
@@ -2211,6 +2222,8 @@ class SpecialistSession:
                 "in obligation_updates. The controller retains the original conclusion and paths. "
                 "Use unresolved when no eligible retained excerpt proves the conclusion."
             )
+        elif any(item.kind == "obligation" for item in rejections):
+            lines.append(_OBLIGATION_DISPOSITION_RULE)
         lines.extend((
             "Return only corrections for these rejected changes. For each "
             "rejected obligation, revise its obligation_updates entry or list "
@@ -2787,7 +2800,7 @@ class SpecialistSession:
                 conversation=conversation,
                 allow_fallbacks=allow_gateway_fallbacks,
             )
-            request = replace(request, timeout_sec=timeout)
+            request = replace(request, timeout_sec=timeout, request_id=request_id)
             result = CALLBACK_POOL.run(
                 lambda: self.gateway.complete(request),
                 timeout_sec=timeout,
@@ -8377,9 +8390,9 @@ class SpecialistSession:
             "for each target below using only the evidence already collected. "
             "Return only obligation_updates matching the schema; do not regenerate "
             "memory or candidates. Listing a target in checkpoint unresolved did not "
-            "record a disposition. Covered requires eligible retained evidence; "
-            "not_applicable requires evidence of irrelevance to this change. Use "
-            "blocked for an unavailable prerequisite, exhausted when bounded investigation "
+            "record a disposition. "
+            + _OBLIGATION_DISPOSITION_RULE
+            + "Use blocked for an unavailable prerequisite, exhausted when bounded investigation "
             "cannot resolve it, or unresolved with a concrete, new next action when "
             "more investigation would help. Never claim coverage just to finish. "
             "Owned changed paths below are capped at 40 per target; the count gives "

@@ -103,7 +103,9 @@ _ROLE_SYSTEM = {
         "Return JSON with question (copy the supplied question), outcome (supported, "
         "incompatible, insufficient_evidence, or potential_contradiction), reason, evidence_ids, "
         "followup_kind (none, repository_evidence, or maintainer_decision), missing_fact, and "
-        "suggested_investigation. Cite source evidence IDs for the participants and contract. "
+        "suggested_investigation. For supported or incompatible, copy at least one short evidence "
+        "handle from each participant_evidence_ids group and from contract_evidence_ids when non-empty. "
+        "A handle can satisfy more than one group only when it appears in each group. "
         "Use incompatible when the complete packet proves an observable mismatch with the contract, "
         "even if author intent is unknown. Use potential_contradiction only for a suspected "
         "mismatch not yet established. A proven mismatch neither certifies compatibility nor "
@@ -1154,6 +1156,7 @@ def build_controller(
         tokens_param=config.tokens_param,
         reasoning_effort=config.reasoning_effort,
         structured_chat_template_kwargs=config.structured_chat_template_kwargs,
+        evidence_handle_logger=runtime_logger,
     )
     role_response_format = "json_object" if config.response_format == "json_schema" else None
     change_summarizer = _BoundedRoleAdapter(

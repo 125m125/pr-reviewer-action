@@ -6171,7 +6171,7 @@ def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract()
         assert "candidate_findings" not in prompt
         assert "new_candidates" in prompt
         assert "candidate_finding_ids" not in prompt
-        assert "exact retained evidence IDs" in prompt
+        assert "short retained evidence handles exactly as shown" in prompt
         assert "repository paths are not evidence IDs" in prompt
 
 

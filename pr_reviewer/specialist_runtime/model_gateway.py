@@ -7,8 +7,11 @@ callers' responsibilities.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from threading import Lock
@@ -30,6 +33,22 @@ from redact import mask_secrets
 
 
 Transport = Callable[..., dict[str, Any]]
+_CANONICAL_EVIDENCE_ID = re.compile(r"(?<![\w-])evidence:[0-9a-f]{64}(?![\w-])")
+_EVIDENCE_HANDLE = re.compile(r"(?<![\w-])E-[0-9A-Z]{8,52}(?![\w-])")
+_HANDLE_ALPHABET = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", "0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+
+
+def _rewrite_evidence_refs(value: Any, rewrite: Callable[[str], str]) -> Any:
+    if isinstance(value, str):
+        return rewrite(value)
+    if isinstance(value, list):
+        return [_rewrite_evidence_refs(item, rewrite) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_rewrite_evidence_refs(item, rewrite) for item in value)
+    if isinstance(value, Mapping):
+        return {_rewrite_evidence_refs(key, rewrite): _rewrite_evidence_refs(item, rewrite)
+                for key, item in value.items()}
+    return value
 
 
 @dataclass(frozen=True)
@@ -55,6 +74,7 @@ class ModelTurnRequest:
     allow_fallbacks: bool = True
     # Retain exploration wire settings for a logically tools-disabled checkpoint.
     thinking_budget_tokens: int | None = None
+    request_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -101,6 +121,10 @@ class OpenAIModelGateway:
     stream_watchdog: bool = True
     structured_chat_template_kwargs: Mapping[str, Any] = field(default_factory=dict)
     transport: Transport | None = None
+    evidence_handle_logger: Callable[[str], None] | None = None
+    _evidence_handles: dict[str, str] = field(default_factory=dict, init=False, repr=False, compare=False)
+    _canonical_evidence_ids: dict[str, str] = field(default_factory=dict, init=False, repr=False, compare=False)
+    _evidence_handle_lock: Any = field(default_factory=Lock, init=False, repr=False, compare=False)
     # Shared by specialist sessions in this run; never persisted across endpoints.
     assistant_prefill_unsupported: bool = field(default=False, init=False)
     _performance_rows: list[dict[str, int | float | None]] = field(default_factory=list, init=False, repr=False, compare=False)
@@ -169,7 +193,30 @@ class OpenAIModelGateway:
             payload["chat_template_kwargs"] = dict(
                 self.structured_chat_template_kwargs
             )
+        with self._evidence_handle_lock:
+            for key in ("messages", "tools", "response_format"):
+                if key in payload:
+                    payload[key] = _rewrite_evidence_refs(payload[key], self._shorten_evidence_refs)
         return payload
+
+    def _shorten_evidence_refs(self, text: str) -> str:
+        def handle(match: re.Match[str]) -> str:
+            canonical = match[0]
+            existing = self._evidence_handles.get(canonical)
+            if existing is not None:
+                return existing
+            # Hash the entire identifier so near-identical IDs still have
+            # visually distinct handles. Extend an actual prefix collision.
+            digest = base64.b32encode(hashlib.sha256(canonical.encode("ascii")).digest())
+            encoded = digest.decode("ascii").rstrip("=").translate(_HANDLE_ALPHABET)
+            for length in range(8, len(encoded) + 1, 2):
+                short = "E-" + encoded[:length]
+                if short not in self._canonical_evidence_ids:
+                    self._canonical_evidence_ids[short] = canonical
+                    self._evidence_handles[canonical] = short
+                    return short
+            raise RuntimeError("evidence handle collision")
+        return _CANONICAL_EVIDENCE_ID.sub(handle, text)
 
     def rendered_request_bytes(self, request: ModelTurnRequest) -> int:
         """Return the compact UTF-8 size of the exact provider payload."""
@@ -205,6 +252,21 @@ class OpenAIModelGateway:
         calls, content, reasoning, finish_reason = extract_intermediate_turn_parts(
             response, "openai"
         )
+        canonical_returned: set[str] = set()
+
+        def restore(text: str) -> str:
+            canonical_returned.update(_CANONICAL_EVIDENCE_ID.findall(text))
+            return _EVIDENCE_HANDLE.sub(lambda match: self._canonical_evidence_ids.get(match[0], match[0]), text)
+
+        with self._evidence_handle_lock:
+            calls, content, reasoning = _rewrite_evidence_refs((calls, content, reasoning), restore)
+        if canonical_returned:
+            diagnostics["canonical_evidence_ids_returned"] = len(canonical_returned)
+            if self.evidence_handle_logger is not None:
+                self.evidence_handle_logger(
+                    f"canonical evidence ID fallback role={request.role} "
+                    f"request={request.request_id or '-'} count={len(canonical_returned)}"
+                )
         text, text_source = effective_intermediate_text(
             {"content": content, "reasoning_content": reasoning},
             "openai",

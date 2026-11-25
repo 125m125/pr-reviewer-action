@@ -113,7 +113,9 @@ from .assignments import (
     validate_assignment_plan,
 )
 from .budget import BudgetExhausted, BudgetLedger, RunDeadline, SessionLease
-from .boundary_evaluation import build_boundary_context, validate_boundary_evaluation, BoundaryEvaluation
+from .boundary_evaluation import (
+    build_boundary_context, validate_boundary_evaluation, BoundaryCitationError, BoundaryEvaluation,
+)
 from .callbacks import (
     CALLBACK_POOL,
     CallbackTimedOut,
@@ -1152,6 +1154,7 @@ class GatewayRoleAdapter:
                 before_attempt(attempt)
             turn_request = ModelTurnRequest(
                 role=request.role,
+                request_id=request.request_id,
                 conversation=conversation,
                 max_tokens=(
                     min(request.max_tokens, 2_048)
@@ -3849,6 +3852,7 @@ class ReviewController:
             state.coverage.record_boundary_result(combined.id, (), supported=False)
             outcome = None
             error = ""
+            citation_error = None
             if context["incomplete"]:
                 error = "; ".join(context["diagnostics"])
             elif self.boundary_evaluator is None:
@@ -3887,6 +3891,7 @@ class ReviewController:
                         if is_model_endpoint_unavailable(exc):
                             raise
                         error = _bounded_error(exc)
+                        citation_error = exc if isinstance(exc, BoundaryCitationError) else None
                         if attempts_left == previous_attempts_left:
                             attempts_left -= 1  # A pre-send rejection still consumes this recovery opportunity.
                         state.journal.emit("boundary_evaluation_rejected", {"boundary_id": boundary.id, "reason": error, "attempts_remaining": attempts_left})
@@ -3897,17 +3902,34 @@ class ReviewController:
                         )
                         if not phase_open or self._remaining_global_budget(state)[0] <= 0:
                             break
-                        request_context = {**context, "repair": {"reason": error, "instruction": "Correct only the boundary evaluation JSON using supplied source evidence."}}
+                        repair = {"reason": error, "instruction": "Correct only the boundary evaluation JSON using supplied source evidence."}
+                        if citation_error is not None:
+                            repair.update({
+                                "missing_groups": citation_error.missing_groups,
+                                "allowed_handles": citation_error.allowed_handles,
+                                "instruction": (
+                                    "Return the boundary evaluation JSON. Correct the evidence_ids, including one "
+                                    "eligible handle for each required group. Keep valid citations for other groups. "
+                                    "Do not change the conclusion unless the evidence warrants it."
+                                ),
+                            })
+                        request_context = {**context, "repair": repair}
             if outcome is None:
+                citation_repair_exhausted = citation_error is not None and not context["incomplete"]
+                if citation_repair_exhausted:
+                    state.journal.emit("boundary_evaluation_citation_repair_exhausted", {
+                        "boundary_id": boundary.id, "reason": error, "missing_groups": citation_error.missing_groups,
+                    })
                 outcome = BoundaryEvaluation(
                     boundary.id, context["input_fingerprint"], "insufficient_evidence",
                     error or "boundary comparison did not complete", (),
                     missing_fact=error or "compatible participant behavior is not established",
                     suggested_investigation=(
-                        "" if context["configuration_only_gap"] else
+                        "" if context["configuration_only_gap"] or citation_repair_exhausted else
                         context.get("suggested_investigation") or f"Investigate {error or boundary.objective}."
                     ),
-                    followup_kind="maintainer_decision" if context["configuration_only_gap"] else "repository_evidence",
+                    followup_kind=("maintainer_decision" if context["configuration_only_gap"] else
+                                   "none" if citation_repair_exhausted else "repository_evidence"),
                 )
             state.boundary_evaluations[boundary.id] = outcome
             supported = outcome.outcome == "supported"

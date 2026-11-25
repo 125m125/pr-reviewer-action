@@ -138,6 +138,26 @@ def test_boundary_evaluator_uses_sources_and_does_not_repeat_unchanged_inputs(tm
     assert state.coverage.obligation_statuses()[combined.id] is ObligationStatus.COVERED
     assert state.investigation_leads == {}
 
+    # A complete packet with a malformed citation needs a citation repair,
+    # not another repository investigation.
+    state.boundary_evaluations.clear()
+    repairs = []
+
+    def wrong_citation(request):
+        packet = request.context
+        repairs.append(packet)
+        return {"question": packet["question"], "outcome": "supported",
+                "reason": "Both endpoints preserve the contract identity.",
+                "evidence_ids": [contract.id, *packet["participant_evidence_ids"]["b"]]}
+
+    ReviewController(boundary_evaluator=wrong_citation, artifact_output_root=tmp_path)._evaluate_boundaries(state)
+    assert len(repairs) == 2
+    assert repairs[1]["repair"]["missing_groups"] == ("participant:a",)
+    assert repairs[1]["repair"]["allowed_handles"]["participant:a"] == repairs[0]["participant_evidence_ids"]["a"]
+    assert state.boundary_evaluations["api"].outcome == "insufficient_evidence"
+    assert state.boundary_evaluations["api"].followup_kind == "none"
+    assert state.investigation_leads == {}
+
     # The evidence can settle the comparison without settling the author's
     # intent. A prior lead for this boundary must stop being schedulable.
     from pr_reviewer.specialist_runtime.types import InvestigationLead, InvestigationLeadStatus
