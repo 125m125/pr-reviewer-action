@@ -81,23 +81,26 @@ jobs:
       - name: Review pull request
         # Component-owned specialist reviews with policy v3 and bounded
         # cross-component evaluation; pin the clean implementation, not canaries.
-        uses: 125m125/pr-reviewer-action@e9bc9a13556a1cbd88f31447112e7c9e3b2a8df7
+        uses: 125m125/pr-reviewer-action@0327bc5f542b9f6e21d31b4766e3ed14ee9acd36
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
-          ai_base_url: ${{ vars.LM_STUDIO_BASE_URL }}
-          # Intermediate calls preserve LM Studio reasoning_content when normal
-          # content is blank. Public review text is rendered only from validated
-          # candidates; raw reasoning is never published.
+          ai_base_url: ${{ vars.LITELLM_BASE_URL }}
+          # The LiteLLM endpoint sits behind a self-signed cert the runner
+          # container's CA store doesn't trust, so skip TLS verification.
+          ai_allow_insecure_tls: "true"
+          # LiteLLM exposes the model through the OpenAI-compatible
+          # /v1/chat/completions endpoint. Public review text is rendered only
+          # from validated candidates; raw reasoning is never published.
           ai_api_format: openai
-          ai_api_key: ${{ secrets.LM_STUDIO_API_KEY }}
-          ai_model: qwen/qwen3.6-35b-a3b
+          ai_api_key: ${{ secrets.LITELLM_API_KEY }}
+          ai_model: code
           ai_response_format: json_schema
           ai_reasoning_effort: ""
           ai_verdict_reasoning_effort: none
           ai_stream: "true"
           ai_max_tokens: "8192"
-          model_context_tokens: "75000"
+          model_context_tokens: "224000"
           ai_request_timeout_sec: "1200"
           standards_file: .github/ai-review-rules.md
           system_prompt_file: .github/ai-review-prompt.md
@@ -107,15 +110,18 @@ jobs:
           # only the latest delta.
           review_scope: full
 
-          # Start from deterministic component ownership, then schedule bounded
-          # follow-ups/delegations. The local model runs specialists sequentially.
+          # Let a bounded scout derive free-form focuses from the diff and the
+          # repository topology below, then run independent specialists in
+          # parallel waves.
           review_strategy: specialists
           review_policy_file: .github/ai-review-policy.json
           specialist_tool_mode: native_loop
 
           specialist_review_deadline_sec: "7200"
           specialist_phase_shares: '{"planning":10,"initial":60,"followup":20,"finalization":10}'
-          specialist_concurrency: "1"
+          # High parallelism to stress-test the shared LiteLLM endpoint
+          # off-peak; lower it before regular use.
+          specialist_concurrency: "8"
           specialist_max_sessions: "12"
           specialist_max_followup_sessions: "2"
           specialist_max_model_turns_per_session: "64"
@@ -125,14 +131,17 @@ jobs:
           specialist_max_recoveries_per_session: "1"
 
           specialist_planner_max_tokens: "8192"
-          specialist_planner_max_context_bytes: "180000"
+          specialist_planner_max_context_bytes: "540000"
 
           specialist_pass_timeout_sec: "1200"
-          specialist_max_tokens: "8192"
+          # Normal specialist turns run with model-default reasoning, so the
+          # thinking tokens share this output budget; keep it above the 8192
+          # default to avoid truncating mid-reasoning turns.
+          specialist_max_tokens: "16384"
           # Keep the larger project-specific budgets; the new watchdog still
           # interrupts repetitive streamed output before it consumes them.
           specialist_recovery_max_tokens: "4096"
-          specialist_max_conversation_tokens: "60000"
+          specialist_max_conversation_tokens: "96000"
           specialist_temperature: "0.6"
           specialist_stream_watchdog: "true"
           specialist_structured_chat_template_kwargs: '{"enable_thinking":false}'
