@@ -4316,12 +4316,17 @@ class ReviewController:
             owner = owners[0] if len(owners) == 1 else None
             session_id = state.assignment_sessions.get(owner.id, "") if owner else ""
             reasons = [reason for applies, reason in signals(snapshot) if applies]
+            owner_evidence = tuple(
+                record.id for record, _ in self._historical_anchor_evidence(
+                    snapshot, state.evidence.snapshot(), state.inputs.head_sha, owner=session_id,
+                )
+            ) if session_id else ()
             summary = f"Reassess unresolved review discussion {target} on {path}"
             if reasons:
                 summary += " (" + "; ".join(reasons) + ")"
             state.investigation_leads[lead_id] = InvestigationLead(
                 lead_id=lead_id, summary=summary,
-                affected_paths=(path,), evidence_ids=(),
+                affected_paths=(path,), evidence_ids=owner_evidence,
                 next_action=(f"Independently verify discussion {target} against current code; "
                              "reuse current candidate evidence where relevant. Use assess_review_thread, "
                              "not a new candidate merely repeating the historical claim."),
@@ -4342,6 +4347,29 @@ class ReviewController:
         )
         return (lead, *tuple(peers)[:2])
 
+    @staticmethod
+    def _historical_anchor_evidence(thread, evidence, head_sha, *, owner=""):
+        line, path = thread.get("line"), thread["path"]
+        if (thread.get("side") != "RIGHT" or type(line) is not int or line <= 0
+                or thread.get("head_sha") != head_sha):
+            return []
+        found = []
+        for record in evidence.records:
+            if (record.source_path != path or record.provenance.head_sha != head_sha
+                    or record.truncated or not record.is_usable_for_coverage
+                    or record.tool not in {"read_file", "read_pr_diff"}
+                    or (owner and owner != record.collector_session_id and owner not in record.imported_by)):
+                continue
+            if record.tool == "read_file":
+                bounds = record.source_range or {}
+                start, lines = bounds.get("offset"), bounds.get("lines")
+                if type(start) is not int or type(lines) is not int or not start <= line < start + lines:
+                    continue
+            excerpt = _critic_anchor_excerpt(record, f"{path}:{line}")
+            if excerpt:
+                found.append((record, excerpt))
+        return sorted(found, key=lambda item: (len(item[0].content), item[0].id))[:2]
+
     def _review_thread_feedback(self, state, leads):
         by_target = {item["target"]: item for item in state.inputs.review_threads}
         snapshots = tuple(
@@ -4353,6 +4381,20 @@ class ReviewController:
         path = snapshots[0]["path"]
         candidates = []
         evidence_ids = set()
+        available_evidence = state.evidence.snapshot()
+        projected = []
+        for snapshot in snapshots:
+            anchor_evidence = self._historical_anchor_evidence(
+                snapshot, available_evidence, state.inputs.head_sha,
+            )
+            evidence_ids.update(record.id for record, _ in anchor_evidence)
+            projected.append({
+                **snapshot,
+                "anchor_evidence": [
+                    {"evidence_id": record.id, "tool": record.tool, "excerpt": excerpt}
+                    for record, excerpt in anchor_evidence
+                ],
+            })
         active = {session_id: set(result.checkpoint.candidate_finding_ids)
                   for (_, session_id), result in state.session_results.items() if result.checkpoint}
         for candidate in (*state.candidate_occurrences.values(), *state.inputs.candidate_findings):
@@ -4367,9 +4409,9 @@ class ReviewController:
                                "status": "provisional", "evidence_ids": ids})
             if len(candidates) == 6:
                 break
-        evidence = EvidenceSnapshot(tuple(record for record in state.evidence.snapshot().records
+        evidence = EvidenceSnapshot(tuple(record for record in available_evidence.records
                                            if record.id in evidence_ids))
-        return snapshots, tuple(candidates), evidence
+        return tuple(projected), tuple(candidates), evidence
 
     def _followup_prior_work(
         self, state: _RunState, assignment: Assignment, lead: InvestigationLead,

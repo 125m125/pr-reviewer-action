@@ -1446,7 +1446,8 @@ def test_review_threads_are_hidden_until_explicitly_assigned():
     assert "review_thread_state" in session._cumulative_checkpoint_payload()["latest_checkpoint"]
 
 
-def test_historical_retrieval_only_opens_shared_evidence_for_current_thread():
+@pytest.mark.parametrize("via_anchor", [False, True])
+def test_historical_retrieval_only_opens_shared_evidence_for_current_thread(via_anchor):
     from pr_reviewer.specialist_runtime.evidence import EvidenceProvenance
 
     session = make_session([], repository_head_sha="a" * 40)
@@ -1460,9 +1461,13 @@ def test_historical_retrieval_only_opens_shared_evidence_for_current_thread():
     shared = retain("a.py", "relevant current source")
     unrelated = retain("secret.py", "unrelated history")
     session._compacted_evidence[unrelated.id] = unrelated
-    session.apply_review_thread_feedback((
-        {"target": "H1", "path": "a.py"}, {"target": "H2", "path": "a.py"},
-    ), ({"candidate_id": "candidate:reference:C1", "evidence_ids": [shared.id]},))
+    current = {"target": "H1", "path": "a.py"}
+    candidates = ()
+    if via_anchor:
+        current["anchor_evidence"] = [{"evidence_id": shared.id, "excerpt": "relevant current source"}]
+    else:
+        candidates = ({"candidate_id": "candidate:reference:C1", "evidence_ids": [shared.id]},)
+    session.apply_review_thread_feedback((current, {"target": "H2", "path": "a.py"}), candidates)
 
     def retrieve(target, evidence_id):
         return session._read_compacted_evidence({

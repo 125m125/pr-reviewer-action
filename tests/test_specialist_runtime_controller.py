@@ -130,6 +130,41 @@ def test_historical_threads_are_optional_post_initial_leads(tmp_path):
     assert initial < queued
 
 
+def test_historical_feedback_shares_only_intact_current_head_anchor_evidence(tmp_path):
+    from pr_reviewer.specialist_runtime.evidence import EvidenceProvenance
+
+    inputs = _inputs(tmp_path)
+    thread = {"target": "H1", "path": "a.py", "line": 51, "side": "RIGHT", "head_sha": inputs.head_sha}
+    inputs = replace(inputs, review_threads=(thread,))
+    store = EvidenceStore()
+
+    def retain(offset, text, *, head_sha=inputs.head_sha, truncated=False):
+        return store.add_tool_result(
+            session_id="owner", tool="read_file", arguments={"path": "a.py", "offset": offset},
+            result={"status": "ok", "result": {"content": text, "range": {
+                "offset": offset, "lines": len(text.splitlines()), "truncated": truncated,
+            }}}, provenance=EvidenceProvenance(head_sha=head_sha),
+        )
+
+    keep = retain(50, "before\nanchor\nafter")
+    retain(10, "wrong location")
+    retain(51, "old content", head_sha="f" * 40)
+    retain(51, "clipped content", truncated=True)
+    state = _RunState(inputs, EventJournal(), RunDeadline(0, 100, PhaseShares()), store)
+    state.plan = controller_module.AssignmentPlan(())
+    controller = _controller(tmp_path)
+    controller._queue_review_threads(state)
+
+    (snapshot,), candidates, evidence = controller._review_thread_feedback(
+        state, (state.investigation_leads["review-thread:H1"],),
+    )
+    assert not candidates
+    assert evidence.evidence_ids == (keep.id,)
+    assert snapshot["anchor_evidence"][0]["evidence_id"] == keep.id
+    assert "anchor" in snapshot["anchor_evidence"][0]["excerpt"]
+    assert "anchor_evidence" not in thread
+
+
 def test_historical_batch_is_bounded_to_open_discussions_on_the_same_path(tmp_path):
     inputs = replace(_inputs(tmp_path), review_threads=tuple(
         {"target": f"H{index}", "path": "a.py" if index < 6 else "b.py"}

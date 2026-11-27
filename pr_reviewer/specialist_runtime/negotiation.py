@@ -388,9 +388,11 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
         else:
             capable_sessions = _capable_lead_sessions(lead, state)
             origin = lead.assigned_session_id or lead.origin_session_id
+            prefer_owner = (lead.kind == "review_thread" and not lead.attempt_count and bool(lead.evidence_ids)
+                            and origin == lead.origin_session_id and origin in capable_sessions)
             if origin in capable_sessions:
                 allowed_actions.insert(0, "resume")
-            if any(session_id != origin for session_id in capable_sessions):
+            if not prefer_owner and any(session_id != origin for session_id in capable_sessions):
                 allowed_actions.insert(0, "consult")
             required_tools = _lead_required_tools(lead)
             # A fresh assignment can authorize the lead's paths even when no
@@ -400,7 +402,7 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
                 for resource in state.session_resources
             )
             if (
-                capability_available
+                not prefer_owner and capability_available
                 and state.current_session_count < state.max_sessions
                 and state.followup_sessions_started < state.max_followup_sessions
                 and state.new_session_turns_remaining > 0

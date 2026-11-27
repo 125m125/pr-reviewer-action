@@ -1889,27 +1889,35 @@ class SpecialistSession:
         """Disclose history only for a controller-selected post-investigation task."""
         if not threads or self._final_result is not None:
             return
-        self._review_threads.set_queue(_assignment_json_value(threads))
+        threads = _assignment_json_value(threads)
+        self._review_threads.set_queue(threads)
         current_candidates = _assignment_json_value(current_candidates)
         self._review_thread_followup = True
         self._followup_assessment_versions = {}
         self.state = SessionState.COVERAGE_EVALUATION
         self.budget.reset_no_progress_streak("historical review thread feedback")
         self._historical_evidence_ids.clear()
-        for candidate in current_candidates:
-            for evidence_id in candidate.get("evidence_ids", ()):
-                record = self.evidence_store.lookup_canonical(evidence_id)
-                if record is not None and record.provenance.head_sha == self.repository_head_sha:
-                    self._compacted_evidence[record.id] = record
-                    self._historical_evidence_ids.add(record.id)
+        shared_ids = {
+            evidence_id for candidate in current_candidates
+            for evidence_id in candidate.get("evidence_ids", ())
+        }
+        shared_ids.update(
+            item["evidence_id"] for thread in threads for item in thread.get("anchor_evidence", ())
+        )
+        for evidence_id in shared_ids:
+            record = self.evidence_store.lookup_canonical(evidence_id)
+            if record is not None and record.provenance.head_sha == self.repository_head_sha:
+                self._compacted_evidence[record.id] = record
+                self._historical_evidence_ids.add(record.id)
         if not any(item.get("name") == "assess_review_thread" for item in self.conversation.tool_schemas):
             self.conversation.tool_schemas.append(copy.deepcopy(ASSESS_REVIEW_THREAD_SCHEMA))
         path = threads[0]["path"]
         self._continuation_scope = (
             f" Current task scope replaces the earlier assignment scope: reassess the historical "
-            f"discussions on {path} against the current head. Use read_file on that path even if "
-            "it is no longer in the PR diff, and read neighboring callers, helpers, or tests only "
-            "as needed to verify the specific claim. This does not widen read_pr_diff scope. "
+            f"discussions on {path} against the current head. Start with current_thread.anchor_evidence "
+            "when present. If it is insufficient, use read_file for a narrow window around the comment "
+            "even if the path is no longer in the PR diff. Read neighboring callers, helpers, or tests "
+            "only to answer the specific question. This does not widen read_pr_diff scope. "
             "Do not restart independent review or resubmit existing candidates. "
             "The controller finishes this task automatically after the final accepted assessment."
         )
@@ -1924,9 +1932,15 @@ class SpecialistSession:
             "Use assess_review_thread to submit each result; no closing summary is needed. "
             "Reuse evidence for related discussions, but assess each independently. "
             "Publish no acknowledgment or unchanged 'still present' update. "
+            "If a human was last to reply and you have an evidence-backed answer or a useful "
+            "perspective, put a concise reply in update. Answer open questions rather than "
+            "treating them as claims to disprove. Ground opinions in concrete evidence and "
+            "label them as such. Leave update empty if you have nothing substantive to add. "
             "To recover a listed evidence ID, call read_compacted_evidence with target "
             "equal to current_thread.target (the H# handle) and purpose contradiction_check. "
             "Candidate IDs here are references, not tool targets. "
+            + self._external_source_reminder()
+            + " "
             + json.dumps({"review_thread_state": self._review_threads.state(),
                           "current_candidates": current_candidates}, default=str)
         )
