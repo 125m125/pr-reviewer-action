@@ -85,6 +85,7 @@ def test_change_summarizer_prompt_forbids_joined_path_fields():
 
     assert "one exact changed path" in prompt
     assert "never join paths" in prompt
+    assert "empty cross_component_effects list" in prompt
 
 
 def test_controller_role_prompts_do_not_inherit_repository_review_instructions():

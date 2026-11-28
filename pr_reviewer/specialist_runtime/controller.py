@@ -4095,6 +4095,20 @@ class ReviewController:
             float(state.inputs.config.model_request_timeout_sec),
             max(1.0, median(durations) if durations else 60.0),
         )
+        # Earlier follow-ups can collect a useful anchor after the thread was queued.
+        evidence = state.evidence.snapshot()
+        threads = {f"review-thread:{thread['target']}": thread for thread in state.inputs.review_threads}
+        leads = tuple(
+            replace(lead, evidence_ids=tuple(
+                record.id for record, _ in self._historical_anchor_evidence(
+                    threads[lead.lead_id], evidence, state.inputs.head_sha, owner=lead.origin_session_id,
+                )
+            ))
+            if (lead.kind == "review_thread" and lead.origin_session_id
+                and lead.status is InvestigationLeadStatus.OPEN and not lead.attempt_count
+                and lead.lead_id in threads) else lead
+            for lead in state.investigation_leads.values()
+        )
         return NegotiationState(
             source_access_requests=tuple(state.source_requests),
             obligations=state.obligations,
@@ -4131,7 +4145,7 @@ class ReviewController:
             ),
             excluded_obligation_ids=tuple(sorted(set(excluded_obligation_ids))),
             changed_files=state.inputs.changed_files,
-            investigation_leads=tuple(state.investigation_leads.values()),
+            investigation_leads=leads,
         )
 
     def _negotiate(
@@ -4316,17 +4330,12 @@ class ReviewController:
             owner = owners[0] if len(owners) == 1 else None
             session_id = state.assignment_sessions.get(owner.id, "") if owner else ""
             reasons = [reason for applies, reason in signals(snapshot) if applies]
-            owner_evidence = tuple(
-                record.id for record, _ in self._historical_anchor_evidence(
-                    snapshot, state.evidence.snapshot(), state.inputs.head_sha, owner=session_id,
-                )
-            ) if session_id else ()
             summary = f"Reassess unresolved review discussion {target} on {path}"
             if reasons:
                 summary += " (" + "; ".join(reasons) + ")"
             state.investigation_leads[lead_id] = InvestigationLead(
                 lead_id=lead_id, summary=summary,
-                affected_paths=(path,), evidence_ids=owner_evidence,
+                affected_paths=(path,), evidence_ids=(),
                 next_action=(f"Independently verify discussion {target} against current code; "
                              "reuse current candidate evidence where relevant. Use assess_review_thread, "
                              "not a new candidate merely repeating the historical claim."),

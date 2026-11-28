@@ -165,6 +165,36 @@ def test_historical_feedback_shares_only_intact_current_head_anchor_evidence(tmp
     assert "anchor_evidence" not in thread
 
 
+def test_negotiation_refreshes_owner_anchor_evidence_collected_after_queueing(tmp_path):
+    from types import SimpleNamespace
+    from pr_reviewer.specialist_runtime.evidence import EvidenceProvenance
+
+    inputs = _inputs(tmp_path)
+    inputs = replace(inputs, review_threads=({
+        "target": "H1", "path": "a.py", "line": 51, "side": "RIGHT", "head_sha": inputs.head_sha,
+    },))
+    state = _RunState(inputs, EventJournal(), RunDeadline(0, 100, PhaseShares()), EvidenceStore())
+    owner = controller_module.Assignment(
+        "owner", "Owner", "Review a.py", (), (), (), (), (), (), 2, "normal",
+        owned_changed_paths=("a.py",),
+    )
+    state.plan = controller_module.AssignmentPlan((owner,))
+    state.assignment_sessions = {"owner": "S1"}
+    controller = _controller(tmp_path)
+    controller._queue_review_threads(state)
+    reconciliation = SimpleNamespace(snapshot=CoverageLedger(()).snapshot())
+    assert not controller._negotiation_state(state, reconciliation, 0).investigation_leads[0].evidence_ids
+
+    record = state.evidence.add_tool_result(
+        session_id="S1", tool="read_file", arguments={"path": "a.py", "offset": 51},
+        result={"status": "ok", "result": {"content": "anchor", "range": {"offset": 51, "lines": 1}}},
+        provenance=EvidenceProvenance(head_sha=inputs.head_sha),
+    )
+    lead, = controller._negotiation_state(state, reconciliation, 0).investigation_leads
+    assert lead.origin_session_id == "S1"
+    assert lead.evidence_ids == (record.id,)
+
+
 def test_historical_batch_is_bounded_to_open_discussions_on_the_same_path(tmp_path):
     inputs = replace(_inputs(tmp_path), review_threads=tuple(
         {"target": f"H{index}", "path": "a.py" if index < 6 else "b.py"}
