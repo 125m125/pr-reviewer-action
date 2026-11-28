@@ -29,14 +29,16 @@ from pr_reviewer.specialist_runtime.types import (
 def test_historical_collection_uses_action_root_and_immutable_identity(monkeypatch, tmp_path):
     from pr_reviewer.github_review_notes import GhReviewClient
     observed = {}
-    def query(self, repo, pr, head):
-        observed.update(action_root=self.action_root, repo=repo, pr=pr, head=head)
+    def query(self, repo, pr, head, *, objection_locations=()):
+        observed.update(action_root=self.action_root, repo=repo, pr=pr, head=head, objection_locations=objection_locations)
         return ()
     monkeypatch.setattr(GhReviewClient, "query_review_threads", query)
     config = SimpleNamespace(environment={"GITHUB_ACTION_PATH": str(tmp_path)})
-    inputs = SimpleNamespace(repository="o/r", pr_number=7, head_sha="a" * 40)
+    inputs = SimpleNamespace(repository="o/r", pr_number=7, head_sha="a" * 40, changed_files=("a.py",))
     assert cli._collect_review_threads(config, inputs) == ()
-    assert observed == dict(action_root=tmp_path.resolve(), repo="o/r", pr=7, head="a" * 40)
+    assert observed == dict(action_root=tmp_path.resolve(), repo="o/r", pr=7, head="a" * 40, objection_locations=())
+    cli._collect_review_threads(config, inputs, objection_locations=("a.py:5",))
+    assert observed["objection_locations"] == ("a.py:5",)
 
 
 def test_critic_batch_and_dedup_logs_report_sizes_and_outcomes():
@@ -83,6 +85,7 @@ def test_change_summarizer_prompt_forbids_joined_path_fields():
 
     assert "one exact changed path" in prompt
     assert "never join paths" in prompt
+    assert "empty cross_component_effects list" in prompt
 
 
 def test_controller_role_prompts_do_not_inherit_repository_review_instructions():
@@ -2104,6 +2107,7 @@ def test_handoff_summarizer_prompt_limits_prose_to_controller_facts(
     assert "human_focus_facts" in prompt
     assert "controller-authorized orientation" in prompt_lower
     assert "do not invent work absent from the supplied state" in prompt_lower
+    assert "600 characters maximum per field" in prompt_lower
     assert '"human_focus":string' in prompt
     assert "do not list files, findings, severities" in prompt
     assert "do not claim complete coverage" in prompt_lower

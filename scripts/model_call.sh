@@ -56,6 +56,11 @@ curl_model() {
     args+=( -H "anthropic-version: ${ANTHROPIC_VERSION:-2023-06-01}" )
   fi
 
+  local allow_insecure_tls="${PR_REVIEWER_ALLOW_INSECURE_TLS:-}"
+  if [[ "${allow_insecure_tls,,}" =~ ^[[:space:]]*(1|true|yes|on)[[:space:]]*$ ]]; then
+    args+=( --insecure )
+  fi
+
   # The API key goes through a 0600 curl --config file rather than argv, so
   # it never appears in /proc/<pid>/cmdline or `ps` output on shared runners.
   local auth_config=""

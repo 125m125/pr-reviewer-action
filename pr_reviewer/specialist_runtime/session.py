@@ -306,9 +306,12 @@ _OBLIGATION_LOCAL_TOOL_SCHEMAS: tuple[dict[str, Any], ...] = (
             "are admitted independently even if this resolution is rejected. "
             "For covered, cite at least one direct in-scope evidence ID. Tests "
             "and consumers may be cited as supplemental evidence; the controller "
-            "retains only the eligible subset for coverage. Covered means the "
-            "investigation is complete, not that the code is correct: report "
-            "supported defects and mark covered when no investigation remains. "
+            "retains only the eligible subset for coverage. Use covered when "
+            "the change affects this interaction and you finished checking it, "
+            "even if you found a defect. Use not_applicable when cited evidence "
+            "shows the triggering changes do not affect this interaction. "
+            "An unchanged participant alone is not enough. If unsure, use unresolved "
+            "and name the one missing fact. "
             "Do not keep coverage partial pending a code fix or passing tests."
         ),
         "parameters": {"type": "object", "properties": {
@@ -482,7 +485,7 @@ TEST_RESULTS_TOOL_NAME = "read_test_results"
 COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
     "name": COMPACTED_EVIDENCE_TOOL_NAME,
     "description": (
-        "Read a bounded excerpt from an evidence result that the controller "
+        "Recover retained text from an evidence result that the controller "
         "explicitly marked as compacted or shared for the current historical discussion. "
         "This tool never reads arbitrary evidence "
         "or creates new evidence. For another page, use the returned next_offset; "
@@ -501,7 +504,7 @@ COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
             },
             "limit": {
                 "type": "integer",
-                "description": "Optional excerpt size, capped by the controller.",
+                "description": "Optional maximum characters. By default, return as much as fits the normal tool-result budget.",
             },
             "target": {
                 "type": "string",
@@ -519,7 +522,6 @@ COMPACTED_EVIDENCE_SCHEMA: dict[str, Any] = {
     },
 }
 _MAX_COMPACTED_EVIDENCE_READS = 4
-_MAX_COMPACTED_EVIDENCE_READ_CHARS = 4_000
 _CONTEXT_LIMIT_SIGNALS = (
     "context_length_exceeded",
     "context size",
@@ -737,6 +739,7 @@ class _CheckpointChangeRejection:
     reason: str
     payload: Mapping[str, Any]
     diagnostic: Mapping[str, Any] | None = None
+    citation_repair: bool = False
 
 
 _CHECKPOINT_LIFECYCLE_INSTRUCTIONS = {
@@ -762,11 +765,19 @@ _CHECKPOINT_CONTROLLER_STATE_INSTRUCTION = (
     "evidence_metadata, obligation_statuses, recipe_statuses, or "
     "candidate_statuses. The controller preserves and derives those fields."
 )
+_OBLIGATION_DISPOSITION_RULE = (
+    "Covered: the change affects this interaction and you finished checking it; "
+    "report any supported defect separately. Not_applicable: cite the triggering "
+    "change and explain why it cannot affect this interaction. An unchanged file "
+    "alone does not prove no impact. Unresolved: name the one missing fact that "
+    "prevents you from deciding applicability or behavior. Once the conclusion is "
+    "settled, submit it; do not revisit the choice without new evidence. "
+)
 _OBLIGATION_PROTOCOL_INSTRUCTION = (
     " Coverage is not a request to find supporting evidence at all costs. "
-    "Covered means investigation complete, not defect-free code. A reported "
-    "candidate does not keep coverage open: use covered with result=candidates "
-    "when the assigned investigation is complete. Partially covered means a "
+    + _OBLIGATION_DISPOSITION_RULE
+    + "A reported candidate does not keep coverage open: use covered with result=candidates "
+    "when the affected investigation is complete. Partially covered means a "
     "specific investigation remains, not that a developer must fix the defect "
     "or make failing tests pass. "
     "Actively attempt to falsify the changed behavior before resolving an obligation; "
@@ -845,7 +856,7 @@ _CHECKPOINT_RETENTION_INSTRUCTION = (
     "consequence/manual_validation under 300 characters. Use the structured "
     "consequence_support object advertised by the schema. "
     "Use only exact "
-    "retained evidence IDs (evidence:<hash>) from successful tool results in "
+    "short retained evidence handles exactly as shown in successful tool results in "
     "evidence_ids and supporting_evidence_ids; repository paths are not evidence IDs."
 )
 _CHECKPOINT_REPAIR_INSTRUCTION = (
@@ -1262,6 +1273,7 @@ def specialist_assignment_prompt(
             "recipe_objective": item.recipe_objective,
             "recipe_invariants": list(item.recipe_invariants),
             "evidence_hints": list(item.evidence_hints),
+            **({"boundary_change_scope": item.boundary_change_scope} if item.boundary_change_scope else {}),
         } for item in component_obligations)
     boundary_hints = tuple(dict.fromkeys((*getattr(
         assignment,
@@ -1371,7 +1383,8 @@ def specialist_assignment_prompt(
     payload.pop("obligation_ids", None)
     payload["independent_targets"] = [handles[item] for item in payload.pop("independent_obligation_ids") if item in handles]
     payload["obligation_briefs"] = [
-        {**{key: value for key, value in item.items() if key != "obligation_id"},
+        {**{key: value for key, value in item.items()
+            if key != "obligation_id" and (key != "boundary_change_scope" or value)},
          "target": handles[item["obligation_id"]]}
         for item in payload.get("obligation_briefs", ()) if item.get("obligation_id") in handles
     ]
@@ -1510,6 +1523,7 @@ class SpecialistSession:
         delegated_summary_max_tokens: int | None = None,
         delegated_summary_max_source_bytes: int | None = None,
         changed_files: tuple[str, ...] = (),
+        pr_changed_files: tuple[str, ...] | None = None,
         change_overview: Mapping[str, object] | None = None,
         test_results: tuple[Mapping[str, object], ...] = (),
         test_results_repository: str = "",
@@ -1584,6 +1598,8 @@ class SpecialistSession:
         self.test_results_repository = str(test_results_repository).strip()
         self.test_results_head_sha = str(test_results_head_sha).strip()
         self.repository_head_sha = str(repository_head_sha).strip()
+        self._pr_changed_files = (frozenset(_normalized_path(path) for path in pr_changed_files)
+                                  if pr_changed_files is not None else None)
         self.changed_files = tuple(dict.fromkeys(
             str(path).replace("\\", "/").strip("/")
             for path in (
@@ -1702,9 +1718,14 @@ class SpecialistSession:
             assignment, "assignment_id", getattr(assignment, "id", ""),
         ))
         self._request_turn = 0
-        if not self.conversation.events:
-            self.conversation.add_user(self._assignment_prompt())
         self._advertise_obligation_associations()
+        if not self.conversation.events:
+            self.conversation.add_user(self._assignment_prompt(
+                include_followup_reminder=(
+                    self.lease.phase is RunPhase.FOLLOWUP
+                    and not getattr(self.assignment, "investigation_leads", ())
+                ),
+            ))
 
     def _advertise_obligation_associations(self) -> None:
         """Add controller-owned association metadata only to specialist schemas."""
@@ -1821,7 +1842,7 @@ class SpecialistSession:
             ))
         self.conversation.tool_schemas = schemas
 
-    def _assignment_prompt(self) -> str:
+    def _assignment_prompt(self, *, include_followup_reminder: bool = False) -> str:
         prompt = specialist_assignment_prompt(
             self.assignment,
             change_overview=self.change_overview,
@@ -1831,6 +1852,8 @@ class SpecialistSession:
         )
         payload = json.loads(prompt.split("\n", 1)[1])
         payload["delegation_receipts"] = self._delegation_receipts
+        if include_followup_reminder and (reminder := self._external_source_reminder()):
+            payload["followup_source_reminder"] = reminder.strip()
         payload["ownership_instruction"] = (
             "Only current owned_changed_paths and assigned targets are your responsibility. "
             "Transferred work remains queued/incomplete until the controller reports otherwise. "
@@ -1866,27 +1889,35 @@ class SpecialistSession:
         """Disclose history only for a controller-selected post-investigation task."""
         if not threads or self._final_result is not None:
             return
-        self._review_threads.set_queue(_assignment_json_value(threads))
+        threads = _assignment_json_value(threads)
+        self._review_threads.set_queue(threads)
         current_candidates = _assignment_json_value(current_candidates)
         self._review_thread_followup = True
         self._followup_assessment_versions = {}
         self.state = SessionState.COVERAGE_EVALUATION
         self.budget.reset_no_progress_streak("historical review thread feedback")
         self._historical_evidence_ids.clear()
-        for candidate in current_candidates:
-            for evidence_id in candidate.get("evidence_ids", ()):
-                record = self.evidence_store.lookup_canonical(evidence_id)
-                if record is not None and record.provenance.head_sha == self.repository_head_sha:
-                    self._compacted_evidence[record.id] = record
-                    self._historical_evidence_ids.add(record.id)
+        shared_ids = {
+            evidence_id for candidate in current_candidates
+            for evidence_id in candidate.get("evidence_ids", ())
+        }
+        shared_ids.update(
+            item["evidence_id"] for thread in threads for item in thread.get("anchor_evidence", ())
+        )
+        for evidence_id in shared_ids:
+            record = self.evidence_store.lookup_canonical(evidence_id)
+            if record is not None and record.provenance.head_sha == self.repository_head_sha:
+                self._compacted_evidence[record.id] = record
+                self._historical_evidence_ids.add(record.id)
         if not any(item.get("name") == "assess_review_thread" for item in self.conversation.tool_schemas):
             self.conversation.tool_schemas.append(copy.deepcopy(ASSESS_REVIEW_THREAD_SCHEMA))
         path = threads[0]["path"]
         self._continuation_scope = (
             f" Current task scope replaces the earlier assignment scope: reassess the historical "
-            f"discussions on {path} against the current head. Use read_file on that path even if "
-            "it is no longer in the PR diff, and read neighboring callers, helpers, or tests only "
-            "as needed to verify the specific claim. This does not widen read_pr_diff scope. "
+            f"discussions on {path} against the current head. Start with current_thread.anchor_evidence "
+            "when present. If it is insufficient, use read_file for a narrow window around the comment "
+            "even if the path is no longer in the PR diff. Read neighboring callers, helpers, or tests "
+            "only to answer the specific question. This does not widen read_pr_diff scope. "
             "Do not restart independent review or resubmit existing candidates. "
             "The controller finishes this task automatically after the final accepted assessment."
         )
@@ -1901,9 +1932,15 @@ class SpecialistSession:
             "Use assess_review_thread to submit each result; no closing summary is needed. "
             "Reuse evidence for related discussions, but assess each independently. "
             "Publish no acknowledgment or unchanged 'still present' update. "
+            "If a human was last to reply and you have an evidence-backed answer or a useful "
+            "perspective, put a concise reply in update. Answer open questions rather than "
+            "treating them as claims to disprove. Ground opinions in concrete evidence and "
+            "label them as such. Leave update empty if you have nothing substantive to add. "
             "To recover a listed evidence ID, call read_compacted_evidence with target "
             "equal to current_thread.target (the H# handle) and purpose contradiction_check. "
             "Candidate IDs here are references, not tool targets. "
+            + self._external_source_reminder()
+            + " "
             + json.dumps({"review_thread_state": self._review_threads.state(),
                           "current_candidates": current_candidates}, default=str)
         )
@@ -2051,6 +2088,29 @@ class SpecialistSession:
             )
         return self._continuation_scope
 
+    def _external_source_reminder(self) -> str:
+        advertised = {item.get("name") for item in self.conversation.tool_schemas}
+        routes = [
+            hint for name, hint in (
+                ("web_search", "use web_search to locate official documentation"),
+                ("web_fetch", "use web_fetch for a focused page"),
+                ("web_fetch_search_result", "use web_fetch_search_result for an official search result"),
+                ("read_remote_file", "use read_remote_file for a specific upstream file"),
+            )
+            if name in advertised
+        ]
+        if not routes:
+            return ""
+        if (DELEGATE_TOOL_SUMMARY_NAME in advertised
+                and advertised.intersection({"web_fetch", "web_fetch_search_result", "read_remote_file"})):
+            routes.append("prefer delegate_tool_summary for a narrow question about a large page or file")
+        return (
+            " If you are reconsidering the same external behavior without new evidence, "
+            "prefer a focused lookup in an authorized source: " + "; ".join(routes) + ". "
+            "Use retained evidence if it already answers the question. If you cannot verify it, "
+            "record the specific uncertainty and move on."
+        )
+
     def _checkpoint_obligation_contract(self) -> str:
         pending: list[dict[str, object]] = []
         partial: list[dict[str, object]] = []
@@ -2153,6 +2213,12 @@ class SpecialistSession:
         obligation_targets = sorted({
             item.target for item in rejections if item.kind == "obligation"
         })
+        if rejections and all(item.citation_repair for item in rejections):
+            keys = ("target", "evidence_ids")
+            obligation_item["properties"] = {
+                key: obligation_item["properties"][key] for key in keys
+            }
+            obligation_item["required"] = list(keys)
         if obligation_targets:
             obligation_item["properties"]["target"]["enum"] = obligation_targets
         unresolved_items: dict[str, Any] = {"type": "string"}
@@ -2193,6 +2259,14 @@ class SpecialistSession:
                     if item.diagnostic is not None else item.reason
                 )
             )
+        if rejections and all(item.citation_repair for item in rejections):
+            lines.append(
+                "For each supported citation repair, return only target and replacement evidence_ids "
+                "in obligation_updates. The controller retains the original conclusion and paths. "
+                "Use unresolved when no eligible retained excerpt proves the conclusion."
+            )
+        elif any(item.kind == "obligation" for item in rejections):
+            lines.append(_OBLIGATION_DISPOSITION_RULE)
         lines.extend((
             "Return only corrections for these rejected changes. For each "
             "rejected obligation, revise its obligation_updates entry or list "
@@ -2769,7 +2843,7 @@ class SpecialistSession:
                 conversation=conversation,
                 allow_fallbacks=allow_gateway_fallbacks,
             )
-            request = replace(request, timeout_sec=timeout)
+            request = replace(request, timeout_sec=timeout, request_id=request_id)
             result = CALLBACK_POOL.run(
                 lambda: self.gateway.complete(request),
                 timeout_sec=timeout,
@@ -4601,13 +4675,7 @@ class SpecialistSession:
                     {
                         "evidence_id": prior.id,
                         "replayed_duplicate": True,
-                        "changed": bool(
-                            prior.source_path
-                            and any(
-                                prior.source_path in obligation.scope
-                                for obligation in self.coverage.obligations()
-                            )
-                        ),
+                        "changed": self._source_changed(prior),
                         "eligible_targets": list(requested_targets),
                         "coverage_effect": "neutral_evidence_retained",
                     },
@@ -4756,13 +4824,7 @@ class SpecialistSession:
                     **({"range": dict(payload["range"])}
                        if isinstance(payload, Mapping) and isinstance(payload.get("range"), Mapping)
                        else {}),
-                    "changed": bool(
-                        record.source_path
-                        and any(
-                            record.source_path in obligation.scope
-                            for obligation in self.coverage.obligations()
-                        )
-                    ),
+                    "changed": self._source_changed(record),
                     "eligible_targets": list(requested_targets),
                     "coverage_effect": "neutral_evidence_retained",
                     **self._remote_delegation_hint(name, record, payload),
@@ -4981,6 +5043,12 @@ class SpecialistSession:
                 obligation_id=obligation_id,
                 categories=obligation.required_evidence_categories,
             )
+
+    def _source_changed(self, record: EvidenceRecord) -> bool | None:
+        if (self._pr_changed_files is None or not record.source_path
+                or record.tool not in {"read_file", "read_pr_diff", "git_grep", "git_blame"}):
+            return None
+        return _normalized_path(record.source_path) in self._pr_changed_files
 
     def _associate_proposed_evidence(
         self, target: str, evidence_ids: tuple[str, ...],
@@ -5481,8 +5549,26 @@ class SpecialistSession:
                             item.target: item.assessment_version
                             for item in self.obligation_assessments.assessments()
                         }
+                        correction_text = correction.content
+                        if (isinstance(correction_raw, Mapping)
+                                and all(item.citation_repair for item in correction_group)):
+                            originals = {item.target: item.payload for item in correction_group}
+                            updates = correction_raw.get("obligation_updates")
+                            if isinstance(updates, list) and all(
+                                isinstance(row, Mapping) and set(row) == {"target", "evidence_ids"}
+                                and isinstance(row["target"], str) and row["target"] in originals
+                                for row in updates
+                            ):
+                                correction_text = json.dumps({
+                                    **correction_raw,
+                                    "obligation_updates": [
+                                        {**originals[row["target"]], **row} for row in updates
+                                    ],
+                                })
+                            else:
+                                correction_text = ""
                         corrected = self._checkpoint_from_text(
-                            correction.content,
+                            correction_text,
                             require_complete_pending=False,
                             allowed_obligation_targets={
                                 item.target for item in correction_group
@@ -6099,6 +6185,7 @@ class SpecialistSession:
                 ) or str(update.get("target") or "<missing>")
                 rejections.append(_CheckpointChangeRejection(
                     "obligation", target, proposal.reason, dict(update),
+                    citation_repair=proposal.citation_repair,
                 ))
                 continue
             if proposal.ignored_supplemental_evidence_ids:
@@ -6828,6 +6915,7 @@ class SpecialistSession:
                 if not self.obligation_assessments.assessment(target).next_actions_consumed
                 for action in self.obligation_assessments.assessment(target).next_actions
             )
+            source_reminder = self._external_source_reminder() if next_actions else ""
             self._continuation_scope = (
                 " Continue only the latest controller-selected gaps: "
                 + json.dumps([target for value in normalized
@@ -6839,6 +6927,7 @@ class SpecialistSession:
                 "known, use retained evidence without rereading completed work. Then stop issuing tools; the controller will "
                 "request a checkpoint. Do not reopen other gaps, repeat completed checks, "
                 "or resubmit active candidates. Resuming after compaction does not expand this task."
+                + source_reminder
             )
             self.conversation.add_user(
                 "Coverage feedback. The previous checkpoint proposed_next_actions "
@@ -6860,6 +6949,7 @@ class SpecialistSession:
                 "via tool, include the outcome in that checkpoint's obligation_updates. Other obligations remain "
                 "controller-owned: do not reopen or resolve them during this follow-up. "
                 "An active finding does not prevent completion of the selected investigation."
+                + source_reminder
             )
             self.obligation_assessments.consume_next_actions(normalized)
             self.budget.reset_no_progress_streak("material controller feedback")
@@ -6904,12 +6994,14 @@ class SpecialistSession:
                 json.loads(json.dumps(schema))
             )
         self.state = SessionState.COVERAGE_EVALUATION
+        source_reminder = self._external_source_reminder()
         self._continuation_scope = (
             " Continue only the controller-selected lead " + normalized_target
             + ": " + lead.summary + ". Next action: " + lead.next_action
             + ". Once the lead is resolved, stop without tool calls; the controller will "
             "request a checkpoint. Do not reopen other gaps, repeat completed checks, "
             "or resubmit active candidates. Resuming after compaction does not expand this task."
+            + source_reminder
         )
         self.conversation.add_user(
             "Controller-selected investigation lead. Tools are available again. "
@@ -6934,6 +7026,7 @@ class SpecialistSession:
                 "repeating completed investigation."
                 if prior_work else ""
             )
+            + source_reminder
         )
         self.budget.reset_no_progress_streak("material investigation lead feedback")
 
@@ -7542,26 +7635,25 @@ class SpecialistSession:
                 "error": "evidence ID is not marked as compacted",
             }
         raw_offset = arguments.get("offset", 0)
-        raw_limit = arguments.get("limit", _MAX_COMPACTED_EVIDENCE_READ_CHARS)
+        content = record.content
+        raw_limit = arguments.get("limit")
         if (
             isinstance(raw_offset, bool)
             or not isinstance(raw_offset, int)
             or raw_offset < 0
-            or isinstance(raw_limit, bool)
-            or not isinstance(raw_limit, int)
-            or raw_limit <= 0
+            or ("limit" in arguments and (
+                isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or raw_limit <= 0
+            ))
         ):
             return {"status": "error", "error": "offset and limit are invalid"}
         offset = raw_offset
-        limit = min(raw_limit, _MAX_COMPACTED_EVIDENCE_READ_CHARS)
+        limit = raw_limit if raw_limit is not None else max(0, len(content) - offset)
         key = (
             evidence_id, target, purpose, self._compacted_evidence_generation,
         )
-        content = record.content
-        excerpt = content[offset:offset + limit]
-        end = offset + len(excerpt)
+        end = min(len(content), offset + limit)
         ranges = self._compacted_evidence_read_ranges.get(key, [])
-        if excerpt and any(start <= offset and end <= stop for start, stop in ranges):
+        if end > offset and any(start <= offset and end <= stop for start, stop in ranges):
             return {
                 "status": "ok",
                 "evidence_id": evidence_id,
@@ -7569,7 +7661,7 @@ class SpecialistSession:
                 "target": target,
                 "purpose": purpose,
             }
-        if not excerpt:
+        if end <= offset:
             return {
                 "status": "ok", "evidence_id": evidence_id, "target": target,
                 "purpose": purpose, "content": "", "offset": offset,
@@ -7591,7 +7683,37 @@ class SpecialistSession:
             else:
                 end = min(end, start)
                 break
-        excerpt = content[offset:end]
+        def page(stop: int) -> dict[str, Any]:
+            next_offset = stop
+            for start, previous_end in ranges:
+                if start <= next_offset <= previous_end:
+                    next_offset = previous_end
+            return {
+                "status": "ok", "evidence_id": evidence_id, "target": target,
+                "purpose": purpose, "tool": record.tool,
+                "content": content[offset:stop], "offset": offset, "limit": limit,
+                "truncated": stop < len(content),
+                "next_offset": next_offset if next_offset < len(content) else None,
+                "source_truncated": bool(record.truncated),
+            }
+
+        def fits(result: dict[str, Any]) -> bool:
+            return len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= self.max_tool_result_bytes
+
+        # Budget the serialized response before marking any characters as delivered.
+        result = page(end)
+        if not fits(result):
+            low, high = offset, end
+            while low + 1 < high:
+                middle = (low + high) // 2
+                if fits(page(middle)):
+                    low = middle
+                else:
+                    high = middle
+            if low == offset:
+                return {"status": "error", "error": "tool result budget too small for compacted evidence"}
+            end = low
+            result = page(end)
         # Merge delivered intervals so changing page boundaries cannot make
         # already delivered content count as progress. At most four reads are
         # allowed, so a sorted list is sufficient.
@@ -7603,23 +7725,7 @@ class SpecialistSession:
                 merged.append((start, stop))
         self._compacted_evidence_read_ranges[key] = merged
         self._compacted_evidence_reads += 1
-        next_offset = end
-        for start, stop in merged:
-            if start <= next_offset <= stop:
-                next_offset = stop
-        return {
-            "status": "ok",
-            "evidence_id": evidence_id,
-            "target": target,
-            "purpose": purpose,
-            "tool": record.tool,
-            "content": excerpt,
-            "offset": offset,
-            "limit": limit,
-            "truncated": offset + len(excerpt) < len(content),
-            "next_offset": next_offset if next_offset < len(content) else None,
-            "source_truncated": bool(record.truncated),
-        }
+        return result
 
     def _read_test_results(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         """Return bounded controller-seeded test cases matching a model query."""
@@ -8346,9 +8452,9 @@ class SpecialistSession:
             "for each target below using only the evidence already collected. "
             "Return only obligation_updates matching the schema; do not regenerate "
             "memory or candidates. Listing a target in checkpoint unresolved did not "
-            "record a disposition. Covered requires eligible retained evidence; "
-            "not_applicable requires evidence of irrelevance to this change. Use "
-            "blocked for an unavailable prerequisite, exhausted when bounded investigation "
+            "record a disposition. "
+            + _OBLIGATION_DISPOSITION_RULE
+            + "Use blocked for an unavailable prerequisite, exhausted when bounded investigation "
             "cannot resolve it, or unresolved with a concrete, new next action when "
             "more investigation would help. Never claim coverage just to finish. "
             "Owned changed paths below are capped at 40 per target; the count gives "

@@ -106,6 +106,40 @@ def turn_request(value, *, tools_enabled, response_schema=None):
     )
 
 
+def test_wire_evidence_handles_round_trip_prose_tool_arguments_and_full_id_fallback():
+    first = "evidence:" + "ab" * 32
+    second = first[:-1] + "a"  # Identical short digest prefix.
+    messages = []
+    warnings = []
+
+    def transport(_base_url, _api_format, payload, *_args, **_kwargs):
+        packet = json.loads(payload["messages"][-1]["content"])
+        messages.append(packet)
+        handle, other = packet["ids"]
+        assert first not in json.dumps(payload) and second not in json.dumps(payload)
+        assert handle.startswith("E-") and len(handle) < 24
+        assert handle != other and packet["narrative"] == f"cite {handle}"
+        response = stop_response(json.dumps({"evidence_ids": [handle, second, "E-ZZZZZZZZ"]}))
+        response["choices"][0]["message"]["tool_calls"] = [{
+            "id": "call-1", "type": "function",
+            "function": {"name": "read_compacted_evidence", "arguments": json.dumps({"evidence_id": other})},
+        }]
+        return response
+
+    gateway = OpenAIModelGateway(base_url="http://model/v1", api_key="", default_model="model",
+        transport=transport, evidence_handle_logger=warnings.append)
+    value = conversation(json.dumps({"ids": [first, second], "narrative": f"cite {first}"}))
+    request = turn_request(value, tools_enabled=True)
+    for role in ("specialist", "boundary_evaluator"):
+        result = gateway.complete(replace(request, role=role))
+        assert json.loads(result.content)["evidence_ids"] == [first, second, "E-ZZZZZZZZ"]
+        assert json.loads(result.tool_calls[0]["arguments"])["evidence_id"] == second
+        assert result.request_diagnostics["canonical_evidence_ids_returned"] == 1
+    assert messages[0] == messages[1]
+    assert len(warnings) == 2 and all(second not in item for item in warnings)
+    assert first in value.events[-1]["content"]
+
+
 def test_rendered_request_bytes_matches_compact_wire_payload_for_tools():
     value = conversation("inspect the change")
     value.tool_schemas = [{

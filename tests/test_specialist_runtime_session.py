@@ -295,6 +295,38 @@ def test_compacted_evidence_reader_is_strict_and_deduplicated():
     assert "not marked as compacted" in session.conversation.events[-1]["content"]
 
 
+@pytest.mark.parametrize("budget,single_page", [(12_000, True), (3_000, False)])
+def test_compacted_evidence_uses_normal_result_budget(budget, single_page):
+    session = make_session(ScriptedGateway([]), max_tool_result_bytes=budget)
+    record = session.evidence_store.add_tool_result(
+        session_id=session.session_id, tool="read_file", arguments={"path": "a.py"},
+        result={"status": "ok", "content": ('é"\\' * 1_040) + ("tail" * 260)},
+    )
+    session._compacted_evidence[record.id] = record
+    offset = 0
+    recovered = ""
+    for index in range(4):
+        call = {
+            "id": f"page-{index}", "name": COMPACTED_EVIDENCE_TOOL_NAME,
+            "arguments": json.dumps({
+                "evidence_id": record.id, "target": "OB-code",
+                "purpose": "obligation_resolution", "offset": offset,
+            }),
+        }
+        assert session._execute_calls((call,))
+        body = session.conversation.events[-1]["content"]
+        assert len(body.encode("utf-8")) <= budget
+        page = json.loads(body)
+        assert page["offset"] == offset
+        recovered += page["content"]
+        offset = page["next_offset"]
+        if offset is None:
+            break
+        assert offset == len(recovered)
+    assert recovered == record.content
+    assert (index == 0) == single_page
+
+
 def test_compacted_evidence_pages_make_progress_without_replaying_delivered_ranges():
     session = make_session(ScriptedGateway([]))
     record = session.evidence_store.add_tool_result(
@@ -317,7 +349,7 @@ def test_compacted_evidence_pages_make_progress_without_replaying_delivered_rang
     assert progressed
     assert first["content"] == record.content[:4_000]
     assert first["next_offset"] == 4_000
-    progressed, second = read(first["next_offset"], 6_000)
+    progressed, second = read(first["next_offset"])
     assert progressed
     assert second["content"] == record.content[4_000:8_000]
     assert second["next_offset"] == 8_000
@@ -385,7 +417,7 @@ def test_exploration_continues_through_fresh_compacted_pages_and_one_duplicate()
     gateway.responses = [
         tool_call_response(COMPACTED_EVIDENCE_TOOL_NAME, {
             "evidence_id": record.id, "target": "OB-code",
-            "purpose": "obligation_resolution", "offset": offset,
+            "purpose": "obligation_resolution", "offset": offset, "limit": 4_000,
         }, call_id=f"page-{index}")
         for index, offset in enumerate((0, 4_000, 4_000))
     ] + [checkpoint_response(inspected=["a.py"], unresolved=["OB-tests"])]
@@ -1414,7 +1446,8 @@ def test_review_threads_are_hidden_until_explicitly_assigned():
     assert "review_thread_state" in session._cumulative_checkpoint_payload()["latest_checkpoint"]
 
 
-def test_historical_retrieval_only_opens_shared_evidence_for_current_thread():
+@pytest.mark.parametrize("via_anchor", [False, True])
+def test_historical_retrieval_only_opens_shared_evidence_for_current_thread(via_anchor):
     from pr_reviewer.specialist_runtime.evidence import EvidenceProvenance
 
     session = make_session([], repository_head_sha="a" * 40)
@@ -1428,9 +1461,13 @@ def test_historical_retrieval_only_opens_shared_evidence_for_current_thread():
     shared = retain("a.py", "relevant current source")
     unrelated = retain("secret.py", "unrelated history")
     session._compacted_evidence[unrelated.id] = unrelated
-    session.apply_review_thread_feedback((
-        {"target": "H1", "path": "a.py"}, {"target": "H2", "path": "a.py"},
-    ), ({"candidate_id": "candidate:reference:C1", "evidence_ids": [shared.id]},))
+    current = {"target": "H1", "path": "a.py"}
+    candidates = ()
+    if via_anchor:
+        current["anchor_evidence"] = [{"evidence_id": shared.id, "excerpt": "relevant current source"}]
+    else:
+        candidates = ({"candidate_id": "candidate:reference:C1", "evidence_ids": [shared.id]},)
+    session.apply_review_thread_feedback((current, {"target": "H2", "path": "a.py"}), candidates)
 
     def retrieve(target, evidence_id):
         return session._read_compacted_evidence({
@@ -1561,7 +1598,7 @@ def make_session(
     recovery_max_tokens=None, clock=time.monotonic, test_results=(),
     tool_schemas=None, delegated_summary_max_tokens=None,
     delegated_summary_max_source_bytes=None, max_tool_result_bytes=12_000,
-    repository_head_sha="",
+    repository_head_sha="", pr_changed_files=None,
 ):
     obligations = obligations or (
         CoverageObligation(
@@ -1609,8 +1646,21 @@ def make_session(
         test_results_repository="owner/repository",
         test_results_head_sha="b" * 40,
         repository_head_sha=repository_head_sha,
+        pr_changed_files=pr_changed_files,
         clock=clock,
     )
+
+
+@pytest.mark.parametrize("inventory,expected", [(("other.py",), True), ((), False), (None, None)])
+def test_read_change_status_uses_full_pr_inventory(inventory, expected):
+    session = make_session(
+        ScriptedGateway([]), pr_changed_files=inventory,
+        execute_tool=lambda *_: {"status": "ok", "result": {"content": "partial line",
+            "range": {"offset": 1, "lines": 1, "truncated": True}}},
+    )
+    session._execute_calls(({"id": "call", "name": "read_file", "arguments": '{"path":"other.py"}'},))
+    result = json.loads(session.conversation.events[-1]["content"])
+    assert result["changed"] is expected
 
 
 def make_component_group_session(gateway):
@@ -5341,6 +5391,44 @@ def test_checkpoint_partially_accepts_obligations_and_repairs_only_rejections():
     assert "O2" in receipt and "blocked" in receipt
 
 
+def test_boundary_checkpoint_repairs_only_citations_without_reinvestigation():
+    from pr_reviewer.specialist_runtime.evidence import EvidenceProvenance
+
+    gateway = ScriptedGateway([])
+    head = "a" * 40
+    obligation = CoverageObligation("OB-api", "boundary-participant", "consumer",
+        required_evidence_categories=("tool-result",), boundary_id="api",
+        participant_id="consumer", boundary_endpoint_paths=("a.py",), seed_hints=("a.py",))
+    session = make_session(gateway, repository_head_sha=head, obligations=(obligation,),
+        assignment=SpecialistAssignment("api", "Check consumer behavior", primary_obligation_ids=(obligation.id,)))
+    good = session.evidence_store.add_tool_result(session_id="S1", tool="read_file",
+        arguments={"path": "a.py"}, result={"status": "ok", "content": "accept(request.id)"},
+        provenance=EvidenceProvenance(head_sha=head))
+    bad = session.evidence_store.add_tool_result(session_id="S1", tool="read_file",
+        arguments={"path": "a.py", "limit": 100}, result={"status": "ok", "content": "partial", "truncated": True},
+        provenance=EvidenceProvenance(head_sha=head))
+    reason = "The consumer still accepts the request identity."
+    gateway.responses = [
+        checkpoint_response(inspected=[], unresolved=[], obligation_updates=[{
+            "target": "O1", "disposition": "covered", "reason": reason, "evidence_ids": [bad.id],
+            "next_actions": [],
+        }]),
+        invalid_response(json.dumps({
+            "unresolved": [], "candidate_updates": [], "new_candidates": [],
+            "obligation_updates": [{"target": "O1", "evidence_ids": [good.id]}],
+        })),
+    ]
+
+    result = session.request_checkpoint("controller-request")
+
+    assert len(gateway.requests) == 2
+    prompt = json.loads(gateway.requests[1].messages)[-1]["content"]
+    assert bad.id in prompt and good.id in prompt
+    assessment, = result.checkpoint.obligation_assessments
+    assert assessment.disposition.value == "covered"
+    assert assessment.reason == reason and assessment.evidence_ids == (good.id,)
+
+
 def test_focused_unresolved_correction_preserves_existing_coverage_and_scope():
     session = make_session(ScriptedGateway([]))
     session._execute_calls(({
@@ -6120,7 +6208,7 @@ def test_checkpoint_requests_explain_candidate_and_evidence_retention_contract()
         assert "candidate_findings" not in prompt
         assert "new_candidates" in prompt
         assert "candidate_finding_ids" not in prompt
-        assert "exact retained evidence IDs" in prompt
+        assert "short retained evidence handles exactly as shown" in prompt
         assert "repository paths are not evidence IDs" in prompt
 
 
@@ -8186,6 +8274,34 @@ def test_actual_token_overflow_remains_charged_without_retry():
     assert session.budget.snapshot().model_turns == 1
     assert session.budget.snapshot().output_tokens == 5
     assert len(gateway.requests) == 1
+
+
+@pytest.mark.parametrize(("tools", "expected"), [
+    (("web_search", "web_fetch", "read_remote_file"), ("web_search", "web_fetch", "read_remote_file", DELEGATE_TOOL_SUMMARY_NAME)),
+    (("read_remote_file",), ("read_remote_file", DELEGATE_TOOL_SUMMARY_NAME)),
+    (("read_file",), ()),
+])
+def test_followup_source_reminder_only_suggests_available_external_tools(tools, expected):
+    session = make_session(
+        ScriptedGateway([]),
+        tool_schemas=[{"name": name, "parameters": {"type": "object", "properties": {}}}
+                      for name in tools],
+    )
+    assert session.obligation_assessments.propose(
+        target="O2", disposition="unresolved", reason="Need the documented input behavior.",
+        assessed_paths=(), omitted_paths=(), evidence_ids=(),
+        next_actions=("Check the upstream input contract.",),
+        evidence=session.evidence_store.snapshot(), eligible=lambda *_: True,
+    ).accepted
+    assignment = json.loads(session.conversation.events[0]["content"].split("\n", 1)[1])
+    session.apply_coverage_feedback(["OB-tests"])
+
+    feedback = session.conversation.events[-1]["content"]
+    scope = session._current_continuation_scope()
+    for prompt in (assignment.get("followup_source_reminder", ""), feedback, scope):
+        assert ("prefer a focused lookup" in prompt) == bool(expected)
+        for name in ("web_search", "web_fetch", "read_remote_file", DELEGATE_TOOL_SUMMARY_NAME):
+            assert (name in prompt) == (name in expected)
 
 
 def test_coverage_feedback_resumes_same_conversation_and_budget():

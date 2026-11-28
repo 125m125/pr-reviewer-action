@@ -408,6 +408,26 @@ def test_lead_scope_distinguishes_unchanged_supporting_sources(changed_files, ex
         assert action.session_id == "S1"
 
 
+def test_historical_owner_with_anchor_evidence_is_preferred_when_feasible():
+    lead = InvestigationLead(
+        lead_id="review-thread:H1", summary="Check the guard.", affected_paths=("redact.py",),
+        evidence_ids=("evidence:anchor",), next_action="Check current source.",
+        required_capability="repository", origin_session_id="S1", kind="review_thread",
+    )
+    owner = SessionResources("S1", 8, 100, 8, advertised_tools=("read_file",), allowed_diff_paths=("redact.py",))
+    alternative = replace(owner, session_id="S2")
+    state = state_for(covered=("OB1", "OB2"), resources=(owner, alternative),
+                      max_sessions=4, investigation_leads=(lead,))
+    target, = compact_negotiation_context(state)["targets"]
+    assert target["allowed_actions"] == ("resume", "record_unknown")
+    assert fallback_next_action(state).session_id == "S1"
+
+    fallback = replace(state, session_resources=(replace(owner, remaining_model_turns=0), alternative))
+    target, = compact_negotiation_context(fallback)["targets"]
+    assert "consult" in target["allowed_actions"]
+    assert fallback_next_action(fallback).session_id == "S2"
+
+
 def test_historical_consult_skips_unrelated_history_when_repaired_path_leaves_diff():
     lead = InvestigationLead(
         lead_id="review-thread:H3", summary="Verify the repaired publisher.",

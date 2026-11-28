@@ -41,6 +41,47 @@ def test_resolution_requires_current_complete_relevant_source(head, path, trunca
     assert result["status"] == "rejected"
 
 
+@pytest.mark.parametrize(("case", "expected"), [
+    ("code_and_docs", "accepted"), ("docs_only", "rejected"), ("docs_only_update", "rejected"),
+    ("truncated_docs", "rejected"), ("stale_docs", "rejected"),
+    ("unclassified_docs", "rejected"), ("search_result", "rejected"),
+])
+def test_official_documentation_is_supplemental_to_current_head_code(case, expected):
+    from dataclasses import asdict
+    import time
+
+    store = EvidenceStore()
+    code = evidence(store)
+    provenance = EvidenceProvenance(
+        policy_hash="policy", policy_rule_id="docs",
+        source_classification="reference" if case == "unclassified_docs" else "official-platform-documentation",
+        final_url="https://docs.example.org/reference",
+        retrieved_at=time.time() - (7200 if case == "stale_docs" else 0),
+        max_age_hours=1,
+    )
+    doc = store.add_tool_result(
+        session_id="S1",
+        tool="web_search" if case == "search_result" else "web_fetch_search_result",
+        arguments={"url": "https://docs.example.org/reference"},
+        result={"status": "ok", "result": {
+            "kind": "external_evidence",
+            "content": "The platform skips comparisons on deletions.",
+            "truncated": case == "truncated_docs",
+            "provenance": asdict(provenance),
+        }},
+    )
+    ledger = ReviewThreadLedger([thread()], head_sha="a" * 40)
+    citations = [doc.id] if case.startswith("docs_only") else [code.id, doc.id]
+    outcome = ledger.assess(dict(target="H1",
+                                 assessment="unverified" if case == "docs_only_update" else "still_present",
+                                 reason="The current code matches the documented behavior.",
+                                 update="The docs explain the behavior." if case == "docs_only_update" else "",
+                                 evidence_ids=citations), store)
+    assert outcome["status"] == expected
+    if case.startswith("docs_only"):
+        assert "requires current-head source evidence" in outcome["reason"]
+
+
 def test_valid_assessment_is_durable_and_preserves_controller_identity():
     store = EvidenceStore()
     record = evidence(store)

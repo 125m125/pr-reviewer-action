@@ -353,6 +353,7 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             "handle": f"U{index}",
             "risk_tier": item.risk_tier,
             "subject": item.subject,
+            **({"boundary_change_scope": item.boundary_change_scope} if item.boundary_change_scope else {}),
             "summary": (
                 assessment.reason if assessment is not None and assessment.reason else
                 checkpoint_summary or
@@ -369,6 +370,10 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
                 if request.obligation_id == item.id
             ),
         })
+    boundary_scopes = {
+        f"boundary:{item.boundary_id}": item.boundary_change_scope
+        for item in state.obligations if item.evaluator_owned and item.boundary_change_scope
+    }
     reserved_delegations = _reserved_delegation_lead_ids(state)
     for index, lead in enumerate(_negotiable_leads(state), start=1):
         allowed_actions = ["record_unknown"]
@@ -383,9 +388,11 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
         else:
             capable_sessions = _capable_lead_sessions(lead, state)
             origin = lead.assigned_session_id or lead.origin_session_id
+            prefer_owner = (lead.kind == "review_thread" and not lead.attempt_count and bool(lead.evidence_ids)
+                            and origin == lead.origin_session_id and origin in capable_sessions)
             if origin in capable_sessions:
                 allowed_actions.insert(0, "resume")
-            if any(session_id != origin for session_id in capable_sessions):
+            if not prefer_owner and any(session_id != origin for session_id in capable_sessions):
                 allowed_actions.insert(0, "consult")
             required_tools = _lead_required_tools(lead)
             # A fresh assignment can authorize the lead's paths even when no
@@ -395,7 +402,7 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
                 for resource in state.session_resources
             )
             if (
-                capability_available
+                not prefer_owner and capability_available
                 and state.current_session_count < state.max_sessions
                 and state.followup_sessions_started < state.max_followup_sessions
                 and state.new_session_turns_remaining > 0
@@ -408,6 +415,7 @@ def compact_negotiation_context(state: NegotiationState) -> dict[str, object]:
             "risk_tier": "normal",
             "subject": lead.affected_paths[0] if lead.affected_paths else "investigation lead",
             "summary": lead.summary,
+            **({"boundary_change_scope": boundary_scopes[lead.lead_id]} if lead.lead_id in boundary_scopes else {}),
             "allowed_actions": tuple(dict.fromkeys(allowed_actions)),
             "last_conclusion": lead.resolution_reason or lead.last_outcome,
             "attempt_count": lead.attempt_count,
@@ -572,7 +580,8 @@ def _negotiable_leads(state: NegotiationState) -> tuple[InvestigationLead, ...]:
                 InvestigationLeadStatus.SCHEDULED,
             }
         ),
-        key=lambda item: item.lead_id,
+        # Historical leads are queued in relevance order by the controller.
+        key=lambda item: (item.kind == "review_thread", "" if item.kind == "review_thread" else item.lead_id),
     ))
 
 

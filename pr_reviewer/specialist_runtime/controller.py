@@ -87,6 +87,10 @@ def _critic_anchor_excerpt(record, location: str, max_bytes: int = 1200) -> str 
 from pr_reviewer.specialists import classify_file_roles
 from .adjudication import (
     merge_accepted_findings,
+    merge_evidence_options,
+    merge_rejection,
+    normalize_merge_basis,
+    _added_diff_lines_by_path,
     AcceptedFinding,
     AdjudicatedReview,
     ReviewHandoffContext,
@@ -109,7 +113,9 @@ from .assignments import (
     validate_assignment_plan,
 )
 from .budget import BudgetExhausted, BudgetLedger, RunDeadline, SessionLease
-from .boundary_evaluation import build_boundary_context, validate_boundary_evaluation, BoundaryEvaluation
+from .boundary_evaluation import (
+    build_boundary_context, validate_boundary_evaluation, BoundaryCitationError, BoundaryEvaluation,
+)
 from .callbacks import (
     CALLBACK_POOL,
     CallbackTimedOut,
@@ -780,11 +786,11 @@ def _critic_rows(value: object) -> tuple[Mapping[str, object], ...]:
 def _partial_critic_result(
     value: object,
     candidates: Iterable[CandidateFinding],
-) -> tuple[tuple[Mapping[str, str], ...], tuple[str, ...]]:
+) -> tuple[tuple[Mapping[str, object], ...], tuple[str, ...]]:
     """Keep valid rows and identify candidate IDs needing a bounded repair."""
     allowed = {item.candidate_id for item in candidates}
     seen: set[str] = set()
-    rows: list[Mapping[str, str]] = []
+    rows: list[Mapping[str, object]] = []
     for row in _critic_rows(value):
         candidate_id = str(row.get("candidate_id") or "").strip()
         action = str(row.get("action") or "").strip().lower()
@@ -799,10 +805,12 @@ def _partial_critic_result(
         elif target_id:
             continue
         seen.add(candidate_id)
+        basis = normalize_merge_basis(row.get("merge_basis")) if action == "merge" else {}
         rows.append({
             "candidate_id": candidate_id,
             "action": action,
             "target_id": target_id,
+            **({"merge_basis": basis} if basis else {}),
             **({"review_thread": dict(row["review_thread"])} if isinstance(row.get("review_thread"), Mapping) else {}),
         })
     return tuple(rows), tuple(sorted(allowed - seen))
@@ -989,13 +997,12 @@ def _validated_critic_result(
         elif target_id:
             raise ValueError("critic target_id is only valid for merge")
         seen.add(candidate_id)
-        # Models commonly add rationale/evidence fields despite the compact
-        # decision schema.  Those fields cannot change adjudication and are
-        # intentionally ignored; only the validated decision is admitted.
+        basis = normalize_merge_basis(row.get("merge_basis")) if action == "merge" else {}
         admitted.append({
             "candidate_id": candidate_id,
             "action": action,
             "target_id": target_id,
+            **({"merge_basis": basis} if basis else {}),
             **({"review_thread": dict(row["review_thread"])} if isinstance(row.get("review_thread"), Mapping) else {}),
         })
     if seen != allowed_ids:
@@ -1147,6 +1154,7 @@ class GatewayRoleAdapter:
                 before_attempt(attempt)
             turn_request = ModelTurnRequest(
                 role=request.role,
+                request_id=request.request_id,
                 conversation=conversation,
                 max_tokens=(
                     min(request.max_tokens, 2_048)
@@ -1318,6 +1326,7 @@ class ReviewInputs:
     pr_metadata: Mapping[str, Any] = field(default_factory=dict)
     configuration_warnings: tuple[str, ...] = ()
     adapter_configuration: Mapping[str, Any] = field(default_factory=dict)
+    load_closed_thread_objections: Callable[[tuple[str, ...]], Sequence[Mapping[str, Any]]] | None = None
 
 
 def _change_components(
@@ -1956,6 +1965,7 @@ def _json_value(value: object) -> object:
         return {
             item.name: _json_value(getattr(value, item.name))
             for item in fields(value)
+            if not (item.metadata.get("omit_none") and getattr(value, item.name) is None)
         }
     return str(value)
 
@@ -3824,6 +3834,17 @@ class ReviewController:
                 boundary, assessments, state.evidence.snapshot(),
                 max_bytes=getattr(self.boundary_evaluator, "max_context_bytes", None) or 60_000,
                 obligations=locals_by_id, expected_head_sha=state.inputs.head_sha,
+                change_scope=combined.boundary_change_scope,
+                unaffected_diff_paths={
+                    item.participant_id: item.boundary_unaffected_diff_paths
+                    for item in state.obligations if item.id in locals_by_id
+                },
+                contract_unchanged=not any(
+                    fnmatch.fnmatchcase(path, pattern)
+                    for path in (*state.inputs.changed_files,
+                                 *state.inputs.topology.get("changed_original_paths", ()))
+                    for pattern in boundary.contract_paths
+                ),
             )
             previous = state.boundary_evaluations.get(boundary.id)
             if previous is not None and previous.input_fingerprint == context["input_fingerprint"]:
@@ -3831,6 +3852,7 @@ class ReviewController:
             state.coverage.record_boundary_result(combined.id, (), supported=False)
             outcome = None
             error = ""
+            citation_error = None
             if context["incomplete"]:
                 error = "; ".join(context["diagnostics"])
             elif self.boundary_evaluator is None:
@@ -3869,6 +3891,7 @@ class ReviewController:
                         if is_model_endpoint_unavailable(exc):
                             raise
                         error = _bounded_error(exc)
+                        citation_error = exc if isinstance(exc, BoundaryCitationError) else None
                         if attempts_left == previous_attempts_left:
                             attempts_left -= 1  # A pre-send rejection still consumes this recovery opportunity.
                         state.journal.emit("boundary_evaluation_rejected", {"boundary_id": boundary.id, "reason": error, "attempts_remaining": attempts_left})
@@ -3879,14 +3902,34 @@ class ReviewController:
                         )
                         if not phase_open or self._remaining_global_budget(state)[0] <= 0:
                             break
-                        request_context = {**context, "repair": {"reason": error, "instruction": "Correct only the boundary evaluation JSON using supplied source evidence."}}
+                        repair = {"reason": error, "instruction": "Correct only the boundary evaluation JSON using supplied source evidence."}
+                        if citation_error is not None:
+                            repair.update({
+                                "missing_groups": citation_error.missing_groups,
+                                "allowed_handles": citation_error.allowed_handles,
+                                "instruction": (
+                                    "Return the boundary evaluation JSON. Correct the evidence_ids, including one "
+                                    "eligible handle for each required group. Keep valid citations for other groups. "
+                                    "Do not change the conclusion unless the evidence warrants it."
+                                ),
+                            })
+                        request_context = {**context, "repair": repair}
             if outcome is None:
+                citation_repair_exhausted = citation_error is not None and not context["incomplete"]
+                if citation_repair_exhausted:
+                    state.journal.emit("boundary_evaluation_citation_repair_exhausted", {
+                        "boundary_id": boundary.id, "reason": error, "missing_groups": citation_error.missing_groups,
+                    })
                 outcome = BoundaryEvaluation(
                     boundary.id, context["input_fingerprint"], "insufficient_evidence",
                     error or "boundary comparison did not complete", (),
                     missing_fact=error or "compatible participant behavior is not established",
-                    suggested_investigation=context.get("suggested_investigation") or f"Investigate {error or boundary.objective}.",
-                    followup_kind="repository_evidence",
+                    suggested_investigation=(
+                        "" if context["configuration_only_gap"] or citation_repair_exhausted else
+                        context.get("suggested_investigation") or f"Investigate {error or boundary.objective}."
+                    ),
+                    followup_kind=("maintainer_decision" if context["configuration_only_gap"] else
+                                   "none" if citation_repair_exhausted else "repository_evidence"),
                 )
             state.boundary_evaluations[boundary.id] = outcome
             supported = outcome.outcome == "supported"
@@ -3923,6 +3966,12 @@ class ReviewController:
                         "reason": "same closed evidence question",
                     })
                     continue
+                prior_outcome = old_lead.last_outcome if old_lead else ""
+                if (old_lead is not None and old_lead.status is InvestigationLeadStatus.RESOLVED_NO_ISSUE
+                        and old_lead.resolution_reason):
+                    prior_outcome = mask_runtime_text(
+                        "Prior hypothesis ruled out: " + old_lead.resolution_reason, limit=1_000,
+                    )
                 state.investigation_leads[lead_id] = InvestigationLead(
                     lead_id=lead_id,
                     summary=(
@@ -3940,7 +3989,7 @@ class ReviewController:
                     required_capability="repository", origin_session_id="boundary-evaluator",
                     attempt_count=old_lead.attempt_count if old_lead else 0,
                     last_evidence_delta=old_lead.last_evidence_delta if old_lead else 0,
-                    last_outcome=old_lead.last_outcome if old_lead else "",
+                    last_outcome=prior_outcome,
                 )
 
     def _refresh_boundary_coverage(
@@ -4046,6 +4095,20 @@ class ReviewController:
             float(state.inputs.config.model_request_timeout_sec),
             max(1.0, median(durations) if durations else 60.0),
         )
+        # Earlier follow-ups can collect a useful anchor after the thread was queued.
+        evidence = state.evidence.snapshot()
+        threads = {f"review-thread:{thread['target']}": thread for thread in state.inputs.review_threads}
+        leads = tuple(
+            replace(lead, evidence_ids=tuple(
+                record.id for record, _ in self._historical_anchor_evidence(
+                    threads[lead.lead_id], evidence, state.inputs.head_sha, owner=lead.origin_session_id,
+                )
+            ))
+            if (lead.kind == "review_thread" and lead.origin_session_id
+                and lead.status is InvestigationLeadStatus.OPEN and not lead.attempt_count
+                and lead.lead_id in threads) else lead
+            for lead in state.investigation_leads.values()
+        )
         return NegotiationState(
             source_access_requests=tuple(state.source_requests),
             obligations=state.obligations,
@@ -4082,10 +4145,7 @@ class ReviewController:
             ),
             excluded_obligation_ids=tuple(sorted(set(excluded_obligation_ids))),
             changed_files=state.inputs.changed_files,
-            investigation_leads=tuple(
-                state.investigation_leads[key]
-                for key in sorted(state.investigation_leads)
-            ),
+            investigation_leads=leads,
         )
 
     def _negotiate(
@@ -4232,7 +4292,31 @@ class ReviewController:
 
     def _queue_review_threads(self, state: _RunState) -> None:
         """Optional leads only after independent exploration, never hard obligations."""
-        for snapshot in state.inputs.review_threads:
+        candidate_lines: dict[str, set[int]] = {}
+        evidence_paths = set()
+        for candidate in (*state.inputs.candidate_findings, *state.candidate_occurrences.values()):
+            path, _, line = candidate.affected_location.partition(":")
+            lines = candidate_lines.setdefault(path, set())
+            if line.isascii() and line.isdecimal():
+                lines.add(int(line))
+            for evidence_id in candidate.supporting_evidence_ids:
+                record = state.evidence.lookup_canonical(evidence_id)
+                if (record is not None and record.source_path and record.is_usable_for_coverage
+                        and not record.truncated and record.provenance.head_sha == state.inputs.head_sha):
+                    evidence_paths.add(record.source_path)
+
+        def signals(snapshot):
+            path, line = snapshot["path"], snapshot.get("line")
+            nearby = isinstance(line, int) and any(abs(line - other) <= 8 for other in candidate_lines.get(path, ()))
+            return (
+                (nearby, "near a current candidate"),
+                (snapshot.get("previously_reported_fixed"), "previously reported fixed; check for recurrence"),
+                (snapshot.get("has_human_objection"), "human disputed the earlier claim"),
+                (not nearby and path in candidate_lines, "same file as a current candidate"),
+                (path in evidence_paths, "current candidate cites evidence from this file"),
+            )
+
+        for snapshot in sorted(state.inputs.review_threads, key=lambda row: tuple(not applies for applies, _ in signals(row))):
             if snapshot.get("prior_assessment") in {"still_present", "fixed", "disproven"}:
                 state.journal.emit("review_thread_reassessment_reused", {"target": snapshot["target"]})
                 continue
@@ -4245,8 +4329,12 @@ class ReviewController:
             owners = [assignment for assignment in owners if assignment.owner_component_id] or owners
             owner = owners[0] if len(owners) == 1 else None
             session_id = state.assignment_sessions.get(owner.id, "") if owner else ""
+            reasons = [reason for applies, reason in signals(snapshot) if applies]
+            summary = f"Reassess unresolved review discussion {target} on {path}"
+            if reasons:
+                summary += " (" + "; ".join(reasons) + ")"
             state.investigation_leads[lead_id] = InvestigationLead(
-                lead_id=lead_id, summary=f"Reassess unresolved review discussion {target} on {path}",
+                lead_id=lead_id, summary=summary,
                 affected_paths=(path,), evidence_ids=(),
                 next_action=(f"Independently verify discussion {target} against current code; "
                              "reuse current candidate evidence where relevant. Use assess_review_thread, "
@@ -4268,6 +4356,29 @@ class ReviewController:
         )
         return (lead, *tuple(peers)[:2])
 
+    @staticmethod
+    def _historical_anchor_evidence(thread, evidence, head_sha, *, owner=""):
+        line, path = thread.get("line"), thread["path"]
+        if (thread.get("side") != "RIGHT" or type(line) is not int or line <= 0
+                or thread.get("head_sha") != head_sha):
+            return []
+        found = []
+        for record in evidence.records:
+            if (record.source_path != path or record.provenance.head_sha != head_sha
+                    or record.truncated or not record.is_usable_for_coverage
+                    or record.tool not in {"read_file", "read_pr_diff"}
+                    or (owner and owner != record.collector_session_id and owner not in record.imported_by)):
+                continue
+            if record.tool == "read_file":
+                bounds = record.source_range or {}
+                start, lines = bounds.get("offset"), bounds.get("lines")
+                if type(start) is not int or type(lines) is not int or not start <= line < start + lines:
+                    continue
+            excerpt = _critic_anchor_excerpt(record, f"{path}:{line}")
+            if excerpt:
+                found.append((record, excerpt))
+        return sorted(found, key=lambda item: (len(item[0].content), item[0].id))[:2]
+
     def _review_thread_feedback(self, state, leads):
         by_target = {item["target"]: item for item in state.inputs.review_threads}
         snapshots = tuple(
@@ -4279,6 +4390,20 @@ class ReviewController:
         path = snapshots[0]["path"]
         candidates = []
         evidence_ids = set()
+        available_evidence = state.evidence.snapshot()
+        projected = []
+        for snapshot in snapshots:
+            anchor_evidence = self._historical_anchor_evidence(
+                snapshot, available_evidence, state.inputs.head_sha,
+            )
+            evidence_ids.update(record.id for record, _ in anchor_evidence)
+            projected.append({
+                **snapshot,
+                "anchor_evidence": [
+                    {"evidence_id": record.id, "tool": record.tool, "excerpt": excerpt}
+                    for record, excerpt in anchor_evidence
+                ],
+            })
         active = {session_id: set(result.checkpoint.candidate_finding_ids)
                   for (_, session_id), result in state.session_results.items() if result.checkpoint}
         for candidate in (*state.candidate_occurrences.values(), *state.inputs.candidate_findings):
@@ -4293,9 +4418,9 @@ class ReviewController:
                                "status": "provisional", "evidence_ids": ids})
             if len(candidates) == 6:
                 break
-        evidence = EvidenceSnapshot(tuple(record for record in state.evidence.snapshot().records
+        evidence = EvidenceSnapshot(tuple(record for record in available_evidence.records
                                            if record.id in evidence_ids))
-        return snapshots, tuple(candidates), evidence
+        return tuple(projected), tuple(candidates), evidence
 
     def _followup_prior_work(
         self, state: _RunState, assignment: Assignment, lead: InvestigationLead,
@@ -4350,10 +4475,16 @@ class ReviewController:
             evidence_ids.extend(candidates[-1]["evidence_ids"])
             if len(candidates) == 6:
                 break
-        latest = {}
-        for _revision, _owner, assessment in self._accepted_checkpoint_assessments(state):
-            if assessment.obligation_id in obligation_ids:
-                latest[assessment.obligation_id] = assessment
+        boundary_id = lead.lead_id.removeprefix("boundary:") if lead.lead_id.startswith("boundary:") else ""
+        assessment_ids = ({
+            item.id for item in state.obligations
+            if item.boundary_id == boundary_id and item.participant_id
+        } if boundary_id else obligation_ids)
+        latest = {
+            assessment.obligation_id: assessment
+            for _revision, _owner, assessment in self._accepted_checkpoint_assessments(state)
+            if assessment.obligation_id in assessment_ids
+        }
         assessments = []
         for assessment in tuple(latest.values())[:8]:
             assessments.append({
@@ -4361,7 +4492,14 @@ class ReviewController:
                 "disposition": assessment.disposition.value,
                 "reason": mask_runtime_text(assessment.reason, limit=600),
                 "evidence_ids": list(assessment.evidence_ids[:8]),
-                "next_actions": [mask_runtime_text(item, limit=300) for item in assessment.next_actions[:3]],
+                "next_actions": [
+                    mask_runtime_text(item, limit=300) for item in assessment.next_actions[:3]
+                    if not assessment.next_actions_consumed
+                ],
+                **({
+                    "assessed_paths": list(assessment.assessed_paths[:20]),
+                    "omitted_paths": list(assessment.omitted_paths[:20]),
+                } if boundary_id else {}),
             })
             evidence_ids.extend(assessment.evidence_ids[:8])
         sources = []
@@ -4377,16 +4515,18 @@ class ReviewController:
         retained_ids = {record.id for record in sources}
         for item in (*candidates, *assessments):
             item["evidence_ids"] = [value for value in item["evidence_ids"] if value in retained_ids]
-        evaluation = state.boundary_evaluations.get(lead.lead_id.removeprefix("boundary:"))
         return {
-            "missing_question": mask_runtime_text(
-                getattr(evaluation, "missing_fact", "") or lead.next_action, limit=1000,
-            ),
+            "missing_question": mask_runtime_text(lead.next_action, limit=1000),
+            **({"prior_hypothesis_resolution": lead.last_outcome}
+               if boundary_id and lead.last_outcome else {}),
             "semantics": (
-                "Prior candidates and assessments are unverified claims, not facts or coverage proof. "
+                "Prior candidates and assessment explanations are unverified claims, not facts or coverage proof. "
                 "You may contradict them. Answer only the missing question; do not restart the whole "
                 "investigation. Prior observations are not local candidate update or withdrawal targets. "
                 "Use retained source evidence to verify claims and avoid restating an existing defect."
+                + (" The dispositions and omitted paths reflect accepted coverage state. A prior hypothesis "
+                   "resolution does not close this coverage gap; do not recheck it without contradictory evidence."
+                   if boundary_id else "")
             ),
             "candidates": candidates,
             "assessments": assessments,
@@ -4821,10 +4961,19 @@ class ReviewController:
     def _critic_context_slice(context, candidates):
         ids = {item.candidate_id for item in candidates}
         obligation_ids = {oid for item in candidates for oid in item.related_obligation_ids}
+        def near_objection(candidate, objection):
+            path, _, line = candidate.affected_location.partition(":")
+            return path == objection["path"] and (
+                not line.isdigit() or abs(int(line) - objection["line"]) <= 8
+            )
         return {
             **context,
             "review_threads": tuple(item for item in context.get("review_threads", ())
                                     if any(candidate.affected_location.split(":", 1)[0] == item["path"] for candidate in candidates))[:8],
+            "closed_thread_objections": tuple(
+                item for item in context.get("closed_thread_objections", ())
+                if any(near_objection(candidate, item) for candidate in candidates)
+            )[:4],
             "candidates": tuple(candidates),
             "candidate_evidence": {key: value for key, value in context["candidate_evidence"].items()
                                    if key in ids},
@@ -4920,9 +5069,11 @@ class ReviewController:
                     and decision_bytes <= max(1, output_tokens - 256) * 3)
 
         batches, current = [], []
+        # Optional objections must not split an otherwise valid batch.
+        sizing_context = {**context, "closed_thread_objections": ()}
         for candidate in context["candidates"]:
             proposed = (*current, candidate)
-            if current and not fits(proposed, self._critic_context_slice(context, proposed)):
+            if current and not fits(proposed, self._critic_context_slice(sizing_context, proposed)):
                 batches.append(tuple(current))
                 current = []
             current.append(candidate)
@@ -4933,6 +5084,8 @@ class ReviewController:
             batch_context = self._critic_context_slice(context, candidates)
             # History is optional. Drop whole discussions before letting them
             # crowd out an otherwise reviewable candidate and its proof.
+            while batch_context["closed_thread_objections"] and self._critic_context_bytes(batch_context) > limit:
+                batch_context["closed_thread_objections"] = batch_context["closed_thread_objections"][:-1]
             while batch_context["review_threads"] and self._critic_context_bytes(batch_context) > limit:
                 batch_context["review_threads"] = batch_context["review_threads"][:-1]
             request_id = "critic:1" if len(batches) == 1 else f"critic:batch:{index}"
@@ -4955,15 +5108,15 @@ class ReviewController:
             })
         return {"actions": rows}, fallback_ids, len(batches)
 
-    def _deduplicate_critic_batches(self, state):
+    def _deduplicate_critic_batches(self, state, critic_context):
         if len(state.review.accepted) < 2:
             return
         context = {
             "critic_deduplication": {
                 "instruction": (
                     "These findings already passed substantive review and deterministic validation. "
-                    "Only identify duplicates with the same defect and consequence. Return "
-                    "{\"actions\":[{\"candidate_id\":\"source\",\"action\":\"merge\",\"target_id\":\"survivor\"}]}. "
+                    "Only identify duplicates addressed by one concrete fix. Return merge actions with candidate_id and target_id. "
+                    "For cross-file merges also return merge_basis with same_fix, source_evidence_id, and target_evidence_id. "
                     "Return an empty actions array if none are duplicates. Do not reject, downgrade, "
                     "promote, rewrite, or re-evaluate findings. Omit unchanged findings. "
                     "When uncertain, leave both findings unchanged."
@@ -4977,6 +5130,14 @@ class ReviewController:
                 "user_visible_consequence": item.user_visible_consequence,
             } for item in state.review.accepted),
         }
+        if len({item.affected_file for item in state.review.accepted}) > 1:
+            context["candidate_evidence"] = {
+                item.candidate_id: tuple({
+                    **{key: excerpt[key] for key in ("evidence_id", "path", "tool", "truncated")},
+                    "content_excerpt": excerpt["content_excerpt"][:400],
+                } for excerpt in critic_context["candidate_evidence"].get(item.candidate_id, ())[:4])
+                for item in state.review.accepted
+            }
         size = self._critic_context_bytes(context)
         limit = getattr(self.critic, "max_context_bytes", None) or 160_000
         # ponytail: one compact dedup pass; leave duplicates rather than launch
@@ -5025,6 +5186,13 @@ class ReviewController:
             fallback_candidate_ids.update(item.candidate_id for item in candidates)
         else:
             try:
+                closed_objections = ()
+                if state.inputs.load_closed_thread_objections is not None:
+                    try:
+                        locations = tuple(dict.fromkeys(candidate.affected_location for candidate in candidates))
+                        closed_objections = state.inputs.load_closed_thread_objections(locations)
+                    except Exception as exc:
+                        state.journal.emit("review_thread_objections_unavailable", {"reason": _bounded_error(exc)})
                 retained = {
                     record.id: record
                     for record in state.evidence.snapshot().records
@@ -5088,6 +5256,9 @@ class ReviewController:
                     "candidates": candidates,
                     "candidate_evidence": candidate_evidence,
                     "candidate_assessments": candidate_assessments,
+                    "closed_thread_objections": tuple({
+                        field: item[field] for field in ("path", "line", "prior_finding", "human_objection")
+                    } for item in closed_objections),
                     "review_threads": tuple({
                         "target": item["target"], "path": item["path"], "line": item.get("line"),
                         "origin": item["origin"], "discussion_complete": item.get("discussion_complete", False),
@@ -5128,30 +5299,56 @@ class ReviewController:
                 candidates, critic_result, state.evidence,
                 obligations=obligation_map, changed_files=state.inputs.changed_files,
             )
-            invalid_merge_ids = tuple(
-                item.candidate_id
+            rejected_by_id = {
+                item.candidate_id: item
                 for item in state.review.dispositions
                 if item.reason == "invalid-merge-target-kept"
-            )
+            }
+            eligible_targets = {}
             if (
-                invalid_merge_ids
+                rejected_by_id
                 and self.critic is not None
                 and critic_context is not None
             ):
-                invalid_id_set = set(invalid_merge_ids)
                 original_rows, _missing = _partial_critic_result(
                     critic_result, candidates,
                 )
                 original_by_id = {
                     item["candidate_id"]: item for item in original_rows
                 }
+                records = {item.id: item for item in state.evidence.snapshot().records}
+                added_lines = _added_diff_lines_by_path(records.values())
+                accepted = {item.candidate_id: item for item in state.review.accepted}
+                for candidate_id, rejected in rejected_by_id.items():
+                    source = accepted[candidate_id]
+                    targets = tuple(
+                        target.candidate_id for target in accepted.values()
+                        if original_by_id[target.candidate_id]["action"] == "keep"
+                        and (
+                            merge_rejection(source, target, added_lines, records, {}) is None
+                            or (target.candidate_id == rejected.target_id
+                                and source.affected_file != target.affected_file
+                                and merge_evidence_options(source, records)
+                                and merge_evidence_options(target, records))
+                        )
+                    )
+                    if targets:
+                        eligible_targets[candidate_id] = targets
+                if not eligible_targets:
+                    state.journal.emit("critic_merge_repair_skipped", {
+                        "reason": "no feasible independently kept merge target",
+                        "rejected_merges": tuple(_json_value(item) for item in rejected_by_id.values()),
+                    })
+            if eligible_targets:
+                invalid_merge_ids = tuple(eligible_targets)
+                invalid_id_set = set(invalid_merge_ids)
+                target_ids = {target for values in eligible_targets.values() for target in values}
+                rejected_merges = tuple({
+                    **original_by_id[item], "reason": rejected_by_id[item].merge_rejection,
+                } for item in invalid_merge_ids)
                 state.journal.emit("critic_merge_repair_requested", {
                     "invalid_candidate_ids": invalid_merge_ids,
-                    "rejected_merges": tuple(
-                        original_by_id[item]
-                        for item in invalid_merge_ids
-                        if item in original_by_id
-                    ),
+                    "rejected_merges": rejected_merges,
                 })
                 try:
                     repaired = self._model_request(
@@ -5170,28 +5367,25 @@ class ReviewController:
                                 candidate_id: critic_context[
                                     "candidate_evidence"
                                 ][candidate_id]
-                                for candidate_id in invalid_merge_ids
+                                for candidate_id in sorted(invalid_id_set | target_ids)
                             },
                             "candidate_assessments": {
                                 item: critic_context["candidate_assessments"][item]
                                 for item in invalid_merge_ids
                             },
-                            "eligible_merge_targets": tuple(
+                            "merge_target_findings": tuple(
                                 item for item in candidates
-                                if item.candidate_id not in invalid_id_set
+                                if item.candidate_id in target_ids
                             ),
+                            "eligible_merge_targets": eligible_targets,
                             "critic_merge_repair": {
                                 "invalid_candidate_ids": invalid_merge_ids,
-                                "rejected_merges": tuple(
-                                    original_by_id[item]
-                                    for item in invalid_merge_ids
-                                    if item in original_by_id
-                                ),
+                                "rejected_merges": rejected_merges,
                                 "instruction": (
                                     "The requested merges were not deterministically "
-                                    "compatible. Return one corrected action for each listed "
-                                    "candidate ID. Keep the candidate unless another listed "
-                                    "action is justified; merge only into an eligible target."
+                                    "compatible. For each listed source, return keep or merge "
+                                    "into a target listed for that source. For a cross-file "
+                                    "merge use merge_basis to connect the two findings."
                                 ),
                             },
                         },
@@ -5203,7 +5397,10 @@ class ReviewController:
                     repaired_by_id = {
                         item["candidate_id"]: item
                         for item in repaired_rows
-                        if item["candidate_id"] in invalid_id_set
+                        if item["candidate_id"] in invalid_id_set and (
+                            item["action"] == "keep" or (item["action"] == "merge" and
+                            item["target_id"] in eligible_targets[item["candidate_id"]])
+                        )
                     }
                     still_missing = tuple(
                         item for item in invalid_merge_ids
@@ -5229,7 +5426,14 @@ class ReviewController:
                         changed_files=state.inputs.changed_files,
                     )
                     state.journal.emit("critic_merge_repair_completed", {
-                        "repaired_candidate_ids": invalid_merge_ids,
+                        "merged_candidate_ids": tuple(
+                            item.candidate_id for item in state.review.dispositions
+                            if item.candidate_id in invalid_id_set and item.action == "merge"
+                        ),
+                        "retained_candidate_ids": tuple(
+                            item.candidate_id for item in state.review.dispositions
+                            if item.candidate_id in invalid_id_set and item.action == "keep"
+                        ),
                     })
                 except Exception as repair_exc:
                     state.journal.emit("critic_merge_repair_failed", {
@@ -5260,7 +5464,7 @@ class ReviewController:
                 ) for item in state.review.dispositions),
             )
         if critic_batch_count > 1:
-            self._deduplicate_critic_batches(state)
+            self._deduplicate_critic_batches(state, critic_context)
         snapshots = {item["target"]: item for item in state.inputs.review_threads}
         for row in _critic_rows(critic_result):
             association = row.get("review_thread")
@@ -7590,7 +7794,11 @@ class ReviewController:
                     state.investigation_leads[lead_id] = replace(
                         lead, attempt_count=lead.attempt_count + 1,
                         last_evidence_delta=len(evidence_ids),
-                        last_outcome=(lead.resolution_reason or conclusion) if lead.kind == "review_thread" else conclusion,
+                        last_outcome=(
+                            (lead.resolution_reason or conclusion) if lead.kind == "review_thread"
+                            else lead.last_outcome if lead_id.startswith("boundary:")
+                            else conclusion
+                        ),
                         evidence_ids=tuple(dict.fromkeys((*lead.evidence_ids, *evidence_ids))),
                     )
                     journal.emit("investigation_lead_followup_completed", {

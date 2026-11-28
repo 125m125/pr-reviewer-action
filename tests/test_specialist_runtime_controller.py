@@ -130,6 +130,71 @@ def test_historical_threads_are_optional_post_initial_leads(tmp_path):
     assert initial < queued
 
 
+def test_historical_feedback_shares_only_intact_current_head_anchor_evidence(tmp_path):
+    from pr_reviewer.specialist_runtime.evidence import EvidenceProvenance
+
+    inputs = _inputs(tmp_path)
+    thread = {"target": "H1", "path": "a.py", "line": 51, "side": "RIGHT", "head_sha": inputs.head_sha}
+    inputs = replace(inputs, review_threads=(thread,))
+    store = EvidenceStore()
+
+    def retain(offset, text, *, head_sha=inputs.head_sha, truncated=False):
+        return store.add_tool_result(
+            session_id="owner", tool="read_file", arguments={"path": "a.py", "offset": offset},
+            result={"status": "ok", "result": {"content": text, "range": {
+                "offset": offset, "lines": len(text.splitlines()), "truncated": truncated,
+            }}}, provenance=EvidenceProvenance(head_sha=head_sha),
+        )
+
+    keep = retain(50, "before\nanchor\nafter")
+    retain(10, "wrong location")
+    retain(51, "old content", head_sha="f" * 40)
+    retain(51, "clipped content", truncated=True)
+    state = _RunState(inputs, EventJournal(), RunDeadline(0, 100, PhaseShares()), store)
+    state.plan = controller_module.AssignmentPlan(())
+    controller = _controller(tmp_path)
+    controller._queue_review_threads(state)
+
+    (snapshot,), candidates, evidence = controller._review_thread_feedback(
+        state, (state.investigation_leads["review-thread:H1"],),
+    )
+    assert not candidates
+    assert evidence.evidence_ids == (keep.id,)
+    assert snapshot["anchor_evidence"][0]["evidence_id"] == keep.id
+    assert "anchor" in snapshot["anchor_evidence"][0]["excerpt"]
+    assert "anchor_evidence" not in thread
+
+
+def test_negotiation_refreshes_owner_anchor_evidence_collected_after_queueing(tmp_path):
+    from types import SimpleNamespace
+    from pr_reviewer.specialist_runtime.evidence import EvidenceProvenance
+
+    inputs = _inputs(tmp_path)
+    inputs = replace(inputs, review_threads=({
+        "target": "H1", "path": "a.py", "line": 51, "side": "RIGHT", "head_sha": inputs.head_sha,
+    },))
+    state = _RunState(inputs, EventJournal(), RunDeadline(0, 100, PhaseShares()), EvidenceStore())
+    owner = controller_module.Assignment(
+        "owner", "Owner", "Review a.py", (), (), (), (), (), (), 2, "normal",
+        owned_changed_paths=("a.py",),
+    )
+    state.plan = controller_module.AssignmentPlan((owner,))
+    state.assignment_sessions = {"owner": "S1"}
+    controller = _controller(tmp_path)
+    controller._queue_review_threads(state)
+    reconciliation = SimpleNamespace(snapshot=CoverageLedger(()).snapshot())
+    assert not controller._negotiation_state(state, reconciliation, 0).investigation_leads[0].evidence_ids
+
+    record = state.evidence.add_tool_result(
+        session_id="S1", tool="read_file", arguments={"path": "a.py", "offset": 51},
+        result={"status": "ok", "result": {"content": "anchor", "range": {"offset": 51, "lines": 1}}},
+        provenance=EvidenceProvenance(head_sha=inputs.head_sha),
+    )
+    lead, = controller._negotiation_state(state, reconciliation, 0).investigation_leads
+    assert lead.origin_session_id == "S1"
+    assert lead.evidence_ids == (record.id,)
+
+
 def test_historical_batch_is_bounded_to_open_discussions_on_the_same_path(tmp_path):
     inputs = replace(_inputs(tmp_path), review_threads=tuple(
         {"target": f"H{index}", "path": "a.py" if index < 6 else "b.py"}
@@ -234,6 +299,52 @@ def test_critic_thread_association_preserves_authorized_finding(tmp_path, kind, 
     assert association["kind"] == kind
     assert association["fingerprint"]
     assert any(note.kind == ReviewNoteKind.FINDING for note in result.notes)
+
+
+def test_closed_thread_objections_are_advisory_critic_context(tmp_path):
+    inputs = _inputs(tmp_path)
+    objection = {"path": "src/worker.py", "line": 7, "prior_finding": "Old delivery finding",
+                 "human_objection": "False positive: only internal callers can reach this."}
+    requests = []
+
+    def critic(request):
+        requests.append(request.context)
+        return {"actions": [{"candidate_id": item.candidate_id, "action": "keep"}
+                            for item in request.context["candidates"]]}
+
+    def load_objections(locations):
+        assert locations == ("src/worker.py:7",)
+        assert not requests
+        return (objection, {**objection, "path": "src/other.py"}, {**objection, "line": 70})
+
+    result = _controller(tmp_path, critic=critic).run(replace(inputs, load_closed_thread_objections=load_objections))
+    context, = requests
+    assert context["closed_thread_objections"] == (objection,)
+    assert context["review_threads"] == ()
+    assert not result.artifact["review_threads"]["associations"]
+    assert any(note.kind == ReviewNoteKind.FINDING for note in result.notes)
+
+
+def test_historical_queue_prioritizes_candidate_overlap_and_prior_fix(tmp_path):
+    history = tuple({"target": f"H{i}", "path": "unrelated.py", "line": i}
+                    for i in range(1, 34))
+    matching = {"target": "H34", "path": "src/worker.py", "line": 7}
+    regression = {"target": "H35", "path": "src/other.py", "line": 2, "previously_reported_fixed": True}
+    disputed = {"target": "H36", "path": "src/x.py", "line": 3, "has_human_objection": True}
+    inputs = replace(_inputs(tmp_path), review_threads=(*history, matching, regression, disputed))
+    summaries = []
+
+    def negotiator(request):
+        summaries.append([row["summary"] for row in request.context["negotiation_targets"] if row["handle"].startswith("L")])
+        raise RuntimeError("use deterministic fallback after capturing scheduling context")
+
+    result = _controller(tmp_path, negotiator=negotiator).run(inputs)
+    queued = [row["payload"] for row in result.artifact["events"] if row["kind"] == "review_thread_queued"]
+    assert [row["target"] for row in queued[:3]] == ["H34", "H35", "H36"]
+    assert len(queued) == 32
+    assert "near a current candidate" in summaries[0][0]
+    assert "check for recurrence" in summaries[0][1]
+    assert "human disputed the earlier claim" in summaries[0][2]
 
 
 @pytest.mark.parametrize("selected,expected", [("H1", 1), ("H99", 0), (None, 0)])
@@ -3945,7 +4056,9 @@ def test_malformed_critic_result_uses_evidence_gated_conservative_fallback(
     assert "private" not in critic_degradations[0]["reason"]
 
 
-def test_critic_gets_one_focused_correction_for_invalid_merge(tmp_path):
+@pytest.mark.parametrize("cross_file", [False, True])
+def test_critic_only_repairs_a_merge_when_it_has_a_feasible_target(tmp_path, cross_file):
+    source_path = "src/audit.py" if cross_file else "src/worker.py"
     store = EvidenceStore()
     first = store.add_tool_result(
         session_id="seed-a",
@@ -3957,7 +4070,7 @@ def test_critic_gets_one_focused_correction_for_invalid_merge(tmp_path):
     second = store.add_tool_result(
         session_id="seed-b",
         tool="read_file",
-        arguments={"path": "src/worker.py"},
+        arguments={"path": source_path},
         result={"status": "ok", "content": "audit_after_retry()"},
         category="implementation",
     )
@@ -3993,7 +4106,7 @@ def test_critic_gets_one_focused_correction_for_invalid_merge(tmp_path):
         candidate_id="duplicate-audit",
         root_cause_fingerprint="root-audit",
         claim="The audit callback may emit two records for one action",
-        affected_location="src/worker.py:9",
+        affected_location=f"{source_path}:9",
         causal_chain=(
             "An ambiguous response reaches the audit callback and the audit callback "
             "observes the repeated write."
@@ -4048,8 +4161,12 @@ def test_critic_gets_one_focused_correction_for_invalid_merge(tmp_path):
             ]}
         repair = request.context["critic_merge_repair"]
         assert repair["invalid_candidate_ids"] == (source.candidate_id,)
+        assert repair["rejected_merges"][0]["reason"] == "cross-file-same-fix-and-two-citations-required"
+        assert request.context["eligible_merge_targets"][source.candidate_id] == (target.candidate_id,)
         return {"actions": [
-            {"candidate_id": source.candidate_id, "action": "keep"},
+            {"candidate_id": source.candidate_id, "action": "merge", "target_id": target.candidate_id,
+             "merge_basis": {"same_fix": "Make the repeated write idempotent so the audit callback never sees a duplicate.",
+                             "source_evidence_id": second.id, "target_evidence_id": first.id}},
         ]}
 
     result = _controller(
@@ -4064,16 +4181,18 @@ def test_critic_gets_one_focused_correction_for_invalid_merge(tmp_path):
         obligation_deriver=lambda *_args, **_kwargs: (obligation,),
     ).run(replace(
         _inputs(tmp_path), candidate_findings=(target, source),
+        changed_files=tuple(dict.fromkeys(("src/worker.py", source_path))),
     ))
 
-    assert len(critic_requests) == 2
-    assert {item["candidate_id"] for item in result.artifact["accepted_candidates"]} >= {
-        target.candidate_id, source.candidate_id,
-    }
-    assert any(
-        item["kind"] == "critic_merge_repair_completed"
-        for item in result.artifact["events"]
-    )
+    assert len(critic_requests) == (2 if cross_file else 1)
+    accepted = {item["candidate_id"] for item in result.artifact["accepted_candidates"]}
+    if cross_file:
+        assert accepted == {target.candidate_id}
+        completed, = [item["payload"] for item in result.artifact["events"] if item["kind"] == "critic_merge_repair_completed"]
+        assert completed["merged_candidate_ids"] == (source.candidate_id,)
+    else:
+        assert accepted == {target.candidate_id, source.candidate_id}
+        assert any(item["kind"] == "critic_merge_repair_skipped" for item in result.artifact["events"])
 
 
 def test_critic_degradation_emits_one_verification_request_per_controller_root(

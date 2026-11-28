@@ -179,6 +179,9 @@ def run_chat_request(
     if api_format == "anthropic":
         curl_args.extend(["-H", f"anthropic-version: {os.getenv('ANTHROPIC_VERSION', '2023-06-01')}"])
 
+    if os.getenv("PR_REVIEWER_ALLOW_INSECURE_TLS", "").strip().lower() in {"1", "true", "yes", "on"}:
+        curl_args.append("--insecure")
+
     # Streaming keeps bytes flowing so proxies with a short idle/read timeout
     # (Cloudflare's 100s edge timer etc.) don't 524 a long thinking-model turn.
     # --no-buffer flushes each SSE chunk; the body is reassembled below.
